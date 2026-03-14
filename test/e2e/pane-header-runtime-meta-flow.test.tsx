@@ -17,6 +17,11 @@ import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
 import type { AgentChatState } from '@/store/agentChatTypes'
 import type { PaneNode, TerminalPaneContent, AgentChatPaneContent } from '@/store/paneTypes'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -129,6 +134,13 @@ function createStore(options?: {
   agentChatState?: Partial<AgentChatState>
   activeTabId?: string
 }) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings({
+    sidebar: { collapsed: true },
+  })
+
   const codexTab: Tab = {
     id: 'tab-codex',
     createRequestId: 'req-codex',
@@ -227,10 +239,9 @@ function createStore(options?: {
       }),
     preloadedState: {
       settings: {
-        settings: {
-          ...defaultSettings,
-          sidebar: { ...defaultSettings.sidebar, collapsed: true },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: null,
       },
@@ -302,10 +313,9 @@ describe('pane header runtime metadata flow (e2e)', () => {
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: {
-            ...defaultSettings,
-            sidebar: { ...defaultSettings.sidebar, collapsed: true },
-          },
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
           platform: {
             platform: 'linux',
             availableClis: { codex: true, claude: true },
@@ -691,10 +701,9 @@ describe('pane header runtime metadata flow (e2e)', () => {
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: {
-            ...defaultSettings,
-            sidebar: { ...defaultSettings.sidebar, collapsed: true },
-          },
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
           platform: {
             platform: 'linux',
             availableClis: { codex: true, claude: true },

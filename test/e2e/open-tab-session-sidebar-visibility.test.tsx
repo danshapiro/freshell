@@ -15,6 +15,14 @@ import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { layoutMirrorMiddleware } from '@/store/layoutMirrorMiddleware'
 import * as sessionsThunks from '@/store/sessionsThunks'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 const _resetSessionWindowThunkState = ((sessionsThunks as any)._resetSessionWindowThunkState ?? (() => {})) as () => void
 
@@ -156,6 +164,17 @@ function createStore(options?: {
     zoomedPane: options?.panes?.zoomedPane ?? {},
   }
 
+  const defaultServerSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const serverSettings = mergeServerSettings(defaultServerSettings, {})
+  const localSettings = resolveLocalSettings({
+    sidebar: {
+      collapsed: false,
+      width: 288,
+    },
+  } satisfies LocalSettingsPatch)
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -177,14 +196,9 @@ function createStore(options?: {
       }).concat(layoutMirrorMiddleware),
     preloadedState: {
       settings: {
-        settings: {
-          ...defaultSettings,
-          sidebar: {
-            ...defaultSettings.sidebar,
-            collapsed: false,
-            width: 288,
-          },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },
@@ -249,12 +263,18 @@ describe('open tab session sidebar visibility (e2e)', () => {
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: defaultSettings,
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
           platform: { platform: 'linux' },
           shell: { authenticated: true, ready: true },
         })
       }
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/settings') {
+        return Promise.resolve(createDefaultServerSettings({
+          loggingDebug: defaultSettings.logging.debug,
+        }) as ServerSettingsPatch)
+      }
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/version') return Promise.resolve({})
       if (url === '/api/network/status') return Promise.resolve(null)

@@ -15,6 +15,11 @@ import codexActivityReducer, { type CodexActivityState } from '@/store/codexActi
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 vi.mock('react-window', () => ({
   List: ({ rowCount, rowComponent: Row, rowProps, style }: {
@@ -88,6 +93,17 @@ function createStore(options: {
   activeTabId?: string | null
   codexActivity?: Partial<CodexActivityState>
 }) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings({
+    sidebar: {
+      sortMode: 'activity',
+      showProjectBadges: true,
+      hideEmptySessions: false,
+    },
+  })
+
   const projects = options.projects.map((project) => ({
     ...project,
     sessions: (project.sessions ?? []).map((session) => ({
@@ -135,15 +151,9 @@ function createStore(options: {
       }),
     preloadedState: {
       settings: {
-        settings: {
-          ...defaultSettings,
-          sidebar: {
-            ...defaultSettings.sidebar,
-            sortMode: 'activity',
-            showProjectBadges: true,
-            hideEmptySessions: false,
-          },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },

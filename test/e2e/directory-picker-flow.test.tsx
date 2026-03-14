@@ -10,6 +10,14 @@ import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -24,10 +32,14 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
   },
 ]
 
-const { mockApiGet, mockApiPost, mockApiPatch } = vi.hoisted(() => ({
+const { mockApiGet, mockApiPost, mockApiPatch, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
   mockApiGet: vi.fn(),
   mockApiPost: vi.fn(),
   mockApiPatch: vi.fn(),
+  saveServerSettingsPatchSpy: vi.fn((patch: unknown) => ({
+    type: 'settings/saveServerSettingsPatch',
+    payload: patch,
+  })),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -47,6 +59,30 @@ vi.mock('@/lib/api', () => ({
     patch: (path: string, body: unknown) => mockApiPatch(path, body),
   },
 }))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: false,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+  }
+}
 
 function renderPickerFlow() {
   const node: PaneNode = {
@@ -81,30 +117,35 @@ function renderPickerFlow() {
         platform: 'linux',
         availableClis: { claude: true },
       },
-      settings: {
-        settings: {
-          theme: 'system' as const,
+      settings: createSettingsState({
+        server: {
+          terminal: { scrollback: 5000 },
+          safety: { autoKillIdleMinutes: 180 },
+          panes: { defaultNewPane: 'ask' },
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: { claude: { cwd: '/home/user/work' } },
+          },
+          logging: { debug: false },
+        },
+        local: {
+          theme: 'system',
           uiScale: 1,
           terminal: {
             fontSize: 14,
             fontFamily: 'monospace',
             lineHeight: 1.2,
             cursorBlink: true,
-            scrollback: 5000,
-            theme: 'auto' as const,
+            theme: 'auto',
           },
-          safety: { autoKillIdleMinutes: 180 },
-          sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
-          panes: { defaultNewPane: 'ask' as const },
-          codingCli: {
-            enabledProviders: ['claude'] as any[],
-            providers: { claude: { cwd: '/home/user/work' } },
+          sidebar: {
+            sortMode: 'activity',
+            showProjectBadges: true,
+            width: 288,
+            collapsed: false,
           },
-          logging: { debug: false },
         },
-        loaded: true,
-        lastSavedAt: null,
-      },
+      }),
     },
   })
 
@@ -169,30 +210,35 @@ function renderTabAwarePickerFlow() {
         platform: 'linux',
         availableClis: { claude: true },
       },
-      settings: {
-        settings: {
-          theme: 'system' as const,
+      settings: createSettingsState({
+        server: {
+          terminal: { scrollback: 5000 },
+          safety: { autoKillIdleMinutes: 180 },
+          panes: { defaultNewPane: 'ask' },
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: { claude: { cwd: '/code/global-default' } },
+          },
+          logging: { debug: false },
+        },
+        local: {
+          theme: 'system',
           uiScale: 1,
           terminal: {
             fontSize: 14,
             fontFamily: 'monospace',
             lineHeight: 1.2,
             cursorBlink: true,
-            scrollback: 5000,
-            theme: 'auto' as const,
+            theme: 'auto',
           },
-          safety: { autoKillIdleMinutes: 180 },
-          sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
-          panes: { defaultNewPane: 'ask' as const },
-          codingCli: {
-            enabledProviders: ['claude'] as any[],
-            providers: { claude: { cwd: '/code/global-default' } },
+          sidebar: {
+            sortMode: 'activity',
+            showProjectBadges: true,
+            width: 288,
+            collapsed: false,
           },
-          logging: { debug: false },
         },
-        loaded: true,
-        lastSavedAt: null,
-      },
+      }),
     },
   })
 
@@ -210,6 +256,7 @@ describe('directory picker flow (e2e)', () => {
     mockApiGet.mockReset()
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
+    saveServerSettingsPatchSpy.mockReset()
     mockApiGet.mockResolvedValue({ directories: ['/home/user/work', '/home/user/next'] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/home/user/next' })
     mockApiPatch.mockResolvedValue({})
@@ -240,8 +287,12 @@ describe('directory picker flow (e2e)', () => {
       }
     })
 
-    expect(mockApiPatch).toHaveBeenCalledWith('/api/settings', {
-      codingCli: { providers: { claude: { cwd: '/home/user/next' } } },
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      codingCli: {
+        providers: {
+          claude: expect.objectContaining({ cwd: '/home/user/next' }),
+        },
+      },
     })
   })
 
@@ -363,8 +414,12 @@ describe('directory picker flow (e2e)', () => {
       })
 
       // Global default should be persisted
-      expect(mockApiPatch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { claude: { cwd: '/code/tab-project' } } },
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        codingCli: {
+          providers: {
+            claude: expect.objectContaining({ cwd: '/code/tab-project' }),
+          },
+        },
       })
     })
   })

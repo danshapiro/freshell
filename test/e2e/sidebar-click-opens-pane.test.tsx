@@ -10,6 +10,13 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import type { ProjectGroup } from '@/store/types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -82,6 +89,28 @@ function createStore(options: {
   ignoreCodexSubagents?: boolean
   showNoninteractiveSessions?: boolean
 }) {
+  const serverSettings = mergeServerSettings(
+    createDefaultServerSettings({
+      loggingDebug: defaultSettings.logging.debug,
+    }),
+    {
+      sidebar: {
+        excludeFirstChatSubstrings: options.excludeFirstChatSubstrings,
+        excludeFirstChatMustStart: options.excludeFirstChatMustStart,
+      },
+    } satisfies ServerSettingsPatch,
+  )
+  const localSettings = resolveLocalSettings({
+    sidebar: {
+      sortMode: 'activity',
+      showProjectBadges: true,
+      showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
+      ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
+      showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
+      hideEmptySessions: false,
+    },
+  })
+
   const projects = options.projects.map((project) => ({
     ...project,
     sessions: (project.sessions ?? []).map((session) => ({
@@ -127,20 +156,9 @@ function createStore(options: {
       }),
     preloadedState: {
       settings: {
-        settings: {
-          ...defaultSettings,
-          sidebar: {
-            ...defaultSettings.sidebar,
-            sortMode: 'activity',
-            showProjectBadges: true,
-            showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
-            ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
-            showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
-            hideEmptySessions: false,
-            excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
-            excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
-          },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },
