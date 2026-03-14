@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, removeLayout } from './panesSlice'
+import { closePane, initLayout, removeLayout, updatePaneContent } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -318,6 +318,10 @@ export const openSessionTab = createAsyncThunk(
     const state = getState() as RootState
     const localServerInstanceId = (state as Partial<RootState>).connection?.serverInstanceId
     const extensions = (state as Partial<RootState>).extensions?.entries ?? []
+    const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
+    const providerSettings = agentConfig
+      ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
+      : undefined
     const sessionMetadataInput = {
       sessionType: resolvedSessionType,
       firstUserMessage,
@@ -328,6 +332,13 @@ export const openSessionTab = createAsyncThunk(
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
       mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
 
+    const desiredResumeContent = buildResumeContent({
+      sessionType: resolvedSessionType,
+      sessionId,
+      cwd,
+      agentChatProviderSettings: providerSettings,
+    })
+
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
       if (!tab) return
       const sessionMetadataByKey = buildSessionMetadataByKey(tab.sessionMetadataByKey)
@@ -335,6 +346,58 @@ export const openSessionTab = createAsyncThunk(
       dispatch(updateTab({
         id: tab.id,
         updates: { sessionMetadataByKey },
+      }))
+    }
+
+    const repairExistingTabLayout = (tab: Tab | undefined) => {
+      if (!tab) return
+      const layout = state.panes.layouts[tab.id]
+      if (!layout) return
+
+      const matchingLeaves: Array<{ id: string; content: any }> = []
+      const visit = (node: PaneNode) => {
+        if (node.type === 'leaf') {
+          const content = node.content
+          const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
+          const matchesExplicitSessionRef =
+            typeof sessionRef?.provider === 'string'
+            && typeof sessionRef?.sessionId === 'string'
+            && sessionRef.provider === resolvedProvider
+            && sessionRef.sessionId === sessionId
+          const matchesImplicitSessionRef = (
+            content.kind === 'terminal'
+            && content.mode === resolvedProvider
+            && content.resumeSessionId === sessionId
+          ) || (
+            content.kind === 'agent-chat'
+            && resolvedProvider === 'claude'
+            && content.resumeSessionId === sessionId
+          )
+          if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
+            matchingLeaves.push({ id: node.id, content })
+          }
+          return
+        }
+        visit(node.children[0])
+        visit(node.children[1])
+      }
+
+      visit(layout)
+
+      if (matchingLeaves.length !== 1) return
+      const [{ id: paneId, content }] = matchingLeaves
+      if (content.kind === 'terminal' && content.terminalId) return
+
+      const needsRepair = desiredResumeContent.kind === 'agent-chat'
+        ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
+        : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
+
+      if (!needsRepair) return
+
+      dispatch(updatePaneContent({
+        tabId: tab.id,
+        paneId,
+        content: desiredResumeContent,
       }))
     }
 
@@ -368,7 +431,9 @@ export const openSessionTab = createAsyncThunk(
         localServerInstanceId,
       )
       if (existingTabId) {
-        updateExistingTabMetadata(state.tabs.tabs.find((tab) => tab.id === existingTabId))
+        const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
+        updateExistingTabMetadata(existingTab)
+        repairExistingTabLayout(existingTab)
         dispatch(setActiveTab(existingTabId))
         return
       }
@@ -377,10 +442,6 @@ export const openSessionTab = createAsyncThunk(
     // For agent-chat sessions, create a tab then immediately set up agent-chat layout
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
     if (isAgentChatProviderName(resolvedSessionType)) {
-      const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
-      const providerSettings = agentConfig
-        ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
-        : undefined
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
@@ -393,12 +454,7 @@ export const openSessionTab = createAsyncThunk(
       }))
       dispatch(initLayout({
         tabId,
-        content: buildResumeContent({
-          sessionType: resolvedSessionType,
-          sessionId,
-          cwd,
-          agentChatProviderSettings: providerSettings,
-        }),
+        content: desiredResumeContent,
       }))
       return
     }

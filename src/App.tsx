@@ -19,6 +19,7 @@ import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/sessi
 import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
 import {
   loadBrowserPreferencesRecord,
+  patchBrowserPreferencesRecord,
   resolveBrowserPreferenceSettings,
   seedBrowserPreferencesSettingsIfEmpty,
 } from '@/lib/browser-preferences'
@@ -36,6 +37,7 @@ import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
+import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
@@ -437,6 +439,7 @@ export default function App() {
     let versionInfoLoading = false
     let platformDetailsLoading = false
     let startupRecoveryInFlight = false
+    let startupRecoveryRerunRequested = false
     let platformCapabilitiesLoaded = false
     let lastReadyServerInstanceId: string | undefined
     const versionInfoLoadedRef = { current: false }
@@ -472,7 +475,22 @@ export default function App() {
           if (!cancelled) {
             if (bootstrapData.legacyLocalSettingsSeed) {
               const currentPreferences = loadBrowserPreferencesRecord()
-              const nextPreferences = seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
+              const currentLocalSettingsPatch = buildLocalSettingsPatch(appStore.getState().settings.localSettings)
+              const currentPreferencesPatch = currentPreferences.settings ?? {}
+              const hasExistingLocalSettings =
+                Object.keys(currentPreferencesPatch).length > 0
+                || Object.keys(currentLocalSettingsPatch).length > 0
+              const shouldPersistCurrentLocalSettings =
+                Object.keys(currentLocalSettingsPatch).length > 0
+                && JSON.stringify(currentPreferencesPatch) !== JSON.stringify(currentLocalSettingsPatch)
+              const nextPreferences = hasExistingLocalSettings
+                ? patchBrowserPreferencesRecord({
+                    ...(shouldPersistCurrentLocalSettings
+                      ? { settings: currentLocalSettingsPatch }
+                      : {}),
+                    legacyLocalSettingsSeedApplied: true,
+                  })
+                : seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
 
               if (JSON.stringify(currentPreferences.settings) !== JSON.stringify(nextPreferences.settings)) {
                 dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences)))
@@ -649,7 +667,11 @@ export default function App() {
       }
 
       const recoverMissingStartupState = async () => {
-        if (startupRecoveryInFlight || cancelled) return
+        if (cancelled) return
+        if (startupRecoveryInFlight) {
+          startupRecoveryRerunRequested = true
+          return
+        }
         startupRecoveryInFlight = true
         try {
           const state = appStore.getState()
@@ -664,6 +686,10 @@ export default function App() {
           ensureNetworkStatusLoaded()
         } finally {
           startupRecoveryInFlight = false
+          if (startupRecoveryRerunRequested && !cancelled) {
+            startupRecoveryRerunRequested = false
+            void recoverMissingStartupState()
+          }
         }
       }
 
@@ -812,6 +838,7 @@ export default function App() {
       // sidebar snapshot. The HTTP bootstrap window remains the source of truth.
       if (ws.isReady) {
         if (cancelled) return
+        lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))

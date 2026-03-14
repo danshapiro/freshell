@@ -288,21 +288,30 @@ export function ContextMenuProvider({
     dispatch(reorderTabs({ fromIndex: index, toIndex: next }))
   }, [dispatch, tabsState.tabs])
 
-  const getProjectCollections = useCallback((): ProjectGroup[][] => {
+  const getProjectCollections = useCallback((target?: ContextTarget | null): ProjectGroup[][] => {
     const collections: ProjectGroup[][] = []
     const pushCollection = (projects: ProjectGroup[]) => {
       if (projects.length === 0) return
       if (collections.some((existing) => existing === projects)) return
       collections.push(projects)
     }
-    pushCollection(sidebarSessions)
-    pushCollection(historySessions)
+
+    if (target?.kind === 'history-project' || target?.kind === 'history-session') {
+      pushCollection(historySessions)
+      pushCollection(sidebarSessions)
+    } else if (target?.kind === 'sidebar-session') {
+      pushCollection(sidebarSessions)
+      pushCollection(historySessions)
+    } else {
+      pushCollection(sidebarSessions)
+      pushCollection(historySessions)
+    }
     pushCollection(sessions)
     return collections
   }, [historySessions, sessions, sidebarSessions])
 
-  const getSessionInfo = useCallback((sessionId: string, provider?: string) => {
-    for (const projects of getProjectCollections()) {
+  const getSessionInfo = useCallback((sessionId: string, provider?: string, target?: ContextTarget | null) => {
+    for (const projects of getProjectCollections(target)) {
       for (const project of projects) {
         const session = project.sessions.find((s) =>
           s.sessionId === sessionId && (!provider || s.provider === provider)
@@ -313,8 +322,8 @@ export function ContextMenuProvider({
     return null
   }, [getProjectCollections])
 
-  const getProjectInfo = useCallback((projectPath: string) => {
-    for (const projects of getProjectCollections()) {
+  const getProjectInfo = useCallback((projectPath: string, target?: ContextTarget | null) => {
+    for (const projects of getProjectCollections(target)) {
       const project = projects.find((item) => item.projectPath === projectPath)
       if (project) return project
     }
@@ -344,11 +353,11 @@ export function ContextMenuProvider({
   }, [dispatch, tabsState.tabs])
 
   const openSessionInNewTab = useCallback((sessionId: string, provider?: string) => {
-    const info = getSessionInfo(sessionId, provider)
+    const target = menuState?.target
+    const info = getSessionInfo(sessionId, provider, target)
     if (!info) return
     const { session } = info
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
-    const target = menuState?.target
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
     const runningTerminalId =
@@ -375,11 +384,11 @@ export function ContextMenuProvider({
       openSessionInNewTab(sessionId, provider)
       return
     }
-    const info = getSessionInfo(sessionId, provider)
+    const target = menuState?.target
+    const info = getSessionInfo(sessionId, provider, target)
     if (!info) return
     const { session } = info
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
-    const target = menuState?.target
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
     const runningTerminalId =
@@ -404,7 +413,7 @@ export function ContextMenuProvider({
   }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
-    const info = getSessionInfo(sessionId, provider)
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (!info) return
     const title = window.prompt('Rename session', info.session.title || '')
     if (title === null) return
@@ -424,7 +433,7 @@ export function ContextMenuProvider({
     } catch {
       // ignore
     }
-  }, [dispatch, getSessionInfo])
+  }, [dispatch, getSessionInfo, menuState?.target])
 
   const toggleArchiveSession = useCallback(async (sessionId: string, provider: string | undefined, next: boolean) => {
     try {
@@ -437,7 +446,7 @@ export function ContextMenuProvider({
   }, [dispatch])
 
   const deleteSession = useCallback((sessionId: string, provider?: string) => {
-    const info = getSessionInfo(sessionId, provider)
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (!info) return
     const messageCount = info.session.messageCount
     const createdAt = info.session.createdAt
@@ -472,28 +481,28 @@ export function ContextMenuProvider({
         }
       },
     })
-  }, [dispatch, getSessionInfo])
+  }, [dispatch, getSessionInfo, menuState?.target])
 
   const copySessionId = useCallback(async (sessionId: string) => {
     await copyText(sessionId)
   }, [])
 
   const copySessionCwd = useCallback(async (sessionId: string, provider?: string) => {
-    const info = getSessionInfo(sessionId, provider)
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (info?.session.cwd) {
       await copyText(info.session.cwd)
     }
-  }, [getSessionInfo])
+  }, [getSessionInfo, menuState?.target])
 
   const copySessionSummary = useCallback(async (sessionId: string, provider?: string) => {
-    const info = getSessionInfo(sessionId, provider)
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (info?.session.summary) {
       await copyText(info.session.summary)
     }
-  }, [getSessionInfo])
+  }, [getSessionInfo, menuState?.target])
 
   const copySessionMetadata = useCallback(async (sessionId: string, provider?: string) => {
-    const info = getSessionInfo(sessionId, provider)
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (!info) return
     const { session, project } = info
     const keyProvider = (provider || session.provider || 'claude')
@@ -561,7 +570,7 @@ export function ContextMenuProvider({
       confirmLabel: 'Open tabs',
       body: 'This will open every session in the project in its own tab.',
       onConfirm: () => {
-        const project = getProjectInfo(projectPath)
+        const project = getProjectInfo(projectPath, menuState?.target)
         if (project) {
           for (const session of project.sessions) {
             const provider = (session.provider || 'claude') as CodingCliProviderName
@@ -581,7 +590,7 @@ export function ContextMenuProvider({
         setConfirmState(null)
       },
     })
-  }, [dispatch, getProjectInfo])
+  }, [dispatch, getProjectInfo, menuState?.target])
 
   const copyProjectPath = useCallback(async (projectPath: string) => {
     await copyText(projectPath)

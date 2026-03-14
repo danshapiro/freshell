@@ -706,6 +706,50 @@ describe('tabsSlice', () => {
       })
     })
 
+    it('repairs a mis-restored single-pane session tab when the reopened session resolves to agent-chat', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      store.dispatch(addTab({
+        id: 'tab-1',
+        mode: 'claude',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+      }))
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+      expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+        [`claude:${VALID_CLAUDE_SESSION_ID}`]: {
+          sessionType: 'freshclaude',
+        },
+      })
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      })
+    })
+
     it('activates existing tab when terminalId is already attached', async () => {
       const store = configureStore({
         reducer: {

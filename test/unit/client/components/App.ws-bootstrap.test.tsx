@@ -655,6 +655,72 @@ describe('App WS bootstrap recovery', () => {
     expect(platformCalls).toBe(1)
   })
 
+  it('refetches platform capabilities when a preconnected socket later reports a new server instance', async () => {
+    const store = createStore()
+    let platformCalls = 0
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-empty'
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: {
+            platform: 'linux',
+            availableClis: {},
+            featureFlags: {},
+            hostName: 'devbox-a',
+          },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/platform') {
+        platformCalls += 1
+        return Promise.resolve({
+          platform: 'linux',
+          availableClis: { claude: true, codex: true, opencode: true },
+          featureFlags: { kilroy: true },
+          hostName: 'devbox-b',
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-empty')
+      expect(store.getState().connection.availableClis).toEqual({})
+    })
+
+    expect(platformCalls).toBe(0)
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-restarted',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.serverInstanceId).toBe('srv-restarted')
+      expect(store.getState().connection.availableClis).toEqual({
+        claude: true,
+        codex: true,
+        opencode: true,
+      })
+      expect(store.getState().connection.featureFlags).toEqual({ kilroy: true })
+    })
+
+    expect(platformCalls).toBe(1)
+  })
+
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
     const store = createStore({
       codexActivity: {
