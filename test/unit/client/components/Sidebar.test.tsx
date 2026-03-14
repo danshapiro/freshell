@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -29,36 +29,6 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
   },
 ]
-
-let latestOnRowsRendered:
-  | ((visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void)
-  | null = null
-
-// Mock react-window's List component
-vi.mock('react-window', () => ({
-  List: ({ rowCount, rowComponent: Row, rowProps, style, onRowsRendered }: {
-    rowCount: number
-    rowComponent: React.ComponentType<any>
-    rowProps: any
-    style: React.CSSProperties
-    onRowsRendered?: (visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void
-  }) => {
-    latestOnRowsRendered = onRowsRendered ?? null
-    const items = []
-    for (let i = 0; i < rowCount; i++) {
-      items.push(
-        <Row
-          key={i}
-          index={i}
-          style={{ height: 56 }}
-          ariaAttributes={{}}
-          {...rowProps}
-        />
-      )
-    }
-    return <div style={style} data-testid="virtualized-list">{items}</div>
-  },
-}))
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
@@ -255,11 +225,31 @@ function renderSidebar(
   return { ...result, onNavigate }
 }
 
+function setSidebarListGeometry(
+  node: HTMLElement,
+  geometry: { clientHeight: number; scrollHeight: number; scrollTop: number }
+) {
+  Object.defineProperty(node, 'clientHeight', { configurable: true, value: geometry.clientHeight })
+  Object.defineProperty(node, 'scrollHeight', { configurable: true, value: geometry.scrollHeight })
+  Object.defineProperty(node, 'scrollTop', { configurable: true, value: geometry.scrollTop, writable: true })
+}
+
+function triggerNearBottomScroll(
+  node: HTMLElement,
+  geometry: { clientHeight: number; scrollHeight: number }
+) {
+  setSidebarListGeometry(node, {
+    clientHeight: geometry.clientHeight,
+    scrollHeight: geometry.scrollHeight,
+    scrollTop: geometry.scrollHeight - geometry.clientHeight,
+  })
+  fireEvent.scroll(node)
+}
+
 describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
-    latestOnRowsRendered = null
     mockFetchSidebarSessionsSnapshot.mockReset()
     mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
     mockGetTerminalDirectoryPage.mockReset()
@@ -1742,7 +1732,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       renderSidebar(store, [])
 
       expect(screen.getByText('Recent Session')).toBeInTheDocument()
-      expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
+      expect(screen.getByTestId('sidebar-session-list')).toBeInTheDocument()
       expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
       expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
     })
@@ -1889,7 +1879,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       renderSidebar(store, [])
 
       expect(screen.getByText('Recent Session')).toBeInTheDocument()
-      expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
+      expect(screen.getByTestId('sidebar-session-list')).toBeInTheDocument()
       expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
       expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
     })
@@ -1973,7 +1963,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
     })
 
     it('keeps first-load search blocking even when fallback tab sessions exist', async () => {
@@ -2031,10 +2021,368 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByTestId('search-loading')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
     })
 
-    it('does not start append pagination while the sidebar is already refreshing', async () => {
+    it('starts append pagination when the loaded sidebar is scrolled near the bottom', async () => {
+      vi.useRealTimers()
+
+      mockFetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-session',
+            projectPath: '/older',
+            lastActivityAt: 10,
+            title: 'Older Session',
+          }],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 10,
+        oldestIncludedSessionId: 'codex:older-session',
+        hasMore: false,
+      })
+
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/recent',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'recent-session',
+            projectPath: '/recent',
+            lastActivityAt: 20,
+            title: 'Recent Session',
+          }],
+        }],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [{
+            projectPath: '/recent',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'recent-session',
+              projectPath: '/recent',
+              lastActivityAt: 20,
+              title: 'Recent Session',
+            }],
+          }],
+          lastLoadedAt: 1_700_000_000_000,
+          hasMore: true,
+          oldestLoadedTimestamp: 20,
+          oldestLoadedSessionId: 'codex:recent-session',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/recent',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'recent-session',
+                  projectPath: '/recent',
+                  lastActivityAt: 20,
+                  title: 'Recent Session',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 20,
+              oldestLoadedSessionId: 'codex:recent-session',
+              loading: false,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+      expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(0)
+
+      const list = screen.getByTestId('sidebar-session-list')
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+
+      await waitFor(() => {
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+          limit: 50,
+          before: 20,
+          beforeId: 'codex:recent-session',
+          signal: expect.any(AbortSignal),
+        }))
+      })
+      await waitFor(() => {
+        expect(screen.getByText('Older Session')).toBeInTheDocument()
+      })
+      expect(screen.getByText('Recent Session')).toBeInTheDocument()
+    })
+
+    it('starts append pagination when a loaded sidebar is shorter than the viewport', async () => {
+      vi.useRealTimers()
+
+      const resizeCallbacks: Array<() => void> = []
+      class MockResizeObserver {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(() => callback([], this as unknown as ResizeObserver))
+        }
+        observe() {}
+        disconnect() {}
+      }
+      vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+      mockFetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-session',
+            projectPath: '/older',
+            lastActivityAt: 10,
+            title: 'Older Session',
+          }],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 10,
+        oldestIncludedSessionId: 'codex:older-session',
+        hasMore: false,
+      })
+
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/recent',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'recent-session',
+            projectPath: '/recent',
+            lastActivityAt: 20,
+            title: 'Recent Session',
+          }],
+        }],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [{
+            projectPath: '/recent',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'recent-session',
+              projectPath: '/recent',
+              lastActivityAt: 20,
+              title: 'Recent Session',
+            }],
+          }],
+          lastLoadedAt: 1_700_000_000_000,
+          hasMore: true,
+          oldestLoadedTimestamp: 20,
+          oldestLoadedSessionId: 'codex:recent-session',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/recent',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'recent-session',
+                  projectPath: '/recent',
+                  lastActivityAt: 20,
+                  title: 'Recent Session',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 20,
+              oldestLoadedSessionId: 'codex:recent-session',
+              loading: false,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      try {
+        renderSidebar(store)
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(0)
+
+        const list = screen.getByTestId('sidebar-session-list')
+        setSidebarListGeometry(list, { clientHeight: 560, scrollHeight: 112, scrollTop: 0 })
+
+        await act(async () => {
+          resizeCallbacks.forEach((callback) => callback())
+          await Promise.resolve()
+        })
+
+        await waitFor(() => {
+          expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+            limit: 50,
+            before: 20,
+            beforeId: 'codex:recent-session',
+            signal: expect.any(AbortSignal),
+          }))
+        })
+        await waitFor(() => {
+          expect(screen.getByText('Older Session')).toBeInTheDocument()
+        })
+        expect(screen.getByText('Recent Session')).toBeInTheDocument()
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('does not append while the sidebar window is showing committed search results', () => {
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/search',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'search-session',
+                  projectPath: '/search',
+                  lastActivityAt: 20,
+                  title: 'Search Result',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 20,
+              oldestLoadedSessionId: 'codex:search-session',
+              loading: false,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+      const list = screen.getByTestId('sidebar-session-list')
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+    })
+
+    it('does not append while the user has typed an uncommitted sidebar search query', () => {
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/recent',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'recent-session',
+                  projectPath: '/recent',
+                  lastActivityAt: 20,
+                  title: 'Recent Session',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 20,
+              oldestLoadedSessionId: 'codex:recent-session',
+              loading: false,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      const list = screen.getByTestId('sidebar-session-list')
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+    })
+
+    it('releases the sidebar append guard even when another session surface is active', async () => {
+      vi.useRealTimers()
+
+      mockFetchSidebarSessionsSnapshot
+        .mockResolvedValueOnce({
+          projects: [{
+            projectPath: '/older',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'older-session-1',
+              projectPath: '/older',
+              lastActivityAt: 10,
+              title: 'Older Session 1',
+            }],
+          }],
+          totalSessions: 2,
+          oldestIncludedTimestamp: 10,
+          oldestIncludedSessionId: 'codex:older-session-1',
+          hasMore: true,
+        })
+        .mockResolvedValueOnce({
+          projects: [{
+            projectPath: '/older',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'older-session-2',
+              projectPath: '/older',
+              lastActivityAt: 8,
+              title: 'Older Session 2',
+            }],
+          }],
+          totalSessions: 3,
+          oldestIncludedTimestamp: 8,
+          oldestIncludedSessionId: 'codex:older-session-2',
+          hasMore: false,
+        })
+
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'history',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/recent',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'recent-session',
+                  projectPath: '/recent',
+                  lastActivityAt: 20,
+                  title: 'Recent Session',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 20,
+              oldestLoadedSessionId: 'codex:recent-session',
+              loading: false,
+              query: '',
+              searchTier: 'title',
+            },
+            history: {
+              projects: [],
+              lastLoadedAt: 1_700_000_000_000,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+      const list = screen.getByTestId('sidebar-session-list')
+
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+      await waitFor(() => {
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+      })
+      await screen.findByText('Older Session 1')
+
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+      await waitFor(() => {
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
+      })
+      await screen.findByText('Older Session 2')
+    })
+
+    it('does not start append pagination while the sidebar is already refreshing', () => {
       const recentProjects: ProjectGroup[] = [{
         projectPath: '/work/recent',
         sessions: [{
@@ -2071,17 +2419,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       })
 
-      renderSidebar(store, [])
+      renderSidebar(store)
 
-      expect(latestOnRowsRendered).not.toBeNull()
-
-      await act(async () => {
-        latestOnRowsRendered?.(
-          { startIndex: 0, stopIndex: 0 },
-          { startIndex: 0, stopIndex: 0 },
-        )
-        await Promise.resolve()
-      })
+      const list = screen.getByTestId('sidebar-session-list')
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
 
       expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     })

@@ -350,11 +350,4 @@ describe('Sidebar render stability', () => {
       expect(areSessionItemsEqual(a, b)).toBe(true)
     })
   })
-
-  describe('Row component stability', () => {
-    it('SidebarRow is exported at module scope (not recreated per render)', async () => {
-      const { SidebarRow } = await import('@/components/Sidebar')
-      expect(typeof SidebarRow).toBe('function')
-    })
-  })
 })

@@ -1,6 +1,5 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
-import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
@@ -70,7 +69,6 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
 }
 
 const SESSION_ITEM_HEIGHT = 56
-const SESSION_LIST_MAX_HEIGHT = 600
 
 function formatRelativeTime(timestamp: number): string {
   const now = Date.now()
@@ -123,15 +121,6 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
   )
 }
 
-interface SidebarRowProps {
-  items: SessionItem[]
-  activeSessionKey: string | null
-  activeTerminalId: string | undefined
-  showProjectBadge: boolean | undefined
-  onItemClick: (item: SessionItem) => void
-  timestampTick: number
-}
-
 /**
  * Determine whether a sidebar session item should be highlighted as active.
  * Prefers activeSessionKey (derived from the active pane's content) when
@@ -155,46 +144,6 @@ export function computeIsActive(params: {
     return params.runningTerminalId === params.activeTerminalId
   }
   return false
-}
-
-/** Row component defined at module scope for stable identity — prevents react-window
- *  from unmounting/remounting all visible rows on every parent re-render. */
-export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowComponentProps<SidebarRowProps>) => {
-  const item = data.items[index]
-  const sessionKey = `${item.provider}:${item.sessionId}`
-  const isActive = computeIsActive({
-    isRunning: item.isRunning,
-    runningTerminalId: item.runningTerminalId,
-    sessionKey,
-    activeSessionKey: data.activeSessionKey,
-    activeTerminalId: data.activeTerminalId,
-  })
-
-  // Stable click handler: store latest callback + item in a ref so the
-  // onClick function identity never changes, but always invokes current data.
-  // This avoids breaking SidebarItem's React.memo on every parent re-render.
-  const callbackRef = useRef({ onItemClick: data.onItemClick, item })
-  callbackRef.current = { onItemClick: data.onItemClick, item }
-  const onClick = useStableCallback(callbackRef)
-
-  return (
-    <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
-      <SidebarItem
-        item={item}
-        isActiveTab={isActive}
-        showProjectBadge={data.showProjectBadge}
-        onClick={onClick}
-        timestampTick={data.timestampTick}
-      />
-    </div>
-  )
-}
-
-/** Returns a stable function that always calls the latest onItemClick(item) from the ref. */
-function useStableCallback(
-  ref: MutableRefObject<{ onItemClick: (item: SessionItem) => void; item: SessionItem }>
-) {
-  return useCallback(() => ref.current.onItemClick(ref.current.item), [ref])
 }
 
 export default function Sidebar({
@@ -232,10 +181,6 @@ export default function Sidebar({
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
-  const hasMore = useAppSelector((s) => s.sessions.hasMore)
-  const loadingMore = useAppSelector((s) => s.sessions.loadingMore)
-  const oldestLoadedTimestamp = useAppSelector((s) => s.sessions.oldestLoadedTimestamp)
-  const oldestLoadedSessionId = useAppSelector((s) => s.sessions.oldestLoadedSessionId)
   const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
   const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
   const terminals = useAppSelector((state) => (
@@ -244,8 +189,9 @@ export default function Sidebar({
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const lastMarkedSearchQueryRef = useRef<string | null>(null)
-  const listContainerRef = useRef<HTMLDivElement | null>(null)
-  const [listHeight, setListHeight] = useState(0)
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const listContentRef = useRef<HTMLDivElement | null>(null)
+  const listMetricsRef = useRef({ clientHeight: 0, scrollHeight: 0 })
 
   // Tick counter that increments every 15s to keep relative timestamps fresh.
   // The custom comparator on SidebarItem ensures only the timestamp text node
@@ -297,25 +243,6 @@ export default function Sidebar({
   // value actually changes — the custom memo comparator on SidebarItem
   // handles that independently.
   const sortedItems = useStableArray(computedItems, isSessionItemEqual)
-
-  useEffect(() => {
-    const container = listContainerRef.current
-    if (!container) return
-
-    const updateHeight = () => {
-      const nextHeight = container.clientHeight
-      if (nextHeight > 0) {
-        setListHeight(() => nextHeight)
-      }
-    }
-
-    updateHeight()
-
-    if (typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(() => updateHeight())
-    ro.observe(container)
-    return () => ro.disconnect()
-  }, [])
 
   // Read activeTabId from the store at call time (not closure) so that
   // handleItemClick has a stable reference and doesn't cause SidebarItem
@@ -399,58 +326,111 @@ export default function Sidebar({
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
   const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
-  const effectiveListHeight = listHeight > 0
-    ? listHeight
-    : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
+  const sidebarHasMore = sidebarWindow?.hasMore ?? false
+  const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
+  const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
+  const localQuery = filter.trim()
+  const committedQuery = (sidebarWindow?.query ?? '').trim()
+  const hasActiveQuery = localQuery.length > 0 || committedQuery.length > 0
 
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const handleRowsRendered = useCallback(
-    (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
-      if (
-        !hasMore ||
-        sidebarWindow?.loading ||
-        loadMoreInFlightRef.current ||
-        oldestLoadedTimestamp == null ||
-        oldestLoadedSessionId == null ||
-        filter.trim() // Don't load more while filtering
-      ) return
-      const nearBottom = allRows.stopIndex >= sortedItems.length - 10
-      if (!nearBottom) return
-      loadMoreInFlightRef.current = true
-      void dispatch(fetchSessionWindow({
-        surface: 'sidebar',
-        priority: 'visible',
-        append: true,
-      }) as any)
-      // Safety timeout: reset if response never arrives
-      if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
-      loadMoreTimeoutRef.current = setTimeout(() => {
-        loadMoreInFlightRef.current = false
-      }, 15_000)
-    },
-    [hasMore, sidebarWindow?.loading, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
-  )
-  // Reset in-flight guard when loadingMore clears (response received)
+  const requestSidebarAppend = useCallback(() => {
+    if (!sidebarHasMore || sidebarWindow?.loading || loadMoreInFlightRef.current) return
+    if (sidebarOldestLoadedTimestamp == null || sidebarOldestLoadedSessionId == null) return
+    if (hasActiveQuery) return
+
+    loadMoreInFlightRef.current = true
+    void dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      append: true,
+    }) as any)
+    if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
+    loadMoreTimeoutRef.current = setTimeout(() => {
+      loadMoreInFlightRef.current = false
+    }, 15_000)
+  }, [
+    dispatch,
+    hasActiveQuery,
+    sidebarHasMore,
+    sidebarOldestLoadedSessionId,
+    sidebarOldestLoadedTimestamp,
+    sidebarWindow?.loading,
+  ])
+
+  const getListMetrics = useCallback(() => {
+    const list = listRef.current
+    if (!list) return null
+
+    const clientHeight = list.clientHeight > 0
+      ? list.clientHeight
+      : listMetricsRef.current.clientHeight
+    const measuredScrollHeight = list.scrollHeight > 0
+      ? list.scrollHeight
+      : listMetricsRef.current.scrollHeight
+    const estimatedScrollHeight = sortedItems.length * SESSION_ITEM_HEIGHT
+    const scrollHeight = Math.max(measuredScrollHeight, estimatedScrollHeight)
+
+    if (clientHeight > 0 || scrollHeight > 0) {
+      listMetricsRef.current = { clientHeight, scrollHeight }
+    }
+
+    return {
+      list,
+      clientHeight,
+      scrollHeight,
+    }
+  }, [sortedItems.length])
+
+  const maybeBackfillViewport = useCallback(() => {
+    const metrics = getListMetrics()
+    if (!metrics) return
+    if (metrics.clientHeight <= 0 || metrics.scrollHeight <= 0) return
+    const underfilledViewport = metrics.scrollHeight <= metrics.clientHeight
+    if (!underfilledViewport) return
+    requestSidebarAppend()
+  }, [getListMetrics, requestSidebarAppend])
+
+  const handleListScroll = useCallback(() => {
+    const metrics = getListMetrics()
+    if (!metrics) return
+    const remaining = metrics.scrollHeight - (metrics.list.scrollTop + metrics.clientHeight)
+    const nearBottom = remaining <= SESSION_ITEM_HEIGHT * 10
+    if (!nearBottom) return
+    requestSidebarAppend()
+  }, [getListMetrics, requestSidebarAppend])
+
   useEffect(() => {
-    if (!loadingMore) {
+    if (!sidebarWindow?.loading) {
       loadMoreInFlightRef.current = false
       if (loadMoreTimeoutRef.current) { clearTimeout(loadMoreTimeoutRef.current); loadMoreTimeoutRef.current = null }
     }
-  }, [loadingMore])
-  // Clear timeout on unmount
+  }, [sidebarWindow?.loading])
+
+  useEffect(() => {
+    maybeBackfillViewport()
+  }, [
+    maybeBackfillViewport,
+    sortedItems.length,
+    sidebarWindow?.lastLoadedAt,
+    sidebarWindow?.oldestLoadedTimestamp,
+    sidebarWindow?.oldestLoadedSessionId,
+    sidebarWindow?.hasMore,
+    sidebarWindow?.loading,
+  ])
+
+  useEffect(() => {
+    const resizeTarget = listContentRef.current ?? listRef.current
+    if (!resizeTarget || typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(() => maybeBackfillViewport())
+    observer.observe(resizeTarget)
+    return () => observer.disconnect()
+  }, [maybeBackfillViewport, showBlockingLoad, sortedItems.length])
+
   useEffect(() => () => {
     if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
   }, [])
-
-  const rowProps: SidebarRowProps = useMemo(() => ({
-    items: sortedItems,
-    activeSessionKey,
-    activeTerminalId,
-    showProjectBadge: settings.sidebar?.showProjectBadges,
-    onItemClick: handleItemClick,
-    timestampTick,
-  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick, timestampTick])
 
   useEffect(() => {
     const query = filter.trim()
@@ -601,7 +581,7 @@ export default function Sidebar({
 
       {/* Session List */}
       <div className="flex flex-1 min-h-0 flex-col">
-        <div ref={listContainerRef} className="flex-1 min-h-0 px-2">
+        <div className="flex-1 min-h-0 px-2">
           {showBlockingLoad ? (
             <div
               className="flex items-center justify-center py-8"
@@ -621,16 +601,37 @@ export default function Sidebar({
               : 'No sessions yet'}
           </div>
           ) : (
-            <List
-              defaultHeight={effectiveListHeight}
-              rowCount={sortedItems.length}
-              rowHeight={SESSION_ITEM_HEIGHT}
-              rowComponent={SidebarRow}
-              rowProps={rowProps}
-              onRowsRendered={handleRowsRendered}
-              className="overflow-y-auto"
-              style={{ height: effectiveListHeight, width: '100%' }}
-            />
+            <div
+              ref={listRef}
+              data-testid="sidebar-session-list"
+              className="h-full overflow-y-auto"
+              onScroll={handleListScroll}
+            >
+              <div ref={listContentRef}>
+                {sortedItems.map((item) => {
+                  const sessionKey = `${item.provider}:${item.sessionId}`
+                  const isActive = computeIsActive({
+                    isRunning: item.isRunning,
+                    runningTerminalId: item.runningTerminalId,
+                    sessionKey,
+                    activeSessionKey,
+                    activeTerminalId,
+                  })
+
+                  return (
+                    <div key={sessionKey} className="pb-0.5">
+                      <SidebarItem
+                        item={item}
+                        isActiveTab={isActive}
+                        showProjectBadge={settings.sidebar?.showProjectBadges}
+                        onClick={() => handleItemClick(item)}
+                        timestampTick={timestampTick}
+                      />
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
           )}
         </div>
       </div>
