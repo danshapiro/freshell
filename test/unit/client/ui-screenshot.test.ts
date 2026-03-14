@@ -332,7 +332,7 @@ describe('captureUiScreenshot iframe handling', () => {
       const topLabels = topMenuItems.map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
       const allHaveIcons = topMenuItems.every((node) => node.querySelector('svg'))
       const matchesTerminalClipboardSection =
-        topLabels.join('|') === 'copy|Paste|Select all' && allHaveIcons
+        topLabels.join('|') === 'Copy|Paste|Select all' && allHaveIcons
 
       expectedImageBase64 = createSolidPngBase64(
         matchesTerminalClipboardSection ? [12, 129, 54, 255] : [188, 28, 28, 255],
@@ -356,7 +356,7 @@ describe('captureUiScreenshot iframe handling', () => {
     const clonedMenuItems = Array.from(cloneDoc!.querySelectorAll('[role="menuitem"]')).map(
       (node) => node.textContent?.replace(/\s+/g, ' ').trim(),
     )
-    expect(clonedMenuItems.slice(0, 3)).toEqual(['copy', 'Paste', 'Select all'])
+    expect(clonedMenuItems.slice(0, 3)).toEqual(['Copy', 'Paste', 'Select all'])
 
     const topMenuItems = Array.from(cloneDoc!.querySelectorAll('[role="menuitem"]')).slice(0, 3)
     for (const node of topMenuItems) {

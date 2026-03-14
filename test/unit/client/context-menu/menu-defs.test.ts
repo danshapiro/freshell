@@ -399,7 +399,7 @@ describe('buildMenuItems - terminal clipboard section', () => {
       'separator',
     ])
 
-    expect(getTerminalItem(items, 'terminal-copy').label).toBe('copy')
+    expect(getTerminalItem(items, 'terminal-copy').label).toBe('Copy')
     expect(getTerminalItem(items, 'terminal-copy').icon).toBeTruthy()
     expect(getTerminalItem(items, 'terminal-paste').icon).toBeTruthy()
     expect(getTerminalItem(items, 'terminal-select-all').icon).toBeTruthy()

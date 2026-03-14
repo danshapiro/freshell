@@ -1,5 +1,5 @@
-import { addTab, setActiveTab, closeTab, updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { initLayout, splitPane, setActivePane, updatePaneContent, updatePaneTitle, resizePanes, swapPanes } from '@/store/panesSlice'
+import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
+import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
