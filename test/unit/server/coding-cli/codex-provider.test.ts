@@ -68,6 +68,64 @@ describe('codex-provider', () => {
     expect(meta.messageCount).toBe(2)
   })
 
+  it('derives Codex createdAt and lastActivityAt from semantic events', () => {
+    const meta = parseCodexSessionContent([
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-activity', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Visible reply' }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'turn_aborted' },
+      }),
+    ].join('\n'))
+
+    expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:06.000Z'))
+  })
+
+  it('ignores token_count and turn_context when deriving Codex lastActivityAt', () => {
+    const meta = parseCodexSessionContent([
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-1', cwd: '/repo' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Visible reply' }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:20.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { total_usage_tokens: 999 } },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:21.000Z',
+        type: 'turn_context',
+        payload: { cwd: '/repo' },
+      }),
+    ].join('\n'))
+
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:04.000Z'))
+  })
+
   it('parses fixture-backed codex task event timestamps', async () => {
     const content = await fsp.readFile(codexTaskEventsFixturePath, 'utf8')
 

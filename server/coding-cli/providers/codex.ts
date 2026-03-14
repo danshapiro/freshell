@@ -12,6 +12,8 @@ const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
 // explicit auto-compact limit, approximate it by scaling from the effective window.
 const CODEX_AUTO_COMPACT_DEFAULT_PERCENT = 90
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT = 95
+const SEMANTIC_CODEX_RESPONSE_TYPES = new Set(['message', 'function_call', 'function_call_output'])
+const SEMANTIC_CODEX_EVENT_TYPES = new Set(['agent_reasoning', 'task_started', 'task_complete', 'turn_aborted'])
 
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
@@ -47,6 +49,27 @@ function maxTimestamp(current: number | undefined, candidate: number | undefined
   if (candidate === undefined) return current
   if (current === undefined) return candidate
   return Math.max(current, candidate)
+}
+
+function recordSemanticClock(
+  clock: { createdAt?: number; lastActivityAt?: number },
+  value: unknown,
+): void {
+  const at = parseTimestampMs(value)
+  if (at === undefined) return
+  clock.createdAt = clock.createdAt === undefined ? at : Math.min(clock.createdAt, at)
+  clock.lastActivityAt = clock.lastActivityAt === undefined ? at : Math.max(clock.lastActivityAt, at)
+}
+
+function isSemanticCodexRecord(obj: any): boolean {
+  if (obj?.type === 'session_meta') return true
+  if (obj?.type === 'response_item') {
+    return typeof obj?.payload?.type === 'string' && SEMANTIC_CODEX_RESPONSE_TYPES.has(obj.payload.type)
+  }
+  if (obj?.type === 'event_msg') {
+    return typeof obj?.payload?.type === 'string' && SEMANTIC_CODEX_EVENT_TYPES.has(obj.payload.type)
+  }
+  return false
 }
 
 function normalizeCompactPercent(numerator: number, denominator?: number): number | undefined {
@@ -227,6 +250,8 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   const lines = content.split(/\r?\n/).filter(Boolean)
   let sessionId: string | undefined
   let cwd: string | undefined
+  let createdAt: number | undefined
+  let lastActivityAt: number | undefined
   let title: string | undefined
   let summary: string | undefined
   let firstUserMessage: string | undefined
@@ -245,6 +270,13 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       obj = JSON.parse(line)
     } catch {
       continue
+    }
+
+    if (isSemanticCodexRecord(obj)) {
+      const clock = { createdAt, lastActivityAt }
+      recordSemanticClock(clock, obj.timestamp)
+      createdAt = clock.createdAt
+      lastActivityAt = clock.lastActivityAt
     }
 
     if (obj?.type === 'session_meta') {
@@ -341,6 +373,8 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       : {}),
     sessionId,
     cwd,
+    createdAt,
+    lastActivityAt,
     title,
     summary,
     firstUserMessage,
