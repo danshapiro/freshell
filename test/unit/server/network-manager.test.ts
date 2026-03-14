@@ -213,6 +213,34 @@ describe('NetworkManager', () => {
     expect(status.accessUrl).not.toContain('localhost')
   })
 
+  it('reports blocked native Windows remote access as needing repair instead of disabled setup', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'windows',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockResolvedValue(false)
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(testPort, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(true)
+    expect((status as any).remoteAccessNeedsRepair).toBe(true)
+    expect(status.firewall.portOpen).toBe(false)
+    expect(status.accessUrl).toContain('localhost')
+    expect(status.accessUrl).not.toContain('192.168.1.100')
+  })
+
   it('does not hot rebind WSL when only the saved remote-access intent changes', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     vi.mocked(firewallModule.detectFirewall).mockResolvedValue({

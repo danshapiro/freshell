@@ -271,7 +271,7 @@ export class NetworkManager {
     ) || (
       firewallInfo.platform === 'windows'
       && remoteAccessRequested
-      && staleUpgradeExposure
+      && (rawPortOpen === false || staleUpgradeExposure)
     )
     const shareRouteEnabled = remoteAccessEnabled
       || (

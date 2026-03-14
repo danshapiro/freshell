@@ -64,4 +64,26 @@ describe('resolveStartupBanner', () => {
     expect(banner.url).toBe('http://localhost:3001/?token=test')
     expect(banner.noteLines).toContain('Remote access is configured but needs firewall/port-forward repair.')
   })
+
+  it('shows the repair banner instead of the setup-wizard banner for blocked native Windows remote access', () => {
+    const banner = resolveStartupBanner({
+      localUrl: 'http://localhost:5173/?token=test',
+      advertisedUrl: 'http://localhost:5173/?token=test',
+      status: {
+        remoteAccessEnabled: false,
+        remoteAccessRequested: true,
+        remoteAccessNeedsRepair: true,
+        accessUrl: 'http://localhost:5173/?token=test',
+        firewall: {
+          platform: 'windows',
+          portOpen: false,
+        },
+      },
+    })
+
+    expect(banner.kind).toBe('local')
+    expect(banner.url).toBe('http://localhost:5173/?token=test')
+    expect(banner.noteLines).toContain('Remote access is configured but needs firewall/port-forward repair.')
+    expect(banner.noteLines).not.toContain('Run the setup wizard to enable remote access.')
+  })
 })

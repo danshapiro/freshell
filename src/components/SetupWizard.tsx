@@ -380,7 +380,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   }, [firewallConfirmation])
 
   const handleContinueAnyway = useCallback(() => {
-    if (networkStatus?.firewall.platform === 'wsl2' && !isRemoteAccessEnabledStatus(networkStatus)) {
+    if (!networkStatus || !isRemoteAccessEnabledStatus(networkStatus)) {
       onComplete()
       return
     }
