@@ -23,6 +23,7 @@ import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 import { browserPreferencesPersistenceMiddleware } from './browserPreferencesPersistence'
 import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
+import { serverSettingsSaveStateMiddleware } from './settingsThunks'
 
 enableMapSet()
 
@@ -56,6 +57,7 @@ export const store = configureStore({
     }).concat(
       perfMiddleware,
       persistMiddleware,
+      serverSettingsSaveStateMiddleware,
       browserPreferencesPersistenceMiddleware,
       layoutMirrorMiddleware,
       sessionActivityPersistMiddleware,

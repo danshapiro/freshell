@@ -15,6 +15,25 @@ export type SettingsPatch = ServerSettingsPatch
 
 // --- normalizeSettingsPatch (moved from server/index.ts) ---
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function stripDeprecatedSettingsPatchAliases(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) {
+    return {}
+  }
+
+  const patch = { ...value }
+  if (isRecord(patch.sidebar)) {
+    const sidebar = { ...patch.sidebar }
+    delete sidebar.ignoreCodexSubagentSessions
+    patch.sidebar = sidebar
+  }
+
+  return patch
+}
+
 export const normalizeSettingsPatch = (patch: Record<string, any>) => {
   if (Object.prototype.hasOwnProperty.call(patch, 'defaultCwd')) {
     const raw = patch.defaultCwd
@@ -86,7 +105,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   })
 
   const handleSettingsPatch = async (req: any, res: any) => {
-    const parsed = settingsPatchSchema.safeParse(req.body || {})
+    const parsed = settingsPatchSchema.safeParse(stripDeprecatedSettingsPatchAliases(req.body || {}))
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }

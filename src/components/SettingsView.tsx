@@ -4,6 +4,7 @@ import {
   defaultSettings,
   mergeSettings,
   previewServerSettingsPatch,
+  setServerSettings,
   updateSettingsLocal,
 } from '@/store/settingsSlice'
 import {
@@ -286,7 +287,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const remoteAccessRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const serverTextSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
-  const serverTextConfirmedSettingsRef = useRef<Record<string, typeof serverSettings>>({})
+  const serverTextPendingPreviewRef = useRef<Record<string, {
+    confirmedServerSettings: typeof serverSettings
+    order: number
+  }>>({})
+  const nextServerTextPreviewOrderRef = useRef(1)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
   const lastSettingsExcludeFirstChatRef = useRef(
@@ -319,14 +324,21 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
+      const pendingServerTextEntries = Object.entries(serverTextPendingPreviewRef.current)
+        .sort(([, left], [, right]) => left.order - right.order)
       for (const timer of Object.values(serverTextSaveTimerRef.current)) {
         clearTimeout(timer)
       }
+      if (pendingServerTextEntries.length > 0) {
+        dispatch(setServerSettings(pendingServerTextEntries[0][1].confirmedServerSettings))
+      }
+      serverTextSaveTimerRef.current = {}
+      serverTextPendingPreviewRef.current = {}
       for (const timer of Object.values(providerCwdTimerRef.current)) {
         clearTimeout(timer)
       }
     }
-  }, [])
+  }, [dispatch])
   const refreshFirewallStatusAfterNoop = useCallback(async (message?: string) => {
     setFirewallRefreshDetail(message ?? 'Refreshing firewall status...')
     try {
@@ -580,17 +592,20 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [dispatch])
 
   const scheduleServerTextSettingSave = useCallback((key: string, updates: ServerSettingsPatch) => {
-    if (!serverTextSaveTimerRef.current[key]) {
-      serverTextConfirmedSettingsRef.current[key] = serverSettings
+    if (!serverTextPendingPreviewRef.current[key]) {
+      serverTextPendingPreviewRef.current[key] = {
+        confirmedServerSettings: serverSettings,
+        order: nextServerTextPreviewOrderRef.current++,
+      }
     }
     dispatch(previewServerSettingsPatch(updates))
     if (serverTextSaveTimerRef.current[key]) {
       clearTimeout(serverTextSaveTimerRef.current[key])
     }
     serverTextSaveTimerRef.current[key] = setTimeout(() => {
-      const confirmedServerSettings = serverTextConfirmedSettingsRef.current[key]
+      const confirmedServerSettings = serverTextPendingPreviewRef.current[key]?.confirmedServerSettings
       delete serverTextSaveTimerRef.current[key]
-      delete serverTextConfirmedSettingsRef.current[key]
+      delete serverTextPendingPreviewRef.current[key]
       void dispatch(saveServerSettingsPatch({
         patch: updates,
         confirmedServerSettings,

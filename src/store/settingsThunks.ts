@@ -1,4 +1,4 @@
-import { createAsyncThunk } from '@reduxjs/toolkit'
+import { createAsyncThunk, type Middleware } from '@reduxjs/toolkit'
 
 import { api } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
@@ -82,6 +82,9 @@ type SaveServerSettingsState = {
   confirmedServerSettings?: ServerSettings
   pendingPatches: PendingServerSettingsPatch[]
 }
+type SaveQueueMeta = {
+  saveQueueReconcile?: boolean
+}
 
 let saveServerSettingsStateByGetState = new WeakMap<SaveServerSettingsGetState, SaveServerSettingsState>()
 let nextPendingServerSettingsPatchId = 1
@@ -141,6 +144,14 @@ function buildVisibleServerSettings(
   )
 }
 
+function isSaveQueueReconcileAction(action: unknown): boolean {
+  return (
+    isRecord(action)
+    && isRecord(action.meta)
+    && (action.meta as SaveQueueMeta).saveQueueReconcile === true
+  )
+}
+
 function reconcileVisibleServerSettings(
   dispatch: DispatchLike,
   saveState: SaveServerSettingsState,
@@ -149,9 +160,12 @@ function reconcileVisibleServerSettings(
     return
   }
 
-  dispatch(setServerSettings(
-    buildVisibleServerSettings(saveState.confirmedServerSettings, saveState.pendingPatches),
-  ))
+  dispatch({
+    ...setServerSettings(
+      buildVisibleServerSettings(saveState.confirmedServerSettings, saveState.pendingPatches),
+    ),
+    meta: { saveQueueReconcile: true },
+  })
 }
 
 function removePendingServerSettingsPatch(
@@ -189,6 +203,33 @@ function queueServerSettingsSave(
   const queued = saveState.queue.then(run, run)
   saveState.queue = queued.catch(() => {})
   return queued
+}
+
+export const serverSettingsSaveStateMiddleware: Middleware<
+  {},
+  { settings: Pick<SettingsState, 'serverSettings'> }
+> = (storeApi) => (next) => (action) => {
+  const result = next(action)
+
+  if (!setServerSettings.match(action) || isSaveQueueReconcileAction(action)) {
+    return result
+  }
+
+  const typedGetState = storeApi.getState as SaveServerSettingsGetState
+  const saveState = saveServerSettingsStateByGetState.get(typedGetState)
+  if (!saveState) {
+    return result
+  }
+
+  saveState.confirmedServerSettings = action.payload
+  if (saveState.pendingPatches.length > 0) {
+    storeApi.dispatch({
+      ...setServerSettings(buildVisibleServerSettings(action.payload, saveState.pendingPatches)),
+      meta: { saveQueueReconcile: true },
+    })
+  }
+
+  return result
 }
 
 export const saveServerSettingsPatch = createAsyncThunk(

@@ -351,6 +351,30 @@ describe('SettingsView Editor section', () => {
     expect(store.getState().settings.settings.editor?.customEditorCommand).toBeUndefined()
   })
 
+  it('rolls back pending debounced custom command previews on unmount before save dispatch', async () => {
+    const store = createTestStore({ editor: { externalEditor: 'custom' } })
+    const { unmount } = render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const input = screen.getByPlaceholderText('nvim +{line} {file}')
+    fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBe('vim +{line} {file}')
+
+    unmount()
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBeUndefined()
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+
   it('displays existing custom command value', () => {
     const store = createTestStore({
       editor: { externalEditor: 'custom', customEditorCommand: 'emacs +{line} {file}' },

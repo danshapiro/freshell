@@ -235,11 +235,21 @@ describe('Settings API Integration', () => {
     }
   })
 
-  it('PATCH /api/settings rejects stray local-only sidebar keys', async () => {
+  it('PATCH /api/settings ignores the deprecated ignoreCodexSubagentSessions alias', async () => {
     const res = await request(app)
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
-      .send({ sidebar: { width: 300, ignoreCodexSubagentSessions: true } })
+      .send({ sidebar: { ignoreCodexSubagentSessions: true } })
+
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual(defaultSettings)
+  })
+
+  it('PATCH /api/settings still rejects stray local-only sidebar keys', async () => {
+    const res = await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ sidebar: { width: 300 } })
 
     expect(res.status).toBe(400)
     expect(res.body.error).toBe('Invalid request')

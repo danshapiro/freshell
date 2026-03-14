@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import settingsReducer, { setServerSettings } from '@/store/settingsSlice'
-import { resetServerSettingsSaveQueueForTests, saveServerSettingsPatch } from '@/store/settingsThunks'
+import {
+  resetServerSettingsSaveQueueForTests,
+  saveServerSettingsPatch,
+  serverSettingsSaveStateMiddleware,
+} from '@/store/settingsThunks'
 
 const apiPatch = vi.fn()
 
@@ -22,6 +26,7 @@ function makeStore() {
     reducer: {
       settings: settingsReducer,
     },
+    middleware: (getDefault) => getDefault().concat(serverSettingsSaveStateMiddleware),
   })
 }
 
@@ -221,6 +226,77 @@ describe('settingsThunks', () => {
     expect(warnSpy).toHaveBeenCalledWith('[settingsThunks]', 'Failed to save server settings patch', expect.any(Error))
 
     warnSpy.mockRestore()
+  })
+
+  it('preserves an intervening authoritative settings update when an in-flight save later rejects', async () => {
+    const store = makeStore()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let rejectFirst: ((reason?: unknown) => void) | null = null
+    const authoritativeBaseline = store.getState().settings.serverSettings
+
+    apiPatch.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectFirst = reject
+    }))
+
+    const pendingSave = store.dispatch(saveServerSettingsPatch({
+      defaultCwd: '/workspace',
+    }))
+
+    await Promise.resolve()
+
+    store.dispatch(setServerSettings({
+      ...authoritativeBaseline,
+      editor: {
+        ...authoritativeBaseline.editor,
+        externalEditor: 'code',
+      },
+    }))
+
+    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+    expect(store.getState().settings.settings.editor.externalEditor).toBe('code')
+
+    rejectFirst?.(new Error('save failed'))
+    const result = await pendingSave
+
+    expect(result.type).toBe('settings/saveServerSettingsPatch/rejected')
+    expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
+    expect(store.getState().settings.settings.editor.externalEditor).toBe('code')
+
+    warnSpy.mockRestore()
+  })
+
+  it('preserves an intervening authoritative settings update when an in-flight save resolves without returning settings', async () => {
+    const store = makeStore()
+    let resolveFirst: ((value: unknown) => void) | null = null
+    const authoritativeBaseline = store.getState().settings.serverSettings
+
+    apiPatch.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveFirst = resolve
+    }))
+
+    const pendingSave = store.dispatch(saveServerSettingsPatch({
+      defaultCwd: '/workspace',
+    }))
+
+    await Promise.resolve()
+
+    store.dispatch(setServerSettings({
+      ...authoritativeBaseline,
+      editor: {
+        ...authoritativeBaseline.editor,
+        externalEditor: 'code',
+      },
+    }))
+
+    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+    expect(store.getState().settings.settings.editor.externalEditor).toBe('code')
+
+    resolveFirst?.({})
+    const result = await pendingSave
+
+    expect(result.type).toBe('settings/saveServerSettingsPatch/fulfilled')
+    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+    expect(store.getState().settings.settings.editor.externalEditor).toBe('code')
   })
 
   it('preserves nested coding CLI clears by converting them into API clear sentinels', async () => {
