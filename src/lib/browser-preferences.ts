@@ -17,6 +17,7 @@ export type BrowserPreferencesRecord = {
   settings?: LocalSettingsPatch
   toolStrip?: { expanded?: boolean }
   tabs?: { searchRangeDays?: number }
+  legacyLocalSettingsSeedApplied?: boolean
 }
 
 function canUseStorage(): boolean {
@@ -40,6 +41,10 @@ function normalizeRecord(value: unknown): BrowserPreferencesRecord {
   const settings = isRecord(value.settings) ? extractLegacyLocalSettingsSeed(value.settings) : undefined
   if (settings) {
     normalized.settings = settings
+  }
+
+  if (value.legacyLocalSettingsSeedApplied === true) {
+    normalized.legacyLocalSettingsSeedApplied = true
   }
 
   if (isRecord(value.toolStrip) && typeof value.toolStrip.expanded === 'boolean') {
@@ -183,7 +188,7 @@ export function patchBrowserPreferencesRecord(patch: BrowserPreferencesRecord): 
 
 export function seedBrowserPreferencesSettingsIfEmpty(seed: LocalSettingsPatch): BrowserPreferencesRecord {
   const current = loadBrowserPreferencesRecord()
-  if (current.settings !== undefined) {
+  if (current.legacyLocalSettingsSeedApplied) {
     return current
   }
 
@@ -192,9 +197,14 @@ export function seedBrowserPreferencesSettingsIfEmpty(seed: LocalSettingsPatch):
     return current
   }
 
+  const nextSettings = current.settings === undefined
+    ? normalizedSeed
+    : mergeLocalSettings(normalizedSeed, current.settings)
+
   return saveRecord({
     ...current,
-    settings: normalizedSeed,
+    settings: nextSettings,
+    legacyLocalSettingsSeedApplied: true,
   })
 }
 

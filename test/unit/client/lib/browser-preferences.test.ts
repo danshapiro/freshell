@@ -68,12 +68,9 @@ describe('browser preferences', () => {
     }))
   })
 
-  it('seedBrowserPreferencesSettingsIfEmpty fills only a missing settings payload', () => {
-    expect(seedBrowserPreferencesSettingsIfEmpty({
-      terminal: {
-        fontFamily: 'Fira Code',
-      },
-    })).toEqual({
+  it('fills missing seeded values without overwriting existing local settings', () => {
+    localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
+    expect(loadBrowserPreferencesRecord()).toEqual({
       settings: {
         terminal: {
           fontFamily: 'Fira Code',
@@ -82,13 +79,36 @@ describe('browser preferences', () => {
     })
 
     expect(seedBrowserPreferencesSettingsIfEmpty({
-      theme: 'dark',
+      theme: 'light',
+      terminal: {
+        fontFamily: 'JetBrains Mono',
+      },
+      sidebar: {
+        showSubagents: true,
+      },
     })).toEqual({
       settings: {
+        theme: 'light',
         terminal: {
           fontFamily: 'Fira Code',
         },
+        sidebar: {
+          showSubagents: true,
+        },
       },
+      legacyLocalSettingsSeedApplied: true,
+    })
+  })
+
+  it('does not reapply a legacy seed after it has already been consumed', () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      legacyLocalSettingsSeedApplied: true,
+    }))
+
+    expect(seedBrowserPreferencesSettingsIfEmpty({
+      theme: 'light',
+    })).toEqual({
+      legacyLocalSettingsSeedApplied: true,
     })
   })
 

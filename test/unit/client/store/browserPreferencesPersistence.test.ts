@@ -8,6 +8,7 @@ import {
   browserPreferencesPersistenceMiddleware,
   resetBrowserPreferencesFlushListenersForTests,
 } from '@/store/browserPreferencesPersistence'
+import { seedBrowserPreferencesSettingsIfEmpty } from '@/lib/browser-preferences'
 import { resetPersistBroadcastForTests } from '@/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
@@ -82,6 +83,31 @@ describe('browserPreferencesPersistence', () => {
           sortMode: 'project',
         },
       },
+    })
+  })
+
+  it('preserves the consumed seed marker when seeded settings are reset to defaults', () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        theme: 'light',
+      },
+      legacyLocalSettingsSeedApplied: true,
+    }))
+
+    const store = createStore()
+
+    store.dispatch(setLocalSettings(resolveLocalSettings()))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      legacyLocalSettingsSeedApplied: true,
+    })
+
+    expect(seedBrowserPreferencesSettingsIfEmpty({
+      theme: 'light',
+    })).toEqual({
+      legacyLocalSettingsSeedApplied: true,
     })
   })
 })

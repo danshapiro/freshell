@@ -128,6 +128,10 @@ function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserP
   const current = loadBrowserPreferencesRecord()
   const next: BrowserPreferencesRecord = {}
 
+  if (current.legacyLocalSettingsSeedApplied) {
+    next.legacyLocalSettingsSeedApplied = true
+  }
+
   if (current.toolStrip?.expanded !== undefined) {
     next.toolStrip = { expanded: current.toolStrip.expanded }
   }

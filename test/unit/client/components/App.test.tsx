@@ -904,6 +904,69 @@ describe('App Bootstrap', () => {
           fontFamily: 'Fira Code',
         },
       },
+      legacyLocalSettingsSeedApplied: true,
+    })
+  })
+
+  it('merges legacyLocalSettingsSeed into a partial browser-local payload without overwriting existing values', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        terminal: {
+          fontFamily: 'JetBrains Mono',
+        },
+      },
+    }))
+
+    const store = createTestStore({
+      settings: {
+        local: {
+          terminal: {
+            fontFamily: 'JetBrains Mono',
+          },
+        },
+      },
+    })
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          legacyLocalSettingsSeed: {
+            theme: 'light',
+            sidebar: {
+              showSubagents: true,
+            },
+            terminal: {
+              fontFamily: 'Fira Code',
+            },
+          },
+          platform: { platform: 'linux' },
+        })
+      }
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      return Promise.resolve({})
+    })
+
+    renderApp(store)
+
+    await waitFor(() => {
+      expect(store.getState().settings.settings.theme).toBe('light')
+    })
+
+    expect(store.getState().settings.settings.terminal.fontFamily).toBe('JetBrains Mono')
+    expect(store.getState().settings.settings.sidebar.showSubagents).toBe(true)
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        theme: 'light',
+        sidebar: {
+          showSubagents: true,
+        },
+        terminal: {
+          fontFamily: 'JetBrains Mono',
+        },
+      },
+      legacyLocalSettingsSeedApplied: true,
     })
   })
 
@@ -1023,6 +1086,41 @@ describe('App Bootstrap', () => {
           fontFamily: 'JetBrains Mono',
         },
       },
+      legacyLocalSettingsSeedApplied: true,
+    })
+  })
+
+  it('does not reapply legacyLocalSettingsSeed after a seeded value is reset back to default', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      legacyLocalSettingsSeedApplied: true,
+    }))
+
+    const store = createTestStore()
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          legacyLocalSettingsSeed: {
+            theme: 'light',
+          },
+          platform: { platform: 'linux' },
+        })
+      }
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      return Promise.resolve({})
+    })
+
+    renderApp(store)
+
+    await waitFor(() => {
+      expect(store.getState().settings.loaded).toBe(true)
+    })
+
+    expect(store.getState().settings.settings.theme).toBe('system')
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      legacyLocalSettingsSeedApplied: true,
     })
   })
 })

@@ -348,6 +348,7 @@ describe('terminal font preference (e2e)', () => {
           fontFamily: 'Consolas',
         },
       },
+      legacyLocalSettingsSeedApplied: true,
     })
   })
 })
