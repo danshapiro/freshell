@@ -19,10 +19,8 @@ vi.mock('@/lib/api', () => ({
 }))
 
 const mockFetchFirewallConfig = vi.fn()
-const mockCancelFirewallConfirmation = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
-  cancelFirewallConfirmation: (...args: any[]) => mockCancelFirewallConfirmation(...args),
 }))
 
 installSettingsViewHooks({ mockFonts: true })
@@ -107,6 +105,33 @@ describe('SettingsView network access section', () => {
     expect(screen.queryByRole('button', { name: /get link/i })).not.toBeInTheDocument()
   })
 
+  it('keeps the native toggle on while hiding share affordances when remote access is requested but the port is blocked', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: false,
+            remoteAccessRequested: true,
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
+    expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /get link/i })).not.toBeInTheDocument()
+  })
+
   it('shows an admin-approval modal before disabling exposed WSL remote access', async () => {
     const { api } = await import('@/lib/api')
     vi.mocked(api.post)
@@ -178,7 +203,7 @@ describe('SettingsView network access section', () => {
 
     expect(api.post).toHaveBeenCalledTimes(1)
     await waitFor(() => {
-      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('disable-1')
+      expect(screen.queryByRole('dialog', { name: /administrator approval required/i })).not.toBeInTheDocument()
     })
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
   })
@@ -416,7 +441,7 @@ describe('SettingsView network access section', () => {
     })
   })
 
-  it('revokes the confirmation token when the modal is cancelled', async () => {
+  it('closes the admin-approval modal without a second API call when cancelled', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'confirmation-required',
       title: 'Administrator approval required',
@@ -449,7 +474,7 @@ describe('SettingsView network access section', () => {
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
     await waitFor(() => {
-      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('confirm-1')
+      expect(screen.queryByRole('dialog', { name: /administrator approval required/i })).not.toBeInTheDocument()
     })
   })
 

@@ -6,7 +6,7 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-import { cancelFirewallConfirmation, fetchFirewallConfig } from '@/lib/firewall-configure'
+import { fetchFirewallConfig } from '@/lib/firewall-configure'
 import { api } from '@/lib/api'
 
 describe('fetchFirewallConfig', () => {
@@ -86,16 +86,6 @@ describe('fetchFirewallConfig', () => {
     await expect(fetchFirewallConfig()).resolves.toEqual({
       method: 'in-progress',
       error: 'Firewall configuration already in progress',
-    })
-  })
-
-  it('posts the server-issued token when canceling a confirmation', async () => {
-    vi.mocked(api.post).mockResolvedValue({})
-
-    await cancelFirewallConfirmation('confirm-1')
-
-    expect(api.post).toHaveBeenCalledWith('/api/network/cancel-firewall-confirmation', {
-      confirmationToken: 'confirm-1',
     })
   })
 })

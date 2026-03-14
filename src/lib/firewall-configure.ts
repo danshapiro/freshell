@@ -49,7 +49,3 @@ export async function fetchFirewallConfig(
     throw error
   }
 }
-
-export async function cancelFirewallConfirmation(confirmationToken: string): Promise<void> {
-  await api.post('/api/network/cancel-firewall-confirmation', { confirmationToken })
-}

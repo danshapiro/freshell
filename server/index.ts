@@ -678,10 +678,12 @@ async function main() {
 
       let advertisedUrl = localUrl
       let remoteAccessEnabled = bindHost !== '127.0.0.1'
+      let remoteAccessNeedsRepair = false
 
       try {
         const startupStatus = await networkManager.getStatus()
         remoteAccessEnabled = startupStatus.remoteAccessEnabled
+        remoteAccessNeedsRepair = startupStatus.remoteAccessNeedsRepair === true
         if (hideToken) {
           const parsed = new URL(startupStatus.accessUrl)
           parsed.searchParams.delete('token')
@@ -695,7 +697,14 @@ async function main() {
 
       console.log('')
       console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-      if (!remoteAccessEnabled) {
+      if (remoteAccessNeedsRepair) {
+        console.log(`   Local only for now: \x1b[36m${localUrl}\x1b[0m`)
+        if (hideToken) {
+          console.log('   Auth token is configured in .env (not printed to logs).')
+        }
+        console.log('   Remote access is configured but needs firewall/port-forward repair.')
+        console.log('   Open Settings and use Fix firewall to restore LAN access.')
+      } else if (!remoteAccessEnabled) {
         console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
         if (hideToken) {
           console.log('   Auth token is configured in .env (not printed to logs).')

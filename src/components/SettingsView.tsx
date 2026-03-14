@@ -28,7 +28,6 @@ import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import {
-  cancelFirewallConfirmation,
   fetchFirewallConfig,
   type ConfigureFirewallResult,
 } from '@/lib/firewall-configure'
@@ -237,7 +236,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const remoteAccessRequested = networkStatus?.remoteAccessRequested ?? remoteAccessEnabled
   const isWslRemoteAccess = networkStatus?.firewall?.platform === 'wsl2'
-  const remoteAccessToggleChecked = remoteAccessEnabled || (isWslRemoteAccess && remoteAccessRequested)
+  const remoteAccessToggleChecked = remoteAccessEnabled || remoteAccessRequested
   const enabledProviders = useMemo(
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
@@ -562,12 +561,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [pendingConfirmation, requestFirewallFix, requestWslRemoteAccessDisable])
 
   const handleCancelPendingAction = useCallback(() => {
-    const confirmationToken = pendingConfirmation?.request.confirmationToken
     setPendingConfirmation(null)
-    if (!confirmationToken) {
-      return
-    }
-    void cancelFirewallConfirmation(confirmationToken).catch(() => {})
   }, [pendingConfirmation])
 
   const scheduleSave = useCallback((updates: any) => {
@@ -1535,7 +1529,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               </div>
             )}
 
-            {(remoteAccessEnabled || (isWslRemoteAccess && remoteAccessRequested)) && networkStatus && (
+            {(remoteAccessEnabled || remoteAccessRequested) && networkStatus && (
               <>
                 {networkStatus.firewall && (
                   <SettingsRow

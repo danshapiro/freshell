@@ -155,6 +155,7 @@ describe('NetworkManager', () => {
     expect(status.host).toBe('0.0.0.0')
     expect(status.remoteAccessEnabled).toBe(false)
     expect((status as any).remoteAccessRequested).toBe(true)
+    expect((status as any).remoteAccessNeedsRepair).toBe(true)
     expect(status.accessUrl).toContain('localhost')
     expect(status.accessUrl).not.toContain('192.168.1.100')
   })
@@ -277,6 +278,8 @@ describe('NetworkManager', () => {
   })
 
   it('builds correct accessUrl with token and port', async () => {
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(portReachable.default).mockResolvedValue(true)
     process.env.AUTH_TOKEN = 'test-token-1234567890'
     mockConfigStore = createMockConfigStore({
       network: {
@@ -351,6 +354,7 @@ describe('NetworkManager', () => {
     const status = await manager.getStatus()
 
     expect(status.remoteAccessEnabled).toBe(true)
+    expect((status as any).remoteAccessNeedsRepair).toBe(true)
     expect(status.accessUrl).toContain('192.168.1.100:5173')
     expect(status.firewall.portOpen).toBe(false)
   })
@@ -383,7 +387,8 @@ describe('NetworkManager', () => {
 
     const status = await manager.getStatus()
 
-    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(true)
     expect(status.firewall.portOpen).toBe(false)
     expect(status.firewall.commands).toContain(
       'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>$null',
@@ -424,7 +429,8 @@ describe('NetworkManager', () => {
 
     const status = await manager.getStatus()
 
-    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(true)
     expect(status.firewall.portOpen).toBe(false)
     expect(status.firewall.commands).toContain(
       'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>$null',

@@ -42,10 +42,8 @@ vi.mock('@/lib/api', () => ({
 
 // Mock firewall-configure for firewall button tests
 const mockFetchFirewallConfig = vi.fn()
-const mockCancelFirewallConfirmation = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
-  cancelFirewallConfirmation: (...args: any[]) => mockCancelFirewallConfirmation(...args),
 }))
 vi.mock('@/components/setup-wizard-timing', () => ({
   SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS: 10,
@@ -114,8 +112,6 @@ describe('SetupWizard', () => {
     mockPost.mockReset()
     mockPost.mockResolvedValue({ ...defaultConfigureNetworkResponse })
     mockFetchFirewallConfig.mockReset()
-    mockCancelFirewallConfirmation.mockReset()
-    mockCancelFirewallConfirmation.mockResolvedValue(undefined)
     vi.mocked(api.get).mockResolvedValue({})
     vi.mocked(api.patch).mockResolvedValue({})
   })
@@ -412,7 +408,7 @@ describe('SetupWizard', () => {
     })
   })
 
-  it('revokes the confirmation token when the user cancels the admin-approval modal', async () => {
+  it('closes the admin-approval modal without a second API call when the user cancels', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'confirmation-required',
       title: 'Administrator approval required',
@@ -456,7 +452,7 @@ describe('SetupWizard', () => {
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
     await waitFor(() => {
-      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('confirm-1')
+      expect(screen.queryByRole('dialog', { name: /administrator approval required/i })).not.toBeInTheDocument()
     })
   })
 

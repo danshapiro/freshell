@@ -6,6 +6,7 @@ export interface NetworkStatusResponse {
   host: '127.0.0.1' | '0.0.0.0'
   remoteAccessEnabled?: boolean
   remoteAccessRequested?: boolean
+  remoteAccessNeedsRepair?: boolean
   port: number
   lanIps: string[]
   machineHostname: string

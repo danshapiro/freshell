@@ -102,6 +102,7 @@ export interface NetworkStatus {
   host: '127.0.0.1' | '0.0.0.0'
   remoteAccessEnabled: boolean
   remoteAccessRequested: boolean
+  remoteAccessNeedsRepair: boolean
   port: number
   lanIps: string[]
   machineHostname: string
@@ -262,7 +263,10 @@ export class NetworkManager {
       : []
     const remoteAccessEnabled = firewallInfo.platform === 'wsl2'
       ? rawPortOpen === true
-      : remoteAccessRequested
+      : remoteAccessRequested && portOpen !== false
+    const remoteAccessNeedsRepair = firewallInfo.platform === 'wsl2'
+      && remoteAccessRequested
+      && portOpen === false
     const shareRouteEnabled = remoteAccessEnabled
       || (
         firewallInfo.platform === 'wsl2'
@@ -282,6 +286,7 @@ export class NetworkManager {
       host: effectiveHost,
       remoteAccessEnabled,
       remoteAccessRequested,
+      remoteAccessNeedsRepair,
       port: this.port,
       lanIps: this.lanIps,
       machineHostname: os.hostname().replace(/\.local$/, ''),

@@ -9,7 +9,7 @@ import request from 'supertest'
 import isPortReachable from 'is-port-reachable'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { createLocalFileRouter } from '../../../server/local-file-router.js'
-import { createNetworkRouter } from '../../../server/network-router.js'
+import { createNetworkRouter, FIREWALL_CONFIRMATION_TTL_MS } from '../../../server/network-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
@@ -172,6 +172,34 @@ describe('Network API integration', () => {
       expect(res.body).toHaveProperty('firewall')
       expect(res.body).toHaveProperty('devMode')
       expect(res.body).toHaveProperty('accessUrl')
+    })
+
+    it('surfaces previously-enabled WSL remote access as needing repair after restart/IP churn', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(false)
+
+      const res = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(res.status).toBe(200)
+      expect(res.body.host).toBe('0.0.0.0')
+      expect(res.body.remoteAccessEnabled).toBe(false)
+      expect(res.body.remoteAccessRequested).toBe(true)
+      expect(res.body.remoteAccessNeedsRepair).toBe(true)
+      expect(res.body.accessUrl).toContain('localhost')
+      expect(res.body.accessUrl).not.toContain('192.168.1.100')
     })
 
     it('requires authentication', async () => {
@@ -1053,7 +1081,8 @@ describe('Network API integration', () => {
       expectConfirmationRequired(replayRes.body)
     })
 
-    it('revokes a confirmation token when the client cancels the approval modal', async () => {
+    it('re-prompts when a confirmation token expires before the confirmed retry arrives', async () => {
+      vi.useFakeTimers()
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'windows',
         active: true,
@@ -1061,32 +1090,30 @@ describe('Network API integration', () => {
       networkManager.resetFirewallCache()
 
       const cp = await import('node:child_process')
+      try {
+        const firstRes = await request(app)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({})
 
-      const firstRes = await request(app)
-        .post('/api/network/configure-firewall')
-        .set('x-auth-token', token)
-        .send({})
+        expectConfirmationRequired(firstRes.body)
 
-      expectConfirmationRequired(firstRes.body)
+        vi.advanceTimersByTime(FIREWALL_CONFIRMATION_TTL_MS + 1)
 
-      const cancelRes = await request(app)
-        .post('/api/network/cancel-firewall-confirmation')
-        .set('x-auth-token', token)
-        .send({ confirmationToken: firstRes.body.confirmationToken })
+        const confirmedRes = await request(app)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({
+            confirmElevation: true,
+            confirmationToken: firstRes.body.confirmationToken,
+          })
 
-      expect(cancelRes.status).toBe(204)
-
-      const confirmedRes = await request(app)
-        .post('/api/network/configure-firewall')
-        .set('x-auth-token', token)
-        .send({
-          confirmElevation: true,
-          confirmationToken: firstRes.body.confirmationToken,
-        })
-
-      expect(confirmedRes.status).toBe(200)
-      expectConfirmationRequired(confirmedRes.body)
-      expect(cp.execFile).not.toHaveBeenCalled()
+        expect(confirmedRes.status).toBe(200)
+        expectConfirmationRequired(confirmedRes.body)
+        expect(cp.execFile).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('re-prompts when a confirmation token is for the wrong platform', async () => {

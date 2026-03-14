@@ -4,7 +4,6 @@ import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import {
-  cancelFirewallConfirmation,
   fetchFirewallConfig,
   type ConfigureFirewallResult,
 } from '@/lib/firewall-configure'
@@ -377,12 +376,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   }, [firewallConfirmation, requestFirewallConfig])
 
   const handleCancelFirewallConfirmation = useCallback(() => {
-    const confirmationToken = firewallConfirmation?.confirmationToken
     setFirewallConfirmation(null)
-    if (!confirmationToken) {
-      return
-    }
-    void cancelFirewallConfirmation(confirmationToken).catch(() => {})
   }, [firewallConfirmation])
 
   const handleContinueAnyway = useCallback(() => {

@@ -23,10 +23,6 @@ const ConfigureFirewallRequestSchema = z.object({
   confirmationToken: z.string().min(1).optional(),
 }).strict()
 
-const CancelFirewallConfirmationRequestSchema = z.object({
-  confirmationToken: z.string().min(1),
-}).strict()
-
 const WINDOWS_ELEVATION_CONFIRMATION = {
   method: 'confirmation-required',
   title: 'Administrator approval required',
@@ -48,6 +44,8 @@ const REMOTE_ACCESS_DISABLED_SUCCESS = {
   method: 'none',
   message: 'Remote access disabled',
 } as const
+
+export const FIREWALL_CONFIRMATION_TTL_MS = 30_000
 
 type ConfirmationAction = 'windows-repair' | 'wsl2-repair' | 'wsl2-disable'
 
@@ -86,11 +84,25 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const { networkManager, configStore, wsHandler, detectLanIps } = deps
   const router = Router()
   const FIREWALL_REPAIR_LOCKED = Symbol('FIREWALL_REPAIR_LOCKED')
-  let currentConfirmation: { token: string; action: ConfirmationAction } | null = null
+  let currentConfirmation: { token: string; action: ConfirmationAction; expiresAt: number } | null = null
   let confirmedRepairInFlight = false
 
+  const getCurrentConfirmation = () => {
+    if (currentConfirmation === null) {
+      return null
+    }
+
+    if (currentConfirmation.expiresAt <= Date.now()) {
+      currentConfirmation = null
+      return null
+    }
+
+    return currentConfirmation
+  }
+
   const consumeCurrentConfirmation = (token: string | undefined) => {
-    if (currentConfirmation === null || currentConfirmation.token !== token) {
+    const confirmation = getCurrentConfirmation()
+    if (confirmation === null || confirmation.token !== token) {
       return false
     }
 
@@ -194,7 +206,11 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
   const issueConfirmation = (action: ConfirmationAction) => {
     const confirmationToken = randomUUID()
-    currentConfirmation = { token: confirmationToken, action }
+    currentConfirmation = {
+      token: confirmationToken,
+      action,
+      expiresAt: Date.now() + FIREWALL_CONFIRMATION_TTL_MS,
+    }
     return {
       ...WINDOWS_ELEVATION_CONFIRMATION,
       confirmationToken,
@@ -202,9 +218,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   }
 
   const matchesConfirmation = (token: string | undefined, action: ConfirmationAction) => {
-    return currentConfirmation !== null
-      && currentConfirmation.token === token
-      && currentConfirmation.action === action
+    const confirmation = getCurrentConfirmation()
+    return confirmation !== null
+      && confirmation.token === token
+      && confirmation.action === action
   }
 
   const consumeConfirmation = (token: string | undefined, action: ConfirmationAction) => {
@@ -385,16 +402,6 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       return
     }
     await broadcastSettingsUpdated()
-  })
-
-  router.post('/network/cancel-firewall-confirmation', (req, res) => {
-    const parsed = CancelFirewallConfirmationRequestSchema.safeParse(req.body ?? {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-
-    consumeCurrentConfirmation(parsed.data.confirmationToken)
-    return res.status(204).send()
   })
 
   router.post('/network/disable-remote-access', async (req, res) => {

@@ -57,4 +57,19 @@ describe('getShareAction', () => {
 
     expect(action).toEqual({ type: 'panel' })
   })
+
+  it('returns the wizard when native remote access was requested but the port is still blocked', () => {
+    const action = getShareAction({
+      configured: true,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+      remoteAccessRequested: true,
+      firewall: {
+        platform: 'windows',
+        portOpen: false,
+      },
+    })
+
+    expect(action).toEqual({ type: 'wizard', initialStep: 2 })
+  })
 })
