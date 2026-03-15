@@ -87,7 +87,17 @@ describe('NetworkManager', () => {
 
   afterEach(async () => {
     if (manager) await manager.stop()
-    if (server.listening) server.close()
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => {
+          if (error) {
+            reject(error)
+            return
+          }
+          resolve()
+        })
+      })
+    }
     if (savedAllowedOrigins !== undefined) {
       process.env.ALLOWED_ORIGINS = savedAllowedOrigins
     } else {

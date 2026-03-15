@@ -506,7 +506,7 @@ describe('test coordinator CLI', () => {
           FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
           FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
           FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-            'npm:test:balanced': { holdMs: 1_500 },
+            'npm:test:balanced': { holdMs: 3_000 },
           }),
         },
       )
@@ -527,12 +527,10 @@ describe('test coordinator CLI', () => {
       )
 
       await waitForOutput(queued, /queued intentionally/i, 15_000)
-      await delay(150)
+      await fixture.markDirty()
 
       const queuedCaptures = await readCaptureLines(captureFile)
       expect(queuedCaptures.map((entry) => entry.selector)).not.toContain(prePhaseSelector)
-
-      await fixture.markDirty()
 
       expect((await waitForExit(holder)).code).toBe(0)
       await waitForRunningStatus(fixture.checkoutRoot, new RegExp(`commandKey: ${commandKey}`))
