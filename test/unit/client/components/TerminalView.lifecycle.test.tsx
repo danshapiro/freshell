@@ -7,6 +7,7 @@ import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
@@ -255,6 +256,7 @@ describe('TerminalView lifecycle updates', () => {
     vi.unstubAllGlobals()
     clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
+    delete window.__FRESHELL_TEST_HARNESS__
     requestAnimationFrameSpy?.mockRestore()
     cancelAnimationFrameSpy?.mockRestore()
     requestAnimationFrameSpy = null
@@ -323,6 +325,38 @@ describe('TerminalView lifecycle updates', () => {
     await waitFor(() => {
       expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(4.5)
     })
+  })
+
+  it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
+    window.__FRESHELL_TEST_HARNESS__ = {
+      getState: vi.fn(),
+      dispatch: vi.fn(),
+      getWsReadyState: vi.fn(),
+      waitForConnection: vi.fn(),
+      forceDisconnect: vi.fn(),
+      sendWsMessage: vi.fn(),
+      setAgentChatNetworkEffectsSuppressed: vi.fn(),
+      isAgentChatNetworkEffectsSuppressed: vi.fn(() => false),
+      setTerminalNetworkEffectsSuppressed: vi.fn(),
+      isTerminalNetworkEffectsSuppressed: vi.fn((paneId: string) => paneId === 'pane-theme'),
+      getTerminalBuffer: vi.fn(),
+      registerTerminalBuffer: vi.fn(),
+      unregisterTerminalBuffer: vi.fn(),
+      getPerfAuditSnapshot: vi.fn(),
+    }
+
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    const createCalls = wsMocks.send.mock.calls.filter(
+      ([msg]) => msg?.type === 'terminal.create',
+    )
+    expect(createCalls).toHaveLength(0)
   })
 
   it('marks terminal.first_output when the focused terminal renders output', async () => {
@@ -748,6 +782,125 @@ describe('TerminalView lifecycle updates', () => {
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === '\x1b]0;New title\x07')).toBe(true)
     expect(store.getState().turnCompletion.lastEvent).toBeNull()
+  })
+
+  it('tracks claude terminal runtime activity from submit to output to turn completion', async () => {
+    const tabId = 'tab-claude-activity'
+    const paneId = 'pane-claude-activity'
+    const terminalId = 'term-claude-activity'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-activity',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '11111111-1111-4111-8111-111111111111',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '11111111-1111-4111-8111-111111111111',
+            createRequestId: 'req-claude-activity',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    const onData = terminalInstances[0].onData.mock.calls[0]?.[0] as ((data: string) => void) | undefined
+    expect(onData).toBeTypeOf('function')
+
+    act(() => {
+      onData?.('\r')
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'pending',
+    })
+
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 0,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'Claude is working',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'working',
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 2,
+        seqEnd: 2,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
   })
 
   it('does not record turn completion for shell mode output', async () => {

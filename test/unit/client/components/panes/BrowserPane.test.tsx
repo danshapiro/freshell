@@ -4,6 +4,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import BrowserPane from '@/components/panes/BrowserPane'
 
 // Mock clipboard
@@ -31,6 +32,7 @@ const createMockStore = () =>
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      paneRuntimeActivity: paneRuntimeActivityReducer,
     },
     preloadedState: {
       panes: {
@@ -42,6 +44,9 @@ const createMockStore = () =>
         renameRequestPaneId: null,
         zoomedPane: {},
         refreshRequestsByPane: {},
+      },
+      paneRuntimeActivity: {
+        byPaneId: {},
       },
     },
   })
@@ -109,11 +114,14 @@ describe('BrowserPane', () => {
     })
 
     it('renders iframe when URL is provided', () => {
-      renderBrowserPane({ url: 'https://example.com' })
+      const { store } = renderBrowserPane({ url: 'https://example.com' })
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
       expect(iframe!.getAttribute('src')).toBe('https://example.com')
+      expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
+        source: 'browser',
+      })
     })
 
     it('shows dev tools panel when devToolsOpen is true', () => {
@@ -226,6 +234,7 @@ describe('BrowserPane', () => {
         reducer: {
           panes: panesReducer,
           settings: settingsReducer,
+          paneRuntimeActivity: paneRuntimeActivityReducer,
         },
         preloadedState: {
           panes: {
@@ -248,6 +257,9 @@ describe('BrowserPane', () => {
             renameRequestPaneId: null,
             zoomedPane: {},
             refreshRequestsByPane: {},
+          },
+          paneRuntimeActivity: {
+            byPaneId: {},
           },
         },
       })
@@ -303,6 +315,51 @@ describe('BrowserPane', () => {
       })
       expect(document.querySelector('iframe')?.getAttribute('src')).toBe('http://192.168.1.100:45678/')
       expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
+    })
+  })
+
+  describe('runtime activity', () => {
+    it('marks the pane idle after iframe load succeeds', () => {
+      const { store } = renderBrowserPane({ url: 'https://example.com' })
+
+      const iframe = document.querySelector('iframe') as HTMLIFrameElement
+      fireEvent.load(iframe)
+
+      expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
+        source: 'browser',
+        phase: 'idle',
+      })
+    })
+
+    it('marks the pane as error when port forwarding fails', async () => {
+      setWindowHostname('remote-host')
+      vi.mocked(api.post).mockRejectedValueOnce(new Error('forward failed'))
+      const { store } = renderBrowserPane({ url: 'http://127.0.0.1:3000' })
+
+      await waitFor(() => {
+        expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
+          source: 'browser',
+          phase: 'error',
+        })
+      })
+    })
+
+    it('marks remote localhost forwarding as busy while the proxy request is pending', async () => {
+      setWindowHostname('remote-host')
+      let resolveForward: ((value: { forwardedPort: number }) => void) | null = null
+      vi.mocked(api.post).mockReturnValueOnce(new Promise((resolve) => {
+        resolveForward = resolve
+      }))
+      const { store } = renderBrowserPane({ url: 'http://127.0.0.1:3000' })
+
+      expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
+        source: 'browser',
+        phase: 'forwarding',
+      })
+
+      await act(async () => {
+        resolveForward?.({ forwardedPort: 45678 })
+      })
     })
   })
 

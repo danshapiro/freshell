@@ -71,6 +71,7 @@ describe('AgentChatView reload/restore behavior', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    delete window.__FRESHELL_TEST_HARNESS__
   })
 
   it('sends sdk.attach on mount when paneContent has a persisted sessionId', () => {
@@ -85,6 +86,37 @@ describe('AgentChatView reload/restore behavior', () => {
       type: 'sdk.attach',
       sessionId: 'sess-reload-1',
     })
+  })
+
+  it('skips sdk.attach when the e2e harness suppresses agent chat network effects for the pane', () => {
+    window.__FRESHELL_TEST_HARNESS__ = {
+      getState: vi.fn(),
+      dispatch: vi.fn(),
+      getWsReadyState: vi.fn(),
+      waitForConnection: vi.fn(),
+      forceDisconnect: vi.fn(),
+      sendWsMessage: vi.fn(),
+      setAgentChatNetworkEffectsSuppressed: vi.fn(),
+      isAgentChatNetworkEffectsSuppressed: vi.fn((paneId: string) => paneId === 'p1'),
+      setTerminalNetworkEffectsSuppressed: vi.fn(),
+      isTerminalNetworkEffectsSuppressed: vi.fn(() => false),
+      getTerminalBuffer: vi.fn(),
+      registerTerminalBuffer: vi.fn(),
+      unregisterTerminalBuffer: vi.fn(),
+      getPerfAuditSnapshot: vi.fn(),
+    }
+
+    const store = makeStore()
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    const attachCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.attach',
+    )
+    expect(attachCalls).toHaveLength(0)
   })
 
   it('does NOT send sdk.attach when paneContent has no sessionId (new session)', () => {

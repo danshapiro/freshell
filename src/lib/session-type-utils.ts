@@ -4,7 +4,7 @@ import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { PaneContentInput } from '@/store/paneTypes'
+import type { AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export interface SessionTypeConfig {
@@ -52,7 +52,7 @@ export function buildResumeContent(opts: {
     defaultPermissionMode?: string
     defaultEffort?: 'low' | 'medium' | 'high' | 'max'
   }
-}): PaneContentInput {
+}): TerminalPaneInput | AgentChatPaneInput {
   const agentConfig = getAgentChatProviderConfig(opts.sessionType)
   if (agentConfig) {
     const ps = opts.agentChatProviderSettings

@@ -9,6 +9,11 @@ import type { PaneContent } from '@/store/paneTypes'
 import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
+type TabPaneEntry = {
+  paneId: string
+  content: PaneContent
+}
+
 function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean }) {
   return <Circle className={cn('h-2 w-2', busy && status === 'running' ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
@@ -20,11 +25,11 @@ export interface TabItemProps {
   isActive: boolean
   needsAttention: boolean
   busy?: boolean
-  activityTerminalIds?: string[]
+  busyPaneIds?: string[]
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
-  paneContents?: PaneContent[]
+  paneEntries?: TabPaneEntry[]
   iconsOnTabs?: boolean
   tabAttentionStyle?: TabAttentionStyle
   onRenameChange: (value: string) => void
@@ -40,11 +45,11 @@ export default function TabItem({
   isActive,
   needsAttention,
   busy,
-  activityTerminalIds = [],
+  busyPaneIds = [],
   isDragging,
   isRenaming,
   renameValue,
-  paneContents,
+  paneEntries,
   iconsOnTabs = true,
   tabAttentionStyle = 'highlight',
   onRenameChange,
@@ -63,33 +68,21 @@ export default function TabItem({
   }, [isRenaming])
 
   const renderIcons = () => {
-    if (!iconsOnTabs || !paneContents || paneContents.length === 0) {
+    if (!iconsOnTabs || !paneEntries || paneEntries.length === 0) {
       return <StatusDot status={tab.status} busy={busy && tab.status === 'running'} />
     }
 
-    const visible = paneContents.slice(0, MAX_TAB_ICONS)
-    const overflow = paneContents.length - MAX_TAB_ICONS
-    const hiddenBusyTerminal = paneContents
+    const visible = paneEntries.slice(0, MAX_TAB_ICONS)
+    const overflow = paneEntries.length - MAX_TAB_ICONS
+    const hiddenBusyPane = paneEntries
       .slice(MAX_TAB_ICONS)
-      .some((content) => content.kind === 'terminal' && !!content.terminalId && activityTerminalIds.includes(content.terminalId))
-    const runningTerminalContents = visible.filter(
-      (content): content is Extract<PaneContent, { kind: 'terminal' }> =>
-        content.kind === 'terminal' && content.status === 'running',
-    )
-    const busyUnnamedSingleTerminal = busy
-      && activityTerminalIds.length === 1
-      && runningTerminalContents.length === 1
-      && !runningTerminalContents[0].terminalId
+      .some((entry) => busyPaneIds.includes(entry.paneId))
 
     return (
       <span className="flex items-center gap-0.5">
-        {visible.map((content, i) => {
+        {visible.map(({ paneId, content }, i) => {
           const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
-          const isBusy = content.kind === 'terminal'
-            && status === 'running'
-            && (content.terminalId
-              ? activityTerminalIds.includes(content.terminalId)
-              : busyUnnamedSingleTerminal)
+          const isBusy = busyPaneIds.includes(paneId)
           return (
             <PaneIcon
               key={i}
@@ -102,7 +95,7 @@ export default function TabItem({
           )
         })}
         {overflow > 0 && (
-          <span className={cn('text-[10px] leading-none', hiddenBusyTerminal ? 'text-blue-500' : 'text-muted-foreground')}>+{overflow}</span>
+          <span className={cn('text-[10px] leading-none', hiddenBusyPane ? 'text-blue-500' : 'text-muted-foreground')}>+{overflow}</span>
         )}
       </span>
     )

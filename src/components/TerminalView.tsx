@@ -13,6 +13,7 @@ import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
+import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -78,6 +79,10 @@ const RATE_LIMIT_RETRY_MAX_MS = 1000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
+
+function isClaudeTurnSubmit(data: string): boolean {
+  return data.includes('\r') || data.includes('\n')
+}
 const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
 const TAP_MULTI_INTERVAL_MS = 350
 const TAP_MAX_DISTANCE_PX = 24
@@ -173,6 +178,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
+  // Playwright can opt a pane into state-only mode so activity chrome tests
+  // don't race the live terminal create/attach lifecycle.
+  const suppressNetworkEffects = typeof window !== 'undefined'
+    && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
@@ -665,7 +674,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             && suppressedResize.rows === term.rows
           if (matchesSuppressedViewport) {
             suppressNextMatchingResizeRef.current = null
-          } else {
+          } else if (!suppressNetworkEffects) {
             ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
           }
         }
@@ -678,7 +687,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (shouldFocus) {
       term.focus()
     }
-  }, [ws])
+  }, [suppressNetworkEffects, ws])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void) => {
     if (!data) return
@@ -744,6 +753,22 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         terminalId: tid,
         at: Date.now(),
       }))
+      if (mode === 'claude') {
+        dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+      }
+    }
+
+    if (
+      mode === 'claude'
+      && cleaned
+      && count === 0
+      && !seqStateRef.current.pendingReplay
+    ) {
+      dispatch(setPaneRuntimeActivity({
+        paneId: paneIdRef.current,
+        source: 'terminal',
+        phase: 'working',
+      }))
     }
 
     if (cleaned) {
@@ -767,6 +792,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       if (hasPaneAttentionRef.current) {
         dispatch(clearPaneAttention({ paneId }))
       }
+    }
+    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
+      dispatch(setPaneRuntimeActivity({
+        paneId: paneIdRef.current,
+        source: 'terminal',
+        phase: 'pending',
+      }))
     }
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
@@ -1213,6 +1245,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     intent: AttachIntent,
     opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean; skipPreAttachFit?: boolean },
   ) => {
+    if (suppressNetworkEffects) return
     const term = termRef.current
     if (!term) return
     const runtime = runtimeRef.current
@@ -1272,9 +1305,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       sinceSeq,
       attachRequestId,
     })
-  }, [ws, applySeqState])
+  }, [suppressNetworkEffects, ws, applySeqState])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
+    if (suppressNetworkEffects) return false
     if (!request) return false
     if (handledRefreshRequestIdRef.current === request.requestId) return true
 
@@ -1300,7 +1334,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, paneId, tabId, ws])
+  }, [attachTerminal, dispatch, paneId, suppressNetworkEffects, tabId, ws])
 
   // Apply settings changes
   useEffect(() => {
@@ -1346,6 +1380,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   // Create or attach to backend terminal
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
     const termCandidate = termRef.current
     if (!termCandidate) return
@@ -1623,6 +1658,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             pendingIntent: null,
             pendingSinceSeq: 0,
           }
+          dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           clearTerminalCursor(tid)
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
           // operations (resize, input) from sending commands to the dead terminal,
@@ -1693,6 +1729,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
           clearRateLimitRetry()
           setIsAttaching(false)
+          dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           updateContent({ status: 'error' })
           term.writeln(`\r\n[Error] ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
@@ -1844,6 +1881,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [
     isTerminal,
     paneId,
+    suppressNetworkEffects,
     terminalContent?.createRequestId,
     updateContent,
     ws,

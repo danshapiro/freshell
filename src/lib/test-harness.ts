@@ -8,6 +8,10 @@ export interface FreshellTestHarness {
   waitForConnection: (timeoutMs?: number) => Promise<void>
   forceDisconnect: () => void
   sendWsMessage: (msg: unknown) => void
+  setAgentChatNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
+  isAgentChatNetworkEffectsSuppressed: (paneId: string) => boolean
+  setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
+  isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
@@ -41,6 +45,8 @@ export function installTestHarness(
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
+  const suppressedAgentChatPaneIds = new Set<string>()
+  const suppressedTerminalPaneIds = new Set<string>()
 
   window.__FRESHELL_TEST_HARNESS__ = {
     getState: () => store.getState(),
@@ -59,6 +65,22 @@ export function installTestHarness(
       if (first.done) return null
       return first.value()
     },
+    setAgentChatNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => {
+      if (suppressed) {
+        suppressedAgentChatPaneIds.add(paneId)
+        return
+      }
+      suppressedAgentChatPaneIds.delete(paneId)
+    },
+    isAgentChatNetworkEffectsSuppressed: (paneId: string) => suppressedAgentChatPaneIds.has(paneId),
+    setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => {
+      if (suppressed) {
+        suppressedTerminalPaneIds.add(paneId)
+        return
+      }
+      suppressedTerminalPaneIds.delete(paneId)
+    },
+    isTerminalNetworkEffectsSuppressed: (paneId: string) => suppressedTerminalPaneIds.has(paneId),
     registerTerminalBuffer: (terminalId: string, accessor: () => string) => {
       terminalBuffers.set(terminalId, accessor)
     },

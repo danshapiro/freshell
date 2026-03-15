@@ -14,6 +14,7 @@ import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
 import agentChatReducer from './agentChatSlice'
+import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
 import extensionsReducer from './extensionsSlice'
@@ -45,6 +46,7 @@ export const store = configureStore({
     terminalMeta: terminalMetaReducer,
     codexActivity: codexActivityReducer,
     agentChat: agentChatReducer,
+    paneRuntimeActivity: paneRuntimeActivityReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
     extensions: extensionsReducer,

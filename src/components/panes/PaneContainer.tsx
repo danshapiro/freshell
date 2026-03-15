@@ -19,7 +19,7 @@ import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
-import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
+import { resolvePaneActivity } from '@/lib/pane-activity'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
@@ -36,6 +36,7 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -49,6 +50,7 @@ const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, string> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
@@ -169,6 +171,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
+  )
+  const paneRuntimeActivityByPaneId = useAppSelector(
+    (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
   const attentionByPane = useAppSelector(
@@ -420,18 +425,16 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       paneRuntimeMeta
         ? formatPaneRuntimeTooltip(paneRuntimeMeta)
         : undefined
-    const paneActivityRecord =
-      node.content.kind === 'terminal'
-        ? resolveExactCodexActivity(codexActivityByTerminalId, {
-          terminalId: node.content.terminalId,
-          tabTerminalId,
-          isOnlyPane,
-        })
-        : undefined
-    const paneBusy =
-      node.content.kind === 'terminal'
-      && node.content.status === 'running'
-      && paneActivityRecord?.phase === 'busy'
+    const paneBusy = resolvePaneActivity({
+      paneId: node.id,
+      content: node.content,
+      tabMode: tab?.mode,
+      tabTerminalId,
+      isOnlyPane,
+      codexActivityByTerminalId,
+      paneRuntimeActivityByPaneId,
+      agentChatSessions,
+    }).isBusy
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 

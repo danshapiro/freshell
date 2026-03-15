@@ -79,6 +79,10 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const surfaceVisibleMarkedRef = useRef(false)
   const timelineSessionId = paneContent.resumeSessionId ?? session?.cliSessionId ?? paneContent.sessionId
+  // Playwright can opt a pane into state-only mode so chrome activity tests
+  // don't race the live SDK attach/create lifecycle.
+  const suppressNetworkEffects = typeof window !== 'undefined'
+    && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
@@ -117,16 +121,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // session.lost = true). This avoids the 5-second timeout for known-dead sessions.
   const sessionLost = !!session?.lost
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!sessionLost || !paneContent.sessionId) return
     triggerRecovery()
-  }, [sessionLost, paneContent.sessionId, triggerRecovery])
+  }, [sessionLost, paneContent.sessionId, suppressNetworkEffects, triggerRecovery])
 
   // Fallback: auto-recover when restore times out (e.g. server restarted, error was
   // not routed through sdk.error). Safety net for the immediate recovery above.
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!restoreTimedOut || !isRestoring) return
     triggerRecovery()
-  }, [restoreTimedOut, isRestoring, triggerRecovery])
+  }, [restoreTimedOut, isRestoring, suppressNetworkEffects, triggerRecovery])
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -182,6 +188,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Best-effort: errors are logged but do not block the UI.
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!cliSessionId) return
     if (taggedSessionRef.current === cliSessionId) return
     taggedSessionRef.current = cliSessionId
@@ -195,7 +202,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [cliSessionId, providerConfig?.codingCliProvider, paneContent.provider])
+  }, [cliSessionId, providerConfig?.codingCliProvider, paneContent.provider, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -206,6 +213,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   // Send sdk.create when the pane first mounts with a createRequestId but no sessionId
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (paneContent.sessionId || createSentRef.current) return
     if (paneContent.status !== 'creating') return
 
@@ -227,27 +235,30 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       paneId,
       content: { ...paneContent, status: 'starting' },
     }))
-  }, [paneContent.createRequestId, paneContent.sessionId, paneContent.status, tabId, paneId, dispatch, ws])
+  }, [paneContent.createRequestId, paneContent.sessionId, paneContent.status, tabId, paneId, dispatch, suppressNetworkEffects, ws])
 
   // Attach to existing session on mount (e.g. after page refresh with persisted pane)
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!paneContent.sessionId || attachSentRef.current) return
     // Only attach if we didn't just create this session ourselves
     if (createSentRef.current) return
 
     attachSentRef.current = true
     ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
-  }, [paneContent.sessionId, ws])
+  }, [paneContent.sessionId, suppressNetworkEffects, ws])
 
   // Re-attach on WS reconnect so server re-subscribes this client
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!paneContent.sessionId) return
     return ws.onReconnect(() => {
       ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId! })
     })
-  }, [paneContent.sessionId, ws])
+  }, [paneContent.sessionId, suppressNetworkEffects, ws])
 
   useEffect(() => {
+    if (suppressNetworkEffects) return
     if (!paneContent.sessionId || !timelineSessionId) return
     if (hidden) return
     if (activePaneId && activePaneId !== paneId) return
@@ -270,6 +281,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     paneId,
     session?.historyLoaded,
     session?.latestTurnId,
+    suppressNetworkEffects,
     tabId,
     timelineSessionId,
   ])

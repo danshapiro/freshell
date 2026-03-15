@@ -5,8 +5,8 @@ import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameR
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { collectTerminalIds, collectPaneContents } from '@/lib/pane-utils'
-import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
+import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
+import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
@@ -34,7 +34,9 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import type { Tab, TabAttentionStyle } from '@/store/types'
-import type { PaneContent } from '@/store/paneTypes'
+import type { PaneContent, PaneNode } from '@/store/paneTypes'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
 
@@ -44,11 +46,11 @@ interface SortableTabProps {
   isActive: boolean
   needsAttention: boolean
   busy: boolean
-  activityTerminalIds: string[]
+  busyPaneIds: string[]
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
-  paneContents?: PaneContent[]
+  paneEntries?: Array<{ paneId: string; content: PaneContent }>
   iconsOnTabs?: boolean
   tabAttentionStyle?: TabAttentionStyle
   onRenameChange: (value: string) => void
@@ -65,11 +67,11 @@ function SortableTab({
   isActive,
   needsAttention,
   busy,
-  activityTerminalIds,
+  busyPaneIds,
   isDragging,
   isRenaming,
   renameValue,
-  paneContents,
+  paneEntries,
   iconsOnTabs,
   tabAttentionStyle,
   onRenameChange,
@@ -105,11 +107,11 @@ function SortableTab({
         isActive={isActive}
         needsAttention={needsAttention}
         busy={busy}
-        activityTerminalIds={activityTerminalIds}
+        busyPaneIds={busyPaneIds}
         isDragging={isDragging}
         isRenaming={isRenaming}
         renameValue={renameValue}
-        paneContents={paneContents}
+        paneEntries={paneEntries}
         iconsOnTabs={iconsOnTabs}
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={onRenameChange}
@@ -128,7 +130,8 @@ const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
-const EMPTY_ACTIVITY_TERMINAL_IDS: string[] = []
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 interface TabBarProps {
   sidebarCollapsed?: boolean
@@ -148,6 +151,10 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const paneRuntimeActivityByPaneId = useAppSelector(
+    (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
+  )
   const activePaneMap = useAppSelector((s) => s.panes?.activePane)
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
@@ -163,19 +170,25 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     [paneLayouts, paneTitles, extensions]
   )
 
-  const getPaneContents = useCallback((tab: Tab): PaneContent[] | undefined => {
+  const getPaneEntries = useCallback((tab: Tab): Array<{ paneId: string; content: PaneContent }> | undefined => {
     const layout = paneLayouts[tab.id]
     if (layout) {
-      return collectPaneContents(layout)
+      return collectPaneEntries(layout)
     }
     // Fallback: synthesize a single content from tab.mode
     if (tab.mode) {
       return [{
-        kind: 'terminal' as const,
-        mode: tab.mode,
-        shell: tab.shell,
-        createRequestId: tab.createRequestId,
-        status: tab.status,
+        paneId: tab.id,
+        content: {
+          kind: 'terminal' as const,
+          mode: tab.mode,
+          shell: tab.shell,
+          createRequestId: tab.createRequestId,
+          status: tab.status,
+          terminalId: tab.terminalId,
+          resumeSessionId: tab.resumeSessionId,
+          initialCwd: tab.initialCwd,
+        },
       }]
     }
     return undefined
@@ -192,36 +205,13 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     return tab.terminalId ? [tab.terminalId] : []
   }, [paneLayouts])
 
-  const getTabActivityTerminalIds = useCallback((tab: Tab): string[] => {
-    const layout = paneLayouts[tab.id]
-    if (!layout) {
-      if (
-        tab.terminalId
-        && tab.status === 'running'
-        && codexActivityByTerminalId[tab.terminalId]?.phase === 'busy'
-      ) {
-        return [tab.terminalId]
-      }
-      return EMPTY_ACTIVITY_TERMINAL_IDS
-    }
-
-    const busyTerminalIds = new Set<string>()
-    const isOnlyPane = layout.type === 'leaf'
-    for (const content of collectPaneContents(layout)) {
-      if (content.kind !== 'terminal') continue
-      if (content.status !== 'running') continue
-      const record = resolveExactCodexActivity(codexActivityByTerminalId, {
-        terminalId: content.terminalId,
-        tabTerminalId: tab.terminalId,
-        isOnlyPane,
-      })
-      if (record?.phase === 'busy') {
-        busyTerminalIds.add(record.terminalId)
-      }
-    }
-
-    return busyTerminalIds.size > 0 ? Array.from(busyTerminalIds) : EMPTY_ACTIVITY_TERMINAL_IDS
-  }, [codexActivityByTerminalId, paneLayouts])
+  const getBusyPaneIds = useCallback((tab: Tab): string[] => getBusyPaneIdsForTab({
+    tab,
+    paneLayouts: paneLayouts as Record<string, PaneNode | undefined>,
+    codexActivityByTerminalId,
+    paneRuntimeActivityByPaneId,
+    agentChatSessions,
+  }), [agentChatSessions, codexActivityByTerminalId, paneLayouts, paneRuntimeActivityByPaneId])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -272,7 +262,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   )
 
   const renderSortableTab = useCallback((tab: Tab) => {
-    const activityTerminalIds = getTabActivityTerminalIds(tab)
+    const busyPaneIds = getBusyPaneIds(tab)
     return (
       <SortableTab
         key={tab.id}
@@ -280,12 +270,12 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         displayTitle={getDisplayTitle(tab)}
         isActive={tab.id === activeTabId}
         needsAttention={!!attentionByTab[tab.id]}
-        busy={activityTerminalIds.length > 0}
-        activityTerminalIds={activityTerminalIds}
+        busy={busyPaneIds.length > 0}
+        busyPaneIds={busyPaneIds}
         isDragging={activeId === tab.id}
         isRenaming={renamingId === tab.id}
         renameValue={renameValue}
-        paneContents={getPaneContents(tab)}
+        paneEntries={getPaneEntries(tab)}
         iconsOnTabs={iconsOnTabs}
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={setRenameValue}
@@ -346,8 +336,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     attentionDismiss,
     dispatch,
     getDisplayTitle,
-    getPaneContents,
-    getTabActivityTerminalIds,
+    getBusyPaneIds,
+    getPaneEntries,
     getTerminalIdsForTab,
     iconsOnTabs,
     renameValue,
@@ -498,12 +488,12 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
                 needsAttention={!!attentionByTab[activeTab.id]}
-                busy={getTabActivityTerminalIds(activeTab).length > 0}
-                activityTerminalIds={getTabActivityTerminalIds(activeTab)}
+                busy={getBusyPaneIds(activeTab).length > 0}
+                busyPaneIds={getBusyPaneIds(activeTab)}
                 isDragging={false}
                 isRenaming={false}
                 renameValue=""
-                paneContents={getPaneContents(activeTab)}
+                paneEntries={getPaneEntries(activeTab)}
                 iconsOnTabs={iconsOnTabs}
                 tabAttentionStyle={tabAttentionStyle}
                 onRenameChange={() => {}}

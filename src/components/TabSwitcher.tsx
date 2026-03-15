@@ -2,12 +2,16 @@ import { Plus, X } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { getBusyCodexActivityTerminalIdsForTab } from '@/lib/tab-codex-activity'
+import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useMemo } from 'react'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 interface TabSwitcherProps {
   onClose: () => void
@@ -35,6 +39,10 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const paneRuntimeActivityByPaneId = useAppSelector(
+    (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
+  )
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const getDisplayTitle = useCallback(
@@ -83,7 +91,13 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId
             const title = getDisplayTitle(tab)
-            const isBusy = getBusyCodexActivityTerminalIdsForTab(tab, paneLayouts, codexActivityByTerminalId).length > 0
+            const isBusy = getBusyPaneIdsForTab({
+              tab,
+              paneLayouts,
+              codexActivityByTerminalId,
+              paneRuntimeActivityByPaneId,
+              agentChatSessions,
+            }).length > 0
             return (
               <button
                 key={tab.id}

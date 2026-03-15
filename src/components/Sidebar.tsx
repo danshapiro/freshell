@@ -3,6 +3,7 @@ import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, Pa
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
+import { shallowEqual } from 'react-redux'
 import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
@@ -16,8 +17,15 @@ import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
+import { collectBusySessionKeys } from '@/lib/pane-activity'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
+const EMPTY_LAYOUTS: Record<string, never> = {}
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores terminal `lastActivityAt` since it changes frequently but doesn't affect rendering. */
@@ -244,6 +252,14 @@ export default function Sidebar({
   // value actually changes — the custom memo comparator on SidebarItem
   // handles that independently.
   const sortedItems = useStableArray(computedItems, isSessionItemEqual)
+  const busySessionKeys = useAppSelector((state) => collectBusySessionKeys({
+    tabs: state.tabs.tabs,
+    paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
+    codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
+    paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
+    agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
+  }), shallowEqual)
+  const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
 
   // Read activeTabId from the store at call time (not closure) so that
   // handleItemClick has a stable reference and doesn't cause SidebarItem
@@ -278,7 +294,8 @@ export default function Sidebar({
       : undefined
 
     // 2. Fallback: no active tab or active tab has no layout → create new tab
-    const activeLayout = currentActiveTabId ? state.panes.layouts[currentActiveTabId] : undefined
+    const paneLayouts = state.panes?.layouts ?? EMPTY_LAYOUTS
+    const activeLayout = currentActiveTabId ? paneLayouts[currentActiveTabId] : undefined
     if (!currentActiveTabId || !activeLayout) {
       dispatch(openSessionTab({
         sessionId: item.sessionId,
@@ -645,6 +662,7 @@ export default function Sidebar({
                       <SidebarItem
                         item={item}
                         isActiveTab={isActive}
+                        isBusy={busySessionKeySet.has(sessionKey)}
                         showProjectBadge={settings.sidebar?.showProjectBadges}
                         onClick={() => handleItemClick(item)}
                         timestampTick={timestampTick}
@@ -665,6 +683,7 @@ export default function Sidebar({
 interface SidebarItemProps {
   item: SessionItem
   isActiveTab?: boolean
+  isBusy?: boolean
   showProjectBadge?: boolean
   onClick: () => void
   /** Changing tick value breaks memo equality to refresh relative timestamps. */
@@ -677,6 +696,7 @@ interface SidebarItemProps {
  *  click handler are compared here (sessionId, provider, title, cwd, etc.). */
 function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps): boolean {
   if (prev.isActiveTab !== next.isActiveTab) return false
+  if (prev.isBusy !== next.isBusy) return false
   if (prev.showProjectBadge !== next.showProjectBadge) return false
   if (prev.timestampTick !== next.timestampTick) return false
 
@@ -700,15 +720,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 }
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
-  const { item, isActiveTab, showProjectBadge, onClick } = props
+  const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
-  const terminalIds = item.runningTerminalIds
-  const isBusy = useAppSelector((s) => {
-    if (!item.hasTab || !terminalIds?.length) return false
-    const byTerminalId = s.codexActivity?.byTerminalId
-    if (!byTerminalId) return false
-    return terminalIds.some((tid) => byTerminalId[tid]?.phase === 'busy')
-  })
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
     <Tooltip>

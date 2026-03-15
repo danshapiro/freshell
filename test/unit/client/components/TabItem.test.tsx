@@ -37,6 +37,13 @@ function getTabElement() {
   return screen.getByText('Test Tab').closest('div[class*="group"]')
 }
 
+function createPaneEntries(contents: PaneContent[]) {
+  return contents.map((content, index) => ({
+    paneId: `pane-${index + 1}`,
+    content,
+  }))
+}
+
 describe('TabItem', () => {
   afterEach(() => {
     cleanup()
@@ -107,7 +114,7 @@ describe('TabItem', () => {
   })
 
   it('uses a muted status dot for creating tabs when pane icons are unavailable', () => {
-    render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneContents={[]} iconsOnTabs={false} />)
+    render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneEntries={[]} iconsOnTabs={false} />)
     const dot = screen.getByTestId('circle-icon')
     expect(dot.getAttribute('class')).toContain('text-muted-foreground')
     expect(dot.getAttribute('class')).toContain('fill-muted-foreground')
@@ -178,9 +185,9 @@ describe('TabItem', () => {
     render(
       <TabItem
         {...defaultProps}
-        paneContents={paneContents}
+        paneEntries={createPaneEntries(paneContents)}
         busy={true}
-        activityTerminalIds={['term-1']}
+        busyPaneIds={['pane-1']}
       />
     )
 
@@ -207,9 +214,9 @@ describe('TabItem', () => {
     render(
       <TabItem
         {...defaultProps}
-        paneContents={paneContents}
+        paneEntries={createPaneEntries(paneContents)}
         busy={true}
-        activityTerminalIds={['term-tab']}
+        busyPaneIds={['pane-1']}
       />
     )
 
@@ -229,9 +236,9 @@ describe('TabItem', () => {
     render(
       <TabItem
         {...defaultProps}
-        paneContents={paneContents}
+        paneEntries={createPaneEntries(paneContents)}
         busy={true}
-        activityTerminalIds={['term-7']}
+        busyPaneIds={['pane-7']}
       />
     )
 

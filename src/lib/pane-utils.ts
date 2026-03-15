@@ -1,5 +1,10 @@
 import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
 
+export interface PaneEntry {
+  paneId: string
+  content: PaneContent
+}
+
 /**
  * Get the cwd of the first terminal in the pane tree (depth-first traversal).
  * Returns null if no terminal with a known cwd is found.
@@ -43,6 +48,16 @@ export function collectPaneContents(node: PaneNode): PaneContent[] {
   return [
     ...collectPaneContents(node.children[0]),
     ...collectPaneContents(node.children[1]),
+  ]
+}
+
+export function collectPaneEntries(node: PaneNode): PaneEntry[] {
+  if (node.type === 'leaf') {
+    return [{ paneId: node.id, content: node.content }]
+  }
+  return [
+    ...collectPaneEntries(node.children[0]),
+    ...collectPaneEntries(node.children[1]),
   ]
 }
 

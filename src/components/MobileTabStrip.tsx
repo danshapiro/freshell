@@ -2,10 +2,14 @@ import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { getBusyCodexActivityTerminalIdsForTab } from '@/lib/tab-codex-activity'
+import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 interface MobileTabStripProps {
   onOpenSwitcher?: () => void
@@ -20,6 +24,10 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const paneRuntimeActivityByPaneId = useAppSelector(
+    (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
+  )
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const activeIndex = tabs.findIndex((t) => t.id === activeTabId)
@@ -29,7 +37,13 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
     ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id], paneTitles?.[activeTab.id], extensions)
     : ''
   const isActiveBusy = activeTab
-    ? getBusyCodexActivityTerminalIdsForTab(activeTab, paneLayouts, codexActivityByTerminalId).length > 0
+    ? getBusyPaneIdsForTab({
+      tab: activeTab,
+      paneLayouts,
+      codexActivityByTerminalId,
+      paneRuntimeActivityByPaneId,
+      agentChatSessions,
+    }).length > 0
     : false
 
   const isFirst = activeIndex <= 0

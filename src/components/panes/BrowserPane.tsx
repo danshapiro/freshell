@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { ArrowLeft, ArrowRight, RotateCcw, X, Wrench, Loader2 } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice'
+import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { cn } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
@@ -165,6 +166,34 @@ export default function BrowserPane({
   const [forwardRetryKey, setForwardRetryKey] = useState(0)
 
   const currentUrl = history[historyIndex] || ''
+
+  useEffect(() => {
+    if (!currentUrl) {
+      dispatch(clearPaneRuntimeActivity({ paneId }))
+      return
+    }
+
+    if (forwardError || loadError) {
+      dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'error' }))
+      return
+    }
+
+    if (isForwarding) {
+      dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'forwarding' }))
+      return
+    }
+
+    if (isLoading) {
+      dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'loading' }))
+      return
+    }
+
+    dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'idle' }))
+  }, [currentUrl, dispatch, forwardError, isForwarding, isLoading, loadError, paneId])
+
+  useEffect(() => () => {
+    dispatch(clearPaneRuntimeActivity({ paneId }))
+  }, [dispatch, paneId])
 
   useEffect(() => {
     const previousUrl = currentUrl
