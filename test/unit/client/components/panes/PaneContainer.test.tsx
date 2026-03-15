@@ -743,6 +743,62 @@ describe('PaneContainer', () => {
       expect(screen.getByTitle('Close pane')).toBeInTheDocument()
     })
 
+    it('kills and clears a pending agent-chat session using pendingCreates.sessionId', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-agent',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-1',
+          status: 'starting',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-agent' },
+        },
+        {},
+        {},
+        {
+          sessions: {
+            'sdk-sess-1': {
+              sessionId: 'sdk-sess-1',
+              status: 'starting',
+              messages: [],
+              timelineItems: [],
+              timelineBodies: {},
+              streamingText: '',
+              streamingActive: false,
+              pendingPermissions: {},
+              pendingQuestions: {},
+              totalCostUsd: 0,
+              totalInputTokens: 0,
+              totalOutputTokens: 0,
+            },
+          },
+          pendingCreates: {
+            'req-1': {
+              sessionId: 'sdk-sess-1',
+              expectsHistoryHydration: true,
+            },
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(mockSend).toHaveBeenCalledWith({ type: 'sdk.kill', sessionId: 'sdk-sess-1' })
+      expect(store.getState().agentChat.pendingCreates['req-1']).toBeUndefined()
+    })
+
     it('closes second pane when its close button is clicked', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'

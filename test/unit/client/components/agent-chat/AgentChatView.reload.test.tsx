@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
+  registerPendingCreate,
   sessionCreated,
   sessionInit,
   sessionSnapshotReceived,
@@ -241,6 +242,37 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
+  it('does not show restoring for a fresh sdk.created session', () => {
+    const store = makeStore()
+    store.dispatch(registerPendingCreate({
+      requestId: 'req-fresh',
+      expectsHistoryHydration: false,
+    }))
+    store.dispatch(sessionCreated({
+      requestId: 'req-fresh',
+      sessionId: 'sdk-fresh',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-fresh',
+            sessionId: 'sdk-fresh',
+            status: 'starting',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
+    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
+  })
+
   it('shows welcome screen (not stuck restoring) when the initial timeline window arrives empty', () => {
     const store = makeStore()
     const { rerender } = render(
@@ -381,6 +413,47 @@ describe('AgentChatView reload/restore behavior', () => {
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
+  })
+
+  it('does not issue an HTTP timeline fetch when snapshot proves the resumed session is empty', async () => {
+    const store = makeStore()
+    store.dispatch(registerPendingCreate({
+      requestId: 'req-empty',
+      expectsHistoryHydration: true,
+    }))
+    store.dispatch(sessionCreated({
+      requestId: 'req-empty',
+      sessionId: 'sdk-empty',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-empty',
+      latestTurnId: null,
+      status: 'idle',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-empty',
+            sessionId: 'sdk-empty',
+            status: 'idle',
+            resumeSessionId: 'cli-empty',
+          }}
+        />
+      </Provider>,
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
   })
 
   it('stays in restoring state when sdk.status arrives before the first timeline window (race condition)', () => {

@@ -31,7 +31,6 @@ interface SetupWizardProps {
 
 type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
-type FirewallState = NetworkStatusResponse['firewall']
 type FirewallChecklistStatus = Pick<NetworkStatusResponse, 'firewall' | 'host' | 'remoteAccessEnabled'>
 
 function isRemoteAccessBindRequested(status: NetworkStatusResponse | null): boolean {

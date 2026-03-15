@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import agentChatReducer, {
   sessionCreated,
+  registerPendingCreate,
   sessionInit,
   sessionSnapshotReceived,
   addAssistantMessage,
@@ -135,6 +136,62 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sess-1'].historyLoaded).toBe(true)
   })
 
+  it('records pending create intent before sdk.created', () => {
+    const state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'resume-req',
+      expectsHistoryHydration: true,
+    }))
+
+    expect(state.pendingCreates['resume-req']).toEqual({
+      expectsHistoryHydration: true,
+      sessionId: undefined,
+    })
+  })
+
+  it('marks a fresh create as history-loaded immediately', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'fresh-req',
+      expectsHistoryHydration: false,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'fresh-req',
+      sessionId: 'sdk-fresh',
+    }))
+
+    expect(state.sessions['sdk-fresh'].historyLoaded).toBe(true)
+  })
+
+  it('keeps a resumed create restoring until durable history is known', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'resume-req',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'resume-req',
+      sessionId: 'sdk-resume',
+    }))
+
+    expect(state.sessions['sdk-resume'].historyLoaded).toBe(false)
+  })
+
+  it('ends restore mode immediately when snapshot says there is no backlog', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'resume-empty',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'resume-empty',
+      sessionId: 'sdk-empty',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-empty',
+      latestTurnId: null,
+      status: 'idle',
+    }))
+
+    expect(state.sessions['sdk-empty'].historyLoaded).toBe(true)
+  })
+
   it('sets historyLoaded when the initial timeline window is empty', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-attach',
@@ -258,8 +315,15 @@ describe('agentChatSlice', () => {
   })
 
   it('clears a pendingCreates entry', () => {
-    let state = agentChatReducer(initial, sessionCreated({ requestId: 'req-1', sessionId: 's1' }))
-    expect(state.pendingCreates['req-1']).toBe('s1')
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-1',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({ requestId: 'req-1', sessionId: 's1' }))
+    expect(state.pendingCreates['req-1']).toEqual({
+      sessionId: 's1',
+      expectsHistoryHydration: true,
+    })
     state = agentChatReducer(state, clearPendingCreate({ requestId: 'req-1' }))
     expect(state.pendingCreates['req-1']).toBeUndefined()
   })

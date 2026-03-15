@@ -1,6 +1,6 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
+import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
 import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
@@ -31,7 +31,7 @@ import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/
 import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
-import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
@@ -52,7 +52,7 @@ const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
-const EMPTY_PENDING_CREATES: Record<string, string> = {}
+const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 interface PaneContainerProps {
@@ -285,7 +285,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Clean up agent-chat resources
     if (content.kind === 'agent-chat') {
       clearDraft(paneId)
-      const sessionId = content.sessionId || sdkPendingCreates[content.createRequestId]
+      const pendingCreate = sdkPendingCreates[content.createRequestId]
+      const pendingSessionId = pendingCreate?.sessionId
+      const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
         ws.send({ type: 'sdk.kill', sessionId })
       } else {
@@ -294,8 +296,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         cancelCreate(content.createRequestId)
       }
       // Clean up Redux state for orphaned pending creates
-      if (!content.sessionId && sdkPendingCreates[content.createRequestId]) {
-        dispatch(removeSession({ sessionId: sdkPendingCreates[content.createRequestId] }))
+      if (!content.sessionId && pendingSessionId) {
+        dispatch(removeSession({ sessionId: pendingSessionId }))
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))
       }
     }

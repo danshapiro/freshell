@@ -393,13 +393,12 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       await dispatch(fetchNetworkStatus()).unwrap()
     } catch (refreshError) {
       log.warn('Failed to reconcile remote access status after polling error', refreshError)
-    } finally {
-      if (remoteAccessRefreshRequestRef.current !== refreshRequestId) {
-        return
-      }
-      setRemoteAccessPending(false)
-      setRemoteAccessError(errorMessage)
     }
+    if (remoteAccessRefreshRequestRef.current !== refreshRequestId) {
+      return
+    }
+    setRemoteAccessPending(false)
+    setRemoteAccessError(errorMessage)
   }, [dispatch])
 
   const queueRemoteAccessRefresh = useCallback((refreshRequestId: number, attempts = 0) => {

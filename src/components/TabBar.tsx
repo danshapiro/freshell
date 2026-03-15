@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
+import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
