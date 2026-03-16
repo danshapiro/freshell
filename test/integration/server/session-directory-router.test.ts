@@ -1,8 +1,12 @@
 // @vitest-environment node
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fsp from 'fs/promises'
+import path from 'path'
+import os from 'os'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { createSessionsRouter } from '../../../server/sessions-router.js'
+import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
 import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
@@ -227,5 +231,120 @@ describe('GET /api/session-directory', () => {
       signal: expect.any(AbortSignal),
       run: expect.any(Function),
     }))
+  })
+})
+
+describe('search tiers through the HTTP route (full round-trip)', () => {
+  let app: Express
+  let tempDir: string
+
+  beforeEach(async () => {
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'router-search-'))
+  })
+
+  afterEach(async () => {
+    await fsp.rm(tempDir, { recursive: true, force: true })
+  })
+
+  function createAppWithProjects(projects: ProjectGroup[]) {
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride: vi.fn().mockResolvedValue({ ok: true }),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliIndexer: {
+        getProjects: () => projects,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [claudeProvider],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [],
+      },
+    }))
+  }
+
+  it('title tier searches metadata only', async () => {
+    createAppWithProjects([{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 100,
+        title: 'Deploy the service',
+      }],
+    }])
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&query=deploy&tier=title')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.items).toHaveLength(1)
+    expect(res.body.items[0].matchedIn).toBe('title')
+  })
+
+  it('userMessages tier searches JSONL user messages', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the authentication bug"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Working on login"}]}}',
+    ].join('\n'))
+
+    createAppWithProjects([{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 100,
+        title: 'Session one',
+        sourceFile: sessionFile,
+      }],
+    }])
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&query=authentication&tier=userMessages')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.items).toHaveLength(1)
+    expect(res.body.items[0].matchedIn).toBe('userMessage')
+  })
+
+  it('fullText tier finds assistant message matches', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The secret_keyword is here"}]}}',
+    ].join('\n'))
+
+    createAppWithProjects([{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 100,
+        title: 'Session one',
+        sourceFile: sessionFile,
+      }],
+    }])
+
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&query=secret_keyword&tier=fullText')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.items).toHaveLength(1)
+    expect(res.body.items[0].matchedIn).toBe('assistantMessage')
   })
 })
