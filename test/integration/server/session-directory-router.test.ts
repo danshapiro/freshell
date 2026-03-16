@@ -159,6 +159,34 @@ describe('GET /api/session-directory', () => {
     expect(broadcastTerminalsChanged).toHaveBeenCalledOnce()
   })
 
+  it('forwards the tier query parameter to the session-directory service', async () => {
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&query=deploy&tier=userMessages')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    // Should succeed (200) even with no file-based results since sessions lack sourceFile
+    expect(res.status).toBe(200)
+  })
+
+  it('defaults to title tier when tier parameter is omitted', async () => {
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&query=deploy')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    // Should match on title metadata (existing behavior)
+    expect(res.body.items).toHaveLength(1)
+    expect(res.body.items[0].sessionId).toBe('session-1')
+  })
+
+  it('rejects unknown tier values with 400', async () => {
+    const res = await request(app)
+      .get('/api/session-directory?priority=visible&tier=bogus')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+  })
+
   it('routes directory reads through the requested visible-first lane', async () => {
     const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
       expect(signal).toBeInstanceOf(AbortSignal)

@@ -64,6 +64,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   router.get('/session-directory', async (req, res) => {
     const parsed = SessionDirectoryQuerySchema.safeParse({
       query: typeof req.query.query === 'string' ? req.query.query : undefined,
+      tier: typeof req.query.tier === 'string' ? req.query.tier : undefined,
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: req.query.priority,
       revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,

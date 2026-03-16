@@ -166,6 +166,7 @@ export async function getSessionDirectoryPage(
   return api.get(
     `/api/session-directory${buildQueryString([
       ['query', parsed.query],
+      ['tier', parsed.tier === 'title' ? undefined : parsed.tier],
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
       ['revision', parsed.revision],
@@ -385,6 +386,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
   const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     query,
+    tier,
     ...(limit ? { limit } : {}),
   }, {
     signal,
