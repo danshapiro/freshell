@@ -44,6 +44,46 @@ function createIndexer(): CodingCliSessionIndexer {
 }
 
 describe('SessionAssociationCoordinator integration', () => {
+  it('associates a Claude terminal created with a human-readable resume name after UUID discovery', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+    const onBound = vi.fn()
+
+    // Terminal created with a non-UUID resume name — the server passes it
+    // through to --resume but doesn't create a session binding.
+    const terminal = registry.create({
+      mode: 'claude',
+      cwd: '/home/user/project',
+      resumeSessionId: '137 tour',
+    })
+
+    expect(terminal.resumeSessionId).toBeUndefined()
+    expect(terminal.pendingResumeName).toBe('137 tour')
+
+    registry.on('terminal.session.bound', onBound)
+
+    // The indexer discovers the real UUID from the JSONL file
+    const realUuid = '550e8400-e29b-41d4-a716-446655440000'
+    const result = coordinator.associateSingleSession({
+      provider: 'claude',
+      sessionId: realUuid,
+      projectPath: '/home/user/project',
+      lastActivityAt: Date.now(),
+      cwd: '/home/user/project',
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(realUuid)
+    expect(onBound).toHaveBeenCalledWith({
+      terminalId: terminal.terminalId,
+      provider: 'claude',
+      sessionId: realUuid,
+      reason: 'association',
+    })
+
+    registry.shutdown()
+  })
+
   it('keeps Codex association working and emits an association binding event', () => {
     const registry = new TerminalRegistry()
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)
