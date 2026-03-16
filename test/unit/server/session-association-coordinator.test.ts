@@ -18,6 +18,7 @@ describe('SessionAssociationCoordinator', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => []),
       bindSession: vi.fn(() => ({ ok: false, reason: 'terminal_missing' })),
+      isSessionBound: vi.fn(() => false),
     }
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
@@ -41,6 +42,7 @@ describe('SessionAssociationCoordinator', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
     }
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
@@ -86,6 +88,7 @@ describe('SessionAssociationCoordinator', () => {
 
     expect(result).toEqual({ associated: false })
     expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
+    expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
     expect(registry.bindSession).not.toHaveBeenCalled()
   })
 
