@@ -139,7 +139,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
 
     // Initial overflow check
     updateOverflow(node)
-  }, [updateOverflow])
+  }, [ensureTabVisible, updateOverflow])
 
   // Clean up on unmount
   useEffect(() => {
