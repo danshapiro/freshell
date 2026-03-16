@@ -65,6 +65,7 @@ describe('NetworkManager', () => {
   let savedAuthToken: string | undefined
   let savedFreshellHome: string | undefined
   let savedHost: string | undefined
+  let savedDisableWslPortForward: string | undefined
   let tmpDir: string
 
   beforeEach(() => {
@@ -75,10 +76,12 @@ describe('NetworkManager', () => {
     savedAuthToken = process.env.AUTH_TOKEN
     savedFreshellHome = process.env.FRESHELL_HOME
     savedHost = process.env.HOST
+    savedDisableWslPortForward = process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-windows-managed-'))
     delete process.env.ALLOWED_ORIGINS
     delete process.env.EXTRA_ALLOWED_ORIGINS
     delete process.env.HOST
+    delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     process.env.FRESHELL_HOME = tmpDir
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
     vi.mocked(computeWslPortForwardingPlanAsync).mockReset()
@@ -126,6 +129,11 @@ describe('NetworkManager', () => {
       process.env.HOST = savedHost
     } else {
       delete process.env.HOST
+    }
+    if (savedDisableWslPortForward !== undefined) {
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = savedDisableWslPortForward
+    } else {
+      delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     }
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
@@ -444,7 +452,6 @@ describe('NetworkManager', () => {
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
     const portReachable = await import('is-port-reachable')
     vi.mocked(portReachable.default).mockResolvedValue(false)
-    const savedDisableEnv = process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
     mockConfigStore = createMockConfigStore({
       network: {
@@ -455,18 +462,10 @@ describe('NetworkManager', () => {
     manager = new NetworkManager(server, mockConfigStore, testPort)
     await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
 
-    try {
-      const status = await manager.getStatus()
+    const status = await manager.getStatus()
 
-      expect(status.remoteAccessNeedsRepair).toBe(false)
-      expect(status.remoteAccessEnabled).toBe(false)
-    } finally {
-      if (savedDisableEnv !== undefined) {
-        process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = savedDisableEnv
-      } else {
-        delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
-      }
-    }
+    expect(status.remoteAccessNeedsRepair).toBe(false)
+    expect(status.remoteAccessEnabled).toBe(false)
   })
 
   it('keeps remote access enabled while flagging stale native Windows dev-mode API-port rules for cleanup', async () => {
