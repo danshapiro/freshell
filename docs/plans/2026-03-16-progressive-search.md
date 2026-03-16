@@ -63,6 +63,8 @@ const localFilteredItems = useAppSelector((state) => selectSortedItems(state, te
 const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
 ```
 
+Remove `sidebarWindow` and `topLevelSessionCount` from the search effect's dependency array. The clear-search guard is refactored to use `lastMarkedSearchQueryRef` instead of `sidebarWindow`, which prevents the effect from re-triggering after every search response (see Task 0, step 4 for details).
+
 This means `sidebarSelectors.ts`'s `filterSessionItems` function is no longer invoked for search -- the server handles all filtering. The selector still applies visibility filtering (subagent hiding, empty session hiding, etc.) and sorting, which is correct.
 
 ### Layer 2: sessionsThunks.ts -- Two-Phase Fetch
@@ -244,10 +246,11 @@ When Phase 2 results arrive, the merge follows these rules:
 
 ## Abort Semantics
 
-- **New query typed:** The 300ms debounce in `Sidebar.tsx` means the effect fires 300ms after the user stops typing. At that point, `fetchSessionWindow` is called, which calls `abortSurface(surface)`, canceling any in-flight Phase 1 or Phase 2 from the previous query. Both use the same AbortController.
+- **New query typed:** The 300ms debounce in `Sidebar.tsx` means the effect fires 300ms after the user stops typing. At that point, `fetchSessionWindow` is called, which calls `abortSurface(surface)`, canceling any in-flight Phase 1 or Phase 2 from the previous query. Both use the same AbortController. The effect dependency array is `[dispatch, filter, searchTier]` (after removing `sidebarWindow` and `topLevelSessionCount`), so only user-initiated changes trigger re-runs.
 - **Tier changed:** The effect also triggers on `searchTier` change. Same abort path.
 - **Search cleared:** When `filter` becomes empty, the effect dispatches a non-search `fetchSessionWindow` which aborts the search surface. The non-search `setSessionWindowData` dispatch will set `deepSearchPending` to `false` (via the default-to-false behavior).
 - **No orphaned requests:** Because both phases use the same controller, there's no scenario where Phase 2 outlives an aborted Phase 1.
+- **No re-fetch loops:** Since `sidebarWindow` is removed from the dependency array, search responses do not re-trigger the effect. Only user-driven state changes (typing in the filter input, changing the tier dropdown) cause the effect to run.
 
 ## Flash Prevention
 
@@ -289,6 +292,38 @@ This is the root fix for "search is broken." Without this, title-tier searches s
    The selector still applies visibility filtering and sorting; it just no longer does text-based filtering (that is the server's job now).
 
 3. **Remove `topLevelSessionCount` dependency** from the search effect's dependency array (line 243) since the early-return that used it is gone. Also remove the `topLevelSessionCount` selector (line 194) if it is no longer used elsewhere in the component.
+
+4. **Remove `sidebarWindow` from the search effect's dependency array** (line 243) to prevent infinite re-fetch loops. Currently, `sidebarWindow` is in the dependency array because the early-return guard and the clear-search guard reference it. After removing the early-return guard, only the clear-search guard (lines 217-223) still needs it. But `sidebarWindow` changes on every `setSessionWindowData` dispatch (the reducer creates a new object), which would re-trigger the effect after every search response -- causing the debounced dispatch to fire again with the same query/tier, creating an infinite loop.
+
+   **Fix the clear-search guard to not depend on `sidebarWindow`:** Add a new ref `wasSearchingRef = useRef(false)` to track whether a search dispatch has been fired. Set it to `true` inside the debounced dispatch callback (just before dispatching `fetchSessionWindow` with a query). In the clear-search guard, replace `sidebarWindow && lastMarkedSearchQueryRef.current !== null` with `wasSearchingRef.current`, and reset it to `false` after dispatching the browse re-fetch.
+
+   Concretely, change lines 217-223 from:
+   ```ts
+   if (sidebarWindow && lastMarkedSearchQueryRef.current !== null) {
+     lastMarkedSearchQueryRef.current = null
+     void dispatch(fetchSessionWindow({
+       surface: 'sidebar',
+       priority: 'visible',
+     }) as any)
+   }
+   ```
+   to:
+   ```ts
+   if (wasSearchingRef.current) {
+     wasSearchingRef.current = false
+     lastMarkedSearchQueryRef.current = null
+     void dispatch(fetchSessionWindow({
+       surface: 'sidebar',
+       priority: 'visible',
+     }) as any)
+   }
+   ```
+
+   And inside the debounced dispatch callback (line 231-237), add `wasSearchingRef.current = true` before the dispatch.
+
+   **Why `lastMarkedSearchQueryRef` alone is not sufficient:** The perf-audit effect (line 474-485) only sets `lastMarkedSearchQueryRef` when search results are visible AND `sortedItems.length > 0`. If a search returns zero results, the ref is never set, so clearing the search would not trigger a browse re-fetch -- leaving the sidebar showing "No results" instead of reloading browse data. The dedicated `wasSearchingRef` is set unconditionally whenever a search dispatch occurs.
+
+   **Why the loop didn't occur before:** The removed early-return guard on line 227 prevented the debounced dispatch from firing when `!sidebarWindow` (the common initial state). For the case where `sidebarWindow` exists, the loop existed in theory but was masked because the debounce timeout was cleared by the effect cleanup before it could fire -- except when `sidebarWindow` changed between the debounce starting and the timeout firing (e.g., during a search response). In practice this was a latent bug, now fixed by removing `sidebarWindow` from the dependency array entirely.
 
 ### Task 1: Add `deepSearchPending` to SessionWindowState
 
@@ -376,6 +411,7 @@ New tests:
 6. "Scanning files..." indicator has `role="status"` for accessibility
 7. Clearing search input removes "Scanning files..." indicator
 8. New query typed while deep search pending clears "Scanning files..." indicator immediately (via `setSessionWindowLoading` clearing `deepSearchPending`)
+9. Search response does not re-trigger search (no infinite re-fetch loop) -- verify that after a search completes, no additional fetch dispatches occur without user input
 
 #### `test/unit/client/store/sessionsSlice.test.ts`
 
@@ -400,7 +436,7 @@ End-to-end flow scenarios:
 3. `src/store/sessionsThunks.ts` -- two-phase fetch logic, `mergeSearchResults` utility
 4. `test/unit/client/store/sessionsThunks.test.ts` -- ~13 new tests (additions to existing file)
 5. `test/unit/client/store/sessionsSlice.test.ts` -- 2 new tests (additions to existing file)
-6. `test/e2e/sidebar-search-flow.test.tsx` -- new e2e test file (~12 scenarios: 8 Sidebar UI tests + 4 flow tests)
+6. `test/e2e/sidebar-search-flow.test.tsx` -- new e2e test file (~13 scenarios: 9 Sidebar UI tests + 4 flow tests)
 
 ## Files NOT Modified
 
