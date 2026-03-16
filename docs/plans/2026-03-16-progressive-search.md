@@ -362,9 +362,11 @@ New tests to add to the existing `sessionsThunks` describe block:
 13. Background refresh (`queueActiveSessionWindowRefresh`) with deep tier uses two-phase
 14. `setSessionWindowData` without explicit `deepSearchPending` defaults to false (slice test, can be in sessionsSlice.test.ts)
 
-#### `test/unit/client/components/Sidebar.test.tsx`
+#### `test/e2e/sidebar-search-flow.test.tsx` (Sidebar UI tests)
 
-New tests to add to the existing Sidebar test suite:
+Note: There is no existing `test/unit/client/components/Sidebar.test.tsx` file. Sidebar component tests live in `test/e2e/` using the e2e scaffolding pattern (render with full Redux store + mocked API/WS). The Sidebar UI search tests belong in the new `sidebar-search-flow.test.tsx` file alongside the flow tests, using the same scaffolding as `test/e2e/sidebar-click-opens-pane.test.tsx`.
+
+New tests:
 
 1. Title-tier search always dispatches to server (no client-side bypass)
 2. Search with no sidebarWindow dispatches server request (previously was short-circuited)
@@ -382,9 +384,9 @@ New tests:
 1. `setSessionWindowData` without explicit `deepSearchPending` defaults to false
 2. `setSessionWindowLoading` with `loading: true` clears `deepSearchPending`
 
-#### `test/e2e/sidebar-search-flow.test.tsx` (new file)
+The `sidebar-search-flow.test.tsx` file is a single new e2e test file that combines both the Sidebar UI tests (items 1-8 above) and the end-to-end flow tests below. It uses the same scaffolding patterns as `test/e2e/sidebar-click-opens-pane.test.tsx` (full Redux store, mocked API/WS).
 
-E2e test covering the end-to-end search flow. Uses the same patterns as `test/e2e/sidebar-click-opens-pane.test.tsx` for test scaffolding. Test scenarios:
+End-to-end flow scenarios:
 
 1. Title-tier search returns server-side results (verify the bypass is removed)
 2. Deep-tier search shows title results first, then merged results after Phase 2 completes
@@ -397,9 +399,8 @@ E2e test covering the end-to-end search flow. Uses the same patterns as `test/e2
 2. `src/store/sessionsSlice.ts` -- `deepSearchPending` field in interface and payload type, reducer update in both `setSessionWindowData` and `setSessionWindowLoading`
 3. `src/store/sessionsThunks.ts` -- two-phase fetch logic, `mergeSearchResults` utility
 4. `test/unit/client/store/sessionsThunks.test.ts` -- ~13 new tests (additions to existing file)
-5. `test/unit/client/components/Sidebar.test.tsx` -- ~8 new tests (additions to existing file)
-6. `test/unit/client/store/sessionsSlice.test.ts` -- 2 new tests (additions to existing file)
-7. `test/e2e/sidebar-search-flow.test.tsx` -- new e2e test file (~4 scenarios)
+5. `test/unit/client/store/sessionsSlice.test.ts` -- 2 new tests (additions to existing file)
+6. `test/e2e/sidebar-search-flow.test.tsx` -- new e2e test file (~12 scenarios: 8 Sidebar UI tests + 4 flow tests)
 
 ## Files NOT Modified
 
