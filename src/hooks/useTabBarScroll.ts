@@ -207,17 +207,8 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     const peek = nextPos ? nextPos.width / 2 : 0
 
     // Scroll so cutoff tab's right edge is at container's right edge, plus peek.
-    // Clamp to [0, maxScroll] for correctness -- browsers silently clamp, but
-    // the explicit bounds match the stated contract.
-    const maxScroll = el.scrollWidth - el.clientWidth
-    const targetScroll = Math.min(maxScroll, Math.max(0, cutoff.rightInScroll - el.clientWidth + peek))
-
-    if (typeof el.scrollTo === 'function') {
-      el.scrollTo({ left: targetScroll, behavior })
-    } else {
-      el.scrollLeft = targetScroll
-    }
-  }, [])
+    scrollContainerTo(el, cutoff.rightInScroll - el.clientWidth + peek, behavior)
+  }, [scrollContainerTo])
 
   const scrollJumpLeft = useCallback((behavior: ScrollBehavior = 'smooth') => {
     const el = nodeRef.current
@@ -250,18 +241,8 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     const peek = prevPos ? prevPos.width / 2 : 0
 
     // Scroll so cutoff tab's left edge is at container's left edge, minus peek.
-    // Only a lower-bound clamp is needed: the target is always <= visibleLeft
-    // (which is the current scrollLeft, already <= maxScroll), so no upper clamp.
-    // Math.max(0, ...) is a defensive lower-bound guard; with contiguous tabs
-    // cutoff.leftInScroll >= 2 * peek, so the negative case is unreachable.
-    const targetScroll = Math.max(0, cutoff.leftInScroll - peek)
-
-    if (typeof el.scrollTo === 'function') {
-      el.scrollTo({ left: targetScroll, behavior })
-    } else {
-      el.scrollLeft = targetScroll
-    }
-  }, [])
+    scrollContainerTo(el, cutoff.leftInScroll - peek, behavior)
+  }, [scrollContainerTo])
 
   /** Click handler for arrow buttons. Checks pointerHandledRef to deduplicate
    *  pointer+click sequences: if startHoldScroll already fired the jump via
