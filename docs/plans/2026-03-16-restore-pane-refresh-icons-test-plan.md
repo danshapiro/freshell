@@ -1,162 +1,217 @@
-# Restore Pane Refresh Icons Test Plan
+# Restore Pane Refresh Icons - Test Plan
 
 ## Strategy Reconciliation
-No strategy changes requiring user approval are needed.
 
-This is a regression fix: commit `96330ebf` ("feat(panes): add refresh button to PaneHeader") added an `onRefresh` prop and RefreshCw icon button to `PaneHeader`, but a parallel branch commit `e43e069e` ("feat: use blue icon color for busy terminals instead of pulse animation") landed on main from a stale base that lacked the refresh button, silently overwriting the PaneHeader back to a version without `onRefresh`. The refresh infrastructure (Redux actions `requestPaneRefresh`/`requestTabRefresh`/`consumePaneRefreshRequest`, `buildPaneRefreshTarget`, context menu wiring, and individual pane view consumers like `TerminalView` and `BrowserPane`) is fully intact on main. Only the PaneHeader UI button and the prop threading from `PaneContainer` through `Pane` to `PaneHeader` were lost.
+The agreed strategy allocates:
+- **40% PaneHeader unit tests** (render conditions, click handler, propagation, ARIA, DOM ordering)
+- **30% PaneContainer integration tests** (eligibility per content type)
+- **15% Pane forwarding test**
+- **15% Mock updates and regression**
 
-The fix restores the original design from `96330ebf` and additionally threads the `onRefresh` callback through the `Pane` intermediate component and wires it from `PaneContainer`, which the original commit did not do (the original commit added the PaneHeader prop/button but never wired it from PaneContainer/Pane). This plan completes the original feature by wiring `onRefresh` end-to-end.
+After reading the implementation plan and the full codebase (current source, existing tests, original commits `96330ebf` and `061c8518`, and the overwriting commit `e43e069e`), I confirm this allocation is sound. The original feature introduced tests at the PaneHeader and PaneContainer levels but never added a Pane forwarding test -- which is exactly why the Pane gap went undetected when the overwrite landed. The 15% Pane allocation fills that gap.
 
-## Architecture
+No strategy changes requiring user approval.
 
-The refresh icon is a convenience affordance that dispatches the same `requestPaneRefresh` action the context menu already dispatches. The button appears in the PaneHeader action icon row (between the search button and the zoom button) for any pane whose content produces a non-null `buildPaneRefreshTarget()` -- currently `terminal` panes with a `terminalId` and `browser` panes with a non-empty URL. Panes that do not support refresh (picker, editor, agent-chat, extension) show no button.
+## Sources of Truth
 
-The prop threading path is: `PaneContainer` computes `canRefresh` using `buildPaneRefreshTarget(content)` and creates an `onRefresh` callback that dispatches `requestPaneRefresh({ tabId, paneId })`. It passes this to `Pane`, which forwards it to `PaneHeader`. `PaneHeader` conditionally renders the RefreshCw icon button when `onRefresh` is provided.
+- **S1**: Commit `96330ebf` -- Original PaneHeader `onRefresh` prop, RefreshCw icon button, `title="Refresh pane"`, `aria-label="Refresh pane"`, placement after search and before zoom.
+- **S2**: `src/lib/pane-utils.ts` `buildPaneRefreshTarget()` -- Returns non-null for terminal panes with `terminalId` and browser panes with non-empty URL. Returns null for all other content kinds.
+- **S3**: Context menu in `src/components/context-menu/menu-defs.ts` and `ContextMenuProvider.tsx` -- Uses `buildPaneRefreshTarget()` for gating and `requestPaneRefresh` for dispatch. The PaneHeader icon must use the identical gate and dispatch.
+- **S4**: Commit `061c8518` -- PaneContainer wiring: compute `refreshTarget` via `buildPaneRefreshTarget(node.content)`, create `handleRefresh` callback dispatching `requestPaneRefresh({ tabId, paneId: node.id })`, pass as `onRefresh` to `<Pane>`.
+- **S5**: Existing PaneContainer prop-threading pattern -- `onClose`, `onFocus`, `onToggleZoom`, `onSearch` all flow `PaneContainer -> Pane -> PaneHeader`. `onRefresh` must follow the same pattern.
 
-## Sources Of Truth
-- `S1 Original feature commit`: Commit `96330ebf` defines the intended PaneHeader prop interface (`onRefresh?: () => void`), the button markup (RefreshCw icon, "Refresh pane" title/aria-label), its placement (after search, before zoom), and the test expectations.
-- `S2 Refresh infrastructure contract`: The existing `buildPaneRefreshTarget()` in `src/lib/pane-utils.ts`, `requestPaneRefresh` / `consumePaneRefreshRequest` in `src/store/panesSlice.ts`, and the consumer hooks in `TerminalView.tsx` and `BrowserPane.tsx` define which pane types support refresh and how the Redux-driven one-shot refresh request flows from dispatch to consumption.
-- `S3 Context menu contract`: The context menu already shows "Refresh pane" for terminal and browser panes using the same `buildPaneRefreshTarget` gate and the same `requestPaneRefresh` dispatch. The PaneHeader icon must use the identical gate and dispatch so both paths remain consistent.
-- `S4 PaneContainer wiring contract`: `PaneContainer` already computes pane-specific callbacks (`onClose`, `onFocus`, `onToggleZoom`, `onSearch`) and passes them through `Pane` to `PaneHeader`. The `onRefresh` callback must follow the same pattern.
+## Harnesses
 
-## Action Space
-- `src/components/panes/PaneHeader.tsx`: Add `onRefresh?: () => void` prop, add RefreshCw to lucide-react import, render the button between search and zoom buttons.
-- `src/components/panes/Pane.tsx`: Add `onRefresh?: () => void` prop to `PaneProps`, accept it in the component, forward it to `PaneHeader`.
-- `src/components/panes/PaneContainer.tsx`: Import `buildPaneRefreshTarget` and `requestPaneRefresh`, compute whether the leaf pane supports refresh, create the `onRefresh` callback, pass it to `<Pane>`.
-- `test/unit/client/components/panes/PaneHeader.test.tsx`: Add RefreshCw mock to the lucide-react mock, add the refresh button test suite from `S1` (adapted for current test conventions).
+| ID | Harness | Infrastructure | Notes |
+|----|---------|---------------|-------|
+| H1 | PaneHeader unit test harness | `test/unit/client/components/panes/PaneHeader.test.tsx`, RTL `render`, lucide-react mocks, `fireEvent` | Must add `RefreshCw` to existing lucide-react mock block |
+| H2 | Pane unit test harness | `test/unit/client/components/panes/Pane.test.tsx`, RTL `render`, lucide-react mocks, `fireEvent` | Must add `RefreshCw`, `Search`, `Maximize2`, `Minimize2` to lucide-react mock (currently only has `X` and `Circle`) |
+| H3 | PaneContainer integration harness | `test/unit/client/components/panes/PaneContainer.test.tsx`, RTL `render` with Redux `Provider` + `configureStore` | Must add `RefreshCw` to existing lucide-react mock block |
+| H4 | Existing test suite | `npm run test:vitest -- --run <path>` for focused runs, `npm test` for broad verification | No changes needed |
 
-## Harness Requirements
-No new standalone harness is required.
+## Mock Updates Required (15% allocation -- regression/infra)
 
-| Harness | What it exercises | Notes |
-| --- | --- | --- |
-| `H1 PaneHeader render harness` | Existing PaneHeader unit test harness in `test/unit/client/components/panes/PaneHeader.test.tsx`; uses RTL `render`, lucide-react mocks, and `fireEvent`. | Add `RefreshCw` to the existing lucide-react mock block. |
-| `H2 PaneContainer integration harness` | Existing PaneContainer tests (if any) or a new focused test that renders PaneContainer with a Redux store providing pane state. | Verifies the end-to-end wiring from PaneContainer through Pane to PaneHeader. |
-| `H3 Broad verification harness` | Lint, typecheck, focused suites, then coordinated full-suite verification. | Use `npm run test:status` before `npm test`; set `FRESHELL_TEST_SUMMARY`. |
+Before any new tests can pass, these mock updates are required in existing test files:
+
+1. **PaneHeader.test.tsx lucide-react mock**: Add `RefreshCw` entry:
+   ```tsx
+   RefreshCw: ({ className }: { className?: string }) => (
+     <svg data-testid="refresh-icon" className={className} />
+   ),
+   ```
+
+2. **Pane.test.tsx lucide-react mock**: Add `Search`, `Maximize2`, `Minimize2`, `RefreshCw` entries so that PaneHeader can render its full button set when Pane forwards props.
+
+3. **PaneContainer.test.tsx lucide-react mock**: Add `RefreshCw` entry (same as above).
+
+4. **PaneContainer.createContent.test.tsx** and **PaneLayout.test.tsx**: Add `RefreshCw` to lucide-react mock if they render PaneHeader. (Per original commit `061c8518`, both needed a one-line mock addition.)
 
 ## Test Plan
-### Unit Tests
-1. **Name:** Refresh button renders when onRefresh is provided.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered with `onRefresh={vi.fn()}` and terminal content.
-   **Actions:** Render PaneHeader.
-   **Expected outcome:** A button with title "Refresh pane" and the RefreshCw icon (data-testid "refresh-icon") is present in the DOM. Source of truth: `S1`.
-   **Interactions:** `PaneHeader` rendering path.
 
-2. **Name:** Refresh button does not render when onRefresh is not provided.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered without `onRefresh`.
-   **Actions:** Render PaneHeader.
-   **Expected outcome:** No element with title "Refresh pane" exists. Source of truth: `S1`.
-   **Interactions:** `PaneHeader` rendering path.
+### PaneHeader Unit Tests (40%)
 
-3. **Name:** Clicking refresh button calls onRefresh exactly once.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered with `onRefresh` spy.
-   **Actions:** Click the "Refresh pane" button.
-   **Expected outcome:** The `onRefresh` spy has been called once. Source of truth: `S1`.
-   **Interactions:** `PaneHeader` click handler.
+#### T01: Refresh button renders when onRefresh is provided
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `onRefresh={vi.fn()}` and terminal content.
+- **Actions:** Render PaneHeader.
+- **Expected outcome:** A button with `title="Refresh pane"` is present. An element with `data-testid="refresh-icon"` is present.
+- **Source of truth:** S1
 
-4. **Name:** Refresh button click stops propagation.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader wrapped in a parent div with onClick spy.
-   **Actions:** Click the "Refresh pane" button.
-   **Expected outcome:** `onRefresh` called once; parent onClick not called. Source of truth: `S1`.
-   **Interactions:** `e.stopPropagation()` in refresh button handler.
+#### T02: Refresh button does not render when onRefresh is omitted
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered without `onRefresh` prop (or `onRefresh={undefined}`).
+- **Actions:** Render PaneHeader.
+- **Expected outcome:** `screen.queryByTitle('Refresh pane')` returns null.
+- **Source of truth:** S1
 
-5. **Name:** Refresh button renders for browser panes when onRefresh is provided.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered with browser content and `onRefresh`.
-   **Actions:** Render PaneHeader.
-   **Expected outcome:** Button with title "Refresh pane" is present. Source of truth: `S1`, `S2`.
-   **Interactions:** `PaneHeader` rendering path -- confirms button is not gated by content kind.
+#### T03: Clicking refresh button calls onRefresh exactly once
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `onRefresh` spy.
+- **Actions:** `fireEvent.click(screen.getByTitle('Refresh pane'))`.
+- **Expected outcome:** `onRefresh` spy called exactly once.
+- **Source of truth:** S1
 
-6. **Name:** Refresh button appears in correct DOM order: search, refresh, zoom, close.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered with `onSearch`, `onRefresh`, `onToggleZoom`, and `onClose`.
-   **Actions:** Query all buttons and compare indices.
-   **Expected outcome:** Search button index < refresh button index < zoom button index < close button index. Source of truth: `S1`.
-   **Interactions:** DOM ordering of PaneHeader action buttons.
+#### T04: Refresh button click stops propagation to parent
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader wrapped in `<div onClick={parentClick}>`. `onRefresh` and `parentClick` are both `vi.fn()`.
+- **Actions:** Click the "Refresh pane" button.
+- **Expected outcome:** `onRefresh` called once; `parentClick` not called.
+- **Source of truth:** S1
 
-7. **Name:** Refresh button has correct aria-label for accessibility.
-   **Type:** unit
-   **Harness:** `H1`
-   **Preconditions:** PaneHeader rendered with `onRefresh`.
-   **Actions:** Query the button by title.
-   **Expected outcome:** Button has `aria-label="Refresh pane"`. Source of truth: `S1`.
-   **Interactions:** `PaneHeader` a11y attributes.
+#### T05: Refresh button renders for browser panes when onRefresh is provided
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `content={{ kind: 'browser', browserInstanceId: 'b1', url: 'https://example.com', devToolsOpen: false }}` and `onRefresh={vi.fn()}`.
+- **Actions:** Render PaneHeader.
+- **Expected outcome:** Button with `title="Refresh pane"` is present.
+- **Source of truth:** S1, S2 (PaneHeader itself is not gated by content kind -- gating is in PaneContainer. This confirms PaneHeader shows the button for any content when `onRefresh` is provided.)
 
-### Integration Tests
-8. **Name:** PaneContainer passes onRefresh to Pane for terminal panes with terminalId.
-   **Type:** integration
-   **Harness:** `H2`
-   **Preconditions:** Redux store has a tab with a leaf pane containing terminal content with a `terminalId` set.
-   **Actions:** Render PaneContainer and inspect the rendered DOM.
-   **Expected outcome:** The "Refresh pane" button is present in the rendered output. Source of truth: `S2`, `S4`.
-   **Interactions:** `PaneContainer` -> `buildPaneRefreshTarget()` -> `Pane` -> `PaneHeader`.
+#### T06: Refresh button appears in correct DOM order (search < refresh < zoom < close)
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `onSearch`, `onRefresh`, `onToggleZoom`, and `onClose` all provided. Terminal content so search button is visible.
+- **Actions:** `screen.getAllByRole('button')` and find indices of each button by title.
+- **Expected outcome:** indexOf("Search in terminal") < indexOf("Refresh pane") < indexOf("Maximize pane") < indexOf("Close pane").
+- **Source of truth:** S1
 
-9. **Name:** PaneContainer does not pass onRefresh for terminal panes without terminalId.
-   **Type:** integration
-   **Harness:** `H2`
-   **Preconditions:** Redux store has a tab with a leaf pane containing terminal content with `status: 'creating'` and no `terminalId`.
-   **Actions:** Render PaneContainer and inspect the rendered DOM.
-   **Expected outcome:** No "Refresh pane" button is present. Source of truth: `S2`, `S4`.
-   **Interactions:** `PaneContainer` -> `buildPaneRefreshTarget()` returns null -> no `onRefresh`.
+#### T07: Refresh button has correct aria-label
+- **Type:** unit
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `onRefresh={vi.fn()}`.
+- **Actions:** Query button by title "Refresh pane".
+- **Expected outcome:** `btn.getAttribute('aria-label')` equals `'Refresh pane'`.
+- **Source of truth:** S1
 
-10. **Name:** PaneContainer does not pass onRefresh for agent-chat, editor, or picker panes.
-    **Type:** integration
-    **Harness:** `H2`
-    **Preconditions:** Redux store has leaf panes of non-refreshable content kinds.
-    **Actions:** Render PaneContainer for each.
-    **Expected outcome:** No "Refresh pane" button for any of them. Source of truth: `S2`.
-    **Interactions:** `buildPaneRefreshTarget()` returns null for these kinds.
+### Pane Forwarding Tests (15%)
 
-### Invariants
-11. **Name:** The refresh icon gate in PaneHeader matches the context menu refresh gate.
-    **Type:** invariant
-    **Harness:** `H3`
-    **Preconditions:** The branch has completed all code changes.
-    **Actions:** Verify that `PaneContainer` uses `buildPaneRefreshTarget()` from the same module the context menu uses, and dispatches `requestPaneRefresh` from the same slice action.
-    **Expected outcome:** Both paths use identical gating logic and dispatch the same action, ensuring they always agree on which panes are refreshable. Source of truth: `S3`.
-    **Interactions:** Code review / grep verification during test run.
+#### T08: Pane forwards onRefresh to PaneHeader
+- **Type:** unit
+- **Harness:** H2
+- **Preconditions:** Pane rendered with `title="Test"`, `status="running"`, `content={makeTerminalContent()}`, `onRefresh={vi.fn()}`, `onClose={vi.fn()}`, `onFocus={vi.fn()}`.
+- **Actions:** Render Pane. Query for "Refresh pane" button.
+- **Expected outcome:** Button with `title="Refresh pane"` is present in the DOM. Clicking it calls the `onRefresh` spy exactly once.
+- **Source of truth:** S5 (prop-threading pattern)
 
-### Regressions
-12. **Name:** Existing search and zoom buttons remain functional after refresh button insertion.
-    **Type:** regression
-    **Harness:** `H1`
-    **Preconditions:** PaneHeader rendered with `onSearch`, `onRefresh`, `onToggleZoom`.
-    **Actions:** Click search and zoom buttons.
-    **Expected outcome:** Both still fire their respective callbacks. Source of truth: existing test suite.
-    **Interactions:** PaneHeader action button row.
+#### T09: Pane does not render refresh button when onRefresh is omitted
+- **Type:** unit
+- **Harness:** H2
+- **Preconditions:** Pane rendered with `title="Test"`, `status="running"`, `content={makeTerminalContent()}`, no `onRefresh` prop.
+- **Actions:** Render Pane.
+- **Expected outcome:** `screen.queryByTitle('Refresh pane')` returns null.
+- **Source of truth:** S5
 
-13. **Name:** Context menu "Refresh pane" still works.
-    **Type:** regression
-    **Harness:** `H3`
-    **Preconditions:** Full test suite passes.
-    **Actions:** Run the existing context menu test suite.
-    **Expected outcome:** All existing tests pass unchanged. Source of truth: `S3`.
-    **Interactions:** Context menu -> `requestPaneRefresh` -> `TerminalView` / `BrowserPane` consumer.
+### PaneContainer Integration Tests (30%)
+
+#### T10: Renders refresh button for terminal pane with terminalId
+- **Type:** integration
+- **Harness:** H3
+- **Preconditions:** Redux store with a tab and leaf pane: `content.kind === 'terminal'`, `terminalId: 'term-1'`, `status: 'running'`.
+- **Actions:** Render PaneContainer with this leaf node.
+- **Expected outcome:** Button with `title="Refresh pane"` is present.
+- **Source of truth:** S2, S4
+
+#### T11: Does not render refresh button for terminal pane without terminalId
+- **Type:** integration
+- **Harness:** H3
+- **Preconditions:** Redux store with a tab and leaf pane: `content.kind === 'terminal'`, no `terminalId`, `status: 'creating'`.
+- **Actions:** Render PaneContainer.
+- **Expected outcome:** `screen.queryByTitle('Refresh pane')` returns null.
+- **Source of truth:** S2
+
+#### T12: Renders refresh button for browser pane with URL
+- **Type:** integration
+- **Harness:** H3
+- **Preconditions:** Redux store with leaf pane: `content.kind === 'browser'`, `url: 'https://example.com'`.
+- **Actions:** Render PaneContainer.
+- **Expected outcome:** Button with `title="Refresh pane"` is present.
+- **Source of truth:** S2
+
+#### T13: Does not render refresh button for picker pane
+- **Type:** integration
+- **Harness:** H3
+- **Preconditions:** Redux store with leaf pane: `content.kind === 'picker'`.
+- **Actions:** Render PaneContainer.
+- **Expected outcome:** No "Refresh pane" button.
+- **Source of truth:** S2
+
+#### T14: Clicking refresh button dispatches requestPaneRefresh to Redux store
+- **Type:** integration
+- **Harness:** H3
+- **Preconditions:** Redux store with terminal pane with `terminalId`.
+- **Actions:** Render PaneContainer. Click "Refresh pane" button. Read `store.getState().panes.refreshRequestsByPane`.
+- **Expected outcome:** `refreshRequestsByPane['tab-1']['pane-1']` is defined, with `target` matching `{ kind: 'terminal', createRequestId: '<the pane createRequestId>' }`.
+- **Source of truth:** S3, S4
+
+### Regression Tests (15% -- shared with mock updates)
+
+#### T15: Existing search and zoom buttons remain functional after refresh button insertion
+- **Type:** regression
+- **Harness:** H1
+- **Preconditions:** PaneHeader rendered with `onSearch`, `onRefresh`, `onToggleZoom`, and `onClose`.
+- **Actions:** Click search button. Click zoom button.
+- **Expected outcome:** `onSearch` called once. `onToggleZoom` called once. Neither call is affected by the presence of `onRefresh`.
+- **Source of truth:** Existing PaneHeader test suite (search and zoom describe blocks)
+
+#### T16: Context menu "Refresh pane" tests still pass
+- **Type:** regression
+- **Harness:** H4
+- **Preconditions:** Code changes complete.
+- **Actions:** Run full test suite.
+- **Expected outcome:** All existing context-menu tests pass unchanged, confirming the PaneHeader icon uses the same gating logic and dispatch as the context menu.
+- **Source of truth:** S3
+
+### Invariant (code review verification)
+
+#### T17: PaneContainer uses same gate and dispatch as context menu
+- **Type:** invariant (manual verification during code review)
+- **Harness:** N/A (grep/code inspection)
+- **Preconditions:** All code changes applied.
+- **Actions:** Verify `PaneContainer.tsx` imports `buildPaneRefreshTarget` from `@/lib/pane-utils` (same as `menu-defs.ts`) and `requestPaneRefresh` from `@/store/panesSlice` (same as `ContextMenuProvider.tsx`).
+- **Expected outcome:** Both paths use identical imports. No separate/duplicated gating logic.
+- **Source of truth:** S3
+
+## Verification Sequence
+
+1. `npm run lint` -- catch a11y violations
+2. `npx tsc --noEmit` -- typecheck all changes
+3. `npm run test:vitest -- --run test/unit/client/components/panes/PaneHeader.test.tsx` -- focused PaneHeader suite
+4. `npm run test:vitest -- --run test/unit/client/components/panes/Pane.test.tsx` -- focused Pane suite
+5. `npm run test:vitest -- --run test/unit/client/components/panes/PaneContainer.test.tsx` -- focused PaneContainer suite
+6. `npm run test:status` -- check coordinator availability
+7. `FRESHELL_TEST_SUMMARY="restore pane refresh icons" CI=true npm test` -- coordinated full suite
 
 ## Coverage Summary
-This plan covers the full regression:
-- PaneHeader: onRefresh prop, RefreshCw icon button, placement, a11y, propagation behavior.
-- Pane: prop threading from PaneContainer to PaneHeader.
-- PaneContainer: computation of refresh eligibility using the shared `buildPaneRefreshTarget` gate, dispatch of `requestPaneRefresh`.
-- All pane content kinds: terminal (with/without terminalId), browser (with/without URL), agent-chat, editor, picker, extension.
-- Consistency invariant: the icon button and context menu use the same gate and action.
-- Regression: existing search/zoom buttons and context menu refresh remain unaffected.
 
-The plan intentionally does not add new test infrastructure for the end-to-end refresh flow (Redux action -> terminal reconnect / browser reload) because that flow is already covered by existing tests and was never broken -- only the UI icon entry point was lost.
+| Layer | Tests | What it covers |
+|-------|-------|---------------|
+| PaneHeader (unit) | T01-T07 | Conditional render, click handler, propagation, ARIA, DOM order, content-kind independence |
+| Pane (unit) | T08-T09 | Prop forwarding from Pane to PaneHeader (the gap that allowed the original regression) |
+| PaneContainer (integration) | T10-T14 | End-to-end wiring: buildPaneRefreshTarget gating, Redux dispatch, per-content-type eligibility |
+| Regression | T15-T16 | Existing buttons unaffected, context menu unaffected |
+| Invariant | T17 | Gate/dispatch consistency between icon and context menu paths |
 
-Broad verification should finish with:
-- `npm run lint`
-- `npx tsc --noEmit`
-- Focused suite: `npm run test:vitest -- --run test/unit/client/components/panes/PaneHeader.test.tsx`
-- `npm run test:status`
-- `FRESHELL_TEST_SUMMARY="restore pane refresh icons" CI=true npm test`
+Total: 17 tests covering 4 layers, aligned with the 40/30/15/15 strategy.
