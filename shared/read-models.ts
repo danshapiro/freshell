@@ -27,6 +27,7 @@ export const ReadModelPrioritySchema = z.enum(['visible', 'background'])
 
 export const SessionDirectoryQuerySchema = z.object({
   query: z.string().optional(),
+  tier: z.enum(['title', 'userMessages', 'fullText']).default('title'),
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema,
   revision: z.number().int().nonnegative().optional(),
@@ -40,7 +41,7 @@ export const SessionDirectoryItemSchema = z.object({
   title: z.string().optional(),
   summary: z.string().optional(),
   snippet: z.string().optional(),
-  matchedIn: z.enum(['title', 'summary', 'firstUserMessage']).optional(),
+  matchedIn: z.enum(['title', 'summary', 'firstUserMessage', 'userMessage', 'assistantMessage']).optional(),
   lastActivityAt: z.number().int().nonnegative(),
   createdAt: z.number().int().nonnegative().optional(),
   archived: z.boolean().optional(),
