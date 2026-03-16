@@ -1015,4 +1015,59 @@ describe('open tab session sidebar visibility (e2e)', () => {
       await Promise.resolve()
     })
   })
+
+  it('shows a fallback sidebar item for a Claude tab with a human-readable resume name', async () => {
+    const namedResumeName = '137 tour'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-named',
+        title: '137 tour',
+        mode: 'claude',
+        resumeSessionId: namedResumeName,
+        createdAt: Date.now(),
+      }],
+      panes: {
+        layouts: {
+          'tab-named': {
+            type: 'leaf',
+            id: 'pane-named',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-named',
+              status: 'running',
+              resumeSessionId: namedResumeName,
+            },
+          },
+        },
+        activePane: {
+          'tab-named': 'pane-named',
+        },
+        paneTitles: {
+          'tab-named': {
+            'pane-named': '137 tour',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      // The session should appear in the sidebar as a fallback item
+      expect(screen.getAllByText('137 tour').length).toBeGreaterThan(0)
+    })
+  })
 })
