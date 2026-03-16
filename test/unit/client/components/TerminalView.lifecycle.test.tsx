@@ -903,6 +903,397 @@ describe('TerminalView lifecycle updates', () => {
     expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
   })
 
+  it('does not re-enter working state when claude output arrives after turn completion BEL', async () => {
+    const tabId = 'tab-claude-post-bel'
+    const paneId = 'pane-claude-post-bel'
+    const terminalId = 'term-claude-post-bel'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-post-bel',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '22222222-2222-4222-8222-222222222222',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '22222222-2222-4222-8222-222222222222',
+            createRequestId: 'req-claude-post-bel',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    const onData = terminalInstances[0].onData.mock.calls[0]?.[0] as ((data: string) => void) | undefined
+    expect(onData).toBeTypeOf('function')
+
+    // Step 1: User submits input -> pending
+    act(() => {
+      onData?.('\r')
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'pending',
+    })
+
+    // Complete attach handshake
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 0,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    // Step 2: Claude produces output -> working
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'Claude is thinking...',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'working',
+    })
+
+    // Step 3: Turn completion BEL -> cleared
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 2,
+        seqEnd: 2,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+
+    // Step 4: Post-BEL output (Claude's next prompt) -> should STAY cleared
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 3,
+        seqEnd: 3,
+        data: '\r\n> ',
+      })
+    })
+
+    // THIS IS THE KEY ASSERTION: activity should still be cleared, not re-set to working
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+  })
+
+  it('allows working state again after user submits new input following a completed turn', async () => {
+    const tabId = 'tab-claude-second-turn'
+    const paneId = 'pane-claude-second-turn'
+    const terminalId = 'term-claude-second-turn'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-second-turn',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '33333333-3333-4333-8333-333333333333',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '33333333-3333-4333-8333-333333333333',
+            createRequestId: 'req-claude-second-turn',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    const onData = terminalInstances[0].onData.mock.calls[0]?.[0] as ((data: string) => void) | undefined
+    expect(onData).toBeTypeOf('function')
+
+    // First turn: submit -> working -> BEL clear
+    act(() => {
+      onData?.('\r')
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'pending',
+    })
+
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 0,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'First response',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'working',
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 2,
+        seqEnd: 2,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+
+    // Post-BEL prompt -- guard should prevent re-triggering
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 3,
+        seqEnd: 3,
+        data: '\r\n> ',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+
+    // Second turn: user submits new input -> guard resets
+    act(() => {
+      onData?.('\r')
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'pending',
+    })
+
+    // New output after second submit -> should set working again
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 4,
+        seqEnd: 4,
+        data: 'Second response',
+      })
+    })
+
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toMatchObject({
+      source: 'terminal',
+      phase: 'working',
+    })
+  })
+
+  it('does not show working state for initial prompt output before any user input', async () => {
+    const tabId = 'tab-claude-initial'
+    const paneId = 'pane-claude-initial'
+    const terminalId = 'term-claude-initial'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-initial',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '44444444-4444-4444-8444-444444444444',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '44444444-4444-4444-8444-444444444444',
+            createRequestId: 'req-claude-initial',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    // Complete attach handshake (no user input yet)
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 0,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    // Initial prompt output before any user input
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'Welcome to Claude\r\n> ',
+      })
+    })
+
+    // Should NOT show as working -- no user input has been submitted yet
+    expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+  })
+
   it('does not record turn completion for shell mode output', async () => {
     const tabId = 'tab-shell-bell'
     const paneId = 'pane-shell-bell'

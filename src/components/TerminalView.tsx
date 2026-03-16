@@ -231,6 +231,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const lastTapPointRef = useRef<{ x: number; y: number } | null>(null)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
+  const turnCompletedSinceLastInputRef = useRef(true)
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -755,6 +756,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }))
       if (mode === 'claude') {
         dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+        turnCompletedSinceLastInputRef.current = true
       }
     }
 
@@ -763,6 +765,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       && cleaned
       && count === 0
       && !seqStateRef.current.pendingReplay
+      && !turnCompletedSinceLastInputRef.current
     ) {
       dispatch(setPaneRuntimeActivity({
         paneId: paneIdRef.current,
@@ -794,6 +797,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     }
     if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
+      turnCompletedSinceLastInputRef.current = false
       dispatch(setPaneRuntimeActivity({
         paneId: paneIdRef.current,
         source: 'terminal',
