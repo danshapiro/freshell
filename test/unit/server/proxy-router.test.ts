@@ -1,5 +1,7 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import type { PortForwardManager } from '../../../server/port-forward.js'
@@ -50,6 +52,106 @@ describe('createProxyRouter', () => {
   afterEach(() => {
     delete process.env.AUTH_TOKEN
     delete process.env.FRESHELL_TRUST_PROXY
+  })
+
+  describe('HTTP reverse proxy', () => {
+    let targetServer: http.Server
+    let targetPort: number
+
+    beforeAll(async () => {
+      const targetApp = express()
+      targetApp.get('/', (_req, res) => res.send('hello from target'))
+      targetApp.get('/path/to/page', (_req, res) => res.send('deep path'))
+      targetApp.get('/with-query', (req, res) => res.json({ q: req.query.q }))
+      targetApp.post('/echo', express.json(), (req, res) => res.json(req.body))
+      targetServer = await new Promise((resolve) => {
+        const server = targetApp.listen(0, '127.0.0.1', () => resolve(server))
+      })
+      targetPort = (targetServer.address() as AddressInfo).port
+    })
+
+    afterAll(async () => {
+      await new Promise<void>((resolve, reject) => {
+        targetServer.close((err) => (err ? reject(err) : resolve()))
+      })
+    })
+
+    it('proxies GET to localhost target', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('hello from target')
+    })
+
+    it('proxies deep paths', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/path/to/page`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('deep path')
+    })
+
+    it('preserves query strings', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/with-query?q=hello`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ q: 'hello' })
+    })
+
+    it('proxies POST with body', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .post(`/api/proxy/http/${targetPort}/echo`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ foo: 'bar' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ foo: 'bar' })
+    })
+
+    it('returns 502 for unreachable port', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get('/api/proxy/http/19999/')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(502)
+    })
+
+    it('rejects invalid port numbers', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get('/api/proxy/http/99999/')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(400)
+    })
   })
 
   it('waits for forward shutdown before returning from delete', async () => {

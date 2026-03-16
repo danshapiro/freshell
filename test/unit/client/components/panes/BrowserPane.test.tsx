@@ -151,17 +151,23 @@ describe('BrowserPane', () => {
       expect(iframe!.getAttribute('src')).toBe('https://example.com')
     })
 
-    it('preserves http:// protocol when specified', () => {
+    it('preserves http:// protocol when specified', async () => {
       setWindowHostname('localhost')
       renderBrowserPane()
 
       const input = screen.getByPlaceholderText('Enter URL...')
-      fireEvent.change(input, { target: { value: 'http://localhost:3000' } })
-      fireEvent.keyDown(input, { key: 'Enter' })
+      await act(async () => {
+        // Use port 4000 to avoid collision with jsdom's default port (3000)
+        fireEvent.change(input, { target: { value: 'http://localhost:4000' } })
+        fireEvent.keyDown(input, { key: 'Enter' })
+      })
 
-      const iframe = document.querySelector('iframe')
-      expect(iframe).toBeTruthy()
-      expect(iframe!.getAttribute('src')).toContain('localhost:3000')
+      await waitFor(() => {
+        const iframe = document.querySelector('iframe')
+        expect(iframe).toBeTruthy()
+        // Localhost URLs are proxied through Freshell's HTTP proxy (handles WSL2/Docker)
+        expect(iframe!.getAttribute('src')).toBe('/api/proxy/http/4000/')
+      })
     })
 
     it('syncs input and history when url prop changes externally', () => {
@@ -465,15 +471,22 @@ describe('BrowserPane', () => {
       })
     })
 
-    it('does not request port forwarding when accessing locally', () => {
+    it('proxies localhost URLs through HTTP proxy when accessing locally', async () => {
       setWindowHostname('localhost')
-      renderBrowserPane({ url: 'http://localhost:3000' })
+      await act(async () => {
+        // Use port 4000 to avoid collision with jsdom's default port (3000)
+        renderBrowserPane({ url: 'http://localhost:4000' })
+      })
 
+      // No TCP port forward needed — uses HTTP proxy instead
       expect(api.post).not.toHaveBeenCalled()
 
-      const iframe = document.querySelector('iframe')
-      expect(iframe).toBeTruthy()
-      expect(iframe!.getAttribute('src')).toBe('http://localhost:3000')
+      await waitFor(() => {
+        const iframe = document.querySelector('iframe')
+        expect(iframe).toBeTruthy()
+        // Routed through Freshell's HTTP proxy (handles WSL2/Docker networking)
+        expect(iframe!.getAttribute('src')).toBe('/api/proxy/http/4000/')
+      })
     })
 
     it('does not request port forwarding for non-localhost URLs', () => {
