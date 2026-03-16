@@ -156,8 +156,9 @@ For completeness, we should also fix the client-side fallback path so that a non
    - `TerminalRecord` type: Add optional `pendingResumeName?: string`
    - `findUnassociatedTerminals()`: Include terminals that have `pendingResumeName` but no `resumeSessionId`
 
-2. **`server/ws-handler.ts`** (remove redundant gate)
+2. **`server/ws-handler.ts`** (remove redundant gate, guard session repair)
    - Remove lines 1135-1138 that discard non-UUID Claude resume names. The terminal registry's normalization is the single source of truth.
+   - Add `isValidClaudeSessionId` guard to the session repair block (line 1299) so session repair is only invoked for UUID-based resume IDs. Human-readable names don't have corresponding `<name>.jsonl` files; Claude Code resolves them internally.
 
 3. **`server/session-association-coordinator.ts`** (no changes needed -- it already works correctly when terminals are unassociated)
 
@@ -167,6 +168,7 @@ For completeness, we should also fix the client-side fallback path so that a non
 
 5. **`src/lib/session-utils.ts`** (client-side defense in depth)
    - `isValidSessionRef()` (line 22-26): Allow non-UUID Claude session refs when they are non-empty strings
+   - `extractSessionLocators()` (lines 106 and 115): Remove direct `isValidClaudeSessionId` checks that block intrinsic `resumeSessionId` path for non-UUID Claude names
 
 6. **`src/store/layoutMirrorMiddleware.ts`** (client-side defense in depth)
    - `buildTabFallbackSessionRef()` (line 16): Allow non-UUID Claude session refs
@@ -180,7 +182,8 @@ For completeness, we should also fix the client-side fallback path so that a non
 2. **`test/unit/client/store/selectors/sidebarSelectors.test.ts`**: Add test for non-UUID Claude resume name fallback item
 3. **`test/unit/client/lib/session-utils.test.ts`**: Add test for non-UUID Claude session ref in `isValidSessionRef`
 4. **`test/server/session-association.test.ts`**: Add test for named-resume-to-UUID association flow
-5. **`test/e2e/open-tab-session-sidebar-visibility.test.tsx`**: Add test for non-UUID resume name tab visibility
+5. **`test/server/ws-terminal-create-session-repair.test.ts`**: Update test for non-UUID resume ID pass-through and session repair skip
+6. **`test/e2e/open-tab-session-sidebar-visibility.test.tsx`**: Add test for non-UUID resume name tab visibility
 
 ---
 
@@ -195,6 +198,7 @@ This is the core fix. We split `normalizeResumeSessionId` into two functions and
 - Modify: `server/terminal-registry.ts:1735-1754` (findUnassociatedTerminals)
 - Modify: `server/terminal-registry.ts:1768-1837` (bindSession)
 - Modify: `server/ws-handler.ts:1135-1138` (remove early UUID check)
+- Modify: `server/ws-handler.ts:1299` (add UUID guard to session repair block)
 - Test: `test/unit/server/terminal-registry.test.ts`
 
 - [ ] **Step 1: Write failing test — `buildSpawnSpec` should pass `--resume` with non-UUID Claude name**
@@ -369,6 +373,18 @@ if (m.mode === 'claude' && effectiveResumeSessionId && !isValidClaudeSessionId(e
 ```
 
 The terminal registry's split normalization now handles this correctly — the spawn gets the raw name, the binding only uses valid UUIDs.
+
+Also update the session repair guard at line 1299 to only enter session repair when the resume ID is a valid UUID. Session repair searches for `<sessionId>.jsonl` files, which only makes sense for UUID-based session IDs. For human-readable resume names, Claude Code handles the name-to-UUID resolution internally:
+
+```typescript
+// OLD (line 1299):
+if (m.mode === 'claude' && effectiveResumeSessionId && this.sessionRepairService) {
+
+// NEW:
+if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
+```
+
+This prevents a pointless glob for `*/137 tour.jsonl` (which would throw, get caught, and add latency). The `isValidClaudeSessionId` import is already present in `ws-handler.ts`.
 
 Update the existing test `'omits --resume when resumeSessionId is invalid'` (line 764) to reflect the new behavior. The test name and assertion should change: non-UUID names are NOW valid resume args for Claude. Change the test to verify that empty strings are rejected:
 
@@ -560,7 +576,7 @@ Expected: FAIL — current code skips non-UUID Claude session refs in the fallba
 
 - [ ] **Step 3: Implement — Relax UUID requirement in fallback display paths**
 
-**In `src/lib/session-utils.ts`**, modify `isValidSessionRef` to accept non-UUID Claude session refs when they are non-empty:
+**In `src/lib/session-utils.ts`**, modify `isValidSessionRef` (line 22-26) to accept non-UUID Claude session refs when they are non-empty:
 
 ```typescript
 function isValidSessionRef(provider: string, sessionId: string): provider is CodingCliProviderName {
@@ -572,7 +588,24 @@ function isValidSessionRef(provider: string, sessionId: string): provider is Cod
 }
 ```
 
-**Justification:** `isValidSessionRef` is used by `extractSessionLocators`, `sanitizeSessionLocator`, `buildTabFallbackLocator`, and `collectSessionRefsFromNode`. These are all in the *display/navigation* path, not the *binding authority* path. Allowing non-UUID Claude refs here lets the sidebar show a fallback item for the tab while the UUID is being discovered. Once the UUID is bound, the pane's `sessionRef` is updated to the real UUID.
+**Justification:** `isValidSessionRef` is used by `sanitizeSessionLocator`, `buildTabFallbackLocator`, and `collectSessionRefsFromNode` (via `sanitizeSessionLocator`). These are all in the *display/navigation* path, not the *binding authority* path. Allowing non-UUID Claude refs here lets the sidebar show a fallback item for the tab while the UUID is being discovered. Once the UUID is bound, the pane's `sessionRef` is updated to the real UUID.
+
+Also modify `extractSessionLocators` (lines 104-117) to remove the direct `isValidClaudeSessionId` checks on the intrinsic `resumeSessionId` path. These are redundant with the `isValidSessionRef` change above, but more importantly, without removing them the intrinsic path silently fails for non-UUID names. Although the explicit `sessionRef` path (via `sanitizeSessionLocator`) compensates, leaving the intrinsic path broken creates a fragile dependency on `sessionRef` always being present:
+
+```typescript
+// Line 106 (agent-chat path) — REMOVE the isValidClaudeSessionId gate:
+// OLD:
+if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
+// NEW:
+if (!sessionId) return dedupeBy(locators, locatorIdentity)
+
+// Line 115 (terminal path) — REMOVE the isValidClaudeSessionId gate:
+// OLD:
+if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
+// NEW: (remove this line entirely — empty sessionId is already handled by line 114)
+```
+
+This ensures `collectSessionRefsFromNode` returns results for non-UUID Claude panes regardless of whether they have an explicit `sessionRef`. The `isValidClaudeSessionId` import in `session-utils.ts` may become unused after this change — check and remove if so.
 
 **In `src/store/selectors/sidebarSelectors.ts`**, modify the two `isValidClaudeSessionId` guards in the fallback path:
 
@@ -719,7 +752,7 @@ Several existing tests assert that non-UUID Claude resume names are rejected. Th
 **Files:**
 - Modify: `test/unit/server/terminal-registry.test.ts` (Windows-specific --resume tests)
 - Modify: `test/unit/client/store/selectors/sidebarSelectors.test.ts` (hasTab test for invalid IDs)
-- Modify: `test/server/ws-terminal-create-session-repair.test.ts` (if it has tests for invalid resume IDs)
+- Modify: `test/server/ws-terminal-create-session-repair.test.ts` (session repair test for non-UUID resume IDs)
 - Test: `test/unit/client/lib/claude-session-id.test.ts` (verify UUID validation still works)
 
 - [ ] **Step 1: Identify all tests that assert non-UUID Claude resume names are rejected**
@@ -733,6 +766,9 @@ The Windows tests in `terminal-registry.test.ts`:
 
 The sidebar test in `sidebarSelectors.test.ts`:
 - `'keeps hasTab correct for layout-backed and no-layout fallback sessions'` (line 93) — this test asserts that `hasTab` is `false` for a Claude session with `invalidClaudeSessionId`. With our fix, `hasTab` should be `true` since the non-UUID resume name now creates a valid fallback item.
+
+The session repair test in `ws-terminal-create-session-repair.test.ts`:
+- `'ignores invalid resumeSessionId and skips session repair wait'` (line 829) — this test creates a terminal with `resumeSessionId: 'not-a-uuid'` and asserts that `registry.lastCreateOpts?.resumeSessionId` is `undefined`, `created.effectiveResumeSessionId` is `undefined`, and session repair was NOT called for `'not-a-uuid'`. With our fix, the non-UUID name is passed through (no longer stripped), AND session repair is skipped because of the new `isValidClaudeSessionId` guard on the repair path.
 
 - [ ] **Step 2: Update the Windows `buildSpawnSpec` tests**
 
@@ -784,16 +820,55 @@ Update the assertion:
 expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(true)
 ```
 
-- [ ] **Step 4: Run all tests to verify**
+- [ ] **Step 4: Update the session repair test**
 
-Run: `cd /home/user/code/freshell/.worktrees/fix-named-resume-sidebar && npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/lib/claude-session-id.test.ts`
+In `test/server/ws-terminal-create-session-repair.test.ts`, the test `'ignores invalid resumeSessionId and skips session repair wait'` (line 829) needs to be updated. The non-UUID resume name is no longer stripped by ws-handler, so it IS passed through to `registry.create()`. However, session repair IS still skipped because of the new `isValidClaudeSessionId` guard on the repair path.
+
+Update the test name and assertions:
+
+```typescript
+it('passes non-UUID resumeSessionId through to create and skips session repair wait', async () => {
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+  try {
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    await waitForReady(ws)
+
+    const requestId = 'resume-invalid-1'
+    const createdPromise = waitForCreated(ws, requestId)
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'claude',
+      resumeSessionId: 'not-a-uuid',
+    }))
+
+    const created = await createdPromise
+
+    // Non-UUID name is now passed through to the registry (not stripped)
+    expect(registry.lastCreateOpts?.resumeSessionId).toBe('not-a-uuid')
+    // effectiveResumeSessionId is set because the name is passed through
+    expect(created.effectiveResumeSessionId).toBe('not-a-uuid')
+    // Session repair is still skipped for non-UUID names
+    expect(sessionRepairService.waitForSessionCalls).not.toContain('not-a-uuid')
+  } finally {
+    await closeWebSocket(ws)
+  }
+})
+```
+
+Note: Check the test infrastructure to verify that `registry.lastCreateOpts` captures the raw opts passed to `create()` and that `created.effectiveResumeSessionId` comes from the `terminal.created` message. Adjust accessor names if needed.
+
+- [ ] **Step 5: Run all tests to verify**
+
+Run: `cd /home/user/code/freshell/.worktrees/fix-named-resume-sidebar && npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/lib/claude-session-id.test.ts test/server/ws-terminal-create-session-repair.test.ts`
 Expected: All PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cd /home/user/code/freshell/.worktrees/fix-named-resume-sidebar
-git add test/unit/server/terminal-registry.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts
+git add test/unit/server/terminal-registry.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/server/ws-terminal-create-session-repair.test.ts
 git commit -m "test: update assertions to match named resume pass-through behavior"
 ```
 
@@ -1022,7 +1097,8 @@ Expected: No lint errors
 - [ ] **Step 4: Clean up any unused imports**
 
 Check if removing `isValidClaudeSessionId` imports left any unused:
-- `src/store/selectors/sidebarSelectors.ts`: If `isValidClaudeSessionId` was only used in the removed lines, remove the import
+- `src/lib/session-utils.ts`: If `isValidClaudeSessionId` is no longer used after removing it from `isValidSessionRef` and `extractSessionLocators`, remove the import
+- `src/store/selectors/sidebarSelectors.ts`: If `isValidClaudeSessionId` was only used in the removed lines (note: the agent-chat path at line 185 still uses it), check whether it can be removed
 - `src/store/layoutMirrorMiddleware.ts`: If the import is now unused, remove it
 - `src/store/panesSlice.ts`: The import may still be used for `sessionRef` construction and agent-chat — check
 
@@ -1040,16 +1116,16 @@ git commit -m "refactor: remove unused imports after named resume fix"
 
 ### Server (core fix)
 - `server/terminal-registry.ts`: Split `normalizeResumeSessionId` into `normalizeResumeForSpawn` (pass-through for any non-empty string) and `normalizeResumeForBinding` (UUID-only for Claude session authority). Add `pendingResumeName` field to `TerminalRecord`.
-- `server/ws-handler.ts`: Remove the redundant early `isValidClaudeSessionId` check that discarded non-UUID resume names.
+- `server/ws-handler.ts`: Remove the redundant early `isValidClaudeSessionId` check that discarded non-UUID resume names. Add `isValidClaudeSessionId` guard to the session repair block so it only runs for UUID-based resume IDs.
 
 ### Client (defense in depth)
-- `src/lib/session-utils.ts`: Remove Claude UUID gate from `isValidSessionRef` so non-UUID resume names are valid session refs.
+- `src/lib/session-utils.ts`: Remove Claude UUID gate from `isValidSessionRef` so non-UUID resume names are valid session refs. Also remove direct `isValidClaudeSessionId` checks in `extractSessionLocators` intrinsic path (lines 106 and 115).
 - `src/store/selectors/sidebarSelectors.ts`: Remove `isValidClaudeSessionId` checks in fallback item generation paths.
 - `src/store/layoutMirrorMiddleware.ts`: Remove `isValidClaudeSessionId` check in `buildTabFallbackSessionRef`.
 - `src/store/panesSlice.ts`: Remove Claude-specific UUID validation for `resumeSessionId` storage on terminal panes.
 
 ### Tests
-- Updated existing tests that asserted non-UUID Claude resume names are rejected
+- Updated existing tests that asserted non-UUID Claude resume names are rejected (including `terminal-registry.test.ts`, `sidebarSelectors.test.ts`, and `ws-terminal-create-session-repair.test.ts`)
 - New server unit tests for named resume pass-through in `buildSpawnSpec`
 - New integration test for named-resume -> UUID association coordinator flow
 - New client unit tests for sidebar fallback items with non-UUID Claude names
