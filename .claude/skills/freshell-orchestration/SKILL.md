@@ -7,17 +7,12 @@ description: "Use when interacting with Freshell panes, panels, or tabs from the
 
 ## Start state
 
+Freshell injects `FRESHELL_URL` and `FRESHELL_TOKEN` into every spawned terminal. They are already set in your environment.
+
 Use the repo-local CLI entrypoint (no build needed):
 
 ```bash
 FSH="npx tsx server/cli/index.ts"
-```
-
-Point commands at the running Freshell server:
-
-```bash
-export FRESHELL_URL="http://localhost:3001"
-export FRESHELL_TOKEN="$(grep AUTH_TOKEN /home/user/code/freshell/.env | cut -d= -f2)"
 $FSH health
 ```
 
