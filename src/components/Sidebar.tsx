@@ -363,7 +363,7 @@ export default function Sidebar({
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
   const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
-  const showDeepSearchPending = !!sidebarWindow?.deepSearchPending && sidebarWindowHasItems
+  const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
@@ -588,7 +588,7 @@ export default function Sidebar({
               <option value="userMessages">User Msg</option>
               <option value="fullText">Full Text</option>
             </select>
-            {showDeepSearchPending && (
+            {showDeepSearchPending && sidebarWindowHasItems && (
               <div role="status" aria-live="polite" className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
                 <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
                 <span>Scanning files...</span>
@@ -637,6 +637,12 @@ export default function Sidebar({
               </span>
             </div>
           ) : sortedItems.length === 0 ? (
+          showDeepSearchPending ? (
+            <div className="flex items-center justify-center py-8" role="status" aria-live="polite">
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />
+              <span className="ml-2 text-sm text-muted-foreground">Scanning files...</span>
+            </div>
+          ) : (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
             {activeQuery && activeSearchTier !== 'title'
               ? 'No results found'
@@ -644,6 +650,7 @@ export default function Sidebar({
               ? 'No matching sessions'
               : 'No sessions yet'}
           </div>
+          )
           ) : (
             <div
               ref={listRef}

@@ -16,6 +16,8 @@ export interface SessionWindowState {
   query?: string
   searchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
+  partial?: boolean
+  partialReason?: 'budget' | 'io_error'
 }
 
 function sessionKey(s: any): string {
@@ -217,6 +219,8 @@ export const sessionsSlice = createSlice({
         query?: string
         searchTier?: 'title' | 'userMessages' | 'fullText'
         deepSearchPending?: boolean
+        partial?: boolean
+        partialReason?: 'budget' | 'io_error'
       }>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
@@ -230,6 +234,8 @@ export const sessionsSlice = createSlice({
       window.loadingKind = undefined
       window.error = undefined
       window.deepSearchPending = action.payload.deepSearchPending ?? false
+      window.partial = action.payload.partial
+      window.partialReason = action.payload.partialReason
       if (action.payload.query !== undefined) window.query = action.payload.query
       if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
       if (!state.activeSurface || state.activeSurface === action.payload.surface) {

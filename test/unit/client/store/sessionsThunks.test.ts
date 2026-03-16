@@ -1141,6 +1141,56 @@ describe('sessionsThunks', () => {
       expect(store.getState().sessions.windows.sidebar.error).toBe('Deep search failed')
     })
 
+    it('forwards partial and partialReason from Phase 2 response to window state', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise)
+        .mockReturnValueOnce(phase2Deferred.promise)
+
+      const store = createLoadedStore()
+
+      const request = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      phase1Deferred.resolve({
+        results: [],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 0,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Phase 1: no partial info
+      expect(store.getState().sessions.windows.sidebar.partial).toBeUndefined()
+
+      phase2Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'userMessage',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 50,
+        partial: true,
+        partialReason: 'budget',
+      })
+
+      await request
+
+      expect(store.getState().sessions.windows.sidebar.partial).toBe(true)
+      expect(store.getState().sessions.windows.sidebar.partialReason).toBe('budget')
+    })
+
     it('Phase 1 abort prevents Phase 2 from firing', async () => {
       const phase1Deferred = createDeferred<any>()
       searchSessions.mockReturnValueOnce(phase1Deferred.promise)

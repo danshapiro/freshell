@@ -2903,7 +2903,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
     })
 
-    it('does not show "Scanning files..." when no items are visible even if deepSearchPending', async () => {
+    it('shows "Scanning files..." in empty state when deepSearchPending is true and no items visible', async () => {
       const store = createTestStore({
         projects: [],
         sessions: {
@@ -2927,7 +2927,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
       fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
       await act(() => vi.advanceTimersByTime(0))
 
-      expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
+      expect(screen.getByText('Scanning files...')).toBeInTheDocument()
+      expect(screen.queryByText('No results found')).not.toBeInTheDocument()
     })
 
     it('clearing search input removes "Scanning files..." indicator', async () => {

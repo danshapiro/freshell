@@ -184,6 +184,7 @@ function buildSearchPayload(
   query: string,
   searchTier: SearchOptions['tier'],
   deepSearchPending: boolean,
+  opts?: { partial?: boolean; partialReason?: 'budget' | 'io_error' },
 ) {
   const last = results.at(-1)
   return {
@@ -196,6 +197,8 @@ function buildSearchPayload(
     query,
     searchTier,
     deepSearchPending,
+    partial: opts?.partial,
+    partialReason: opts?.partialReason,
   }
 }
 
@@ -257,7 +260,10 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               if (controller.signal.aborted) return
 
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-              dispatch(setSessionWindowData(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false)))
+              dispatch(setSessionWindowData(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
+                partial: deepResponse.partial,
+                partialReason: deepResponse.partialReason,
+              })))
             } catch (phase2Error) {
               if (controller.signal.aborted) return
               // Phase 2 failed but Phase 1 data is already displayed.
@@ -277,7 +283,10 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(setSessionWindowData(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false)))
+            dispatch(setSessionWindowData(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
+              partial: response.partial,
+              partialReason: response.partialReason,
+            })))
           }
           return
         }
