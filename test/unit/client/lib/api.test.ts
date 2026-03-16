@@ -269,6 +269,69 @@ describe('visible-first read-model helpers', () => {
   })
 })
 
+describe('searchSessions tier forwarding', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('includes tier in session directory URL when not title', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    await searchSessions({ query: 'test', tier: 'fullText' })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    expect(requestUrl).toContain('tier=fullText')
+  })
+
+  it('omits tier from URL when tier is title (the default)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    await searchSessions({ query: 'test', tier: 'title' })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    expect(requestUrl).not.toContain('tier=')
+  })
+
+  it('defaults tier to title when not specified', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    await searchSessions({ query: 'test' })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    expect(requestUrl).not.toContain('tier=')
+  })
+
+  it('includes tier=userMessages in URL', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    await searchSessions({ query: 'test', tier: 'userMessages' })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    expect(requestUrl).toContain('tier=userMessages')
+  })
+})
+
 describe('setSessionMetadata()', () => {
   beforeEach(() => {
     mockFetch.mockReset()

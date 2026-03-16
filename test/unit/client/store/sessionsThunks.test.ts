@@ -763,6 +763,55 @@ describe('sessionsThunks', () => {
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(3)
   })
 
+  it('passes tier to searchSessions when a query is active', async () => {
+    searchSessions.mockResolvedValue({
+      results: [],
+      tier: 'userMessages',
+      query: 'needle',
+      totalScanned: 0,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'needle',
+      searchTier: 'userMessages',
+    }) as any)
+
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'userMessages',
+      signal: expect.any(AbortSignal),
+    })
+  })
+
+  it('defaults searchTier to title when not provided', async () => {
+    searchSessions.mockResolvedValue({
+      results: [],
+      tier: 'title',
+      query: 'needle',
+      totalScanned: 0,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'needle',
+    }) as any)
+
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
+  })
+
   it('reset hook cancels parked invalidation runners before they can dispatch follow-up fetches', async () => {
     const firstFetch = createDeferred<any>()
     fetchSidebarSessionsSnapshot.mockReturnValueOnce(firstFetch.promise)
