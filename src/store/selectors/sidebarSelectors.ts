@@ -198,7 +198,6 @@ export function buildSessionItems(
 
     if (node.content.kind !== 'terminal') return
     if (node.content.mode === 'shell' || !node.content.resumeSessionId) return
-    if (node.content.mode === 'claude' && !isValidClaudeSessionId(node.content.resumeSessionId)) return
 
     const metadata = getSessionMetadata(tab, node.content.mode, node.content.resumeSessionId)
     pushFallbackItem({
@@ -225,7 +224,6 @@ export function buildSessionItems(
     const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
     const sessionId = tab.resumeSessionId
     if (!provider || !sessionId) continue
-    if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) continue
 
     const metadata = getSessionMetadata(tab, provider, sessionId)
     pushFallbackItem({

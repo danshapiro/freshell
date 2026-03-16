@@ -174,6 +174,46 @@ describe('sidebarSelectors', () => {
       expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(false)
     })
 
+    it('creates a fallback sidebar item for a Claude pane with a human-readable resume name', () => {
+      const tabs = [
+        { id: 'tab-named', title: 'Named Resume Session', mode: 'claude', createdAt: 3_000 },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-named': {
+            type: 'leaf',
+            id: 'pane-named',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              status: 'running',
+              createRequestId: 'req-named',
+              resumeSessionId: '137 tour',
+            },
+          },
+        },
+        activePane: {
+          'tab-named': 'pane-named',
+        },
+        paneTitles: {
+          'tab-named': {
+            'pane-named': 'Named Resume Session',
+          },
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0]).toMatchObject({
+        sessionId: '137 tour',
+        provider: 'claude',
+        title: 'Named Resume Session',
+        hasTab: true,
+      })
+    })
+
     it('synthesizes a local fallback row for restored open sessions that are not in the current server window', () => {
       const fallbackSessionId = 'codex-restored'
       const tabs = [

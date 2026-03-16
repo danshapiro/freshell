@@ -26,13 +26,7 @@ function normalizePaneContent(
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
-    const resumeSessionId = hasLifecycleFields
-      ? inputResumeSessionId
-      : mode === 'claude' && isValidClaudeSessionId(input.resumeSessionId)
-        ? input.resumeSessionId
-        : mode === 'claude'
-          ? undefined
-          : input.resumeSessionId
+    const resumeSessionId = inputResumeSessionId
     const explicitSessionRef = input.sessionRef
       && typeof input.sessionRef.provider === 'string'
       && typeof input.sessionRef.sessionId === 'string'

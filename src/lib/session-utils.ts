@@ -22,7 +22,10 @@ function isNonEmptyString(value: unknown): value is string {
 function isValidSessionRef(provider: string, sessionId: string): provider is CodingCliProviderName {
   // Provider names are validated at creation time; here we just check it's a valid non-shell mode.
   if (!isNonShellMode(provider) || sessionId.length === 0) return false
-  return provider !== 'claude' || isValidClaudeSessionId(sessionId)
+  // All non-empty session IDs are valid refs. Claude named resumes (non-UUID)
+  // are legitimate: the terminal was launched with --resume "<name>" and is
+  // waiting for the association coordinator to discover the real UUID.
+  return true
 }
 
 function locatorIdentity(locator: SessionLocator): string {
@@ -112,7 +115,6 @@ function extractSessionLocators(content: PaneContent): Array<{
   if (!isNonShellMode(content.mode)) return dedupeBy(locators, locatorIdentity)
   const sessionId = content.resumeSessionId
   if (!sessionId) return dedupeBy(locators, locatorIdentity)
-  if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
   locators.push({ provider: content.mode, sessionId })
   return dedupeBy(locators, locatorIdentity)
 }

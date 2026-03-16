@@ -1,6 +1,5 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 const INITIAL_LAYOUT_SYNC_DEBOUNCE_MS = 1000
 const LAYOUT_SYNC_DEBOUNCE_MS = 200
@@ -13,7 +12,6 @@ function buildTabFallbackSessionRef(tab: {
   const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
   const sessionId = tab.resumeSessionId
   if (!provider || !sessionId) return undefined
-  if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) return undefined
   return { provider, sessionId }
 }
 
