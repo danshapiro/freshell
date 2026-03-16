@@ -607,6 +607,80 @@ describe('useTabBarScroll', () => {
     })
   })
 
+  describe('active tab visibility maintenance', () => {
+    it('keeps the active tab onscreen when the container shrinks', () => {
+      const el = createMockScrollContainer({
+        scrollWidth: 800,
+        clientWidth: 300,
+        scrollLeft: 0,
+        boundingLeft: 0,
+      })
+
+      const tabEl = createMockTabElement('tab-2', { boundingLeft: 180, boundingWidth: 100 })
+      el.appendChild(tabEl)
+      el.querySelector = vi.fn((selector: string) => {
+        if (selector === '[data-tab-id="tab-2"]') return tabEl
+        return null
+      }) as any
+
+      const { result } = renderHook(
+        ({ activeTabId, tabCount }) => useTabBarScroll(activeTabId, tabCount),
+        { initialProps: { activeTabId: 'tab-2' as string | null, tabCount: 5 } }
+      )
+
+      act(() => {
+        result.current.callbackRef(el)
+      })
+
+      ;(el.scrollTo as ReturnType<typeof vi.fn>).mockClear()
+
+      Object.defineProperty(el, 'clientWidth', { value: 200, configurable: true })
+      resizeCallback?.([])
+
+      expect(el.scrollTo).toHaveBeenCalledWith({
+        left: 80,
+        behavior: 'instant',
+      })
+    })
+
+    it('keeps the active tab onscreen when tab count changes without changing the active tab', () => {
+      const el = createMockScrollContainer({
+        scrollWidth: 500,
+        clientWidth: 300,
+        scrollLeft: 0,
+        boundingLeft: 0,
+      })
+
+      const tabEl = createMockTabElement('tab-2', { boundingLeft: 220, boundingWidth: 100 })
+      el.appendChild(tabEl)
+      el.querySelector = vi.fn((selector: string) => {
+        if (selector === '[data-tab-id="tab-2"]') return tabEl
+        return null
+      }) as any
+
+      const { result, rerender } = renderHook(
+        ({ activeTabId, tabCount }) => useTabBarScroll(activeTabId, tabCount),
+        { initialProps: { activeTabId: 'tab-2' as string | null, tabCount: 4 } }
+      )
+
+      act(() => {
+        result.current.callbackRef(el)
+      })
+
+      ;(el.scrollTo as ReturnType<typeof vi.fn>).mockClear()
+
+      Object.defineProperty(el, 'clientWidth', { value: 250, configurable: true })
+      Object.defineProperty(el, 'scrollWidth', { value: 650, configurable: true })
+
+      rerender({ activeTabId: 'tab-2', tabCount: 6 })
+
+      expect(el.scrollTo).toHaveBeenCalledWith({
+        left: 70,
+        behavior: 'instant',
+      })
+    })
+  })
+
   describe('scrollJumpRight', () => {
     it('scrolls so the cutoff right-edge tab is fully visible with next tab peeking', () => {
       // Container: clientWidth=300, scrollLeft=0

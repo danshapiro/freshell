@@ -27,10 +27,14 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
   const cleanupRef = useRef<(() => void) | null>(null)
   const holdRafRef = useRef<number | null>(null)
   const pointerHandledRef = useRef(false)
+  const activeTabIdRef = useRef(activeTabId)
+  const lastAutoScrolledActiveTabIdRef = useRef<string | null>(null)
   const [overflow, setOverflow] = useState<TabBarScrollState>({
     canScrollLeft: false,
     canScrollRight: false,
   })
+
+  activeTabIdRef.current = activeTabId
 
   const updateOverflow = useCallback((el: HTMLDivElement | null) => {
     if (!el) {
@@ -44,6 +48,53 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
       canScrollRight: scrollLeft + clientWidth < scrollWidth - SCROLL_THRESHOLD,
     })
   }, [])
+
+  const scrollContainerTo = useCallback((el: HTMLDivElement, left: number, behavior: ScrollBehavior) => {
+    const maxScroll = Math.max(0, el.scrollWidth - el.clientWidth)
+    const targetLeft = Math.max(0, Math.min(left, maxScroll))
+
+    if (typeof el.scrollTo === 'function') {
+      el.scrollTo({ left: targetLeft, behavior })
+    } else {
+      el.scrollLeft = targetLeft
+    }
+  }, [])
+
+  const getTabScrollMetrics = useCallback((tabId: string) => {
+    const el = nodeRef.current
+    if (!el) return null
+
+    const tabEl = el.querySelector(`[data-tab-id="${CSS.escape(tabId)}"]`) as HTMLElement | null
+    if (!tabEl) return null
+
+    const containerRect = el.getBoundingClientRect()
+    const tabRect = tabEl.getBoundingClientRect()
+    const leftInScroll = (tabRect.left - containerRect.left) + el.scrollLeft
+
+    return {
+      el,
+      leftInScroll,
+      rightInScroll: leftInScroll + tabRect.width,
+    }
+  }, [])
+
+  const ensureTabVisible = useCallback((tabId: string, behavior: ScrollBehavior = 'instant') => {
+    const metrics = getTabScrollMetrics(tabId)
+    if (!metrics) return
+
+    const { el, leftInScroll, rightInScroll } = metrics
+    const visibleLeft = el.scrollLeft
+    const visibleRight = visibleLeft + el.clientWidth
+
+    if (leftInScroll < visibleLeft + SCROLL_THRESHOLD) {
+      scrollContainerTo(el, leftInScroll, behavior)
+      return
+    }
+
+    if (rightInScroll > visibleRight - SCROLL_THRESHOLD) {
+      scrollContainerTo(el, rightInScroll - el.clientWidth, behavior)
+    }
+  }, [getTabScrollMetrics, scrollContainerTo])
 
   const callbackRef = useCallback((node: HTMLDivElement | null) => {
     // Tear down previous listeners if any
@@ -71,7 +122,12 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     node.addEventListener('scroll', handleScroll, { passive: true })
 
     // Set up ResizeObserver
-    const observer = new ResizeObserver(() => updateOverflow(node))
+    const observer = new ResizeObserver(() => {
+      updateOverflow(node)
+      if (activeTabIdRef.current) {
+        ensureTabVisible(activeTabIdRef.current, 'instant')
+      }
+    })
     observer.observe(node)
 
     // Store cleanup function
@@ -107,29 +163,23 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
   // fires either. So we need an explicit trigger keyed on tabCount.
   useEffect(() => {
     updateOverflow(nodeRef.current)
-  }, [tabCount, updateOverflow])
+    if (activeTabId && lastAutoScrolledActiveTabIdRef.current === activeTabId) {
+      ensureTabVisible(activeTabId, 'instant')
+    }
+  }, [activeTabId, tabCount, ensureTabVisible, updateOverflow])
 
   const scrollToTab = useCallback((tabId: string) => {
-    const el = nodeRef.current
-    if (!el) return
+    const metrics = getTabScrollMetrics(tabId)
+    if (!metrics) return
 
-    const tabEl = el.querySelector(`[data-tab-id="${CSS.escape(tabId)}"]`) as HTMLElement | null
-    if (!tabEl) return
-
-    const containerRect = el.getBoundingClientRect()
-    const tabRect = tabEl.getBoundingClientRect()
-
+    const { el, leftInScroll, rightInScroll } = metrics
     // Compute tab center in container's scrollable coordinate space
-    const tabCenterInContainer = (tabRect.left - containerRect.left) + el.scrollLeft + (tabRect.width / 2)
+    const tabCenterInContainer = (leftInScroll + rightInScroll) / 2
     const containerCenter = el.clientWidth / 2
     const targetScroll = Math.max(0, tabCenterInContainer - containerCenter)
 
-    if (typeof el.scrollTo === 'function') {
-      el.scrollTo({ left: targetScroll, behavior: 'smooth' })
-    } else {
-      el.scrollLeft = targetScroll
-    }
-  }, [])
+    scrollContainerTo(el, targetScroll, 'smooth')
+  }, [getTabScrollMetrics, scrollContainerTo])
 
   const scrollJumpRight = useCallback((behavior: ScrollBehavior = 'smooth') => {
     const el = nodeRef.current
@@ -300,6 +350,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     if (activeTabId) {
       scrollToTab(activeTabId)
     }
+    lastAutoScrolledActiveTabIdRef.current = activeTabId
   }, [activeTabId, scrollToTab])
 
   return {
