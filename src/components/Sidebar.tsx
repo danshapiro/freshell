@@ -191,13 +191,13 @@ export default function Sidebar({
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
   const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
-  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
   const terminals = useAppSelector((state) => (
     (state as any).terminalDirectory?.windows?.sidebar?.items ?? EMPTY_TERMINALS
   )) as BackgroundTerminal[]
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const lastMarkedSearchQueryRef = useRef<string | null>(null)
+  const wasSearchingRef = useRef(false)
   const listRef = useRef<HTMLDivElement | null>(null)
   const listContentRef = useRef<HTMLDivElement | null>(null)
   const listMetricsRef = useRef({ clientHeight: 0, scrollHeight: 0 })
@@ -214,7 +214,8 @@ export default function Sidebar({
   useEffect(() => {
     const query = filter.trim()
     if (!query) {
-      if (sidebarWindow && lastMarkedSearchQueryRef.current !== null) {
+      if (wasSearchingRef.current) {
+        wasSearchingRef.current = false
         lastMarkedSearchQueryRef.current = null
         void dispatch(fetchSessionWindow({
           surface: 'sidebar',
@@ -224,11 +225,8 @@ export default function Sidebar({
       return
     }
 
-    if (!sidebarWindow && topLevelSessionCount > 0 && searchTier === 'title') {
-      return
-    }
-
     const timeoutId = setTimeout(async () => {
+      wasSearchingRef.current = true
       void dispatch(fetchSessionWindow({
         surface: 'sidebar',
         priority: 'visible',
@@ -240,9 +238,9 @@ export default function Sidebar({
     return () => {
       clearTimeout(timeoutId)
     }
-  }, [dispatch, filter, searchTier, sidebarWindow, topLevelSessionCount])
+  }, [dispatch, filter, searchTier])
 
-  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, sidebarWindow ? '' : filter))
+  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
   const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
 
   // Stabilize the array reference so react-window doesn't rebuild all row
@@ -365,6 +363,7 @@ export default function Sidebar({
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
   const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
+  const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
@@ -589,6 +588,12 @@ export default function Sidebar({
               <option value="userMessages">User Msg</option>
               <option value="fullText">Full Text</option>
             </select>
+            {showDeepSearchPending && (
+              <div role="status" aria-live="polite" className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                <span>Scanning files...</span>
+              </div>
+            )}
           </div>
         )}
       </div>

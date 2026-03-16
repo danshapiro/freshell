@@ -1131,7 +1131,24 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('session filtering', () => {
-    it('filters sessions by title', async () => {
+    it('filters sessions by title via server-side search', async () => {
+      vi.mocked(mockSearchSessions).mockResolvedValue({
+        results: [
+          {
+            sessionId: sessionId('session-1'),
+            provider: 'claude',
+            projectPath: '/home/user/project',
+            matchedIn: 'title' as const,
+            lastActivityAt: Date.now(),
+            title: 'Fix authentication bug',
+            cwd: '/home/user/project',
+          },
+        ],
+        tier: 'title',
+        query: 'auth',
+        totalScanned: 2,
+      })
+
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -1167,12 +1184,35 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const searchInput = screen.getByPlaceholderText('Search...')
       fireEvent.change(searchInput, { target: { value: 'auth' } })
 
-      // Only matching session visible
+      // Wait for debounce + server response
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+      })
+
+      // Only matching session visible (server-side filtering)
       expect(screen.getByText('Fix authentication bug')).toBeInTheDocument()
       expect(screen.queryByText('Add user profile page')).not.toBeInTheDocument()
     })
 
-    it('filters sessions by project path', async () => {
+    it('filters sessions via server-side search by project path', async () => {
+      vi.mocked(mockSearchSessions).mockResolvedValue({
+        results: [
+          {
+            sessionId: sessionId('session-1'),
+            provider: 'claude',
+            projectPath: '/home/user/project-alpha',
+            matchedIn: 'title' as const,
+            lastActivityAt: Date.now(),
+            title: 'Alpha work',
+            cwd: '/home/user/project-alpha',
+          },
+        ],
+        tier: 'title',
+        query: 'alpha',
+        totalScanned: 2,
+      })
+
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project-alpha',
@@ -1207,6 +1247,12 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       const searchInput = screen.getByPlaceholderText('Search...')
       fireEvent.change(searchInput, { target: { value: 'alpha' } })
+
+      // Wait for debounce + server response
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+      })
 
       expect(screen.getByText('Alpha work')).toBeInTheDocument()
       expect(screen.queryByText('Beta work')).not.toBeInTheDocument()
@@ -2454,9 +2500,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Change tier to userMessages
       fireEvent.change(getByRole('combobox', { name: /search tier/i }), { target: { value: 'userMessages' } })
 
-      // Wait for debounce
-      await act(() => vi.advanceTimersByTime(500))
+      // Wait for debounce and flush async (two-phase search: title then userMessages)
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+        await Promise.resolve()
+      })
 
+      // Two-phase search: Phase 1 calls with title, Phase 2 calls with userMessages
       expect(mockSearchSessions).toHaveBeenCalledWith({
         query: 'test',
         tier: 'userMessages',
@@ -2490,7 +2541,16 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(getByText('Found Session')).toBeInTheDocument()
     })
 
-    it('does not call API for title tier (uses local filter)', async () => {
+    it('calls searchSessions API for title tier (server-side search)', async () => {
+      vi.mocked(mockSearchSessions).mockResolvedValue({
+        results: [
+          { sessionId: 's1', provider: 'claude', projectPath: '/proj', matchedIn: 'title', lastActivityAt: 1000, title: 'Test session' },
+        ],
+        tier: 'title',
+        query: 'test',
+        totalScanned: 1,
+      })
+
       const store = createTestStore({
         projects: [
           {
@@ -2505,9 +2565,17 @@ describe('Sidebar Component - Session-Centric Display', () => {
       fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'test' } })
 
       // Keep default title tier
-      await act(() => vi.advanceTimersByTime(500))
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+      })
 
-      expect(mockSearchSessions).not.toHaveBeenCalled()
+      // After bypass removal, title tier search DOES call the API
+      expect(mockSearchSessions).toHaveBeenCalledWith({
+        query: 'test',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
     })
   })
 
@@ -2761,6 +2829,113 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(2)
       const newTab = state.tabs.tabs.find((t: any) => t.resumeSessionId === sessionId('session-no-layout'))
       expect(newTab).toBeDefined()
+    })
+  })
+
+  describe('deep search pending indicator', () => {
+    beforeEach(() => {
+      vi.mocked(mockSearchSessions).mockReset()
+    })
+
+    it('shows "Scanning files..." when deepSearchPending is true and items are visible', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          wsSnapshotReceived: true,
+          windows: {
+            sidebar: {
+              projects: [
+                {
+                  projectPath: '/proj',
+                  sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', lastActivityAt: 1000, title: 'Found Session' }],
+                },
+              ],
+              lastLoadedAt: Date.now(),
+              query: 'test',
+              searchTier: 'fullText',
+              deepSearchPending: true,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      // Need to type in the search box so the filter.trim() conditional shows the tier dropdown
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      await act(() => vi.advanceTimersByTime(0))
+
+      expect(screen.getByText('Scanning files...')).toBeInTheDocument()
+      expect(screen.getByText('Scanning files...').closest('[role="status"]')).toBeInTheDocument()
+    })
+
+    it('does not show "Scanning files..." when deepSearchPending is false', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          wsSnapshotReceived: true,
+          windows: {
+            sidebar: {
+              projects: [
+                {
+                  projectPath: '/proj',
+                  sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', lastActivityAt: 1000, title: 'Found Session' }],
+                },
+              ],
+              lastLoadedAt: Date.now(),
+              query: 'test',
+              searchTier: 'fullText',
+              deepSearchPending: false,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      await act(() => vi.advanceTimersByTime(0))
+
+      expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
+    })
+
+    it('"Scanning files..." indicator has role="status" and aria-live="polite"', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          wsSnapshotReceived: true,
+          windows: {
+            sidebar: {
+              projects: [
+                {
+                  projectPath: '/proj',
+                  sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', lastActivityAt: 1000, title: 'Found Session' }],
+                },
+              ],
+              lastLoadedAt: Date.now(),
+              query: 'test',
+              searchTier: 'fullText',
+              deepSearchPending: true,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      await act(() => vi.advanceTimersByTime(0))
+
+      const statusElement = screen.getByRole('status')
+      expect(statusElement).toBeInTheDocument()
+      expect(statusElement.getAttribute('aria-live')).toBe('polite')
+      expect(statusElement.textContent).toContain('Scanning files...')
     })
   })
 })
