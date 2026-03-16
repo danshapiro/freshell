@@ -178,6 +178,27 @@ export function activateSessionSurface(surface: SessionSurface) {
   }
 }
 
+function buildSearchPayload(
+  surface: SessionSurface,
+  results: SearchResult[],
+  query: string,
+  searchTier: SearchOptions['tier'],
+  deepSearchPending: boolean,
+) {
+  const last = results.at(-1)
+  return {
+    surface,
+    projects: searchResultsToProjects(results),
+    totalSessions: results.length,
+    oldestLoadedTimestamp: last?.lastActivityAt ?? 0,
+    oldestLoadedSessionId: last ? `${last.provider}:${last.sessionId}` : '',
+    hasMore: false,
+    query,
+    searchTier,
+    deepSearchPending,
+  }
+}
+
 export function fetchSessionWindow(args: FetchSessionWindowArgs) {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
     const { surface, query = '', searchTier = 'title', append = false } = args
@@ -224,19 +245,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(setSessionWindowData({
-              surface,
-              projects: searchResultsToProjects(titleResponse.results),
-              totalSessions: titleResponse.results.length,
-              oldestLoadedTimestamp: titleResponse.results.at(-1)?.lastActivityAt ?? 0,
-              oldestLoadedSessionId: titleResponse.results.at(-1)
-                ? `${titleResponse.results.at(-1)!.provider}:${titleResponse.results.at(-1)!.sessionId}`
-                : '',
-              hasMore: false,
-              query: trimmedQuery,
-              searchTier,
-              deepSearchPending: true,
-            }))
+            dispatch(setSessionWindowData(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true)))
 
             // Phase 2: file-based search
             try {
@@ -248,36 +257,12 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               if (controller.signal.aborted) return
 
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-              dispatch(setSessionWindowData({
-                surface,
-                projects: searchResultsToProjects(merged),
-                totalSessions: merged.length,
-                oldestLoadedTimestamp: merged.at(-1)?.lastActivityAt ?? 0,
-                oldestLoadedSessionId: merged.at(-1)
-                  ? `${merged.at(-1)!.provider}:${merged.at(-1)!.sessionId}`
-                  : '',
-                hasMore: false,
-                query: trimmedQuery,
-                searchTier,
-                deepSearchPending: false,
-              }))
+              dispatch(setSessionWindowData(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false)))
             } catch (phase2Error) {
               if (controller.signal.aborted) return
               // Phase 2 failed but Phase 1 data is already displayed.
               // Clear the pending indicator and report the error.
-              dispatch(setSessionWindowData({
-                surface,
-                projects: searchResultsToProjects(titleResponse.results),
-                totalSessions: titleResponse.results.length,
-                oldestLoadedTimestamp: titleResponse.results.at(-1)?.lastActivityAt ?? 0,
-                oldestLoadedSessionId: titleResponse.results.at(-1)
-                  ? `${titleResponse.results.at(-1)!.provider}:${titleResponse.results.at(-1)!.sessionId}`
-                  : '',
-                hasMore: false,
-                query: trimmedQuery,
-                searchTier,
-                deepSearchPending: false,
-              }))
+              dispatch(setSessionWindowData(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false)))
               dispatch(setSessionWindowError({
                 surface,
                 error: phase2Error instanceof Error ? phase2Error.message : 'Deep search failed',
@@ -292,19 +277,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(setSessionWindowData({
-              surface,
-              projects: searchResultsToProjects(response.results),
-              totalSessions: response.results.length,
-              oldestLoadedTimestamp: response.results.at(-1)?.lastActivityAt ?? 0,
-              oldestLoadedSessionId: response.results.at(-1)
-                ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
-                : '',
-              hasMore: false,
-              query: trimmedQuery,
-              searchTier,
-              deepSearchPending: false,
-            }))
+            dispatch(setSessionWindowData(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false)))
           }
           return
         }

@@ -176,7 +176,7 @@ describe('sessionsThunks', () => {
       surface: 'sidebar',
       priority: 'visible',
       query: 'needle',
-      searchTier: 'fullText',
+      searchTier: 'title',
     }) as any)
 
     try {
@@ -184,7 +184,7 @@ describe('sessionsThunks', () => {
     } finally {
       deferred.resolve({
         results: [],
-        tier: 'fullText',
+        tier: 'title',
         query: 'needle',
         totalScanned: 0,
       })
@@ -764,13 +764,21 @@ describe('sessionsThunks', () => {
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(3)
   })
 
-  it('passes tier to searchSessions when a query is active', async () => {
-    searchSessions.mockResolvedValue({
-      results: [],
-      tier: 'userMessages',
-      query: 'needle',
-      totalScanned: 0,
-    })
+  it('passes tier to searchSessions when a query is active with userMessages (two-phase)', async () => {
+    // userMessages triggers two-phase: first title, then userMessages
+    searchSessions
+      .mockResolvedValueOnce({
+        results: [],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 0,
+      })
+      .mockResolvedValueOnce({
+        results: [],
+        tier: 'userMessages',
+        query: 'needle',
+        totalScanned: 0,
+      })
 
     const store = createStore()
     store.dispatch(setActiveSessionSurface('sidebar'))
@@ -782,7 +790,13 @@ describe('sessionsThunks', () => {
       searchTier: 'userMessages',
     }) as any)
 
-    expect(searchSessions).toHaveBeenCalledWith({
+    expect(searchSessions).toHaveBeenCalledTimes(2)
+    expect(searchSessions).toHaveBeenNthCalledWith(1, {
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
+    expect(searchSessions).toHaveBeenNthCalledWith(2, {
       query: 'needle',
       tier: 'userMessages',
       signal: expect.any(AbortSignal),

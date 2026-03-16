@@ -2903,6 +2903,70 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
     })
 
+    it('does not show "Scanning files..." when no items are visible even if deepSearchPending', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          wsSnapshotReceived: true,
+          windows: {
+            sidebar: {
+              projects: [],
+              lastLoadedAt: Date.now(),
+              query: 'test',
+              searchTier: 'fullText',
+              deepSearchPending: true,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      await act(() => vi.advanceTimersByTime(0))
+
+      expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
+    })
+
+    it('clearing search input removes "Scanning files..." indicator', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          wsSnapshotReceived: true,
+          windows: {
+            sidebar: {
+              projects: [
+                {
+                  projectPath: '/proj',
+                  sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', lastActivityAt: 1000, title: 'Found Session' }],
+                },
+              ],
+              lastLoadedAt: Date.now(),
+              query: 'test',
+              searchTier: 'fullText',
+              deepSearchPending: true,
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      await act(() => vi.advanceTimersByTime(0))
+      expect(screen.getByText('Scanning files...')).toBeInTheDocument()
+
+      // Clear the search
+      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: '' } })
+      await act(() => vi.advanceTimersByTime(0))
+
+      expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
+    })
+
     it('"Scanning files..." indicator has role="status" and aria-live="polite"', async () => {
       const store = createTestStore({
         projects: [],

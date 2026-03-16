@@ -363,7 +363,7 @@ export default function Sidebar({
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
   const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
-  const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
+  const showDeepSearchPending = !!sidebarWindow?.deepSearchPending && sidebarWindowHasItems
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
