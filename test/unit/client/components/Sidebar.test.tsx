@@ -656,17 +656,17 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toHaveClass('bg-muted')
     })
 
-    it('ignores invalid pane resumeSessionId for hasTab', async () => {
-      const invalid = 'not-a-uuid'
+    it('marks non-UUID Claude pane resumeSessionId as hasTab (named resume)', async () => {
+      const namedResume = 'not-a-uuid'
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
           sessions: [
             {
-              sessionId: invalid,
+              sessionId: namedResume,
               projectPath: '/home/user/project',
               lastActivityAt: Date.now(),
-              title: 'Invalid session id',
+              title: 'Named resume session',
               cwd: '/home/user/project',
             },
           ],
@@ -690,7 +690,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               mode: 'claude',
               createRequestId: 'req-1',
               status: 'running',
-              resumeSessionId: invalid,
+              resumeSessionId: namedResume,
             },
           },
         },
@@ -707,9 +707,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
         vi.advanceTimersByTime(100)
       })
 
-      const button = screen.getByText('Invalid session id').closest('button')
+      const button = screen.getByText('Named resume session').closest('button')
       expect(button).not.toBeNull()
-      expect(button).toHaveAttribute('data-has-tab', 'false')
+      // Non-UUID Claude resume names are now recognized as valid tabs
+      expect(button).toHaveAttribute('data-has-tab', 'true')
     })
   })
 

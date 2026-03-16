@@ -319,7 +319,7 @@ describe('panesSlice', () => {
       }
     })
 
-    it('drops invalid resumeSessionId for claude panes', () => {
+    it('preserves non-UUID resumeSessionId for claude panes (named resume)', () => {
       const state = panesReducer(
         initialState,
         initLayout({
@@ -330,7 +330,8 @@ describe('panesSlice', () => {
 
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       if (leaf.content.kind === 'terminal') {
-        expect(leaf.content.resumeSessionId).toBeUndefined()
+        // Non-UUID resume names are valid for Claude (named resume support)
+        expect(leaf.content.resumeSessionId).toBe('not-a-uuid')
       }
     })
   })

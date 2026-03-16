@@ -21,8 +21,6 @@ function normalizePaneContent(
 ): PaneContent {
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
-    const hasLifecycleFields = input.createRequestId !== undefined || input.status !== undefined
-    // Only validate Claude resume IDs; other providers pass through unchanged.
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
