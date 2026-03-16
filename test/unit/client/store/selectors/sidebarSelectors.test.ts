@@ -214,6 +214,36 @@ describe('sidebarSelectors', () => {
       })
     })
 
+    it('creates fallback item for Claude session with special character resume name', () => {
+      const tabs = [
+        { id: 'tab-special', title: 'Special Name Session', mode: 'claude', createdAt: 3_000 },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-special': {
+            type: 'leaf',
+            id: 'pane-special',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              status: 'running',
+              createRequestId: 'req-special',
+              resumeSessionId: "fix: can't parse (issue #42)",
+            },
+          },
+        },
+        activePane: {},
+        paneTitles: {},
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0].sessionId).toBe("fix: can't parse (issue #42)")
+      expect(items[0].hasTab).toBe(true)
+    })
+
     it('synthesizes a local fallback row for restored open sessions that are not in the current server window', () => {
       const fallbackSessionId = 'codex-restored'
       const tabs = [

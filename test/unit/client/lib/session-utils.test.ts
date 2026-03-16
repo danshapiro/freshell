@@ -137,7 +137,7 @@ describe('getSessionsForHello', () => {
     expect(result.background).toBeUndefined()
   })
 
-  it('drops invalid claude session IDs', () => {
+  it('includes non-UUID Claude session IDs in hello (named resume)', () => {
     const layoutActive: PaneNode = {
       type: 'leaf',
       id: 'pane-claude',
@@ -161,7 +161,8 @@ describe('getSessionsForHello', () => {
 
     const result = getSessionsForHello(state)
 
-    expect(result.active).toBeUndefined()
+    // Non-UUID Claude session IDs are now valid (named resume support)
+    expect(result.active).toBe('not-a-uuid')
     expect(result.visible).toEqual([])
     expect(result.background).toBeUndefined()
   })
@@ -218,12 +219,14 @@ describe('collectSessionLocatorsFromTabs', () => {
       { provider: 'claude', sessionId: VALID_SESSION_ID, serverInstanceId: 'srv-local' },
       { provider: 'claude', sessionId: VALID_SESSION_ID },
       { provider: 'codex', sessionId: 'tab-only' },
+      { provider: 'claude', sessionId: 'not-a-uuid' },
     ])
 
     expect(collectSessionRefsFromTabs(tabs, panes)).toEqual([
       { provider: 'codex', sessionId: 'shared' },
       { provider: 'claude', sessionId: VALID_SESSION_ID },
       { provider: 'codex', sessionId: 'tab-only' },
+      { provider: 'claude', sessionId: 'not-a-uuid' },
     ])
   })
 
@@ -650,6 +653,18 @@ describe('collectSessionRefsFromNode — agent-chat panes', () => {
   })
 
   it('returns empty for an agent-chat pane with invalid session ID', () => {
+    const node = leaf('p1', agentChatContent('not-a-uuid'))
+    expect(collectSessionRefsFromNode(node)).toEqual([])
+  })
+
+  it('returns session ref for a Claude terminal pane with non-UUID resume name', () => {
+    const node = leaf('p1', terminalContent('claude', '137 tour'))
+    expect(collectSessionRefsFromNode(node)).toEqual([
+      { provider: 'claude', sessionId: '137 tour' },
+    ])
+  })
+
+  it('does not include agent-chat panes with non-UUID session IDs in session refs (invariant)', () => {
     const node = leaf('p1', agentChatContent('not-a-uuid'))
     expect(collectSessionRefsFromNode(node)).toEqual([])
   })

@@ -797,6 +797,42 @@ describe('buildSpawnSpec Unix paths', () => {
     })
   })
 
+  describe('buildSpawnSpec with various Claude resume names', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+      delete process.env.CLAUDE_CMD
+    })
+
+    it('passes --resume with name containing spaces', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', '137 tour')
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain('137 tour')
+    })
+
+    it('passes --resume with name containing special characters', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', "fix: can't parse")
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain("fix: can't parse")
+    })
+
+    it('does not pass --resume with empty string', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', '')
+      expect(spec.args).not.toContain('--resume')
+    })
+
+    it('passes --resume with a partial UUID that is not a valid UUID', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', '550e8400-e29b')
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain('550e8400-e29b')
+    })
+
+    it('passes --resume with a valid UUID', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', VALID_CLAUDE_SESSION_ID)
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
+    })
+  })
+
   describe('codex mode on Unix', () => {
     beforeEach(() => {
       mockPlatform('linux')
