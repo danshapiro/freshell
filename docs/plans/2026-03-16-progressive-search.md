@@ -205,6 +205,14 @@ window.deepSearchPending = action.payload.deepSearchPending ?? false
 
 This is simpler and safer than conditional `if (action.payload.deepSearchPending !== undefined)` logic because it prevents orphaned `true` values when a new non-search fetch replaces the window data.
 
+**Reducer behavior in `setSessionWindowLoading`:** When `loading` is set to `true`, also clear `deepSearchPending` to `false`. This handles the race condition where a new search starts while a previous Phase 2 is still in progress -- the old `deepSearchPending: true` would otherwise persist until the new Phase 1's `setSessionWindowData` arrives:
+
+```ts
+if (action.payload.loading) {
+  window.deepSearchPending = false
+}
+```
+
 **Update `setSessionWindowData` PayloadAction type** to include `deepSearchPending?: boolean` in the payload interface (currently at line 206-215 of `sessionsSlice.ts`).
 
 **`syncTopLevelFromWindow`** does NOT need to sync `deepSearchPending` to top-level state because this flag is only consumed by Sidebar which reads directly from `sidebarWindow?.deepSearchPending`.
@@ -245,11 +253,13 @@ When Phase 2 results arrive, the merge follows these rules:
 
 The key insight: we never clear the displayed results between Phase 1 and Phase 2. The sequence is:
 
-1. User types query -> 300ms debounce -> dispatch `setSessionWindowLoading({ loading: true, loadingKind: 'search' })`
+1. User types query -> 300ms debounce -> dispatch `setSessionWindowLoading({ loading: true, loadingKind: 'search' })` -- this also clears `deepSearchPending` to `false` (important when re-searching while a previous Phase 2 was pending)
 2. Phase 1 returns -> dispatch `setSessionWindowData({ projects: titleResults, deepSearchPending: true })` -- this SETS data (the list is now populated), clears loading
 3. Phase 2 returns -> dispatch `setSessionWindowData({ projects: mergedResults, deepSearchPending: false })` -- updates data in-place
 
 At no point between steps 2 and 3 is the data cleared. The user sees title results appear, then (potentially) sees the list grow with additional file-match-only sessions when Phase 2 resolves. The match metadata (`matchedIn`, `snippet`) is not currently displayed in the Sidebar, so the visual transition between Phase 1 and Phase 2 is simply "more items may appear."
+
+**Re-search while Phase 2 pending:** If the user types a new query while Phase 2 is still running: (a) the abort cancels both phases, (b) `setSessionWindowLoading` fires for the new search, clearing `deepSearchPending` immediately, (c) the "Scanning files..." indicator disappears, (d) the new Phase 1 runs and either shows results or the brief "Searching..." spinner. No flash of the old deep-search indicator during the new search.
 
 ## Tasks
 
@@ -287,6 +297,7 @@ This is the root fix for "search is broken." Without this, title-tier searches s
 1. Add `deepSearchPending?: boolean` to `SessionWindowState` interface
 2. Add `deepSearchPending?: boolean` to the `setSessionWindowData` PayloadAction type
 3. In the `setSessionWindowData` reducer, set `window.deepSearchPending = action.payload.deepSearchPending ?? false`
+4. In the `setSessionWindowLoading` reducer, clear `deepSearchPending` to `false` when `loading` is `true`. This prevents a stale "Scanning files..." indicator from lingering when a new search starts (the old Phase 2 is aborted, but its `deepSearchPending: true` would persist in the window state until the new Phase 1 resolves). Adding `window.deepSearchPending = false` when `action.payload.loading` is `true` clears it immediately at the start of the new search.
 
 ### Task 2: Implement `mergeSearchResults` utility
 
@@ -362,15 +373,33 @@ New tests to add to the existing Sidebar test suite:
 5. Does not show "Scanning files..." when no items are visible (even if `deepSearchPending` true)
 6. "Scanning files..." indicator has `role="status"` for accessibility
 7. Clearing search input removes "Scanning files..." indicator
+8. New query typed while deep search pending clears "Scanning files..." indicator immediately (via `setSessionWindowLoading` clearing `deepSearchPending`)
+
+#### `test/unit/client/store/sessionsSlice.test.ts`
+
+New tests:
+
+1. `setSessionWindowData` without explicit `deepSearchPending` defaults to false
+2. `setSessionWindowLoading` with `loading: true` clears `deepSearchPending`
+
+#### `test/e2e/sidebar-search-flow.test.tsx` (new file)
+
+E2e test covering the end-to-end search flow. Uses the same patterns as `test/e2e/sidebar-click-opens-pane.test.tsx` for test scaffolding. Test scenarios:
+
+1. Title-tier search returns server-side results (verify the bypass is removed)
+2. Deep-tier search shows title results first, then merged results after Phase 2 completes
+3. Changing query while deep search is pending aborts the old search
+4. Clearing search returns to browse mode
 
 ## Files to Modify
 
 1. `src/components/Sidebar.tsx` -- remove client-side search bypass, add deep search pending indicator
-2. `src/store/sessionsSlice.ts` -- `deepSearchPending` field in interface and payload type, reducer update
+2. `src/store/sessionsSlice.ts` -- `deepSearchPending` field in interface and payload type, reducer update in both `setSessionWindowData` and `setSessionWindowLoading`
 3. `src/store/sessionsThunks.ts` -- two-phase fetch logic, `mergeSearchResults` utility
 4. `test/unit/client/store/sessionsThunks.test.ts` -- ~13 new tests (additions to existing file)
-5. `test/unit/client/components/Sidebar.test.tsx` -- ~7 new tests (additions to existing file)
-6. `test/unit/client/store/sessionsSlice.test.ts` -- 1 new test for deepSearchPending default (addition to existing file)
+5. `test/unit/client/components/Sidebar.test.tsx` -- ~8 new tests (additions to existing file)
+6. `test/unit/client/store/sessionsSlice.test.ts` -- 2 new tests (additions to existing file)
+7. `test/e2e/sidebar-search-flow.test.tsx` -- new e2e test file (~4 scenarios)
 
 ## Files NOT Modified
 
@@ -378,3 +407,9 @@ New tests to add to the existing Sidebar test suite:
 - `shared/read-models.ts` -- no schema changes needed (deepSearchPending is client-only state)
 - `src/lib/api.ts` -- no changes needed (already supports tier parameter)
 - `src/store/selectors/sidebarSelectors.ts` -- no changes needed; `filterSessionItems` remains available but is no longer invoked for search since the selector always receives an empty filter string when the server handles search
+
+## Implementation Notes
+
+### `matchedIn` field mapping
+
+The server-side `SessionDirectoryItem` uses `matchedIn` values: `'title' | 'summary' | 'firstUserMessage' | 'userMessage' | 'assistantMessage'`. The client-side `SearchResult` type maps `'firstUserMessage'` to `'userMessage'` (see `api.ts` line 403). The `mergeSearchResults` function operates on client-side `SearchResult` objects (post-mapping), so it never sees `'firstUserMessage'` -- dedup keys and matchedIn values are already normalized by the time they reach the merge.
