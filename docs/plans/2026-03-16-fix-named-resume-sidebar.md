@@ -45,102 +45,23 @@ When a Claude terminal is created with a non-UUID resume name, we store it as `p
 
 Once the association coordinator binds the actual UUID, `resumeSessionId` is set and `pendingResumeName` becomes informational.
 
-### Decision 3: Client-side approach
+### Decision 3: Client-side defense in depth
 
-On the client side, the pane content stores `resumeSessionId` which may be a non-UUID name (set by the user when opening the tab). The existing `isValidClaudeSessionId` gates in `session-utils.ts`, `sidebarSelectors.ts`, `panesSlice.ts`, and `layoutMirrorMiddleware.ts` prevent this from creating any session association or sidebar entry.
+The **primary fix** is server-side (Decisions 1 & 2). Once the server passes `--resume "137 tour"` through to Claude Code, Claude resumes the correct session, writes to the correct UUID-named JSONL file, and the indexer + association coordinator bind the real UUID. The sidebar shows the session under its real title.
 
-The fix: when a Claude pane has a non-UUID `resumeSessionId`, it should still create a fallback sidebar item (with `hasTitle: false` initially, since we don't have the real session data yet) and should be discoverable by the session matching logic. However, we cannot use the non-UUID name as the session key -- instead, we use a synthetic key pattern `claude:pending:<resumeName>` for the fallback item so it doesn't collide with real UUID-keyed sessions.
+However, there is a brief interim window between terminal spawn and UUID discovery where a non-UUID `resumeSessionId` on the pane prevents the sidebar fallback path from creating an entry. Currently, `isValidClaudeSessionId` gates in `session-utils.ts`, `sidebarSelectors.ts`, `panesSlice.ts`, and `layoutMirrorMiddleware.ts` reject non-UUID Claude session refs. Additionally, `collectFallbackItemsFromNode` is only called when `collectSessionRefsFromNode` returns non-empty results (see `sidebarSelectors.ts` lines 215-223), so a tab with only a non-UUID Claude pane generates no fallback items at all.
 
-Actually, the simpler and correct approach: the pane stores `resumeSessionId` as the raw user input. When the server discovers the real UUID and binds, the `terminal.session.associated` broadcast updates the pane's `resumeSessionId` to the real UUID (this already happens via `sessionRef` updates). The fallback sidebar item just needs to handle the non-UUID case during the interim period.
+The fix: relax the `isValidClaudeSessionId` gates in the *display/fallback* paths (not the binding/authority paths) so that a non-empty non-UUID Claude resume name creates a temporary fallback sidebar item. A non-UUID string used as a temporary session key (e.g., `claude:137 tour`) will never match a real UUID-keyed session -- this is acceptable because once the real UUID arrives via `terminal.session.associated`, the pane's `resumeSessionId` and `sessionRef` are updated to the real UUID (see `TerminalView.tsx` lines 1694-1721), replacing the temporary entry.
 
-**Revised client-side approach:** Rather than adding complex synthetic keys, we make the client-side `isValidClaudeSessionId` checks in the *fallback path* more permissive. A fallback sidebar item for a non-UUID Claude resume name should still be created (it represents an "open tab for a session we're waiting to discover"). This item will be replaced by the real session once the indexer finds it and the server broadcasts the update.
+**Note:** The agent-chat path in `panesSlice.ts` (lines 74-91) also has `isValidClaudeSessionId` checks (lines 77 and 81). These are intentionally left unchanged because agent-chat sessions always use UUIDs from the SDK bridge, not user-typed resume names.
 
 Concretely:
-- `session-utils.ts` `isValidSessionRef()`: Allow non-UUID Claude session refs when they look like a human-readable resume name (not empty)
-- `sidebarSelectors.ts` `collectFallbackItemsFromNode()` and tab fallback loop: Allow non-UUID Claude resume names to create fallback items
-- `panesSlice.ts` `buildPaneContent()`: Already stores the raw `resumeSessionId` when `hasLifecycleFields` is true; needs to also store it when it's a non-UUID name used for initial creation
-- `layoutMirrorMiddleware.ts` `buildTabFallbackSessionRef()`: Allow non-UUID Claude session refs
 
-**Wait -- this approach has a problem.** If we allow non-UUID strings as session refs, they'll be used as session keys throughout the system (e.g., `claude:137 tour`), which will never match the real UUID-based session key once it's discovered. This creates orphaned entries and potential confusion.
-
-### Decision 3 (revised): Introduce `isValidCodingCliResumeId`
-
-Create a new validation function that accepts either a UUID (for direct session ID references) or a non-empty string (for named resume references). Use this in the fallback/display paths only. The binding/authority paths continue to require UUIDs.
-
-Actually, let me think about this more carefully. The real question is: what should happen in the sidebar during the window between "terminal spawned with `--resume '137 tour'`" and "association coordinator discovers the UUID and binds it"?
-
-**Answer:** The terminal will appear as a running terminal in a tab. The tab should show in the sidebar as a fallback item. But since we don't know the real session UUID yet, we can't create a proper session-keyed sidebar item. We have two options:
-
-1. **Don't show a sidebar item until the UUID is discovered.** The tab is still visible and usable; it just won't have a corresponding sidebar entry until the indexer runs (usually seconds). This is acceptable behavior -- it's the same experience as creating a brand new Claude session (which also starts unassociated).
-
-2. **Show a temporary sidebar item keyed by the non-UUID name.** This creates complications with session key mismatches.
-
-Option 1 is simpler and correct. The real fix is just on the **server side**: pass the resume name through to `--resume` so Claude Code actually resumes the right session, and don't block the association flow. The client doesn't need to change its UUID validation at all -- the sidebar item will appear once the UUID is discovered and bound.
-
-**But wait:** The user's complaint is "the session is active but isn't showing up in the left panel." If we go with Option 1, the session would show up once the association coordinator binds it (seconds later). The user's complaint suggests it NEVER shows up. Why?
-
-Because the server currently rejects the non-UUID resume name entirely, so:
-- Claude Code is launched WITHOUT `--resume "137 tour"` (the arg is stripped)
-- Claude Code starts a FRESH session instead of resuming "137 tour"
-- The fresh session gets a new UUID
-- The terminal IS associated with the new UUID (eventually)
-- But the user expects to see the "137 tour" session, not a new session
-
-So the primary fix is server-side: pass `--resume "137 tour"` through to Claude Code. Once that works, Claude Code resumes the correct session, writes to the correct UUID-named JSONL file, and the indexer + association coordinator do their job. The sidebar will show the session under its real title.
-
-### Final Design
-
-**Server changes:**
-1. `normalizeResumeSessionId()` in `terminal-registry.ts` (line 297): Return the raw value for Claude when it's a non-empty string (not just when it's a valid UUID). Rename to clarify it normalizes for spawn, not for binding.
-2. `buildSpawnSpec()` in `terminal-registry.ts`: Pass the raw resume arg through to the CLI command.
-3. `create()` in `terminal-registry.ts`: Split the logic -- use the raw resume arg for spawning, but only bind the session if it's a valid UUID. Store the raw name as `pendingResumeName` when non-UUID.
-4. `ws-handler.ts`: Remove the early `isValidClaudeSessionId` check that discards non-UUID resume names. Let the registry handle it.
-5. `bindSession()`: Keep requiring valid UUIDs (this is correct -- bindings must use canonical IDs).
-
-**The terminal record gets a new optional field:** `pendingResumeName?: string`. Set when a Claude terminal is created with a non-UUID resume name. This is informational -- it indicates the terminal was spawned with `--resume <name>` but hasn't been bound to a UUID session yet.
-
-**No client changes required.** The client correctly handles the case where a terminal starts unassociated and gets bound later. The existing `terminal.session.associated` -> `sessionRef` update flow handles the transition.
-
-**However**, the client's `panesSlice.ts` `buildPaneContent()` currently strips non-UUID `resumeSessionId` for Claude terminals without lifecycle fields. This means when a tab is restored from localStorage with `resumeSessionId: "137 tour"`, it becomes `undefined`. This is fine because:
-- The tab was originally created with `resumeSessionId: "137 tour"`
-- The server received it and (with our fix) spawned Claude with `--resume "137 tour"`
-- Claude Code resumed the session, indexer found the UUID, association coordinator bound it
-- The server sent `terminal.session.associated` with the real UUID
-- The pane's `resumeSessionId` was updated to the real UUID
-- That's what's persisted to localStorage
-
-But what if the user refreshes the page BEFORE the UUID is discovered? Then `resumeSessionId` in localStorage is still "137 tour", and `buildPaneContent()` strips it. The terminal create request goes out with no resume ID, and Claude starts fresh. This is a pre-existing edge case that's not specific to this bug.
-
-Actually, looking more carefully at the client code: when `hasLifecycleFields` is true (which it is after the terminal is created and the pane has `createRequestId` and `status`), the `resumeSessionId` is preserved as-is without UUID validation. So the non-UUID name IS kept in the pane content during the terminal's lifecycle. It's only stripped when `hasLifecycleFields` is false (initial pane creation / restore).
-
-For the restore path: when the page reloads and the pane content is deserialized from localStorage, `hasLifecycleFields` is true (it has `createRequestId` and `status`), so `resumeSessionId: "137 tour"` is preserved. The terminal.create message will include it, the server will pass it through, and Claude will resume correctly. Good.
-
-But the `sessionRef` won't be built for a non-UUID Claude `resumeSessionId` (line 31-35 and 39 in panesSlice.ts). This means the pane won't be tracked as having a session ref, which means `collectSessionRefsFromNode` won't find it, which means `collectFallbackItemsFromNode` won't be called for it. Actually wait -- `collectFallbackItemsFromNode` is called for ALL panes in a tab's layout tree (line 218-222 in sidebarSelectors.ts), not just ones with session refs. Let me re-read.
-
-Looking at `sidebarSelectors.ts` lines 215-223:
-```js
-for (const tab of tabs || []) {
-    const layout = panes.layouts?.[tab.id]
-    if (layout) {
-      const refs = collectSessionRefsFromNode(layout)
-      if (refs.length > 0) {
-        collectFallbackItemsFromNode(layout, tab)
-      }
-      continue
-    }
-```
-
-So `collectFallbackItemsFromNode` is ONLY called if `collectSessionRefsFromNode` returns non-empty. And `collectSessionRefsFromNode` uses `isValidSessionRef` which requires UUID for Claude. So a tab with only a non-UUID Claude pane won't generate any fallback items!
-
-This IS a client-side issue after all, but only for the interim period before the UUID is discovered. Once the UUID is bound and the pane's `sessionRef` is updated, the fallback items work fine. And the REAL session data from the indexer will show it in the sidebar regardless.
-
-The question is: is the user seeing this bug because the UUID is never discovered? Or because there's a timing issue?
-
-Given the user says the session "is active in this session" but not in the sidebar, the most likely scenario is: the server stripped `--resume "137 tour"`, Claude started fresh with a new UUID, that new UUID IS eventually indexed and shown in the sidebar, but the session titled "137 tour" was never actually resumed, so it never gets new activity, and its title/data is from a previous run. The sidebar shows the NEW session, not the one the user expected.
-
-So the fix IS primarily server-side. Once the server passes through the named resume, Claude Code resumes the correct session, the indexer picks up activity on the existing UUID-named JSONL file, and the sidebar shows it.
-
-For completeness, we should also fix the client-side fallback path so that a non-UUID Claude resume name doesn't block sidebar visibility during the discovery window. This is a defense-in-depth improvement.
+- `session-utils.ts` `isValidSessionRef()`: Accept any non-empty Claude session ref (not just UUIDs)
+- `session-utils.ts` `extractSessionLocators()`: Remove `isValidClaudeSessionId` gates on the intrinsic `resumeSessionId` path (lines 106, 115) so `collectSessionRefsFromNode` returns results for non-UUID Claude panes
+- `sidebarSelectors.ts` `collectFallbackItemsFromNode()` and tab fallback loop: Remove `isValidClaudeSessionId` guards (lines 201, 228)
+- `layoutMirrorMiddleware.ts` `buildTabFallbackSessionRef()`: Remove `isValidClaudeSessionId` guard (line 16)
+- `panesSlice.ts` `buildPaneContent()` terminal path: Simplify to `const resumeSessionId = inputResumeSessionId` (remove Claude-specific UUID validation for the initial pane creation path). The `sessionRef` auto-creation at lines 42-45 will produce `{ provider: 'claude', sessionId: '137 tour' }` during the interim period, which is handled gracefully
 
 ## File Structure
 
@@ -160,20 +81,23 @@ For completeness, we should also fix the client-side fallback path so that a non
    - Remove lines 1135-1138 that discard non-UUID Claude resume names. The terminal registry's normalization is the single source of truth.
    - Add `isValidClaudeSessionId` guard to the session repair block (line 1299) so session repair is only invoked for UUID-based resume IDs. Human-readable names don't have corresponding `<name>.jsonl` files; Claude Code resolves them internally.
 
-3. **`server/session-association-coordinator.ts`** (no changes needed -- it already works correctly when terminals are unassociated)
+3. **`server/spawn-spec.ts`** (dead code consistency)
+   - Contains a duplicate `normalizeResumeSessionId()` at line 247 with the same UUID-only bug. This file is not currently imported anywhere, but update it to match the new behavior so it stays consistent if ever re-enabled.
 
-4. **`src/store/selectors/sidebarSelectors.ts`** (client-side defense in depth)
+4. **`server/session-association-coordinator.ts`** (no changes needed -- it already works correctly when terminals are unassociated)
+
+5. **`src/store/selectors/sidebarSelectors.ts`** (client-side defense in depth)
    - `collectFallbackItemsFromNode()` (line 201): Remove the `isValidClaudeSessionId` check that prevents non-UUID Claude resume names from creating fallback items, OR change the condition to only skip empty strings
    - Tab fallback loop (line 228): Same treatment
 
-5. **`src/lib/session-utils.ts`** (client-side defense in depth)
+6. **`src/lib/session-utils.ts`** (client-side defense in depth)
    - `isValidSessionRef()` (line 22-26): Allow non-UUID Claude session refs when they are non-empty strings
    - `extractSessionLocators()` (lines 106 and 115): Remove direct `isValidClaudeSessionId` checks that block intrinsic `resumeSessionId` path for non-UUID Claude names
 
-6. **`src/store/layoutMirrorMiddleware.ts`** (client-side defense in depth)
+7. **`src/store/layoutMirrorMiddleware.ts`** (client-side defense in depth)
    - `buildTabFallbackSessionRef()` (line 16): Allow non-UUID Claude session refs
 
-7. **`src/store/panesSlice.ts`** (client-side defense in depth)
+8. **`src/store/panesSlice.ts`** (client-side defense in depth)
    - `buildPaneContent()` (lines 29-35): Allow non-UUID Claude `resumeSessionId` to be preserved for initial pane creation
 
 ### Test Files to Modify/Create
@@ -358,9 +282,9 @@ for (const term of this.terminals.values()) {
 
 This already works correctly — a terminal with `pendingResumeName` but no `resumeSessionId` will be matched. No change needed here.
 
-Also update the export of `normalizeResumeSessionId` in the module's exports (search for any re-exports). The function `normalizeResumeSessionId` is also exported from `spawn-spec.ts` but that file is not imported by anything active. Check if `terminal-registry.ts` exports it:
+The function at line 297 in `terminal-registry.ts` is not exported (`function`, not `export function`), so no export changes are needed there.
 
-The function at line 297 is not exported (it's a module-level `function`, not `export function`). Good — no export changes needed.
+Also update the duplicate `normalizeResumeSessionId` in `server/spawn-spec.ts` (line 247-253) for consistency. This file is not currently imported by anything, but should stay in sync. Apply the same pass-through logic: return the raw value for any non-empty string regardless of mode.
 
 Finally, remove the redundant early check in `ws-handler.ts` (lines 1135-1138):
 
@@ -657,74 +581,12 @@ const resumeSessionId = hasLifecycleFields
       : input.resumeSessionId
 
 // NEW:
-const resumeSessionId = hasLifecycleFields
-  ? inputResumeSessionId
-  : inputResumeSessionId
-```
-
-Wait, that removes the UUID validation entirely, which is too permissive. The validation was there to prevent junk data from being stored. Let me think...
-
-Actually, the validation for initial pane creation (non-lifecycle fields) should just check for non-empty string, not UUID format. If the user explicitly sets a resume name, we should preserve it:
-
-```typescript
 const resumeSessionId = inputResumeSessionId
 ```
 
-This is simpler and correct. The `inputResumeSessionId` is already validated as a non-empty string (or undefined) on line 26-28. The only thing the old code added was stripping non-UUID Claude names, which is exactly the bug we're fixing.
+The `inputResumeSessionId` is already validated as a non-empty string (or undefined) on line 26-28. The only thing the old code added was stripping non-UUID Claude names, which is exactly the bug we're fixing.
 
-For the `sessionRef` construction (line 42-45), it should still only create a `sessionRef` when the resume ID is a valid UUID (since `sessionRef` is used for cross-device identity):
-
-```typescript
-const sessionRef = explicitSessionRef
-  ?? (resumeSessionId && mode !== 'shell'
-    ? (mode === 'claude' && !isValidClaudeSessionId(resumeSessionId)
-      ? undefined  // Non-UUID Claude names can't be used as session refs yet
-      : { provider: mode, sessionId: resumeSessionId })
-    : undefined)
-```
-
-Actually wait -- we changed `isValidSessionRef` in `session-utils.ts` to allow non-UUID Claude refs. And `sessionRef` is validated through `sanitizeSessionLocator` which uses `isValidSessionRef`. So if we allow it there, it will work. But `sessionRef` is used for cross-device session identity, and a named resume like "137 tour" is not stable across devices.
-
-Hmm, let me reconsider. The `sessionRef` is set when the pane is first created. Once the real UUID is discovered and bound, the `sessionRef` is updated (via `terminal.session.associated` handling in `panesSlice.ts`). So a temporary non-UUID `sessionRef` will be replaced. And during the interim, having a sessionRef (even non-UUID) is better than not having one, because it lets the sidebar show the fallback item.
-
-But the risk is: if the non-UUID sessionRef is synced to other devices via `layoutMirrorMiddleware`, those devices will have a ref that doesn't match any session. That's confusing but not harmful — it just means the other device won't show a sidebar item for it (same as today).
-
-I think the cleanest approach is:
-- `session-utils.ts`: Allow non-UUID Claude refs in `isValidSessionRef`
-- `sidebarSelectors.ts`: Remove the UUID guards in the fallback path
-- `layoutMirrorMiddleware.ts`: Remove the UUID guard (the other device just gets a ref it can't resolve, which is harmless)
-- `panesSlice.ts`: Allow non-UUID Claude resumeSessionId to be stored, but don't auto-create a `sessionRef` for non-UUID Claude names (the ref will be set when the server associates the real UUID)
-
-So for `panesSlice.ts`, the `resumeSessionId` line simplifies to:
-```typescript
-const resumeSessionId = inputResumeSessionId
-```
-
-And the `sessionRef` logic stays as-is for the auto-creation path, but relies on the `isValidClaudeSessionId` check in the existing code. Wait, let me re-read lines 42-45:
-
-```typescript
-const sessionRef = explicitSessionRef
-  ?? (resumeSessionId && mode !== 'shell'
-    ? { provider: mode, sessionId: resumeSessionId }
-    : undefined)
-```
-
-This would create `sessionRef: { provider: 'claude', sessionId: '137 tour' }`. With our relaxed `isValidSessionRef`, this would be accepted as a valid ref. That's OK for the local display path, but might cause issues if it's sent to the server or other devices.
-
-Looking at where `sessionRef` is consumed:
-- `layoutMirrorMiddleware.ts`: Sent to server via `ui.layout.sync`
-- `session-utils.ts`: Used for session matching / tab finding
-- `sidebarSelectors.ts`: Used for session ref collection
-
-For `ui.layout.sync`, the server uses it to track which sessions are open on which tabs. A non-UUID ref won't match any known session, so it's just ignored. That's fine.
-
-OK, let me simplify the panesSlice change. Just remove the Claude-specific UUID validation for `resumeSessionId`:
-
-```typescript
-const resumeSessionId = inputResumeSessionId
-```
-
-And keep the sessionRef auto-creation as-is (it will create a ref with the non-UUID name, which is handled gracefully by the rest of the system).
+The `sessionRef` auto-creation logic at lines 42-45 stays as-is. It will create `{ provider: 'claude', sessionId: '137 tour' }` for a non-UUID name. This temporary ref works for the local sidebar display path. When synced to other devices via `layoutMirrorMiddleware`, the non-UUID ref won't match any known session (harmless -- same as current behavior). Once the real UUID is discovered via `terminal.session.associated`, the pane's `resumeSessionId` and `sessionRef` are both updated to the canonical UUID.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1081,8 +943,8 @@ Run the complete test suite to catch any regressions.
 
 - [ ] **Step 1: Run the full test suite**
 
-Run: `cd /home/user/code/freshell/.worktrees/fix-named-resume-sidebar && npm run test:vitest -- --run`
-Expected: All PASS
+Run: `cd /home/user/code/freshell/.worktrees/fix-named-resume-sidebar && npm test`
+Expected: All PASS (uses coordinated test runner as required by repo rules)
 
 - [ ] **Step 2: Run typecheck**
 
@@ -1117,6 +979,7 @@ git commit -m "refactor: remove unused imports after named resume fix"
 ### Server (core fix)
 - `server/terminal-registry.ts`: Split `normalizeResumeSessionId` into `normalizeResumeForSpawn` (pass-through for any non-empty string) and `normalizeResumeForBinding` (UUID-only for Claude session authority). Add `pendingResumeName` field to `TerminalRecord`.
 - `server/ws-handler.ts`: Remove the redundant early `isValidClaudeSessionId` check that discarded non-UUID resume names. Add `isValidClaudeSessionId` guard to the session repair block so it only runs for UUID-based resume IDs.
+- `server/spawn-spec.ts`: Update duplicate `normalizeResumeSessionId` for consistency (dead code, not imported).
 
 ### Client (defense in depth)
 - `src/lib/session-utils.ts`: Remove Claude UUID gate from `isValidSessionRef` so non-UUID resume names are valid session refs. Also remove direct `isValidClaudeSessionId` checks in `extractSessionLocators` intrinsic path (lines 106 and 115).
