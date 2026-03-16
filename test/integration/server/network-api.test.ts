@@ -212,6 +212,34 @@ describe('Network API integration', () => {
       expect(res.body.accessUrl).not.toContain('192.168.1.100')
     })
 
+    it('suppresses WSL repair nag when FRESHELL_DISABLE_WSL_PORT_FORWARD env var is set', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(false)
+      vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReturnValue(true)
+
+      const res = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(res.status).toBe(200)
+      expect(res.body.host).toBe('0.0.0.0')
+      expect(res.body.remoteAccessEnabled).toBe(false)
+      expect(res.body.remoteAccessNeedsRepair).toBe(false)
+
+      vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReturnValue(false)
+    })
+
     it('requires authentication', async () => {
       const res = await request(app).get('/api/network/status')
       expect(res.status).toBe(401)
