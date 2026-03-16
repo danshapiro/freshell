@@ -10,7 +10,7 @@ import { detectFirewall, firewallCommands, type FirewallInfo, type FirewallPlatf
 import type { ConfigStore } from './config-store.js'
 import { logger } from './logger.js'
 import { isRemoteAccessEnabled } from './network-access.js'
-import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
+import { computeWslPortForwardingPlanAsync, isWslPortForwardingDisabledByEnv } from './wsl-port-forward.js'
 import type { ServerSettings } from '../shared/settings.js'
 
 type NetworkSettings = ServerSettings['network']
@@ -353,6 +353,7 @@ export class NetworkManager {
       firewallInfo.platform === 'wsl2'
       && remoteAccessRequested
       && portOpen === false
+      && !isWslPortForwardingDisabledByEnv()
     ) || (
       firewallInfo.platform === 'windows'
       && remoteAccessRequested

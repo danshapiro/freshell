@@ -450,7 +450,7 @@ export function buildPortForwardingTeardownScript(ports: number[]): string {
   return commands.join('; ')
 }
 
-function isWslPortForwardingDisabledByEnv(): boolean {
+export function isWslPortForwardingDisabledByEnv(): boolean {
   const value = process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
   if (!value) return false
   return ['1', 'true', 'yes'].includes(value.toLowerCase())

@@ -23,9 +23,13 @@ vi.mock('../../../server/firewall.js', () => ({
   detectFirewall: vi.fn().mockResolvedValue({ platform: 'linux-none', active: false }),
   firewallCommands: vi.fn().mockReturnValue([]),
 }))
-vi.mock('../../../server/wsl-port-forward.js', () => ({
-  computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({ status: 'noop', wslIp: '172.30.149.249' }),
-}))
+vi.mock('../../../server/wsl-port-forward.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../server/wsl-port-forward.js')>('../../../server/wsl-port-forward.js')
+  return {
+    ...actual,
+    computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({ status: 'noop', wslIp: '172.30.149.249' }),
+  }
+})
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
   return { ...actual, execFile: vi.fn() }
@@ -434,6 +438,35 @@ describe('NetworkManager', () => {
     const status = await manager.getStatus()
 
     expect(status.remoteAccessNeedsRepair).toBe(false)
+  })
+
+  it('suppresses remoteAccessNeedsRepair when WSL port forwarding is disabled by env var and port is unreachable', async () => {
+    vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(portReachable.default).mockResolvedValue(false)
+    const savedDisableEnv = process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
+    process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    try {
+      const status = await manager.getStatus()
+
+      expect(status.remoteAccessNeedsRepair).toBe(false)
+      expect(status.remoteAccessEnabled).toBe(false)
+    } finally {
+      if (savedDisableEnv !== undefined) {
+        process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = savedDisableEnv
+      } else {
+        delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
+      }
+    }
   })
 
   it('keeps remote access enabled while flagging stale native Windows dev-mode API-port rules for cleanup', async () => {
