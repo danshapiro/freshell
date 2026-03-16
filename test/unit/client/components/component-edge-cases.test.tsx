@@ -539,7 +539,7 @@ describe('Component Edge Cases', () => {
         expect(screen.getByLabelText('Hide sidebar')).toBeInTheDocument()
       })
 
-      it('handles filter resulting in empty array', () => {
+      it('handles filter resulting in empty array after server search', async () => {
         const project = createProjectGroup({
           sessions: [
             { sessionId: 'sess-1', projectPath: '/test', lastActivityAt: Date.now(), title: 'Alpha' },
@@ -547,17 +547,29 @@ describe('Component Edge Cases', () => {
         })
 
         const store = createTestStore({
-          sessions: { projects: [project], expandedProjects: new Set() },
+          sessions: {
+            projects: [project],
+            expandedProjects: new Set(),
+            activeSurface: 'sidebar',
+            windows: {
+              sidebar: {
+                projects: [],
+                lastLoadedAt: Date.now(),
+                query: 'xyznonexistent',
+                searchTier: 'title',
+              },
+            },
+          },
           tabs: { tabs: [], activeTabId: null },
         })
 
         renderWithStore(<Sidebar view="terminal" onNavigate={() => {}} />, store)
 
-        // Search for something that doesn't exist
+        // Search input with a query that the server returned no results for
         const searchInput = screen.getByPlaceholderText('Search...')
         fireEvent.change(searchInput, { target: { value: 'xyznonexistent' } })
 
-        // Should show empty state for a filtered search
+        // The sidebar window has empty projects from server, so empty state shows
         expect(screen.getByText('No matching sessions')).toBeInTheDocument()
       })
     })
