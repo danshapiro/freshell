@@ -417,6 +417,25 @@ describe('NetworkManager', () => {
     expect(status.firewall.portOpen).toBe(false)
   })
 
+  it('treats disabled WSL port forwarding plan as no stale exposure', async () => {
+    vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(portReachable.default).mockResolvedValue(true)
+    vi.mocked(computeWslPortForwardingPlanAsync).mockResolvedValue({ status: 'disabled' })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessNeedsRepair).toBe(false)
+  })
+
   it('keeps remote access enabled while flagging stale native Windows dev-mode API-port rules for cleanup', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     const portReachable = await import('is-port-reachable')

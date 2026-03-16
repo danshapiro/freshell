@@ -281,7 +281,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       if (plan.status === 'error') {
         return { kind: 'error', error: plan.message }
       }
-      if (plan.status === 'noop' || plan.status === 'not-wsl2') {
+      if (plan.status === 'noop' || plan.status === 'not-wsl2' || plan.status === 'disabled') {
         return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
       }
 
@@ -358,7 +358,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       return { kind: 'error', error: teardownPlan.message }
     }
 
-    if (teardownPlan.status === 'not-wsl2') {
+    if (teardownPlan.status === 'not-wsl2' || teardownPlan.status === 'disabled') {
       return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
     }
 

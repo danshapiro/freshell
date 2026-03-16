@@ -656,6 +656,28 @@ describe('Network API integration', () => {
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
+    it('returns no configuration required when WSL port forwarding is disabled by env var', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
+
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({ status: 'disabled' })
+      const cp = await import('node:child_process')
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
+    })
+
     it('consumes the WSL2 confirmation token when the confirmed retry recomputes to noop', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
@@ -1540,6 +1562,25 @@ describe('Network API integration', () => {
         configured: true,
         host: '0.0.0.0',
       }))
+    })
+
+    it('returns no-op when WSL port forwarding teardown is disabled by env var', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({ status: 'disabled' })
+      const cp = await import('node:child_process')
+
+      const res = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body.method).toBe('none')
+      expectNoPowerShellSpawn(cp)
     })
 
     it('disables WSL remote access immediately when no privileged teardown is needed', async () => {

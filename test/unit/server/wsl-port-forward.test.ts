@@ -860,4 +860,81 @@ Address         Port        Address         Port
       })
     })
   })
+
+  describe('FRESHELL_DISABLE_WSL_PORT_FORWARD', () => {
+    afterEach(() => {
+      delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
+    })
+
+    it('computeWslPortForwardingPlan returns disabled when env var is "1"', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+
+      const plan = computeWslPortForwardingPlan([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingPlan returns disabled when env var is "True" (case-insensitive)', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'True'
+
+      const plan = computeWslPortForwardingPlan([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingPlan returns disabled when env var is "yes"', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'yes'
+
+      const plan = computeWslPortForwardingPlan([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingPlan proceeds normally when env var is unset', () => {
+      vi.mocked(isWSL2).mockReturnValue(false)
+
+      const plan = computeWslPortForwardingPlan([3001])
+
+      expect(plan).toEqual({ status: 'not-wsl2' })
+    })
+
+    it('computeWslPortForwardingPlan proceeds normally when env var is "0"', () => {
+      vi.mocked(isWSL2).mockReturnValue(false)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '0'
+
+      const plan = computeWslPortForwardingPlan([3001])
+
+      expect(plan).toEqual({ status: 'not-wsl2' })
+    })
+
+    it('computeWslPortForwardingPlanAsync returns disabled when env var is set', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+
+      const plan = await computeWslPortForwardingPlanAsync([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingTeardownPlan returns disabled when env var is set', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+
+      const plan = computeWslPortForwardingTeardownPlan([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingTeardownPlanAsync returns disabled when env var is set', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+
+      const plan = await computeWslPortForwardingTeardownPlanAsync([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+  })
 })

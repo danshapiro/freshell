@@ -450,8 +450,15 @@ export function buildPortForwardingTeardownScript(ports: number[]): string {
   return commands.join('; ')
 }
 
+function isWslPortForwardingDisabledByEnv(): boolean {
+  const value = process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
+  if (!value) return false
+  return ['1', 'true', 'yes'].includes(value.toLowerCase())
+}
+
 export type WslPortForwardingPlan =
   | { status: 'not-wsl2' }
+  | { status: 'disabled' }
   | { status: 'error'; message: string }
   | { status: 'noop'; wslIp: string }
   | {
@@ -463,6 +470,7 @@ export type WslPortForwardingPlan =
 
 export type WslPortForwardingTeardownPlan =
   | { status: 'not-wsl2' }
+  | { status: 'disabled' }
   | { status: 'error'; message: string }
   | { status: 'noop' }
   | { status: 'ready'; script: string }
@@ -560,6 +568,9 @@ export function computeWslPortForwardingPlan(
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
   }
+  if (isWslPortForwardingDisabledByEnv()) {
+    return { status: 'disabled' }
+  }
 
   const wslIp = getWslIp()
   if (!wslIp) {
@@ -589,6 +600,9 @@ export async function computeWslPortForwardingPlanAsync(
 ): Promise<WslPortForwardingPlan> {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
+  }
+  if (isWslPortForwardingDisabledByEnv()) {
+    return { status: 'disabled' }
   }
 
   const wslIp = await getWslIpAsync()
@@ -629,6 +643,9 @@ export function computeWslPortForwardingTeardownPlan(
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
   }
+  if (isWslPortForwardingDisabledByEnv()) {
+    return { status: 'disabled' }
+  }
 
   const existingRules = getExistingPortProxyRules()
   const existingFirewallPorts = getExistingFirewallPorts()
@@ -649,6 +666,9 @@ export async function computeWslPortForwardingTeardownPlanAsync(
 ): Promise<WslPortForwardingTeardownPlan> {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
+  }
+  if (isWslPortForwardingDisabledByEnv()) {
+    return { status: 'disabled' }
   }
 
   const [existingRules, existingFirewallPorts] = await Promise.all([
