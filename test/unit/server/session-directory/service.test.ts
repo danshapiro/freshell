@@ -1,8 +1,13 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
+import fsp from 'fs/promises'
+import path from 'path'
+import os from 'os'
 import type { ProjectGroup, CodingCliSession } from '../../../../server/coding-cli/types.js'
 import type { TerminalMeta } from '../../../../server/terminal-metadata-service.js'
 import { querySessionDirectory } from '../../../../server/session-directory/service.js'
+import { claudeProvider } from '../../../../server/coding-cli/providers/claude.js'
+import { codexProvider } from '../../../../server/coding-cli/providers/codex.js'
 
 function makeSession(overrides: Partial<CodingCliSession> & Pick<CodingCliSession, 'sessionId' | 'projectPath' | 'lastActivityAt'>): CodingCliSession {
   return {
@@ -195,5 +200,369 @@ describe('querySessionDirectory', () => {
 
     expect(page.items).toHaveLength(50)
     expect(page.nextCursor).toBeTruthy()
+  })
+})
+
+describe('querySessionDirectory file-based search', () => {
+  let tempDir: string
+
+  beforeEach(async () => {
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'session-dir-search-'))
+  })
+
+  afterEach(async () => {
+    await fsp.rm(tempDir, { recursive: true, force: true })
+  })
+
+  it('userMessages tier finds matches in user messages only', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the authentication bug"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Working on the login system"}]}}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'authentication', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].matchedIn).toBe('userMessage')
+    expect(page.items[0].snippet).toContain('authentication')
+  })
+
+  it('userMessages tier does NOT match assistant messages', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication system is broken"}]}}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'authentication', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(0)
+  })
+
+  it('fullText tier finds matches in assistant messages', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication system is broken"}]}}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'authentication', tier: 'fullText' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].matchedIn).toBe('assistantMessage')
+  })
+
+  it('title tier still works without file I/O (does not require providers)', async () => {
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Deploy pipeline fix',
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      query: { priority: 'visible', query: 'deploy', tier: 'title' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].matchedIn).toBe('title')
+  })
+
+  it('file-based search skips sessions without sourceFile', async () => {
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-no-file',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'No source file',
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'anything', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(0)
+  })
+
+  it('file-based search handles missing files gracefully', async () => {
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-missing',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Missing file',
+        sourceFile: '/nonexistent/path.jsonl',
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'anything', tier: 'fullText' },
+    })
+
+    expect(page.items).toHaveLength(0)
+    // No throw -- graceful handling
+  })
+
+  it('file-based search respects abort signals', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}\n')
+
+    const controller = new AbortController()
+    controller.abort()
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    await expect(querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'Hello', tier: 'userMessages' },
+      signal: controller.signal,
+    })).rejects.toThrow(/aborted/i)
+  })
+
+  it('file-based search respects page limit for results', async () => {
+    // Create multiple sessions, each matching
+    for (let i = 0; i < 5; i++) {
+      await fsp.writeFile(
+        path.join(tempDir, `session-${i}.jsonl`),
+        `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"needle match ${i}"}]}}\n`
+      )
+    }
+
+    const sessions = Array.from({ length: 5 }, (_, i) => makeSession({
+      sessionId: `session-${i}`,
+      projectPath: '/repo',
+      lastActivityAt: 5000 - i,
+      title: `Session ${i}`,
+      sourceFile: path.join(tempDir, `session-${i}.jsonl`),
+    }))
+
+    const page = await querySessionDirectory({
+      projects: [makeProject('/repo', sessions)],
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'needle', tier: 'userMessages', limit: 2 },
+    })
+
+    expect(page.items).toHaveLength(2)
+    expect(page.nextCursor).toBeTruthy()
+  })
+
+  it('sort order is preserved for file-based search results', async () => {
+    // Create 3 sessions with different timestamps, one archived
+    for (const id of ['a', 'b', 'c']) {
+      await fsp.writeFile(
+        path.join(tempDir, `session-${id}.jsonl`),
+        `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"deploy fix"}]}}\n`
+      )
+    }
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-a',
+        projectPath: '/repo',
+        lastActivityAt: 3000,
+        title: 'Session A',
+        sourceFile: path.join(tempDir, 'session-a.jsonl'),
+      }),
+      makeSession({
+        sessionId: 'session-b',
+        projectPath: '/repo',
+        lastActivityAt: 2000,
+        title: 'Session B',
+        sourceFile: path.join(tempDir, 'session-b.jsonl'),
+        archived: true,
+      }),
+      makeSession({
+        sessionId: 'session-c',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Session C',
+        sourceFile: path.join(tempDir, 'session-c.jsonl'),
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'deploy', tier: 'userMessages' },
+    })
+
+    // Non-archived by recency desc, then archived by recency desc
+    expect(page.items.map((item) => item.sessionId)).toEqual([
+      'session-a',
+      'session-c',
+      'session-b',
+    ])
+  })
+
+  it('file-based search with Codex provider finds user messages', async () => {
+    const sessionFile = path.join(tempDir, 'codex-session.jsonl')
+    // Codex format: response_item with message payload
+    await fsp.writeFile(sessionFile, [
+      '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"auth bug fix"}]}}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        provider: 'codex',
+        sessionId: 'codex-session',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Codex session',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [codexProvider],
+      query: { priority: 'visible', query: 'auth bug', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].matchedIn).toBe('userMessage')
+  })
+
+  it('file-based search skips sessions with unknown provider', async () => {
+    const sessionFile = path.join(tempDir, 'unknown-session.jsonl')
+    await fsp.writeFile(sessionFile, '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"test content"}]}}\n')
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        provider: 'unknown-cli' as any,
+        sessionId: 'unknown-session',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Unknown provider session',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'test content', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(0)
+  })
+
+  it('fullText tier prefers user message match over assistant when both contain the term', async () => {
+    const sessionFile = path.join(tempDir, 'session-both.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"deploy the service"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I will deploy it now"}]}}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-both',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'deploy', tier: 'fullText' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    // User message comes first in the file, so first hit is user message
+    expect(page.items[0].matchedIn).toBe('userMessage')
+  })
+
+  it('title-tier search completes quickly for many sessions (performance guard)', async () => {
+    const sessions = Array.from({ length: 1000 }, (_, i) => makeSession({
+      sessionId: `session-${i}`,
+      projectPath: '/repo',
+      lastActivityAt: 10000 - i,
+      title: i % 10 === 0 ? `Deploy session ${i}` : `Other session ${i}`,
+    }))
+
+    const start = performance.now()
+    const page = await querySessionDirectory({
+      projects: [makeProject('/repo', sessions)],
+      terminalMeta: [],
+      query: { priority: 'visible', query: 'deploy', tier: 'title' },
+    })
+    const elapsed = performance.now() - start
+
+    expect(page.items.length).toBeGreaterThan(0)
+    expect(elapsed).toBeLessThan(50)
   })
 })

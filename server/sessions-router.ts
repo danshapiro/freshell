@@ -85,6 +85,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
           projects: codingCliIndexer.getProjects(),
           query: parsed.data,
           terminalMeta: deps.terminalMetadata?.list() ?? [],
+          providers: codingCliProviders,
           signal: scheduledSignal,
         }),
       })

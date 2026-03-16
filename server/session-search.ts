@@ -56,6 +56,10 @@ export const SearchResponseSchema = z.object({
 
 export type SearchResponse = z.infer<typeof SearchResponseSchema>
 
+/**
+ * @deprecated Superseded by the session-directory service's applySearch for the title tier.
+ * Retained for backward compatibility; do not delete until all references are removed.
+ */
 export function searchTitleTier(
   projects: ProjectGroup[],
   query: string,
@@ -253,6 +257,10 @@ export interface SearchSessionsOptions {
   maxFiles?: number
 }
 
+/**
+ * @deprecated Superseded by querySessionDirectory with file-based search tiers.
+ * Retained for backward compatibility; do not delete until all references are removed.
+ */
 export async function searchSessions(
   options: SearchSessionsOptions
 ): Promise<SearchResponse> {
