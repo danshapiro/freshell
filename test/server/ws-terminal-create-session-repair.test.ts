@@ -826,7 +826,7 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
-  it('ignores invalid resumeSessionId and skips session repair wait', async () => {
+  it('passes non-UUID resumeSessionId through to create and skips session repair wait', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -844,8 +844,11 @@ describe('terminal.create session repair wait', () => {
 
       const created = await createdPromise
 
-      expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      // Non-UUID name is now passed through to the registry (not stripped)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe('not-a-uuid')
+      // effectiveResumeSessionId is set because the name is passed through
+      expect(created.effectiveResumeSessionId).toBe('not-a-uuid')
+      // Session repair is still skipped for non-UUID names
       expect(sessionRepairService.waitForSessionCalls).not.toContain('not-a-uuid')
     } finally {
       await closeWebSocket(ws)

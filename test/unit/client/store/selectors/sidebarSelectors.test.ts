@@ -171,7 +171,7 @@ describe('sidebarSelectors', () => {
       expect(hasTabBySessionId.get('codex-layout')).toBe(true)
       expect(hasTabBySessionId.get('codex-no-layout')).toBe(true)
       expect(hasTabBySessionId.get(validClaudeSessionId)).toBe(true)
-      expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(false)
+      expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(true)
     })
 
     it('creates a fallback sidebar item for a Claude pane with a human-readable resume name', () => {

@@ -1596,22 +1596,25 @@ describe('buildSpawnSpec resume validation on Windows shells', () => {
     process.env = { ...originalEnv }
   })
 
-  it('omits --resume in cmd.exe string when invalid', () => {
+  it('passes --resume in cmd.exe string with human-readable name', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' })
     const spec = buildSpawnSpec('claude', 'C:\\tmp', 'cmd', 'not-a-uuid')
-    expect(spec.args.join(' ')).not.toContain('--resume')
+    expect(spec.args.join(' ')).toContain('--resume')
+    expect(spec.args.join(' ')).toContain('not-a-uuid')
   })
 
-  it('omits --resume in PowerShell command when invalid', () => {
+  it('passes --resume in PowerShell command with human-readable name', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' })
     const spec = buildSpawnSpec('claude', 'C:\\tmp', 'powershell', 'not-a-uuid')
-    expect(spec.args.join(' ')).not.toContain('--resume')
+    expect(spec.args.join(' ')).toContain('--resume')
+    expect(spec.args.join(' ')).toContain('not-a-uuid')
   })
 
-  it('omits --resume in WSL args when invalid', () => {
+  it('passes --resume in WSL args with human-readable name', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' })
     const spec = buildSpawnSpec('claude', 'C:\\tmp', 'wsl', 'not-a-uuid')
-    expect(spec.args).not.toContain('--resume')
+    expect(spec.args).toContain('--resume')
+    expect(spec.args).toContain('not-a-uuid')
   })
 
   it('converts Windows cwd to WSL mount path when launching with wsl shell on Windows', () => {
