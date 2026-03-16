@@ -1,5 +1,4 @@
 import { logger } from './logger.js'
-import { isValidClaudeSessionId } from './claude-session-id.js'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
@@ -244,12 +243,14 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   }
 }
 
-export function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
+/**
+ * Normalize a resume identifier for spawning the CLI process.
+ * Claude Code accepts both UUIDs and human-readable names for --resume.
+ * Returns the raw value for any non-empty string; undefined for empty/missing.
+ */
+export function normalizeResumeForSpawn(_mode: TerminalMode, resumeSessionId?: string): string | undefined {
   if (!resumeSessionId) return undefined
-  if (mode !== 'claude') return resumeSessionId
-  if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
-  logger.warn({ resumeSessionId }, 'Ignoring invalid Claude resumeSessionId')
-  return undefined
+  return resumeSessionId
 }
 
 export function getModeLabel(mode: TerminalMode): string {
@@ -337,7 +338,7 @@ export function buildSpawnSpec(
     COLORTERM: process.env.COLORTERM || 'truecolor',
   }
 
-  const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
+  const normalizedResume = normalizeResumeForSpawn(mode, resumeSessionId)
 
   // Resolve shell for the current platform
   const effectiveShell = resolveShell(shell)

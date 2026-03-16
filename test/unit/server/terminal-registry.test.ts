@@ -761,10 +761,28 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
     })
 
-    it('omits --resume when resumeSessionId is invalid', () => {
+    it('passes --resume with human-readable name for claude', () => {
       delete process.env.CLAUDE_CMD
 
       const spec = buildSpawnSpec('claude', '/Users/john', 'system', 'not-a-uuid')
+
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain('not-a-uuid')
+    })
+
+    it('passes --resume with human-readable resume name containing spaces', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', '137 tour')
+
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain('137 tour')
+    })
+
+    it('omits --resume when resumeSessionId is empty string', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system', '')
 
       expect(spec.args).not.toContain('--resume')
     })

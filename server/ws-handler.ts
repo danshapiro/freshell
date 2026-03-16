@@ -1132,11 +1132,6 @@ export class WsHandler {
         let rateLimited = false
         let effectiveResumeSessionId = m.resumeSessionId
         try {
-          if (m.mode === 'claude' && effectiveResumeSessionId && !isValidClaudeSessionId(effectiveResumeSessionId)) {
-            log.warn({ resumeSessionId: effectiveResumeSessionId, connectionId: ws.connectionId }, 'Ignoring invalid Claude resumeSessionId')
-            effectiveResumeSessionId = undefined
-          }
-
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
             async () => {
@@ -1296,7 +1291,7 @@ export class WsHandler {
               // Session repair is Claude-specific (uses JSONL session files).
               // Other providers (codex, opencode, etc.) don't use the same file
               // structure, so this block correctly remains gated on mode === 'claude'.
-              if (m.mode === 'claude' && effectiveResumeSessionId && this.sessionRepairService) {
+              if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
                 const sessionId = effectiveResumeSessionId
                 const cached = this.sessionRepairService.getResult(sessionId)
                 if (cached?.status === 'missing') {

@@ -294,11 +294,26 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   }
 }
 
-function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
+/**
+ * Normalize a resume identifier for spawning the CLI process.
+ * Claude Code accepts both UUIDs and human-readable names for --resume.
+ * Returns the raw value for any non-empty string; undefined for empty/missing.
+ */
+function normalizeResumeForSpawn(_mode: TerminalMode, resumeSessionId?: string): string | undefined {
+  if (!resumeSessionId) return undefined
+  return resumeSessionId
+}
+
+/**
+ * Normalize a resume identifier for session binding (the authoritative
+ * terminal-to-session association).  Claude session files are UUID-named,
+ * so only valid UUIDs can be used as binding keys.  Other providers
+ * accept any non-empty string.
+ */
+function normalizeResumeForBinding(mode: TerminalMode, resumeSessionId?: string): string | undefined {
   if (!resumeSessionId) return undefined
   if (mode !== 'claude') return resumeSessionId
   if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
-  logger.warn({ resumeSessionId }, 'Ignoring invalid Claude resumeSessionId')
   return undefined
 }
 
@@ -326,6 +341,7 @@ export type TerminalRecord = {
   description?: string
   mode: TerminalMode
   resumeSessionId?: string
+  pendingResumeName?: string
   createdAt: number
   lastActivityAt: number
   exitedAt?: number
@@ -721,7 +737,7 @@ export function buildSpawnSpec(
     ...envOverrides,
   }
 
-  const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
+  const normalizedResume = normalizeResumeForSpawn(mode, resumeSessionId)
 
   // Resolve shell for the current platform
   const effectiveShell = resolveShell(shell)
@@ -1057,7 +1073,8 @@ export class TerminalRegistry extends EventEmitter {
     const rows = opts.rows || 30
 
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
-    const normalizedResume = normalizeResumeSessionId(opts.mode, opts.resumeSessionId)
+    const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
+    const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
 
     const port = Number(process.env.PORT || 3001)
     const baseEnv = {
@@ -1073,7 +1090,7 @@ export class TerminalRegistry extends EventEmitter {
       opts.mode,
       cwd,
       opts.shell || 'system',
-      normalizedResume,
+      resumeForSpawn,
       opts.providerSettings,
       baseEnv,
     )
@@ -1222,14 +1239,21 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
-    if (modeSupportsResume(opts.mode) && normalizedResume) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, normalizedResume, 'resume')
+    if (modeSupportsResume(opts.mode) && resumeForBinding) {
+      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, resumeForBinding, 'resume')
       if (!bound.ok) {
         logger.warn(
-          { terminalId, mode: opts.mode, sessionId: normalizedResume, reason: bound.reason },
+          { terminalId, mode: opts.mode, sessionId: resumeForBinding, reason: bound.reason },
           'Failed to bind resume session during terminal create',
         )
       }
+    }
+    if (resumeForSpawn && !resumeForBinding) {
+      record.pendingResumeName = resumeForSpawn
+      logger.info(
+        { terminalId, mode: opts.mode, pendingResumeName: resumeForSpawn },
+        'Terminal created with named resume; awaiting session association',
+      )
     }
     this.emit('terminal.created', record)
     return record
@@ -1778,7 +1802,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!term) return { ok: false, reason: 'terminal_missing' }
     if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
 
-    const normalized = normalizeResumeSessionId(provider, sessionId)
+    const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return { ok: false, reason: 'invalid_session_id' }
 
     const currentBinding = this.bindingAuthority.sessionForTerminal(terminalId)
