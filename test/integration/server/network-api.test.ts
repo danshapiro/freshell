@@ -105,6 +105,7 @@ describe('Network API integration', () => {
     vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockReset()
     vi.mocked(wslModule.persistManagedWslRemoteAccessPorts).mockReset()
     vi.mocked(wslModule.clearManagedWslRemoteAccessPorts).mockReset()
+    vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReset()
     delete process.env.HOST
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
     vi.mocked(isPortReachable).mockResolvedValue(false)
@@ -130,6 +131,7 @@ describe('Network API integration', () => {
     })
     vi.mocked(wslModule.persistManagedWslRemoteAccessPorts).mockResolvedValue(undefined)
     vi.mocked(wslModule.clearManagedWslRemoteAccessPorts).mockResolvedValue(undefined)
+    vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReturnValue(false)
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
 
@@ -236,8 +238,6 @@ describe('Network API integration', () => {
       expect(res.body.host).toBe('0.0.0.0')
       expect(res.body.remoteAccessEnabled).toBe(false)
       expect(res.body.remoteAccessNeedsRepair).toBe(false)
-
-      vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReturnValue(false)
     })
 
     it('requires authentication', async () => {
