@@ -546,6 +546,141 @@ describe('querySessionDirectory file-based search', () => {
     expect(page.items[0].matchedIn).toBe('userMessage')
   })
 
+  it('reports partial with partialReason budget when scan budget is exhausted', async () => {
+    // Create 25 sessions: only the last one (session-024) contains "needle".
+    // With limit=2, maxScan = 2*10 = 20. We'll scan 20 sessions, none matching,
+    // then hit the budget before reaching session-024.
+    for (let i = 0; i < 25; i++) {
+      const text = i === 24 ? 'needle here' : `unrelated content ${i}`
+      await fsp.writeFile(
+        path.join(tempDir, `session-${i}.jsonl`),
+        `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"${text}"}]}}\n`
+      )
+    }
+
+    const sessions = Array.from({ length: 25 }, (_, i) => makeSession({
+      sessionId: `session-${String(i).padStart(3, '0')}`,
+      projectPath: '/repo',
+      lastActivityAt: 25000 - i,
+      title: `Session ${i}`,
+      sourceFile: path.join(tempDir, `session-${i}.jsonl`),
+    }))
+
+    const page = await querySessionDirectory({
+      projects: [makeProject('/repo', sessions)],
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'needle', tier: 'userMessages', limit: 2 },
+    })
+
+    // The match is at position 24, but scan budget is 20, so it's never reached
+    expect(page.items).toHaveLength(0)
+    expect(page.partial).toBe(true)
+    expect(page.partialReason).toBe('budget')
+  })
+
+  it('reports partial with partialReason io_error when file reads fail', async () => {
+    const goodFile = path.join(tempDir, 'good.jsonl')
+    await fsp.writeFile(goodFile, '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"needle here"}]}}\n')
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-bad',
+        projectPath: '/repo',
+        lastActivityAt: 2000,
+        title: 'Bad file session',
+        sourceFile: '/nonexistent/path.jsonl',
+      }),
+      makeSession({
+        sessionId: 'session-good',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Good file session',
+        sourceFile: goodFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'needle', tier: 'userMessages' },
+    })
+
+    // The good session should still be found
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0].sessionId).toBe('session-good')
+    expect(page.partial).toBe(true)
+    expect(page.partialReason).toBe('io_error')
+  })
+
+  it('does not report partial when all files are scanned without errors within budget', async () => {
+    const sessionFile = path.join(tempDir, 'session-1.jsonl')
+    await fsp.writeFile(sessionFile, '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"needle"}]}}\n')
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-1',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Some title',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'needle', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.partial).toBeUndefined()
+    expect(page.partialReason).toBeUndefined()
+  })
+
+  it('propagates abort signal into file streaming within searchSessionFile', async () => {
+    // Create a file with content that would match
+    const sessionFile = path.join(tempDir, 'session-abort.jsonl')
+    // Write many lines to make the file large enough that streaming takes time
+    const lines = Array.from({ length: 100 }, (_, i) =>
+      `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"line ${i} padding content to make file bigger"}]}}`
+    )
+    // Put the match at the end so the signal should be checked before reaching it
+    lines.push('{"type":"user","message":{"role":"user","content":[{"type":"text","text":"needle at end"}]}}')
+    await fsp.writeFile(sessionFile, lines.join('\n'))
+
+    // Create a controller that aborts mid-scan
+    const controller = new AbortController()
+
+    const projects = [makeProject('/repo', [
+      makeSession({
+        sessionId: 'session-abort',
+        projectPath: '/repo',
+        lastActivityAt: 1000,
+        title: 'Abort test',
+        sourceFile: sessionFile,
+      }),
+    ])]
+
+    // Abort after a microtask to allow search to start but not finish
+    const abortPromise = Promise.resolve().then(() => controller.abort())
+
+    const resultPromise = querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [claudeProvider],
+      query: { priority: 'visible', query: 'needle at end', tier: 'userMessages' },
+      signal: controller.signal,
+    })
+
+    await abortPromise
+
+    // Should reject with abort or return partial results (not hang)
+    await expect(resultPromise).rejects.toThrow(/aborted/i)
+  })
+
   it('title-tier search completes quickly for many sessions (performance guard)', async () => {
     const sessions = Array.from({ length: 1000 }, (_, i) => makeSession({
       sessionId: `session-${i}`,

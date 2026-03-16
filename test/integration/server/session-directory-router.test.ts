@@ -320,6 +320,60 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(res.body.items[0].matchedIn).toBe('userMessage')
   })
 
+  it('passes providers to querySessionDirectory for file-based search', async () => {
+    const sessionFile = path.join(tempDir, 'session-provider-test.jsonl')
+    await fsp.writeFile(sessionFile, [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"provider wiring test"}]}}',
+    ].join('\n'))
+
+    // Create app with a scheduler spy that captures the run callback args
+    const runArgs: any[] = []
+    const schedule = vi.fn(async ({ signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
+      return run(signal)
+    })
+
+    const testApp = express()
+    testApp.use(express.json())
+    testApp.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    testApp.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride: vi.fn().mockResolvedValue({ ok: true }),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliIndexer: {
+        getProjects: () => [{
+          projectPath: '/repo',
+          sessions: [{
+            provider: 'claude',
+            sessionId: 'session-provider-test',
+            projectPath: '/repo',
+            lastActivityAt: 100,
+            title: 'Provider test',
+            sourceFile: sessionFile,
+          }],
+        }],
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [claudeProvider],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: { list: () => [] },
+      readModelScheduler: { schedule },
+    }))
+
+    const res = await request(testApp)
+      .get('/api/session-directory?priority=visible&query=provider+wiring&tier=userMessages')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    // The file-based search found the match -- this proves providers were passed through
+    expect(res.body.items).toHaveLength(1)
+    expect(res.body.items[0].matchedIn).toBe('userMessage')
+  })
+
   it('fullText tier finds assistant message matches', async () => {
     const sessionFile = path.join(tempDir, 'session-1.jsonl')
     await fsp.writeFile(sessionFile, [

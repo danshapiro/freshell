@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { SessionDirectoryQuerySchema, SessionDirectoryItemSchema } from '../../../shared/read-models'
+import { SessionDirectoryQuerySchema, SessionDirectoryItemSchema, SessionDirectoryPageSchema } from '../../../shared/read-models'
 
 describe('SessionDirectoryQuerySchema tier field', () => {
   it('accepts title tier', () => {
@@ -51,5 +51,35 @@ describe('SessionDirectoryItemSchema matchedIn field', () => {
       const result = SessionDirectoryItemSchema.parse({ ...baseItem, matchedIn: value })
       expect(result.matchedIn).toBe(value)
     }
+  })
+})
+
+describe('SessionDirectoryPageSchema partial fields', () => {
+  const basePage = {
+    items: [],
+    nextCursor: null,
+    revision: 0,
+  }
+
+  it('accepts partial: true with partialReason: budget', () => {
+    const result = SessionDirectoryPageSchema.parse({ ...basePage, partial: true, partialReason: 'budget' })
+    expect(result.partial).toBe(true)
+    expect(result.partialReason).toBe('budget')
+  })
+
+  it('accepts partial: true with partialReason: io_error', () => {
+    const result = SessionDirectoryPageSchema.parse({ ...basePage, partial: true, partialReason: 'io_error' })
+    expect(result.partial).toBe(true)
+    expect(result.partialReason).toBe('io_error')
+  })
+
+  it('omits partial fields when not present', () => {
+    const result = SessionDirectoryPageSchema.parse(basePage)
+    expect(result.partial).toBeUndefined()
+    expect(result.partialReason).toBeUndefined()
+  })
+
+  it('rejects unknown partialReason values', () => {
+    expect(() => SessionDirectoryPageSchema.parse({ ...basePage, partial: true, partialReason: 'timeout' })).toThrow()
   })
 })

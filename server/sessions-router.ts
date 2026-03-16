@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
@@ -37,7 +38,7 @@ export interface SessionsRouterDeps {
     getProjects: () => any[]
     refresh: () => Promise<void>
   }
-  codingCliProviders: any[]
+  codingCliProviders: CodingCliProvider[]
   perfConfig: { slowSessionRefreshMs: number }
   terminalMetadata?: { list: () => TerminalMeta[] }
   registry?: { updateTitle: (id: string, title: string) => void }

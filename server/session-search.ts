@@ -198,7 +198,8 @@ export async function searchSessionFile(
   provider: CodingCliProvider,
   filePath: string,
   query: string,
-  tier: 'userMessages' | 'fullText'
+  tier: 'userMessages' | 'fullText',
+  signal?: AbortSignal,
 ): Promise<Omit<SearchResult, 'sessionId' | 'projectPath' | 'lastActivityAt'> | null> {
   const q = query.toLowerCase()
 
@@ -207,36 +208,49 @@ export async function searchSessionFile(
   let reader: ReturnType<typeof createInterface> | null = null
 
   try {
+    if (signal?.aborted) throw new Error('Session file search aborted')
+
     handle = await fs.promises.open(filePath, 'r')
     stream = handle.createReadStream({ encoding: 'utf-8' })
     reader = createInterface({ input: stream, crlfDelay: Infinity })
 
-    for await (const line of reader) {
-      if (!line) continue
+    // Abort handler: destroy the stream to unblock the async iterator
+    const onAbort = () => {
+      stream?.destroy()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
 
-      let events: NormalizedEvent[] = []
-      try {
-        events = provider.parseEvent(line)
-      } catch {
-        continue
-      }
+    try {
+      for await (const line of reader) {
+        if (signal?.aborted) throw new Error('Session file search aborted')
+        if (!line) continue
 
-      for (const event of events) {
-        if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
-        if (tier === 'userMessages' && event.type !== 'message.user') continue
+        let events: NormalizedEvent[] = []
+        try {
+          events = provider.parseEvent(line)
+        } catch {
+          continue
+        }
 
-        const text = event.message?.content
-        if (!text) continue
+        for (const event of events) {
+          if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
+          if (tier === 'userMessages' && event.type !== 'message.user') continue
 
-      if (text.toLowerCase().includes(q)) {
-        return {
-          provider: provider.name,
-          matchedIn: event.type === 'message.user' ? 'userMessage' : 'assistantMessage',
-          snippet: extractSnippet(text, query),
+          const text = event.message?.content
+          if (!text) continue
+
+          if (text.toLowerCase().includes(q)) {
+            return {
+              provider: provider.name,
+              matchedIn: event.type === 'message.user' ? 'userMessage' : 'assistantMessage',
+              snippet: extractSnippet(text, query),
+            }
+          }
         }
       }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
     }
-  }
   } finally {
     reader?.close()
     stream?.destroy()

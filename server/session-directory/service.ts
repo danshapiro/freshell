@@ -21,6 +21,12 @@ type QuerySessionDirectoryInput = {
   signal?: AbortSignal
 }
 
+type FileSearchResult = {
+  items: SessionDirectoryItem[]
+  partial?: true
+  partialReason?: 'budget' | 'io_error'
+}
+
 type CursorPayload = {
   lastActivityAt: number
   key: string
@@ -109,7 +115,7 @@ async function applyFileSearch(
   tier: 'userMessages' | 'fullText',
   input: QuerySessionDirectoryInput,
   limit: number,
-): Promise<SessionDirectoryItem[]> {
+): Promise<FileSearchResult> {
   const providersByName = new Map(
     (input.providers ?? []).map((p) => [p.name, p])
   )
@@ -127,10 +133,17 @@ async function applyFileSearch(
 
   const results: SessionDirectoryItem[] = []
   const maxScan = limit * 10 // Scan budget to avoid unbounded I/O
+  let partial = false
+  let partialReason: 'budget' | 'io_error' | undefined
 
   let scanned = 0
   for (const item of items) {
-    if (scanned >= maxScan || results.length >= limit + 1) break
+    if (results.length >= limit + 1) break
+    if (scanned >= maxScan) {
+      partial = true
+      partialReason = 'budget'
+      break
+    }
     throwIfAborted(input.signal)
 
     const key = buildSessionKey(item)
@@ -143,21 +156,32 @@ async function applyFileSearch(
     scanned++
 
     try {
-      const match = await searchSessionFile(provider, sourceFile, queryText, tier)
+      const match = await searchSessionFile(provider, sourceFile, queryText, tier, input.signal)
       if (match) {
         results.push({
           ...item,
-          matchedIn: match.matchedIn as SessionDirectoryItem['matchedIn'],
+          matchedIn: match.matchedIn,
           snippet: match.snippet,
         })
       }
-    } catch {
-      // Graceful: skip sessions with I/O errors
+    } catch (error) {
+      // Re-throw abort errors so they propagate correctly
+      if (input.signal?.aborted) throw error
+      // Graceful: mark partial and skip sessions with I/O errors
+      partial = true
+      if (partialReason !== 'budget') {
+        partialReason = 'io_error'
+      }
       continue
     }
   }
 
-  return results
+  const result: FileSearchResult = { items: results }
+  if (partial) {
+    result.partial = true
+    result.partialReason = partialReason
+  }
+  return result
 }
 
 export async function querySessionDirectory(input: QuerySessionDirectoryInput): Promise<SessionDirectoryPage> {
@@ -183,6 +207,9 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
 
   throwIfAborted(input.signal)
 
+  let partial: true | undefined
+  let partialReason: 'budget' | 'io_error' | undefined
+
   if (input.query.query?.trim()) {
     if (tier === 'title') {
       // Existing metadata-only search
@@ -191,7 +218,10 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
         .filter((item): item is SessionDirectoryItem => item !== null)
     } else {
       // File-based search for userMessages / fullText
-      items = await applyFileSearch(items, input.query.query!.trim(), tier, input, limit)
+      const fileResult = await applyFileSearch(items, input.query.query!.trim(), tier, input, limit)
+      items = fileResult.items
+      partial = fileResult.partial
+      partialReason = fileResult.partialReason
     }
   }
 
@@ -201,9 +231,16 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     ? encodeCursor({ lastActivityAt: tail.lastActivityAt, key: buildSessionKey(tail) })
     : null
 
-  return {
+  const page: SessionDirectoryPage = {
     items: pageItems,
     nextCursor,
     revision,
   }
+
+  if (partial) {
+    page.partial = partial
+    page.partialReason = partialReason
+  }
+
+  return page
 }

@@ -58,6 +58,8 @@ export const SessionDirectoryPageSchema = z.object({
   items: z.array(SessionDirectoryItemSchema),
   nextCursor: z.string().nullable(),
   revision: z.number().int().nonnegative(),
+  partial: z.boolean().optional(),
+  partialReason: z.enum(['budget', 'io_error']).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({
