@@ -1874,7 +1874,7 @@ export class TerminalRegistry extends EventEmitter {
    * Check whether a session is already bound to any terminal.
    */
   isSessionBound(provider: CodingCliProviderName, sessionId: string): boolean {
-    const normalized = normalizeResumeSessionId(provider, sessionId)
+    const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return false
     return this.bindingAuthority.ownerForSession(provider, normalized) !== undefined
   }
