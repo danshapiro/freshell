@@ -106,8 +106,10 @@ function terminalMetaEquals(a: TerminalMeta, b: TerminalMeta): boolean {
 }
 
 export class TerminalMetadataService {
+  static readonly RETIRED_TTL_MS = 60 * 60 * 1000 // 1 hour
+
   private byTerminalId = new Map<string, TerminalMeta>()
-  private retiredIds = new Set<string>()
+  private retiredAt = new Map<string, number>()
   private readonly now: () => number
   private readonly git: GitMetadataResolvers
 
@@ -125,7 +127,7 @@ export class TerminalMetadataService {
 
   list(): TerminalMeta[] {
     return Array.from(this.byTerminalId.values()).filter(
-      (meta) => !this.retiredIds.has(meta.terminalId),
+      (meta) => !this.retiredAt.has(meta.terminalId),
     )
   }
 
@@ -193,13 +195,24 @@ export class TerminalMetadataService {
       sessionId: entry.sessionId,
       updatedAt: entry.updatedAt,
     })
-    this.retiredIds.add(terminalId)
+    this.retiredAt.set(terminalId, this.now())
+    this.pruneStaleRetired()
     return true
   }
 
   remove(terminalId: string): boolean {
-    this.retiredIds.delete(terminalId)
+    this.retiredAt.delete(terminalId)
     return this.byTerminalId.delete(terminalId)
+  }
+
+  private pruneStaleRetired(): void {
+    const cutoff = this.now() - TerminalMetadataService.RETIRED_TTL_MS
+    for (const [id, timestamp] of this.retiredAt) {
+      if (timestamp < cutoff) {
+        this.retiredAt.delete(id)
+        this.byTerminalId.delete(id)
+      }
+    }
   }
 
   private async upsert(

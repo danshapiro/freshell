@@ -117,8 +117,47 @@ describe('Unified rename cascade — integration', () => {
     expect(sessionOverride!.titleOverride).toBe('My Renamed Session')
   })
 
+  // ────────────────────────────────────────────────────────────
+  // Test 2: Terminal rename cascades AFTER terminal process exits
+  // ────────────────────────────────────────────────────────────
+  it('terminal rename cascades to session after process exit (retired metadata)', async () => {
+    const terminalId = 'term_cascade_exit'
+    const provider: CodingCliProviderName = 'claude'
+    const sessionId = 'session-exited-123'
+    const compositeKey = makeSessionKey(provider, sessionId)
+
+    // Seed a terminal and associate it with a coding CLI session
+    await terminalMetadata.seedFromTerminal({
+      terminalId,
+      mode: 'claude',
+      cwd: '/tmp/project',
+    })
+    terminalMetadata.associateSession(terminalId, provider, sessionId)
+
+    // Simulate terminal process exit: retire instead of remove
+    terminalMetadata.retire(terminalId)
+
+    // Verify metadata is retired (not in list, but accessible via get)
+    expect(terminalMetadata.list().find((m) => m.terminalId === terminalId)).toBeUndefined()
+    expect(terminalMetadata.get(terminalId)?.provider).toBe(provider)
+
+    // PATCH terminal with a new title — cascade should still work
+    const res = await request(app)
+      .patch(`/api/terminals/${terminalId}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Renamed After Exit' })
+      .expect(200)
+
+    expect(res.body.titleOverride).toBe('Renamed After Exit')
+
+    // Verify the session override was written via the cascade
+    const sessionOverride = await configStore.getSessionOverride(compositeKey)
+    expect(sessionOverride).toBeDefined()
+    expect(sessionOverride!.titleOverride).toBe('Renamed After Exit')
+  })
+
   // ────────────────────────────────────────────
-  // Test 2: Session rename cascades to terminal
+  // Test 3: Session rename cascades to terminal
   // ────────────────────────────────────────────
   it('session rename cascades to terminal override', async () => {
     const terminalId = 'term_cascade_2'
@@ -187,10 +226,12 @@ function buildTestApp(
       deleted,
     })
 
-    // Cascade: if this terminal has a coding CLI session, also rename the session
-    // (inlined from cascadeTerminalRenameToSession to use the test's configStore)
+    // Cascade: if this terminal has a coding CLI session, also rename the session.
+    // Uses get() with fallback to list().find() so the cascade works even after
+    // the terminal process has exited (retired entries are preserved via get()).
     if (typeof titleOverride === 'string' && titleOverride.trim()) {
-      const meta = terminalMetadata.list().find((m) => m.terminalId === terminalId)
+      const meta = terminalMetadata.get(terminalId)
+        ?? terminalMetadata.list().find((m) => m.terminalId === terminalId)
       if (meta?.provider && meta.sessionId) {
         const compositeKey = makeSessionKey(meta.provider as CodingCliProviderName, meta.sessionId)
         await configStore.patchSessionOverride(compositeKey, { titleOverride: titleOverride.trim() })

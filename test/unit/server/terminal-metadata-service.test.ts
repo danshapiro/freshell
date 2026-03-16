@@ -349,5 +349,70 @@ describe('TerminalMetadataService', () => {
       service.remove('term-full-remove')
       expect(service.get('term-full-remove')).toBeUndefined()
     })
+
+    it('prunes retired entries older than the TTL on subsequent retire() calls', async () => {
+      let now = 1_000
+      const service = new TerminalMetadataService({
+        now: () => now,
+        git: {
+          resolveCheckoutRoot: async () => '/workspace/repo',
+          resolveRepoRoot: async () => '/workspace',
+          resolveBranchAndDirty: async () => ({ branch: 'main', isDirty: false }),
+        },
+      })
+
+      // Seed and retire an old terminal
+      await service.seedFromTerminal(
+        createTerminalRecord({ terminalId: 'term-old', mode: 'claude', cwd: '/workspace/repo', resumeSessionId: 's-old' }),
+      )
+      service.retire('term-old')
+      expect(service.get('term-old')).toBeDefined()
+
+      // Advance time past the TTL (default 1 hour)
+      now += 60 * 60 * 1000 + 1
+
+      // Seed and retire a new terminal — should trigger pruning of the old one
+      await service.seedFromTerminal(
+        createTerminalRecord({ terminalId: 'term-new', mode: 'claude', cwd: '/workspace/repo', resumeSessionId: 's-new' }),
+      )
+      service.retire('term-new')
+
+      // Old entry should have been pruned
+      expect(service.get('term-old')).toBeUndefined()
+      // New entry should still be accessible
+      expect(service.get('term-new')).toBeDefined()
+      expect(service.get('term-new')?.provider).toBe('claude')
+    })
+
+    it('preserves recently retired entries during pruning', async () => {
+      let now = 1_000
+      const service = new TerminalMetadataService({
+        now: () => now,
+        git: {
+          resolveCheckoutRoot: async () => '/workspace/repo',
+          resolveRepoRoot: async () => '/workspace',
+          resolveBranchAndDirty: async () => ({ branch: 'main', isDirty: false }),
+        },
+      })
+
+      // Seed and retire terminal A
+      await service.seedFromTerminal(
+        createTerminalRecord({ terminalId: 'term-a', mode: 'claude', cwd: '/workspace/repo', resumeSessionId: 's-a' }),
+      )
+      service.retire('term-a')
+
+      // Advance 30 minutes (within TTL)
+      now += 30 * 60 * 1000
+
+      // Seed and retire terminal B — should NOT prune A
+      await service.seedFromTerminal(
+        createTerminalRecord({ terminalId: 'term-b', mode: 'codex', cwd: '/workspace/repo', resumeSessionId: 's-b' }),
+      )
+      service.retire('term-b')
+
+      // Both should be accessible
+      expect(service.get('term-a')).toBeDefined()
+      expect(service.get('term-b')).toBeDefined()
+    })
   })
 })
