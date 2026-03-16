@@ -2,9 +2,31 @@
 
 ## Problem Statement
 
-When a user selects a deeper search tier (userMessages or fullText), the current system fires a single HTTP request to `/api/session-directory` with the chosen tier. The entire result set is computed server-side (scanning JSONL files sequentially) before any response is sent. During this time, the sidebar shows either a spinner or nothing -- the user sees zero results until the full scan completes, which can take seconds on large session directories.
+Search is broken in two ways:
+
+1. **Client-side search bypass:** When `searchTier === 'title'` and no `sidebarWindow` exists yet (but top-level sessions are loaded), `Sidebar.tsx` (line 226-229) short-circuits the server request entirely and falls back to client-side filtering via `filterSessionItems` in `sidebarSelectors.ts`. This client-side filter searches different fields (title, subtitle/project name, projectPath, provider) than the server's title tier (title, summary, firstUserMessage). The result: the two code paths produce inconsistent results, and the server's richer metadata search (summary, firstUserMessage) is never exercised for the most common case.
+
+2. **Blocking deep search:** When a user selects a deeper search tier (userMessages or fullText), the current system fires a single HTTP request to `/api/session-directory` with the chosen tier. The entire result set is computed server-side (scanning JSONL files sequentially) before any response is sent. During this time, the sidebar shows either a spinner or nothing -- the user sees zero results until the full scan completes, which can take seconds on large session directories.
+
+### What each search tier actually does (server-side)
+
+Understanding the server behavior is essential. All search goes through `querySessionDirectory` in `server/session-directory/service.ts`:
+
+- **`title` tier:** Metadata-only, no file I/O. The `applySearch` function (service.ts line 65-81) checks `item.title`, `item.summary`, and `item.firstUserMessage` against the query string (case-insensitive substring match). Returns the first matching field as `matchedIn` with a snippet. Fast -- runs against in-memory data.
+
+- **`userMessages` tier:** File-based. For each session, opens the JSONL source file and streams through it line by line. Only matches against `message.user` type events. Returns on first match with the matching text as snippet. Slow -- requires sequential file I/O.
+
+- **`fullText` tier:** File-based, same as userMessages but also includes `message.assistant` events. Slowest tier since it reads both user and assistant messages from every session file.
 
 ## Design Overview
+
+Two changes, both on the client:
+
+### Change 1: Remove client-side search bypass (make all search server-side)
+
+Remove the early-return in `Sidebar.tsx` that skips the server request for title-tier search when no `sidebarWindow` exists. Remove the client-side filter fallback (`sidebarWindow ? '' : filter` on line 245). After this change, ALL search queries -- regardless of tier -- go through `fetchSessionWindow` which calls `searchSessions` which hits the `/api/session-directory` endpoint. The client-side `filterSessionItems` function in `sidebarSelectors.ts` is no longer used for search (it remains for non-search scenarios where the selector needs local filtering).
+
+### Change 2: Progressive (two-phase) search for deep tiers
 
 Progressive search works in two phases per keystroke:
 
@@ -21,9 +43,29 @@ Progressive search works in two phases per keystroke:
 
 ## Architecture Changes
 
-The change spans three layers: the client thunk (`sessionsThunks.ts`), the Redux slice (`sessionsSlice.ts`), and the Sidebar component (`Sidebar.tsx`). No server changes are needed -- the server already supports tier-specific queries correctly.
+The change spans three layers: the Sidebar component (`Sidebar.tsx`), the client thunk (`sessionsThunks.ts`), and the Redux slice (`sessionsSlice.ts`). No server changes are needed -- the server already supports tier-specific queries correctly.
 
-### Layer 1: sessionsThunks.ts -- Two-Phase Fetch
+### Layer 1: Sidebar.tsx -- Remove client-side search bypass
+
+**Current behavior (broken):** The search effect at line 214-243 has an early-return at line 226-229:
+```ts
+if (!sidebarWindow && topLevelSessionCount > 0 && searchTier === 'title') {
+  return  // <-- BUG: skips server search, falls back to client-side filter
+}
+```
+And line 245 passes the filter to the selector for client-side filtering:
+```ts
+const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, sidebarWindow ? '' : filter))
+```
+
+**New behavior:** Remove the early-return bypass entirely. Always dispatch `fetchSessionWindow` for search queries. Change line 245 to always pass empty string to the selector (server results are authoritative):
+```ts
+const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+```
+
+This means `sidebarSelectors.ts`'s `filterSessionItems` function is no longer invoked for search -- the server handles all filtering. The selector still applies visibility filtering (subagent hiding, empty session hiding, etc.) and sorting, which is correct.
+
+### Layer 2: sessionsThunks.ts -- Two-Phase Fetch
 
 **Current behavior:** `fetchSessionWindow` fires one `searchSessions()` call when a query is present, passing the selected tier. It aborts the previous request for the same surface and dispatches `setSessionWindowData` when done.
 
@@ -64,27 +106,51 @@ if (searchTier !== 'title') {
   }))
 
   // Phase 2: file-based search
-  const deepResponse = await searchSessions({
-    query: trimmedQuery,
-    tier: searchTier,
-    signal: controller.signal,
-  })
-  if (controller.signal.aborted) return
+  try {
+    const deepResponse = await searchSessions({
+      query: trimmedQuery,
+      tier: searchTier,
+      signal: controller.signal,
+    })
+    if (controller.signal.aborted) return
 
-  const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-  dispatch(setSessionWindowData({
-    surface,
-    projects: searchResultsToProjects(merged),
-    totalSessions: merged.length,
-    oldestLoadedTimestamp: merged.at(-1)?.lastActivityAt ?? 0,
-    oldestLoadedSessionId: merged.at(-1)
-      ? `${merged.at(-1)!.provider}:${merged.at(-1)!.sessionId}`
-      : '',
-    hasMore: false,
-    query: trimmedQuery,
-    searchTier,
-    deepSearchPending: false,
-  }))
+    const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
+    dispatch(setSessionWindowData({
+      surface,
+      projects: searchResultsToProjects(merged),
+      totalSessions: merged.length,
+      oldestLoadedTimestamp: merged.at(-1)?.lastActivityAt ?? 0,
+      oldestLoadedSessionId: merged.at(-1)
+        ? `${merged.at(-1)!.provider}:${merged.at(-1)!.sessionId}`
+        : '',
+      hasMore: false,
+      query: trimmedQuery,
+      searchTier,
+      deepSearchPending: false,
+    }))
+  } catch (phase2Error) {
+    if (controller.signal.aborted) return
+    // Phase 2 failed but Phase 1 data is already displayed.
+    // Clear the pending indicator and report the error.
+    dispatch(setSessionWindowData({
+      .../* re-dispatch Phase 1 data with deepSearchPending: false */
+      surface,
+      projects: searchResultsToProjects(titleResponse.results),
+      totalSessions: titleResponse.results.length,
+      oldestLoadedTimestamp: titleResponse.results.at(-1)?.lastActivityAt ?? 0,
+      oldestLoadedSessionId: titleResponse.results.at(-1)
+        ? `${titleResponse.results.at(-1)!.provider}:${titleResponse.results.at(-1)!.sessionId}`
+        : '',
+      hasMore: false,
+      query: trimmedQuery,
+      searchTier,
+      deepSearchPending: false,
+    }))
+    dispatch(setSessionWindowError({
+      surface,
+      error: phase2Error instanceof Error ? phase2Error.message : 'Deep search failed',
+    }))
+  }
 } else {
   // Single-phase title search (existing path, unchanged)
   const response = await searchSessions({
@@ -116,11 +182,11 @@ if (searchTier !== 'title') {
 
 **`loadingKind` semantics:** Phase 1 sets `loadingKind: 'search'` as today. When Phase 1 resolves and dispatches `setSessionWindowData`, the reducer unconditionally clears `loading` to `false` and `loadingKind` to `undefined` (see `sessionsSlice.ts` lines 224-225). Between Phase 1 resolve and Phase 2 resolve, the window is no longer "loading" in the blocking sense. The `deepSearchPending` flag carries the background-scan state instead.
 
-**Error handling:** If Phase 1 throws (network error, abort, etc.), the existing catch block runs -- it dispatches `setSessionWindowError` and re-throws. Phase 2 never fires. If Phase 2 throws, the catch block also runs, but the Phase 1 data remains visible (it was already dispatched). The catch block should additionally dispatch `setSessionWindowData` with `deepSearchPending: false` to clear the "Scanning files..." indicator on Phase 2 failure, OR handle it by checking whether Phase 1 data was already dispatched. The simplest approach: wrap Phase 2 in its own try/catch inside the main try block.
+**Error handling:** If Phase 1 throws (network error, abort, etc.), the existing catch block runs -- it dispatches `setSessionWindowError` and re-throws. Phase 2 never fires. If Phase 2 throws, the inner try/catch handles it: re-dispatches Phase 1 data with `deepSearchPending: false` (clearing the "Scanning files..." indicator) and dispatches `setSessionWindowError`. The Phase 1 results remain visible.
 
 **Background refreshes:** `refreshActiveSessionWindow` and `queueActiveSessionWindowRefresh` call `fetchSessionWindow` with the window's stored `query` and `searchTier`. This means background WS invalidation refreshes will also use two-phase search when the user has a deep tier selected. This is correct behavior -- the user gets instant title results followed by a background file scan on refresh too.
 
-### Layer 2: sessionsSlice.ts -- New `deepSearchPending` Field
+### Layer 3: sessionsSlice.ts -- New `deepSearchPending` Field
 
 Add `deepSearchPending?: boolean` to `SessionWindowState`. This field is set by `setSessionWindowData` and is purely informational for the UI. It defaults to `undefined` (falsy).
 
@@ -143,7 +209,7 @@ This is simpler and safer than conditional `if (action.payload.deepSearchPending
 
 **`syncTopLevelFromWindow`** does NOT need to sync `deepSearchPending` to top-level state because this flag is only consumed by Sidebar which reads directly from `sidebarWindow?.deepSearchPending`.
 
-### Layer 3: Sidebar.tsx -- UI Indicators
+### Layer 4: Sidebar.tsx -- UI Indicators
 
 **Current:** `showSearchLoading` is derived from `sidebarWindow?.loading && loadingKind === 'search'`. This drives the inline "Searching..." spinner and the full-list blocking load state.
 
@@ -187,6 +253,33 @@ At no point between steps 2 and 3 is the data cleared. The user sees title resul
 
 ## Tasks
 
+### Task 0: Remove client-side search bypass (prerequisite)
+
+**Files:** `src/components/Sidebar.tsx`
+
+This is the root fix for "search is broken." Without this, title-tier searches skip the server entirely.
+
+1. **Remove the early-return bypass** at line 226-229 of `Sidebar.tsx`:
+   ```ts
+   // DELETE this block:
+   if (!sidebarWindow && topLevelSessionCount > 0 && searchTier === 'title') {
+     return
+   }
+   ```
+   After removal, all search queries (including title tier) will dispatch `fetchSessionWindow` to hit the server.
+
+2. **Remove client-side filter fallback** at line 245. Change:
+   ```ts
+   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, sidebarWindow ? '' : filter))
+   ```
+   to:
+   ```ts
+   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+   ```
+   The selector still applies visibility filtering and sorting; it just no longer does text-based filtering (that is the server's job now).
+
+3. **Remove `topLevelSessionCount` dependency** from the search effect's dependency array (line 243) since the early-return that used it is gone. Also remove the `topLevelSessionCount` selector (line 194) if it is no longer used elsewhere in the component.
+
 ### Task 1: Add `deepSearchPending` to SessionWindowState
 
 **Files:** `src/store/sessionsSlice.ts`
@@ -213,12 +306,10 @@ The existing `sessionKey` helper (line 87-89 of `sessionsThunks.ts`) can be reus
 1. When `trimmedQuery` is non-empty and `searchTier !== 'title'`:
    - Phase 1: fetch with `tier: 'title'`, dispatch results with `deepSearchPending: true`
    - Phase 2: fetch with `tier: searchTier`, merge with Phase 1, dispatch with `deepSearchPending: false`
+   - Phase 2 error: inner try/catch re-dispatches Phase 1 data with `deepSearchPending: false`, dispatches error
 2. When `searchTier === 'title'`, use existing single-phase path with `deepSearchPending: false`
 3. Both phases share the same AbortController
-4. Error handling:
-   - Phase 1 error: existing catch block runs, Phase 2 never fires
-   - Phase 2 error: wrap in inner try/catch; on failure, dispatch `setSessionWindowData` with `deepSearchPending: false` (preserving Phase 1 data), then dispatch `setSessionWindowError`
-5. All `setSessionWindowData` calls in the non-search branch (browse/paginate) should omit `deepSearchPending` so the default-to-false behavior clears it
+4. All `setSessionWindowData` calls in the non-search branch (browse/paginate) should omit `deepSearchPending` so the default-to-false behavior clears it
 
 ### Task 4: Update Sidebar UI for deep search indicator
 
@@ -264,24 +355,26 @@ New tests to add to the existing `sessionsThunks` describe block:
 
 New tests to add to the existing Sidebar test suite:
 
-1. Shows "Scanning files..." when `deepSearchPending` is true and items are visible
-2. Does not show "Scanning files..." when `deepSearchPending` is false
-3. Does not show "Scanning files..." when no items are visible (even if `deepSearchPending` true)
-4. "Scanning files..." indicator has `role="status"` for accessibility
-5. Clearing search input removes "Scanning files..." indicator
+1. Title-tier search always dispatches to server (no client-side bypass)
+2. Search with no sidebarWindow dispatches server request (previously was short-circuited)
+3. Shows "Scanning files..." when `deepSearchPending` is true and items are visible
+4. Does not show "Scanning files..." when `deepSearchPending` is false
+5. Does not show "Scanning files..." when no items are visible (even if `deepSearchPending` true)
+6. "Scanning files..." indicator has `role="status"` for accessibility
+7. Clearing search input removes "Scanning files..." indicator
 
 ## Files to Modify
 
-1. `src/store/sessionsSlice.ts` -- `deepSearchPending` field in interface and payload type, reducer update
-2. `src/store/sessionsThunks.ts` -- two-phase fetch logic, `mergeSearchResults` utility
-3. `src/components/Sidebar.tsx` -- deep search pending indicator
+1. `src/components/Sidebar.tsx` -- remove client-side search bypass, add deep search pending indicator
+2. `src/store/sessionsSlice.ts` -- `deepSearchPending` field in interface and payload type, reducer update
+3. `src/store/sessionsThunks.ts` -- two-phase fetch logic, `mergeSearchResults` utility
 4. `test/unit/client/store/sessionsThunks.test.ts` -- ~13 new tests (additions to existing file)
-5. `test/unit/client/components/Sidebar.test.tsx` -- ~5 new tests (additions to existing file)
+5. `test/unit/client/components/Sidebar.test.tsx` -- ~7 new tests (additions to existing file)
 6. `test/unit/client/store/sessionsSlice.test.ts` -- 1 new test for deepSearchPending default (addition to existing file)
 
 ## Files NOT Modified
 
-- Server code (`session-search.ts`, `session-directory/service.ts`, `sessions-router.ts`) -- no changes needed
+- Server code (`session-search.ts`, `session-directory/service.ts`, `sessions-router.ts`) -- no changes needed, server search already works correctly for all tiers
 - `shared/read-models.ts` -- no schema changes needed (deepSearchPending is client-only state)
 - `src/lib/api.ts` -- no changes needed (already supports tier parameter)
-- `src/store/selectors/sidebarSelectors.ts` -- no changes needed (sort/filter logic already correct for merged results)
+- `src/store/selectors/sidebarSelectors.ts` -- no changes needed; `filterSessionItems` remains available but is no longer invoked for search since the selector always receives an empty filter string when the server handles search
