@@ -15,6 +15,7 @@ type AssociationRegistry = {
     sessionId: string,
     reason: SessionBindingReason,
   ) => BindSessionResult
+  isSessionBound: (provider: CodingCliSession['provider'], sessionId: string) => boolean
 }
 
 export type SessionAssociationResult = {
@@ -49,6 +50,7 @@ export class SessionAssociationCoordinator {
 
   associateSingleSession(session: CodingCliSession): SessionAssociationResult {
     if (!this.isAssociationCandidate(session)) return { associated: false }
+    if (this.registry.isSessionBound(session.provider, session.sessionId)) return { associated: false }
     const cwd = session.cwd!
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
     if (unassociated.length === 0) return { associated: false }

@@ -63,6 +63,7 @@ describe('SessionAssociationCoordinator', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
     }
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
@@ -71,5 +72,35 @@ describe('SessionAssociationCoordinator', () => {
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
     expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('codex', '/repo/project')
     expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'codex', 'session-main', 'association')
+  })
+
+  it('skips association when session is already bound to another terminal', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-2', createdAt: 1_000 }]),
+      bindSession: vi.fn(),
+      isSessionBound: vi.fn(() => true),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession())
+
+    expect(result).toEqual({ associated: false })
+    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
+    expect(registry.bindSession).not.toHaveBeenCalled()
+  })
+
+  it('does not skip association when isSessionBound returns false', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession())
+
+    expect(result).toEqual({ associated: true, terminalId: 'term-1' })
+    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
+    expect(registry.bindSession).toHaveBeenCalled()
   })
 })

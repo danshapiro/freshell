@@ -882,6 +882,9 @@ export class TerminalRegistry extends EventEmitter {
 
   constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
+    // 5 permanent terminal.exit listeners (index, ws-handler, broker, codex-wiring,
+    // terminal-view) plus transient per-terminal listeners during shutdown.
+    this.setMaxListeners(20)
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
     this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
@@ -1841,6 +1844,15 @@ export class TerminalRegistry extends EventEmitter {
     if (!term) return false
     if (term.mode === 'shell') return false
     return this.bindSession(terminalId, term.mode as CodingCliProviderName, sessionId, 'association').ok
+  }
+
+  /**
+   * Check whether a session is already bound to any terminal.
+   */
+  isSessionBound(provider: CodingCliProviderName, sessionId: string): boolean {
+    const normalized = normalizeResumeSessionId(provider, sessionId)
+    if (!normalized) return false
+    return this.bindingAuthority.ownerForSession(provider, normalized) !== undefined
   }
 
   /**

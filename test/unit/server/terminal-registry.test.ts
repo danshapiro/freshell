@@ -2338,6 +2338,26 @@ describe('TerminalRegistry', () => {
       })
     })
   })
+
+  describe('maxListeners', () => {
+    it('sets maxListeners above the default to prevent EventEmitter warnings', () => {
+      const reg = new TerminalRegistry()
+      expect(reg.getMaxListeners()).toBeGreaterThan(10)
+      reg.shutdown()
+    })
+  })
+
+  describe('isSessionBound', () => {
+    it('returns true when session is already bound to a terminal', () => {
+      const term = registry.create({ mode: 'codex', resumeSessionId: '019cf585-9b35-7510-a99c-09b77b1f351a' })
+      expect(term).toBeTruthy()
+      expect(registry.isSessionBound('codex', '019cf585-9b35-7510-a99c-09b77b1f351a')).toBe(true)
+    })
+
+    it('returns false when session is not bound', () => {
+      expect(registry.isSessionBound('codex', '019cf585-9b35-7510-a99c-09b77b1f351a')).toBe(false)
+    })
+  })
 })
 
 describe('buildSpawnSpec Unix paths', () => {
@@ -3306,4 +3326,5 @@ describe('buildSpawnSpec Unix paths', () => {
       })
     })
   })
+
 })
