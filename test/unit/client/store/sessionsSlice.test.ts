@@ -14,6 +14,7 @@ import sessionsReducer, {
   SessionsState,
   setActiveSessionSurface,
   setSessionWindowData,
+  setSessionWindowLoading,
 } from '@/store/sessionsSlice'
 import type { ProjectGroup } from '@/store/types'
 
@@ -807,6 +808,52 @@ describe('sessionsSlice', () => {
       expect(claudeSession.lastActivityAt).toBe(2000)
       const codexSession = project.sessions.find((s: any) => s.provider === 'codex') as any
       expect(codexSession.lastActivityAt).toBe(500)
+    })
+  })
+
+  describe('deepSearchPending', () => {
+    it('defaults deepSearchPending to false when setSessionWindowData omits it', () => {
+      // Start with a sidebar window that has deepSearchPending: true
+      const stateWithPending: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [],
+            deepSearchPending: true,
+          },
+        },
+      }
+
+      const state = sessionsReducer(stateWithPending, setSessionWindowData({
+        surface: 'sidebar',
+        projects: mockProjects,
+        totalSessions: 3,
+        hasMore: false,
+      }))
+
+      expect(state.windows.sidebar.deepSearchPending).toBe(false)
+    })
+
+    it('clears deepSearchPending when setSessionWindowLoading sets loading to true', () => {
+      const stateWithPending: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: mockProjects,
+            deepSearchPending: true,
+          },
+        },
+      }
+
+      const state = sessionsReducer(stateWithPending, setSessionWindowLoading({
+        surface: 'sidebar',
+        loading: true,
+        loadingKind: 'search',
+      }))
+
+      expect(state.windows.sidebar.deepSearchPending).toBe(false)
     })
   })
 })

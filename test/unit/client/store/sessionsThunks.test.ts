@@ -7,6 +7,7 @@ import * as sessionsThunks from '@/store/sessionsThunks'
 const {
   fetchSessionWindow,
   refreshActiveSessionWindow,
+  mergeSearchResults,
 } = sessionsThunks
 const queueActiveSessionWindowRefresh = ((sessionsThunks as any).queueActiveSessionWindowRefresh ?? refreshActiveSessionWindow) as typeof refreshActiveSessionWindow
 const _resetSessionWindowThunkState = ((sessionsThunks as any)._resetSessionWindowThunkState ?? (() => {})) as () => void
@@ -840,5 +841,646 @@ describe('sessionsThunks', () => {
     await Promise.all([first, queued])
 
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  describe('mergeSearchResults', () => {
+    const makeResult = (overrides: Record<string, unknown>) => ({
+      sessionId: 'session-1',
+      provider: 'claude',
+      projectPath: '/tmp/project',
+      title: 'Test',
+      matchedIn: 'title',
+      lastActivityAt: 1_000,
+      archived: false,
+      ...overrides,
+    })
+
+    it('deep results overwrite title results with same session key', () => {
+      const titleResults = [makeResult({ matchedIn: 'title', snippet: 'title match' })]
+      const deepResults = [makeResult({ matchedIn: 'userMessage', snippet: 'deep match' })]
+
+      const merged = mergeSearchResults(titleResults as any, deepResults as any)
+      expect(merged).toHaveLength(1)
+      expect(merged[0].matchedIn).toBe('userMessage')
+      expect(merged[0].snippet).toBe('deep match')
+    })
+
+    it('title-only results preserved when absent from deep results', () => {
+      const titleResults = [
+        makeResult({ sessionId: 'a', title: 'Session A' }),
+        makeResult({ sessionId: 'b', title: 'Session B' }),
+      ]
+      const deepResults = [
+        makeResult({ sessionId: 'c', title: 'Session C', matchedIn: 'userMessage' }),
+      ]
+
+      const merged = mergeSearchResults(titleResults as any, deepResults as any)
+      expect(merged).toHaveLength(3)
+      expect(merged.map((r: any) => r.sessionId).sort()).toEqual(['a', 'b', 'c'])
+    })
+
+    it('empty title results with non-empty deep results', () => {
+      const deepResults = [makeResult({ matchedIn: 'userMessage' })]
+
+      const merged = mergeSearchResults([] as any, deepResults as any)
+      expect(merged).toHaveLength(1)
+      expect(merged[0].matchedIn).toBe('userMessage')
+    })
+
+    it('empty deep results preserves all title results', () => {
+      const titleResults = [
+        makeResult({ sessionId: 'a' }),
+        makeResult({ sessionId: 'b' }),
+      ]
+
+      const merged = mergeSearchResults(titleResults as any, [] as any)
+      expect(merged).toHaveLength(2)
+    })
+
+    it('different providers for same sessionId kept separate', () => {
+      const titleResults = [makeResult({ provider: 'claude', sessionId: 'session-1' })]
+      const deepResults = [makeResult({ provider: 'codex', sessionId: 'session-1', matchedIn: 'userMessage' })]
+
+      const merged = mergeSearchResults(titleResults as any, deepResults as any)
+      expect(merged).toHaveLength(2)
+    })
+  })
+
+  describe('two-phase search', () => {
+    const loadedProjects = [{
+      projectPath: '/tmp/project-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        lastActivityAt: 1_000,
+        title: 'Alpha',
+      }],
+    }]
+
+    function createLoadedStore() {
+      return createStoreWithSessions({
+        activeSurface: 'sidebar',
+        projects: loadedProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: loadedProjects,
+            lastLoadedAt: 1_000,
+            query: '',
+            searchTier: 'title',
+          },
+        },
+      })
+    }
+
+    it('dispatches title results with deepSearchPending true, then merged results with false', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise) // Phase 1: title
+        .mockReturnValueOnce(phase2Deferred.promise) // Phase 2: fullText
+
+      const store = createLoadedStore()
+
+      const request = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Resolve Phase 1 (title)
+      phase1Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // After Phase 1: deepSearchPending should be true
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(true)
+      const phase1Sessions = store.getState().sessions.windows.sidebar.projects
+        .flatMap((p: any) => p.sessions)
+      expect(phase1Sessions.some((s: any) => s.sessionId === 'session-A')).toBe(true)
+
+      // Resolve Phase 2 (fullText) with a new session
+      phase2Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-B',
+          projectPath: '/tmp/project',
+          title: 'Session B',
+          matchedIn: 'userMessage',
+          lastActivityAt: 1_500,
+          archived: false,
+        }],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 10,
+      })
+
+      await request
+
+      // After Phase 2: deepSearchPending should be false, both sessions present
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+      const finalSessions = store.getState().sessions.windows.sidebar.projects
+        .flatMap((p: any) => p.sessions)
+      expect(finalSessions.some((s: any) => s.sessionId === 'session-A')).toBe(true)
+      expect(finalSessions.some((s: any) => s.sessionId === 'session-B')).toBe(true)
+    })
+
+    it('title-only search uses single-phase path with deepSearchPending false', async () => {
+      searchSessions.mockResolvedValue({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-title',
+          projectPath: '/tmp/project',
+          title: 'Title Match',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+
+      const store = createLoadedStore()
+
+      await store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'title',
+      }) as any)
+
+      expect(searchSessions).toHaveBeenCalledTimes(1)
+      expect(searchSessions).toHaveBeenCalledWith({
+        query: 'needle',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+    })
+
+    it('new query aborts both phases of previous two-phase search', async () => {
+      const phase1Deferred = createDeferred<any>()
+      searchSessions.mockReturnValueOnce(phase1Deferred.promise)
+
+      const store = createLoadedStore()
+
+      // Start first search (will hang on Phase 1)
+      const first = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'alpha',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Capture the signal from the first call
+      const firstSignal = searchSessions.mock.calls[0]?.[0]?.signal as AbortSignal
+
+      // Start second search (aborts first)
+      searchSessions.mockResolvedValueOnce({
+        results: [],
+        tier: 'title',
+        query: 'beta',
+        totalScanned: 0,
+      })
+
+      store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'beta',
+        searchTier: 'title',
+      }) as any)
+
+      expect(firstSignal.aborted).toBe(true)
+
+      // Let the first deferred resolve (should be ignored due to abort)
+      phase1Deferred.resolve({
+        results: [],
+        tier: 'title',
+        query: 'alpha',
+        totalScanned: 0,
+      })
+
+      await first.catch(() => {})
+    })
+
+    it('Phase 2 error preserves Phase 1 results and clears deepSearchPending', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise)
+        .mockReturnValueOnce(phase2Deferred.promise)
+
+      const store = createLoadedStore()
+
+      const request = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Resolve Phase 1
+      phase1Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Phase 1 data displayed with pending flag
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(true)
+
+      // Reject Phase 2
+      phase2Deferred.reject(new Error('Deep search failed'))
+
+      await request.catch(() => {})
+
+      // Phase 1 data preserved, pending cleared, error set
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+      const sessions = store.getState().sessions.windows.sidebar.projects
+        .flatMap((p: any) => p.sessions)
+      expect(sessions.some((s: any) => s.sessionId === 'session-A')).toBe(true)
+      expect(store.getState().sessions.windows.sidebar.error).toBe('Deep search failed')
+    })
+
+    it('Phase 1 abort prevents Phase 2 from firing', async () => {
+      const phase1Deferred = createDeferred<any>()
+      searchSessions.mockReturnValueOnce(phase1Deferred.promise)
+
+      const store = createLoadedStore()
+
+      // Start two-phase search
+      const first = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      expect(searchSessions).toHaveBeenCalledTimes(1) // Only Phase 1 call so far
+
+      // Abort by dispatching a new fetch
+      searchSessions.mockResolvedValueOnce({
+        results: [],
+        tier: 'title',
+        query: 'new',
+        totalScanned: 0,
+      })
+      store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'new',
+        searchTier: 'title',
+      }) as any)
+
+      // Resolve Phase 1 after abort
+      phase1Deferred.resolve({
+        results: [],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 0,
+      })
+
+      await first.catch(() => {})
+
+      // Phase 2 for the original "needle" query never fires
+      // Total calls: 1 (needle Phase 1) + 1 (new title search) = 2
+      const needleCalls = searchSessions.mock.calls.filter(
+        (call: any[]) => call[0]?.query === 'needle'
+      )
+      expect(needleCalls).toHaveLength(1) // Only Phase 1, no Phase 2
+    })
+
+    it('background refresh with deep tier uses two-phase search', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise)
+        .mockReturnValueOnce(phase2Deferred.promise)
+
+      const store = createStoreWithSessions({
+        activeSurface: 'sidebar',
+        projects: loadedProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: loadedProjects,
+            lastLoadedAt: 1_000,
+            query: 'needle',
+            searchTier: 'fullText',
+          },
+        },
+      })
+
+      const request = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+      // Resolve Phase 1
+      phase1Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-bg',
+          projectPath: '/tmp/project',
+          title: 'BG Result',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Resolve Phase 2
+      phase2Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-bg',
+          projectPath: '/tmp/project',
+          title: 'BG Result',
+          matchedIn: 'userMessage',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 10,
+      })
+
+      await request
+
+      // Should have called searchSessions twice: once for title, once for fullText
+      expect(searchSessions).toHaveBeenCalledWith({
+        query: 'needle',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
+      expect(searchSessions).toHaveBeenCalledWith({
+        query: 'needle',
+        tier: 'fullText',
+        signal: expect.any(AbortSignal),
+      })
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+    })
+
+    it('tier downgrade from fullText to title cancels in-flight Phase 2', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise) // fullText Phase 1
+        .mockReturnValueOnce(phase2Deferred.promise) // fullText Phase 2
+
+      const store = createLoadedStore()
+
+      // Start fullText search
+      const first = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Resolve Phase 1
+      phase1Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(true)
+
+      // Tier downgrade: same query, title tier
+      searchSessions.mockResolvedValueOnce({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+
+      await store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'title',
+      }) as any)
+
+      // Phase 2 of fullText was aborted; final state is single-phase title result
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+
+      // Resolve the Phase 2 deferred (should be ignored)
+      phase2Deferred.resolve({
+        results: [],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 0,
+      })
+
+      await first.catch(() => {})
+    })
+
+    it('Phase 2 abort after Phase 1 success preserves Phase 1 data', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise)
+        .mockReturnValueOnce(phase2Deferred.promise)
+
+      const store = createLoadedStore()
+
+      const request = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Resolve Phase 1
+      phase1Deferred.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-A',
+          projectPath: '/tmp/project',
+          title: 'Session A',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 1,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Phase 1 data is displayed
+      const phase1Sessions = store.getState().sessions.windows.sidebar.projects
+        .flatMap((p: any) => p.sessions)
+      expect(phase1Sessions.some((s: any) => s.sessionId === 'session-A')).toBe(true)
+
+      // Abort the surface (simulate user clearing search)
+      // Dispatching a browse fetch aborts the current controller
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: loadedProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-alpha',
+        hasMore: false,
+      })
+
+      await store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+      }) as any)
+
+      // Phase 2 resolves late (already aborted)
+      phase2Deferred.resolve({
+        results: [],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 0,
+      })
+
+      await request.catch(() => {})
+
+      // The browse fetch replaced the data, but the key point is
+      // Phase 2 did not crash or corrupt state
+      expect(store.getState().sessions.windows.sidebar.projects).toBeDefined()
+    })
+
+    it('non-search dispatches clear deepSearchPending via default', async () => {
+      // Pre-set deepSearchPending to true
+      const store = createStoreWithSessions({
+        activeSurface: 'sidebar',
+        projects: loadedProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: loadedProjects,
+            lastLoadedAt: 1_000,
+            query: 'needle',
+            searchTier: 'fullText',
+            deepSearchPending: true,
+          },
+        },
+      })
+
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: loadedProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-alpha',
+        hasMore: false,
+      })
+
+      // Browse mode fetch (no query)
+      await store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+      }) as any)
+
+      expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
+    })
+
+    it('both phases share the same AbortController signal', async () => {
+      const phase1Deferred = createDeferred<any>()
+      const phase2Deferred = createDeferred<any>()
+      searchSessions
+        .mockReturnValueOnce(phase1Deferred.promise)
+        .mockReturnValueOnce(phase2Deferred.promise)
+
+      const store = createLoadedStore()
+
+      const request = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: 'needle',
+        searchTier: 'fullText',
+      }) as any)
+
+      // Capture Phase 1 signal
+      const phase1Signal = searchSessions.mock.calls[0]?.[0]?.signal as AbortSignal
+
+      // Resolve Phase 1
+      phase1Deferred.resolve({
+        results: [],
+        tier: 'title',
+        query: 'needle',
+        totalScanned: 0,
+      })
+      await new Promise((r) => setTimeout(r, 0))
+
+      // Phase 2 should have been called; capture its signal
+      expect(searchSessions).toHaveBeenCalledTimes(2)
+      const phase2Signal = searchSessions.mock.calls[1]?.[0]?.signal as AbortSignal
+
+      // Both signals reference the same controller
+      expect(phase1Signal).toBe(phase2Signal)
+
+      // Abort by dispatching new fetch
+      fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+      store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+      }) as any)
+
+      expect(phase1Signal.aborted).toBe(true)
+      expect(phase2Signal.aborted).toBe(true)
+
+      phase2Deferred.resolve({
+        results: [],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 0,
+      })
+
+      await request.catch(() => {})
+    })
   })
 })

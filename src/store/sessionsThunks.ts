@@ -2,6 +2,7 @@ import {
   fetchSidebarSessionsSnapshot,
   searchSessions,
   type SearchOptions,
+  type SearchResult,
 } from '@/lib/api'
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
@@ -86,6 +87,27 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
 
 function sessionKey(session: { provider?: string; sessionId: string }) {
   return `${session.provider || 'claude'}:${session.sessionId}`
+}
+
+/**
+ * Merge Phase 1 (title) and Phase 2 (deep) search results.
+ * Deep results overwrite title results for the same session key (provider:sessionId).
+ * Title-only results that were not found by the deep search are preserved.
+ */
+export function mergeSearchResults(titleResults: SearchResult[], deepResults: SearchResult[]): SearchResult[] {
+  const merged = new Map<string, SearchResult>()
+
+  for (const result of titleResults) {
+    const key = sessionKey(result)
+    merged.set(key, result)
+  }
+
+  for (const result of deepResults) {
+    const key = sessionKey(result)
+    merged.set(key, result) // Deep results overwrite title results
+  }
+
+  return Array.from(merged.values())
 }
 
 function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): ProjectGroup[] {
@@ -193,25 +215,97 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
 
       try {
         if (trimmedQuery) {
-          const response = await searchSessions({
-            query: trimmedQuery,
-            tier: searchTier,
-            signal: controller.signal,
-          })
-          if (controller.signal.aborted) return
+          if (searchTier !== 'title') {
+            // Two-phase search: Phase 1 (title) then Phase 2 (deep)
+            const titleResponse = await searchSessions({
+              query: trimmedQuery,
+              tier: 'title',
+              signal: controller.signal,
+            })
+            if (controller.signal.aborted) return
 
-          dispatch(setSessionWindowData({
-            surface,
-            projects: searchResultsToProjects(response.results),
-            totalSessions: response.results.length,
-            oldestLoadedTimestamp: response.results.at(-1)?.lastActivityAt ?? 0,
-            oldestLoadedSessionId: response.results.at(-1)
-              ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
-              : '',
-            hasMore: false,
-            query: trimmedQuery,
-            searchTier,
-          }))
+            dispatch(setSessionWindowData({
+              surface,
+              projects: searchResultsToProjects(titleResponse.results),
+              totalSessions: titleResponse.results.length,
+              oldestLoadedTimestamp: titleResponse.results.at(-1)?.lastActivityAt ?? 0,
+              oldestLoadedSessionId: titleResponse.results.at(-1)
+                ? `${titleResponse.results.at(-1)!.provider}:${titleResponse.results.at(-1)!.sessionId}`
+                : '',
+              hasMore: false,
+              query: trimmedQuery,
+              searchTier,
+              deepSearchPending: true,
+            }))
+
+            // Phase 2: file-based search
+            try {
+              const deepResponse = await searchSessions({
+                query: trimmedQuery,
+                tier: searchTier,
+                signal: controller.signal,
+              })
+              if (controller.signal.aborted) return
+
+              const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
+              dispatch(setSessionWindowData({
+                surface,
+                projects: searchResultsToProjects(merged),
+                totalSessions: merged.length,
+                oldestLoadedTimestamp: merged.at(-1)?.lastActivityAt ?? 0,
+                oldestLoadedSessionId: merged.at(-1)
+                  ? `${merged.at(-1)!.provider}:${merged.at(-1)!.sessionId}`
+                  : '',
+                hasMore: false,
+                query: trimmedQuery,
+                searchTier,
+                deepSearchPending: false,
+              }))
+            } catch (phase2Error) {
+              if (controller.signal.aborted) return
+              // Phase 2 failed but Phase 1 data is already displayed.
+              // Clear the pending indicator and report the error.
+              dispatch(setSessionWindowData({
+                surface,
+                projects: searchResultsToProjects(titleResponse.results),
+                totalSessions: titleResponse.results.length,
+                oldestLoadedTimestamp: titleResponse.results.at(-1)?.lastActivityAt ?? 0,
+                oldestLoadedSessionId: titleResponse.results.at(-1)
+                  ? `${titleResponse.results.at(-1)!.provider}:${titleResponse.results.at(-1)!.sessionId}`
+                  : '',
+                hasMore: false,
+                query: trimmedQuery,
+                searchTier,
+                deepSearchPending: false,
+              }))
+              dispatch(setSessionWindowError({
+                surface,
+                error: phase2Error instanceof Error ? phase2Error.message : 'Deep search failed',
+              }))
+            }
+          } else {
+            // Single-phase title search
+            const response = await searchSessions({
+              query: trimmedQuery,
+              tier: searchTier,
+              signal: controller.signal,
+            })
+            if (controller.signal.aborted) return
+
+            dispatch(setSessionWindowData({
+              surface,
+              projects: searchResultsToProjects(response.results),
+              totalSessions: response.results.length,
+              oldestLoadedTimestamp: response.results.at(-1)?.lastActivityAt ?? 0,
+              oldestLoadedSessionId: response.results.at(-1)
+                ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
+                : '',
+              hasMore: false,
+              query: trimmedQuery,
+              searchTier,
+              deepSearchPending: false,
+            }))
+          }
           return
         }
 
