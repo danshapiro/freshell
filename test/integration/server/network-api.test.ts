@@ -30,6 +30,7 @@ vi.mock('is-port-reachable', () => ({
   default: vi.fn().mockResolvedValue(false),
 }))
 vi.mock('../../../server/wsl-port-forward.js', () => ({
+  isWslPortForwardingDisabledByEnv: vi.fn().mockReturnValue(false),
   clearManagedWslRemoteAccessPorts: vi.fn().mockResolvedValue(undefined),
   computeWslPortForwardingPlan: vi.fn().mockReturnValue({
     status: 'ready',
