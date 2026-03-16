@@ -235,4 +235,119 @@ describe('TerminalMetadataService', () => {
     expect(secondApply).toBeUndefined()
     expect(service.list()).toHaveLength(1)
   })
+
+  describe('get', () => {
+    it('returns active entries by terminal ID', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-get',
+          mode: 'codex',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'session-get',
+        }),
+      )
+
+      const meta = service.get('term-get')
+      expect(meta?.terminalId).toBe('term-get')
+      expect(meta?.provider).toBe('codex')
+      expect(meta?.sessionId).toBe('session-get')
+    })
+
+    it('returns undefined for unknown terminal IDs', () => {
+      const { service } = createService()
+      expect(service.get('nonexistent')).toBeUndefined()
+    })
+  })
+
+  describe('retire', () => {
+    it('removes the entry from list() but preserves provider/sessionId via get()', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-retire',
+          mode: 'claude',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'session-retire',
+        }),
+      )
+
+      expect(service.list()).toHaveLength(1)
+
+      const retired = service.retire('term-retire')
+      expect(retired).toBe(true)
+
+      // No longer in list
+      expect(service.list()).toHaveLength(0)
+
+      // But still accessible via get
+      const meta = service.get('term-retire')
+      expect(meta).toBeDefined()
+      expect(meta?.provider).toBe('claude')
+      expect(meta?.sessionId).toBe('session-retire')
+    })
+
+    it('strips volatile fields (tokenUsage, branch, isDirty) from retired entries', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-volatile',
+          mode: 'claude',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'session-volatile',
+        }),
+      )
+
+      const session: CodingCliSession = {
+        provider: 'claude',
+        sessionId: 'session-volatile',
+        projectPath: '/workspace/repo',
+        updatedAt: Date.now(),
+        cwd: '/workspace/repo',
+        tokenUsage: {
+          inputTokens: 100,
+          outputTokens: 50,
+          cachedTokens: 10,
+          totalTokens: 160,
+          contextTokens: 160,
+          modelContextWindow: 200000,
+          compactThresholdTokens: 190000,
+          compactPercent: 0,
+        },
+      }
+      await service.applySessionMetadata('term-volatile', session)
+
+      service.retire('term-volatile')
+
+      const meta = service.get('term-volatile')
+      expect(meta?.tokenUsage).toBeUndefined()
+      expect(meta?.branch).toBeUndefined()
+      expect(meta?.isDirty).toBeUndefined()
+      expect(meta?.provider).toBe('claude')
+      expect(meta?.sessionId).toBe('session-volatile')
+    })
+
+    it('returns false for unknown terminal IDs', () => {
+      const { service } = createService()
+      expect(service.retire('nonexistent')).toBe(false)
+    })
+
+    it('remove() also clears retired entries', async () => {
+      const { service } = createService()
+      await service.seedFromTerminal(
+        createTerminalRecord({
+          terminalId: 'term-full-remove',
+          mode: 'claude',
+          cwd: '/workspace/repo',
+          resumeSessionId: 'session-x',
+        }),
+      )
+
+      service.retire('term-full-remove')
+      expect(service.get('term-full-remove')).toBeDefined()
+
+      service.remove('term-full-remove')
+      expect(service.get('term-full-remove')).toBeUndefined()
+    })
+  })
 })

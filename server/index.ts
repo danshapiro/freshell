@@ -362,7 +362,9 @@ async function main() {
   registry.on('terminal.exit', (payload) => {
     const terminalId = (payload as { terminalId?: string })?.terminalId
     if (!terminalId) return
-    if (terminalMetadata.remove(terminalId)) {
+    // Retire instead of remove: keeps the provider/sessionId association so
+    // rename cascades still work after the terminal process exits.
+    if (terminalMetadata.retire(terminalId)) {
       broadcastTerminalMetaRemoval(terminalId)
     }
   })

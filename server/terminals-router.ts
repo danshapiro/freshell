@@ -71,7 +71,7 @@ export interface TerminalsRouterDeps {
     broadcast: (msg: any) => void
     broadcastTerminalsChanged?: () => void
   }
-  terminalMetadata?: { list: () => TerminalMeta[] }
+  terminalMetadata?: { list: () => TerminalMeta[]; get?: (terminalId: string) => TerminalMeta | undefined }
   codingCliIndexer?: { refresh: () => Promise<void> }
   terminalViewService?: TerminalViewService
   readModelScheduler?: ReadModelWorkScheduler
@@ -303,10 +303,13 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
     if (typeof titleOverride === 'string' && titleOverride.trim()) registry.updateTitle(terminalId, titleOverride.trim())
     if (typeof descriptionOverride === 'string') registry.updateDescription(terminalId, descriptionOverride)
 
-    // Cascade: if this terminal has a coding CLI session, also rename the session
+    // Cascade: if this terminal has a coding CLI session, also rename the session.
+    // Uses get() instead of list().find() so the cascade works even after the
+    // terminal process has exited (retired entries preserve provider/sessionId).
     if (typeof titleOverride === 'string' && titleOverride.trim() && deps.terminalMetadata) {
       try {
-        const meta = deps.terminalMetadata.list().find((m) => m.terminalId === terminalId)
+        const meta = deps.terminalMetadata.get?.(terminalId)
+          ?? deps.terminalMetadata.list().find((m) => m.terminalId === terminalId)
         await cascadeTerminalRenameToSession(meta, titleOverride.trim())
         if (meta?.provider && meta?.sessionId) {
           await deps.codingCliIndexer?.refresh()

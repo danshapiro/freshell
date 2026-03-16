@@ -107,6 +107,7 @@ function terminalMetaEquals(a: TerminalMeta, b: TerminalMeta): boolean {
 
 export class TerminalMetadataService {
   private byTerminalId = new Map<string, TerminalMeta>()
+  private retiredIds = new Set<string>()
   private readonly now: () => number
   private readonly git: GitMetadataResolvers
 
@@ -123,7 +124,13 @@ export class TerminalMetadataService {
   }
 
   list(): TerminalMeta[] {
-    return Array.from(this.byTerminalId.values())
+    return Array.from(this.byTerminalId.values()).filter(
+      (meta) => !this.retiredIds.has(meta.terminalId),
+    )
+  }
+
+  get(terminalId: string): TerminalMeta | undefined {
+    return this.byTerminalId.get(terminalId)
   }
 
   async seedFromTerminal(record: TerminalSeedRecord): Promise<TerminalMeta | undefined> {
@@ -173,7 +180,25 @@ export class TerminalMetadataService {
     return this.commitIfChanged(next)
   }
 
+  retire(terminalId: string): boolean {
+    const entry = this.byTerminalId.get(terminalId)
+    if (!entry) return false
+
+    // Strip volatile fields but preserve the provider/sessionId association
+    // so rename cascades can still find the session after the terminal exits.
+    this.byTerminalId.set(terminalId, {
+      terminalId: entry.terminalId,
+      cwd: entry.cwd,
+      provider: entry.provider,
+      sessionId: entry.sessionId,
+      updatedAt: entry.updatedAt,
+    })
+    this.retiredIds.add(terminalId)
+    return true
+  }
+
   remove(terminalId: string): boolean {
+    this.retiredIds.delete(terminalId)
     return this.byTerminalId.delete(terminalId)
   }
 
