@@ -363,6 +363,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
 
   const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
+    tier: 'title' as const,
     limit: Math.min(limit, 50),
     cursor: encodeSessionCursor(before, beforeId),
   }, {
@@ -392,7 +393,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     signal,
   })) as ReadModelSessionDirectoryPage
 
-  return {
+  const response: SearchResponse = {
     results: page.items.map((item) => ({
       sessionId: item.sessionId,
       provider: item.provider,
@@ -414,4 +415,11 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     query,
     totalScanned: page.items.length,
   }
+
+  if (page.partial) {
+    response.partial = page.partial
+    response.partialReason = page.partialReason
+  }
+
+  return response
 }

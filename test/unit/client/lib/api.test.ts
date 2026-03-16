@@ -330,6 +330,43 @@ describe('searchSessions tier forwarding', () => {
     const requestUrl = mockFetch.mock.calls[0]?.[0] as string
     expect(requestUrl).toContain('tier=userMessages')
   })
+
+  it('forwards partial and partialReason from server response', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-1',
+        provider: 'claude',
+        projectPath: '/repo',
+        title: 'Result',
+        matchedIn: 'userMessage',
+        snippet: 'found it',
+        isRunning: false,
+        lastActivityAt: 1000,
+      }],
+      nextCursor: null,
+      revision: 1,
+      partial: true,
+      partialReason: 'budget',
+    }))
+
+    const response = await searchSessions({ query: 'test', tier: 'userMessages' })
+
+    expect(response.partial).toBe(true)
+    expect(response.partialReason).toBe('budget')
+  })
+
+  it('does not include partial fields when server omits them', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    const response = await searchSessions({ query: 'test', tier: 'userMessages' })
+
+    expect(response.partial).toBeUndefined()
+    expect(response.partialReason).toBeUndefined()
+  })
 })
 
 describe('setSessionMetadata()', () => {
