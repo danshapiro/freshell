@@ -1,5 +1,5 @@
 import { useRef, useEffect } from 'react'
-import { X, Maximize2, Minimize2, Search } from 'lucide-react'
+import { X, Maximize2, Minimize2, Search, RefreshCw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import type { TerminalStatus } from '@/store/types'
@@ -26,6 +26,7 @@ interface PaneHeaderProps {
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClick?: () => void
   onSearch?: () => void
+  onRefresh?: () => void
 }
 
 export default function PaneHeader({
@@ -48,6 +49,7 @@ export default function PaneHeader({
   onRenameKeyDown,
   onDoubleClick,
   onSearch,
+  onRefresh,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -119,6 +121,20 @@ export default function PaneHeader({
             aria-label="Search in terminal"
           >
             <Search className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+          </button>
+        )}
+
+        {onRefresh && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onRefresh()
+            }}
+            className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+            title="Refresh pane"
+            aria-label="Refresh pane"
+          >
+            <RefreshCw className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
           </button>
         )}
 

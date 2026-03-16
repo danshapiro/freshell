@@ -11,6 +11,18 @@ vi.mock('lucide-react', () => ({
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
   ),
+  Search: ({ className }: { className?: string }) => (
+    <svg data-testid="search-icon" className={className} />
+  ),
+  Maximize2: ({ className }: { className?: string }) => (
+    <svg data-testid="maximize-icon" className={className} />
+  ),
+  Minimize2: ({ className }: { className?: string }) => (
+    <svg data-testid="minimize-icon" className={className} />
+  ),
+  RefreshCw: ({ className }: { className?: string }) => (
+    <svg data-testid="refresh-icon" className={className} />
+  ),
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
@@ -433,6 +445,53 @@ describe('Pane', () => {
 
       fireEvent.click(screen.getByTitle('Close pane'))
       expect(onClose).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('refresh button forwarding', () => {
+    it('forwards onRefresh to PaneHeader', () => {
+      const onRefresh = vi.fn()
+      render(
+        <Pane
+          tabId="t1"
+          paneId="p1"
+          isActive={true}
+          isOnlyPane={false}
+          title="Test"
+          status="running"
+          content={makeTerminalContent()}
+          onRefresh={onRefresh}
+          onClose={vi.fn()}
+          onFocus={vi.fn()}
+        >
+          <div>Content</div>
+        </Pane>
+      )
+
+      const btn = screen.getByTitle('Refresh pane')
+      expect(btn).toBeInTheDocument()
+      fireEvent.click(btn)
+      expect(onRefresh).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not render refresh button when onRefresh is omitted', () => {
+      render(
+        <Pane
+          tabId="t1"
+          paneId="p1"
+          isActive={true}
+          isOnlyPane={false}
+          title="Test"
+          status="running"
+          content={makeTerminalContent()}
+          onClose={vi.fn()}
+          onFocus={vi.fn()}
+        >
+          <div>Content</div>
+        </Pane>
+      )
+
+      expect(screen.queryByTitle('Refresh pane')).toBeNull()
     })
   })
 })

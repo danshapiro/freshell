@@ -150,6 +150,9 @@ vi.mock('lucide-react', () => ({
   Search: ({ className }: { className?: string }) => (
     <svg data-testid="search-icon" className={className} />
   ),
+  RefreshCw: ({ className }: { className?: string }) => (
+    <svg data-testid="refresh-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -2097,6 +2100,122 @@ describe('PaneContainer', () => {
       expect(screen.getByText('Kilroy')).toBeInTheDocument()
       expect(screen.queryByText('freshell (main*)  25%')).not.toBeInTheDocument()
       expect(screen.queryByText(/%$/)).not.toBeInTheDocument()
+    })
+  })
+
+  describe('refresh button integration', () => {
+    it('renders refresh button for terminal pane with terminalId', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1', status: 'running', createRequestId: 'cr-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+    })
+
+    it('does not render refresh button for terminal pane without terminalId', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: undefined, status: 'creating', createRequestId: 'cr-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.queryByTitle('Refresh pane')).toBeNull()
+    })
+
+    it('renders refresh button for browser pane with URL', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'browser',
+          browserInstanceId: 'bi-1',
+          url: 'https://example.com',
+          devToolsOpen: false,
+        },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+    })
+
+    it('does not render refresh button for picker pane', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'picker' },
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.queryByTitle('Refresh pane')).toBeNull()
+    })
+
+    it('clicking refresh button dispatches requestPaneRefresh to Redux store', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1', status: 'running', createRequestId: 'cr-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Refresh pane'))
+
+      const state = store.getState()
+      const tabRequests = state.panes.refreshRequestsByPane?.['tab-1']
+      expect(tabRequests).toBeDefined()
+      expect(tabRequests?.['pane-1']).toBeDefined()
+      expect(tabRequests?.['pane-1'].target).toEqual({
+        kind: 'terminal',
+        createRequestId: 'cr-1',
+      })
     })
   })
 })

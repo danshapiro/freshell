@@ -90,6 +90,9 @@ vi.mock('lucide-react', () => ({
   FolderOpen: ({ className }: { className?: string }) => (
     <svg data-testid="folder-open-icon" className={className} />
   ),
+  RefreshCw: ({ className }: { className?: string }) => (
+    <svg data-testid="refresh-icon" className={className} />
+  ),
 }))
 
 // Mock PaneIcon to avoid transitive dependency issues

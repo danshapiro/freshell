@@ -19,6 +19,9 @@ vi.mock('lucide-react', () => ({
   Minimize2: ({ className }: { className?: string }) => (
     <svg data-testid="minimize-icon" className={className} />
   ),
+  RefreshCw: ({ className }: { className?: string }) => (
+    <svg data-testid="refresh-icon" className={className} />
+  ),
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
@@ -705,6 +708,166 @@ describe('PaneHeader', () => {
       const header = container.firstChild as HTMLElement
       expect(header.className).not.toContain('bg-emerald-50')
       expect(header.className).not.toContain('border-l-emerald-500')
+    })
+  })
+
+  describe('refresh button', () => {
+    it('renders when onRefresh is provided', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onRefresh={vi.fn()}
+        />
+      )
+
+      expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+      expect(screen.getByTestId('refresh-icon')).toBeInTheDocument()
+    })
+
+    it('does not render when onRefresh is omitted', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+        />
+      )
+
+      expect(screen.queryByTitle('Refresh pane')).toBeNull()
+    })
+
+    it('calls onRefresh exactly once when clicked', () => {
+      const onRefresh = vi.fn()
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onRefresh={onRefresh}
+        />
+      )
+
+      fireEvent.click(screen.getByTitle('Refresh pane'))
+      expect(onRefresh).toHaveBeenCalledTimes(1)
+    })
+
+    it('stops propagation to parent on click', () => {
+      const onRefresh = vi.fn()
+      const parentClick = vi.fn()
+
+      render(
+        <div onClick={parentClick}>
+          <PaneHeader
+            title="My Terminal"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={makeTerminalContent()}
+            onRefresh={onRefresh}
+          />
+        </div>
+      )
+
+      fireEvent.click(screen.getByTitle('Refresh pane'))
+      expect(onRefresh).toHaveBeenCalledTimes(1)
+      expect(parentClick).not.toHaveBeenCalled()
+    })
+
+    it('renders for browser panes when onRefresh is provided', () => {
+      render(
+        <PaneHeader
+          title="My Browser"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={{ kind: 'browser', browserInstanceId: 'b1', url: 'https://example.com', devToolsOpen: false }}
+          onRefresh={vi.fn()}
+        />
+      )
+
+      expect(screen.getByTitle('Refresh pane')).toBeInTheDocument()
+    })
+
+    it('appears in correct DOM order (search < refresh < zoom < close)', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onSearch={vi.fn()}
+          onRefresh={vi.fn()}
+          onToggleZoom={vi.fn()}
+          isZoomed={false}
+        />
+      )
+
+      const buttons = screen.getAllByRole('button')
+      const titles = buttons.map((b) => b.getAttribute('title'))
+      const searchIdx = titles.indexOf('Search in terminal')
+      const refreshIdx = titles.indexOf('Refresh pane')
+      const zoomIdx = titles.indexOf('Maximize pane')
+      const closeIdx = titles.indexOf('Close pane')
+
+      expect(searchIdx).toBeGreaterThanOrEqual(0)
+      expect(refreshIdx).toBeGreaterThanOrEqual(0)
+      expect(zoomIdx).toBeGreaterThanOrEqual(0)
+      expect(closeIdx).toBeGreaterThanOrEqual(0)
+      expect(searchIdx).toBeLessThan(refreshIdx)
+      expect(refreshIdx).toBeLessThan(zoomIdx)
+      expect(zoomIdx).toBeLessThan(closeIdx)
+    })
+
+    it('has correct aria-label', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onRefresh={vi.fn()}
+        />
+      )
+
+      const btn = screen.getByTitle('Refresh pane')
+      expect(btn.getAttribute('aria-label')).toBe('Refresh pane')
+    })
+  })
+
+  describe('regression: existing buttons unaffected by refresh button', () => {
+    it('search and zoom buttons remain functional after refresh button insertion', () => {
+      const onSearch = vi.fn()
+      const onToggleZoom = vi.fn()
+
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onSearch={onSearch}
+          onRefresh={vi.fn()}
+          onToggleZoom={onToggleZoom}
+          isZoomed={false}
+        />
+      )
+
+      fireEvent.click(screen.getByTitle('Search in terminal'))
+      expect(onSearch).toHaveBeenCalledTimes(1)
+
+      fireEvent.click(screen.getByTitle('Maximize pane'))
+      expect(onToggleZoom).toHaveBeenCalledTimes(1)
     })
   })
 })

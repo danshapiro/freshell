@@ -30,6 +30,7 @@ interface PaneProps {
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClickTitle?: () => void
   onSearch?: () => void
+  onRefresh?: () => void
 }
 
 export default function Pane({
@@ -57,6 +58,7 @@ export default function Pane({
   onRenameKeyDown,
   onDoubleClickTitle,
   onSearch,
+  onRefresh,
 }: PaneProps) {
   const showHeader = title !== undefined
   const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -112,6 +114,7 @@ export default function Pane({
             onRenameKeyDown={onRenameKeyDown}
             onDoubleClick={onDoubleClickTitle}
             onSearch={onSearch}
+            onRefresh={onRefresh}
           />
         </div>
       )}

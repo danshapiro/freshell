@@ -1,6 +1,6 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
+import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
@@ -16,6 +16,7 @@ import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-util
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
+import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -440,6 +441,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 
+    const refreshTarget = buildPaneRefreshTarget(node.content)
+    const handleRefresh = refreshTarget
+      ? () => dispatch(requestPaneRefresh({ tabId, paneId: node.id }))
+      : undefined
+
     return (
       <Pane
         tabId={tabId}
@@ -464,6 +470,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
         onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
+        onRefresh={handleRefresh}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
