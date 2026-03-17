@@ -206,11 +206,10 @@ describe('sidebar search flow (e2e)', () => {
     })
 
     // Server-side search was called
-    expect(mockSearchSessions).toHaveBeenCalledWith({
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
       query: 'deploy',
       tier: 'title',
-      signal: expect.any(AbortSignal),
-    })
+    }))
 
     // Search results rendered
     expect(screen.getByText('Deploy Pipeline')).toBeInTheDocument()

@@ -2508,11 +2508,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       // Two-phase search: Phase 1 calls with title, Phase 2 calls with userMessages
-      expect(mockSearchSessions).toHaveBeenCalledWith({
+      expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+        query: 'test',
+        tier: 'title',
+      }))
+      expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
         query: 'test',
         tier: 'userMessages',
-        signal: expect.any(AbortSignal),
-      })
+      }))
     })
 
     it('displays search results from API', async () => {
@@ -2571,11 +2574,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       // After bypass removal, title tier search DOES call the API
-      expect(mockSearchSessions).toHaveBeenCalledWith({
+      expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
         query: 'test',
         tier: 'title',
-        signal: expect.any(AbortSignal),
-      })
+      }))
     })
   })
 

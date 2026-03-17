@@ -198,6 +198,18 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
 
   let items = toItems(input.projects, input.terminalMeta).sort(compareItems)
 
+  // Server-side visibility pre-filtering to avoid wasting search budget on
+  // sessions the client will hide. Matches the client's default sidebar settings.
+  if (!input.query.includeSubagents) {
+    items = items.filter((item) => !item.isSubagent)
+  }
+  if (!input.query.includeNonInteractive) {
+    items = items.filter((item) => !item.isNonInteractive)
+  }
+  if (!input.query.includeEmpty) {
+    items = items.filter((item) => item.title != null && item.title !== '')
+  }
+
   if (cursor) {
     items = items.filter((item) => (
       item.lastActivityAt < cursor.lastActivityAt ||
