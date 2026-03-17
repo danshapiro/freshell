@@ -32,6 +32,9 @@ export const SessionDirectoryQuerySchema = z.object({
   priority: ReadModelPrioritySchema,
   revision: z.number().int().nonnegative().optional(),
   limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
+  includeSubagents: z.coerce.boolean().optional(),
+  includeNonInteractive: z.coerce.boolean().optional(),
+  includeEmpty: z.coerce.boolean().optional(),
 })
 
 export const SessionDirectoryItemSchema = z.object({

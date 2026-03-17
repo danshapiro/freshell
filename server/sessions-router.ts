@@ -70,6 +70,9 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       priority: req.query.priority,
       revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
+      includeSubagents: req.query.includeSubagents,
+      includeNonInteractive: req.query.includeNonInteractive,
+      includeEmpty: req.query.includeEmpty,
     })
 
     if (!parsed.success) {

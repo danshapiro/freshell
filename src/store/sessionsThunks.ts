@@ -206,7 +206,14 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
     const { surface, query = '', searchTier = 'title', append = false } = args
     const trimmedQuery = query.trim()
-    const windowState = getState().sessions.windows?.[surface]
+    const state = getState()
+    const windowState = state.sessions.windows?.[surface]
+    const sidebarSettings = state.settings?.settings?.sidebar
+    const visibilityOpts = {
+      includeSubagents: sidebarSettings?.showSubagents || undefined,
+      includeNonInteractive: sidebarSettings?.showNoninteractiveSessions || undefined,
+      includeEmpty: sidebarSettings?.hideEmptySessions === false || undefined,
+    }
     const previousQuery = (windowState?.query ?? '').trim()
     const previousTier = windowState?.searchTier ?? 'title'
     const hasCommittedWindow = typeof windowState?.lastLoadedAt === 'number'
@@ -245,6 +252,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               query: trimmedQuery,
               tier: 'title',
               signal: controller.signal,
+              ...visibilityOpts,
             })
             if (controller.signal.aborted) return
 
@@ -256,6 +264,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
                 query: trimmedQuery,
                 tier: searchTier,
                 signal: controller.signal,
+                ...visibilityOpts,
               })
               if (controller.signal.aborted) return
 
@@ -280,6 +289,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               query: trimmedQuery,
               tier: searchTier,
               signal: controller.signal,
+              ...visibilityOpts,
             })
             if (controller.signal.aborted) return
 
@@ -298,6 +308,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             beforeId: windowState?.oldestLoadedSessionId,
           } : {}),
           signal: controller.signal,
+          ...visibilityOpts,
         })
         if (controller.signal.aborted) return
 

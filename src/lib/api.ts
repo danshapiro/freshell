@@ -171,6 +171,9 @@ export async function getSessionDirectoryPage(
       ['priority', parsed.priority],
       ['revision', parsed.revision],
       ['limit', parsed.limit],
+      ['includeSubagents', parsed.includeSubagents ? '1' : undefined],
+      ['includeNonInteractive', parsed.includeNonInteractive ? '1' : undefined],
+      ['includeEmpty', parsed.includeEmpty ? '1' : undefined],
     ])}`,
     options,
   )
@@ -301,6 +304,9 @@ export type SearchOptions = {
   limit?: number
   maxFiles?: number
   signal?: AbortSignal
+  includeSubagents?: boolean
+  includeNonInteractive?: boolean
+  includeEmpty?: boolean
 }
 
 function encodeSessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
@@ -351,6 +357,9 @@ export async function fetchSidebarSessionsSnapshot(options: {
   beforeId?: string
   openSessions?: SessionLocator[]
   signal?: AbortSignal
+  includeSubagents?: boolean
+  includeNonInteractive?: boolean
+  includeEmpty?: boolean
 } = {}): Promise<any> {
   const {
     limit = 100,
@@ -358,6 +367,9 @@ export async function fetchSidebarSessionsSnapshot(options: {
     beforeId,
     openSessions = [],
     signal,
+    includeSubagents,
+    includeNonInteractive,
+    includeEmpty,
   } = options
   sanitizeSessionLocators(openSessions)
 
@@ -366,6 +378,9 @@ export async function fetchSidebarSessionsSnapshot(options: {
     tier: 'title' as const,
     limit: Math.min(limit, 50),
     cursor: encodeSessionCursor(before, beforeId),
+    includeSubagents,
+    includeNonInteractive,
+    includeEmpty,
   }, {
     signal,
   })) as ReadModelSessionDirectoryPage
@@ -383,12 +398,15 @@ export async function fetchSidebarSessionsSnapshot(options: {
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit, signal } = options
+  const { query, tier = 'title', limit, signal, includeSubagents, includeNonInteractive, includeEmpty } = options
   const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     query,
     tier,
     ...(limit ? { limit } : {}),
+    includeSubagents,
+    includeNonInteractive,
+    includeEmpty,
   }, {
     signal,
   })) as ReadModelSessionDirectoryPage
