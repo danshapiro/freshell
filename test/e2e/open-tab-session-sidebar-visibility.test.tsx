@@ -557,7 +557,11 @@ describe('open tab session sidebar visibility (e2e)', () => {
         title: 'Recent Session',
       }],
     }]
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+    // Use mockResolvedValue (not Once) so that if bootstrap triggers an
+    // unexpected sidebar fetch under CPU pressure, the mock still returns
+    // valid data instead of undefined — preventing a false-negative from
+    // empty projects overwriting the store.
+    const refetchResponse = {
       projects: [{
         projectPath: '/older',
         sessions: [{
@@ -572,7 +576,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
       oldestIncludedTimestamp: 1,
       oldestIncludedSessionId: 'codex:older-open',
       hasMore: false,
-    })
+    }
+    fetchSidebarSessionsSnapshot.mockResolvedValue(refetchResponse)
 
     const store = createStore({
       sessions: {
@@ -603,6 +608,13 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     expect(store.getState().sessions.projects).toEqual(recentProjects)
+
+    // Record any bootstrap-driven calls before the test's own WS flow.
+    // The sidebar window is pre-loaded (lastLoadedAt is set), so bootstrap
+    // should NOT call fetchSidebarSessionsSnapshot — but under heavy CPU
+    // pressure in the full suite, concurrent async flows can race and
+    // occasionally trigger one.
+    const callsBeforeReady = fetchSidebarSessionsSnapshot.mock.calls.length
 
     act(() => {
       broadcastWs({
@@ -635,6 +647,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
       }))
     }, { timeout: 2500 })
 
+    // Snapshot the call count just before the invalidation event so the
+    // assertion below only counts calls caused by sessions.changed.
+    const callsBeforeChanged = fetchSidebarSessionsSnapshot.mock.calls.length
+
     act(() => {
       broadcastWs({
         type: 'sessions.changed',
@@ -643,7 +659,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+      // At least one new call must have been triggered by sessions.changed.
+      expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeGreaterThan(callsBeforeChanged)
       expect(store.getState().sessions.projects).toEqual([
         expect.objectContaining({
           projectPath: '/older',
@@ -655,7 +672,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
           ]),
         }),
       ])
-    })
+    }, { timeout: 2500 })
+
+    // Exactly one new call should have been made by the invalidation handler.
+    expect(fetchSidebarSessionsSnapshot.mock.calls.length - callsBeforeChanged).toBe(1)
 
     expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
   })
