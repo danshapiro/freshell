@@ -5,7 +5,6 @@ import sessionsReducer, {
   setProjects,
   clearProjects,
   mergeProjects,
-  mergeSnapshotProjects,
   applySessionsPatch,
   toggleProjectExpanded,
   setProjectExpanded,
@@ -576,110 +575,33 @@ describe('sessionsSlice', () => {
       expect(state.expandedProjects.size).toBe(0)
     })
 
-    it('merges duplicate projectPath entries from split chunks', () => {
-      // When chunkProjects splits an oversized project, multiple entries share
-      // the same projectPath. normalizeProjects must merge their sessions.
-      const splitChunks: ProjectGroup[] = [
+    it('passes through duplicate projectPath entries without merging', () => {
+      // normalizeProjects validates and normalizes but does not deduplicate
+      // by projectPath — downstream reducers handle merging when needed.
+      const duplicated: ProjectGroup[] = [
         {
           projectPath: '/large/project',
           sessions: [
             { sessionId: 's1', projectPath: '/large/project', lastActivityAt: 1 },
-            { sessionId: 's2', projectPath: '/large/project', lastActivityAt: 2 },
           ],
         },
         {
           projectPath: '/large/project',
           sessions: [
-            { sessionId: 's3', projectPath: '/large/project', lastActivityAt: 3 },
+            { sessionId: 's2', projectPath: '/large/project', lastActivityAt: 2 },
           ],
         },
         {
           projectPath: '/other/project',
           sessions: [
-            { sessionId: 's4', projectPath: '/other/project', lastActivityAt: 4 },
+            { sessionId: 's3', projectPath: '/other/project', lastActivityAt: 3 },
           ],
         },
       ]
 
-      const state = sessionsReducer(initialState, setProjects(splitChunks))
-      expect(state.projects).toHaveLength(2)
-
-      const large = state.projects.find(p => p.projectPath === '/large/project')!
-      expect(large.sessions).toHaveLength(3)
-      expect(large.sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2', 's3'])
-
-      const other = state.projects.find(p => p.projectPath === '/other/project')!
-      expect(other.sessions).toHaveLength(1)
-    })
-
-    it('preserves color from first entry when merging duplicate projectPaths', () => {
-      const splitChunks: ProjectGroup[] = [
-        {
-          projectPath: '/colored/project',
-          sessions: [{ sessionId: 's1', projectPath: '/colored/project', lastActivityAt: 1 }],
-          color: '#ff0000',
-        },
-        {
-          projectPath: '/colored/project',
-          sessions: [{ sessionId: 's2', projectPath: '/colored/project', lastActivityAt: 2 }],
-        },
-      ]
-
-      const state = sessionsReducer(initialState, setProjects(splitChunks))
-      expect(state.projects).toHaveLength(1)
-      expect(state.projects[0].color).toBe('#ff0000')
-      expect(state.projects[0].sessions).toHaveLength(2)
-    })
-
-    it('deduplicates sessions by provider:sessionId when merging split chunks', () => {
-      // If overlapping chunks arrive (e.g., reconnect/retry), duplicate
-      // sessions should not produce duplicate entries. Dedup uses composite
-      // key provider:sessionId to match mergeSnapshotProjects convention.
-      const overlapping: ProjectGroup[] = [
-        {
-          projectPath: '/project/dup',
-          sessions: [
-            { sessionId: 's1', projectPath: '/project/dup', lastActivityAt: 1 },
-            { sessionId: 's2', projectPath: '/project/dup', lastActivityAt: 2 },
-          ],
-        },
-        {
-          projectPath: '/project/dup',
-          sessions: [
-            { sessionId: 's2', projectPath: '/project/dup', lastActivityAt: 2 },
-            { sessionId: 's3', projectPath: '/project/dup', lastActivityAt: 3 },
-          ],
-        },
-      ]
-
-      const state = sessionsReducer(initialState, setProjects(overlapping))
-      const project = state.projects.find(p => p.projectPath === '/project/dup')!
-      expect(project.sessions).toHaveLength(3)
-      expect(project.sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2', 's3'])
-    })
-
-    it('keeps sessions with same sessionId but different providers', () => {
-      // Two providers can generate sessions with the same sessionId.
-      // normalizeProjects must use provider:sessionId as the dedup key.
-      const multiProvider: ProjectGroup[] = [
-        {
-          projectPath: '/project/multi',
-          sessions: [
-            { sessionId: 's1', projectPath: '/project/multi', lastActivityAt: 1, provider: 'claude' },
-          ],
-        },
-        {
-          projectPath: '/project/multi',
-          sessions: [
-            { sessionId: 's1', projectPath: '/project/multi', lastActivityAt: 2, provider: 'codex' },
-          ],
-        },
-      ]
-
-      const state = sessionsReducer(initialState, setProjects(multiProvider))
-      const project = state.projects.find(p => p.projectPath === '/project/multi')!
-      expect(project.sessions).toHaveLength(2)
-      expect(project.sessions.map((s: any) => s.provider)).toEqual(['claude', 'codex'])
+      const state = sessionsReducer(initialState, setProjects(duplicated))
+      // All three entries are preserved as-is (no merging)
+      expect(state.projects).toHaveLength(3)
     })
 
     it('filters non-object session entries to prevent downstream crashes', () => {
@@ -693,121 +615,6 @@ describe('sessionsSlice', () => {
       const state = sessionsReducer(initialState, setProjects(bad))
       expect(state.projects).toHaveLength(1)
       expect(state.projects[0].sessions).toHaveLength(1)
-    })
-  })
-
-  describe('mergeSnapshotProjects', () => {
-    it('adds new projects from snapshot', () => {
-      const existing: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
-        ] },
-      ]
-      const snapshot: ProjectGroup[] = [
-        { projectPath: '/project/b', sessions: [
-          { sessionId: 's2', projectPath: '/project/b', lastActivityAt: 2000, provider: 'claude' },
-        ] },
-      ]
-      let state = sessionsReducer(initialState, setProjects(existing))
-      state = sessionsReducer(state, mergeSnapshotProjects(snapshot))
-
-      const paths = state.projects.map(p => p.projectPath)
-      expect(paths).toContain('/project/a')
-      expect(paths).toContain('/project/b')
-    })
-
-    it('updates sessions from snapshot while preserving older sessions', () => {
-      const existing: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 3000, provider: 'claude', title: 'Recent' },
-          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude', title: 'Old paginated' },
-        ] },
-      ]
-      // Snapshot only includes the recent session (paginated window)
-      const snapshot: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 4000, provider: 'claude', title: 'Recent updated' },
-        ] },
-      ]
-      let state = sessionsReducer(initialState, setProjects(existing))
-      state = sessionsReducer(state, mergeSnapshotProjects(snapshot))
-
-      const project = state.projects.find(p => p.projectPath === '/project/a')!
-      expect(project.sessions).toHaveLength(2)
-
-      const s1 = project.sessions.find((s: any) => s.sessionId === 's1') as any
-      expect(s1.title).toBe('Recent updated')
-      expect(s1.lastActivityAt).toBe(4000)
-
-      const s2 = project.sessions.find((s: any) => s.sessionId === 's2') as any
-      expect(s2.title).toBe('Old paginated')
-    })
-
-    it('does not duplicate sessions that appear in both snapshot and existing', () => {
-      const existing: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
-          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 500, provider: 'claude' },
-        ] },
-      ]
-      const snapshot: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
-          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 1500, provider: 'claude' },
-        ] },
-      ]
-      let state = sessionsReducer(initialState, setProjects(existing))
-      state = sessionsReducer(state, mergeSnapshotProjects(snapshot))
-
-      const project = state.projects.find(p => p.projectPath === '/project/a')!
-      expect(project.sessions).toHaveLength(2)
-    })
-
-    it('preserves projects not in the snapshot', () => {
-      const existing: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
-        ] },
-        { projectPath: '/project/old', sessions: [
-          { sessionId: 's-old', projectPath: '/project/old', lastActivityAt: 100, provider: 'claude' },
-        ] },
-      ]
-      // Snapshot only has project/a (paginated, doesn't include old projects)
-      const snapshot: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
-        ] },
-      ]
-      let state = sessionsReducer(initialState, setProjects(existing))
-      state = sessionsReducer(state, mergeSnapshotProjects(snapshot))
-
-      const paths = state.projects.map(p => p.projectPath)
-      expect(paths).toContain('/project/a')
-      expect(paths).toContain('/project/old')
-    })
-
-    it('handles different providers for the same sessionId', () => {
-      const existing: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 500, provider: 'codex' },
-        ] },
-      ]
-      const snapshot: ProjectGroup[] = [
-        { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
-        ] },
-      ]
-      let state = sessionsReducer(initialState, setProjects(existing))
-      state = sessionsReducer(state, mergeSnapshotProjects(snapshot))
-
-      const project = state.projects.find(p => p.projectPath === '/project/a')!
-      // Should have both: updated claude session + preserved codex session
-      expect(project.sessions).toHaveLength(2)
-      const claudeSession = project.sessions.find((s: any) => s.provider === 'claude') as any
-      expect(claudeSession.lastActivityAt).toBe(2000)
-      const codexSession = project.sessions.find((s: any) => s.provider === 'codex') as any
-      expect(codexSession.lastActivityAt).toBe(500)
     })
   })
 
