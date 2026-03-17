@@ -364,6 +364,7 @@ export class NetworkManager {
         firewallInfo.platform === 'wsl2'
         && remoteAccessRequested
         && rawPortOpen === null
+        && !isWslPortForwardingDisabledByEnv()
       )
 
     const token = process.env.AUTH_TOKEN ?? ''

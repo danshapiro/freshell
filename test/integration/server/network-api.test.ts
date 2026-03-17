@@ -240,6 +240,34 @@ describe('Network API integration', () => {
       expect(res.body.remoteAccessNeedsRepair).toBe(false)
     })
 
+    it('falls back to localhost accessUrl when WSL port probe fails and port forwarding is disabled by env', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockRejectedValue(new Error('probe failed'))
+      vi.mocked(wslModule.isWslPortForwardingDisabledByEnv).mockReturnValue(true)
+
+      const res = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(res.status).toBe(200)
+      expect(res.body.host).toBe('0.0.0.0')
+      expect(res.body.remoteAccessEnabled).toBe(false)
+      expect(res.body.firewall.portOpen).toBeNull()
+      expect(res.body.accessUrl).toContain('localhost')
+      expect(res.body.accessUrl).not.toContain('192.168.1.100')
+    })
+
     it('requires authentication', async () => {
       const res = await request(app).get('/api/network/status')
       expect(res.status).toBe(401)
