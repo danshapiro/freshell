@@ -47,7 +47,7 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
   return true
 }
 
-export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
+export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings' | 'extensions'
 
 type SessionItem = SidebarSessionItem
 

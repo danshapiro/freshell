@@ -127,6 +127,9 @@ export type ServerSettings = {
     defaultPlugins: string[]
     providers: Partial<Record<string, AgentChatProviderDefaults>>
   }
+  extensions: {
+    disabled: string[]
+  }
   network: {
     host: NetworkHost
     configured: boolean
@@ -185,6 +188,7 @@ export type ResolvedSettings = {
   panes: ServerSettings['panes'] & LocalSettings['panes']
   editor: ServerSettings['editor']
   agentChat: ServerSettings['agentChat']
+  extensions: ServerSettings['extensions']
   network: ServerSettings['network']
 }
 
@@ -559,6 +563,9 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
       defaultPlugins: z.array(z.string()).optional(),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
     }).strict().optional(),
+    extensions: z.object({
+      disabled: z.array(z.string()).optional(),
+    }).strict().optional(),
     network: z.object({
       host: NetworkHostSchema.optional(),
       configured: z.coerce.boolean().optional(),
@@ -601,6 +608,9 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
     agentChat: {
       defaultPlugins: [],
       providers: {},
+    },
+    extensions: {
+      disabled: [],
     },
     network: {
       host: '127.0.0.1',
@@ -825,6 +835,18 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     }
   }
 
+  if (isRecord(candidate.extensions)) {
+    const extensions: ServerSettingsPatch['extensions'] = {}
+    if (Array.isArray(candidate.extensions.disabled)) {
+      extensions.disabled = candidate.extensions.disabled.filter(
+        (item): item is string => typeof item === 'string',
+      )
+    }
+    if (Object.keys(extensions).length > 0) {
+      sanitized.extensions = extensions
+    }
+  }
+
   return sanitized
 }
 
@@ -867,6 +889,11 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
         ? normalizeTrimmedStringList(agentChatPatch?.defaultPlugins)
         : base.agentChat.defaultPlugins,
       providers: mergeRecordOfObjects(base.agentChat.providers, agentChatPatch?.providers),
+    },
+    extensions: {
+      disabled: hasOwn(normalizedPatch.extensions, 'disabled')
+        ? [...(normalizedPatch.extensions?.disabled || [])]
+        : [...base.extensions.disabled],
     },
     network: mergeDefined(base.network, normalizedPatch.network),
   }
@@ -963,6 +990,9 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
       ...server.agentChat,
       defaultPlugins: [...server.agentChat.defaultPlugins],
       providers: mergeRecordOfObjects(server.agentChat.providers),
+    },
+    extensions: {
+      disabled: [...server.extensions.disabled],
     },
     network: { ...server.network },
   }

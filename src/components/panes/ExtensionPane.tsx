@@ -1,7 +1,7 @@
 // Renders server and client extension panes as sandboxed iframes.
 // Server extensions are proxied through /api/proxy/http/:port/ for Docker/WSL2 compatibility.
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
 import { api } from '@/lib/api'
@@ -26,6 +26,33 @@ function interpolateUrl(template: string, props: Record<string, unknown>): strin
   })
 }
 
+/**
+ * Check if an iframe loaded an error response instead of real content.
+ * Detects small JSON error bodies like {"error":"..."} that freshell's
+ * API middleware returns for auth failures, proxy errors, etc.
+ */
+function detectIframeError(iframe: HTMLIFrameElement): string | null {
+  try {
+    const doc = iframe.contentDocument
+    if (!doc?.body) return null
+
+    const text = doc.body.textContent?.trim() ?? ''
+    // Only check small responses — real extension pages are larger
+    if (text.length > 500) return null
+
+    // Look for the {"error":"..."} pattern anywhere in the text.
+    // Chrome's JSON viewer may wrap the raw JSON in additional elements,
+    // so we can't rely on children count being zero.
+    const match = text.match(/\{"error"\s*:\s*"([^"]+)"\}/)
+    if (match) {
+      return match[1]
+    }
+  } catch {
+    // Cross-origin or access denied — not an error we can detect
+  }
+  return null
+}
+
 export default function ExtensionPane({ content }: ExtensionPaneProps) {
   useEnsureExtensionsRegistry()
 
@@ -38,6 +65,11 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
   const [startState, setStartState] = useState<'idle' | 'starting' | 'error'>('idle')
   const [startError, setStartError] = useState<string | null>(null)
   const [startAttempt, setStartAttempt] = useState(0)
+
+  // Iframe load error state
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [loadAttempt, setLoadAttempt] = useState(0)
+  const iframeRef = useRef<HTMLIFrameElement>(null)
 
   // Auto-start server extensions that aren't running
   useEffect(() => {
@@ -87,8 +119,51 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
     }
   }, [extension?.name, extension?.category, extension?.serverRunning, startAttempt, dispatch])
 
+  const handleIframeError = useCallback(() => {
+    setLoadError(`Extension "${extension?.label ?? content.extensionName}" failed to load.`)
+  }, [extension?.label, content.extensionName])
+
+  const handleIframeLoad = useCallback(() => {
+    if (!iframeRef.current) return
+    const error = detectIframeError(iframeRef.current)
+    if (error) {
+      setLoadError(error)
+    }
+  }, [])
+
+  // Attach native event listeners for iframe error detection.
+  // React's synthetic onError/onLoad don't reliably fire for iframes in all
+  // environments, so we use native listeners on the ref.
+  useEffect(() => {
+    const iframe = iframeRef.current
+    if (!iframe) return
+
+    iframe.addEventListener('error', handleIframeError)
+    iframe.addEventListener('load', handleIframeLoad)
+
+    return () => {
+      iframe.removeEventListener('error', handleIframeError)
+      iframe.removeEventListener('load', handleIframeLoad)
+    }
+  }, [handleIframeError, handleIframeLoad, loadAttempt])
+
+  // Reset load error on retry
+  useEffect(() => {
+    setLoadError(null)
+  }, [loadAttempt])
+
   if (!extension) {
     return <ExtensionError name={content.extensionName} />
+  }
+
+  if (loadError) {
+    return (
+      <ExtensionError
+        name={content.extensionName}
+        message={loadError}
+        onRetry={() => setLoadAttempt((n) => n + 1)}
+      />
+    )
   }
 
   const urlTemplate = extension.url ?? '/'
@@ -137,6 +212,8 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
 
   return (
     <iframe
+      key={loadAttempt}
+      ref={iframeRef}
       src={src}
       className="w-full h-full border-0"
       sandbox="allow-scripts allow-same-origin allow-forms allow-popups"

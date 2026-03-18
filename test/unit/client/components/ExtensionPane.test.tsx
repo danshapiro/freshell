@@ -580,4 +580,148 @@ describe('ExtensionPane', () => {
 
     mockIsLoopback.mockReturnValue(true)
   })
+
+  describe('iframe load error detection', () => {
+    it('shows error overlay when iframe fires error event', async () => {
+      const ext: ClientExtensionEntry = {
+        name: 'err-ext',
+        version: '1.0.0',
+        label: 'Err Ext',
+        description: 'Error test',
+        category: 'client',
+        url: '/index.html',
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'err-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      const iframe = screen.getByTitle('Err Ext') as HTMLIFrameElement
+      iframe.dispatchEvent(new Event('error'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Extension not available')).toBeInTheDocument()
+        expect(screen.getByText(/failed to load/i)).toBeInTheDocument()
+      })
+    })
+
+    it('shows error with response details when iframe loads an error page', async () => {
+      const ext: ClientExtensionEntry = {
+        name: 'http-err-ext',
+        version: '1.0.0',
+        label: 'HTTP Err Ext',
+        description: 'HTTP error test',
+        category: 'server',
+        url: '/app',
+        serverRunning: true,
+        serverPort: 5000,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'http-err-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      const iframe = screen.getByTitle('HTTP Err Ext') as HTMLIFrameElement
+
+      // Simulate an iframe that loaded an error JSON response
+      Object.defineProperty(iframe, 'contentDocument', {
+        value: {
+          body: {
+            textContent: '{"error":"Failed to connect to localhost:5000"}',
+          },
+        },
+        configurable: true,
+      })
+      iframe.dispatchEvent(new Event('load'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Extension not available')).toBeInTheDocument()
+        expect(screen.getByText(/Failed to connect/i)).toBeInTheDocument()
+      })
+    })
+
+    it('does not show error when iframe loads valid content', async () => {
+      const ext: ClientExtensionEntry = {
+        name: 'ok-ext',
+        version: '1.0.0',
+        label: 'OK Ext',
+        description: 'Success test',
+        category: 'client',
+        url: '/index.html',
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'ok-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      const iframe = screen.getByTitle('OK Ext') as HTMLIFrameElement
+
+      // Simulate normal page load with real HTML content
+      Object.defineProperty(iframe, 'contentDocument', {
+        value: {
+          body: {
+            textContent: 'Hello from extension - this is real content with enough text',
+          },
+        },
+        configurable: true,
+      })
+      iframe.dispatchEvent(new Event('load'))
+
+      // Should still show the iframe, not an error
+      await waitFor(() => {
+        expect(screen.getByTitle('OK Ext')).toBeInTheDocument()
+      })
+      expect(screen.queryByText('Extension not available')).not.toBeInTheDocument()
+    })
+
+    it('provides retry button on load error', async () => {
+      const ext: ClientExtensionEntry = {
+        name: 'retry-load',
+        version: '1.0.0',
+        label: 'Retry Load',
+        description: 'Retry test',
+        category: 'client',
+        url: '/index.html',
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'retry-load',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      const iframe = screen.getByTitle('Retry Load') as HTMLIFrameElement
+      iframe.dispatchEvent(new Event('error'))
+
+      await waitFor(() => {
+        expect(screen.getByText('Retry')).toBeInTheDocument()
+      })
+    })
+  })
 })
