@@ -40,7 +40,11 @@ export function httpAuthMiddleware(req: Request, res: Response, next: NextFuncti
   const token = process.env.AUTH_TOKEN
   if (!token) return res.status(500).json({ error: 'Server misconfigured: AUTH_TOKEN missing' })
 
-  const provided = (req.headers['x-auth-token'] as string | undefined) || undefined
+  const headerToken = (req.headers['x-auth-token'] as string | undefined) || undefined
+  const cookieToken = typeof req.cookies?.['freshell-auth'] === 'string'
+    ? req.cookies['freshell-auth']
+    : undefined
+  const provided = headerToken || cookieToken
   if (!provided || !timingSafeCompare(provided, token)) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
