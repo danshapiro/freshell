@@ -27,7 +27,7 @@ import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
 import { createPlatformRouter, detectFeatureFlags } from './platform-router.js'
-import { createProxyRouter } from './proxy-router.js'
+import { createProxyRouter, attachProxyUpgradeHandler } from './proxy-router.js'
 import { createLocalFileRouter } from './local-file-router.js'
 import { createTerminalsRouter } from './terminals-router.js'
 import { createProjectColorsRouter } from './project-colors-router.js'
@@ -290,6 +290,7 @@ async function main() {
     extensionManager,
     () => codexActivity.tracker.list(),
   )
+  attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined

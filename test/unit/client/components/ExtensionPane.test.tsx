@@ -79,7 +79,7 @@ describe('ExtensionPane', () => {
 
     const iframe = screen.getByTitle('My Dashboard') as HTMLIFrameElement
     expect(iframe.tagName).toBe('IFRAME')
-    expect(iframe.src).toBe('http://localhost:4500/dashboard/overview')
+    expect(iframe.src).toContain('/api/proxy/http/4500/dashboard/overview')
   })
 
   it('renders iframe with correct URL for a client extension', () => {
@@ -238,7 +238,7 @@ describe('ExtensionPane', () => {
     )
 
     const iframe = screen.getByTitle('Multi Var') as HTMLIFrameElement
-    expect(iframe.src).toBe('http://localhost:9000/page/reports/item/42')
+    expect(iframe.src).toContain('/api/proxy/http/9000/page/reports/item/42')
   })
 
   it('shows loading state when server extension is not running (auto-start)', () => {
@@ -292,7 +292,7 @@ describe('ExtensionPane', () => {
     )
 
     const iframe = screen.getByTitle('Missing Var') as HTMLIFrameElement
-    expect(iframe.src).toBe('http://localhost:3000/path//end')
+    expect(iframe.src).toContain('/api/proxy/http/3000/path//end')
   })
 
   describe('auto-start server extensions', () => {
@@ -477,7 +477,7 @@ describe('ExtensionPane', () => {
       await waitFor(() => {
         const iframe = screen.getByTitle('Transition Ext') as HTMLIFrameElement
         expect(iframe.tagName).toBe('IFRAME')
-        expect(iframe.src).toBe('http://localhost:5000/dashboard')
+        expect(iframe.src).toContain('/api/proxy/http/5000/dashboard')
       })
     })
 
@@ -544,156 +544,40 @@ describe('ExtensionPane', () => {
       await waitFor(() => {
         const iframe = screen.getByTitle('Fallback Ext') as HTMLIFrameElement
         expect(iframe.tagName).toBe('IFRAME')
-        expect(iframe.src).toBe('http://localhost:7777/app')
+        expect(iframe.src).toContain('/api/proxy/http/7777/app')
       })
     })
   })
 
-  describe('remote access (port forwarding)', () => {
-    beforeEach(() => {
-      // Simulate remote access by returning false for isLoopbackHostname
-      mockIsLoopback.mockReturnValue(false)
-      mockApiPost.mockReset()
-      mockApiDelete.mockReset()
-      // Default: delete always resolves (cleanup should never throw)
-      mockApiDelete.mockResolvedValue({ ok: true })
-    })
+  it('uses proxy path for server extensions regardless of remote access', () => {
+    // Even when accessing remotely, server extensions use the proxy path
+    mockIsLoopback.mockReturnValue(false)
 
-    afterEach(() => {
-      // Restore local access default
-      mockIsLoopback.mockReturnValue(true)
-    })
+    const ext: ClientExtensionEntry = {
+      name: 'remote-ext',
+      version: '1.0.0',
+      label: 'Remote Ext',
+      description: 'Remote test',
+      category: 'server',
+      url: '/app',
+      serverRunning: true,
+      serverPort: 5000,
+    }
 
-    it('shows loading state while port forwarding is in progress', () => {
-      // Keep the promise pending (never resolves)
-      mockApiPost.mockReturnValue(new Promise(() => {}))
+    const content: ExtensionPaneContent = {
+      kind: 'extension',
+      extensionName: 'remote-ext',
+      props: {},
+    }
 
-      const ext: ClientExtensionEntry = {
-        name: 'remote-ext',
-        version: '1.0.0',
-        label: 'Remote Ext',
-        description: 'Remote test',
-        category: 'server',
-        url: '/app',
-        serverRunning: true,
-        serverPort: 5000,
-      }
+    renderWithStore(
+      <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+      [ext],
+    )
 
-      const content: ExtensionPaneContent = {
-        kind: 'extension',
-        extensionName: 'remote-ext',
-        props: {},
-      }
+    const iframe = screen.getByTitle('Remote Ext') as HTMLIFrameElement
+    expect(iframe.src).toContain('/api/proxy/http/5000/app')
 
-      renderWithStore(
-        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
-        [ext],
-      )
-
-      expect(screen.getByText('Connecting to extension server...')).toBeInTheDocument()
-    })
-
-    it('renders iframe with forwarded port on success', async () => {
-      mockApiPost.mockResolvedValue({ forwardedPort: 54321 })
-
-      const ext: ClientExtensionEntry = {
-        name: 'remote-ok',
-        version: '1.0.0',
-        label: 'Remote OK',
-        description: 'Forwarding success',
-        category: 'server',
-        url: '/dashboard',
-        serverRunning: true,
-        serverPort: 5000,
-      }
-
-      const content: ExtensionPaneContent = {
-        kind: 'extension',
-        extensionName: 'remote-ok',
-        props: {},
-      }
-
-      renderWithStore(
-        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
-        [ext],
-      )
-
-      await waitFor(() => {
-        const iframe = screen.getByTitle('Remote OK') as HTMLIFrameElement
-        // In jsdom, window.location.hostname is "localhost"
-        expect(iframe.src).toBe('http://localhost:54321/dashboard')
-      })
-
-      expect(mockApiPost).toHaveBeenCalledWith('/api/proxy/forward', { port: 5000 })
-    })
-
-    it('shows error when port forwarding fails', async () => {
-      mockApiPost.mockRejectedValue(new Error('Connection refused'))
-
-      const ext: ClientExtensionEntry = {
-        name: 'remote-fail',
-        version: '1.0.0',
-        label: 'Remote Fail',
-        description: 'Forwarding failure',
-        category: 'server',
-        url: '/app',
-        serverRunning: true,
-        serverPort: 6000,
-      }
-
-      const content: ExtensionPaneContent = {
-        kind: 'extension',
-        extensionName: 'remote-fail',
-        props: {},
-      }
-
-      renderWithStore(
-        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
-        [ext],
-      )
-
-      await waitFor(() => {
-        expect(screen.getByText('Extension not available')).toBeInTheDocument()
-        expect(
-          screen.getByText(/Failed to connect to extension server on port 6000/),
-        ).toBeInTheDocument()
-      })
-    })
-
-    it('calls delete on cleanup when unmounting', async () => {
-      mockApiPost.mockResolvedValue({ forwardedPort: 54321 })
-      mockApiDelete.mockResolvedValue({ ok: true })
-
-      const ext: ClientExtensionEntry = {
-        name: 'remote-cleanup',
-        version: '1.0.0',
-        label: 'Remote Cleanup',
-        description: 'Cleanup test',
-        category: 'server',
-        url: '/app',
-        serverRunning: true,
-        serverPort: 7000,
-      }
-
-      const content: ExtensionPaneContent = {
-        kind: 'extension',
-        extensionName: 'remote-cleanup',
-        props: {},
-      }
-
-      const { unmount } = renderWithStore(
-        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
-        [ext],
-      )
-
-      // Wait for the forward to be established
-      await waitFor(() => {
-        expect(screen.getByTitle('Remote Cleanup')).toBeInTheDocument()
-      })
-
-      unmount()
-
-      expect(mockApiDelete).toHaveBeenCalledWith('/api/proxy/forward/7000')
-    })
+    mockIsLoopback.mockReturnValue(true)
   })
 })
