@@ -284,6 +284,8 @@ function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftK
     '[': 'BracketLeft',
     ']': 'BracketRight',
     Insert: 'Insert',
+    ArrowLeft: 'ArrowLeft',
+    ArrowRight: 'ArrowRight',
   }
 
   return {
@@ -590,6 +592,65 @@ describe('TerminalView keyboard handling', () => {
       expect(keyupEvent.preventDefault).not.toHaveBeenCalled()
       expect(store.getState().tabs.activeTabId).toBe('tab-2')
       expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore)
+    })
+  })
+
+  describe('tab reorder shortcuts', () => {
+    it('returns false for Ctrl+Shift+ArrowRight so xterm does not block event propagation', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('ArrowRight', { ctrlKey: true, shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+    })
+
+    it('returns false for Ctrl+Shift+ArrowLeft so xterm does not block event propagation', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('ArrowLeft', { ctrlKey: true, shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+    })
+
+    it('does not block plain arrow keys', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('ArrowRight', {})
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(true)
     })
   })
 
