@@ -27,9 +27,10 @@ These are the source-of-truth behaviors the implementation must preserve:
 1. `fit()` on reveal is still allowed. The bug is not calling `fit`; it is sending same-size `terminal.resize` after `fit`.
 2. Client-side resize dedupe is keyed by `terminalId + cols + rows`, not by pane id, so replacing a terminal in the same pane does not inherit stale viewport state.
 3. The existing `suppressNextMatchingResizeRef` behavior stays in place for attach flows. The new dedupe layers on top of it; it does not replace attach suppression.
-4. Server-side `resize()` remains idempotent: same-size requests return success but do not call `pty.resize()`.
-5. The e2e WebSocket log records actual wire sends, not queued intent. It must stay bounded and only exist in `?e2e=1` mode.
-6. The new test-harness methods and WS observer hook should be optional at the type boundary so existing non-e2e unit-test doubles do not need mechanical updates.
+4. The client-side viewport cache must be seeded from every viewport-bearing send, including both `terminal.attach` and `terminal.resize`. If the cache only tracks explicit resize calls, the first reveal after an attach can still re-emit a redundant resize.
+5. Server-side `resize()` remains idempotent: same-size requests return success but do not call `pty.resize()`.
+6. The e2e WebSocket log records actual wire sends, not queued intent. It must stay bounded and only exist in `?e2e=1` mode.
+7. The new test-harness methods and WS observer hook should be optional at the type boundary so existing non-e2e unit-test doubles do not need mechanical updates.
 
 ## Root Cause Summary
 
@@ -60,6 +61,7 @@ No user decision is required. The fix is local, reversible, and consistent with 
 1. **`src/components/TerminalView.tsx`**
    - Add a per-terminal `lastSentViewportRef`.
    - Reset that ref when the active `terminalId` changes.
+   - Seed that ref whenever `TerminalView` sends a viewport-bearing message, including `terminal.attach` and `terminal.resize`.
    - Gate `ws.send({ type: 'terminal.resize' ... })` behind both the existing attach suppression check and the new same-size dedupe check.
    - Keep reveal `fit()` behavior intact.
 
@@ -435,9 +437,11 @@ if (matchesSuppressedViewport) {
 }
 ```
 
-4. Do **not** remove `requestTerminalLayout({ fit: true, resize: true })` from the reveal effect. The correct fix is idempotence, not skipping fit.
+4. After `attachTerminal()` sends `terminal.attach`, immediately seed `lastSentViewportRef.current` with the same `{ terminalId, cols, rows }` tuple so later reveals compare against the last viewport that actually went over the wire.
 
-5. Do **not** special-case hidden tabs beyond the current behavior. Hidden deferred attach logic already works and must stay intact.
+5. Do **not** remove `requestTerminalLayout({ fit: true, resize: true })` from the reveal effect. The correct fix is idempotence, not skipping fit.
+
+6. Do **not** special-case hidden tabs beyond the current behavior. Hidden deferred attach logic already works and must stay intact.
 
 - [ ] **Step 4: Run the client tests green**
 
