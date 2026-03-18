@@ -7,6 +7,7 @@ symlink it into your extensions directory and restart freshell:
 # macOS/Linux
 ln -sf "$(pwd)/examples/extensions/notepad" ~/.freshell/extensions/notepad
 ln -sf "$(pwd)/examples/extensions/status-dashboard" ~/.freshell/extensions/status-dashboard
+ln -sf "$(pwd)/examples/extensions/live-counter" ~/.freshell/extensions/live-counter
 ln -sf "$(pwd)/examples/extensions/system-monitor" ~/.freshell/extensions/system-monitor
 
 # Windows (use task-list instead of system-monitor)
@@ -39,6 +40,15 @@ allocated port, `server.readyPattern` tells freshell when the server is ready.
 **Note:** If your server extension uses CommonJS (`require()`), include a
 `package.json` without `"type": "module"` in the extension directory.
 Otherwise Node may inherit an ESM `package.json` from a parent directory.
+
+### live-counter (server, WebSocket)
+
+A shared counter with real-time updates. Click +/- in one pane and see
+the count update instantly in all other panes via WebSocket. Demonstrates
+that server extensions can use WebSocket through freshell's HTTP proxy.
+
+**Key manifest fields:** Same as status-dashboard. The WebSocket connection
+uses a relative URL so it routes through the proxy automatically.
 
 ### system-monitor (cli, macOS/Linux)
 

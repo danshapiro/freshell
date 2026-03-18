@@ -1,0 +1,17 @@
+{
+  "name": "live-counter",
+  "version": "0.1.0",
+  "label": "Live Counter",
+  "description": "Shared counter with real-time WebSocket updates across panes",
+  "category": "server",
+  "server": {
+    "command": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "{{port}}" },
+    "readyPattern": "Listening on"
+  },
+  "picker": {
+    "shortcut": "K",
+    "group": "tools"
+  }
+}
