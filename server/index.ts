@@ -6,6 +6,7 @@ import http from 'http'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import cookieParser from 'cookie-parser'
 import rateLimit from 'express-rate-limit'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
@@ -138,6 +139,7 @@ async function main() {
     }),
   )
 
+  app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
   // Shell bootstrap route: returns shell-critical first-paint data only
   app.use('/api', createShellBootstrapRouter({

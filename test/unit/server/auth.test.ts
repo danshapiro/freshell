@@ -111,6 +111,53 @@ describe('auth module', () => {
       expect(next).toHaveBeenCalled()
     })
 
+    it('accepts auth token from freshell-auth cookie', () => {
+      process.env.AUTH_TOKEN = 'valid-token-16chars'
+      const req = {
+        path: '/api/extensions/test/client/index.html',
+        headers: {},
+        cookies: { 'freshell-auth': 'valid-token-16chars' },
+      } as any
+      const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any
+      const next = vi.fn()
+
+      httpAuthMiddleware(req, res, next)
+
+      expect(next).toHaveBeenCalled()
+      expect(res.status).not.toHaveBeenCalled()
+    })
+
+    it('returns 401 when cookie token is wrong', () => {
+      process.env.AUTH_TOKEN = 'valid-token-16chars'
+      const req = {
+        path: '/api/extensions/test/client/index.html',
+        headers: {},
+        cookies: { 'freshell-auth': 'wrong-token-value' },
+      } as any
+      const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any
+      const next = vi.fn()
+
+      httpAuthMiddleware(req, res, next)
+
+      expect(res.status).toHaveBeenCalledWith(401)
+      expect(next).not.toHaveBeenCalled()
+    })
+
+    it('prefers header token over cookie when both present', () => {
+      process.env.AUTH_TOKEN = 'valid-token-16chars'
+      const req = {
+        path: '/api/settings',
+        headers: { 'x-auth-token': 'valid-token-16chars' },
+        cookies: { 'freshell-auth': 'wrong-cookie-value' },
+      } as any
+      const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any
+      const next = vi.fn()
+
+      httpAuthMiddleware(req, res, next)
+
+      expect(next).toHaveBeenCalled()
+    })
+
     it('returns 500 when AUTH_TOKEN is not configured', () => {
       delete process.env.AUTH_TOKEN
       const req = { path: '/api/settings', headers: {} } as any
