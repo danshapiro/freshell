@@ -22,6 +22,13 @@ const runtimeMocks = vi.hoisted(() => ({
   }>,
 }))
 
+const terminalMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    cols: number
+    rows: number
+  }>,
+}))
+
 vi.mock('@/components/terminal/terminal-runtime', () => ({
   createTerminalRuntime: () => {
     const runtime = {
@@ -40,21 +47,25 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 }))
 
 vi.mock('@xterm/xterm', () => ({
-  Terminal: vi.fn().mockImplementation(() => ({
-    open: vi.fn(),
-    onData: vi.fn(() => ({ dispose: vi.fn() })),
-    onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
-    attachCustomKeyEventHandler: vi.fn(),
-    registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
-    write: vi.fn(),
-    clear: vi.fn(),
-    dispose: vi.fn(),
-    getSelection: vi.fn(() => ''),
-    focus: vi.fn(),
-    cols: 80,
-    rows: 24,
-    options: {},
-  })),
+  Terminal: vi.fn().mockImplementation(() => {
+    const term = {
+      open: vi.fn(),
+      onData: vi.fn(() => ({ dispose: vi.fn() })),
+      onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
+      attachCustomKeyEventHandler: vi.fn(),
+      registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
+      write: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+      getSelection: vi.fn(() => ''),
+      focus: vi.fn(),
+      cols: 80,
+      rows: 24,
+      options: {},
+    }
+    terminalMocks.instances.push(term)
+    return term
+  }),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -157,6 +168,7 @@ describe('TerminalView mobile viewport handling', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     runtimeMocks.instances.length = 0
+    terminalMocks.instances.length = 0
     ;(globalThis as any).setMobileForTest(false)
     originalVisualViewport = window.visualViewport
     originalInnerHeight = window.innerHeight
@@ -393,9 +405,14 @@ describe('TerminalView mobile viewport handling', () => {
     })
 
     const runtime = runtimeMocks.instances[0]
+    const term = terminalMocks.instances[0]
     while (pendingRaf.length > 0) {
       pendingRaf.shift()?.(0)
     }
+    runtime.fit.mockImplementation(() => {
+      term.cols = 96
+      term.rows = 30
+    })
     runtime.fit.mockClear()
     wsMocks.send.mockClear()
 

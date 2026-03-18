@@ -123,9 +123,14 @@ test.describe('Terminal Lifecycle', () => {
     await terminal.executeCommand('echo "tab-two-live"', 1)
     await terminal.waitForOutput('tab-two-live', { terminalId: secondTerminalId! })
 
-    await harness.clearSentWsMessages()
-
     const tabs = page.locator('[data-context="tab"]')
+    await tabs.first().click()
+    await terminal.waitForOutput('tab-one-live', { terminalId: firstTerminalId! })
+    await tabs.last().click()
+    await terminal.waitForOutput('tab-two-live', { terminalId: secondTerminalId! })
+
+    await page.waitForTimeout(200)
+    await harness.clearSentWsMessages()
     await tabs.first().click()
     await terminal.waitForOutput('tab-one-live', { terminalId: firstTerminalId! })
     await tabs.last().click()
