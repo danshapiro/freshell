@@ -1,10 +1,12 @@
 // Extension management page — shows installed extensions with enable/disable controls.
 
-import { useAppSelector } from '@/store/hooks'
+import { useCallback, useMemo } from 'react'
+import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { AppView } from '@/components/Sidebar'
-import { ArrowLeft, Puzzle, Server, Monitor, Terminal, ExternalLink } from 'lucide-react'
+import { ArrowLeft, Puzzle, Server, Monitor, Terminal } from 'lucide-react'
 
 interface ExtensionsViewProps {
   onNavigate: (view: AppView) => void
@@ -26,12 +28,18 @@ function categoryLabel(category: ClientExtensionEntry['category']) {
   }
 }
 
-function ExtensionCard({ ext }: { ext: ClientExtensionEntry }) {
+interface ExtensionCardProps {
+  ext: ClientExtensionEntry
+  enabled: boolean
+  onToggle: (name: string, enabled: boolean) => void
+}
+
+function ExtensionCard({ ext, enabled, onToggle }: ExtensionCardProps) {
   const isRunning = ext.category === 'server' && ext.serverRunning
 
   return (
     <div
-      className="rounded-lg border border-border/40 bg-card p-4 flex flex-col gap-3"
+      className={`rounded-lg border border-border/40 bg-card p-4 flex flex-col gap-3 ${!enabled ? 'opacity-50' : ''}`}
       data-testid={`extension-card-${ext.name}`}
     >
       {/* Header: icon + name + version */}
@@ -52,14 +60,14 @@ function ExtensionCard({ ext }: { ext: ClientExtensionEntry }) {
         </div>
       </div>
 
-      {/* Footer: category badge + status + details */}
+      {/* Footer: category badge + status + toggle */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
             {categoryIcon(ext.category)}
             {categoryLabel(ext.category)}
           </span>
-          {isRunning && (
+          {enabled && isRunning && (
             <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-400">
               Running
             </span>
@@ -70,17 +78,21 @@ function ExtensionCard({ ext }: { ext: ClientExtensionEntry }) {
             </span>
           )}
         </div>
-        {ext.url && (
-          <a
-            href={ext.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-muted-foreground hover:text-foreground"
-            aria-label={`Open ${ext.label} homepage`}
-          >
-            <ExternalLink className="w-3.5 h-3.5" />
-          </a>
-        )}
+        <button
+          role="switch"
+          aria-checked={enabled}
+          aria-label={`${enabled ? 'Disable' : 'Enable'} ${ext.label}`}
+          onClick={() => onToggle(ext.name, !enabled)}
+          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+            enabled ? 'bg-emerald-500' : 'bg-zinc-600'
+          }`}
+        >
+          <span
+            className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform ${
+              enabled ? 'translate-x-[22px]' : 'translate-x-[3px]'
+            }`}
+          />
+        </button>
       </div>
     </div>
   )
@@ -89,7 +101,18 @@ function ExtensionCard({ ext }: { ext: ClientExtensionEntry }) {
 export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
   useEnsureExtensionsRegistry()
 
+  const dispatch = useAppDispatch()
   const extensions = useAppSelector((s) => s.extensions.entries)
+  const disabledList = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? [])
+
+  const disabledSet = useMemo(() => new Set(disabledList), [disabledList])
+
+  const handleToggle = useCallback((name: string, enabled: boolean) => {
+    const next = enabled
+      ? disabledList.filter((n) => n !== name)
+      : [...new Set([...disabledList, name])]
+    void dispatch(saveServerSettingsPatch({ extensions: { disabled: next } }))
+  }, [dispatch, disabledList])
 
   const cliExts = extensions.filter((e) => e.category === 'cli')
   const serverExts = extensions.filter((e) => e.category === 'server')
@@ -141,7 +164,12 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
                 </h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {group.exts.map((ext) => (
-                    <ExtensionCard key={ext.name} ext={ext} />
+                    <ExtensionCard
+                      key={ext.name}
+                      ext={ext}
+                      enabled={!disabledSet.has(ext.name)}
+                      onToggle={handleToggle}
+                    />
                   ))}
                 </div>
               </div>

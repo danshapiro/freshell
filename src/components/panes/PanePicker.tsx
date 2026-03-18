@@ -98,13 +98,14 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const availableClis = useAppSelector((s) => s.connection?.availableClis ?? EMPTY_AVAILABLE_CLIS)
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
+  const disabledExtensions = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? EMPTY_ENABLED_PROVIDERS)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const options = useMemo(() => {
     // CLI options: derived from extension entries, show if both available and enabled
     const cliConfigs = getCliProviderConfigs(extensionEntries)
     const cliOptions = cliConfigs
-      .filter((config) => availableClis[config.name] && enabledProviders.includes(config.name))
+      .filter((config) => availableClis[config.name] && enabledProviders.includes(config.name) && !disabledExtensions.includes(config.name))
       .map((config) => cliConfigToOption(config, extensionEntries.find(e => e.name === config.name)))
 
     // Shell options depend on platform
@@ -125,9 +126,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
     const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
 
-    // Extension options from the registry (exclude CLI extensions -- they're in cliOptions)
+    // Extension options from the registry (exclude CLI extensions and disabled extensions)
     const extensionOptions: PickerOption[] = extensionEntries
-      .filter((ext) => ext.category !== 'cli')
+      .filter((ext) => ext.category !== 'cli' && !disabledExtensions.includes(ext.name))
       .map((ext) => ({
         type: `ext:${ext.name}` as PanePickerType,
         label: ext.label,
@@ -137,7 +138,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
 
     // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
     return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]
-  }, [platform, availableClis, featureFlags, enabledProviders, extensionEntries])
+  }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
