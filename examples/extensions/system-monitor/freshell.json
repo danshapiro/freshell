@@ -1,0 +1,14 @@
+{
+  "name": "system-monitor",
+  "version": "0.1.0",
+  "label": "System Monitor",
+  "description": "Live system resource monitor (top) in a terminal pane",
+  "category": "cli",
+  "cli": {
+    "command": "top"
+  },
+  "picker": {
+    "shortcut": "M",
+    "group": "tools"
+  }
+}

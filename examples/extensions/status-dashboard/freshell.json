@@ -1,0 +1,17 @@
+{
+  "name": "status-dashboard",
+  "version": "0.1.0",
+  "label": "Status Dashboard",
+  "description": "Live system resource monitor with auto-refreshing stats",
+  "category": "server",
+  "server": {
+    "command": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "{{port}}" },
+    "readyPattern": "Listening on"
+  },
+  "picker": {
+    "shortcut": "D",
+    "group": "tools"
+  }
+}

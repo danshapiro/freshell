@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Notepad</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      display: flex; flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.5rem 1rem;
+      background: #1e293b; border-bottom: 1px solid #334155;
+    }
+    header h1 { font-size: 0.875rem; color: #94a3b8; font-weight: 500; }
+    .status { font-size: 0.75rem; color: #475569; }
+    textarea {
+      flex: 1; resize: none;
+      background: #0f172a; color: #e2e8f0;
+      border: none; outline: none;
+      padding: 1rem;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 0.875rem;
+      line-height: 1.6;
+      tab-size: 2;
+    }
+    textarea::placeholder { color: #334155; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Notepad</h1>
+    <span class="status" id="status">Ready</span>
+  </header>
+  <textarea
+    id="editor"
+    placeholder="Type your notes here...&#10;&#10;Content is saved to localStorage automatically."
+    spellcheck="false"
+  ></textarea>
+  <script>
+    // Persist notes to localStorage keyed by extension name
+    const STORAGE_KEY = 'freshell-notepad-content'
+    const editor = document.getElementById('editor')
+    const status = document.getElementById('status')
+
+    // Load saved content
+    const saved = localStorage.getItem(STORAGE_KEY)
+    if (saved) editor.value = saved
+
+    // Auto-save on input with debounce
+    let saveTimeout
+    editor.addEventListener('input', () => {
+      status.textContent = 'Saving...'
+      clearTimeout(saveTimeout)
+      saveTimeout = setTimeout(() => {
+        localStorage.setItem(STORAGE_KEY, editor.value)
+        status.textContent = 'Saved'
+      }, 500)
+    })
+
+    // Tab key inserts spaces instead of changing focus
+    editor.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        const start = editor.selectionStart
+        const end = editor.selectionEnd
+        editor.value = editor.value.substring(0, start) + '  ' + editor.value.substring(end)
+        editor.selectionStart = editor.selectionEnd = start + 2
+        editor.dispatchEvent(new Event('input'))
+      }
+    })
+
+    editor.focus()
+  </script>
+</body>
+</html>
