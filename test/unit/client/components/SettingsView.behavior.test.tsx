@@ -565,13 +565,14 @@ describe('SettingsView behavior sections', () => {
   })
 
   describe('keyboard shortcuts section', () => {
-    it('displays keyboard shortcuts', () => {
+    it('displays keyboard shortcuts from the shared registry', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
+      expect(screen.getByText('New tab')).toBeInTheDocument()
+      expect(screen.getByText('Close tab')).toBeInTheDocument()
       expect(screen.getByText('Previous tab')).toBeInTheDocument()
       expect(screen.getByText('Next tab')).toBeInTheDocument()
-      expect(screen.getByText('Newline (same as Ctrl+J)')).toBeInTheDocument()
       expect(screen.getByText('Newline')).toBeInTheDocument()
     })
 
@@ -579,6 +580,7 @@ describe('SettingsView behavior sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
+      expect(screen.getAllByText('Alt').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Ctrl').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Shift').length).toBeGreaterThan(0)
       expect(screen.getByText('[')).toBeInTheDocument()

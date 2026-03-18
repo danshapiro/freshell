@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
@@ -162,6 +163,9 @@ export function ContextMenuProvider({
     const url = await buildShareLink()
     await copyText(url)
   }, [buildShareLink])
+
+  const [shortcutsDialogOpen, setShortcutsDialogOpen] = useState(false)
+  const showKeyboardShortcuts = useCallback(() => setShortcutsDialogOpen(true), [])
 
   const copyTabNames = useCallback(async () => {
     const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id], paneTitles?.[tab.id], extensionEntries))
@@ -879,6 +883,7 @@ export function ContextMenuProvider({
         copyTabNames,
         toggleSidebar: onToggleSidebar,
         copyShareLink,
+        showKeyboardShortcuts,
         openView: onViewChange,
         copyTabName,
         refreshTab: refreshTabAction,
@@ -950,6 +955,7 @@ export function ContextMenuProvider({
     copyTabNames,
     onToggleSidebar,
     copyShareLink,
+    showKeyboardShortcuts,
     onViewChange,
     copyTabName,
     refreshTabAction,
@@ -1004,6 +1010,10 @@ export function ContextMenuProvider({
         confirmLabel={confirmState?.confirmLabel || 'Confirm'}
         onConfirm={() => confirmState?.onConfirm()}
         onCancel={() => setConfirmState(null)}
+      />
+      <KeyboardShortcutsDialog
+        open={shortcutsDialogOpen}
+        onClose={() => setShortcutsDialogOpen(false)}
       />
     </>
   )
