@@ -65,6 +65,30 @@ system-monitor example.
 **Note:** CLI extensions must also be enabled in freshell settings
 (Settings → Coding CLI → Enabled Providers) to appear in the picker.
 
+## How Server Extensions Are Proxied
+
+Server extension iframes load through freshell's built-in HTTP proxy at
+`/api/proxy/http/:port/`. This means:
+
+- The browser only needs to reach freshell's port (e.g., 3001)
+- Extension server ports are internal — they don't need to be exposed
+- **Docker/WSL2/containers work out of the box** — no extra port mapping needed
+- Both HTTP and WebSocket are proxied transparently
+
+For WebSocket, use a relative URL from your extension's JavaScript:
+
+```javascript
+const wsUrl = 'ws://' + location.host + location.pathname + '/ws'
+```
+
+This routes through the proxy automatically. See `live-counter/server.js`
+for a complete example.
+
+## Docker
+
+Server extensions work in Docker without exposing extension ports.
+See [`examples/docker/`](../docker/) for a ready-to-run Dockerfile.
+
 ## Creating Your Own
 
 1. Create a directory with a `freshell.json` manifest
