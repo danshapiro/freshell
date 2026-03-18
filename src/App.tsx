@@ -88,6 +88,7 @@ function ShareQrCode({ url }: { url: string }) {
 
 const HistoryView = lazy(() => import('@/components/HistoryView'))
 const SettingsView = lazy(() => import('@/components/SettingsView'))
+const ExtensionsView = lazy(() => import('@/components/ExtensionsView'))
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
@@ -981,6 +982,15 @@ export default function App() {
         <ErrorBoundary label="Projects" onNavigate={() => setView('overview')}>
           <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading sessions…</div>}>
             <HistoryView onOpenSession={() => setView('terminal')} />
+          </Suspense>
+        </ErrorBoundary>
+      )
+    }
+    if (view === 'extensions') {
+      return (
+        <ErrorBoundary label="Extensions" onNavigate={() => setView('settings')}>
+          <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading extensions…</div>}>
+            <ExtensionsView onNavigate={setView} />
           </Suspense>
         </ErrorBoundary>
       )

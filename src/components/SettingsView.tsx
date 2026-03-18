@@ -51,6 +51,7 @@ import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { parseNormalizedLineList } from '@shared/string-list'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
+import { Puzzle, ChevronRight } from 'lucide-react'
 
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
@@ -898,6 +899,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto w-full max-w-2xl space-y-8 px-3 py-4 md:px-6 md:py-6">
+
+          {/* Manage Extensions button */}
+          <button
+            onClick={() => onNavigate?.('extensions')}
+            className="w-full flex items-center justify-between rounded-lg border border-border/40 bg-card px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+            aria-label="Manage extensions"
+          >
+            <div className="flex items-center gap-3">
+              <Puzzle className="w-5 h-5 text-muted-foreground" />
+              <div>
+                <div className="text-sm font-medium">Manage Extensions</div>
+                <div className="text-xs text-muted-foreground">View and configure installed extensions</div>
+              </div>
+            </div>
+            <ChevronRight className="w-4 h-4 text-muted-foreground" />
+          </button>
 
           {/* Terminal preview */}
           <div className="space-y-2" data-testid="terminal-preview">
