@@ -1,6 +1,33 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Terminal Lifecycle', () => {
+  async function selectShellForActiveTab(page: any): Promise<void> {
+    const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
+    for (const name of shellNames) {
+      const button = page.locator(`button[aria-label="${name}"]`).first()
+      if (await button.isVisible().catch(() => false)) {
+        await button.click({ timeout: 5000 })
+        await page.locator('.xterm').last().waitFor({ state: 'visible', timeout: 30_000 })
+        return
+      }
+    }
+    throw new Error('No shell option available for the active tab')
+  }
+
+  function getTerminalId(layout: any): string | null {
+    if (!layout) return null
+    if (layout.type === 'leaf' && layout.content?.kind === 'terminal') {
+      return typeof layout.content.terminalId === 'string' ? layout.content.terminalId : null
+    }
+    if (layout.type === 'split' && Array.isArray(layout.children)) {
+      for (const child of layout.children) {
+        const terminalId = getTerminalId(child)
+        if (terminalId) return terminalId
+      }
+    }
+    return null
+  }
+
   test('creates a terminal on first load', async ({ freshellPage, harness, terminal }) => {
     // Wait for terminal to appear
     await terminal.waitForTerminal()
@@ -66,6 +93,49 @@ test.describe('Terminal Lifecycle', () => {
 
     // Previous output should still be visible (scrollback preserved)
     await terminal.waitForOutput('before-switch-marker')
+  })
+
+  test('already-live top-tab switches do not emit terminal.attach or terminal.resize when geometry is unchanged', async ({
+    freshellPage,
+    page,
+    harness,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    await terminal.executeCommand('echo "tab-one-live"')
+    await terminal.waitForOutput('tab-one-live')
+    const firstTabId = await harness.getActiveTabId()
+    const firstLayout = await harness.getPaneLayout(firstTabId!)
+    const firstTerminalId = getTerminalId(firstLayout)
+    expect(firstTerminalId).toBeTruthy()
+
+    await page.locator('[data-context="tab-add"]').click()
+    await harness.waitForTabCount(2)
+
+    await selectShellForActiveTab(page)
+    const secondTabId = await harness.getActiveTabId()
+    const secondLayout = await harness.getPaneLayout(secondTabId!)
+    const secondTerminalId = getTerminalId(secondLayout)
+    expect(secondTerminalId).toBeTruthy()
+    await terminal.waitForPrompt({ timeout: 30_000, terminalId: secondTerminalId! })
+    await terminal.executeCommand('echo "tab-two-live"', 1)
+    await terminal.waitForOutput('tab-two-live', { terminalId: secondTerminalId! })
+
+    await harness.clearSentWsMessages()
+
+    const tabs = page.locator('[data-context="tab"]')
+    await tabs.first().click()
+    await terminal.waitForOutput('tab-one-live', { terminalId: firstTerminalId! })
+    await tabs.last().click()
+    await terminal.waitForOutput('tab-two-live', { terminalId: secondTerminalId! })
+    await tabs.first().click()
+    await terminal.waitForOutput('tab-one-live', { terminalId: firstTerminalId! })
+
+    const sent = await harness.getSentWsMessages()
+    expect(sent.filter((msg: any) => msg?.type === 'terminal.attach')).toHaveLength(0)
+    expect(sent.filter((msg: any) => msg?.type === 'terminal.resize')).toHaveLength(0)
   })
 
   test('terminal resize updates dimensions', async ({ freshellPage, page, terminal }) => {

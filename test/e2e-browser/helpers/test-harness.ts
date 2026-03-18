@@ -68,6 +68,22 @@ export class TestHarness {
     })
   }
 
+  async getSentWsMessages(): Promise<unknown[]> {
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getSentWsMessages?.() ?? []
+    })
+  }
+
+  async clearSentWsMessages(): Promise<void> {
+    await this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      harness.clearSentWsMessages?.()
+    })
+  }
+
   /**
    * Wait for specific text to appear in the terminal buffer.
    * Uses the xterm.js buffer API via the test harness (renderer-agnostic).

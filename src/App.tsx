@@ -193,6 +193,9 @@ export default function App() {
       (msg: unknown) => { ws.send(msg) },
       () => perfAuditBridgeRef.current?.snapshot() ?? null,
     )
+    ws.setOutboundMessageObserver?.((msg) => {
+      window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(msg)
+    })
     return true
   })
 

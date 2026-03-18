@@ -15,6 +15,7 @@ type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
 type DisconnectHandler = () => void
+type OutboundMessageObserver = (msg: unknown) => void
 type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
   sidebarOpenSessions?: SessionLocator[]
@@ -86,6 +87,7 @@ export class WsClient {
   private messageHandlers = new Set<MessageHandler>()
   private reconnectHandlers = new Set<ReconnectHandler>()
   private disconnectHandlers = new Set<DisconnectHandler>()
+  private outboundMessageObserver?: OutboundMessageObserver
   private pendingMessages: unknown[] = []
   private intentionalClose = false
   private helloExtensionProvider?: HelloExtensionProvider
@@ -112,6 +114,10 @@ export class WsClient {
    */
   setHelloExtensionProvider(provider: HelloExtensionProvider): void {
     this.helloExtensionProvider = provider
+  }
+
+  setOutboundMessageObserver(observer?: OutboundMessageObserver): void {
+    this.outboundMessageObserver = observer
   }
 
   get state(): ConnectionState {
@@ -539,6 +545,7 @@ export class WsClient {
 
   private sendNow(msg: unknown) {
     this.ws?.send(JSON.stringify(msg))
+    this.outboundMessageObserver?.(msg)
   }
 }
 

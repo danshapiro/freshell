@@ -16,6 +16,9 @@ export interface FreshellTestHarness {
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
+  getSentWsMessages?: () => unknown[]
+  clearSentWsMessages?: () => void
+  recordSentWsMessage?: (msg: unknown) => void
 }
 
 declare global {
@@ -47,6 +50,15 @@ export function installTestHarness(
   const terminalBuffers = new Map<string, () => string>()
   const suppressedAgentChatPaneIds = new Set<string>()
   const suppressedTerminalPaneIds = new Set<string>()
+  const sentWsMessages: unknown[] = []
+  const recordSentWsMessage = (msg: unknown) => {
+    try {
+      sentWsMessages.push(JSON.parse(JSON.stringify(msg)))
+    } catch {
+      sentWsMessages.push(msg)
+    }
+    if (sentWsMessages.length > 500) sentWsMessages.shift()
+  }
 
   window.__FRESHELL_TEST_HARNESS__ = {
     getState: () => store.getState(),
@@ -88,5 +100,10 @@ export function installTestHarness(
       terminalBuffers.delete(terminalId)
     },
     getPerfAuditSnapshot,
+    getSentWsMessages: () => [...sentWsMessages],
+    clearSentWsMessages: () => {
+      sentWsMessages.length = 0
+    },
+    recordSentWsMessage,
   }
 }
