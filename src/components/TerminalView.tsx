@@ -124,6 +124,18 @@ type DeferredAttachState = {
   pendingSinceSeq: number
 }
 
+type SentViewport = {
+  terminalId: string
+  cols: number
+  rows: number
+}
+
+const lastSentViewportByTerminal = new Map<string, { cols: number; rows: number }>()
+
+export function __resetLastSentViewportCacheForTests(): void {
+  lastSentViewportByTerminal.clear()
+}
+
 type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
 type RepeatableMobileToolbarKeyId = Extract<MobileToolbarKeyId, 'up' | 'down' | 'left' | 'right'>
 
@@ -266,6 +278,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     cols: number
     rows: number
   } | null>(null)
+  const lastSentViewportRef = useRef<SentViewport | null>(null)
   const handledCreatedMessageRef = useRef<{
     requestId: string
     terminalId: string
@@ -312,6 +325,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
+        const cachedViewport = terminalContent.terminalId
+          ? lastSentViewportByTerminal.get(terminalContent.terminalId)
+          : undefined
+        lastSentViewportRef.current = terminalContent.terminalId && cachedViewport
+          ? { terminalId: terminalContent.terminalId, cols: cachedViewport.cols, rows: cachedViewport.rows }
+          : null
         const initialSeq = terminalContent.terminalId
           ? loadTerminalCursor(terminalContent.terminalId)
           : 0
@@ -673,10 +692,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             && suppressedResize.terminalId === tid
             && suppressedResize.cols === term.cols
             && suppressedResize.rows === term.rows
+          const lastSentViewport = lastSentViewportRef.current
+          const matchesLastSentViewport = lastSentViewport
+            && lastSentViewport.terminalId === tid
+            && lastSentViewport.cols === term.cols
+            && lastSentViewport.rows === term.rows
           if (matchesSuppressedViewport) {
             suppressNextMatchingResizeRef.current = null
-          } else if (!suppressNetworkEffects) {
+          } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
             ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+            lastSentViewportByTerminal.set(tid, { cols: term.cols, rows: term.rows })
+            lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
           }
         }
       }
@@ -1320,6 +1346,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       sinceSeq,
       attachRequestId,
     })
+    lastSentViewportByTerminal.set(tid, { cols, rows })
+    lastSentViewportRef.current = { terminalId: tid, cols, rows }
   }, [suppressNetworkEffects, ws, applySeqState])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {

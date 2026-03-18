@@ -35,6 +35,10 @@ const restoreMocks = vi.hoisted(() => ({
   addTerminalRestoreRequestId: vi.fn(),
 }))
 
+const runtimeMocks = vi.hoisted(() => ({
+  instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
+}))
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
@@ -86,12 +90,15 @@ vi.mock('@xterm/xterm', () => {
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     fit = vi.fn()
+    constructor() {
+      runtimeMocks.instances.push(this)
+    }
   },
 }))
 
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
-import TerminalView from '@/components/TerminalView'
+import TerminalView, { __resetLastSentViewportCacheForTests } from '@/components/TerminalView'
 
 function TerminalViewFromStore({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) {
   const paneContent = useAppSelector((state) => {
@@ -215,6 +222,7 @@ describe('TerminalView lifecycle updates', () => {
   beforeEach(() => {
     clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
+    __resetLastSentViewportCacheForTests()
     latestAttachRequestIdByTerminal.clear()
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
@@ -231,6 +239,7 @@ describe('TerminalView lifecycle updates', () => {
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
     terminalInstances.length = 0
+    runtimeMocks.instances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
       messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
       return () => { messageHandler = null }
@@ -3161,6 +3170,221 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(attach?.sinceSeq).toBe(0)
       expect(attach?.attachRequestId).toBeTruthy()
+    })
+
+    it('does not send terminal.resize when an already-live terminal is hidden and revealed with unchanged geometry', async () => {
+      const { rerender, store, tabId, paneId, terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-live-reveal-no-resize',
+        clearSends: false,
+      })
+
+      const runtime = runtimeMocks.instances.at(-1)
+      expect(runtime).toBeTruthy()
+
+      const queuedFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        queuedFrames.push(cb)
+        return queuedFrames.length
+      })
+
+      wsMocks.send.mockClear()
+      runtime!.fit.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden
+            />
+          </Provider>,
+        )
+      })
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden={false}
+            />
+          </Provider>,
+        )
+      })
+
+      await act(async () => {
+        queuedFrames.splice(0).forEach((cb) => cb(0))
+      })
+
+      await waitFor(() => {
+        expect(runtime!.fit).toHaveBeenCalled()
+      })
+
+      const sent = wsMocks.send.mock.calls.map(([msg]) => msg)
+      expect(sent.filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+      expect(sent.filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
+    it('does not send terminal.resize when a create-path terminal is already-live before a same-geometry reveal', async () => {
+      const { rerender, store, tabId, paneId, requestId } = await renderTerminalHarness({
+        status: 'creating',
+        requestId: 'req-live-reveal-created',
+        clearSends: false,
+      })
+
+      const runtime = runtimeMocks.instances.at(-1)
+      expect(runtime).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId,
+          terminalId: 'term-live-reveal-created',
+          createdAt: Date.now(),
+        })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .reverse()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 'term-live-reveal-created')
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId: 'term-live-reveal-created',
+          headSeq: attach?.sinceSeq ?? 0,
+          replayFromSeq: (attach?.sinceSeq ?? 0) + 1,
+          replayToSeq: attach?.sinceSeq ?? 0,
+          attachRequestId: attach.attachRequestId,
+        })
+      })
+
+      const queuedFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        queuedFrames.push(cb)
+        return queuedFrames.length
+      })
+
+      wsMocks.send.mockClear()
+      runtime!.fit.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden
+            />
+          </Provider>,
+        )
+      })
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden={false}
+            />
+          </Provider>,
+        )
+      })
+
+      await act(async () => {
+        queuedFrames.splice(0).forEach((cb) => cb(0))
+      })
+
+      await waitFor(() => {
+        expect(runtime!.fit).toHaveBeenCalled()
+      })
+
+      const sent = wsMocks.send.mock.calls.map(([msg]) => msg)
+      expect(sent.filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 'term-live-reveal-created')).toHaveLength(0)
+      expect(sent.filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === 'term-live-reveal-created')).toHaveLength(0)
+    })
+
+    it('sends exactly one terminal.resize when an already-live terminal is revealed after geometry changes', async () => {
+      const { rerender, store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-live-reveal-real-resize',
+        clearSends: false,
+      })
+
+      const runtime = runtimeMocks.instances.at(-1)
+      expect(runtime).toBeTruthy()
+
+      const queuedFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+        queuedFrames.push(cb)
+        return queuedFrames.length
+      })
+
+      runtime!.fit.mockImplementation(() => {
+        term.cols = 132
+        term.rows = 40
+      })
+
+      wsMocks.send.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden
+            />
+          </Provider>,
+        )
+      })
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={readPaneContent()!}
+              hidden={false}
+            />
+          </Provider>,
+        )
+      })
+
+      await act(async () => {
+        queuedFrames.splice(0).forEach((cb) => cb(0))
+      })
+
+      await waitFor(() => {
+        const resizeCalls = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)
+        expect(resizeCalls).toHaveLength(1)
+      })
     })
 
     it('renders terminal.output.gap marker and advances sinceSeq for subsequent attach', async () => {
