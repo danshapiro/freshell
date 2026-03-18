@@ -1,6 +1,20 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Tab Management', () => {
+  function getTerminalId(layout: any): string | null {
+    if (!layout) return null
+    if (layout.type === 'leaf' && layout.content?.kind === 'terminal') {
+      return typeof layout.content.terminalId === 'string' ? layout.content.terminalId : null
+    }
+    if (layout.type === 'split' && Array.isArray(layout.children)) {
+      for (const child of layout.children) {
+        const terminalId = getTerminalId(child)
+        if (terminalId) return terminalId
+      }
+    }
+    return null
+  }
+
   async function selectShellForActiveTab(page: any): Promise<void> {
     const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
     for (const name of shellNames) {
@@ -94,20 +108,59 @@ test.describe('Tab Management', () => {
     await expect(tab.getByText('My Custom Tab')).toBeVisible({ timeout: 5_000 })
   })
 
-  test('tabs persist across page reload', async ({ freshellPage, page, harness, serverInfo }) => {
-    // Create a second tab and rename the first
+  test('restored top tabs stay hot across page reload and still switch without replay', async ({
+    freshellPage,
+    page,
+    harness,
+    serverInfo,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await terminal.executeCommand('echo "restored-tab-one"')
+    await terminal.waitForOutput('restored-tab-one')
+    const firstTabId = await harness.getActiveTabId()
+    const firstLayout = await harness.getPaneLayout(firstTabId!)
+    const firstTerminalId = getTerminalId(firstLayout)
+    expect(firstTerminalId).toBeTruthy()
+
     const addButton = page.locator('[data-context="tab-add"]')
     await addButton.click()
     await harness.waitForTabCount(2)
+    await selectShellForActiveTab(page)
+    const secondTabId = await harness.getActiveTabId()
+    const secondLayout = await harness.getPaneLayout(secondTabId!)
+    const secondTerminalId = getTerminalId(secondLayout)
+    expect(secondTerminalId).toBeTruthy()
+    await terminal.waitForPrompt({ timeout: 30_000, terminalId: secondTerminalId! })
+    await terminal.executeCommand('echo "restored-tab-two"', 1)
+    await terminal.waitForOutput('restored-tab-two', { terminalId: secondTerminalId! })
 
-    // Reload the page
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
+    await harness.waitForTabCount(2)
 
-    // Tabs should be restored from localStorage
-    const tabCount = await harness.getTabCount()
-    expect(tabCount).toBeGreaterThanOrEqual(1)
+    const tabs = page.locator('[data-context="tab"]')
+    await terminal.waitForOutput('restored-tab-two', { timeout: 30_000, terminalId: secondTerminalId! })
+    await tabs.first().click()
+    await terminal.waitForOutput('restored-tab-one', { terminalId: firstTerminalId! })
+    await tabs.last().click()
+    await terminal.waitForOutput('restored-tab-two', { terminalId: secondTerminalId! })
+
+    await page.waitForTimeout(200)
+    await harness.clearSentWsMessages()
+
+    await tabs.first().click()
+    await terminal.waitForOutput('restored-tab-one', { terminalId: firstTerminalId! })
+    await tabs.last().click()
+    await terminal.waitForOutput('restored-tab-two', { terminalId: secondTerminalId! })
+    await tabs.first().click()
+    await terminal.waitForOutput('restored-tab-one', { terminalId: firstTerminalId! })
+
+    const sent = await harness.getSentWsMessages()
+    expect(sent.filter((msg: any) => msg?.type === 'terminal.attach')).toHaveLength(0)
+    expect(sent.filter((msg: any) => msg?.type === 'terminal.resize')).toHaveLength(0)
   })
 
   test.skip('keyboard shortcut creates new tab', async ({ freshellPage, page, harness }) => {

@@ -143,13 +143,48 @@ test.describe('Terminal Lifecycle', () => {
     expect(sent.filter((msg: any) => msg?.type === 'terminal.resize')).toHaveLength(0)
   })
 
-  test('terminal resize updates dimensions', async ({ freshellPage, page, terminal }) => {
+  test('terminal resize updates dimensions', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await terminal.executeCommand('echo "before-resize-marker"')
+    await terminal.waitForOutput('before-resize-marker')
+    const firstTabId = await harness.getActiveTabId()
+    const firstLayout = await harness.getPaneLayout(firstTabId!)
+    const firstTerminalId = getTerminalId(firstLayout)
+    expect(firstTerminalId).toBeTruthy()
 
-    // Resize the viewport
+    await page.locator('[data-context="tab-add"]').click()
+    await harness.waitForTabCount(2)
+    await selectShellForActiveTab(page)
+    const secondTabId = await harness.getActiveTabId()
+    const secondLayout = await harness.getPaneLayout(secondTabId!)
+    const secondTerminalId = getTerminalId(secondLayout)
+    expect(secondTerminalId).toBeTruthy()
+    await terminal.waitForPrompt({ timeout: 30_000, terminalId: secondTerminalId! })
+    await terminal.executeCommand('echo "other-tab-marker"', 1)
+    await terminal.waitForOutput('other-tab-marker', { terminalId: secondTerminalId! })
+
+    const tabs = page.locator('[data-context="tab"]')
+    await tabs.first().click()
+    await terminal.waitForOutput('before-resize-marker', { terminalId: firstTerminalId! })
+    await page.waitForTimeout(200)
+    await harness.clearSentWsMessages()
+
     await page.setViewportSize({ width: 1600, height: 1200 })
+    await terminal.waitForOutput('before-resize-marker', { terminalId: firstTerminalId! })
+    await tabs.last().click()
+    await terminal.waitForOutput('other-tab-marker', { terminalId: secondTerminalId! })
+    await tabs.first().click()
+    await terminal.waitForOutput('before-resize-marker', { terminalId: firstTerminalId! })
 
-    // Terminal should still be functional
+    const sent = await harness.getSentWsMessages()
+    const attachMessages = sent.filter((msg: any) => msg?.type === 'terminal.attach')
+    const firstTerminalResizeMessages = sent.filter(
+      (msg: any) => msg?.type === 'terminal.resize' && msg?.terminalId === firstTerminalId,
+    )
+    expect(attachMessages).toHaveLength(0)
+    expect(firstTerminalResizeMessages).toHaveLength(1)
+
     await terminal.waitForPrompt()
     await terminal.executeCommand('echo "after-resize"')
     await terminal.waitForOutput('after-resize')

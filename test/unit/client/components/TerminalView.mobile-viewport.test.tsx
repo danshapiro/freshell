@@ -77,7 +77,7 @@ vi.mock('@/lib/ws-client', () => ({
   })),
 }))
 
-import TerminalView from '@/components/TerminalView'
+import TerminalView, { __resetLastSentViewportCacheForTests } from '@/components/TerminalView'
 
 function createStore() {
   return configureStore({
@@ -169,6 +169,7 @@ describe('TerminalView mobile viewport handling', () => {
     vi.clearAllMocks()
     runtimeMocks.instances.length = 0
     terminalMocks.instances.length = 0
+    __resetLastSentViewportCacheForTests()
     ;(globalThis as any).setMobileForTest(false)
     originalVisualViewport = window.visualViewport
     originalInnerHeight = window.innerHeight
