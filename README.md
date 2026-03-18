@@ -123,6 +123,16 @@ OpenCode sessions are discovered directly from OpenCode's local session database
 - **Testing**: Vitest, Testing Library, supertest, superwstest
 - **AI**: Vercel AI SDK with Google Gemini
 
+## Extensions
+
+Freshell supports custom pane types via extensions. Three categories are available:
+
+- **Client** — Static HTML/JS served by freshell (no server needed)
+- **Server** — Your own HTTP server, managed by freshell with automatic port allocation
+- **CLI** — Any terminal tool wrapped as a pane
+
+Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart freshell. See [`examples/extensions/`](examples/extensions/) for working examples of each type.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
