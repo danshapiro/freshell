@@ -1,12 +1,16 @@
 # Example Extensions
 
-Three example extensions demonstrating each extension category. To try one,
+Example extensions demonstrating each extension category. To try one,
 symlink it into your extensions directory and restart freshell:
 
 ```bash
+# macOS/Linux
 ln -sf "$(pwd)/examples/extensions/notepad" ~/.freshell/extensions/notepad
 ln -sf "$(pwd)/examples/extensions/status-dashboard" ~/.freshell/extensions/status-dashboard
 ln -sf "$(pwd)/examples/extensions/system-monitor" ~/.freshell/extensions/system-monitor
+
+# Windows (use task-list instead of system-monitor)
+ln -sf "$(pwd)/examples/extensions/task-list" ~/.freshell/extensions/task-list
 ```
 
 After restarting, each extension appears in the **New Tab** pane picker.
@@ -36,12 +40,17 @@ allocated port, `server.readyPattern` tells freshell when the server is ready.
 `package.json` without `"type": "module"` in the extension directory.
 Otherwise Node may inherit an ESM `package.json` from a parent directory.
 
-### system-monitor (cli)
+### system-monitor (cli, macOS/Linux)
 
 Wraps `top` as a terminal pane. The simplest possible extension — just a
 manifest pointing at an existing binary. No code needed.
 
 **Key manifest fields:** `category: "cli"`, `cli.command` is the binary to run.
+
+### task-list (cli, Windows)
+
+Wraps `tasklist` as a terminal pane — the Windows equivalent of the
+system-monitor example.
 
 **Note:** CLI extensions must also be enabled in freshell settings
 (Settings → Coding CLI → Enabled Providers) to appear in the picker.

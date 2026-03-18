@@ -1,0 +1,14 @@
+{
+  "name": "task-list",
+  "version": "0.1.0",
+  "label": "Task List",
+  "description": "Running processes snapshot (tasklist) in a terminal pane",
+  "category": "cli",
+  "cli": {
+    "command": "tasklist"
+  },
+  "picker": {
+    "shortcut": "T",
+    "group": "tools"
+  }
+}
