@@ -625,6 +625,36 @@ describe('TerminalRegistry Lifecycle', () => {
     })
   })
 
+  describe('Idempotent resize', () => {
+    it('returns true without calling pty.resize when cols and rows are unchanged', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+
+      expect(term.cols).toBe(120)
+      expect(term.rows).toBe(30)
+
+      const result = registry.resize(term.terminalId, 120, 30)
+
+      expect(result).toBe(true)
+      expect(pty.resize).not.toHaveBeenCalled()
+      expect(term.cols).toBe(120)
+      expect(term.rows).toBe(30)
+    })
+
+    it('still calls pty.resize exactly once when cols or rows change', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+
+      const result = registry.resize(term.terminalId, 140, 40)
+
+      expect(result).toBe(true)
+      expect(pty.resize).toHaveBeenCalledTimes(1)
+      expect(pty.resize).toHaveBeenCalledWith(140, 40)
+      expect(term.cols).toBe(140)
+      expect(term.rows).toBe(40)
+    })
+  })
+
   describe('Input to exited terminal', () => {
     it('should return false for input to exited terminal', () => {
       const term = registry.create({ mode: 'shell' })

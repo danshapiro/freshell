@@ -1317,6 +1317,7 @@ export class TerminalRegistry extends EventEmitter {
   resize(terminalId: string, cols: number, rows: number): boolean {
     const term = this.terminals.get(terminalId)
     if (!term || term.status !== 'running') return false
+    if (term.cols === cols && term.rows === rows) return true
     term.cols = cols
     term.rows = rows
     try {
