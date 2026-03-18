@@ -89,6 +89,7 @@ const TAP_MAX_DISTANCE_PX = 24
 const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
+const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
@@ -132,8 +133,30 @@ type SentViewport = {
 
 const lastSentViewportByTerminal = new Map<string, { cols: number; rows: number }>()
 
+function rememberSentViewport(terminalId: string, cols: number, rows: number): void {
+  if (lastSentViewportByTerminal.has(terminalId)) {
+    lastSentViewportByTerminal.delete(terminalId)
+  }
+  lastSentViewportByTerminal.set(terminalId, { cols, rows })
+  if (lastSentViewportByTerminal.size > MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES) {
+    const oldestTerminalId = lastSentViewportByTerminal.keys().next().value
+    if (typeof oldestTerminalId === 'string') {
+      lastSentViewportByTerminal.delete(oldestTerminalId)
+    }
+  }
+}
+
+function forgetSentViewport(terminalId?: string): void {
+  if (!terminalId) return
+  lastSentViewportByTerminal.delete(terminalId)
+}
+
 export function __resetLastSentViewportCacheForTests(): void {
   lastSentViewportByTerminal.clear()
+}
+
+export function __getLastSentViewportCacheSizeForTests(): number {
+  return lastSentViewportByTerminal.size
 }
 
 type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
@@ -325,6 +348,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
+        forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
           ? lastSentViewportByTerminal.get(terminalContent.terminalId)
           : undefined
@@ -701,7 +725,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             suppressNextMatchingResizeRef.current = null
           } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
             ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
-            lastSentViewportByTerminal.set(tid, { cols: term.cols, rows: term.rows })
+            rememberSentViewport(tid, term.cols, term.rows)
             lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
           }
         }
@@ -1346,7 +1370,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       sinceSeq,
       attachRequestId,
     })
-    lastSentViewportByTerminal.set(tid, { cols, rows })
+    rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
   }, [suppressNetworkEffects, ws, applySeqState])
 
@@ -1703,6 +1727,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           clearTerminalCursor(tid)
+          forgetSentViewport(tid)
+          lastSentViewportRef.current = null
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
           // operations (resize, input) from sending commands to the dead terminal,
           // which would trigger INVALID_TERMINAL_ID and cause a reconnection loop.
@@ -1816,6 +1842,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             }
             requestIdRef.current = newRequestId
             clearTerminalCursor(currentTerminalId)
+            forgetSentViewport(currentTerminalId)
+            lastSentViewportRef.current = null
             terminalIdRef.current = undefined
             deferredAttachStateRef.current = {
               mode: 'none',

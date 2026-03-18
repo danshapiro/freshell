@@ -143,6 +143,7 @@ test.describe('Tab Management', () => {
 
     const tabs = page.locator('[data-context="tab"]')
     await terminal.waitForOutput('restored-tab-two', { timeout: 30_000, terminalId: secondTerminalId! })
+
     await tabs.first().click()
     await terminal.waitForOutput('restored-tab-one', { terminalId: firstTerminalId! })
     await tabs.last().click()

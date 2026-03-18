@@ -98,7 +98,10 @@ vi.mock('@xterm/addon-fit', () => ({
 
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
-import TerminalView, { __resetLastSentViewportCacheForTests } from '@/components/TerminalView'
+import TerminalView, {
+  __getLastSentViewportCacheSizeForTests,
+  __resetLastSentViewportCacheForTests,
+} from '@/components/TerminalView'
 
 function TerminalViewFromStore({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) {
   const paneContent = useAppSelector((state) => {
@@ -3385,6 +3388,39 @@ describe('TerminalView lifecycle updates', () => {
           .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)
         expect(resizeCalls).toHaveLength(1)
       })
+    })
+
+    it('evicts cached viewport entries when a terminal exits', async () => {
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-live-reveal-cache-evict',
+        clearSends: false,
+      })
+
+      expect(__getLastSentViewportCacheSizeForTests()).toBe(1)
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.exit',
+          terminalId,
+          exitCode: 0,
+        })
+      })
+
+      expect(__getLastSentViewportCacheSizeForTests()).toBe(0)
+    })
+
+    it('bounds cached viewport entries to the most recent terminals', async () => {
+      for (let index = 0; index < 205; index += 1) {
+        const { unmount } = await renderTerminalHarness({
+          status: 'running',
+          terminalId: `term-live-reveal-cache-bound-${index}`,
+          clearSends: false,
+        })
+        unmount()
+      }
+
+      expect(__getLastSentViewportCacheSizeForTests()).toBe(200)
     })
 
     it('renders terminal.output.gap marker and advances sinceSeq for subsequent attach', async () => {

@@ -33,13 +33,13 @@ No additional harness work is required for the unit tests; they already use the 
    - **Interactions:** Tab bar selection, xterm rendering, client outbound WS observation, server PTY resize propagation.
    - **Source of truth:** `src/components/TerminalView.tsx`, `server/terminal-registry.ts`, `test/e2e-browser/specs/terminal-lifecycle.spec.ts`.
 
-2. **Restored top tabs stay hot across page reload and still switch without replay**
+2. **Restored top tabs persist across page reload, then switch hot after they become live**
    - **Type:** scenario
    - **Disposition:** extend
    - **Harness:** H1, H2, `test/e2e-browser/specs/tab-management.spec.ts`
    - **Preconditions:** At least two terminal tabs exist and have prior output in their buffers before the page reload. The browser is running with `?e2e=1` so the harness is available after restore.
-   - **Actions:** Reload the app through the existing e2e URL, wait for the harness and shell prompt, clear the outbound log, then switch among the restored top tabs and re-read the visible buffers.
-   - **Expected outcome:** The restored buffers still contain the earlier marker output, and switching between the restored tabs does not emit `terminal.attach` or `terminal.resize`. This verifies that persistence does not regress into a fresh replay on first post-reload reveal.
+   - **Actions:** Reload the app through the existing e2e URL, wait for the harness and shell prompt, reveal any restored hidden tabs once so they complete their existing deferred attach flow, clear the outbound log, then switch among the restored top tabs and re-read the visible buffers.
+   - **Expected outcome:** The restored buffers still contain the earlier marker output, and once the restored tabs have become live in the new app session, subsequent switching between them does not emit `terminal.attach` or `terminal.resize`. This verifies persistence plus hot switching without broadening the existing first-restored-reveal attach contract.
    - **Interactions:** LocalStorage tab persistence, reconnect/bootstrap flow, terminal visibility attach path, outbound WS capture.
    - **Source of truth:** `src/App.tsx`, `src/components/TerminalView.tsx`, `test/e2e-browser/specs/tab-management.spec.ts`.
 
@@ -74,7 +74,7 @@ No additional harness work is required for the unit tests; they already use the 
    - **Source of truth:** `src/components/TerminalView.tsx`, `test/unit/client/components/TerminalView.lifecycle.test.tsx`.
 
 ## Coverage Summary
-- Covered: top-tab switching between already-live terminals, top-tab switching after page reload/persistence, real geometry changes, server no-op resize idempotence, and client same-geometry reveal dedupe.
-- Covered indirectly by existing tests: hidden first-reveal attach behavior, reconnect attach semantics, and replay ordering. Those remain important invariants but are already exercised by the current lifecycle suite.
+- Covered: top-tab switching between already-live terminals, post-restore hot switching after restored tabs become live, real geometry changes, server no-op resize idempotence, and client same-geometry reveal dedupe.
+- Covered indirectly by existing tests: hidden first-reveal attach behavior, reconnect attach semantics, and replay ordering. Those remain important invariants and the clarified reload proof intentionally preserves them.
 - Explicitly excluded: manual visual inspection, mock-only proof of the browser traffic path, and any rewrite of attach hydration or reconnect policy before the resize dedupe lands.
 - Residual risk: if the outbound WS recorder misses a send path, the browser scenarios could under-report traffic. The server and client boundary tests reduce that risk by pinning the two resize choke points directly.

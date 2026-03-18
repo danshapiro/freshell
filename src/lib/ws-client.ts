@@ -186,13 +186,13 @@ export class WsClient {
             ? { sidebarOpenSessions: sanitizeSessionLocators(extensions.sidebarOpenSessions) }
             : {}),
         }
-        this.ws?.send(JSON.stringify({
+        this.sendNow({
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
           capabilities: { uiScreenshotV1: true },
           ...helloExtensions,
-        }))
+        })
       }
 
       this.ws.onmessage = (event) => {

@@ -94,6 +94,25 @@ describe('WsClient.connect', () => {
     await p
   })
 
+  it('observes the hello handshake as an outbound wire send', async () => {
+    const c = new WsClient('ws://example/ws')
+    const observer = vi.fn()
+    c.setOutboundMessageObserver(observer)
+
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0]._open()
+
+    expect(observer).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'hello',
+      token: 't',
+      protocolVersion: WS_PROTOCOL_VERSION,
+    }))
+
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+  })
+
   it('hello payload does not advertise split flags', async () => {
     const c = new WsClient('ws://example/ws')
     const p = c.connect()

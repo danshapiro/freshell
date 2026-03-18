@@ -693,7 +693,13 @@ function PickerWrapper({
   )
 }
 
-function renderContent(tabId: string, paneId: string, content: PaneContent, isOnlyPane: boolean, hidden?: boolean) {
+function renderContent(
+  tabId: string,
+  paneId: string,
+  content: PaneContent,
+  isOnlyPane: boolean,
+  hidden?: boolean,
+) {
   if (content.kind === 'terminal') {
     return (
       <ErrorBoundary key={paneId} label="Terminal">
