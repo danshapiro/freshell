@@ -79,7 +79,7 @@ const server = http.createServer((req, res) => {
   <script>
     async function refresh() {
       try {
-        const res = await fetch('/api/status')
+        const res = await fetch('api/status')
         const info = await res.json()
         document.getElementById('uptime').textContent = info.hours + 'h ' + info.minutes + 'm'
         document.getElementById('mem').textContent = info.usedMem + ' / ' + info.totalMem + ' GB'

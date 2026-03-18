@@ -75,14 +75,21 @@ Server extension iframes load through freshell's built-in HTTP proxy at
 - **Docker/WSL2/containers work out of the box** — no extra port mapping needed
 - Both HTTP and WebSocket are proxied transparently
 
-For WebSocket, use a relative URL from your extension's JavaScript:
+**Important:** Use relative URLs in your extension's JavaScript, not
+root-relative ones. The iframe loads at a proxy subpath, so root-relative
+URLs (starting with `/`) resolve against freshell's origin instead of the
+extension's.
 
 ```javascript
+// GOOD — relative URL, resolves through the proxy
+fetch('api/status')
 const wsUrl = 'ws://' + location.host + location.pathname + '/ws'
+
+// BAD — root-relative, hits freshell's /api/status instead of the extension's
+fetch('/api/status')
 ```
 
-This routes through the proxy automatically. See `live-counter/server.js`
-for a complete example.
+See `live-counter/server.js` and `status-dashboard/server.js` for examples.
 
 ## Docker
 
