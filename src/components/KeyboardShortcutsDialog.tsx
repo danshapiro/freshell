@@ -17,6 +17,7 @@ export function KeyboardShortcutsDialog({ open, onClose }: KeyboardShortcutsDial
   useEffect(() => {
     if (!open) return
     previousFocusRef.current = document.activeElement as HTMLElement | null
+    const focusTimer = window.setTimeout(() => dialogRef.current?.focus(), 0)
 
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -26,6 +27,7 @@ export function KeyboardShortcutsDialog({ open, onClose }: KeyboardShortcutsDial
     }
     document.addEventListener('keydown', handleKey)
     return () => {
+      window.clearTimeout(focusTimer)
       document.removeEventListener('keydown', handleKey)
       previousFocusRef.current?.focus()
     }
@@ -47,11 +49,15 @@ export function KeyboardShortcutsDialog({ open, onClose }: KeyboardShortcutsDial
         role="dialog"
         aria-modal="true"
         aria-label="Keyboard shortcuts"
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         onKeyDown={(e) => {
           if (e.key === 'Escape') {
             e.preventDefault()
             onClose()
+          }
+          if (e.key === 'Tab') {
+            e.preventDefault()
           }
         }}
       >
