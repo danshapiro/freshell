@@ -1,7 +1,9 @@
+// Renders server and client extension panes as sandboxed iframes.
+// Server extensions are proxied through /api/proxy/http/:port/ for Docker/WSL2 compatibility.
+
 import { useState, useEffect } from 'react'
 import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
-import { isLoopbackHostname } from '@/lib/url-rewrite'
 import { api } from '@/lib/api'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
@@ -36,10 +38,6 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
   const [startState, setStartState] = useState<'idle' | 'starting' | 'error'>('idle')
   const [startError, setStartError] = useState<string | null>(null)
   const [startAttempt, setStartAttempt] = useState(0)
-
-  // Port forwarding state for server extensions accessed remotely
-  const [forwardedPort, setForwardedPort] = useState<number | null>(null)
-  const [forwardError, setForwardError] = useState<string | null>(null)
 
   // Auto-start server extensions that aren't running
   useEffect(() => {
@@ -89,48 +87,6 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
     }
   }, [extension?.name, extension?.category, extension?.serverRunning, startAttempt, dispatch])
 
-  const isRemote = typeof window !== 'undefined' && !isLoopbackHostname(window.location.hostname)
-  const serverPort = extension?.serverPort
-  const serverRunning = extension?.serverRunning
-
-  useEffect(() => {
-    if (!isRemote || !serverPort || !serverRunning || extension?.category !== 'server') {
-      // Clean up stale state when extension stops or is no longer forwarding
-      setForwardedPort(null)
-      setForwardError(null)
-      return
-    }
-
-    // Reset state when dependencies change to avoid stale forwarding info
-    setForwardedPort(null)
-    setForwardError(null)
-
-    let cancelled = false
-    api
-      .post<{ forwardedPort: number }>('/api/proxy/forward', { port: serverPort })
-      .then((result) => {
-        if (!cancelled) setForwardedPort(result.forwardedPort)
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          let msg: string
-          if (err instanceof Error) {
-            msg = err.message
-          } else if (err && typeof err === 'object' && 'message' in err) {
-            msg = String((err as { message: unknown }).message)
-          } else {
-            msg = String(err)
-          }
-          setForwardError(`Failed to connect to extension server on port ${serverPort}: ${msg}`)
-        }
-      })
-
-    return () => {
-      cancelled = true
-      api.delete(`/api/proxy/forward/${serverPort}`).catch(() => {})
-    }
-  }, [isRemote, serverPort, serverRunning, extension?.category])
-
   if (!extension) {
     return <ExtensionError name={content.extensionName} />
   }
@@ -162,24 +118,11 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
       )
     }
 
-    if (forwardError) {
-      return <ExtensionError name={content.extensionName} message={forwardError} />
-    }
-
-    if (isRemote) {
-      if (!forwardedPort) {
-        // Still waiting for port forwarding
-        return (
-          <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-            Connecting to extension server...
-          </div>
-        )
-      }
-      // Use current page protocol to avoid mixed-content blocking on HTTPS
-      src = `${window.location.protocol}//${window.location.hostname}:${forwardedPort}${interpolated}`
-    } else {
-      src = `${window.location.protocol}//localhost:${extension.serverPort}${interpolated}`
-    }
+    // Proxy all server extension requests through freshell's own port.
+    // This works in Docker, WSL2, and local environments — the browser
+    // only needs to reach freshell's port, and freshell proxies to the
+    // extension's dynamically allocated port internally.
+    src = `/api/proxy/http/${extension.serverPort}${interpolated}`
   } else if (extension.category === 'client') {
     src = `/api/extensions/${encodeURIComponent(extension.name)}/client${interpolated}`
   } else {

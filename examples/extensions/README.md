@@ -7,6 +7,7 @@ symlink it into your extensions directory and restart freshell:
 # macOS/Linux
 ln -sf "$(pwd)/examples/extensions/notepad" ~/.freshell/extensions/notepad
 ln -sf "$(pwd)/examples/extensions/status-dashboard" ~/.freshell/extensions/status-dashboard
+ln -sf "$(pwd)/examples/extensions/live-counter" ~/.freshell/extensions/live-counter
 ln -sf "$(pwd)/examples/extensions/system-monitor" ~/.freshell/extensions/system-monitor
 
 # Windows (use task-list instead of system-monitor)
@@ -40,6 +41,15 @@ allocated port, `server.readyPattern` tells freshell when the server is ready.
 `package.json` without `"type": "module"` in the extension directory.
 Otherwise Node may inherit an ESM `package.json` from a parent directory.
 
+### live-counter (server, WebSocket)
+
+A shared counter with real-time updates. Click +/- in one pane and see
+the count update instantly in all other panes via WebSocket. Demonstrates
+that server extensions can use WebSocket through freshell's HTTP proxy.
+
+**Key manifest fields:** Same as status-dashboard. The WebSocket connection
+uses a relative URL so it routes through the proxy automatically.
+
 ### system-monitor (cli, macOS/Linux)
 
 Wraps `top` as a terminal pane. The simplest possible extension — just a
@@ -54,6 +64,37 @@ system-monitor example.
 
 **Note:** CLI extensions must also be enabled in freshell settings
 (Settings → Coding CLI → Enabled Providers) to appear in the picker.
+
+## How Server Extensions Are Proxied
+
+Server extension iframes load through freshell's built-in HTTP proxy at
+`/api/proxy/http/:port/`. This means:
+
+- The browser only needs to reach freshell's port (e.g., 3001)
+- Extension server ports are internal — they don't need to be exposed
+- **Docker/WSL2/containers work out of the box** — no extra port mapping needed
+- Both HTTP and WebSocket are proxied transparently
+
+**Important:** Use relative URLs in your extension's JavaScript, not
+root-relative ones. The iframe loads at a proxy subpath, so root-relative
+URLs (starting with `/`) resolve against freshell's origin instead of the
+extension's.
+
+```javascript
+// GOOD — relative URL, resolves through the proxy
+fetch('api/status')
+const wsUrl = 'ws://' + location.host + location.pathname + '/ws'
+
+// BAD — root-relative, hits freshell's /api/status instead of the extension's
+fetch('/api/status')
+```
+
+See `live-counter/server.js` and `status-dashboard/server.js` for examples.
+
+## Docker
+
+Server extensions work in Docker without exposing extension ports.
+See [`examples/docker/`](../docker/) for a ready-to-run Dockerfile.
 
 ## Creating Your Own
 

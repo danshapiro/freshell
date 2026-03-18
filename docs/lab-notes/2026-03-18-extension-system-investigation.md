@@ -105,11 +105,11 @@ registered extensions somewhere in the UI (settings page?).
 Convert `demo-projects/synth` to a client extension with a freshell.json.
 This gives users a real reference implementation.
 
-### P4: Docker server extension support
-Either:
-- Allow server extensions to specify a fixed port (breaking the dynamic pattern)
-- Detect Docker environment and always use the proxy forwarding path
-- Add a config option to force proxy mode
+### P4: Docker server extension support — DONE
+Chose approach: always route server extension iframes through the existing
+HTTP proxy at `/api/proxy/http/:port/`. Added WebSocket upgrade support to
+the proxy. Removed the isRemote/port-forwarding fork from ExtensionPane.
+Verified with Docker test (examples/docker/).
 
 ## Files Examined
 
