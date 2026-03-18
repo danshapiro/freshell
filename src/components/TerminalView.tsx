@@ -1106,6 +1106,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         return false
       }
 
+      // Ctrl+Shift+Arrow is tab reorder (handled by TabBar on window).
+      // Return false so xterm doesn't consume the event and block propagation.
+      if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey
+        && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+        return false
+      }
+
       // Shift+Enter -> send newline (same as Ctrl+J)
       if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Enter' && event.type === 'keydown' && !event.repeat) {
         event.preventDefault()
