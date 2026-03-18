@@ -70,14 +70,21 @@ The audit writes one JSON artifact to `artifacts/perf/visible-first-audit.json` 
 
 ## Keyboard Shortcuts
 
+<!-- Canonical source: src/lib/keyboard-shortcuts.ts -->
+
 | Shortcut | Action |
 |----------|--------|
+| `Alt+T` | New tab |
+| `Alt+W` | Close tab |
 | `Ctrl+Shift+[` | Previous tab |
 | `Ctrl+Shift+]` | Next tab |
 | `Ctrl+Shift+ArrowLeft` | Move tab left |
 | `Ctrl+Shift+ArrowRight` | Move tab right |
 | `Ctrl+Shift+C` | Copy selection (in terminal) |
 | `Ctrl+V` / `Ctrl+Shift+V` | Paste (in terminal) |
+| `Ctrl+F` | Search (in terminal) |
+| `Shift+Enter` | Newline (in terminal) |
+| `Cmd/Ctrl+End` | Scroll to bottom (in terminal) |
 | `Right-click` / `Shift+F10` | Context menu |
 
 ## Configuration

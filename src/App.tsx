@@ -6,7 +6,7 @@ import {
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { addTab, closeTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
   fetchSessionWindow,
@@ -27,7 +27,7 @@ import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
-import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
+import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
 import { useOrientation } from '@/hooks/useOrientation'
@@ -928,6 +928,18 @@ export default function App() {
         return
       }
 
+      const lifecycleAction = getTabLifecycleAction(e)
+      if (lifecycleAction) {
+        e.preventDefault()
+        if (lifecycleAction === 'new') {
+          dispatch(addTab())
+        } else {
+          const activeTabId = appStore.getState().tabs.activeTabId
+          if (activeTabId) dispatch(closeTab(activeTabId))
+        }
+        return
+      }
+
       if (isTextInput(e.target)) return
     }
 
@@ -935,7 +947,7 @@ export default function App() {
     return () => {
       window.removeEventListener('keydown', onKeyDown)
     }
-  }, [dispatch])
+  }, [dispatch, appStore])
 
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {

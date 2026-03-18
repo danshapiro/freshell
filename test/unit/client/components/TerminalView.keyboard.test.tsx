@@ -286,6 +286,8 @@ function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftK
     Insert: 'Insert',
     ArrowLeft: 'ArrowLeft',
     ArrowRight: 'ArrowRight',
+    t: 'KeyT',
+    w: 'KeyW',
   }
 
   return {
@@ -651,6 +653,46 @@ describe('TerminalView keyboard handling', () => {
       const result = capturedKeyHandler!(event)
 
       expect(result).toBe(true)
+    })
+  })
+
+  describe('tab lifecycle shortcuts', () => {
+    it('returns false for Alt+T so xterm does not block new tab shortcut', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('t', { altKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+    })
+
+    it('returns false for Alt+W so xterm does not block close tab shortcut', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('w', { altKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
     })
   })
 

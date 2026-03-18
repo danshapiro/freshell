@@ -61,6 +61,7 @@ export type MenuActions = {
   copyAgentChatDiffNew: (clickTarget: HTMLElement | null) => void
   copyAgentChatDiffOld: (clickTarget: HTMLElement | null) => void
   copyAgentChatFilePath: (clickTarget: HTMLElement | null) => void
+  showKeyboardShortcuts: () => void
 }
 
 export type MenuBuildContext = {
@@ -198,7 +199,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     ]
 
     return [
-      { type: 'item', id: 'new-tab', label: 'New tab', onSelect: actions.newDefaultTab },
+      { type: 'item', id: 'new-tab', label: 'New tab', shortcut: 'Alt+T', onSelect: actions.newDefaultTab },
       { type: 'item', id: 'copy-tabs', label: 'Copy all tab names', onSelect: actions.copyTabNames },
       { type: 'item', id: 'toggle-sidebar', label: `${sidebarCollapsed ? 'Open' : 'Close'} menu`, onSelect: actions.toggleSidebar },
       { type: 'item', id: 'copy-link', label: 'Copy freshell token link', onSelect: actions.copyShareLink },
@@ -211,6 +212,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           label: `Open ${v.label}`,
           onSelect: () => actions.openView(v.id),
         })),
+      { type: 'separator', id: 'shortcuts-sep' },
+      { type: 'item', id: 'keyboard-shortcuts', label: 'Keyboard shortcuts', onSelect: actions.showKeyboardShortcuts },
     ]
   }
 
@@ -262,7 +265,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       },
       { type: 'item', id: 'rename-tab', label: 'Rename tab', onSelect: () => actions.renameTab(target.tabId) },
       { type: 'separator', id: 'tab-sep' },
-      { type: 'item', id: 'close-tab', label: 'Close tab', onSelect: () => actions.closeTab(target.tabId) },
+      { type: 'item', id: 'close-tab', label: 'Close tab', shortcut: 'Alt+W', onSelect: () => actions.closeTab(target.tabId) },
       {
         type: 'item',
         id: 'close-others',

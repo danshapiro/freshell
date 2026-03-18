@@ -18,6 +18,7 @@ import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
+import { KEYBOARD_SHORTCUTS } from '@/lib/keyboard-shortcuts'
 import type {
   AppSettings,
   SidebarSortMode,
@@ -1476,11 +1477,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           {/* Keyboard shortcuts */}
           <SettingsSection title="Keyboard shortcuts" description="Navigation and terminal">
             <div className="space-y-2 text-sm">
-              <ShortcutRow keys={['Ctrl', 'Shift', '[']} description="Previous tab" />
-              <ShortcutRow keys={['Ctrl', 'Shift', ']']} description="Next tab" />
-              <ShortcutRow keys={['Shift', 'Enter']} description="Newline (same as Ctrl+J)" />
-              <ShortcutRow keys={['Ctrl', 'J']} description="Newline" />
-              <ShortcutRow keys={['Cmd/Ctrl', 'End']} description="Scroll to bottom" />
+              {KEYBOARD_SHORTCUTS.map((entry) => (
+                <ShortcutRow key={entry.description} keys={entry.keys} description={entry.description} />
+              ))}
             </div>
           </SettingsSection>
 

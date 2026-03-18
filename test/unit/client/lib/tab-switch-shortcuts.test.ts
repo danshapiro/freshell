@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
+import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 
 describe('getTabSwitchShortcutDirection', () => {
   it('maps Ctrl+Shift+[ and Ctrl+Shift+] to tab directions', () => {
@@ -43,6 +43,44 @@ describe('getTabSwitchShortcutDirection', () => {
       altKey: false,
       metaKey: true,
       code: 'BracketLeft',
+    })).toBeNull()
+  })
+})
+
+describe('getTabLifecycleAction', () => {
+  it('maps Alt+T to new and Alt+W to close', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyT',
+    })).toBe('new')
+
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyW',
+    })).toBe('close')
+  })
+
+  it('ignores other modifier combinations', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: true, shiftKey: false, metaKey: false,
+      code: 'KeyT',
+    })).toBeNull()
+
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
+      code: 'KeyW',
+    })).toBeNull()
+
+    expect(getTabLifecycleAction({
+      altKey: false, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyT',
+    })).toBeNull()
+  })
+
+  it('ignores other keys with Alt', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyA',
     })).toBeNull()
   })
 })
