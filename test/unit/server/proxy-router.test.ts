@@ -4,8 +4,9 @@ import type { AddressInfo } from 'node:net'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
+import { WebSocketServer, WebSocket } from 'ws'
 import type { PortForwardManager } from '../../../server/port-forward.js'
-import { createProxyRouter } from '../../../server/proxy-router.js'
+import { createProxyRouter, attachProxyUpgradeHandler } from '../../../server/proxy-router.js'
 import { parseTrustProxyEnv } from '../../../server/request-ip.js'
 
 vi.mock('../../../server/logger', () => {
@@ -186,6 +187,104 @@ describe('createProxyRouter', () => {
     await expect(responsePromise).resolves.toMatchObject({
       status: 200,
       body: { ok: true },
+    })
+  })
+
+  describe('WebSocket upgrade proxy', () => {
+    let wsTargetServer: http.Server
+    let wsTargetPort: number
+    let wss: WebSocketServer
+
+    beforeAll(async () => {
+      wsTargetServer = http.createServer()
+      wss = new WebSocketServer({ server: wsTargetServer })
+      wss.on('connection', (ws) => {
+        ws.on('message', (data) => {
+          ws.send(`echo: ${data}`)
+        })
+      })
+      await new Promise<void>((resolve) => {
+        wsTargetServer.listen(0, '127.0.0.1', () => resolve())
+      })
+      wsTargetPort = (wsTargetServer.address() as AddressInfo).port
+    })
+
+    afterAll(async () => {
+      for (const client of wss.clients) client.terminate()
+      wss.close()
+      await new Promise<void>((resolve, reject) => {
+        wsTargetServer.close((err) => (err ? reject(err) : resolve()))
+      })
+    })
+
+    it('proxies WebSocket connections through the upgrade handler', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+      const server = http.createServer(app)
+      attachProxyUpgradeHandler(server)
+
+      await new Promise<void>((resolve) => {
+        server.listen(0, '127.0.0.1', () => resolve())
+      })
+      const proxyPort = (server.address() as AddressInfo).port
+
+      try {
+        const ws = new WebSocket(
+          `ws://127.0.0.1:${proxyPort}/api/proxy/http/${wsTargetPort}/`,
+          { headers: { 'cookie': `freshell-auth=${TEST_AUTH_TOKEN}` } },
+        )
+
+        const reply = await new Promise<string>((resolve, reject) => {
+          ws.on('open', () => ws.send('hello'))
+          ws.on('message', (data) => resolve(data.toString()))
+          ws.on('error', reject)
+          setTimeout(() => reject(new Error('WebSocket timeout')), 5000)
+        })
+
+        expect(reply).toBe('echo: hello')
+        ws.close()
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
+    })
+
+    it('delegates non-proxy upgrade requests to existing listeners', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+      const server = http.createServer(app)
+
+      // Simulate freshell's own WS handler registered before the proxy
+      const delegatedPaths: string[] = []
+      server.on('upgrade', (req, socket) => {
+        delegatedPaths.push(req.url ?? '')
+        socket.destroy()
+      })
+
+      attachProxyUpgradeHandler(server)
+
+      await new Promise<void>((resolve) => {
+        server.listen(0, '127.0.0.1', () => resolve())
+      })
+      const proxyPort = (server.address() as AddressInfo).port
+
+      try {
+        const ws = new WebSocket(
+          `ws://127.0.0.1:${proxyPort}/some/other/path`,
+          { headers: { 'cookie': `freshell-auth=${TEST_AUTH_TOKEN}` } },
+        )
+
+        await new Promise<void>((resolve) => {
+          ws.on('error', () => resolve())
+          ws.on('close', () => resolve())
+          setTimeout(resolve, 2000)
+        })
+
+        expect(delegatedPaths).toContain('/some/other/path')
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
     })
   })
 })

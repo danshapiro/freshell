@@ -1,6 +1,9 @@
 import http from 'node:http'
+import net from 'node:net'
+import { URL } from 'node:url'
 import { Router } from 'express'
 import { logger } from './logger.js'
+import { timingSafeCompare } from './auth.js'
 import type { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity } from './request-ip.js'
 
@@ -100,4 +103,88 @@ export function createProxyRouter(deps: ProxyRouterDeps): Router {
   })
 
   return router
+}
+
+const PROXY_PATH_RE = /^\/api\/proxy\/http\/(\d+)(\/.*)?$/
+
+/**
+ * Attach a WebSocket upgrade handler to the HTTP server.
+ *
+ * Intercepts upgrade requests whose URL matches /api/proxy/http/:port/...
+ * and pipes the raw TCP socket to the target localhost port. Non-matching
+ * upgrade requests are destroyed (they belong to other handlers like the
+ * main freshell WebSocket).
+ */
+export function attachProxyUpgradeHandler(server: http.Server): void {
+  // Prepend our handler so it runs before any existing upgrade listeners
+  // (e.g. the main freshell WS handler). We only handle proxy paths and
+  // let everything else fall through.
+  const existingListeners = server.listeners('upgrade') as Array<(...args: any[]) => void>
+  server.removeAllListeners('upgrade')
+
+  server.on('upgrade', (req: http.IncomingMessage, socket: net.Socket, head: Buffer) => {
+    const url = req.url ?? ''
+    const match = PROXY_PATH_RE.exec(url)
+
+    if (!match) {
+      // Not a proxy path — delegate to existing upgrade handlers
+      for (const listener of existingListeners) {
+        listener(req, socket, head)
+      }
+      return
+    }
+
+    const targetPort = parseInt(match[1], 10)
+    if (targetPort < 1 || targetPort > 65535) {
+      socket.destroy()
+      return
+    }
+
+    // Authenticate via cookie (iframes can't set custom headers for WS)
+    const token = process.env.AUTH_TOKEN
+    if (token) {
+      const cookieHeader = req.headers.cookie ?? ''
+      const cookies = Object.fromEntries(
+        cookieHeader.split(';').map((c) => {
+          const [k, ...v] = c.trim().split('=')
+          return [k, v.join('=')]
+        }),
+      )
+      const provided = cookies['freshell-auth']
+      if (!provided || !timingSafeCompare(provided, token)) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n')
+        socket.destroy()
+        return
+      }
+    }
+
+    const targetPath = match[2] || '/'
+
+    // Connect to the target and relay the upgrade handshake
+    const proxySocket = net.connect(targetPort, '127.0.0.1', () => {
+      // Reconstruct the HTTP upgrade request for the target
+      const reqLine = `${req.method} ${targetPath} HTTP/1.1\r\n`
+      const headers = Object.entries(req.headers)
+        .filter(([k]) => k !== 'host')
+        .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`)
+        .concat([`host: 127.0.0.1:${targetPort}`])
+        .join('\r\n')
+
+      proxySocket.write(reqLine + headers + '\r\n\r\n')
+      if (head.length > 0) proxySocket.write(head)
+
+      // Bidirectional pipe
+      proxySocket.pipe(socket)
+      socket.pipe(proxySocket)
+    })
+
+    proxySocket.on('error', (err) => {
+      log.warn({ err, targetPort, path: targetPath }, 'WebSocket proxy connection failed')
+      socket.destroy()
+    })
+
+    socket.on('error', () => {
+      proxySocket.destroy()
+    })
+  })
 }
