@@ -1,0 +1,14 @@
+{
+  "name": "notepad",
+  "version": "0.1.0",
+  "label": "Notepad",
+  "description": "Simple scratchpad with auto-save to localStorage",
+  "category": "client",
+  "client": {
+    "entry": "index.html"
+  },
+  "picker": {
+    "shortcut": "N",
+    "group": "tools"
+  }
+}
