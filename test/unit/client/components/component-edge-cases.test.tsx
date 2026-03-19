@@ -106,6 +106,7 @@ vi.mock('lucide-react', () => ({
   Trash2: ({ className }: { className?: string }) => <svg data-testid="trash-icon" className={className} />,
   RefreshCw: ({ className }: { className?: string }) => <svg data-testid="refresh-icon" className={className} />,
   Sparkles: ({ className }: { className?: string }) => <svg data-testid="sparkles-icon" className={className} />,
+  Puzzle: ({ className }: { className?: string }) => <svg data-testid="puzzle-icon" className={className} />,
   ExternalLink: ({ className }: { className?: string }) => <svg data-testid="external-icon" className={className} />,
   ChevronDown: ({ className }: { className?: string }) => <svg data-testid="chevron-down-icon" className={className} />,
   MessageSquare: ({ className }: { className?: string }) => <svg data-testid="message-square-icon" className={className} />,
