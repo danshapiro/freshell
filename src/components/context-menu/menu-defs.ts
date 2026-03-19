@@ -37,6 +37,7 @@ export type MenuActions = {
   openSessionInNewTab: (sessionId: string, provider?: string) => void
   openSessionInThisTab: (sessionId: string, provider?: string) => void
   renameSession: (sessionId: string, provider?: string, withSummary?: boolean) => void
+  generateSessionTitle: (sessionId: string, provider?: string) => void
   toggleArchiveSession: (sessionId: string, provider: string | undefined, next: boolean) => void
   deleteSession: (sessionId: string, provider?: string) => void
   copySessionId: (sessionId: string) => void
@@ -469,6 +470,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
+      { type: 'item', id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) },
       {
         type: 'item',
         id: 'session-archive',

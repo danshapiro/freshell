@@ -38,6 +38,7 @@ export type AppSettingsPatch = ServerSettingsPatch
 
 export type SessionOverride = {
   titleOverride?: string
+  titleSource?: 'user' | 'ai'
   summaryOverride?: string
   deleted?: boolean
   archived?: boolean

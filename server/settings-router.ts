@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { withPerfSpan } from './perf-logger.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
 import { buildServerSettingsPatchSchema, type ServerSettingsPatch } from '../shared/settings.js'
+import { AI_CONFIG } from './ai-prompts.js'
 
 // --- SettingsPatchSchema (moved from settings-schema.ts) ---
 
@@ -112,6 +113,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const patch = normalizeSettingsPatch(parsed.data as Record<string, any>) as SettingsPatch
     const updated = await configStore.patchSettings(patch)
     registry.setSettings(updated)
+    AI_CONFIG.applySettingsKey(updated.ai?.geminiApiKey)
     applyDebugLogging(!!updated.logging?.debug, 'settings')
     wsHandler.broadcast({ type: 'settings.updated', settings: updated })
     await withPerfSpan(

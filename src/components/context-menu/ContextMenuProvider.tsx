@@ -439,6 +439,20 @@ export function ContextMenuProvider({
     }
   }, [dispatch, getSessionInfo, menuState?.target])
 
+  const generateSessionTitle = useCallback(async (sessionId: string, provider?: string) => {
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    if (!info) return
+    const firstMessage = info.session.firstUserMessage || info.session.title || ''
+    if (!firstMessage) return
+    try {
+      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+      await api.post(`/api/sessions/${encodeURIComponent(compositeKey)}/generate-title`, { firstMessage })
+      await dispatch(refreshActiveSessionWindow() as any)
+    } catch {
+      // ignore — AI may not be configured
+    }
+  }, [dispatch, getSessionInfo, menuState?.target])
+
   const toggleArchiveSession = useCallback(async (sessionId: string, provider: string | undefined, next: boolean) => {
     try {
       const compositeKey = `${provider || 'claude'}:${sessionId}`
@@ -914,6 +928,7 @@ export function ContextMenuProvider({
         openSessionInNewTab,
         openSessionInThisTab,
         renameSession,
+        generateSessionTitle,
         toggleArchiveSession,
         deleteSession,
         copySessionId,
