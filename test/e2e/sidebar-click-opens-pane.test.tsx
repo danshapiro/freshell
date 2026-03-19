@@ -558,6 +558,67 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(screen.queryByText('Exec hidden')).not.toBeInTheDocument()
   })
 
+  it('clicking a session fills an existing picker pane instead of splitting', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('fill-picker'),
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Fill picker session',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-picker',
+            content: { kind: 'picker' },
+          },
+        },
+        activePane: { 'tab-1': 'pane-picker' },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Fill picker session').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    // Should NOT create a new tab
+    expect(state.tabs.tabs).toHaveLength(1)
+    // Layout should remain a leaf (not split)
+    const layout = state.panes.layouts['tab-1']
+    expect(layout.type).toBe('leaf')
+    // Content should be the resumed session, not picker
+    if (layout.type === 'leaf') {
+      expect(layout.content.kind).toBe('terminal')
+      if (layout.content.kind === 'terminal') {
+        expect(layout.content.resumeSessionId).toBe(sessionId('fill-picker'))
+        expect(layout.content.mode).toBe('claude')
+      }
+    }
+    // Active pane should be the picker pane (now filled)
+    expect(state.panes.activePane['tab-1']).toBe('pane-picker')
+  })
+
   it('clicking a session with no active tab creates a new tab', async () => {
     const projects: ProjectGroup[] = [
       {

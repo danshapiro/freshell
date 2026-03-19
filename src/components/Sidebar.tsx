@@ -6,8 +6,9 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
 import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, setActivePane } from '@/store/panesSlice'
+import { addPane, setActivePane, updatePaneContent } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
+import { findFirstPickerPane } from '@/lib/pane-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
@@ -309,6 +310,43 @@ export default function Sidebar({
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
       }))
+      onNavigate('terminal')
+      return
+    }
+
+    // 2.5. Picker: if the active tab has a picker pane, fill it instead of splitting
+    const pickerPaneId = findFirstPickerPane(activeLayout)
+    if (pickerPaneId) {
+      dispatch(updatePaneContent({
+        tabId: currentActiveTabId,
+        paneId: pickerPaneId,
+        content: buildResumeContent({
+          sessionType,
+          sessionId: item.sessionId,
+          cwd: item.cwd,
+          terminalId: runningTerminalId,
+          agentChatProviderSettings: providerSettings,
+        }),
+      }))
+      dispatch(setActivePane({ tabId: currentActiveTabId, paneId: pickerPaneId }))
+      const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
+      const sessionMetadataByKey = mergeSessionMetadataByKey(
+        activeTab?.sessionMetadataByKey,
+        provider,
+        item.sessionId,
+        {
+          sessionType,
+          firstUserMessage: item.firstUserMessage,
+          isSubagent: item.isSubagent,
+          isNonInteractive: item.isNonInteractive,
+        },
+      )
+      if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+        dispatch(updateTab({
+          id: currentActiveTabId,
+          updates: { sessionMetadataByKey },
+        }))
+      }
       onNavigate('terminal')
       return
     }
