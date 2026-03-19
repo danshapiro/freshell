@@ -172,4 +172,23 @@ describe('AI API - coding CLI aware summary', () => {
     // readSessionContent was still called, but returned null
     expect(mockSessionFileReader).toHaveBeenCalledWith('session-xyz', 'claude')
   })
+
+  it('falls back to scrollback when readSessionContent throws an error', async () => {
+    mockRegistry.get.mockReturnValue({
+      buffer: { snapshot: () => 'scrollback fallback content\nmore output' },
+      mode: 'claude',
+      resumeSessionId: 'session-err',
+    })
+
+    mockSessionFileReader.mockRejectedValue(new Error('disk error'))
+
+    const res = await request(app)
+      .post('/api/ai/terminals/term-disk-error/summary')
+
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('heuristic')
+    // Falls back to scrollback-based heuristic
+    expect(res.body.description).toContain('scrollback fallback content')
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-err', 'claude')
+  })
 })

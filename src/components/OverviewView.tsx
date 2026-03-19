@@ -116,10 +116,12 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
   }, [items])
 
   const recordSummaryActivity = (terminalId: string, lastActivityAt: number) => {
-    const nextMap = new Map(summaryActivityMap)
-    nextMap.set(terminalId, lastActivityAt)
-    setSummaryActivityMap(nextMap)
-    saveSummaryActivityMap(nextMap)
+    setSummaryActivityMap((prev) => {
+      const nextMap = new Map(prev)
+      nextMap.set(terminalId, lastActivityAt)
+      saveSummaryActivityMap(nextMap)
+      return nextMap
+    })
   }
 
   const handleRefreshAll = async () => {
@@ -131,7 +133,6 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
       })
 
       if (toRefresh.length === 0) {
-        setRefreshingAll(false)
         return
       }
 
@@ -150,14 +151,16 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
         }),
       )
 
-      const nextMap = new Map(summaryActivityMap)
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          nextMap.set(result.value.terminalId, result.value.lastActivityAt)
+      setSummaryActivityMap((prev) => {
+        const nextMap = new Map(prev)
+        for (const result of results) {
+          if (result.status === 'fulfilled') {
+            nextMap.set(result.value.terminalId, result.value.lastActivityAt)
+          }
         }
-      }
-      setSummaryActivityMap(nextMap)
-      saveSummaryActivityMap(nextMap)
+        saveSummaryActivityMap(nextMap)
+        return nextMap
+      })
       await refresh()
     } finally {
       setRefreshingAll(false)

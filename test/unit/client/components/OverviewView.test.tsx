@@ -150,4 +150,51 @@ describe('OverviewView Refresh All', () => {
       expect(mockPatch.mock.calls.length).toBe(1)
     })
   })
+
+  it('per-terminal generate summary records in activity map so Refresh All skips it', async () => {
+    // Use a single terminal to isolate the per-terminal generate path
+    mockGet.mockResolvedValue([
+      {
+        terminalId: 't1',
+        title: 'Shell',
+        mode: 'shell',
+        createdAt: 1000,
+        lastActivityAt: 2000,
+        status: 'running',
+        hasClients: false,
+      },
+    ])
+
+    renderWithStore(<OverviewView />)
+    await waitFor(() => {
+      expect(screen.getByText('Shell')).toBeInTheDocument()
+    })
+
+    // Click the per-terminal "Generate summary with AI" button
+    const genButton = screen.getByLabelText('Generate summary with AI')
+    fireEvent.click(genButton)
+
+    // Wait for the per-terminal summary call to complete
+    await waitFor(() => {
+      const summaryCalls = mockPost.mock.calls.filter((c: any[]) => c[0].includes('/summary'))
+      expect(summaryCalls.length).toBe(1)
+    })
+
+    // Wait for the generate to finish (button reverts from "Generating summary...")
+    await waitFor(() => {
+      expect(screen.getByLabelText('Generate summary with AI')).toBeInTheDocument()
+    })
+
+    // Track call count before Refresh All
+    const postCallsBefore = mockPost.mock.calls.length
+
+    // Now click Refresh All -- terminal should be skipped since lastActivityAt was recorded
+    fireEvent.click(getRefreshAllButton())
+
+    await waitFor(() => {
+      const newCalls = mockPost.mock.calls.slice(postCallsBefore)
+      const newSummaryCalls = newCalls.filter((c: any[]) => c[0].includes('/summary'))
+      expect(newSummaryCalls.length).toBe(0)
+    })
+  })
 })
