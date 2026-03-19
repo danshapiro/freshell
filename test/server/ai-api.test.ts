@@ -94,3 +94,82 @@ describe('AI prompts', () => {
     expect(prompt).toContain(userMessages)
   })
 })
+
+describe('AI API - coding CLI aware summary', () => {
+  let app: express.Express
+  let mockRegistry: { get: ReturnType<typeof vi.fn> }
+  let mockSessionFileReader: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    delete process.env.GOOGLE_GENERATIVE_AI_API_KEY
+
+    mockRegistry = { get: vi.fn() }
+    mockSessionFileReader = vi.fn()
+
+    app = express()
+    app.use(express.json())
+    app.use('/api/ai', createAiRouter({
+      registry: mockRegistry,
+      perfConfig: { slowAiSummaryMs: 500 },
+      readSessionContent: mockSessionFileReader,
+    }))
+  })
+
+  it('uses coding-CLI path for non-shell terminal with session file', async () => {
+    const sessionContent = [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Fix the login bug.' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Now add tests.' } }),
+    ].join('\n')
+
+    mockRegistry.get.mockReturnValue({
+      buffer: { snapshot: () => 'some scrollback output' },
+      mode: 'claude',
+      resumeSessionId: 'session-abc',
+    })
+
+    mockSessionFileReader.mockResolvedValue(sessionContent)
+
+    const res = await request(app)
+      .post('/api/ai/terminals/term-cli/summary')
+
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('heuristic')
+    expect(res.body.description).toBeTruthy()
+    // Verify readSessionContent was called with the session ID and provider
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-abc', 'claude')
+  })
+
+  it('falls back to scrollback for shell-mode terminals', async () => {
+    mockRegistry.get.mockReturnValue({
+      buffer: { snapshot: () => 'npm install\nDone in 2.3s' },
+      mode: 'shell',
+    })
+
+    const res = await request(app)
+      .post('/api/ai/terminals/term-shell/summary')
+
+    expect(res.status).toBe(200)
+    expect(res.body.description).toContain('npm install')
+    // readSessionContent should not be called for shell terminals
+    expect(mockSessionFileReader).not.toHaveBeenCalled()
+  })
+
+  it('falls back to scrollback when no session file is found', async () => {
+    mockRegistry.get.mockReturnValue({
+      buffer: { snapshot: () => 'claude running\nAssistant output' },
+      mode: 'claude',
+      resumeSessionId: 'session-xyz',
+    })
+
+    mockSessionFileReader.mockResolvedValue(null)
+
+    const res = await request(app)
+      .post('/api/ai/terminals/term-no-session/summary')
+
+    expect(res.status).toBe(200)
+    expect(res.body.description).toContain('claude running')
+    // readSessionContent was still called, but returned null
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-xyz', 'claude')
+  })
+})

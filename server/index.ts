@@ -2,6 +2,7 @@ import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env ex
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
+import fsp from 'fs/promises'
 import http from 'http'
 import os from 'os'
 import path from 'path'
@@ -453,7 +454,20 @@ async function main() {
   }))
 
   // --- API: AI ---
-  app.use('/api/ai', createAiRouter({ registry, perfConfig }))
+  app.use('/api/ai', createAiRouter({
+    registry,
+    perfConfig,
+    readSessionContent: async (sessionId, provider) => {
+      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName)
+      if (!filePath) return null
+      try {
+        const content = await fsp.readFile(filePath, 'utf-8')
+        return content
+      } catch {
+        return null
+      }
+    },
+  }))
 
   // --- API: files (for editor pane) ---
   app.use('/api/files', createFilesRouter({ configStore, codingCliIndexer, registry }))
