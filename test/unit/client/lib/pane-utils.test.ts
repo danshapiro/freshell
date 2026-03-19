@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   buildPaneRefreshTarget,
   collectPaneContents,
+  findFirstPickerPane,
   paneRefreshTargetMatchesContent,
 } from '@/lib/pane-utils'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -154,5 +155,90 @@ describe('paneRefreshTargetMatchesContent', () => {
         } as any,
       ),
     ).toBe(false)
+  })
+})
+
+describe('findFirstPickerPane', () => {
+  it('returns undefined for a single non-picker leaf', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running' },
+    }
+    expect(findFirstPickerPane(node)).toBeUndefined()
+  })
+
+  it('returns the id for a single picker leaf', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-picker',
+      content: { kind: 'picker' },
+    }
+    expect(findFirstPickerPane(node)).toBe('pane-picker')
+  })
+
+  it('returns the left picker in a horizontal split with two pickers', () => {
+    const node: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'left', content: { kind: 'picker' } },
+        { type: 'leaf', id: 'right', content: { kind: 'picker' } },
+      ],
+    }
+    expect(findFirstPickerPane(node)).toBe('left')
+  })
+
+  it('finds a picker in the right subtree when left has none', () => {
+    const node: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'left', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running' } },
+        { type: 'leaf', id: 'right', content: { kind: 'picker' } },
+      ],
+    }
+    expect(findFirstPickerPane(node)).toBe('right')
+  })
+
+  it('returns undefined for a split with no picker panes', () => {
+    const node: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'left', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running' } },
+        { type: 'leaf', id: 'right', content: { kind: 'terminal', mode: 'claude', createRequestId: 'r2', status: 'running' } },
+      ],
+    }
+    expect(findFirstPickerPane(node)).toBeUndefined()
+  })
+
+  it('finds picker in deeply nested left subtree', () => {
+    const node: PaneNode = {
+      type: 'split',
+      id: 'split-outer',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        {
+          type: 'split',
+          id: 'split-inner',
+          direction: 'vertical',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'top-left', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running' } },
+            { type: 'leaf', id: 'bottom-left', content: { kind: 'picker' } },
+          ],
+        },
+        { type: 'leaf', id: 'right', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r2', status: 'running' } },
+      ],
+    }
+    expect(findFirstPickerPane(node)).toBe('bottom-left')
   })
 })
