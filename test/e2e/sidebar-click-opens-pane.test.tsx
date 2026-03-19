@@ -619,6 +619,309 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.activePane['tab-1']).toBe('pane-picker')
   })
 
+  it('clicking a session fills picker pane when tab has picker plus non-picker pane', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('fill-picker-split'),
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Fill picker in split',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-shell',
+                content: {
+                  kind: 'terminal',
+                  mode: 'shell',
+                  createRequestId: 'req-shell',
+                  status: 'running',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-picker',
+                content: { kind: 'picker' },
+              },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-shell' },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Fill picker in split').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    // Should NOT create a new tab
+    expect(state.tabs.tabs).toHaveLength(1)
+    // Layout should still be a split (no extra pane added)
+    const layout = state.panes.layouts['tab-1']
+    expect(layout.type).toBe('split')
+    if (layout.type === 'split') {
+      // Shell pane untouched
+      const shellPane = layout.children[0]
+      expect(shellPane.type).toBe('leaf')
+      if (shellPane.type === 'leaf') {
+        expect(shellPane.content.kind).toBe('terminal')
+        if (shellPane.content.kind === 'terminal') {
+          expect(shellPane.content.mode).toBe('shell')
+        }
+      }
+      // Picker pane replaced with session
+      const filledPane = layout.children[1]
+      expect(filledPane.type).toBe('leaf')
+      if (filledPane.type === 'leaf') {
+        expect(filledPane.content.kind).toBe('terminal')
+        if (filledPane.content.kind === 'terminal') {
+          expect(filledPane.content.resumeSessionId).toBe(sessionId('fill-picker-split'))
+          expect(filledPane.content.mode).toBe('claude')
+        }
+      }
+    }
+    // Active pane should switch to the filled picker pane
+    expect(state.panes.activePane['tab-1']).toBe('pane-picker')
+  })
+
+  it('with two picker panes, fills the leftmost one (tiebreak)', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('tiebreak-session'),
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Tiebreak session',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-left-picker',
+                content: { kind: 'picker' },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-right-picker',
+                content: { kind: 'picker' },
+              },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-right-picker' },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Tiebreak session').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    const layout = state.panes.layouts['tab-1']
+    expect(layout.type).toBe('split')
+    if (layout.type === 'split') {
+      // Left picker should be filled
+      const leftPane = layout.children[0]
+      expect(leftPane.type).toBe('leaf')
+      if (leftPane.type === 'leaf') {
+        expect(leftPane.content.kind).toBe('terminal')
+        if (leftPane.content.kind === 'terminal') {
+          expect(leftPane.content.resumeSessionId).toBe(sessionId('tiebreak-session'))
+        }
+      }
+      // Right picker should remain a picker
+      const rightPane = layout.children[1]
+      expect(rightPane.type).toBe('leaf')
+      if (rightPane.type === 'leaf') {
+        expect(rightPane.content.kind).toBe('picker')
+      }
+    }
+    // Active pane should switch to the left picker (the one that was filled)
+    expect(state.panes.activePane['tab-1']).toBe('pane-left-picker')
+  })
+
+  it('dedup takes precedence over picker pane when session already open', async () => {
+    const targetId = sessionId('already-open-with-picker')
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Already open with picker',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [
+        { id: 'tab-1', mode: 'shell' },
+        { id: 'tab-2', mode: 'claude' },
+      ],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-picker',
+            content: { kind: 'picker' },
+          },
+          'tab-2': {
+            type: 'leaf',
+            id: 'pane-existing',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-existing',
+              status: 'running',
+              resumeSessionId: targetId,
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-picker',
+          'tab-2': 'pane-existing',
+        },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Already open with picker').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    // Should switch to tab-2 where the session lives (dedup)
+    expect(state.tabs.activeTabId).toBe('tab-2')
+    expect(state.panes.activePane['tab-2']).toBe('pane-existing')
+    // Picker in tab-1 should remain untouched
+    const tab1Layout = state.panes.layouts['tab-1']
+    expect(tab1Layout.type).toBe('leaf')
+    if (tab1Layout.type === 'leaf') {
+      expect(tab1Layout.content.kind).toBe('picker')
+    }
+  })
+
+  it('clicking a freshclaude session fills a picker pane with agent-chat content', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('freshclaude-picker'),
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Freshclaude into picker',
+            cwd: '/home/user/project',
+            sessionType: 'freshclaude',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-picker',
+            content: { kind: 'picker' },
+          },
+        },
+        activePane: { 'tab-1': 'pane-picker' },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Freshclaude into picker').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    expect(state.tabs.tabs).toHaveLength(1)
+    const layout = state.panes.layouts['tab-1']
+    expect(layout.type).toBe('leaf')
+    if (layout.type === 'leaf') {
+      expect(layout.content.kind).toBe('agent-chat')
+      if (layout.content.kind === 'agent-chat') {
+        expect(layout.content.provider).toBe('freshclaude')
+        expect(layout.content.resumeSessionId).toBe(sessionId('freshclaude-picker'))
+      }
+    }
+  })
+
   it('clicking a session with no active tab creates a new tab', async () => {
     const projects: ProjectGroup[] = [
       {
