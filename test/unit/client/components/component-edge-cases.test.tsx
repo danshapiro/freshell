@@ -744,7 +744,7 @@ describe('Component Edge Cases', () => {
 
         // Initial load triggers loading state
         await waitFor(() => {
-          const refreshButton = screen.getByRole('button')
+          const refreshButton = screen.getByLabelText('Loading...')
           expect(refreshButton.className).toContain('animate-spin')
         })
 
@@ -767,7 +767,7 @@ describe('Component Edge Cases', () => {
           await vi.runAllTimersAsync()
         })
 
-        const refreshButton = screen.getByRole('button')
+        const refreshButton = screen.getByLabelText('Refresh terminals')
         expect(refreshButton.className).not.toContain('animate-spin')
       })
     })
@@ -849,7 +849,7 @@ describe('Component Edge Cases', () => {
         // Second call succeeds
         mockApiTyped.get.mockResolvedValueOnce([])
 
-        const refreshButton = screen.getByRole('button')
+        const refreshButton = screen.getByLabelText('Refresh terminals')
         fireEvent.click(refreshButton)
 
         await act(async () => {
