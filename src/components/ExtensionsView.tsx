@@ -6,11 +6,10 @@ import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
   stageServerSettingsPatchPreview,
-  discardStagedServerSettingsPatch,
 } from '@/store/settingsThunks'
 import { selectManagedItems, type ManagedItem, type ManagedItemConfig } from '@/store/managed-items'
 import type { AppView } from '@/components/Sidebar'
-import type { CodingCliProviderName, ServerSettingsPatch } from '@/store/types'
+import type { ServerSettingsPatch } from '@/store/types'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { ArrowLeft, Puzzle, Server, Monitor, Terminal, ChevronDown } from 'lucide-react'

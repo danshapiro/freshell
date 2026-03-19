@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { configureNetwork } from '@/store/networkSlice'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
