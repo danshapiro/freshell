@@ -9,7 +9,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import type { ProjectGroup } from '@/store/types'
+import type { ProjectGroup, BackgroundTerminal } from '@/store/types'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
