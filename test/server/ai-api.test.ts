@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAiRouter } from '../../server/ai-router.js'
+import { PROMPTS } from '../../server/ai-prompts.js'
 
 describe('AI API', () => {
   let app: express.Express
@@ -78,5 +79,18 @@ describe('AI API', () => {
     expect(res.status).toBe(200)
     expect(res.body.description).not.toContain('\x1b[')
     expect(res.body.description).toContain('Success')
+  })
+})
+
+describe('AI prompts', () => {
+  it('codingCliSummary prompt includes the user messages and correct framing', () => {
+    const userMessages = 'Fix bug 123.\n...\nNow fix bug 456.'
+    const prompt = PROMPTS.codingCliSummary.build(userMessages)
+    expect(prompt).toContain('coding agent session')
+    expect(prompt).toContain('user messages')
+    expect(prompt).toContain('assistant replies are removed')
+    expect(prompt).toContain('250 characters')
+    expect(prompt).toContain('bias towards recency')
+    expect(prompt).toContain(userMessages)
   })
 })
