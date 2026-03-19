@@ -122,14 +122,16 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
-    const next = await configStore.patchSessionOverride(compositeKey, {
-      titleOverride: cleanString(titleOverride),
-      ...(cleanString(titleOverride) ? { titleSource: 'user' as const } : {}),
-      summaryOverride: cleanString(summaryOverride),
-      deleted,
-      archived,
-      createdAtOverride,
-    })
+    const patch: Record<string, unknown> = {}
+    if (titleOverride !== undefined) {
+      patch.titleOverride = cleanString(titleOverride)
+      if (cleanString(titleOverride)) patch.titleSource = 'user' as const
+    }
+    if (summaryOverride !== undefined) patch.summaryOverride = cleanString(summaryOverride)
+    if (deleted !== undefined) patch.deleted = deleted
+    if (archived !== undefined) patch.archived = archived
+    if (createdAtOverride !== undefined) patch.createdAtOverride = createdAtOverride
+    const next = await configStore.patchSessionOverride(compositeKey, patch)
 
     // Cascade: if this session is running in a terminal, also rename the terminal
     const cleanTitle = cleanString(titleOverride)

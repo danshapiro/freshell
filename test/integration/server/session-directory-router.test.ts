@@ -163,6 +163,25 @@ describe('GET /api/session-directory', () => {
     expect(broadcastTerminalsChanged).toHaveBeenCalledOnce()
   })
 
+  it('does not clobber existing overrides when archiving', async () => {
+    const patch = await request(app)
+      .patch('/api/sessions/session-1?provider=claude')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ archived: true })
+
+    expect(patch.status).toBe(200)
+    // The patch sent to configStore must NOT contain titleOverride/summaryOverride
+    // keys — spreading { titleOverride: undefined } over an existing override
+    // erases a previously-set friendly name.
+    const call = patchSessionOverride.mock.calls[0]
+    const patchArg = call[1]
+    expect(patchArg).not.toHaveProperty('titleOverride')
+    expect(patchArg).not.toHaveProperty('summaryOverride')
+    expect(patchArg).not.toHaveProperty('deleted')
+    expect(patchArg).not.toHaveProperty('createdAtOverride')
+    expect(patchArg).toEqual({ archived: true })
+  })
+
   it('forwards the tier query parameter to the session-directory service', async () => {
     const res = await request(app)
       .get('/api/session-directory?priority=visible&query=deploy&tier=userMessages')
