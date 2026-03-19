@@ -314,21 +314,17 @@ export default function Sidebar({
       return
     }
 
-    // 2.5. Picker: if the active tab has a picker pane, fill it instead of splitting
-    const pickerPaneId = findFirstPickerPane(activeLayout)
-    if (pickerPaneId) {
-      dispatch(updatePaneContent({
-        tabId: currentActiveTabId,
-        paneId: pickerPaneId,
-        content: buildResumeContent({
-          sessionType,
-          sessionId: item.sessionId,
-          cwd: item.cwd,
-          terminalId: runningTerminalId,
-          agentChatProviderSettings: providerSettings,
-        }),
-      }))
-      dispatch(setActivePane({ tabId: currentActiveTabId, paneId: pickerPaneId }))
+    // Build the content to place in the target pane (picker fill or new split)
+    const resumeContent = buildResumeContent({
+      sessionType,
+      sessionId: item.sessionId,
+      cwd: item.cwd,
+      terminalId: runningTerminalId,
+      agentChatProviderSettings: providerSettings,
+    })
+
+    // Track session metadata on the active tab so tab headers show session info
+    const syncSessionMetadata = () => {
       const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
       const sessionMetadataByKey = mergeSessionMetadataByKey(
         activeTab?.sessionMetadataByKey,
@@ -347,6 +343,18 @@ export default function Sidebar({
           updates: { sessionMetadataByKey },
         }))
       }
+    }
+
+    // 2.5. Picker: if the active tab has a picker pane, fill it instead of splitting
+    const pickerPaneId = findFirstPickerPane(activeLayout)
+    if (pickerPaneId) {
+      dispatch(updatePaneContent({
+        tabId: currentActiveTabId,
+        paneId: pickerPaneId,
+        content: resumeContent,
+      }))
+      dispatch(setActivePane({ tabId: currentActiveTabId, paneId: pickerPaneId }))
+      syncSessionMetadata()
       onNavigate('terminal')
       return
     }
@@ -354,32 +362,9 @@ export default function Sidebar({
     // 3. Normal: split a new pane in the current tab
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent: buildResumeContent({
-        sessionType,
-        sessionId: item.sessionId,
-        cwd: item.cwd,
-        terminalId: runningTerminalId,
-        agentChatProviderSettings: providerSettings,
-      }),
+      newContent: resumeContent,
     }))
-    const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
-    const sessionMetadataByKey = mergeSessionMetadataByKey(
-      activeTab?.sessionMetadataByKey,
-      provider,
-      item.sessionId,
-      {
-        sessionType,
-        firstUserMessage: item.firstUserMessage,
-        isSubagent: item.isSubagent,
-        isNonInteractive: item.isNonInteractive,
-      },
-    )
-    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
-      dispatch(updateTab({
-        id: currentActiveTabId,
-        updates: { sessionMetadataByKey },
-      }))
-    }
+    syncSessionMetadata()
     onNavigate('terminal')
   }, [dispatch, onNavigate, store])
 
