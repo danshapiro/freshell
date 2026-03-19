@@ -39,11 +39,15 @@ export const PROMPTS = {
   sessionTitle: {
     model: AI_CONFIG.model,
     maxOutputTokens: 30,
-    build: (firstMessage: string) => {
+    defaultPrompt: [
+      'Generate a short title (3-8 words) for a coding assistant conversation.',
+      'The title should describe the task or topic, not the tool being used.',
+      'Return ONLY the title text. No quotes, no markdown, no explanation.',
+    ].join('\n'),
+    build: (firstMessage: string, customPrompt?: string) => {
+      const instructions = customPrompt?.trim() || PROMPTS.sessionTitle.defaultPrompt
       return [
-        'Generate a short title (3-8 words) for a coding assistant conversation.',
-        'The title should describe the task or topic, not the tool being used.',
-        'Return ONLY the title text. No quotes, no markdown, no explanation.',
+        instructions,
         '',
         'First message from the user:',
         firstMessage.slice(0, 2000),

@@ -120,6 +120,7 @@ export type ServerSettings = {
   }
   ai: {
     geminiApiKey?: string
+    titlePrompt?: string
   }
   codingCli: CodingCliSettings
   editor: {
@@ -522,6 +523,7 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
     }).strict(),
     ai: z.object({
       geminiApiKey: z.string().optional(),
+      titlePrompt: z.string().optional(),
     }).strict(),
     codingCli: z.object({
       enabledProviders: z.array(CliProviderNameSchema),
@@ -746,6 +748,9 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     const ai: ServerSettingsPatch['ai'] = {}
     if (hasOwn(candidate.ai, 'geminiApiKey')) {
       ai.geminiApiKey = typeof candidate.ai.geminiApiKey === 'string' ? candidate.ai.geminiApiKey : undefined
+    }
+    if (hasOwn(candidate.ai, 'titlePrompt')) {
+      ai.titlePrompt = typeof candidate.ai.titlePrompt === 'string' ? candidate.ai.titlePrompt : undefined
     }
     if (Object.keys(ai).length > 0) {
       sanitized.ai = ai

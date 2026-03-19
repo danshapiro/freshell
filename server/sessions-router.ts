@@ -32,6 +32,7 @@ export const SessionPatchSchema = z.object({
 
 export interface SessionsRouterDeps {
   configStore: {
+    getSettings: () => Promise<any>
     patchSessionOverride: (key: string, data: any) => Promise<any>
     deleteSession: (key: string) => Promise<void>
   }
@@ -172,11 +173,12 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     }
 
     try {
+      const settings = await configStore.getSettings()
       const { generateText } = await import('ai')
       const { google } = await import('@ai-sdk/google')
       const promptConfig = PROMPTS.sessionTitle
       const model = google(promptConfig.model)
-      const prompt = promptConfig.build(firstMessage)
+      const prompt = promptConfig.build(firstMessage, settings.ai?.titlePrompt)
 
       const result = await generateText({
         model,

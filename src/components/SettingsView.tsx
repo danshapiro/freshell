@@ -1114,6 +1114,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 aria-label="Auto-generate session titles"
               />
             </SettingsRow>
+
+            <SettingsRow
+              label="Title prompt"
+              description="Instructions sent to Gemini for generating session titles."
+            >
+              <textarea
+                value={settings.ai?.titlePrompt || ''}
+                placeholder="Generate a short title (3-8 words) for a coding assistant conversation.&#10;The title should describe the task or topic, not the tool being used.&#10;Return ONLY the title text. No quotes, no markdown, no explanation."
+                onChange={(e) => {
+                  const prompt = e.target.value || undefined
+                  scheduleServerTextSettingSave('ai.titlePrompt', { ai: { titlePrompt: prompt } })
+                }}
+                rows={4}
+                className="w-full px-3 py-2 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border font-mono"
+              />
+            </SettingsRow>
           </SettingsSection>
 
           {/* Panes */}
