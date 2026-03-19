@@ -52,26 +52,20 @@ describe('SettingsView core sections', () => {
 
       expect(screen.getByText('Terminal preview')).toBeInTheDocument()
 
-      expect(screen.getByText('Appearance')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Appearance' })).toBeInTheDocument()
       expect(screen.getByText('Theme and visual preferences')).toBeInTheDocument()
 
-      expect(screen.getByText('Terminal')).toBeInTheDocument()
-      expect(screen.getByText('Font and rendering options')).toBeInTheDocument()
-
-      expect(screen.getByText('Sidebar')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Sidebar' })).toBeInTheDocument()
       expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
 
-      expect(screen.getByText('Safety')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Safety' })).toBeInTheDocument()
       expect(screen.getByText('Auto-kill and idle terminal management')).toBeInTheDocument()
 
-      expect(screen.getByText('Debugging')).toBeInTheDocument()
-      expect(screen.getByText('Debug-level logs and perf instrumentation')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Advanced' })).toBeInTheDocument()
+      expect(screen.getByText('Terminal internals and debugging')).toBeInTheDocument()
 
       expect(screen.getByText('Notifications')).toBeInTheDocument()
       expect(screen.getByText('Sound and alert preferences')).toBeInTheDocument()
-
-      expect(screen.getByText('Coding CLIs')).toBeInTheDocument()
-      expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
 
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
       expect(screen.getByText('Navigation and terminal')).toBeInTheDocument()
@@ -82,7 +76,7 @@ describe('SettingsView core sections', () => {
       renderSettingsView(store)
 
       const preview = screen.getByTestId('terminal-preview')
-      const appearanceHeading = screen.getByText('Appearance')
+      const appearanceHeading = screen.getByRole('heading', { name: 'Appearance' })
 
       expect(preview).toBeInTheDocument()
       expect(preview.compareDocumentPosition(appearanceHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -91,14 +85,14 @@ describe('SettingsView core sections', () => {
       expect(previewLines).toHaveLength(8)
     })
 
-    it('orders Sidebar section above Terminal', () => {
+    it('orders Sidebar section above Safety', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const terminalHeading = screen.getByText('Terminal')
-      const sidebarHeading = screen.getByText('Sidebar')
+      const safetyHeading = screen.getByRole('heading', { name: 'Safety' })
+      const sidebarHeading = screen.getByRole('heading', { name: 'Sidebar' })
 
-      expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+      expect(safetyHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
     })
 
     it('orders Devices section after Network Access', () => {
@@ -135,12 +129,6 @@ describe('SettingsView core sections', () => {
       expect(screen.getByText('Default working directory')).toBeInTheDocument()
 
       expect(screen.getByText('Sound on completion')).toBeInTheDocument()
-
-      expect(screen.getByText('Enable Claude CLI')).toBeInTheDocument()
-      expect(screen.getByText('Enable Codex CLI')).toBeInTheDocument()
-      expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
-      expect(screen.getByText('Codex CLI model')).toBeInTheDocument()
-      expect(screen.getByText('Codex CLI sandbox')).toBeInTheDocument()
     })
   })
 

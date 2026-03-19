@@ -1,19 +1,10 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
-import { Provider } from 'react-redux'
-import { configureStore } from '@reduxjs/toolkit'
-import SettingsView from '@/components/SettingsView'
-import settingsReducer, { defaultSettings, type SettingsState } from '@/store/settingsSlice'
-import tabsReducer from '@/store/tabsSlice'
-import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
-import { networkReducer } from '@/store/networkSlice'
-import { api } from '@/lib/api'
+import { describe, it, expect, vi } from 'vitest'
+import { screen, fireEvent, act } from '@testing-library/react'
 import {
-  composeResolvedSettings,
-  createDefaultServerSettings,
-  resolveLocalSettings,
-} from '@shared/settings'
+  createSettingsViewStore,
+  installSettingsViewHooks,
+  renderSettingsView,
+} from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -25,96 +16,26 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-let originalFonts: Document['fonts'] | undefined
-const defaultServerSettings = createDefaultServerSettings({
-  loggingDebug: defaultSettings.logging.debug,
-})
+import { api } from '@/lib/api'
 
-function createSettingsState(settingsState?: Partial<SettingsState>): SettingsState {
-  const localSettings = resolveLocalSettings()
-
-  return {
-    serverSettings: defaultServerSettings,
-    localSettings,
-    settings: composeResolvedSettings(defaultServerSettings, localSettings),
-    loaded: true,
-    lastSavedAt: undefined,
-    ...settingsState,
-  }
-}
-
-function createTestStore(settingsState?: Partial<SettingsState>) {
-  return configureStore({
-    reducer: {
-      settings: settingsReducer,
-      tabs: tabsReducer,
-      connection: connectionReducer,
-      sessions: sessionsReducer,
-      network: networkReducer,
-    },
-    middleware: (getDefault) =>
-      getDefault({
-        serializableCheck: {
-          ignoredPaths: ['sessions.expandedProjects'],
-        },
-      }),
-    preloadedState: {
-      settings: createSettingsState(settingsState),
-    },
-  })
-}
-
-function renderWithStore(store: ReturnType<typeof createTestStore>) {
-  return render(
-    <Provider store={store}>
-      <SettingsView />
-    </Provider>,
-  )
-}
+installSettingsViewHooks({ fakeTimers: true, mockFonts: true })
 
 describe('SettingsView terminal advanced settings', () => {
-  beforeEach(() => {
-    originalFonts = document.fonts
-    Object.defineProperty(document, 'fonts', {
-      value: {
-        check: vi.fn(() => true),
-        ready: Promise.resolve(),
-      },
-      configurable: true,
-    })
-    vi.useFakeTimers()
-    vi.clearAllMocks()
-  })
-
-  afterEach(() => {
-    cleanup()
-    vi.useRealTimers()
-    if (originalFonts) {
-      Object.defineProperty(document, 'fonts', {
-        value: originalFonts,
-        configurable: true,
-      })
-    } else {
-      // @ts-expect-error test cleanup for jsdom fonts override
-      delete document.fonts
-    }
-  })
-
   it('is collapsed by default', () => {
-    const store = createTestStore()
-    renderWithStore(store)
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
 
-    const advancedToggle = screen.getByRole('button', { name: 'Advanced' })
+    const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     const panel = document.getElementById(advancedToggle.getAttribute('aria-controls') ?? '')
     expect(advancedToggle).toHaveAttribute('aria-expanded', 'false')
     expect(panel).toHaveAttribute('hidden')
   })
 
   it('expands to show OSC52 clipboard policy control', () => {
-    const store = createTestStore()
-    renderWithStore(store)
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
 
-    const advancedToggle = screen.getByRole('button', { name: 'Advanced' })
+    const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     fireEvent.click(advancedToggle)
     const panel = document.getElementById(advancedToggle.getAttribute('aria-controls') ?? '')
 
@@ -127,10 +48,10 @@ describe('SettingsView terminal advanced settings', () => {
   })
 
   it('keeps Always and Never policy updates local-only', async () => {
-    const store = createTestStore()
-    renderWithStore(store)
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
 
-    const advancedToggle = screen.getByRole('button', { name: 'Advanced' })
+    const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     fireEvent.click(advancedToggle)
     fireEvent.click(screen.getByRole('button', { name: 'Always' }))
 
