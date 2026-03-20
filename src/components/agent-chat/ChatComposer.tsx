@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { getDraft, setDraft, clearDraft } from '@/lib/draft-store'
 import { useAppDispatch } from '@/store/hooks'
 import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
 
 export interface ChatComposerHandle {
   focus: () => void
@@ -84,20 +85,12 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [text, onSend, paneId])
 
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
-    // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
-    if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-      if (e.code === 'BracketLeft') {
-        e.preventDefault()
-        e.stopPropagation()
-        dispatch(switchToPrevTab())
-        return
-      }
-      if (e.code === 'BracketRight') {
-        e.preventDefault()
-        e.stopPropagation()
-        dispatch(switchToNextTab())
-        return
-      }
+    const tabDir = getTabSwitchShortcutDirection(e)
+    if (tabDir) {
+      e.preventDefault()
+      e.stopPropagation()
+      dispatch(tabDir === 'next' ? switchToNextTab() : switchToPrevTab())
+      return
     }
 
     if (e.key === 'Enter' && !e.shiftKey) {
