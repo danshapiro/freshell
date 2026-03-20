@@ -27,10 +27,10 @@ export default function NetworkQuickAccess() {
   useEffect(() => {
     if (!open) return
     const handler = (e: MouseEvent) => {
-      if (
-        popoverRef.current && !popoverRef.current.contains(e.target as Node) &&
-        buttonRef.current && !buttonRef.current.contains(e.target as Node)
-      ) {
+      const target = e.target as Node
+      const inPopover = popoverRef.current?.contains(target) ?? false
+      const inButton = buttonRef.current?.contains(target) ?? false
+      if (!inPopover && !inButton) {
         setOpen(false)
       }
     }
