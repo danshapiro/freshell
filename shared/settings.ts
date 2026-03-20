@@ -528,6 +528,9 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       defaultPlugins: z.array(z.string()),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
     }).strict(),
+    extensions: z.object({
+      disabled: z.array(z.string()),
+    }).strict(),
     network: z.object({
       host: NetworkHostSchema,
       configured: z.boolean(),
