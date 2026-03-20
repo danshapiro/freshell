@@ -23,20 +23,26 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   const remoteAccessActive = remoteAccessEnabled || remoteAccessRequested
   const accessUrl = networkStatus?.accessUrl
   const firewall = networkStatus?.firewall
-  const port = networkStatus?.port
 
-  // Derive a localhost URL for local use (accessUrl uses the LAN IP)
-  const localhostUrl = useMemo(() => {
+  // Build a shareable URL using the current browser origin so the link
+  // works regardless of how you're accessing freshell (localhost, LAN IP,
+  // custom domain, remote server).
+  const shareUrl = useMemo(() => {
     if (!accessUrl) return null
     try {
       const parsed = new URL(accessUrl)
-      parsed.hostname = 'localhost'
-      if (port) parsed.port = String(port)
+      const origin = typeof window !== 'undefined' ? window.location.origin : null
+      if (origin) {
+        const current = new URL(origin)
+        parsed.protocol = current.protocol
+        parsed.hostname = current.hostname
+        parsed.port = current.port
+      }
       return parsed.toString()
     } catch {
       return null
     }
-  }, [accessUrl, port])
+  }, [accessUrl])
 
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -70,21 +76,21 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   }, [dispatch])
 
   const handleCopyUrl = useCallback(() => {
-    if (!localhostUrl) return
-    void navigator.clipboard.writeText(localhostUrl).then(() => {
+    if (!shareUrl) return
+    void navigator.clipboard.writeText(shareUrl).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
-  }, [localhostUrl])
+  }, [shareUrl])
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
-    if (localhostUrl) {
-      void navigator.clipboard.writeText(localhostUrl)
+    if (shareUrl) {
+      void navigator.clipboard.writeText(shareUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     }
-  }, [localhostUrl])
+  }, [shareUrl])
 
   const handleDeviceAccess = useCallback(() => {
     setOpen(false)
@@ -155,10 +161,10 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
           {remoteAccessActive && (
             <>
               {/* Localhost URL with copy */}
-              {localhostUrl && (
+              {shareUrl && (
                 <div className="flex items-center gap-1.5">
                   <code className="flex-1 min-w-0 truncate text-xs bg-muted rounded px-2 py-1">
-                    {localhostUrl}
+                    {shareUrl}
                   </code>
                   <button
                     onClick={handleCopyUrl}
