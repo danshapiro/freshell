@@ -144,6 +144,12 @@ Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` 
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## Community Projects
+
+Projects built by the community around freshell.
+
+- [freshell-container](https://github.com/nkcx/freshell-container) — Docker container packaging freshell with all supported coding CLI providers for self-hosted, multi-device access
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
