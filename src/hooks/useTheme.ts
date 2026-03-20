@@ -1,9 +1,6 @@
 import { useEffect } from 'react'
 import { useAppSelector } from '@/store/hooks'
-
-function getSystemPrefersDark(): boolean {
-  return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false
-}
+import { getSystemPrefersDark } from '@/lib/theme-utils'
 
 export function useThemeEffect(): void {
   const theme = useAppSelector((s) => s.settings.settings.theme)

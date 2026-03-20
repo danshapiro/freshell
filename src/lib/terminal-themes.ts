@@ -1,5 +1,6 @@
 import type { ITheme } from '@xterm/xterm'
 import type { TerminalTheme } from '@/store/types'
+import { getSystemPrefersDark } from '@/lib/theme-utils'
 
 // Full xterm theme with ANSI colors for proper syntax highlighting
 export interface TerminalThemeDefinition extends ITheme {
@@ -226,10 +227,6 @@ export function getTerminalTheme(
     return isDark ? terminalThemes['github-dark'] : terminalThemes['github-light']
   }
   return terminalThemes[themeSetting as Exclude<TerminalTheme, 'auto'>]
-}
-
-function getSystemPrefersDark(): boolean {
-  return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false
 }
 
 export function getThemeDisplayName(theme: TerminalTheme): string {

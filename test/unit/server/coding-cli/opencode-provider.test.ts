@@ -2,8 +2,14 @@ import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { DatabaseSync } from 'node:sqlite'
 import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
+
+let DatabaseSync: typeof import('node:sqlite').DatabaseSync
+try {
+  DatabaseSync = (await import('node:sqlite')).DatabaseSync
+} catch {
+  // node:sqlite unavailable — tests will be skipped
+}
 
 describe('OpencodeProvider', () => {
   let tempDir: string
@@ -16,9 +22,10 @@ describe('OpencodeProvider', () => {
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('lists root sessions from the OpenCode database', async () => {
+  it('lists root sessions from the OpenCode database', async ({ skip }) => {
+    if (!DatabaseSync) skip()
     const dbPath = path.join(tempDir, 'opencode.db')
-    const db = new DatabaseSync(dbPath)
+    const db = new DatabaseSync!(dbPath)
     db.exec(`
       CREATE TABLE project (
         id TEXT PRIMARY KEY,
