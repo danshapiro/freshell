@@ -75,6 +75,7 @@ export type MenuBuildContext = {
   contextElement: HTMLElement | null
   clickTarget: HTMLElement | null
   actions: MenuActions
+  aiEnabled: boolean
   platform: string | null
   extensions?: ClientExtensionEntry[]
 }
@@ -470,7 +471,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
-      { type: 'item', id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) },
+      ...(ctx.aiEnabled
+        ? [{ type: 'item' as const, id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) }]
+        : []),
       {
         type: 'item',
         id: 'session-archive',

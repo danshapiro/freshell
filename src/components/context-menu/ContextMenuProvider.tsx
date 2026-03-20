@@ -889,6 +889,7 @@ export function ContextMenuProvider({
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
+      aiEnabled: Boolean(appSettings.ai?.geminiApiKey),
       platform,
       extensions: extensionEntries,
       actions: {
@@ -965,6 +966,7 @@ export function ContextMenuProvider({
     expandedProjects,
     platform,
     extensionEntries,
+    appSettings.ai?.geminiApiKey,
     newDefaultTab,
     newTabWithPane,
     copyTabNames,
