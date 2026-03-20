@@ -114,7 +114,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Agent chat options: only show if underlying CLI is available, enabled, and not hidden by feature flag
     const visibleAgentChatConfigs = getVisibleAgentChatConfigs(featureFlags)
     const allAgentChatOptions: PickerOption[] = visibleAgentChatConfigs
-      .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider))
+      .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider) && !disabledExtensions.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
         label: config.label,

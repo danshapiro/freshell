@@ -20,8 +20,8 @@ const DEFAULT_NEW_PANE_VALUES = ['ask', 'shell', 'browser', 'editor'] as const
 const TAB_ATTENTION_STYLE_VALUES = ['highlight', 'pulse', 'darken', 'none'] as const
 const ATTENTION_DISMISS_VALUES = ['click', 'type'] as const
 const SIDEBAR_SORT_MODE_VALUES = ['recency', 'recency-pinned', 'activity', 'project'] as const
-const CODEX_SANDBOX_VALUES = ['read-only', 'workspace-write', 'danger-full-access'] as const
-const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'] as const
+export const CODEX_SANDBOX_VALUES = ['read-only', 'workspace-write', 'danger-full-access'] as const
+export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'] as const
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
 const NETWORK_HOST_VALUES = ['127.0.0.1', '0.0.0.0'] as const
 const AGENT_CHAT_EFFORT_VALUES = ['low', 'medium', 'high', 'max'] as const
@@ -527,6 +527,9 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
       providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
+    }).strict(),
+    extensions: z.object({
+      disabled: z.array(z.string()),
     }).strict(),
     network: z.object({
       host: NetworkHostSchema,

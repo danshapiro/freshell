@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
+import NetworkQuickAccess from '@/components/NetworkQuickAccess'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
@@ -163,6 +164,7 @@ export default function Sidebar({
   updateAvailable = false,
   latestVersion = null,
   onBrandClick,
+  onSharePanel,
   width = 288,
   fullWidth = false,
 }: {
@@ -173,6 +175,7 @@ export default function Sidebar({
   updateAvailable?: boolean
   latestVersion?: string | null
   onBrandClick?: () => void
+  onSharePanel?: () => void
   width?: number
   fullWidth?: boolean
 }) {
@@ -539,6 +542,9 @@ export default function Sidebar({
           ) : (
             <span className="font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
           )}
+          <div className="ml-auto">
+            <NetworkQuickAccess onSharePanel={onSharePanel} />
+          </div>
         </div>
       </div>
 

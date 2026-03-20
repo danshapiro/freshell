@@ -6,6 +6,7 @@ import {
   installSettingsViewHooks,
   mockAvailableFonts,
   renderSettingsView,
+  switchSettingsTab,
 } from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
@@ -46,101 +47,72 @@ describe('SettingsView core sections', () => {
       expect(headings[0]).toBeInTheDocument()
     })
 
-    it('renders all settings sections', () => {
+    it('renders tab buttons for all sections', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      expect(screen.getByText('Terminal preview')).toBeInTheDocument()
-
-      expect(screen.getByText('Appearance')).toBeInTheDocument()
-      expect(screen.getByText('Theme and visual preferences')).toBeInTheDocument()
-
-      expect(screen.getByText('Terminal')).toBeInTheDocument()
-      expect(screen.getByText('Font and rendering options')).toBeInTheDocument()
-
-      expect(screen.getByText('Sidebar')).toBeInTheDocument()
-      expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
-
-      expect(screen.getByText('Safety')).toBeInTheDocument()
-      expect(screen.getByText('Auto-kill and idle terminal management')).toBeInTheDocument()
-
-      expect(screen.getByText('Debugging')).toBeInTheDocument()
-      expect(screen.getByText('Debug-level logs and perf instrumentation')).toBeInTheDocument()
-
-      expect(screen.getByText('Notifications')).toBeInTheDocument()
-      expect(screen.getByText('Sound and alert preferences')).toBeInTheDocument()
-
-      expect(screen.getByText('Coding CLIs')).toBeInTheDocument()
-      expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
-
-      expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
-      expect(screen.getByText('Navigation and terminal')).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: 'Appearance' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: 'Workspace' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: 'Safety' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: 'Advanced' })).toBeInTheDocument()
     })
 
-    it('renders a terminal preview above Appearance', () => {
+    it('shows Appearance tab content by default', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const preview = screen.getByTestId('terminal-preview')
-      const appearanceHeading = screen.getByText('Appearance')
+      expect(screen.getByTestId('terminal-preview')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Appearance' })).toBeInTheDocument()
+      expect(screen.getByText('Theme and visual preferences')).toBeInTheDocument()
 
-      expect(preview).toBeInTheDocument()
-      expect(preview.compareDocumentPosition(appearanceHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-
-      const previewLines = within(preview).getAllByTestId('terminal-preview-line')
+      const previewLines = within(screen.getByTestId('terminal-preview')).getAllByTestId('terminal-preview-line')
       expect(previewLines).toHaveLength(8)
     })
 
-    it('orders Sidebar section above Terminal', () => {
+    it('switches to Workspace tab on click', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const terminalHeading = screen.getByText('Terminal')
-      const sidebarHeading = screen.getByText('Sidebar')
+      fireEvent.click(screen.getByRole('tab', { name: 'Workspace' }))
 
-      expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+      expect(screen.getByRole('heading', { name: 'Sidebar' })).toBeInTheDocument()
+      expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
+      expect(screen.getByText('Notifications')).toBeInTheDocument()
+      expect(screen.queryByTestId('terminal-preview')).not.toBeInTheDocument()
     })
 
-    it('orders Devices section after Network Access', () => {
+    it('switches to Safety tab on click', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
-      const devicesHeading = screen.getByText('Devices')
-      const networkHeading = screen.getByText('Network Access')
+      fireEvent.click(screen.getByRole('tab', { name: 'Safety' }))
 
-      expect(devicesHeading.compareDocumentPosition(networkHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+      expect(screen.getByRole('heading', { name: 'Safety' })).toBeInTheDocument()
+      expect(screen.getByText('Network Access')).toBeInTheDocument()
+      expect(screen.getByText('Devices')).toBeInTheDocument()
     })
 
-    it('renders all setting labels', () => {
+    it('switches to Advanced tab on click', () => {
+      const store = createSettingsViewStore()
+      renderSettingsView(store)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Advanced' }))
+
+      expect(screen.getByRole('heading', { name: 'Advanced' })).toBeInTheDocument()
+      expect(screen.getByText('Terminal internals and debugging')).toBeInTheDocument()
+    })
+
+    it('renders Appearance tab setting labels', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
       expect(screen.getByText('Theme')).toBeInTheDocument()
       expect(screen.getByText('UI scale')).toBeInTheDocument()
       expect(screen.getByText('Color scheme')).toBeInTheDocument()
-
-      expect(screen.getByText('Sort mode')).toBeInTheDocument()
-      expect(screen.getByText('Show project badges')).toBeInTheDocument()
-      expect(screen.getByText('Show subagent sessions')).toBeInTheDocument()
-      expect(screen.getByText('Hide sessions by first chat')).toBeInTheDocument()
-      expect(screen.getByText('First chat must start with match')).toBeInTheDocument()
-
       expect(screen.getByText('Font size')).toBeInTheDocument()
       expect(screen.getByText('Line height')).toBeInTheDocument()
-      expect(screen.getByText('Scrollback lines')).toBeInTheDocument()
       expect(screen.getByText('Cursor blink')).toBeInTheDocument()
       expect(screen.getByText('Font family')).toBeInTheDocument()
-
-      expect(screen.getByText('Auto-kill idle (minutes)')).toBeInTheDocument()
-      expect(screen.getByText('Default working directory')).toBeInTheDocument()
-
-      expect(screen.getByText('Sound on completion')).toBeInTheDocument()
-
-      expect(screen.getByText('Enable Claude CLI')).toBeInTheDocument()
-      expect(screen.getByText('Enable Codex CLI')).toBeInTheDocument()
-      expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
-      expect(screen.getByText('Codex CLI model')).toBeInTheDocument()
-      expect(screen.getByText('Codex CLI sandbox')).toBeInTheDocument()
     })
   })
 
@@ -178,6 +150,7 @@ describe('SettingsView core sections', () => {
     it('displays current scrollback value', () => {
       const store = createSettingsViewStore({ settings: { terminal: { scrollback: 10000 } } })
       renderSettingsView(store)
+      switchSettingsTab('Advanced')
 
       expect(screen.getByText('10,000')).toBeInTheDocument()
     })
@@ -242,6 +215,7 @@ describe('SettingsView core sections', () => {
     it('displays sidebar sort mode value', () => {
       const store = createSettingsViewStore({ settings: { sidebar: { sortMode: 'recency' } } })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       expect(screen.getByDisplayValue('Recency')).toBeInTheDocument()
     })
@@ -249,6 +223,7 @@ describe('SettingsView core sections', () => {
     it('displays safety settings values', () => {
       const store = createSettingsViewStore({ settings: { safety: { autoKillIdleMinutes: 120 } } })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       expect(screen.getByText('120')).toBeInTheDocument()
     })

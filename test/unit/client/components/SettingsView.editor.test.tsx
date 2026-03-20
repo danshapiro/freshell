@@ -7,6 +7,7 @@ import settingsReducer, { defaultSettings, setServerSettings } from '@/store/set
 import { networkReducer } from '@/store/networkSlice'
 import type { AppSettings } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
+import { switchSettingsTab } from './settings-view-test-utils'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -102,6 +103,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     // "Editor" also appears as a Panes dropdown option, so find the heading specifically
     const editorHeadings = screen.getAllByText('Editor')
@@ -119,6 +121,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.getByText('External editor')).toBeInTheDocument()
   })
@@ -130,6 +133,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const dropdown = screen.getByDisplayValue('Auto (system default)')
     const options = dropdown.querySelectorAll('option')
@@ -152,6 +156,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const dropdown = screen.getByDisplayValue('Cursor')
     expect(dropdown).toHaveValue('cursor')
@@ -164,6 +169,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const dropdown = screen.getByDisplayValue('Auto (system default)')
     fireEvent.change(dropdown, { target: { value: 'code' } })
@@ -189,6 +195,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     // The custom command input (and its placeholder) should not be rendered
     expect(screen.queryByPlaceholderText('nvim +{line} {file}')).not.toBeInTheDocument()
@@ -201,6 +208,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.queryByPlaceholderText('nvim +{line} {file}')).not.toBeInTheDocument()
   })
@@ -212,6 +220,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.queryByPlaceholderText('nvim +{line} {file}')).not.toBeInTheDocument()
   })
@@ -223,6 +232,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     // "Custom command" label appears both as a dropdown option and as the
     // settings row label; verify the input is present via its placeholder
@@ -240,6 +250,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.queryByPlaceholderText('nvim +{line} {file}')).not.toBeInTheDocument()
 
@@ -256,6 +267,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.getByPlaceholderText('nvim +{line} {file}')).toBeInTheDocument()
 
@@ -272,6 +284,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
@@ -302,6 +315,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     fireEvent.change(input, { target: { value: 'vim' } })
@@ -339,6 +353,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
@@ -360,6 +375,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
@@ -388,6 +404,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
@@ -420,6 +437,7 @@ describe('SettingsView Editor section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const input = screen.getByPlaceholderText('nvim +{line} {file}')
     expect(input).toHaveValue('emacs +{line} {file}')

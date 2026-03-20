@@ -6,6 +6,7 @@ import {
   createSettingsViewStore,
   installSettingsViewHooks,
   renderSettingsView,
+  switchSettingsTab,
 } from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
@@ -34,6 +35,7 @@ describe('SettingsView network access section', () => {
   it('renders remote access toggle', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByText(/remote access/i)).toBeInTheDocument()
   })
@@ -49,6 +51,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
   })
@@ -64,6 +67,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByText(/port may be blocked/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
@@ -83,6 +87,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
     expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
@@ -104,6 +109,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
@@ -131,6 +137,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
@@ -162,6 +169,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -209,6 +217,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -257,6 +266,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -293,6 +303,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
@@ -326,6 +337,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -352,6 +364,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -387,6 +400,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -438,6 +452,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -480,6 +495,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
 
@@ -522,6 +538,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 
@@ -564,6 +581,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
@@ -610,6 +628,7 @@ describe('SettingsView network access section', () => {
     }))
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
     await act(async () => {
@@ -651,6 +670,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 
@@ -678,6 +698,7 @@ describe('SettingsView network access section', () => {
     })
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
@@ -718,6 +739,7 @@ describe('SettingsView network access section', () => {
     }))
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
     await act(async () => {
@@ -774,6 +796,7 @@ describe('SettingsView network access section', () => {
     }))
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 
@@ -813,6 +836,7 @@ describe('SettingsView network access section', () => {
     vi.mocked(api.get).mockRejectedValue(new Error('status refresh failed'))
 
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 
@@ -834,6 +858,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('alert')).toBeInTheDocument()
     expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
@@ -854,11 +879,12 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  it('disables remote access toggle during rebind', () => {
+  it('keeps remote access toggle enabled during rebind', () => {
     const store = createSettingsViewStore({
       extraPreloadedState: {
         network: createNetworkState({
@@ -869,8 +895,9 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
-    expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeDisabled()
   })
 
   it('disables remote access toggle during configuring', () => {
@@ -883,6 +910,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
   })
@@ -901,6 +929,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
     expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
@@ -915,6 +944,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn() })
+    switchSettingsTab('Safety')
 
     expect(screen.getByText('Get link')).toBeInTheDocument()
   })
@@ -929,6 +959,7 @@ describe('SettingsView network access section', () => {
       },
     })
     renderSettingsView(store, { onNavigate: vi.fn(), onSharePanel })
+    switchSettingsTab('Safety')
 
     fireEvent.click(screen.getByText('Get link'))
     expect(onSharePanel).toHaveBeenCalledOnce()

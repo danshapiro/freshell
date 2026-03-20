@@ -7,6 +7,7 @@ import {
   installSettingsViewHooks,
   makeRegistryRecord,
   renderSettingsView,
+  switchSettingsTab,
 } from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
@@ -69,6 +70,7 @@ describe('SettingsView behavior sections', () => {
     it('updates sidebar sort mode locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const sortModeSelect = getSelect((select) => {
         return select.querySelector('option[value="activity"]') !== null
@@ -93,6 +95,7 @@ describe('SettingsView behavior sections', () => {
     it('updates sidebar sort mode to recency-pinned locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const sortModeSelect = getSelect((select) => {
         return select.querySelector('option[value="recency-pinned"]') !== null
@@ -113,6 +116,7 @@ describe('SettingsView behavior sections', () => {
     it('toggles show project badges', () => {
       const store = createSettingsViewStore({ settings: { sidebar: { showProjectBadges: true } } })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const showBadgesRow = screen.getByText('Show project badges').closest('div')
       const showBadgesToggle = within(showBadgesRow!).getByRole('switch')
@@ -124,6 +128,7 @@ describe('SettingsView behavior sections', () => {
     it('debounces sidebar first-chat exclusion substring saves and sends the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const textarea = screen.getByLabelText('Sidebar first chat exclusion substrings')
       fireEvent.change(textarea, { target: { value: '__AUTO__' } })
@@ -152,6 +157,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const row = screen.getByText('First chat must start with match').closest('div')
       const toggle = within(row!).getByRole('switch')
@@ -175,6 +181,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const soundRow = screen.getByText('Sound on completion').closest('div')
       const soundToggle = within(soundRow!).getByRole('switch')
@@ -217,6 +224,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Advanced')
 
       const debugRow = screen.getByText('Debug logging').closest('div')
       const debugToggle = within(debugRow!).getByRole('switch')
@@ -230,175 +238,6 @@ describe('SettingsView behavior sections', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         logging: { debug: true },
-      })
-    })
-
-    it('toggles codex provider enabled state', () => {
-      const store = createSettingsViewStore()
-      renderSettingsView(store)
-
-      const row = screen.getByText('Enable Codex CLI').closest('div')!
-      const toggle = row.querySelector('button')!
-      fireEvent.click(toggle)
-
-      expect(store.getState().settings.settings.codingCli.enabledProviders).not.toContain('codex')
-    })
-
-    it('preserves server-known runtime provider names when toggling a live provider', async () => {
-      const store = createSettingsViewStore({
-        settings: {
-          codingCli: {
-            enabledProviders: ['codex', 'gemini'],
-            knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
-          },
-        },
-      })
-      renderSettingsView(store)
-
-      const row = screen.getByText('Enable Codex CLI').closest('div')!
-      const toggle = row.querySelector('button')!
-      fireEvent.click(toggle)
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { enabledProviders: ['gemini'] },
-      })
-    })
-
-    it('preserves enabled provider names that are not live or browser-known when toggling another provider', async () => {
-      const store = createSettingsViewStore({
-        settings: {
-          codingCli: {
-            enabledProviders: ['codex', 'custom-cli'],
-            knownProviders: ['claude', 'codex'],
-          },
-        },
-      })
-      renderSettingsView(store)
-
-      const row = screen.getByText('Enable Codex CLI').closest('div')!
-      const toggle = row.querySelector('button')!
-      fireEvent.click(toggle)
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { enabledProviders: ['custom-cli'] },
-      })
-    })
-
-    it('debounces codex model saves and sends only the latest value', async () => {
-      const store = createSettingsViewStore()
-      renderSettingsView(store)
-
-      const input = screen.getByPlaceholderText('e.g. gpt-5-codex')
-      fireEvent.change(input, { target: { value: 'gpt' } })
-      fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
-
-      expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBe('gpt-5-codex')
-
-      expect(api.patch).not.toHaveBeenCalled()
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledTimes(1)
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { codex: { model: 'gpt-5-codex' } } },
-      })
-    })
-
-    it('clears codex model overrides through the shared save path', async () => {
-      const store = createSettingsViewStore({
-        settings: {
-          codingCli: {
-            providers: {
-              codex: {
-                model: 'gpt-5-codex',
-              },
-            },
-          },
-        },
-      })
-      renderSettingsView(store)
-
-      const input = screen.getByDisplayValue('gpt-5-codex')
-      fireEvent.change(input, { target: { value: '' } })
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBeUndefined()
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { codex: { model: null } } },
-      })
-    })
-
-    it('updates codex sandbox select', async () => {
-      const store = createSettingsViewStore()
-      renderSettingsView(store)
-
-      const sandboxSelect = getSelect((select) => {
-        return select.querySelector('option[value="workspace-write"]') !== null
-      })
-
-      fireEvent.change(sandboxSelect, { target: { value: 'workspace-write' } })
-
-      expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBe('workspace-write')
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { codex: { sandbox: 'workspace-write' } } },
-      })
-    })
-
-    it('clears codex sandbox overrides through the shared save path', async () => {
-      const store = createSettingsViewStore({
-        settings: {
-          codingCli: {
-            providers: {
-              codex: {
-                sandbox: 'workspace-write',
-              },
-            },
-          },
-        },
-      })
-      renderSettingsView(store)
-
-      const sandboxSelect = getSelect((select) => {
-        return select.querySelector('option[value="workspace-write"]') !== null
-      })
-
-      fireEvent.change(sandboxSelect, { target: { value: '' } })
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBeUndefined()
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { codex: { sandbox: null } } },
       })
     })
 
@@ -422,6 +261,7 @@ describe('SettingsView behavior sections', () => {
     it('updates scrollback slider', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Advanced')
 
       const scrollbackSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
@@ -473,6 +313,7 @@ describe('SettingsView behavior sections', () => {
     it('updates auto-kill idle minutes slider', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const autoKillSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
@@ -490,6 +331,7 @@ describe('SettingsView behavior sections', () => {
       vi.mocked(api.post).mockResolvedValue({ valid: true })
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
       fireEvent.change(cwdInput, { target: { value: '/home/user/projects' } })
@@ -517,6 +359,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '/missing/path' } })
@@ -544,6 +387,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '' } })
@@ -568,6 +412,7 @@ describe('SettingsView behavior sections', () => {
     it('displays keyboard shortcuts from the shared registry', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       expect(screen.getByText('New tab')).toBeInTheDocument()
       expect(screen.getByText('Close tab')).toBeInTheDocument()
@@ -579,6 +424,7 @@ describe('SettingsView behavior sections', () => {
     it('displays keyboard shortcut keys', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       expect(screen.getAllByText('Alt').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Ctrl').length).toBeGreaterThan(0)
@@ -611,6 +457,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
 
