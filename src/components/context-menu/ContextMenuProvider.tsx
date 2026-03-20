@@ -107,6 +107,7 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
@@ -889,7 +890,7 @@ export function ContextMenuProvider({
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
-      aiEnabled: Boolean(appSettings.ai?.geminiApiKey),
+      aiEnabled: Boolean(appSettings.ai?.geminiApiKey) || Boolean(featureFlags.aiEnabled),
       platform,
       extensions: extensionEntries,
       actions: {
@@ -967,6 +968,7 @@ export function ContextMenuProvider({
     platform,
     extensionEntries,
     appSettings.ai?.geminiApiKey,
+    featureFlags.aiEnabled,
     newDefaultTab,
     newTabWithPane,
     copyTabNames,

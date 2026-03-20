@@ -113,7 +113,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     const patch = normalizeSettingsPatch(parsed.data as Record<string, any>) as SettingsPatch
     const updated = await configStore.patchSettings(patch)
     registry.setSettings(updated)
-    AI_CONFIG.applySettingsKey(updated.ai?.geminiApiKey)
+    AI_CONFIG.applySettingsKey(updated.ai?.geminiApiKey, { force: true })
     applyDebugLogging(!!updated.logging?.debug, 'settings')
     wsHandler.broadcast({ type: 'settings.updated', settings: updated })
     await withPerfSpan(

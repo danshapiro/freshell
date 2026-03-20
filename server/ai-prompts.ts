@@ -12,10 +12,13 @@ export function stripAnsi(str: string): string {
 export const AI_CONFIG = {
   model: 'gemini-2.5-flash-lite',
   enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY),
-  /** Activate the Gemini key from a settings-provided value at runtime. */
-  applySettingsKey: (key: string | undefined) => {
-    if (key && !process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
-      process.env.GOOGLE_GENERATIVE_AI_API_KEY = key
+  /** Apply a Gemini key from settings. Does not overwrite an env-provided key on startup,
+   *  but always updates when called from the settings save path. */
+  applySettingsKey: (key: string | undefined, { force = false } = {}) => {
+    if (key) {
+      if (force || !process.env.GOOGLE_GENERATIVE_AI_API_KEY) {
+        process.env.GOOGLE_GENERATIVE_AI_API_KEY = key
+      }
     }
   },
 } as const

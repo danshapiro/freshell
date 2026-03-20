@@ -566,6 +566,7 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
     }).strict().optional(),
     ai: z.object({
       geminiApiKey: z.string().nullable().optional(),
+      titlePrompt: z.string().nullable().optional(),
     }).strict().optional(),
     codingCli: z.object({
       enabledProviders: z.array(CliProviderNameSchema).optional(),
