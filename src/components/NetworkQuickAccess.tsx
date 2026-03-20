@@ -119,7 +119,7 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
       {open && (
         <div
           ref={popoverRef}
-          className="absolute top-full left-0 mt-1 w-72 rounded-lg border border-border bg-card shadow-lg p-3 space-y-3 z-50"
+          className="absolute top-full right-0 md:right-auto md:left-0 mt-1 w-72 rounded-lg border border-border bg-card shadow-lg p-3 space-y-3 z-50"
           role="dialog"
           aria-label="Network access"
         >
