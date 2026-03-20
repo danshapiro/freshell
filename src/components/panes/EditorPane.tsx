@@ -2,17 +2,7 @@ import { useRef, useState, useCallback, useEffect, useMemo, type ChangeEvent } f
 import { Editor } from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-
-function getSystemPrefersDark(): boolean {
-  return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false
-}
-
-function useMonacoTheme(): 'vs-dark' | 'vs' {
-  const theme = useAppSelector((s) => s.settings.settings.theme)
-  const isDark =
-    theme === 'dark' ? true : theme === 'light' ? false : getSystemPrefersDark()
-  return isDark ? 'vs-dark' : 'vs'
-}
+import { getSystemPrefersDark } from '@/lib/theme-utils'
 import { updatePaneContent } from '@/store/panesSlice'
 import type { EditorPaneContent } from '@/store/paneTypes'
 import EditorToolbar from './EditorToolbar'
@@ -27,6 +17,13 @@ import { createLogger } from '@/lib/client-logger'
 
 
 const log = createLogger('EditorPane')
+
+function useMonacoTheme(): 'vs-dark' | 'vs' {
+  const theme = useAppSelector((s) => s.settings.settings.theme)
+  const isDark =
+    theme === 'dark' ? true : theme === 'light' ? false : getSystemPrefersDark()
+  return isDark ? 'vs-dark' : 'vs'
+}
 
 const AUTO_SAVE_DELAY = 5000
 
