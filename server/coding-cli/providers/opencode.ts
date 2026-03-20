@@ -1,7 +1,6 @@
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
-import { DatabaseSync } from 'node:sqlite'
 import { logger } from '../../logger.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { CodingCliSession, NormalizedEvent, ParsedSessionMeta } from '../types.js'
@@ -49,9 +48,17 @@ export class OpencodeProvider implements CodingCliProvider {
       return []
     }
 
-    let db: DatabaseSync | undefined
+    let sqlite: typeof import('node:sqlite')
     try {
-      db = new DatabaseSync(dbPath, { readOnly: true })
+      sqlite = await import('node:sqlite')
+    } catch {
+      logger.debug({ provider: this.name }, 'node:sqlite unavailable (requires Node 22.5+); skipping OpenCode sessions')
+      return []
+    }
+
+    let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
+    try {
+      db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
       const rows = db.prepare(`
         SELECT
           s.id AS sessionId,
