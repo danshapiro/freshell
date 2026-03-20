@@ -531,7 +531,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     return [
       { type: 'item', id: 'overview-open', label: 'Open/focus terminal', onSelect: () => actions.openTerminal(target.terminalId) },
       { type: 'item', id: 'overview-rename', label: 'Rename', onSelect: () => actions.renameTerminal(target.terminalId) },
-      { type: 'item', id: 'overview-summary', label: 'Generate summary', onSelect: () => actions.generateTerminalSummary(target.terminalId) },
+      ...(ctx.aiEnabled
+        ? [{ type: 'item' as const, id: 'overview-summary', label: 'Generate summary', onSelect: () => actions.generateTerminalSummary(target.terminalId) }]
+        : []),
       { type: 'item', id: 'overview-delete', label: 'Delete terminal', onSelect: () => actions.deleteTerminal(target.terminalId), danger: true },
       { type: 'separator', id: 'overview-sep' },
       { type: 'item', id: 'overview-copy-cwd', label: 'Copy CWD', onSelect: () => actions.copyTerminalCwd(target.terminalId) },
