@@ -7,7 +7,6 @@ import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
 import { Globe, Check, Copy, Share2 } from 'lucide-react'
-import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 
 const log = createLogger('NetworkQuickAccess')
 
@@ -94,27 +93,21 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
 
   return (
     <div className="relative">
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <button
-            ref={buttonRef}
-            type="button"
-            onClick={() => setOpen(!open)}
-            onContextMenu={handleContextMenu}
-            className={cn(
-              'p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center',
-              remoteAccessActive ? 'text-emerald-500' : 'text-muted-foreground',
-            )}
-            aria-label={remoteAccessActive ? 'Remote access: enabled' : 'Remote access: disabled'}
-            data-testid="network-quick-access"
-          >
-            <Globe className="h-3.5 w-3.5" />
-          </button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom">
-          {remoteAccessActive ? 'Remote access enabled' : 'Remote access disabled'}
-        </TooltipContent>
-      </Tooltip>
+      <button
+        ref={buttonRef}
+        type="button"
+        onClick={() => setOpen(!open)}
+        onContextMenu={handleContextMenu}
+        title={remoteAccessActive ? 'Remote access enabled' : 'Remote access disabled'}
+        className={cn(
+          'p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center',
+          remoteAccessActive ? 'text-emerald-500' : 'text-muted-foreground',
+        )}
+        aria-label={remoteAccessActive ? 'Remote access: enabled' : 'Remote access: disabled'}
+        data-testid="network-quick-access"
+      >
+        <Globe className="h-3.5 w-3.5" />
+      </button>
 
       {open && (
         <div
