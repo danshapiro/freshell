@@ -4,6 +4,7 @@ import {
   createSettingsViewStore,
   installSettingsViewHooks,
   renderSettingsView,
+  switchSettingsTab,
 } from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
@@ -24,6 +25,7 @@ describe('SettingsView terminal advanced settings', () => {
   it('is collapsed by default', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
+    switchSettingsTab('Advanced')
 
     const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     const panel = document.getElementById(advancedToggle.getAttribute('aria-controls') ?? '')
@@ -34,6 +36,7 @@ describe('SettingsView terminal advanced settings', () => {
   it('expands to show OSC52 clipboard policy control', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
+    switchSettingsTab('Advanced')
 
     const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     fireEvent.click(advancedToggle)
@@ -50,6 +53,7 @@ describe('SettingsView terminal advanced settings', () => {
   it('keeps Always and Never policy updates local-only', async () => {
     const store = createSettingsViewStore()
     renderSettingsView(store)
+    switchSettingsTab('Advanced')
 
     const advancedToggle = screen.getByRole('button', { name: 'OSC52 Clipboard' })
     fireEvent.click(advancedToggle)

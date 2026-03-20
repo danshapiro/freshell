@@ -128,16 +128,16 @@ describe('ExtensionsView', () => {
   })
 
   describe('expand/collapse', () => {
-    it('shows expand button for cards with config', () => {
+    it('shows configure button for cards with config', () => {
       renderExtensionsView()
 
-      expect(screen.getByLabelText('Expand Claude CLI details')).toBeInTheDocument()
+      expect(screen.getByLabelText('Show Claude CLI configuration')).toBeInTheDocument()
     })
 
-    it('expands card to show config fields', () => {
+    it('shows config fields when Configure is clicked', () => {
       renderExtensionsView()
 
-      const expandBtn = screen.getByLabelText('Expand Claude CLI details')
+      const expandBtn = screen.getByLabelText('Show Claude CLI configuration')
       fireEvent.click(expandBtn)
 
       expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
@@ -147,11 +147,11 @@ describe('ExtensionsView', () => {
     it('collapses expanded card', () => {
       renderExtensionsView()
 
-      const expandBtn = screen.getByLabelText('Expand Claude CLI details')
+      const expandBtn = screen.getByLabelText('Show Claude CLI configuration')
       fireEvent.click(expandBtn)
       expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
 
-      fireEvent.click(screen.getByLabelText('Collapse Claude CLI details'))
+      fireEvent.click(screen.getByLabelText('Hide Claude CLI configuration'))
       expect(screen.queryByText('Claude CLI permission mode')).not.toBeInTheDocument()
     })
   })
@@ -196,7 +196,7 @@ describe('ExtensionsView', () => {
       renderExtensionsView()
 
       // Expand Claude card
-      fireEvent.click(screen.getByLabelText('Expand Claude CLI details'))
+      fireEvent.click(screen.getByLabelText('Show Claude CLI configuration'))
 
       const select = screen.getByLabelText('Claude CLI permission mode')
       fireEvent.change(select, { target: { value: 'plan' } })
@@ -212,7 +212,7 @@ describe('ExtensionsView', () => {
       renderExtensionsView()
 
       // Expand Codex card
-      fireEvent.click(screen.getByLabelText('Expand Codex CLI details'))
+      fireEvent.click(screen.getByLabelText('Show Codex CLI configuration'))
 
       const input = screen.getByLabelText('Codex CLI model')
       fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
@@ -232,7 +232,7 @@ describe('ExtensionsView', () => {
       renderExtensionsView()
 
       // Expand Codex card
-      fireEvent.click(screen.getByLabelText('Expand Codex CLI details'))
+      fireEvent.click(screen.getByLabelText('Show Codex CLI configuration'))
 
       const select = screen.getByLabelText('Codex CLI sandbox')
       fireEvent.change(select, { target: { value: 'workspace-write' } })

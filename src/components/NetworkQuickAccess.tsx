@@ -6,17 +6,22 @@ import { configureNetwork } from '@/store/networkSlice'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
-import { Globe, Check, Copy } from 'lucide-react'
+import { Globe, Check, Copy, Share2 } from 'lucide-react'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 
 const log = createLogger('NetworkQuickAccess')
 
-export default function NetworkQuickAccess() {
+export interface NetworkQuickAccessProps {
+  onSharePanel?: () => void
+}
+
+export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessProps) {
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network?.status ?? null)
   const configuring = useAppSelector((s) => s.network?.configuring ?? false)
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const accessUrl = networkStatus?.accessUrl
+  const firewall = networkStatus?.firewall
 
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -66,6 +71,11 @@ export default function NetworkQuickAccess() {
     }
   }, [accessUrl])
 
+  const handleDeviceAccess = useCallback(() => {
+    setOpen(false)
+    onSharePanel?.()
+  }, [onSharePanel])
+
   return (
     <div className="relative">
       <Tooltip>
@@ -93,7 +103,7 @@ export default function NetworkQuickAccess() {
       {open && (
         <div
           ref={popoverRef}
-          className="absolute top-full left-0 mt-1 w-64 rounded-lg border border-border bg-card shadow-lg p-3 space-y-3 z-50"
+          className="absolute top-full left-0 mt-1 w-72 rounded-lg border border-border bg-card shadow-lg p-3 space-y-3 z-50"
           role="dialog"
           aria-label="Network access"
         >
@@ -133,23 +143,55 @@ export default function NetworkQuickAccess() {
             </span>
           </div>
 
-          {/* URL with copy */}
-          {remoteAccessEnabled && accessUrl && (
-            <div className="flex items-center gap-1.5">
-              <code className="flex-1 min-w-0 truncate text-xs bg-muted rounded px-2 py-1">
-                {accessUrl}
-              </code>
-              <button
-                onClick={handleCopyUrl}
-                className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors shrink-0"
-                aria-label="Copy access URL"
-              >
-                {copied
-                  ? <Check className="w-3.5 h-3.5 text-emerald-500" />
-                  : <Copy className="w-3.5 h-3.5" />
-                }
-              </button>
-            </div>
+          {remoteAccessEnabled && (
+            <>
+              {/* URL with copy */}
+              {accessUrl && (
+                <div className="flex items-center gap-1.5">
+                  <code className="flex-1 min-w-0 truncate text-xs bg-muted rounded px-2 py-1">
+                    {accessUrl}
+                  </code>
+                  <button
+                    onClick={handleCopyUrl}
+                    className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                    aria-label="Copy access URL"
+                  >
+                    {copied
+                      ? <Check className="w-3.5 h-3.5 text-emerald-500" />
+                      : <Copy className="w-3.5 h-3.5" />
+                    }
+                  </button>
+                </div>
+              )}
+
+              {/* Device access / share */}
+              {onSharePanel && (
+                <button
+                  onClick={handleDeviceAccess}
+                  className="w-full flex items-center gap-2 rounded-md border border-border/40 px-2.5 py-1.5 text-xs hover:bg-muted transition-colors"
+                  aria-label="Get link for your devices"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-muted-foreground" />
+                  <span>Device access</span>
+                  <span className="text-muted-foreground ml-auto">QR code &amp; link</span>
+                </button>
+              )}
+
+              {/* Firewall status */}
+              {firewall && (
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>Firewall</span>
+                  <span>
+                    {firewall.portOpen === true
+                      ? 'Port open'
+                      : firewall.active
+                        ? 'Port may be blocked'
+                        : 'No firewall detected'}
+                    {' · '}{firewall.platform}
+                  </span>
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

@@ -1131,6 +1131,7 @@ export default function App() {
               updateAvailable={updateAvailable}
               latestVersion={latestVersion}
               onBrandClick={handleBrandClick}
+              onSharePanel={handleShare}
               width={sidebarWidth}
               fullWidth={isMobile}
             />

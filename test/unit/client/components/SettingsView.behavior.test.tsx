@@ -7,6 +7,7 @@ import {
   installSettingsViewHooks,
   makeRegistryRecord,
   renderSettingsView,
+  switchSettingsTab,
 } from './settings-view-test-utils'
 
 vi.mock('@/lib/api', () => ({
@@ -69,6 +70,7 @@ describe('SettingsView behavior sections', () => {
     it('updates sidebar sort mode locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const sortModeSelect = getSelect((select) => {
         return select.querySelector('option[value="activity"]') !== null
@@ -93,6 +95,7 @@ describe('SettingsView behavior sections', () => {
     it('updates sidebar sort mode to recency-pinned locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const sortModeSelect = getSelect((select) => {
         return select.querySelector('option[value="recency-pinned"]') !== null
@@ -113,6 +116,7 @@ describe('SettingsView behavior sections', () => {
     it('toggles show project badges', () => {
       const store = createSettingsViewStore({ settings: { sidebar: { showProjectBadges: true } } })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const showBadgesRow = screen.getByText('Show project badges').closest('div')
       const showBadgesToggle = within(showBadgesRow!).getByRole('switch')
@@ -124,6 +128,7 @@ describe('SettingsView behavior sections', () => {
     it('debounces sidebar first-chat exclusion substring saves and sends the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const textarea = screen.getByLabelText('Sidebar first chat exclusion substrings')
       fireEvent.change(textarea, { target: { value: '__AUTO__' } })
@@ -152,6 +157,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const row = screen.getByText('First chat must start with match').closest('div')
       const toggle = within(row!).getByRole('switch')
@@ -175,6 +181,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       const soundRow = screen.getByText('Sound on completion').closest('div')
       const soundToggle = within(soundRow!).getByRole('switch')
@@ -217,6 +224,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Advanced')
 
       const debugRow = screen.getByText('Debug logging').closest('div')
       const debugToggle = within(debugRow!).getByRole('switch')
@@ -253,6 +261,7 @@ describe('SettingsView behavior sections', () => {
     it('updates scrollback slider', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Advanced')
 
       const scrollbackSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
@@ -304,6 +313,7 @@ describe('SettingsView behavior sections', () => {
     it('updates auto-kill idle minutes slider', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const autoKillSlider = getSlider((slider) => {
         const min = slider.getAttribute('min')
@@ -321,6 +331,7 @@ describe('SettingsView behavior sections', () => {
       vi.mocked(api.post).mockResolvedValue({ valid: true })
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
       fireEvent.change(cwdInput, { target: { value: '/home/user/projects' } })
@@ -348,6 +359,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '/missing/path' } })
@@ -375,6 +387,7 @@ describe('SettingsView behavior sections', () => {
         settings: { defaultCwd: '/some/path' },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '' } })
@@ -399,6 +412,7 @@ describe('SettingsView behavior sections', () => {
     it('displays keyboard shortcuts from the shared registry', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       expect(screen.getByText('New tab')).toBeInTheDocument()
       expect(screen.getByText('Close tab')).toBeInTheDocument()
@@ -410,6 +424,7 @@ describe('SettingsView behavior sections', () => {
     it('displays keyboard shortcut keys', () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
+      switchSettingsTab('Workspace')
 
       expect(screen.getAllByText('Alt').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Ctrl').length).toBeGreaterThan(0)
@@ -442,6 +457,7 @@ describe('SettingsView behavior sections', () => {
         },
       })
       renderSettingsView(store)
+      switchSettingsTab('Safety')
 
       expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
 

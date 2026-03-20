@@ -12,7 +12,7 @@ import type { AppView } from '@/components/Sidebar'
 import type { ServerSettingsPatch } from '@/store/types'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { ArrowLeft, Puzzle, Server, Monitor, Terminal, ChevronDown } from 'lucide-react'
+import { ArrowLeft, Puzzle, Server, Monitor, Terminal, ChevronDown, Settings2 } from 'lucide-react'
 
 const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
 
@@ -180,7 +180,7 @@ function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConf
           </div>
         </div>
 
-        {/* Footer: category badge + status + expand + toggle */}
+        {/* Footer: category badge + status + toggle */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
@@ -198,36 +198,43 @@ function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConf
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            {item.config.length > 0 && (
-              <button
-                onClick={onToggleExpand}
-                className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-                aria-expanded={expanded}
-                aria-label={`${expanded ? 'Collapse' : 'Expand'} ${item.name} details`}
-              >
-                <ChevronDown className={cn('w-4 h-4 transition-transform', expanded && 'rotate-180')} />
-              </button>
+          <button
+            role="switch"
+            aria-checked={item.enabled}
+            aria-label={`${item.enabled ? 'Disable' : 'Enable'} ${item.name}`}
+            onClick={() => onToggleEnabled(item, !item.enabled)}
+            className={cn(
+              'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
+              item.enabled ? 'bg-emerald-500' : 'bg-zinc-600',
             )}
-            <button
-              role="switch"
-              aria-checked={item.enabled}
-              aria-label={`${item.enabled ? 'Disable' : 'Enable'} ${item.name}`}
-              onClick={() => onToggleEnabled(item, !item.enabled)}
+          >
+            <span
               className={cn(
-                'relative inline-flex h-6 w-11 items-center rounded-full transition-colors',
-                item.enabled ? 'bg-emerald-500' : 'bg-zinc-600',
+                'inline-block h-4 w-4 rounded-full bg-white shadow transition-transform',
+                item.enabled ? 'translate-x-[22px]' : 'translate-x-[3px]',
               )}
-            >
-              <span
-                className={cn(
-                  'inline-block h-4 w-4 rounded-full bg-white shadow transition-transform',
-                  item.enabled ? 'translate-x-[22px]' : 'translate-x-[3px]',
-                )}
-              />
-            </button>
-          </div>
+            />
+          </button>
         </div>
+
+        {/* Configure button — prominent, full-width */}
+        {item.config.length > 0 && (
+          <button
+            onClick={onToggleExpand}
+            aria-expanded={expanded}
+            aria-label={`${expanded ? 'Hide' : 'Show'} ${item.name} configuration`}
+            className={cn(
+              'w-full flex items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 text-xs transition-colors',
+              expanded
+                ? 'border-border bg-muted text-foreground'
+                : 'border-border/40 text-muted-foreground hover:text-foreground hover:bg-muted/50',
+            )}
+          >
+            <Settings2 className="w-3.5 h-3.5" />
+            {expanded ? 'Hide Configuration' : 'Configure'}
+            <ChevronDown className={cn('w-3 h-3 ml-0.5 transition-transform', expanded && 'rotate-180')} />
+          </button>
+        )}
       </div>
 
       {/* Expanded config */}

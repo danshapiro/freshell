@@ -210,6 +210,23 @@ export function renderSettingsView(store: SettingsViewStore, props: SettingsView
   )
 }
 
+export type SettingsTab = 'Appearance' | 'Workspace' | 'Safety' | 'Advanced'
+
+/** Click a tab button in the settings tabbed navigation to switch sections. */
+export function switchSettingsTab(tab: SettingsTab) {
+  const { fireEvent } = require('@testing-library/react')
+  const tablist = document.querySelector('[role="tablist"]')
+  if (!tablist) throw new Error('No tablist found')
+  const buttons = tablist.querySelectorAll('[role="tab"]')
+  for (const btn of buttons) {
+    if (btn.textContent?.trim() === tab) {
+      fireEvent.click(btn)
+      return
+    }
+  }
+  throw new Error(`Tab "${tab}" not found`)
+}
+
 export function mockAvailableFonts(check: (font: string) => boolean = () => true) {
   Object.defineProperty(document, 'fonts', {
     value: {

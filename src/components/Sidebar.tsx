@@ -164,6 +164,7 @@ export default function Sidebar({
   updateAvailable = false,
   latestVersion = null,
   onBrandClick,
+  onSharePanel,
   width = 288,
   fullWidth = false,
 }: {
@@ -174,6 +175,7 @@ export default function Sidebar({
   updateAvailable?: boolean
   latestVersion?: string | null
   onBrandClick?: () => void
+  onSharePanel?: () => void
   width?: number
   fullWidth?: boolean
 }) {
@@ -541,7 +543,7 @@ export default function Sidebar({
             <span className="font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
           )}
           <div className="ml-auto">
-            <NetworkQuickAccess />
+            <NetworkQuickAccess onSharePanel={onSharePanel} />
           </div>
         </div>
       </div>

@@ -13,6 +13,7 @@ import {
   resolveLocalSettings,
   type LocalSettingsPatch,
 } from '@shared/settings'
+import { switchSettingsTab } from './settings-view-test-utils'
 
 // Mock the API
 vi.mock('@/lib/api', () => ({
@@ -71,6 +72,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.getByText('Panes')).toBeInTheDocument()
   })
@@ -82,6 +84,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.getByText('Default new pane')).toBeInTheDocument()
   })
@@ -93,6 +96,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const dropdown = screen.getByRole('combobox', { name: /default new pane/i })
     expect(dropdown).toHaveValue('shell')
@@ -105,6 +109,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const dropdown = screen.getByRole('combobox', { name: /default new pane/i })
     const options = dropdown.querySelectorAll('option')
@@ -123,6 +128,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     expect(screen.getByText('Snap distance')).toBeInTheDocument()
   })
@@ -134,6 +140,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     // The slider should show "2%" for the default value
     expect(screen.getByText('2%')).toBeInTheDocument()
@@ -146,6 +153,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const snapSlider = screen.getAllByRole('slider').find((slider) => {
       return slider.getAttribute('min') === '0' && slider.getAttribute('max') === '8'
@@ -170,6 +178,7 @@ describe('SettingsView Panes section', () => {
         <SettingsView />
       </Provider>
     )
+    switchSettingsTab('Workspace')
 
     const row = screen.getByText('Icons on tabs').closest('div')!
     const toggle = row.querySelector('button')!
