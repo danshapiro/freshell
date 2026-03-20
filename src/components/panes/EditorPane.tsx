@@ -2,6 +2,17 @@ import { useRef, useState, useCallback, useEffect, useMemo, type ChangeEvent } f
 import { Editor } from '@monaco-editor/react'
 import type * as Monaco from 'monaco-editor'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
+
+function getSystemPrefersDark(): boolean {
+  return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false
+}
+
+function useMonacoTheme(): 'vs-dark' | 'vs' {
+  const theme = useAppSelector((s) => s.settings.settings.theme)
+  const isDark =
+    theme === 'dark' ? true : theme === 'light' ? false : getSystemPrefersDark()
+  return isDark ? 'vs-dark' : 'vs'
+}
 import { updatePaneContent } from '@/store/panesSlice'
 import type { EditorPaneContent } from '@/store/paneTypes'
 import EditorToolbar from './EditorToolbar'
@@ -138,6 +149,7 @@ export default function EditorPane({
   viewMode = 'source',
 }: EditorPaneProps) {
   const dispatch = useAppDispatch()
+  const monacoTheme = useMonacoTheme()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const defaultCwd = useAppSelector((s) => s.settings.settings.defaultCwd)
   const mountedRef = useRef(true)
@@ -745,7 +757,7 @@ export default function EditorPane({
             height="100%"
             language={editorLanguage}
             value={editorValue}
-            theme="vs-dark"
+            theme={monacoTheme}
             onMount={handleEditorMount}
             onChange={handleEditorChange}
             options={{

@@ -20,9 +20,10 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 
 // Mock Monaco to avoid loading issues in tests
 vi.mock('@monaco-editor/react', () => {
-  const MonacoMock = ({ value, onChange }: any) => (
+  const MonacoMock = ({ value, onChange, theme }: any) => (
     <textarea
       data-testid="monaco-mock"
+      data-theme={theme}
       value={value}
       onChange={(e: any) => onChange?.(e.target.value)}
     />
@@ -77,12 +78,29 @@ function createRoutedFetch(opts?: {
   }
 }
 
-const createMockStore = () =>
+const createMockStore = (overrides?: { theme?: string }) =>
   configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
     },
+    preloadedState: overrides
+      ? {
+          settings: {
+            settings: {
+              theme: overrides.theme ?? 'system',
+              defaultCwd: '',
+              uiScale: 1.0,
+              terminal: { fontSize: 16 },
+              sidebar: { canarySubstrings: [] },
+              codingCli: { theme: 'auto' },
+              tabs: {},
+              logging: {},
+              agentChat: { providers: {} },
+            },
+          },
+        }
+      : undefined,
   })
 
 describe('EditorPane', () => {
@@ -574,6 +592,46 @@ describe('EditorPane', () => {
         expect.stringContaining('/api/files/read'),
         expect.any(Object)
       )
+    })
+  })
+
+  describe('theme', () => {
+    it('uses vs-dark theme when settings theme is dark', () => {
+      const darkStore = createMockStore({ theme: 'dark' })
+      render(
+        <Provider store={darkStore}>
+          <EditorPane
+            paneId="pane-1"
+            tabId="tab-1"
+            filePath="/test.ts"
+            language="typescript"
+            readOnly={false}
+            content="const x = 1"
+            viewMode="source"
+          />
+        </Provider>
+      )
+
+      expect(screen.getByTestId('monaco-mock').getAttribute('data-theme')).toBe('vs-dark')
+    })
+
+    it('uses vs (light) theme when settings theme is light', () => {
+      const lightStore = createMockStore({ theme: 'light' })
+      render(
+        <Provider store={lightStore}>
+          <EditorPane
+            paneId="pane-1"
+            tabId="tab-1"
+            filePath="/test.ts"
+            language="typescript"
+            readOnly={false}
+            content="const x = 1"
+            viewMode="source"
+          />
+        </Provider>
+      )
+
+      expect(screen.getByTestId('monaco-mock').getAttribute('data-theme')).toBe('vs')
     })
   })
 })
