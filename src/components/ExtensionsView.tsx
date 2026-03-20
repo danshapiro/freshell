@@ -48,10 +48,11 @@ interface ConfigFieldProps {
   item: ManagedItem
   field: ManagedItemConfig
   onConfigChange: (item: ManagedItem, key: string, value: unknown) => void
+  cwdDrafts: Record<string, string>
   cwdErrors: Record<string, string | null>
 }
 
-function ConfigField({ item, field, onConfigChange, cwdErrors }: ConfigFieldProps) {
+function ConfigField({ item, field, onConfigChange, cwdDrafts, cwdErrors }: ConfigFieldProps) {
   const fieldId = `${item.id}-${field.key}`
 
   if (field.type === 'select') {
@@ -99,7 +100,9 @@ function ConfigField({ item, field, onConfigChange, cwdErrors }: ConfigFieldProp
   }
 
   if (field.type === 'path') {
-    const error = cwdErrors[`${item.id}.${field.key}`]
+    const cwdKey = `${item.id}.${field.key}`
+    const error = cwdErrors[cwdKey]
+    const draftValue = cwdDrafts[cwdKey] ?? (field.value as string)
     return (
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
         <label htmlFor={fieldId} className="text-xs text-muted-foreground">{field.label}</label>
@@ -107,7 +110,7 @@ function ConfigField({ item, field, onConfigChange, cwdErrors }: ConfigFieldProp
           <input
             id={fieldId}
             type="text"
-            value={field.value as string}
+            value={draftValue}
             placeholder="e.g. ~/projects/my-app"
             aria-label={field.label}
             aria-invalid={error ? true : undefined}
@@ -147,10 +150,11 @@ interface ExtensionCardProps {
   onToggleExpand: () => void
   onToggleEnabled: (item: ManagedItem, enabled: boolean) => void
   onConfigChange: (item: ManagedItem, key: string, value: unknown) => void
+  cwdDrafts: Record<string, string>
   cwdErrors: Record<string, string | null>
 }
 
-function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConfigChange, cwdErrors }: ExtensionCardProps) {
+function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConfigChange, cwdDrafts, cwdErrors }: ExtensionCardProps) {
   const isRunning = item.kind === 'server' && item.status?.running
 
   return (
@@ -246,6 +250,7 @@ function ExtensionCard({ item, expanded, onToggleExpand, onToggleEnabled, onConf
               item={item}
               field={field}
               onConfigChange={onConfigChange}
+              cwdDrafts={cwdDrafts}
               cwdErrors={cwdErrors}
             />
           ))}
@@ -264,6 +269,7 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
 
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set())
+  const [cwdDrafts, setCwdDrafts] = useState<Record<string, string>>({})
   const [cwdErrors, setCwdErrors] = useState<Record<string, string | null>>({})
   const cwdTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const cwdValidationRef = useRef<Record<string, number>>({})
@@ -283,7 +289,12 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
       const nextProviders = enabled
         ? Array.from(new Set([...enabledProviders, item.id]))
         : enabledProviders.filter((p) => p !== item.id)
-      void dispatch(saveServerSettingsPatch({ codingCli: { enabledProviders: nextProviders } }))
+      // When enabling, also clear extensions.disabled so PanePicker doesn't hide it
+      const patch: Record<string, unknown> = { codingCli: { enabledProviders: nextProviders } }
+      if (enabled && disabledList.includes(item.id)) {
+        patch.extensions = { disabled: disabledList.filter((n) => n !== item.id) }
+      }
+      void dispatch(saveServerSettingsPatch(patch))
     } else {
       const next = enabled
         ? disabledList.filter((n) => n !== item.id)
@@ -343,6 +354,7 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
   const handleConfigChange = useCallback((item: ManagedItem, key: string, value: unknown) => {
     if (item.kind === 'cli') {
       if (key === 'cwd') {
+        setCwdDrafts((prev) => ({ ...prev, [`${item.id}.cwd`]: value as string }))
         scheduleCwdValidation(item.id, key, value as string)
         return
       }
@@ -358,6 +370,18 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
       void dispatch(saveServerSettingsPatch({
         codingCli: { providers: { [item.id]: { [key]: settingValue } } },
       }))
+    } else {
+      // Non-CLI extensions with contentSchema — persist via extension-scoped storage
+      const storeKey = `extensions.${item.id}.${key}`
+      if (typeof value === 'string') {
+        scheduleTextSave(storeKey, {
+          extensions: { contentDefaults: { [item.id]: { [key]: value || undefined } } },
+        } as any)
+      } else {
+        void dispatch(saveServerSettingsPatch({
+          extensions: { contentDefaults: { [item.id]: { [key]: value } } },
+        } as any))
+      }
     }
   }, [dispatch, scheduleCwdValidation, scheduleTextSave])
 
@@ -419,6 +443,7 @@ export default function ExtensionsView({ onNavigate }: ExtensionsViewProps) {
                       onToggleExpand={() => toggleExpand(item.id)}
                       onToggleEnabled={handleToggleEnabled}
                       onConfigChange={handleConfigChange}
+                      cwdDrafts={cwdDrafts}
                       cwdErrors={cwdErrors}
                     />
                   ))}

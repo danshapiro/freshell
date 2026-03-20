@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork } from '@/store/networkSlice'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
+import { api } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
 import { Globe, Check, Copy, Share2 } from 'lucide-react'
@@ -64,8 +65,17 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
     return () => document.removeEventListener('mousedown', handler)
   }, [open])
 
+  const requiresPrivilegedDisable = (
+    networkStatus?.firewall?.platform === 'windows'
+    || networkStatus?.firewall?.platform === 'wsl2'
+  )
+
   const handleToggleRemoteAccess = useCallback(async (enabled: boolean) => {
     try {
+      if (!enabled && requiresPrivilegedDisable) {
+        await api.post('/api/network/disable-remote-access', {})
+        return
+      }
       await dispatch(configureNetwork({
         host: enabled ? '0.0.0.0' : '127.0.0.1',
         configured: true,
@@ -73,7 +83,7 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
     } catch (error) {
       log.warn('Failed to configure remote access', error)
     }
-  }, [dispatch])
+  }, [dispatch, requiresPrivilegedDisable])
 
   const handleCopyUrl = useCallback(() => {
     if (!shareUrl) return
