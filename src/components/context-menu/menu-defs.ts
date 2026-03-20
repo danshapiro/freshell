@@ -37,6 +37,7 @@ export type MenuActions = {
   openSessionInNewTab: (sessionId: string, provider?: string) => void
   openSessionInThisTab: (sessionId: string, provider?: string) => void
   renameSession: (sessionId: string, provider?: string, withSummary?: boolean) => void
+  generateSessionTitle: (sessionId: string, provider?: string) => void
   toggleArchiveSession: (sessionId: string, provider: string | undefined, next: boolean) => void
   deleteSession: (sessionId: string, provider?: string) => void
   copySessionId: (sessionId: string) => void
@@ -74,6 +75,7 @@ export type MenuBuildContext = {
   contextElement: HTMLElement | null
   clickTarget: HTMLElement | null
   actions: MenuActions
+  aiEnabled: boolean
   platform: string | null
   extensions?: ClientExtensionEntry[]
 }
@@ -469,6 +471,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-open-this', label: 'Open in this tab', onSelect: () => actions.openSessionInThisTab(target.sessionId, target.provider) },
       { type: 'item', id: 'session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider) },
+      ...(ctx.aiEnabled
+        ? [{ type: 'item' as const, id: 'session-generate-title', label: 'Generate title', onSelect: () => actions.generateSessionTitle(target.sessionId, target.provider) }]
+        : []),
       {
         type: 'item',
         id: 'session-archive',
@@ -526,7 +531,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     return [
       { type: 'item', id: 'overview-open', label: 'Open/focus terminal', onSelect: () => actions.openTerminal(target.terminalId) },
       { type: 'item', id: 'overview-rename', label: 'Rename', onSelect: () => actions.renameTerminal(target.terminalId) },
-      { type: 'item', id: 'overview-summary', label: 'Generate summary', onSelect: () => actions.generateTerminalSummary(target.terminalId) },
+      ...(ctx.aiEnabled
+        ? [{ type: 'item' as const, id: 'overview-summary', label: 'Generate summary', onSelect: () => actions.generateTerminalSummary(target.terminalId) }]
+        : []),
       { type: 'item', id: 'overview-delete', label: 'Delete terminal', onSelect: () => actions.deleteTerminal(target.terminalId), danger: true },
       { type: 'separator', id: 'overview-sep' },
       { type: 'item', id: 'overview-copy-cwd', label: 'Copy CWD', onSelect: () => actions.copyTerminalCwd(target.terminalId) },

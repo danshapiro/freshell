@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { AI_CONFIG } from './ai-prompts.js'
 import { logger } from './logger.js'
 
 const log = logger.child({ component: 'platform-router' })
@@ -19,6 +20,7 @@ function isTruthy(value: string | undefined): boolean {
 export function detectFeatureFlags(): Record<string, boolean> {
   return {
     kilroy: isTruthy(process.env.KILROY_ENABLED),
+    aiEnabled: AI_CONFIG.enabled(),
   }
 }
 

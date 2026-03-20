@@ -12,6 +12,7 @@ import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
+import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
 import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
@@ -176,6 +177,7 @@ async function main() {
   const tabsRegistryStore = createTabsRegistryStore()
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
+  AI_CONFIG.applySettingsKey(settings.ai?.geminiApiKey)
   const registry = new TerminalRegistry(settings)
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()

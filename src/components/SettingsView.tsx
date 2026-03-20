@@ -24,12 +24,14 @@ import AppearanceSettings from '@/components/settings/AppearanceSettings'
 import WorkspaceSettings from '@/components/settings/WorkspaceSettings'
 import SafetySettings from '@/components/settings/SafetySettings'
 import AdvancedSettings from '@/components/settings/AdvancedSettings'
+import AISettings from '@/components/settings/AISettings'
 
 const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
 
 const sections = [
   { id: 'appearance', label: 'Appearance' },
   { id: 'workspace', label: 'Workspace' },
+  { id: 'ai', label: 'AI' },
   { id: 'safety', label: 'Safety' },
   { id: 'advanced', label: 'Advanced' },
 ] as const
@@ -151,6 +153,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           <div role="tabpanel" aria-label={`${activeSection} settings`}>
             {activeSection === 'appearance' && <AppearanceSettings {...sectionProps} />}
             {activeSection === 'workspace' && <WorkspaceSettings {...sectionProps} />}
+            {activeSection === 'ai' && <AISettings {...sectionProps} />}
             {activeSection === 'safety' && (
               <SafetySettings
                 {...sectionProps}

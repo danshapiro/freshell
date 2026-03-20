@@ -7,6 +7,7 @@ import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
 import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
+import { AI_CONFIG, PROMPTS } from './ai-prompts.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
@@ -31,6 +32,7 @@ export const SessionPatchSchema = z.object({
 
 export interface SessionsRouterDeps {
   configStore: {
+    getSettings: () => Promise<any>
     patchSessionOverride: (key: string, data: any) => Promise<any>
     deleteSession: (key: string) => Promise<void>
   }
@@ -122,6 +124,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
     const next = await configStore.patchSessionOverride(compositeKey, {
       titleOverride: cleanString(titleOverride),
+      ...(cleanString(titleOverride) ? { titleSource: 'user' as const } : {}),
       summaryOverride: cleanString(summaryOverride),
       deleted,
       archived,
@@ -153,6 +156,51 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
     await codingCliIndexer.refresh()
     res.json({ ...next, cascadedTerminalId })
+  })
+
+  router.post('/sessions/:sessionId/generate-title', async (req, res) => {
+    const rawId = req.params.sessionId
+    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
+    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+
+    const firstMessage = typeof req.body?.firstMessage === 'string' ? req.body.firstMessage : ''
+    if (!firstMessage.trim()) {
+      return res.status(400).json({ error: 'firstMessage is required' })
+    }
+
+    if (!AI_CONFIG.enabled()) {
+      return res.status(503).json({ error: 'AI not configured', source: 'none' })
+    }
+
+    try {
+      const settings = await configStore.getSettings()
+      const { generateText } = await import('ai')
+      const { google } = await import('@ai-sdk/google')
+      const promptConfig = PROMPTS.sessionTitle
+      const model = google(promptConfig.model)
+      const prompt = promptConfig.build(firstMessage, settings.ai?.titlePrompt)
+
+      const result = await generateText({
+        model,
+        prompt,
+        maxOutputTokens: promptConfig.maxOutputTokens,
+      })
+
+      const title = (result.text || '').trim().slice(0, 80)
+      if (!title) {
+        return res.json({ title: null, source: 'none' })
+      }
+
+      await configStore.patchSessionOverride(compositeKey, {
+        titleOverride: title,
+        titleSource: 'ai',
+      })
+      await codingCliIndexer.refresh()
+      res.json({ title, source: 'ai' })
+    } catch (err: any) {
+      log.warn({ err }, 'AI title generation failed')
+      res.json({ title: null, source: 'none', error: err.message })
+    }
   })
 
   router.delete('/sessions/:sessionId', async (req, res) => {

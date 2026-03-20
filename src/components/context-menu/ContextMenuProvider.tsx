@@ -107,6 +107,7 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
@@ -436,6 +437,20 @@ export function ContextMenuProvider({
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
+    }
+  }, [dispatch, getSessionInfo, menuState?.target])
+
+  const generateSessionTitle = useCallback(async (sessionId: string, provider?: string) => {
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    if (!info) return
+    const firstMessage = info.session.firstUserMessage || info.session.title || ''
+    if (!firstMessage) return
+    try {
+      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+      await api.post(`/api/sessions/${encodeURIComponent(compositeKey)}/generate-title`, { firstMessage })
+      await dispatch(refreshActiveSessionWindow() as any)
+    } catch {
+      // ignore — AI may not be configured
     }
   }, [dispatch, getSessionInfo, menuState?.target])
 
@@ -875,6 +890,7 @@ export function ContextMenuProvider({
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
+      aiEnabled: Boolean(appSettings.ai?.geminiApiKey) || Boolean(featureFlags.aiEnabled),
       platform,
       extensions: extensionEntries,
       actions: {
@@ -914,6 +930,7 @@ export function ContextMenuProvider({
         openSessionInNewTab,
         openSessionInThisTab,
         renameSession,
+        generateSessionTitle,
         toggleArchiveSession,
         deleteSession,
         copySessionId,
@@ -950,6 +967,8 @@ export function ContextMenuProvider({
     expandedProjects,
     platform,
     extensionEntries,
+    appSettings.ai?.geminiApiKey,
+    featureFlags.aiEnabled,
     newDefaultTab,
     newTabWithPane,
     copyTabNames,

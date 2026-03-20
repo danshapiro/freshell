@@ -116,6 +116,11 @@ export type ServerSettings = {
   sidebar: {
     excludeFirstChatSubstrings: string[]
     excludeFirstChatMustStart: boolean
+    autoGenerateTitles: boolean
+  }
+  ai: {
+    geminiApiKey?: string
+    titlePrompt?: string
   }
   codingCli: CodingCliSettings
   editor: {
@@ -183,6 +188,7 @@ export type ResolvedSettings = {
   logging: ServerSettings['logging']
   safety: ServerSettings['safety']
   sidebar: ServerSettings['sidebar'] & LocalSettings['sidebar']
+  ai: ServerSettings['ai']
   notifications: LocalSettings['notifications']
   codingCli: ServerSettings['codingCli']
   panes: ServerSettings['panes'] & LocalSettings['panes']
@@ -513,6 +519,11 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
     sidebar: z.object({
       excludeFirstChatSubstrings: z.array(z.string()),
       excludeFirstChatMustStart: z.boolean(),
+      autoGenerateTitles: z.boolean(),
+    }).strict(),
+    ai: z.object({
+      geminiApiKey: z.string().optional(),
+      titlePrompt: z.string().optional(),
     }).strict(),
     codingCli: z.object({
       enabledProviders: z.array(CliProviderNameSchema),
@@ -551,6 +562,11 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
     sidebar: z.object({
       excludeFirstChatSubstrings: z.array(z.string()).optional(),
       excludeFirstChatMustStart: z.coerce.boolean().optional(),
+      autoGenerateTitles: z.coerce.boolean().optional(),
+    }).strict().optional(),
+    ai: z.object({
+      geminiApiKey: z.string().nullable().optional(),
+      titlePrompt: z.string().nullable().optional(),
     }).strict().optional(),
     codingCli: z.object({
       enabledProviders: z.array(CliProviderNameSchema).optional(),
@@ -595,6 +611,10 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
     sidebar: {
       excludeFirstChatSubstrings: [],
       excludeFirstChatMustStart: false,
+      autoGenerateTitles: true,
+    },
+    ai: {
+      geminiApiKey: undefined,
     },
     codingCli: {
       enabledProviders: [...DEFAULT_ENABLED_CLI_PROVIDERS],
@@ -717,8 +737,24 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     if (hasOwn(candidate.sidebar, 'excludeFirstChatMustStart')) {
       sidebar.excludeFirstChatMustStart = !!candidate.sidebar.excludeFirstChatMustStart
     }
+    if (hasOwn(candidate.sidebar, 'autoGenerateTitles')) {
+      sidebar.autoGenerateTitles = !!candidate.sidebar.autoGenerateTitles
+    }
     if (Object.keys(sidebar).length > 0) {
       sanitized.sidebar = sidebar
+    }
+  }
+
+  if (isRecord(candidate.ai)) {
+    const ai: ServerSettingsPatch['ai'] = {}
+    if (hasOwn(candidate.ai, 'geminiApiKey')) {
+      ai.geminiApiKey = typeof candidate.ai.geminiApiKey === 'string' ? candidate.ai.geminiApiKey : undefined
+    }
+    if (hasOwn(candidate.ai, 'titlePrompt')) {
+      ai.titlePrompt = typeof candidate.ai.titlePrompt === 'string' ? candidate.ai.titlePrompt : undefined
+    }
+    if (Object.keys(ai).length > 0) {
+      sanitized.ai = ai
     }
   }
 
@@ -875,6 +911,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
         ? !!normalizedPatch.sidebar?.excludeFirstChatMustStart
         : base.sidebar.excludeFirstChatMustStart,
     },
+    ai: mergeDefined(base.ai, normalizedPatch.ai),
     codingCli: {
       ...mergeDefined(base.codingCli, codingCliPatch),
       enabledProviders: hasOwn(codingCliPatch, 'enabledProviders')
@@ -977,6 +1014,7 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
       ...server.sidebar,
       ...local.sidebar,
     },
+    ai: { ...server.ai },
     notifications: { ...local.notifications },
     codingCli: {
       ...server.codingCli,
