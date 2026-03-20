@@ -537,7 +537,7 @@ export default function SafetySettings({
         >
           <Toggle
             checked={remoteAccessToggleChecked}
-            disabled={configuring || networkStatus?.rebinding || remoteAccessPending || firewallRepairInProgress}
+            disabled={configuring || remoteAccessPending || firewallRepairInProgress}
             aria-label="Remote access"
             onChange={async (checked) => {
               setRemoteAccessError(null)

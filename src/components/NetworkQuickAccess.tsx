@@ -1,6 +1,6 @@
 // Quick-access popover for network/remote access status in the sidebar.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork } from '@/store/networkSlice'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
@@ -22,6 +22,20 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const accessUrl = networkStatus?.accessUrl
   const firewall = networkStatus?.firewall
+  const port = networkStatus?.port
+
+  // Derive a localhost URL for local use (accessUrl uses the LAN IP)
+  const localhostUrl = useMemo(() => {
+    if (!accessUrl) return null
+    try {
+      const parsed = new URL(accessUrl)
+      parsed.hostname = 'localhost'
+      if (port) parsed.port = String(port)
+      return parsed.toString()
+    } catch {
+      return null
+    }
+  }, [accessUrl, port])
 
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
@@ -55,21 +69,21 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   }, [dispatch])
 
   const handleCopyUrl = useCallback(() => {
-    if (!accessUrl) return
-    void navigator.clipboard.writeText(accessUrl).then(() => {
+    if (!localhostUrl) return
+    void navigator.clipboard.writeText(localhostUrl).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     })
-  }, [accessUrl])
+  }, [localhostUrl])
 
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault()
-    if (accessUrl) {
-      void navigator.clipboard.writeText(accessUrl)
+    if (localhostUrl) {
+      void navigator.clipboard.writeText(localhostUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     }
-  }, [accessUrl])
+  }, [localhostUrl])
 
   const handleDeviceAccess = useCallback(() => {
     setOpen(false)
@@ -113,12 +127,12 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
             <button
               role="switch"
               aria-checked={remoteAccessEnabled}
-              disabled={configuring || networkStatus?.rebinding}
+              disabled={configuring}
               onClick={() => handleToggleRemoteAccess(!remoteAccessEnabled)}
               className={cn(
                 'relative w-9 h-5 rounded-full transition-colors',
                 remoteAccessEnabled ? 'bg-emerald-500' : 'bg-muted',
-                (configuring || networkStatus?.rebinding) && 'opacity-50 cursor-not-allowed',
+                configuring && 'opacity-50 cursor-not-allowed',
               )}
               aria-label="Toggle remote access"
             >
@@ -145,11 +159,11 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
 
           {remoteAccessEnabled && (
             <>
-              {/* URL with copy */}
-              {accessUrl && (
+              {/* Localhost URL with copy */}
+              {localhostUrl && (
                 <div className="flex items-center gap-1.5">
                   <code className="flex-1 min-w-0 truncate text-xs bg-muted rounded px-2 py-1">
-                    {accessUrl}
+                    {localhostUrl}
                   </code>
                   <button
                     onClick={handleCopyUrl}

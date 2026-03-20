@@ -884,7 +884,7 @@ describe('SettingsView network access section', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  it('disables remote access toggle during rebind', () => {
+  it('keeps remote access toggle enabled during rebind', () => {
     const store = createSettingsViewStore({
       extraPreloadedState: {
         network: createNetworkState({
@@ -897,7 +897,7 @@ describe('SettingsView network access section', () => {
     renderSettingsView(store, { onNavigate: vi.fn() })
     switchSettingsTab('Safety')
 
-    expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeDisabled()
   })
 
   it('disables remote access toggle during configuring', () => {
