@@ -20,6 +20,8 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   const networkStatus = useAppSelector((s) => s.network?.status ?? null)
   const configuring = useAppSelector((s) => s.network?.configuring ?? false)
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
+  const remoteAccessRequested = networkStatus?.remoteAccessRequested ?? remoteAccessEnabled
+  const remoteAccessActive = remoteAccessEnabled || remoteAccessRequested
   const accessUrl = networkStatus?.accessUrl
   const firewall = networkStatus?.firewall
   const port = networkStatus?.port
@@ -101,16 +103,16 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
             onContextMenu={handleContextMenu}
             className={cn(
               'p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center',
-              remoteAccessEnabled ? 'text-emerald-500' : 'text-muted-foreground',
+              remoteAccessActive ? 'text-emerald-500' : 'text-muted-foreground',
             )}
-            aria-label={remoteAccessEnabled ? 'Remote access: enabled' : 'Remote access: disabled'}
+            aria-label={remoteAccessActive ? 'Remote access: enabled' : 'Remote access: disabled'}
             data-testid="network-quick-access"
           >
             <Globe className="h-3.5 w-3.5" />
           </button>
         </TooltipTrigger>
         <TooltipContent side="bottom">
-          {remoteAccessEnabled ? 'Remote access enabled' : 'Remote access disabled'}
+          {remoteAccessActive ? 'Remote access enabled' : 'Remote access disabled'}
         </TooltipContent>
       </Tooltip>
 
@@ -126,12 +128,12 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
             <span className="text-sm">Remote access</span>
             <button
               role="switch"
-              aria-checked={remoteAccessEnabled}
+              aria-checked={remoteAccessActive}
               disabled={configuring}
-              onClick={() => handleToggleRemoteAccess(!remoteAccessEnabled)}
+              onClick={() => handleToggleRemoteAccess(!remoteAccessActive)}
               className={cn(
                 'relative w-9 h-5 rounded-full transition-colors',
-                remoteAccessEnabled ? 'bg-emerald-500' : 'bg-muted',
+                remoteAccessActive ? 'bg-emerald-500' : 'bg-muted',
                 configuring && 'opacity-50 cursor-not-allowed',
               )}
               aria-label="Toggle remote access"
@@ -139,7 +141,7 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
               <div
                 className={cn(
                   'absolute top-0.5 h-4 w-4 rounded-full transition-all bg-white shadow',
-                  remoteAccessEnabled ? 'left-[1.125rem]' : 'left-0.5',
+                  remoteAccessActive ? 'left-[1.125rem]' : 'left-0.5',
                 )}
                 aria-hidden="true"
               />
@@ -150,14 +152,14 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
           <div className="flex items-center gap-2">
             <div className={cn(
               'w-2 h-2 rounded-full',
-              remoteAccessEnabled ? 'bg-emerald-500' : 'bg-zinc-500',
+              remoteAccessActive ? 'bg-emerald-500' : 'bg-zinc-500',
             )} />
             <span className="text-xs text-muted-foreground">
-              {configuring ? 'Configuring...' : remoteAccessEnabled ? 'Connected' : 'Local only'}
+              {configuring ? 'Configuring...' : remoteAccessActive ? 'Connected' : 'Local only'}
             </span>
           </div>
 
-          {remoteAccessEnabled && (
+          {remoteAccessActive && (
             <>
               {/* Localhost URL with copy */}
               {localhostUrl && (
