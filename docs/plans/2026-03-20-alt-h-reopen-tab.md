@@ -48,7 +48,7 @@ We add a new `restoreLayout` reducer to `panesSlice` that:
 - Sets `state.layouts[tabId]` directly to the provided tree
 - Sets `state.paneTitles[tabId]` to the provided titles
 - Sets `state.activePane[tabId]` to the first leaf in the tree
-- Normalizes all leaf content through `normalizePaneContent` (which assigns fresh `createRequestId` values, resets `terminalId` to `undefined`, and sets `status` to `'creating'`)
+- Normalizes all leaf content through a `stripStaleIds` step followed by `normalizePaneContent`. **Important:** `normalizePaneContent` preserves `terminalId`, `createRequestId`, and `browserInstanceId` when they are already valid strings. The `stripStaleIds` step must delete these fields from saved content so that `normalizePaneContent` generates fresh values via `nanoid()`.
 
 This means all terminals in a reopened tab go through the normal creation flow — new PTY processes are spawned. The tab's visual arrangement is restored, but terminal scrollback is not (it was lost when the PTY was destroyed on close). This is correct: the layout is the valuable thing to preserve; scrollback is ephemeral.
 
@@ -62,13 +62,21 @@ Currently `AddTabPayload` does not include `titleSetByUser`. When restoring a cl
 
 ### D5: Pane content normalization on restore resets terminal lifecycle
 
-When a tab is reopened, its pane contents are normalized:
-- `terminalId` is cleared (set to `undefined`) — the old PTY process is gone
-- `createRequestId` gets a fresh value via `nanoid()` — triggers new `terminal.create`
-- `status` is reset to `'creating'`
-- Browser panes get a fresh `browserInstanceId`
-- Editor panes preserve their content and file path
-- Agent-chat panes get fresh `createRequestId` and reset to `'creating'` status
+When a tab is reopened, its pane contents go through a two-step normalization in `normalizeRestoredTree`:
+
+1. **`stripStaleIds`** — removes fields that `normalizePaneContent` would otherwise preserve:
+   - Terminal panes: deletes `terminalId`, `createRequestId`, `status`
+   - Browser panes: deletes `browserInstanceId`
+   - Agent-chat panes: deletes `sessionId`, `createRequestId`, `status`
+   - Editor/picker/extension panes: passed through unchanged
+
+2. **`normalizePaneContent`** — the existing function then fills in fresh values:
+   - `createRequestId` becomes `nanoid()` (was deleted in step 1)
+   - `terminalId` becomes `undefined` (was deleted in step 1)
+   - `status` becomes `'creating'` (was deleted in step 1)
+   - `browserInstanceId` becomes `nanoid()` (was deleted in step 1)
+
+This two-step approach is necessary because `normalizePaneContent` is designed to preserve valid existing IDs (so existing terminals don't get disrupted). Without the strip step, saved content would keep its stale IDs.
 
 This means the tab reopens with its split layout intact, but all terminals start fresh. For coding CLI panes with `resumeSessionId`, the session resume flow will automatically reconnect to the session if it's still running.
 
@@ -79,18 +87,22 @@ This means the tab reopens with its split layout intact, but all terminals start
 ## File Structure
 
 ### New Files
-- `test/unit/client/store/tabsSlice.reopen-tab.test.ts` — Unit tests for the `reopenClosedTab` thunk
-- `test/unit/client/lib/tab-switch-shortcuts.reopen.test.ts` — Unit tests for Alt+H shortcut detection (extends existing test file pattern)
+- `test/unit/client/store/tabsSlice.reopen-tab.test.ts` — Unit tests for the `reopenClosedTab` thunk and registry interaction
+- `test/unit/client/store/panesSlice.restore-layout.test.ts` — Unit tests for `restoreLayout` reducer
 - `test/e2e-browser/specs/reopen-tab.spec.ts` — Playwright E2E test for the full reopen flow
+
+### Modified Test Files
+- `test/unit/client/lib/tab-switch-shortcuts.test.ts` — Add Alt+H shortcut detection tests
+- `test/unit/client/store/tabRegistrySlice.test.ts` — Add reopenStack tests
 
 ### Modified Files
 - `src/lib/tab-switch-shortcuts.ts` — Add `'reopen'` to `TabLifecycleAction`, detect Alt+H
 - `src/lib/keyboard-shortcuts.ts` — Add Alt+H entry to `KEYBOARD_SHORTCUTS` array
 - `src/store/tabRegistrySlice.ts` — Add `reopenStack` state, `pushReopenEntry` and `popReopenEntry` reducers
 - `src/store/tabsSlice.ts` — Add `titleSetByUser` to `AddTabPayload`, create `reopenClosedTab` thunk
-- `src/store/panesSlice.ts` — Add `restoreLayout` reducer
+- `src/store/panesSlice.ts` — Add `restoreLayout` reducer with `stripStaleIds` and `normalizeRestoredTree` helpers
 - `src/App.tsx` — Handle `'reopen'` lifecycle action
-- `src/components/TerminalView.tsx` — Return `false` for Alt+H in xterm custom key handler
+- `src/components/TerminalView.tsx` — No change needed; existing `getTabLifecycleAction` guard already covers Alt+H after Task 1
 
 ---
 
@@ -508,15 +520,38 @@ restoreLayout: (
 },
 ```
 
-Add two helper functions before the slice definition:
+Add three helper functions before the slice definition:
 
 ```typescript
+/**
+ * Strip lifecycle IDs from saved pane content so normalizePaneContent
+ * generates fresh values. Without this, normalizePaneContent would
+ * preserve the stale terminalId, createRequestId, browserInstanceId,
+ * and sessionId from the saved layout.
+ */
+function stripStaleIds(content: PaneContent): PaneContentInput {
+  if (content.kind === 'terminal') {
+    const { terminalId, createRequestId, status, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'browser') {
+    const { browserInstanceId, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'agent-chat') {
+    const { sessionId, createRequestId, status, ...rest } = content
+    return rest
+  }
+  // editor, picker, extension — pass through unchanged
+  return content
+}
+
 function normalizeRestoredTree(node: PaneNode): PaneNode {
   if (node.type === 'leaf') {
     return {
       type: 'leaf',
       id: node.id,
-      content: normalizePaneContent(node.content),
+      content: normalizePaneContent(stripStaleIds(node.content)),
     }
   }
   return {
@@ -831,46 +866,20 @@ git commit -m "feat: wire Alt+H to reopenClosedTab dispatch in App.tsx"
 
 ---
 
-### Task 6: Terminal Passthrough — xterm returns `false` for Alt+H
+### Task 6: Terminal Passthrough & Keyboard Shortcuts Display
 
-**Files:**
-- Modify: `src/components/TerminalView.tsx`
-
-- [ ] **Step 1: Verify the existing passthrough pattern**
-
-The existing code in `TerminalView.tsx` already has a block (around line 1166):
+**Note on terminal passthrough:** The existing code in `TerminalView.tsx` (around line 1166) already has:
 ```typescript
 if (getTabLifecycleAction(event)) {
   return false
 }
 ```
-
-Because we added `'reopen'` to the `TabLifecycleAction` type and `KeyH` to the detection function in Task 1, this existing block already handles Alt+H correctly — `getTabLifecycleAction` will return `'reopen'` for Alt+H, and the handler returns `false`, preventing xterm from consuming the keystroke.
-
-No code change is needed. Verify by checking the existing logic.
-
-- [ ] **Step 2: Write a test to confirm the passthrough behavior**
-
-The passthrough behavior is implicitly tested by the shortcut detection tests in Task 1 (the function returns a truthy value for Alt+H, causing the `if` to trigger and return `false`). No separate test file is needed.
-
-- [ ] **Step 3: Commit (no changes needed — document verification)**
-
-No commit needed; the existing code handles this case after Task 1's changes.
-
----
-
-### Task 7: Keyboard Shortcuts Display — Add Alt+H entry
+Because Task 1 added `'reopen'` to `TabLifecycleAction` and `KeyH` to the detection function, this existing block already handles Alt+H correctly — no code change needed. The shortcut detection tests in Task 1 implicitly cover this (the function returns a truthy value for Alt+H, causing `return false`).
 
 **Files:**
 - Modify: `src/lib/keyboard-shortcuts.ts`
 
-- [ ] **Step 1: Write the failing test**
-
-Check if there are existing tests for the KEYBOARD_SHORTCUTS array:
-
-There are no dedicated tests for the keyboard-shortcuts registry (it's a static data declaration). We verify this visually in the e2e test.
-
-- [ ] **Step 2: Add the entry**
+- [ ] **Step 1: Add the keyboard shortcuts display entry**
 
 In `src/lib/keyboard-shortcuts.ts`, add after the `Alt+W` entry:
 
@@ -878,7 +887,9 @@ In `src/lib/keyboard-shortcuts.ts`, add after the `Alt+W` entry:
 { keys: ['Alt', 'H'], description: 'Reopen closed tab', category: 'tabs' },
 ```
 
-- [ ] **Step 3: Commit**
+No unit test is needed for this static data declaration — it will be verified through the E2E test in Task 8.
+
+- [ ] **Step 2: Commit**
 
 ```bash
 git add src/lib/keyboard-shortcuts.ts
@@ -887,7 +898,7 @@ git commit -m "feat: add Alt+H to KEYBOARD_SHORTCUTS display array"
 
 ---
 
-### Task 8: Registry Interaction — Closed entry removed from localClosed on reopen
+### Task 7: Registry Interaction — Closed entry removed from localClosed on reopen
 
 **Files:**
 - Modify: `src/store/tabsSlice.ts`
@@ -962,7 +973,7 @@ git commit -m "feat: clear localClosed entry when reopening a closed tab"
 
 ---
 
-### Task 9: Playwright E2E Browser Integration Test
+### Task 8: Playwright E2E Browser Integration Test
 
 **Files:**
 - Create: `test/e2e-browser/specs/reopen-tab.spec.ts`
@@ -1031,7 +1042,7 @@ test.describe('Reopen Closed Tab (Alt+H)', () => {
 - [ ] **Step 2: Run the E2E test**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts test/e2e-browser/specs/reopen-tab.spec.ts`
-Expected: PASS (since all implementation is already in place from Tasks 1-8)
+Expected: PASS (since all implementation is already in place from Tasks 1-7)
 
 - [ ] **Step 3: Commit**
 
@@ -1042,7 +1053,7 @@ git commit -m "test: add Playwright E2E test for Alt+H reopen closed tab"
 
 ---
 
-### Task 10: Run Full Test Suite and Refactor
+### Task 9: Run Full Test Suite and Refactor
 
 - [ ] **Step 1: Run the full unit test suite**
 
@@ -1062,10 +1073,11 @@ Expected: No lint violations.
 - [ ] **Step 4: Review for refactoring opportunities**
 
 Check:
-- Are the new helpers (`normalizeRestoredTree`, `findFirstLeafId`) well-placed?
+- Are the new helpers (`stripStaleIds`, `normalizeRestoredTree`, `findFirstLeafId`) well-placed?
 - Is the deep-copy in `closeTab` (via `JSON.parse(JSON.stringify(...))`) clean enough, or should we use `structuredClone`?
 - Are the test assertions specific enough?
 - Are there any remaining `any` types that should be narrowed?
+- Does `stripStaleIds` cover all current pane content kinds? (Check against `PaneContent` union type)
 
 - [ ] **Step 5: Apply refactoring and commit**
 
