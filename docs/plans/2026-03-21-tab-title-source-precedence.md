@@ -27,7 +27,7 @@ After this lands:
 3. `terminal.title.updated`, history/session rename flows, copied-tab snapshot titles, prompt-derived coding-CLI titles, and explicit rename flows are the durable path.
 4. `titleSource` and `paneTitleSources` are authoritative durable state. `titleSetByUser` and `paneTitleSetByUser` remain compatibility mirrors derived from them until a later cleanup.
 5. `addTab({ title })` must not infer `stable` just because the string is non-default. Durable titles are opt-in at the call sites that truly own them.
-6. Durable pane title updates clear any runtime title for that pane. Content replacement and terminal exit also clear runtime titles for affected panes.
+6. Durable pane title updates clear any runtime title for that pane. Content replacement, terminal identity changes within a pane, and terminal exit also clear runtime titles for affected panes.
 7. Derived pane titles can be recomputed on content replacement. Stable and user pane titles must survive non-destructive lifecycle updates.
 8. Tab-label and pane-header helpers must use separate runtime-eligibility rules: tab labels may only read runtime titles for the matching single-pane live pane, while pane headers may read runtime titles for their own pane.
 9. Legacy persisted state missing source metadata must normalize explicitly instead of guessing ad hoc: `user` when the legacy boolean is true; otherwise `derived` only when the stored title still matches the default/current derived title for that entity, else `stable`.
@@ -93,7 +93,7 @@ No user decision is required.
 - `src/components/context-menu/ContextMenuProvider.tsx` — same display-title inputs plus stable-title rename/attach handling
 - `src/components/TerminalView.tsx` — raw xterm titles write only to the runtime-title slice; durable title events use the shared stable thunk; exit clears runtime titles
 - `src/components/HistoryView.tsx` — session rename path uses the durable stable terminal-id sync thunk
-- `src/components/OverviewView.tsx` — durable terminal titles use explicit stable sources
+- `src/components/OverviewView.tsx` — durable terminal attach/open titles use explicit stable sources, and terminal rename flows write the correct durable source
 - `src/components/BackgroundSessions.tsx` — durable attach titles use explicit stable sources
 - `src/components/TabsView.tsx` — copied tab/pane snapshot titles use explicit stable sources
 - `src/components/SetupWizard.tsx` — fixed workflow tab title uses explicit stable source
@@ -129,6 +129,8 @@ No user decision is required.
 - `test/unit/client/layout-mirror-middleware.test.ts`
 - `test/unit/server/agent-layout-schema.test.ts`
 - `test/unit/server/agent-layout-store-write.test.ts`
+- `test/unit/client/components/OverviewView.test.tsx`
+- `test/unit/client/components/BackgroundSessions.test.tsx`
 - `test/unit/client/components/TabsView.test.tsx`
 - `test/e2e/title-sync-flow.test.tsx`
 
@@ -306,7 +308,7 @@ Add focused cases for:
 - `restoreLayout()` accepting and restoring `paneTitleSources`
 - reopen restoring both `paneTitles` and `paneTitleSources`
 - pane persistence/cross-tab hydration round-tripping `paneTitleSources`
-- runtime titles living in `paneRuntimeTitleSlice` only, clearing on close/remove/exit/content replacement, and never appearing in persisted raw payloads
+- runtime titles living in `paneRuntimeTitleSlice` only, clearing on close/remove/exit/content replacement/terminal-id replacement, and never appearing in persisted raw payloads
 
 - [ ] **Step 2: Run the pane-focused tests and confirm they fail**
 
@@ -330,7 +332,7 @@ Update `src/store/paneTypes.ts`, `src/store/panesSlice.ts`, and `src/store/paneR
 - initialize new panes as `derived`
 - make `splitPane`, `addPane`, `swapPanes`, `replacePane`, `closePane`, `removeLayout`, and `restoreLayout` move/clear `paneTitleSources` exactly alongside `paneTitles`
 - create `paneRuntimeTitleSlice` keyed by pane id, with actions/thunks for setting and clearing runtime titles by pane id and by terminal id
-- clear runtime titles on content replacement, pane close, tab close, layout removal, and terminal exit
+- clear runtime titles on content replacement, pane close, tab close, layout removal, terminal exit, and any terminal-id change that rebinds a pane to a different live terminal
 
 Update persistence/hydration:
 
@@ -458,6 +460,8 @@ git commit -m "refactor: resolve visible titles by source precedence"
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
 - Modify: `test/unit/client/components/TerminalView.test.tsx`
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+- Modify: `test/unit/client/components/OverviewView.test.tsx`
+- Modify: `test/unit/client/components/BackgroundSessions.test.tsx`
 - Modify: `test/unit/client/store/codingCliThunks.test.ts`
 - Modify: `test/unit/client/ui-commands.test.ts`
 - Modify: `test/unit/client/components/TabsView.test.tsx`
@@ -471,15 +475,15 @@ Replace the old “last raw xterm title wins” expectations with focused cases 
 - raw runtime titles updating only the runtime-title slice
 - durable stable titles surviving later runtime titles
 - exit decoration applying only to derived/default visible titles
-- `openSessionTab()` upgrading new tabs and eligible existing derived session tabs to `stable` when it is handed an explicit session title
-- `openSessionTab`, `createCodingCliTab`, `tab.create`, background attach, overview attach, copied-tab open, and fixed workflow tabs opting into `stable` when they provide meaningful durable names
+- `openSessionTab()` upgrading new tabs and both existing-tab branches (`terminalId` lookup and session-layout lookup) to `stable` when they are handed an explicit session title and the current title is still derived
+- `openSessionTab`, `createCodingCliTab`, `tab.create`, background attach, overview attach, overview terminal rename, copied-tab open, and fixed workflow tabs using the intended durable source when they provide meaningful names
 
 - [ ] **Step 2: Run the wiring-focused tests and confirm they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
+npm run test:vitest -- --run test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
 ```
 
 Expected: FAIL because `TerminalView` still writes raw runtime titles into durable title state and durable-title seed call sites are still using derived defaults.
@@ -504,25 +508,25 @@ That thunk must:
 Then wire the runtime/stable event paths:
 
 - `src/store/paneTitleSync.ts` re-exports or wraps the durable thunk so old imports stay valid
-- `src/components/TerminalView.tsx` routes raw xterm titles into the runtime-title slice only, routes `terminal.title.updated` through the durable stable thunk, and clears runtime titles on exit/content loss
+- `src/components/TerminalView.tsx` routes raw xterm titles into the runtime-title slice only, routes `terminal.title.updated` through the durable stable thunk, and clears runtime titles on exit/content loss/terminal-id rebinding
 
 Audit durable-title seeds and opt them into `titleSource: 'stable'` explicitly:
 
-- `openSessionTab()` in `src/store/tabsSlice.ts`, including the “existing matching tab” path when it is still on a derived title and the caller supplied an explicit stable session title
+- `openSessionTab()` in `src/store/tabsSlice.ts`, including both existing-tab branches: the `terminalId` match path and the session-layout “existing matching tab” path when they are still on a derived title and the caller supplied an explicit stable session title
 - `createCodingCliTab()` in `src/store/codingCliThunks.ts`
 - `tab.create` with an explicit title in `src/lib/ui-commands.ts`
 - terminal attach/open flows in `src/components/OverviewView.tsx`
 - detached terminal attach in `src/components/BackgroundSessions.tsx`
 - copied tab/pane snapshot flows in `src/components/TabsView.tsx`
 - fixed workflow tabs in `src/components/SetupWizard.tsx` and `src/components/settings/SafetySettings.tsx`
-- terminal/session rename flows in `src/components/HistoryView.tsx` and `src/components/context-menu/ContextMenuProvider.tsx`
+- terminal/session rename flows in `src/components/HistoryView.tsx`, `src/components/context-menu/ContextMenuProvider.tsx`, and `src/components/OverviewView.tsx`
 
 - [ ] **Step 4: Run the wiring-focused tests green, including the original regressions**
 
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
+npm run test:vitest -- --run test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
 npm run test:e2e:chromium -- test/e2e-browser/specs/tab-title-source-precedence.spec.ts
 ```
 
@@ -531,7 +535,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/titleSync.ts src/store/paneTitleSync.ts src/store/tabsSlice.ts src/components/TerminalView.tsx src/components/HistoryView.tsx src/components/OverviewView.tsx src/components/BackgroundSessions.tsx src/components/TabsView.tsx src/components/SetupWizard.tsx src/components/settings/SafetySettings.tsx src/store/codingCliThunks.ts src/lib/ui-commands.ts src/components/context-menu/ContextMenuProvider.tsx test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
+git add src/store/titleSync.ts src/store/paneTitleSync.ts src/store/tabsSlice.ts src/components/TerminalView.tsx src/components/HistoryView.tsx src/components/OverviewView.tsx src/components/BackgroundSessions.tsx src/components/TabsView.tsx src/components/SetupWizard.tsx src/components/settings/SafetySettings.tsx src/store/codingCliThunks.ts src/lib/ui-commands.ts src/components/context-menu/ContextMenuProvider.tsx test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/tabsSlice.test.ts
 git commit -m "fix: preserve durable titles over runtime terminal titles"
 ```
 
