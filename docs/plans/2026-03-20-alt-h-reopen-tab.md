@@ -814,7 +814,7 @@ git commit -m "feat: add reopenClosedTab thunk with LIFO reopen stack"
 
 **Files:**
 - Modify: `src/App.tsx`
-- Test: `test/unit/client/components/App.test.tsx` (add test to existing file)
+- Test: Verified through Playwright E2E test (Task 8) — no separate unit test file
 
 - [ ] **Step 1: Write the failing test for Alt+H dispatching reopenClosedTab**
 
@@ -828,9 +828,9 @@ it('dispatches reopenClosedTab on Alt+H', async () => {
 })
 ```
 
-However, testing the full App component with Redux integration is complex. Instead, verify this through the existing e2e test (Task 7). For the unit level, the shortcut detection is already covered in Task 1. The wiring in App.tsx is a thin integration layer.
+However, testing the full App component with Redux integration is complex. Instead, verify this through the Playwright e2e test (Task 8). For the unit level, the shortcut detection is already covered in Task 1. The wiring in App.tsx is a thin integration layer.
 
-Given the App.tsx test complexity, we will verify App-level dispatch correctness through the e2e-browser test in Task 7.
+Given the App.tsx test complexity, we will verify App-level dispatch correctness through the e2e-browser test in Task 8.
 
 - [ ] **Step 2: Implement Alt+H handling in App.tsx**
 
@@ -987,7 +987,7 @@ import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Reopen Closed Tab (Alt+H)', () => {
   test('reopens the most recently closed tab with Alt+H in LIFO order', async ({ freshellPage, page, harness }) => {
-    // Start with one tab
+    // Start with one tab (shell, created by freshellPage fixture)
     await harness.waitForTabCount(1)
 
     // Create a second tab via Alt+T
@@ -1036,6 +1036,59 @@ test.describe('Reopen Closed Tab (Alt+H)', () => {
     const state = await harness.getState()
     expect(state.tabs.tabs).toHaveLength(1)
   })
+
+  test('reopens tab with browser pane and preserves split layout', async ({ freshellPage, page, harness, terminal }) => {
+    // Wait for the initial terminal
+    await terminal.waitForTerminal()
+
+    // Create a browser pane via context menu split
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+    const browserButton = page.getByRole('button', { name: /^Browser$/i })
+    await expect(browserButton).toBeVisible({ timeout: 10_000 })
+    await browserButton.click()
+    await expect(page.getByPlaceholder('Enter URL...')).toBeVisible({ timeout: 10_000 })
+
+    // Verify split layout with terminal + browser before close
+    const state1 = await harness.getState()
+    const tabId = state1.tabs.activeTabId
+    const layoutBefore = state1.panes.layouts[tabId]
+    expect(layoutBefore.type).toBe('split')
+    const hasBrowser = layoutBefore.children.some((c: any) =>
+      c.type === 'leaf' && c.content?.kind === 'browser'
+    )
+    expect(hasBrowser).toBe(true)
+
+    // Create a second tab (so closing the first doesn't leave zero tabs)
+    await page.keyboard.press('Alt+t')
+    await harness.waitForTabCount(2)
+
+    // Switch back to first tab and close it
+    const firstTabLocator = page.locator('[data-context="tab"]').first()
+    await firstTabLocator.click()
+    await page.keyboard.press('Alt+w')
+    await harness.waitForTabCount(1)
+
+    // Reopen — the tab with the split layout should return
+    await page.keyboard.press('Alt+h')
+    await harness.waitForTabCount(2)
+
+    const state2 = await harness.getState()
+    const reopenedTabId = state2.tabs.activeTabId
+    const layoutAfter = state2.panes.layouts[reopenedTabId]
+    expect(layoutAfter.type).toBe('split')
+    const hasBrowserAfter = layoutAfter.children.some((c: any) =>
+      c.type === 'leaf' && c.content?.kind === 'browser'
+    )
+    expect(hasBrowserAfter).toBe(true)
+    // Terminal pane should have fresh IDs (stale ones stripped)
+    const termPane = layoutAfter.children.find((c: any) =>
+      c.type === 'leaf' && c.content?.kind === 'terminal'
+    )
+    expect(termPane).toBeDefined()
+    expect(termPane.content.status).toBe('creating')
+  })
 })
 ```
 
@@ -1055,22 +1108,18 @@ git commit -m "test: add Playwright E2E test for Alt+H reopen closed tab"
 
 ### Task 9: Run Full Test Suite and Refactor
 
-- [ ] **Step 1: Run the full unit test suite**
+- [ ] **Step 1: Run typecheck and the full coordinated test suite**
 
-Run: `npm run test:vitest -- --run`
-Expected: All existing tests pass, no regressions.
+Run: `npm run check`
+This runs `tsc --noEmit` followed by the coordinated full test suite (unit + integration).
+Expected: No type errors, all existing tests pass, no regressions.
 
-- [ ] **Step 2: Run typecheck**
-
-Run: `npx tsc --noEmit`
-Expected: No type errors.
-
-- [ ] **Step 3: Run lint**
+- [ ] **Step 2: Run lint**
 
 Run: `npm run lint`
 Expected: No lint violations.
 
-- [ ] **Step 4: Review for refactoring opportunities**
+- [ ] **Step 3: Review for refactoring opportunities**
 
 Check:
 - Are the new helpers (`stripStaleIds`, `normalizeRestoredTree`, `findFirstLeafId`) well-placed?
@@ -1079,7 +1128,7 @@ Check:
 - Are there any remaining `any` types that should be narrowed?
 - Does `stripStaleIds` cover all current pane content kinds? (Check against `PaneContent` union type)
 
-- [ ] **Step 5: Apply refactoring and commit**
+- [ ] **Step 4: Apply refactoring and commit**
 
 ```bash
 git add -A
