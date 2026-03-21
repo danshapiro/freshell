@@ -130,6 +130,9 @@ describe('settings devices management flow (e2e)', () => {
       </Provider>,
     )
 
+    // Devices section is in the Safety tab
+    fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
+
     expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
 
     const devicesHeading = screen.getByText('Devices')
