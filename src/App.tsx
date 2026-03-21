@@ -6,7 +6,7 @@ import {
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { addTab, closeTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { addTab, closeTab, switchToNextTab, switchToPrevTab, reopenClosedTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
   fetchSessionWindow,
@@ -937,6 +937,8 @@ export default function App() {
         e.preventDefault()
         if (lifecycleAction === 'new') {
           dispatch(addTab())
+        } else if (lifecycleAction === 'reopen') {
+          dispatch(reopenClosedTab())
         } else {
           const activeTabId = appStore.getState().tabs.activeTabId
           if (activeTabId) dispatch(closeTab(activeTabId))
