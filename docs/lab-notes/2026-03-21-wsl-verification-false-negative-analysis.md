@@ -1,112 +1,122 @@
-# WSL Verification False Negative Analysis
+# WSL Verification and Repair False Positive Analysis
 
 ## Scope
 
-This note revisits the `WSL2 port forwarding verification failed` error logged on 2026-03-20. The earlier draft identified a plausible failure path. This revision narrows the claims to what the logs, code, repo history, live machine state, and Microsoft documentation support directly.
+This note examines the `WSL2 port forwarding verification failed` error logged on 2026-03-20 and the broader WSL repair state that Freshell reports on this machine today. The goal is to separate incident facts from current reproducible facts, then reassess which change the evidence supports.
 
-## March 20 Evidence
+## March 20 Incident Evidence
 
-The pasted production logs establish these facts:
+The original pasted log is present in the rotated production log at:
 
-- Freshell 0.6.0 was running in `env: "production"`.
-- The startup banner reported: `Remote access is active but needs firewall/port-forward repair.`
-- `POST /api/network/configure-firewall` later logged `WSL2 port forwarding failed`.
-- The thrown error message was `WSL2 port forwarding verification failed`.
+- `~/.freshell/logs/20260321-1440-01-server-debug.production.3001.jsonl`
 
-The last point has a precise meaning in the current code. `verifyWslRepairSuccess()` in `server/network-router.ts` recomputes the WSL plan and throws that exact error only when `computeWslPortForwardingPlanAsync(...)` returns `status: 'ready'`.
+The relevant sequence is:
 
-That is the only incident level conclusion the log proves by itself:
+- `2026-03-20T23:40:55.028Z` `POST /api/network/configure-firewall` returned `200` with `contentLength: "265"`
+- `2026-03-20T23:40:58.142Z` the confirmed retry returned `200` with `contentLength: "36"`
+- `2026-03-20T23:41:02.305Z` Freshell logged `WSL2 port forwarding verification failed`
 
-- At verification time on 2026-03-20, Freshell still believed repair was needed.
+That sequence matches the current `network-router.ts` control flow:
 
-The log does not identify which input kept the plan in `ready`. It does not record the managed-port file contents, the live `portproxy` state, or the live `FreshellLANAccess` rule at that moment.
+1. First request returns the confirmation-required response.
+2. Confirmed retry starts the elevated repair.
+3. The elevated callback returns without a process error.
+4. `verifyWslRepairSuccess()` throws.
+
+The incident log proves one narrow fact:
+
+- At verification time on 2026-03-20, `computeWslPortForwardingPlanAsync(...)` still returned `status: 'ready'`.
+
+The incident log does not prove why the plan stayed in `ready`. It does not record:
+
+- the WSL managed-port file contents
+- the live `portproxy` table
+- the live `FreshellLANAccess` rule
+- the elevated PowerShell child stdout or stderr
 
 ## Current Code Facts
 
-`startElevatedRepair()` in `server/network-router.ts` runs its steps in this order:
+`startElevatedRepair()` in `server/network-router.ts` runs repair steps in this order:
 
-1. Start elevated PowerShell.
-2. Await the child callback.
-3. Run `verifySuccess()`.
-4. Only after verification passes, run `onSuccess()`.
+1. start elevated PowerShell
+2. await the child callback
+3. run `verifySuccess()`
+4. log success
+5. run `onSuccess()`
 
 For WSL repair:
 
-- `verifySuccess()` is `verifyWslRepairSuccess()`.
-- `onSuccess()` calls `persistManagedWslRemoteAccessPorts(networkManager.getRemoteAccessPorts())`.
+- `verifySuccess()` is `verifyWslRepairSuccess()`
+- `onSuccess()` calls `persistManagedWslRemoteAccessPorts(networkManager.getRemoteAccessPorts())`
 
-That means WSL verification always reads the pre-repair managed-port file, not the post-success one.
+That means WSL verification reads the managed-port file before Freshell rewrites it for the current port set.
 
-`buildWslPortForwardingPlan()` in `server/wsl-port-forward.ts` computes:
+`verifyWslRepairSuccess()` does not inspect live Windows state directly. It simply reruns the same planner used elsewhere:
+
+```ts
+const plan = await computeWslPortForwardingPlanAsync(
+  networkManager.getRemoteAccessPorts(),
+  networkManager.getRelevantPorts(),
+)
+if (plan.status === 'ready') {
+  throw new Error('WSL2 port forwarding verification failed')
+}
+```
+
+The planner in `server/wsl-port-forward.ts` treats stale managed metadata as repair-needed drift:
 
 ```ts
 const staleOwnedPorts = Array.from(new Set([...existingFirewallPorts, ...managedPorts]))
   .filter((port) => !requiredPortSet.has(port))
-```
 
-Later it sets:
-
-```ts
 const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
   || staleOwnedPorts.length > 0
 ```
 
-Two direct consequences follow from that code:
+Two direct consequences follow:
 
-- `managedPorts` metadata alone can make the planner return `ready`.
-- A metadata-only mismatch produces `scriptKind: 'firewall-only'`, because the stale port is not required to exist in `portproxy`.
+- a stale entry in `managedPorts` can keep the plan in `ready` even if Windows is already correct
+- when that happens without stale `portproxy` rules, the plan becomes `scriptKind: 'firewall-only'`
 
-## Managed File Semantics
+## WSL Managed File Semantics
 
 The WSL managed-port file is global:
 
-- `server/wsl-port-forward.ts` writes to `~/.freshell/wsl-managed-remote-access-ports.json`
-- The file path does not include `process.cwd()`, server port, or any instance key
+- `server/wsl-port-forward.ts` reads and writes `~/.freshell/wsl-managed-remote-access-ports.json`
+- the path does not include `process.cwd()`, server port, or any other instance key
 
-The only production writers in this repo are:
+The equivalent Windows bookkeeping is different. Managed Windows firewall ports are stored per instance in `server/network-manager.ts`, keyed by `process.cwd()` and server port.
 
-- `persistManagedWslRemoteAccessPorts(...)`
-- `clearManagedWslRemoteAccessPorts()`
+This asymmetry matters because Freshell commonly runs in two modes:
 
-Both are called from `server/network-router.ts`.
+- production on port `3001`
+- dev on server port `3002` with Vite on `5173`
 
-This rules out arbitrary third-party writers inside the repo. If the file changes unexpectedly, the cause is another Freshell process, an earlier Freshell run, or manual filesystem changes.
+In dev mode, `NetworkManager.getRemoteAccessPorts()` returns the dev port. A successful dev-mode WSL repair therefore persists `[5173]` to the global WSL managed-port file.
 
-The Windows bookkeeping added later in `server/network-manager.ts` is different. It writes managed Windows ports to a per-instance file keyed by `process.cwd()` and server port. WSL bookkeeping has no equivalent scoping.
+The machine has local evidence of dev-mode Freshell use with `5173`:
 
-That asymmetry matters because Freshell commonly runs in two modes:
+- shell history contains repeated `PORT=3002 VITE_PORT=5173 npm run dev` commands in Freshell worktrees
 
-- Production mode on port `3001`
-- Dev mode with server port `3002` and Vite on `5173`
+That confirms this host has run Freshell in the mode that writes `[5173]`. It does not prove those commands occurred before the 2026-03-20 incident, because the shell history is not timestamped.
 
-In dev mode, `NetworkManager.getRemoteAccessPorts()` returns the dev port, not the API port. A successful WSL repair from a dev server therefore persists `[5173]` to the global WSL managed-port file.
+The current managed-port file also cannot be treated as a snapshot of March 20. Its current mtime is `2026-03-21 16:28:36 -0700`, which is after the incident.
 
-That does not prove a dev server caused the 2026-03-20 incident. It does prove that a stale `5173` value is structurally consistent with Freshell's own dev-mode behavior.
+## Live System Reproduction
 
-## Live System Facts
+The strongest evidence comes from the current machine state on 2026-03-21.
 
-The current machine state on 2026-03-21 provides a direct reproduction on real Windows and WSL state, not a mocked test harness.
+### Platform state
 
-### Platform mode
-
-- `wsl.exe --status` reports default version `2`
-- `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe` shows this `.wslconfig`:
-
-```ini
-[wsl2]
-networkingMode=nat
-localhostForwarding=true
-maxCrashDumpCount=2
-defaultVhdSize=500GB
-```
-
+- `wsl.exe --status` reports WSL version `2`
+- `.wslconfig` sets `networkingMode=nat`
 - `ip -4 addr show eth0` reports `172.30.149.249/20`
 
-This machine is running the NAT style WSL setup that Freshell's `portproxy` workflow targets.
+This is the WSL NAT setup that Freshell's `portproxy` workflow targets.
 
 ### Live Windows state
 
-At the time of investigation:
+At investigation time:
 
 - `netsh interface portproxy show v4tov4` included `0.0.0.0 3001 -> 172.30.149.249 3001`
 - `netsh advfirewall firewall show rule name=FreshellLANAccess` showed `LocalPort: 3001`
@@ -122,14 +132,13 @@ At the time of investigation:
 
 ### Live planner result
 
-With the live Windows state above, `computeWslPortForwardingPlanAsync([3001], [3001])` returned:
+With that live Windows state, `computeWslPortForwardingPlanAsync([3001], [3001])` returned:
 
 ```json
 {
   "status": "ready",
   "wslIp": "172.30.149.249",
-  "scriptKind": "firewall-only",
-  "script": "netsh advfirewall firewall delete rule name=FreshellLANAccess 2>$null; netsh advfirewall firewall add rule name=FreshellLANAccess dir=in action=allow protocol=tcp localport=3001 profile=private"
+  "scriptKind": "firewall-only"
 }
 ```
 
@@ -137,103 +146,205 @@ I then changed only the managed-port file to `[3001]`, reran the same planner ca
 
 ```json
 {
-  "managed": [
-    3001
-  ],
-  "plan": {
-    "status": "noop",
-    "wslIp": "172.30.149.249"
+  "status": "noop",
+  "wslIp": "172.30.149.249"
+}
+```
+
+Between those two calls, the following inputs were unchanged:
+
+- the WSL IP
+- the Windows `portproxy` rule for `3001`
+- the Windows `FreshellLANAccess` rule for `3001`
+
+That proves a metadata-only mismatch is sufficient to keep the WSL planner in `ready` on the real machine.
+
+## Live API Reproduction
+
+The same stale-file change also flips the running production server's user-visible repair state.
+
+With the current managed file set to `[5173]`, `GET /api/network/status` returned:
+
+```json
+{
+  "remoteAccessEnabled": true,
+  "remoteAccessRequested": true,
+  "remoteAccessNeedsRepair": true,
+  "firewall": {
+    "platform": "wsl2",
+    "portOpen": false,
+    "configuring": false,
+    "commands": []
   }
 }
 ```
 
-The live Windows `portproxy` rule, the live firewall rule, and the WSL IP were unchanged between those runs.
+In the same state, `POST /api/network/configure-firewall` returned:
 
-This is a direct proof on the real machine:
+```json
+{
+  "method": "confirmation-required"
+}
+```
 
-- Live Windows state can already match the required `3001` exposure.
-- The planner can still return `ready`.
-- Changing only the managed-port file is sufficient to flip the result from `ready` to `noop`.
+After changing only the managed-port file to `[3001]`, with no Windows networking changes, the same production server returned:
 
-The `scriptKind` detail matters. The current Windows host also has unrelated stale `0.0.0.0` `portproxy` rules for other ports, but the planner returned `firewall-only`, not `full`. That shows those extra rules were not the reason this specific call stayed in `ready`.
+```json
+{
+  "remoteAccessEnabled": true,
+  "remoteAccessRequested": true,
+  "remoteAccessNeedsRepair": false,
+  "firewall": {
+    "platform": "wsl2",
+    "portOpen": true,
+    "configuring": false,
+    "commands": []
+  }
+}
+```
 
-## Repo History
+In that state, `POST /api/network/configure-firewall` returned:
 
-The relevant behavior landed in three steps on 2026-03-13:
+```json
+{
+  "method": "none",
+  "message": "No configuration changes required"
+}
+```
 
-- `f47f1066` `Fix WSL teardown lock and drift handling`
-  - introduced the WSL managed-port file
-  - added `persistManagedWslRemoteAccessPorts(...)` as a WSL repair `onSuccess()` step
-- `175879b6` `Clean up stale dev remote access ports`
-  - changed `buildWslPortForwardingPlan()` so stale `managedPorts` contribute to `staleOwnedPorts`
-- `9092bc65` `Fix stale remote-access upgrade drift`
-  - widened plan and teardown calls to use `knownOwnedPorts`
+This is not only a post-repair verification bug. The same planner behavior currently drives:
 
-The commit messages and tests added in those changes are about drift cleanup and stale exposure after upgrades. They are not about post-repair verification. That makes the current `verifyWslRepairSuccess() -> computeWslPortForwardingPlanAsync(...)` reuse a design shortcut, not a separately justified verification model.
+- `remoteAccessNeedsRepair`
+- `firewall.portOpen`
+- the confirmation prompt on `POST /api/network/configure-firewall`
+
+The startup banner uses `remoteAccessNeedsRepair` in `server/startup-banner.ts`, so the same false positive also drives:
+
+- `Remote access is active but needs firewall/port-forward repair.`
+
+## Why The Status Path Fails
+
+`NetworkManager.getStatus()` treats the WSL planner as the authority on whether remote access is still open cleanly:
+
+```ts
+if (firewallInfo.platform === 'wsl2' && rawPortOpen === true) {
+  const wslPlan = await computeWslPortForwardingPlanAsync(remoteAccessPorts, this.getRelevantPorts())
+  staleManagedWindowsExposure = wslPlan.status === 'ready'
+}
+
+const portOpen = staleManagedWindowsExposure ? false : rawPortOpen
+```
+
+So a metadata-only `ready` plan forces:
+
+- `firewall.portOpen = false`
+- `remoteAccessNeedsRepair = true`
+
+That is exactly what the live API experiment showed.
+
+## Repo History and Regression Window
+
+The current behavior was assembled in steps on 2026-03-13:
+
+- `f47f1066` introduced the WSL managed-port file
+- `175879b6` changed the planner so stale `managedPorts` contributes to repair-needed drift
+- `14e7f4c4` added repair verification before `onSuccess()` persistence
+
+The new test added in `175879b6` covers a stale old dev port that still exists in live Windows state:
+
+- `portproxy` still has `5173`
+- `FreshellLANAccess` still includes `5173`
+
+That test does not cover metadata-only drift. I did not find a unit or integration test for this narrower case:
+
+- live `portproxy` correct for `3001`
+- live `FreshellLANAccess` correct for `3001`
+- managed file stale to `[5173]`
+
+That matters because the current false positive requires no live stale exposure at all.
 
 ## What The Evidence Proves
 
 The current evidence supports these conclusions directly:
 
-1. `verifyWslRepairSuccess()` fails whenever the recomputed plan stays in `status: 'ready'`.
-2. The planner treats stale managed metadata as actionable drift.
-3. WSL managed metadata is stored in a single global file shared across Freshell instances.
-4. On this machine today, live Windows state for port `3001` is correct while the global managed file still says `5173`.
-5. On this machine today, that metadata mismatch alone is enough to keep the plan in `ready` with `scriptKind: 'firewall-only'`.
-6. Because WSL verification runs before `onSuccess()` updates the managed file, a repair executed in that state will re-read the same stale metadata during verification.
+1. On 2026-03-20, the elevated WSL repair callback completed and the recomputed WSL plan still returned `status: 'ready'`.
+2. The WSL planner currently treats stale managed metadata as repair-needed drift even when Windows already matches the required live exposure.
+3. The WSL managed-port file is global across Freshell instances and modes.
+4. On this machine today, live Windows state for `3001` is correct while the global WSL managed-port file still says `5173`.
+5. On this machine today, changing only that file flips the planner from `ready` to `noop`.
+6. On this machine today, changing only that file also flips `/api/network/status` from repair-needed to healthy and changes `/api/network/configure-firewall` from confirmation-required to no-op.
+7. Because repair verification runs before `onSuccess()` updates the file, the same metadata-only mismatch is sufficient to cause a post-repair verification failure.
 
-That last point is deterministic. In the metadata-only case above, the firewall-only repair script does not change the managed file, and the live firewall rule already matches `3001`. The verification callback therefore sees the same inputs that produced `ready` before the callback started.
+Items 5 through 7 are proven on the live machine, not inferred from tests alone.
 
 ## What Remains Unproven
 
-The current evidence does not prove these stronger claims:
+The evidence still does not prove these stronger claims:
 
-- The 2026-03-20 incident definitely used the same stale `5173` file state.
-- The 2026-03-20 incident was caused by a dev instance writing the global file.
-- Windows or PowerShell behavior played no part in that specific run.
+- the 2026-03-20 incident definitely used the same stale `[5173]` file state
+- a dev-mode Freshell run definitely wrote that stale value before the incident
+- Windows or PowerShell contributed nothing to that specific repair attempt
 
-Those claims need data that the pasted incident logs do not contain:
+Those claims need contemporaneous state that the incident log does not contain.
 
-- the managed-port file contents at 2026-03-20 23:41 local time
-- the exact `portproxy` and firewall state at that time
-- the exact stdout and stderr from the elevated PowerShell child
+## Fix Assessment
 
-There is no need to invoke extra Windows failure modes to explain the incident. The present code bug is sufficient. That is different from proving no extra Windows failure mode happened.
+The earlier draft proposed a verifier-only fix. The newer evidence changes that assessment.
+
+### Verifier Only Fix
+
+A dedicated verifier that ignores the managed-port file would address the `WSL2 port forwarding verification failed` error. It would not address the broader false positive that is already live today:
+
+- `/api/network/status` would still claim repair is needed
+- `POST /api/network/configure-firewall` would still prompt for elevation
+- the startup banner would still tell the user to repair LAN access
+
+That is too narrow for the proven bug.
+
+### Persist Before Verify Fix
+
+Updating the managed-port file before verification would also let the current verification pass in the reproduced state. It has two drawbacks:
+
+- it still leaves the status and prompt path coupled to metadata-only drift
+- it writes bookkeeping before repair success is established
+
+The live API evidence makes this option hard to justify as the primary fix.
+
+### Planner fix
+
+The evidence supports a planner change as the primary fix:
+
+- treat stale WSL managed metadata as actionable only when it corresponds to live Windows exposure
+- do not let metadata by itself keep the plan in `ready`
+
+In practical terms, `managedPorts` should be an ownership hint for existing Windows state, not an independent source of current exposure.
+
+That change addresses all proven manifestations of the bug:
+
+- false `remoteAccessNeedsRepair`
+- false `firewall.portOpen = false`
+- false confirmation-required prompt
+- false startup repair banner
+- false post-repair verification failure
+
+This is also the narrowest change that matches the current tests' intent. The stale-port tests added in `175879b6` and `9092bc65` are about cleaning up actual stale Windows exposure, not about treating a stale bookkeeping file as exposure by itself.
+
+### Follow Up Design Question
+
+The global WSL managed-port file remains a separate design risk even after the planner fix. Matching WSL bookkeeping to the per-instance Windows bookkeeping would reduce cross-instance contamination between dev and production runs. The evidence in this note shows why that risk exists. It does not show that file scoping must be changed in the same patch as the planner fix.
 
 ## Test Gap
 
-The current tests cover several stale-exposure cases, including stale old dev ports and stale legacy `portproxy` drift. I did not find a test for this narrower case:
+I did not find coverage for the exact reproduced case:
 
-- live `portproxy` and firewall already correct for `3001`
-- managed-port file stale to `[5173]`
-- forwarding plan should still allow verification to pass
+- live `3001` `portproxy` correct
+- live `FreshellLANAccess` correct for `3001`
+- managed file stale to `[5173]`
+- status should remain healthy
+- configure-firewall should return no-op
+- post-repair verification should succeed
 
-I also did not find an integration test that exercises the current `startElevatedRepair()` ordering with WSL verification before `onSuccess()` persistence.
-
-## Proposed Change
-
-The narrowest change justified by the evidence is to stop using the broad drift planner as the post-repair verifier.
-
-Instead:
-
-1. Add a dedicated WSL verification helper that checks only live state:
-   - current WSL IP
-   - current `portproxy` rules
-   - current `FreshellLANAccess` rule
-2. Have `verifyWslRepairSuccess()` use that helper.
-3. Ignore the managed-port file during verification.
-
-This change is justified by the evidence in this note:
-
-- The incident failure is specifically a verification failure.
-- The false negative is proven to come from metadata that verification reads before `onSuccess()` refreshes it.
-- The broader planner semantics were introduced for drift cleanup, not for post-repair verification.
-
-This proposal leaves one separate product question open:
-
-- Should metadata-only WSL drift also keep `network/status` and the startup banner in a repair-needed state?
-
-The live machine suggests that answer should probably be no, but the evidence collected here proves the verification bug more strongly than it proves the correct long-term status semantics. A follow-up change can address planner and status behavior after that decision is made.
+That case should be added explicitly.
 
 ## Files Reviewed
 
@@ -245,6 +356,9 @@ The live machine suggests that answer should probably be no, but the evidence co
 - `test/unit/server/wsl-port-forward.test.ts`
 - `test/integration/server/network-api.test.ts`
 - `docs/plans/2026-02-03-wsl2-lan-access-design.md`
+- `~/.freshell/logs/20260321-1440-01-server-debug.production.3001.jsonl`
+- `~/.freshell/wsl-managed-remote-access-ports.json`
+- shell history under `~/.bash_history`
 
 ## External Sources
 
