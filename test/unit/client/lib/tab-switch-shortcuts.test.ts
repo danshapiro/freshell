@@ -77,6 +77,27 @@ describe('getTabLifecycleAction', () => {
     })).toBeNull()
   })
 
+  it('maps Alt+H to reopen', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyH',
+    })).toBe('reopen')
+  })
+
+  it('rejects Alt+Ctrl+H (modifier combo)', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: true, shiftKey: false, metaKey: false,
+      code: 'KeyH',
+    })).toBeNull()
+  })
+
+  it('rejects Alt+Shift+H (modifier combo)', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
+      code: 'KeyH',
+    })).toBeNull()
+  })
+
   it('ignores other keys with Alt', () => {
     expect(getTabLifecycleAction({
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
