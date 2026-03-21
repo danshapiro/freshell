@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
+import { KEYBOARD_SHORTCUTS } from '@/lib/keyboard-shortcuts'
 
 describe('getTabSwitchShortcutDirection', () => {
   it('maps Ctrl+Shift+[ and Ctrl+Shift+] to tab directions', () => {
@@ -103,5 +104,16 @@ describe('getTabLifecycleAction', () => {
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
       code: 'KeyA',
     })).toBeNull()
+  })
+})
+
+describe('KEYBOARD_SHORTCUTS', () => {
+  it('contains an Alt+H entry for reopening closed tabs', () => {
+    const entry = KEYBOARD_SHORTCUTS.find(
+      (s) => s.keys.includes('Alt') && s.keys.includes('H')
+    )
+    expect(entry).toBeDefined()
+    expect(entry!.description.toLowerCase()).toContain('reopen')
+    expect(entry!.category).toBe('tabs')
   })
 })
