@@ -318,6 +318,11 @@ export const reopenClosedTab = createAsyncThunk(
     const entry = stack[stack.length - 1]
     dispatch(popReopenEntry())
 
+    // Remove from localClosed registry if present (prevents stale "recently closed" entry)
+    const deviceId = state.tabRegistry.deviceId
+    const closedTabKey = `${deviceId}:${entry.tab.id}`
+    dispatch(clearClosedTabSnapshot(closedTabKey))
+
     const newTabId = nanoid()
     dispatch(addTab({
       id: newTabId,

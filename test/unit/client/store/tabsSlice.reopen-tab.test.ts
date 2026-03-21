@@ -110,4 +110,32 @@ describe('reopenClosedTab', () => {
     expect(store.getState().tabs.tabs[0].titleSetByUser).toBe(true)
     expect(store.getState().tabs.tabs[0].title).toBe('Custom Title')
   })
+
+  it('clears the corresponding localClosed entry when reopening a tab that had one', async () => {
+    const store = createStore()
+
+    // Create a tab with enough "significance" to be kept in localClosed
+    store.dispatch(addTab({ title: 'Important' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    // Set titleSetByUser so shouldKeepClosedTab returns true
+    store.dispatch({ type: 'tabs/updateTab', payload: { id: tabId, updates: { titleSetByUser: true } } })
+    store.dispatch(initLayout({
+      tabId,
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+
+    await store.dispatch(closeTab(tabId) as any)
+
+    // Both localClosed and reopenStack should have entries
+    expect(Object.keys(store.getState().tabRegistry.localClosed).length).toBeGreaterThan(0)
+    expect(store.getState().tabRegistry.reopenStack.length).toBeGreaterThan(0)
+
+    // Get the tabKey used in localClosed
+    const closedTabKey = Object.keys(store.getState().tabRegistry.localClosed)[0]
+
+    await store.dispatch(reopenClosedTab() as any)
+
+    // After reopen, localClosed entry should be removed
+    expect(store.getState().tabRegistry.localClosed[closedTabKey]).toBeUndefined()
+  })
 })
