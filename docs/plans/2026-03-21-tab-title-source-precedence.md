@@ -4,7 +4,7 @@
 
 **Goal:** Make durable session/history tab names survive later generic terminal runtime titles, while still letting live single-pane terminals show useful raw runtime titles when no stronger durable title exists.
 
-**Architecture:** Split title handling into two layers. Durable tab and pane titles get explicit source metadata (`derived`, `stable`, `user`) in Redux and persistence, while raw xterm/OSC titles move into a separate ephemeral runtime-title slice keyed by pane id and never persist, reopen, cross-tab hydrate, or mirror to the server agent layout store. All visible labels resolve from one precedence model: durable user title first, then durable stable title, then ephemeral runtime title for the live single-pane case, then derived defaults.
+**Architecture:** Split title handling into two layers. Durable tab and pane titles get explicit source metadata (`derived`, `stable`, `user`) in Redux and persistence, while raw xterm/OSC titles move into a separate ephemeral runtime-title slice keyed by pane id and never persist, reopen, cross-tab hydrate, or mirror to the server agent layout store. Tabs and panes share the same source ordering, but runtime titles are eligible differently: tab labels may consult runtime only for the matching live single-pane pane, while pane headers may consult runtime for their own pane regardless of tab shape.
 
 **Tech Stack:** TypeScript, React 18, Redux Toolkit, xterm.js, Vitest, Playwright
 
@@ -22,16 +22,18 @@ After this lands:
 
 ## Contracts And Invariants
 
-1. Title precedence is semantic, not heuristic: `user > stable > runtime > derived`.
+1. Durable precedence is semantic, not heuristic: `user > stable > derived`. Runtime titles are never durable state and are only consulted at render time.
 2. Raw xterm `onTitleChange` is ephemeral pane metadata only. It never writes durable tab state and never persists to storage, reopen snapshots, cross-tab sync, or mirrored layout payloads.
 3. `terminal.title.updated`, history/session rename flows, copied-tab snapshot titles, prompt-derived coding-CLI titles, and explicit rename flows are the durable path.
 4. `titleSource` and `paneTitleSources` are authoritative durable state. `titleSetByUser` and `paneTitleSetByUser` remain compatibility mirrors derived from them until a later cleanup.
 5. `addTab({ title })` must not infer `stable` just because the string is non-default. Durable titles are opt-in at the call sites that truly own them.
 6. Durable pane title updates clear any runtime title for that pane. Content replacement and terminal exit also clear runtime titles for affected panes.
 7. Derived pane titles can be recomputed on content replacement. Stable and user pane titles must survive non-destructive lifecycle updates.
-8. Any helper that computes a visible tab or pane label must receive both durable title metadata and runtime-title metadata; otherwise it cannot enforce the precedence model correctly.
-9. Browser acceptance must use a real shell PTY emitting a real OSC title while the tab is backgrounded.
-10. Layout mirroring to the server agent store must round-trip durable title metadata, not runtime metadata.
+8. Tab-label and pane-header helpers must use separate runtime-eligibility rules: tab labels may only read runtime titles for the matching single-pane live pane, while pane headers may read runtime titles for their own pane.
+9. Legacy persisted state missing source metadata must normalize explicitly instead of guessing ad hoc: `user` when the legacy boolean is true; otherwise `derived` only when the stored title still matches the default/current derived title for that entity, else `stable`.
+10. Legacy reducer payloads that still write `titleSetByUser` / `setByUser` must normalize through the new source model instead of bypassing it.
+11. Browser acceptance must use a real shell PTY emitting a real OSC title while the tab is backgrounded.
+12. Layout mirroring to the server agent store must round-trip durable title metadata, not runtime metadata.
 
 ## Root Cause Summary
 
@@ -48,6 +50,8 @@ After this lands:
   Reason: `addTab({ title }) => stable` would freeze unrelated titles and create regressions in flows that should still yield to a better later durable title.
 - **Chosen:** mirror only durable title metadata to the server agent layout store.
   Reason: agent/layout snapshots should preserve stable semantics, but raw runtime titles are local transient UI state and should not leak into that protocol.
+- **Chosen:** normalize legacy persisted non-user titles to `stable` unless they still match the current derived/default title.
+  Reason: old storage lost the runtime-vs-stable distinction already; preserving known meaningful titles is safer than downgrading every historical session title during the upgrade.
 - **Rejected:** storing `runtime` inside `paneTitleSources` and persisting it.
   Reason: that reclassifies raw OSC titles as durable state and contradicts the approved design.
 - **Rejected:** fixing only `getTabDisplayTitle`.
@@ -108,6 +112,7 @@ No user decision is required.
 - `test/unit/client/components/TabBar.deriveTitle.test.tsx`
 - `test/unit/client/components/MobileTabStrip.test.tsx`
 - `test/unit/client/components/TabSwitcher.test.tsx`
+- `test/unit/client/components/ContextMenuProvider.test.tsx`
 - `test/unit/client/store/selectors/sidebarSelectors.test.ts`
 - `test/unit/client/store/tab-pane-title-sync.test.ts`
 - `test/unit/client/store/tabsSlice.test.ts`
@@ -139,7 +144,7 @@ Create `test/e2e-browser/specs/tab-title-source-precedence.spec.ts` with one rea
 
 - start from a live shell tab
 - create a second real shell tab
-- seed the second single-pane tab with the durable-looking title `codex resume 019d1213-9c59-7bb0-80ae-70c74427f346` using existing reducer actions (`tabs/updateTab` plus `panes/updatePaneTitleByTerminalId`)
+- seed the second single-pane tab with the durable title `codex resume 019d1213-9c59-7bb0-80ae-70c74427f346` through the existing durable terminal-id sync path (`syncPaneTitleByTerminalId`) via the test harness
 - switch away so that tab is hidden
 - send a real OSC title update like `printf '\033]0;codex\007'` into the background PTY
 - assert the visible tab text still shows the durable title before and after reselecting the tab
@@ -158,7 +163,7 @@ Expected: FAIL because the visible tab label downgrades to `codex`.
 
 Extend `test/unit/client/components/TerminalView.lifecycle.test.tsx` with a focused reproduction that:
 
-- seeds a hidden single-pane tab with the durable title `codex resume ...`
+- seeds a hidden single-pane tab through `syncPaneTitleByTerminalId({ terminalId, title: 'codex resume ...' })`
 - fires the mocked xterm `onTitleChange` callback with `codex` while that tab is inactive
 - reactivates the tab
 - asserts the visible label should still be the durable title
@@ -200,6 +205,9 @@ Add `test/unit/client/lib/title-source.test.ts` for:
 - `shouldReplaceDurableTitleSource('stable', 'derived') === false`
 - `inferLegacyTabTitleSource({ titleSetByUser: true }) === 'user'`
 - `inferLegacyTabTitleSource({ title: 'Tab 3', titleSetByUser: false }) === 'derived'`
+- `inferLegacyTabTitleSource({ title: 'codex resume 019d...', titleSetByUser: false }) === 'stable'`
+- `inferLegacyPaneTitleSource({ storedTitle: 'Shell', derivedTitle: 'Shell', titleSetByUser: false }) === 'derived'`
+- `inferLegacyPaneTitleSource({ storedTitle: 'codex resume 019d...', derivedTitle: 'Shell', titleSetByUser: false }) === 'stable'`
 - `normalizeRuntimeTitle('⠋ codex') === 'codex'`
 - `shouldDecorateExitTitle('derived') === true`
 - `shouldDecorateExitTitle('stable') === false`
@@ -210,7 +218,7 @@ Extend `test/unit/client/store/tabsSlice.test.ts`, `test/unit/client/store/tabsP
 - `addTab({ titleSource: 'stable' })` preserves that explicit source
 - `addTab({ title: 'Prompt title' })` does not silently become `stable`
 - `openSessionTab()` creates stable titles explicitly
-- legacy persisted tabs infer missing `titleSource` conservatively
+- legacy persisted tabs infer default names as `derived` and non-default non-user names as `stable`
 - persisted raw tabs accept and round-trip `titleSource`
 
 - [ ] **Step 2: Run the helper and tab-focused tests red**
@@ -245,8 +253,9 @@ Then update `src/store/types.ts` and `src/store/tabsSlice.ts` to:
 - keep `titleSetByUser?: boolean`, but derive it from `titleSource === 'user'`
 - add `setTabTitle({ id, title, source })` for semantic title updates
 - keep `updateTab` for non-title fields; if an old call site passes `updates.title` without a source, preserve the current source instead of inventing `stable`
+- translate legacy `updateTab(... updates.titleSetByUser)` writes through the source model (`true` -> `user`; `false` only clears an existing `user` source when no explicit `source` was supplied)
 - make `addTab` default to `derived` unless the payload explicitly supplies `titleSource` or legacy `titleSetByUser`
-- make `loadInitialTabsState()` / `hydrateTabs()` infer missing sources from legacy payloads
+- make `loadInitialTabsState()` / `hydrateTabs()` infer missing sources from legacy payloads using the explicit default-vs-non-default rule above
 
 - [ ] **Step 4: Run the helper and tab-focused tests green**
 
@@ -292,6 +301,8 @@ Add focused cases for:
 - `updatePaneTitle({ source: 'stable' })` not overwriting a user durable title
 - `updatePaneContent()` / `mergePaneContent()` recomputing only derived durable titles
 - `updatePaneContent()` preserving stable and user durable titles
+- legacy pane metadata inferring `derived` when the stored title still matches the pane’s current derived title
+- legacy pane metadata inferring `stable` when the stored non-user title no longer matches the pane’s current derived title
 - `restoreLayout()` accepting and restoring `paneTitleSources`
 - reopen restoring both `paneTitles` and `paneTitleSources`
 - pane persistence/cross-tab hydration round-tripping `paneTitleSources`
@@ -315,6 +326,7 @@ Update `src/store/paneTypes.ts`, `src/store/panesSlice.ts`, and `src/store/paneR
 - keep `paneTitleSetByUser` as a compatibility mirror of `paneTitleSources === 'user'`
 - add a helper like `setPaneDurableTitleWithSource(state, { tabId, paneId, title, source })`
 - keep `updatePaneTitle` / `updatePaneTitleByTerminalId` for durable titles and allow `source`
+- normalize legacy `setByUser` payloads through the new source model instead of branching separately
 - initialize new panes as `derived`
 - make `splitPane`, `addPane`, `swapPanes`, `replacePane`, `closePane`, `removeLayout`, and `restoreLayout` move/clear `paneTitleSources` exactly alongside `paneTitles`
 - create `paneRuntimeTitleSlice` keyed by pane id, with actions/thunks for setting and clearing runtime titles by pane id and by terminal id
@@ -324,6 +336,7 @@ Update persistence/hydration:
 
 - add `zPaneTitleSources` to `src/store/persistedState.ts`
 - bump `PANES_SCHEMA_VERSION` and update both the “already current” and migration paths in `src/store/persistMiddleware.ts` so `paneTitleSources` survives reload
+- infer missing `paneTitleSources` from legacy `paneTitleSetByUser` plus the current derived pane title when loading old payloads
 - keep `paneRuntimeTitleSlice` out of persistence and cross-tab hydration entirely
 - store `paneTitleSources` in `ClosedTabEntry` so reopen preserves durable semantics
 
@@ -359,6 +372,7 @@ git commit -m "refactor: separate durable pane titles from runtime titles"
 - Modify: `test/unit/client/components/TabBar.deriveTitle.test.tsx`
 - Modify: `test/unit/client/components/MobileTabStrip.test.tsx`
 - Modify: `test/unit/client/components/TabSwitcher.test.tsx`
+- Modify: `test/unit/client/components/ContextMenuProvider.test.tsx`
 - Modify: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
 - Modify: `test/e2e/title-sync-flow.test.tsx`
 
@@ -371,6 +385,7 @@ Extend the tests so they cover:
 - pane headers showing runtime titles only when there is no stronger durable title
 - user rename prefilling from the currently visible pane title
 - multi-pane tabs ignoring pane runtime titles for the overall tab label
+- context-menu copy tab name(s) using the same source-aware display title as TabBar
 - sidebar fallback session items preferring the strongest durable title, not raw runtime pane titles
 
 - [ ] **Step 2: Run the display tests and confirm they fail**
@@ -378,19 +393,26 @@ Extend the tests so they cover:
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
+npm run test:vitest -- --run test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
 ```
 
 Expected: FAIL because display helpers still only know about durable pane titles and do not read the separate runtime-title slice.
 
 - [ ] **Step 3: Implement source-aware label resolution**
 
-Update `src/lib/tab-title.ts` and `src/components/panes/PaneContainer.tsx` so visible labels resolve in this order:
+Update `src/lib/tab-title.ts` so tab labels resolve in this order:
 
-1. durable user title
-2. durable stable title
-3. runtime title for the live single-pane case
-4. derived title
+1. strongest durable user title relevant to the tab
+2. strongest durable stable title relevant to the tab
+3. runtime title only for the matching single-pane live pane
+4. derived/default title
+
+Update `src/components/panes/PaneContainer.tsx` so pane headers resolve in this order:
+
+1. pane-specific durable user title
+2. pane-specific durable stable title
+3. pane-specific runtime title
+4. derived pane title
 
 Then update every caller so it passes the new inputs:
 
@@ -406,7 +428,7 @@ In `src/store/selectors/sidebarSelectors.ts`, keep fallback session items on dur
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
+npm run test:vitest -- --run test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
 ```
 
 Expected: PASS.
@@ -414,7 +436,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lib/tab-title.ts src/components/panes/PaneContainer.tsx src/store/selectors/sidebarSelectors.ts src/components/TabBar.tsx src/components/MobileTabStrip.tsx src/components/TabSwitcher.tsx src/components/context-menu/ContextMenuProvider.tsx test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
+git add src/lib/tab-title.ts src/components/panes/PaneContainer.tsx src/store/selectors/sidebarSelectors.ts src/components/TabBar.tsx src/components/MobileTabStrip.tsx src/components/TabSwitcher.tsx src/components/context-menu/ContextMenuProvider.tsx test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/title-sync-flow.test.tsx
 git commit -m "refactor: resolve visible titles by source precedence"
 ```
 
@@ -449,6 +471,7 @@ Replace the old “last raw xterm title wins” expectations with focused cases 
 - raw runtime titles updating only the runtime-title slice
 - durable stable titles surviving later runtime titles
 - exit decoration applying only to derived/default visible titles
+- `openSessionTab()` upgrading new tabs and eligible existing derived session tabs to `stable` when it is handed an explicit session title
 - `openSessionTab`, `createCodingCliTab`, `tab.create`, background attach, overview attach, copied-tab open, and fixed workflow tabs opting into `stable` when they provide meaningful durable names
 
 - [ ] **Step 2: Run the wiring-focused tests and confirm they fail**
@@ -485,7 +508,7 @@ Then wire the runtime/stable event paths:
 
 Audit durable-title seeds and opt them into `titleSource: 'stable'` explicitly:
 
-- `openSessionTab()` in `src/store/tabsSlice.ts`
+- `openSessionTab()` in `src/store/tabsSlice.ts`, including the “existing matching tab” path when it is still on a derived title and the caller supplied an explicit stable session title
 - `createCodingCliTab()` in `src/store/codingCliThunks.ts`
 - `tab.create` with an explicit title in `src/lib/ui-commands.ts`
 - terminal attach/open flows in `src/components/OverviewView.tsx`
@@ -528,7 +551,7 @@ Add focused cases for:
 
 - mirrored `ui.layout.sync` payloads including `tabs[].titleSource` and `paneTitleSources`
 - mirrored payloads still excluding runtime titles
-- agent-layout schema accepting durable source metadata
+- agent-layout schema accepting durable source metadata while remaining tolerant of legacy payloads without them
 - agent-layout store preserving stable pane titles across attach/respawn updates
 - agent-layout store swapping `paneTitleSources` alongside `paneTitles`
 - agent-layout rename helpers setting user source metadata explicitly
@@ -548,8 +571,8 @@ Expected: FAIL because the mirrored payload and server-side layout snapshot stil
 Update:
 
 - `src/store/layoutMirrorMiddleware.ts` to mirror durable `titleSource` and `paneTitleSources`
-- `server/agent-api/layout-schema.ts` to accept the new durable title metadata
-- `server/agent-api/layout-store.ts` to seed derived pane sources, preserve stable/user pane titles on attach, recompute only derived titles, and swap/remove `paneTitleSources` correctly
+- `server/agent-api/layout-schema.ts` to accept the new durable title metadata without dropping legacy payloads that omit it
+- `server/agent-api/layout-store.ts` to seed derived pane sources, normalize legacy payloads that still only have `paneTitleSetByUser`, preserve stable/user pane titles on attach, recompute only derived titles, and swap/remove `paneTitleSources` correctly
 
 Do not add runtime titles to the mirrored payload.
 
@@ -580,7 +603,7 @@ git commit -m "refactor: mirror durable title metadata to agent layout store"
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/client/lib/title-source.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/paneRuntimeTitleSlice.test.ts test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/store/tabsSlice.reopen-tab.test.ts test/unit/client/store/panesSlice.restore-layout.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/components/TabsView.test.tsx test/e2e/title-sync-flow.test.tsx test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-layout-store-write.test.ts
+npm run test:vitest -- --run test/unit/client/lib/title-source.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/paneRuntimeTitleSlice.test.ts test/unit/client/store/tab-pane-title-sync.test.ts test/unit/client/store/tabsSlice.reopen-tab.test.ts test/unit/client/store/panesSlice.restore-layout.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/components/TerminalView.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/PaneContainer.test.tsx test/unit/client/components/TabBar.deriveTitle.test.tsx test/unit/client/components/MobileTabStrip.test.tsx test/unit/client/components/TabSwitcher.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/codingCliThunks.test.ts test/unit/client/ui-commands.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/components/TabsView.test.tsx test/e2e/title-sync-flow.test.tsx test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-layout-store-write.test.ts
 npm run test:e2e:chromium -- test/e2e-browser/specs/tab-title-source-precedence.spec.ts
 ```
 
