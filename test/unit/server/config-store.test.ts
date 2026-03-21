@@ -215,6 +215,11 @@ describe('ConfigStore', () => {
         sidebar: {
           excludeFirstChatSubstrings: ['build'],
           excludeFirstChatMustStart: true,
+          autoGenerateTitles: true,
+        },
+        codingCli: {
+          ...defaultSettings.codingCli,
+          knownProviders: undefined,
         },
         agentChat: {
           ...defaultSettings.agentChat,
