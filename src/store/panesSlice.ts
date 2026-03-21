@@ -366,15 +366,15 @@ function mergeHydratedPaneMetadata(
  */
 function stripStaleIds(content: PaneContent): PaneContentInput {
   if (content.kind === 'terminal') {
-    const { terminalId, createRequestId, status, ...rest } = content
+    const { terminalId: _terminalId, createRequestId: _createRequestId, status: _status, ...rest } = content
     return rest
   }
   if (content.kind === 'browser') {
-    const { browserInstanceId, ...rest } = content
+    const { browserInstanceId: _browserInstanceId, ...rest } = content
     return rest
   }
   if (content.kind === 'agent-chat') {
-    const { sessionId, createRequestId, status, ...rest } = content
+    const { sessionId: _sessionId, createRequestId: _createRequestId, status: _status, ...rest } = content
     return rest
   }
   // editor, picker, extension — pass through unchanged
