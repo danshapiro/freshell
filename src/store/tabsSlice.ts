@@ -1,14 +1,14 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, removeLayout, updatePaneContent } from './panesSlice'
+import { closePane, initLayout, removeLayout, restoreLayout, updatePaneContent } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
-import { recordClosedTabSnapshot } from './tabRegistrySlice'
+import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry, clearClosedTabSnapshot } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
   buildClosedTabRegistryRecord,
@@ -85,6 +85,7 @@ const initialState: TabsState = loadInitialTabsState()
 type AddTabPayload = {
   id?: string
   title?: string
+  titleSetByUser?: boolean
   description?: string
   terminalId?: string
   codingCliSessionId?: string
@@ -129,6 +130,7 @@ export const tabsSlice = createSlice({
         resumeSessionId: payload.resumeSessionId,
         sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),
+        titleSetByUser: payload.titleSetByUser,
         lastInputAt: undefined,
       }
       state.tabs.push(tab)
@@ -280,6 +282,16 @@ export const closeTab = createAsyncThunk(
       }
     }
 
+    // Always push to reopen stack (Alt+H should reopen any closed tab)
+    if (tab && layout) {
+      dispatch(pushReopenEntry({
+        tab: { ...tab },
+        layout: JSON.parse(JSON.stringify(layout)),
+        paneTitles: { ...(stateBeforeClose.panes.paneTitles[tabId] || {}) },
+        closedAt: Date.now(),
+      }))
+    }
+
     // Collect all pane IDs before removing the layout
     const currentLayout = (getState() as RootState).panes.layouts[tabId]
     const paneIds = collectPaneIds(currentLayout)
@@ -293,6 +305,38 @@ export const closeTab = createAsyncThunk(
       dispatch(clearPaneAttention({ paneId }))
       clearDraft(paneId)
     }
+  }
+)
+
+export const reopenClosedTab = createAsyncThunk(
+  'tabs/reopenClosedTab',
+  async (_, { dispatch, getState }) => {
+    const state = getState() as RootState
+    const stack = state.tabRegistry.reopenStack
+    if (stack.length === 0) return
+
+    const entry = stack[stack.length - 1]
+    dispatch(popReopenEntry())
+
+    const newTabId = nanoid()
+    dispatch(addTab({
+      id: newTabId,
+      title: entry.tab.title,
+      titleSetByUser: entry.tab.titleSetByUser,
+      mode: entry.tab.mode,
+      shell: entry.tab.shell,
+      initialCwd: entry.tab.initialCwd,
+      codingCliSessionId: entry.tab.codingCliSessionId,
+      codingCliProvider: entry.tab.codingCliProvider,
+      resumeSessionId: entry.tab.resumeSessionId,
+      sessionMetadataByKey: entry.tab.sessionMetadataByKey,
+    }))
+
+    dispatch(restoreLayout({
+      tabId: newTabId,
+      layout: entry.layout,
+      paneTitles: entry.paneTitles,
+    }))
   }
 )
 
