@@ -64,13 +64,36 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     })
   })
 
-  function resolveCompositeSessionKey(rawId: string, provider: CodingCliProviderName): { compositeKey?: string; error?: string } {
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
-    const parsed = parseSessionKey(compositeKey)
-    if (sessionKeyRequiresCwdScope(parsed.provider) && !parsed.cwd) {
-      return { error: `Opaque cwd-scoped session key required for provider '${parsed.provider}'` }
+  function resolveCompositeSessionKey(
+    rawId: string,
+    providerQuery: CodingCliProviderName | undefined,
+    cwdQuery: string | undefined,
+  ): { compositeKey?: string; error?: string } {
+    const parsedRaw = parseSessionKey(rawId)
+    const rawProviderIsKnown = validCliProviders.has(parsedRaw.provider)
+    const rawLooksScopedComposite = rawProviderIsKnown
+      && sessionKeyRequiresCwdScope(parsedRaw.provider)
+      && rawId.startsWith(`${parsedRaw.provider}:cwd=`)
+      && rawId.includes(':sid=')
+    const rawLooksLegacyComposite = rawProviderIsKnown
+      && !sessionKeyRequiresCwdScope(parsedRaw.provider)
+      && rawId.startsWith(`${parsedRaw.provider}:`)
+
+    if (rawLooksScopedComposite || rawLooksLegacyComposite) {
+      if (providerQuery && providerQuery !== parsedRaw.provider) {
+        return { error: `Session key provider '${parsedRaw.provider}' does not match requested provider '${providerQuery}'` }
+      }
+      if (sessionKeyRequiresCwdScope(parsedRaw.provider) && !parsedRaw.cwd) {
+        return { error: `Opaque cwd-scoped session key required for provider '${parsedRaw.provider}'` }
+      }
+      return { compositeKey: rawId }
     }
-    return { compositeKey }
+
+    const provider = providerQuery ?? 'claude'
+    if (sessionKeyRequiresCwdScope(provider) && !cwdQuery) {
+      return { error: `Opaque cwd-scoped session key required for provider '${provider}'` }
+    }
+    return { compositeKey: makeSessionKey(provider, rawId, cwdQuery) }
   }
 
   router.get('/session-directory', async (req, res) => {
@@ -124,8 +147,9 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.patch('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
     if (!compositeKey) {
       return res.status(400).json({ error })
     }
@@ -173,8 +197,9 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.post('/sessions/:sessionId/generate-title', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
     if (!compositeKey) {
       return res.status(400).json({ error })
     }
@@ -221,8 +246,9 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.delete('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
     if (!compositeKey) {
       return res.status(400).json({ error })
     }

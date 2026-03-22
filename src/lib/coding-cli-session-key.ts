@@ -57,3 +57,17 @@ export function getCodingCliSessionKey(input: SessionKeyInput): string {
   }
   return makeCodingCliSessionKey(input.provider, input.sessionId, input.cwd)
 }
+
+export function isCodingCliSessionKey(value: string, provider?: string): boolean {
+  if (!value.includes(':')) return false
+
+  if (provider && sessionKeyRequiresCwdScope(provider)) {
+    return value.startsWith(`${provider}:cwd=`) && value.includes(':sid=')
+  }
+
+  if (provider) {
+    return value.startsWith(`${provider}:`)
+  }
+
+  return /^[^:]+:/.test(value)
+}

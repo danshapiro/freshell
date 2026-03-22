@@ -650,4 +650,49 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(localDeleteSession).not.toHaveBeenCalled()
     expect(refresh).not.toHaveBeenCalled()
   })
+
+  it('treats colon-bearing Kimi session ids as opaque ids when cwd is provided', async () => {
+    const localPatchSessionOverride = vi.fn().mockResolvedValue({ ok: true })
+    const localDeleteSession = vi.fn().mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+    const teamAlphaKey = makeSessionKey('kimi', 'team:alpha', '/repo/root/packages/app-b')
+
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride: localPatchSessionOverride,
+        deleteSession: localDeleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => [],
+        refresh,
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [],
+      },
+    }))
+
+    const patch = await request(app)
+      .patch(`/api/sessions/${encodeURIComponent('team:alpha')}?provider=kimi&cwd=${encodeURIComponent('/repo/root/packages/app-b')}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ archived: true })
+
+    const remove = await request(app)
+      .delete(`/api/sessions/${encodeURIComponent('team:alpha')}?provider=kimi&cwd=${encodeURIComponent('/repo/root/packages/app-b')}`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(patch.status).toBe(200)
+    expect(remove.status).toBe(200)
+    expect(localPatchSessionOverride).toHaveBeenCalledWith(teamAlphaKey, { archived: true })
+    expect(localDeleteSession).toHaveBeenCalledWith(teamAlphaKey)
+    expect(refresh).toHaveBeenCalledTimes(2)
+  })
 })

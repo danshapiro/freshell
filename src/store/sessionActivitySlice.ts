@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
+import { isCodingCliSessionKey, makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
 
 export { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
@@ -12,7 +12,7 @@ export interface SessionActivityState {
 }
 
 function makeSessionKey(sessionId: string, provider?: string, cwd?: string): string {
-  if (sessionId.includes(':')) return sessionId
+  if (isCodingCliSessionKey(sessionId, provider)) return sessionId
   return makeCodingCliSessionKey(provider, sessionId, cwd)
 }
 

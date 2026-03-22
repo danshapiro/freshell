@@ -28,14 +28,30 @@ const extensions: ClientExtensionEntry[] = [
 ]
 
 describe('buildResumeCommand', () => {
-  it('builds cwd-sensitive shell-safe Kimi resume commands', () => {
+  it('builds cwd-sensitive shell-safe Kimi resume commands for POSIX shells', () => {
     expect(buildResumeCommand('kimi', 'named kimi session', extensions, {
       cwd: '/repo/root/apps/team app',
+      platform: 'linux',
     })).toBe(`cd '/repo/root/apps/team app' && kimi --session 'named kimi session'`)
   })
 
   it('fails closed for Kimi when cwd is missing', () => {
     expect(buildResumeCommand('kimi', 'named kimi session', extensions)).toBeNull()
+  })
+
+  it('builds cwd-sensitive Kimi resume commands for cmd.exe on Windows', () => {
+    expect(buildResumeCommand('kimi', 'team:alpha', extensions, {
+      cwd: 'C:\\repo root\\team app',
+      platform: 'win32',
+    })).toBe(`cd /d "C:\\repo root\\team app" && kimi --session "team:alpha"`)
+  })
+
+  it('builds cwd-sensitive Kimi resume commands for PowerShell panes', () => {
+    expect(buildResumeCommand('kimi', "team's alpha", extensions, {
+      cwd: "C:\\repo root\\team's app",
+      platform: 'win32',
+      shell: 'powershell',
+    })).toBe(`Set-Location -LiteralPath 'C:\\repo root\\team''s app'; & 'kimi' '--session' 'team''s alpha'`)
   })
 
   it('keeps simple non-cwd-scoped resume commands unchanged', () => {

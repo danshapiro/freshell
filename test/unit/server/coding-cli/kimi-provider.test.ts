@@ -84,11 +84,86 @@ describe('KimiProvider', () => {
         message: expect.objectContaining({ content: 'Visible answer' }),
       }),
     ])
+    expect(provider.parseEvent(JSON.stringify({
+      role: 'assistant',
+      content: [
+        {
+          type: 'text',
+          content: [
+            { type: 'text', text: 'Nested' },
+            [
+              { type: 'text', text: 'assistant' },
+              { type: 'think', think: 'hidden nested thought' },
+            ],
+            { type: 'rich', content: ['content', { text: 'fragments' }] },
+          ],
+        },
+      ],
+    }))).toEqual([
+      expect.objectContaining({
+        type: 'message.assistant',
+        message: expect.objectContaining({ content: 'Nested\nassistant\ncontent\nfragments' }),
+      }),
+    ])
     expect(provider.parseEvent('{"role":"_system_prompt","content":"hidden"}')).toEqual([])
     expect(provider.parseEvent('{"role":"_checkpoint","id":3}')).toEqual([])
     expect(provider.parseEvent('{"role":"_usage","token_count":42}')).toEqual([])
     expect(provider.supportsLiveStreaming()).toBe(false)
     expect(provider.supportsSessionResume()).toBe(true)
+  })
+
+  it('derives titles from nested wire/context content fragments', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-nested-title-'))
+    const sessionDir = path.join(
+      tempShareDir,
+      'sessions',
+      '4a3dcd71f4774356bb688dad99173808',
+      'nested-title-session',
+    )
+    await fsp.mkdir(sessionDir, { recursive: true })
+    await fsp.writeFile(path.join(tempShareDir, 'kimi.json'), JSON.stringify({
+      work_dirs: [{
+        path: '/repo/root/packages/app',
+        last_session_id: 'nested-title-session',
+      }],
+    }))
+    await fsp.writeFile(path.join(sessionDir, 'context.jsonl'), [
+      JSON.stringify({
+        role: 'user',
+        content: [{ type: 'text', content: [{ type: 'text', text: 'Nested context fallback title' }] }],
+      }),
+      JSON.stringify({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Visible assistant' }],
+      }),
+    ].join('\n'))
+    await fsp.writeFile(path.join(sessionDir, 'wire.jsonl'), [
+      JSON.stringify({
+        timestamp: 1710000100,
+        message: {
+          type: 'TurnBegin',
+          payload: {
+            user_input: [
+              { type: 'text', content: [{ type: 'text', text: 'Nested wire title' }] },
+            ],
+          },
+        },
+      }),
+    ].join('\n'))
+
+    try {
+      const provider = new KimiProvider(tempShareDir)
+      const sessions = await provider.listSessionsDirect()
+
+      expect(sessions.find((session) => session.sessionId === 'nested-title-session')).toEqual(
+        expect.objectContaining({
+          title: 'Nested wire title',
+          firstUserMessage: 'Nested context fallback title',
+        }),
+      )
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
   })
 
   it('resolves git metadata once per cwd even when multiple sessions share a workdir', async () => {

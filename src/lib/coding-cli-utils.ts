@@ -60,9 +60,12 @@ export function isNonShellMode(mode?: string): boolean {
 }
 
 export type ResumeCommandProvider = string
+export type ResumeCommandShell = 'system' | 'cmd' | 'powershell' | 'wsl'
 
-type BuildResumeCommandOptions = {
+export type BuildResumeCommandOptions = {
   cwd?: string
+  platform?: string | null
+  shell?: ResumeCommandShell
 }
 
 export function isResumeCommandProvider(value?: string, extensions?: ClientExtensionEntry[]): value is ResumeCommandProvider {
@@ -91,25 +94,92 @@ export function buildResumeCommand(
   const requiresCwd = sessionKeyRequiresCwdScope(provider)
   if (requiresCwd && !cwd) return null
 
+  const shell = resolveResumeShell(options?.platform ?? null, options?.shell)
   const templateUsesCwd = ext.cli.resumeCommandTemplate.some((arg) => arg.includes('{{cwd}}'))
   const args = ext.cli.resumeCommandTemplate.map((arg) => (
     arg
       .replaceAll('{{sessionId}}', sessionId)
       .replaceAll('{{cwd}}', cwd ?? '')
   ))
-  const command = args.map(quoteResumeCommandArg).join(' ')
+  const command = buildShellCommand(args, shell)
 
   if (requiresCwd && cwd && !templateUsesCwd) {
-    return `cd ${quoteResumeCommandArg(cwd)} && ${command}`
+    if (shell === 'cmd') {
+      return `cd /d ${quoteCmdCommandArg(cwd)} && ${command}`
+    }
+    if (shell === 'powershell') {
+      return `Set-Location -LiteralPath ${quotePowerShellLiteral(cwd)}; ${command}`
+    }
+    return `cd ${quotePosixCommandArg(cwd)} && ${command}`
   }
 
   return command
 }
 
-function quoteResumeCommandArg(arg: string): string {
+function resolveResumeShell(platform: string | null, shell?: ResumeCommandShell): ResumeCommandShell {
+  if (shell === 'cmd' || shell === 'powershell' || shell === 'wsl') {
+    return shell
+  }
+  if (platform === 'win32') {
+    return 'cmd'
+  }
+  return 'system'
+}
+
+function buildShellCommand(args: string[], shell: ResumeCommandShell): string {
+  if (shell === 'cmd') {
+    return args.map(quoteCmdCommandArg).join(' ')
+  }
+  if (shell === 'powershell') {
+    return ['&', quotePowerShellLiteral(args[0] || ''), ...args.slice(1).map(quotePowerShellLiteral)].join(' ')
+  }
+  return args.map(quotePosixCommandArg).join(' ')
+}
+
+function quotePosixCommandArg(arg: string): string {
   if (arg.length === 0) return "''"
   if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)) {
     return arg
   }
   return `'${arg.replace(/'/g, `'"'"'`)}'`
+}
+
+function quoteCmdCommandArg(arg: string): string {
+  if (/^[A-Za-z0-9_./@%+=,-]+$/.test(arg)) {
+    return arg
+  }
+
+  const escaped = arg.replace(/%/g, '%%')
+  let quoted = '"'
+  let backslashCount = 0
+  for (const ch of escaped) {
+    if (ch === '\\') {
+      backslashCount += 1
+      continue
+    }
+
+    if (ch === '"') {
+      quoted += '\\'.repeat(backslashCount * 2 + 1)
+      quoted += '"'
+      backslashCount = 0
+      continue
+    }
+
+    if (backslashCount > 0) {
+      quoted += '\\'.repeat(backslashCount)
+      backslashCount = 0
+    }
+    quoted += ch
+  }
+
+  if (backslashCount > 0) {
+    quoted += '\\'.repeat(backslashCount * 2)
+  }
+
+  quoted += '"'
+  return quoted
+}
+
+function quotePowerShellLiteral(arg: string): string {
+  return `'${arg.replace(/'/g, "''")}'`
 }

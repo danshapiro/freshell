@@ -72,43 +72,38 @@ function normalizeTimestampMs(value: unknown): number | undefined {
 }
 
 function flattenVisibleText(content: unknown, role: 'user' | 'assistant'): string {
-  if (typeof content === 'string') {
-    return content.trim()
-  }
-
-  if (!Array.isArray(content)) {
-    return ''
-  }
-
-  const parts = content.flatMap((block) => {
-    if (typeof block === 'string') {
-      return block.trim() ? [block.trim()] : []
-    }
-    if (!block || typeof block !== 'object') {
-      return []
-    }
-
-    const typedBlock = block as {
-      type?: unknown
-      text?: unknown
-      think?: unknown
-      content?: unknown
-    }
-    const type = typeof typedBlock.type === 'string' ? typedBlock.type : undefined
-
-    if (role === 'assistant' && type === 'think') {
-      return []
-    }
-    if (typeof typedBlock.text === 'string' && typedBlock.text.trim()) {
-      return [typedBlock.text.trim()]
-    }
-    if (typeof typedBlock.content === 'string' && typedBlock.content.trim()) {
-      return [typedBlock.content.trim()]
-    }
-    return []
-  })
-
+  const parts = collectVisibleText(content, role)
   return parts.join('\n').trim()
+}
+
+function collectVisibleText(content: unknown, role: 'user' | 'assistant'): string[] {
+  if (typeof content === 'string') {
+    return content.trim() ? [content.trim()] : []
+  }
+
+  if (Array.isArray(content)) {
+    return content.flatMap((item) => collectVisibleText(item, role))
+  }
+
+  if (!content || typeof content !== 'object') {
+    return []
+  }
+
+  const typedBlock = content as {
+    type?: unknown
+    text?: unknown
+    content?: unknown
+  }
+  const type = typeof typedBlock.type === 'string' ? typedBlock.type : undefined
+
+  if (role === 'assistant' && type === 'think') {
+    return []
+  }
+
+  return [
+    ...collectVisibleText(typedBlock.text, role),
+    ...collectVisibleText(typedBlock.content, role),
+  ]
 }
 
 function parseKimiContextRecord(record: unknown): NormalizedEvent[] {

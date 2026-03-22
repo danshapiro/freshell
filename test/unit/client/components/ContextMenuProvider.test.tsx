@@ -1152,6 +1152,90 @@ describe('ContextMenuProvider', () => {
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('cd /repo/root/packages/app-b && kimi --session shared-kimi-session')
   })
 
+  it('copies a PowerShell-safe Kimi resume command for Windows Kimi panes', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Kimi PowerShell',
+              status: 'running',
+              mode: 'kimi',
+              shell: 'powershell',
+              createdAt: 1,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        extensions: {
+          entries: defaultCliExtensions,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'kimi',
+                shell: 'powershell',
+                status: 'running',
+                resumeSessionId: "team:alpha's session",
+                initialCwd: "C:\\repo root\\team's app",
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: 'win32',
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+            Kimi PowerShell Pane
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Kimi PowerShell Pane'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith(
+      `Set-Location -LiteralPath 'C:\\repo root\\team''s app'; & 'kimi' '--session' 'team:alpha''s session'`,
+    )
+  })
+
   it('copies resume command from terminal pane context menu for codex pane', async () => {
     const user = userEvent.setup()
     const store = configureStore({

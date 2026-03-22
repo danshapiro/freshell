@@ -26,7 +26,7 @@ import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
-import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import { buildResumeCommand, type BuildResumeCommandOptions, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -577,8 +577,12 @@ export function ContextMenuProvider({
     await copyText(JSON.stringify(metadata, null, 2))
   }, [getSessionInfo, getSessionMutationKey, tabsState.tabs, panes, menuState?.target])
 
-  const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string, cwd?: string) => {
-    const command = buildResumeCommand(provider, sessionId, extensionEntries, { cwd })
+  const copyResumeCommand = useCallback(async (
+    provider: ResumeCommandProvider,
+    sessionId: string,
+    options?: BuildResumeCommandOptions,
+  ) => {
+    const command = buildResumeCommand(provider, sessionId, extensionEntries, options)
     if (!command) return
     await copyText(command)
   }, [extensionEntries])
