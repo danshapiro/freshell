@@ -328,18 +328,18 @@ function loadPersistedPanesUncached(): any | null {
         ),
         paneTitles: Object.fromEntries(
           Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-        ),
+        ) as Record<string, Record<string, string>>,
         paneTitleSources: inferPaneTitleSourcesByTab(
           sanitizedLayouts,
           Object.fromEntries(
             Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-          ),
+          ) as Record<string, Record<string, string>>,
           Object.fromEntries(
             Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-          ),
+          ) as Record<string, Record<string, boolean>>,
           Object.fromEntries(
             Object.entries(parsed.paneTitleSources || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-          ),
+          ) as Record<string, Record<string, any>>,
         ),
         paneTitleSetByUser: Object.fromEntries(
           Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),

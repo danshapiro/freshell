@@ -111,6 +111,9 @@ const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
+const EMPTY_PANE_TITLES: Record<string, string> = {}
+const EMPTY_PANE_TITLE_SOURCES: Record<string, 'derived' | 'stable' | 'user'> = {}
+const EMPTY_EXTENSION_ENTRIES: any[] = []
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
@@ -244,13 +247,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const tabLayout = useAppSelector((s) => s.panes.layouts[tabId])
-  const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId])
-  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources?.[tabId])
+  const paneTitles = useAppSelector((s) => s.panes.paneTitles?.[tabId] ?? EMPTY_PANE_TITLES)
+  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources?.[tabId] ?? EMPTY_PANE_TITLE_SOURCES)
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
-  const extensionEntries = useAppSelector((s) => (s as any).extensions?.entries ?? [])
+  const extensionEntries = useAppSelector((s) => (s as any).extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
   const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])

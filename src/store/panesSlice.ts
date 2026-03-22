@@ -35,6 +35,13 @@ function ensurePaneTitleSources(state: PanesState, tabId: string): Record<string
   return state.paneTitleSources[tabId]!
 }
 
+function ensurePaneTitleSetByUserMap(state: PanesState): Record<string, Record<string, boolean>> {
+  if (!state.paneTitleSetByUser) {
+    state.paneTitleSetByUser = {}
+  }
+  return state.paneTitleSetByUser
+}
+
 function syncPaneTitleSetByUserMirror(
   state: PanesState,
   tabId: string,
@@ -719,7 +726,7 @@ export const panesSlice = createSlice({
         ...(state.paneTitleSources || {}),
         [tabId]: { [paneId]: 'derived' },
       }
-      delete state.paneTitleSetByUser[tabId]
+      delete ensurePaneTitleSetByUserMap(state)[tabId]
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -750,13 +757,13 @@ export const panesSlice = createSlice({
           state.paneTitleSetByUser?.[tabId],
         ),
       }
-      state.paneTitleSetByUser[tabId] = Object.fromEntries(
+      ensurePaneTitleSetByUserMap(state)[tabId] = Object.fromEntries(
         Object.entries(state.paneTitleSources[tabId] || {})
           .filter(([, source]) => source === 'user')
           .map(([paneId]) => [paneId, true]),
       )
-      if (Object.keys(state.paneTitleSetByUser[tabId] || {}).length === 0) {
-        delete state.paneTitleSetByUser[tabId]
+      if (Object.keys(state.paneTitleSetByUser?.[tabId] || {}).length === 0) {
+        delete ensurePaneTitleSetByUserMap(state)[tabId]
       }
       reconcileRefreshRequestsForTab(state, tabId)
     },
@@ -779,7 +786,7 @@ export const panesSlice = createSlice({
         ...(state.paneTitleSources || {}),
         [tabId]: { [paneId]: 'derived' },
       }
-      delete state.paneTitleSetByUser[tabId]
+      delete ensurePaneTitleSetByUserMap(state)[tabId]
       reconcileRefreshRequestsForTab(state, tabId)
     },
 

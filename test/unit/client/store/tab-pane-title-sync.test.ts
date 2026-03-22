@@ -136,8 +136,8 @@ describe('tab-pane title sync for single-pane tabs', () => {
     })
   })
 
-  describe('runtime title sync uses pane state as the source of truth', () => {
-    it('updates the only pane title and lets the tab display follow it', async () => {
+  describe('stable title sync uses durable pane state as the source of truth', () => {
+    it('updates the only pane title and promotes the single-pane tab title to stable', async () => {
       const store = createStore()
 
       // Create a tab
@@ -153,20 +153,23 @@ describe('tab-pane title sync for single-pane tabs', () => {
       const rootNode = store.getState().panes.layouts[tabId]
       expect(rootNode.type).toBe('leaf')
 
-      // Dispatch the thunk that syncs both pane title and tab title
+      // Dispatch the durable terminal-id sync thunk.
       await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename' }))
 
-      // Pane title should be updated
+      // Pane title should be updated durably.
       const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
       expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Session Rename')
       expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBeUndefined()
+      expect(store.getState().panes.paneTitleSources?.[tabId]?.[paneId]).toBe('stable')
 
-      // The stored tab title remains untouched; display title resolves from the only pane.
-      expect(store.getState().tabs.tabs[0].title).toBe('Original Title')
+      // Matching single-pane tabs are promoted to the stable durable title.
+      expect(store.getState().tabs.tabs[0].title).toBe('Session Rename')
+      expect(store.getState().tabs.tabs[0].titleSource).toBe('stable')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
+        store.getState().panes.paneTitleSources?.[tabId],
       )).toBe('Session Rename')
     })
 
@@ -196,19 +199,21 @@ describe('tab-pane title sync for single-pane tabs', () => {
       // Dispatch the thunk
       await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'Session Rename' }))
 
-      // Pane title should be updated
+      // Pane title should be updated durably.
       expect(store.getState().panes.paneTitles[tabId][firstPaneId]).toBe('Session Rename')
+      expect(store.getState().panes.paneTitleSources?.[tabId]?.[firstPaneId]).toBe('stable')
 
-      // Tab title should NOT be updated; the display stays on the tab-derived label.
+      // Multi-pane tabs keep their stored tab title; the display stays on the derived label.
       expect(store.getState().tabs.tabs[0].title).toBe('Original Title')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
+        store.getState().panes.paneTitleSources?.[tabId],
       )).toBe('Claude')
     })
 
-    it('updates the display title across multiple single-pane tabs sharing a terminalId', async () => {
+    it('promotes matching single-pane tabs across multiple tabs sharing a terminalId', async () => {
       const store = createStore()
 
       // Create two tabs, both with single panes and same terminalId
@@ -228,22 +233,26 @@ describe('tab-pane title sync for single-pane tabs', () => {
 
       await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Shared Session' }))
 
-      // Both tabs keep their stored titles, but their display titles follow the only pane.
-      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
-      expect(store.getState().tabs.tabs[1].title).toBe('Tab 2')
+      // Both matching single-pane tabs are promoted to the stable title.
+      expect(store.getState().tabs.tabs[0].title).toBe('Shared Session')
+      expect(store.getState().tabs.tabs[1].title).toBe('Shared Session')
+      expect(store.getState().tabs.tabs[0].titleSource).toBe('stable')
+      expect(store.getState().tabs.tabs[1].titleSource).toBe('stable')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tab1Id],
         store.getState().panes.paneTitles[tab1Id],
+        store.getState().panes.paneTitleSources?.[tab1Id],
       )).toBe('Shared Session')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[1],
         store.getState().panes.layouts[tab2Id],
         store.getState().panes.paneTitles[tab2Id],
+        store.getState().panes.paneTitleSources?.[tab2Id],
       )).toBe('Shared Session')
     })
 
-    it('only updates single-pane displays, leaving multi-pane tabs unchanged', async () => {
+    it('only promotes matching single-pane tabs, leaving multi-pane tabs unchanged', async () => {
       const store = createStore()
 
       // Tab 1: single-pane with term-42
@@ -271,12 +280,14 @@ describe('tab-pane title sync for single-pane tabs', () => {
 
       await store.dispatch(syncPaneTitleByTerminalId({ terminalId: 'term-42', title: 'New Name' }))
 
-      // Single-pane tab: display title follows the only pane.
-      expect(store.getState().tabs.tabs[0].title).toBe('Single Pane Tab')
+      // Single-pane tab: stored and display title both promote to the stable durable title.
+      expect(store.getState().tabs.tabs[0].title).toBe('New Name')
+      expect(store.getState().tabs.tabs[0].titleSource).toBe('stable')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tab1Id],
         store.getState().panes.paneTitles[tab1Id],
+        store.getState().panes.paneTitleSources?.[tab1Id],
       )).toBe('New Name')
       // Multi-pane tab: stored title stays unchanged and display stays on the tab-derived label.
       expect(store.getState().tabs.tabs[1].title).toBe('Multi Pane Tab')
@@ -284,6 +295,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         store.getState().tabs.tabs[1],
         store.getState().panes.layouts[tab2Id],
         store.getState().panes.paneTitles[tab2Id],
+        store.getState().panes.paneTitleSources?.[tab2Id],
       )).toBe('Claude')
     })
 
@@ -304,6 +316,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
+        store.getState().panes.paneTitleSources?.[tabId],
       )).toBe('Shell')
     })
   })

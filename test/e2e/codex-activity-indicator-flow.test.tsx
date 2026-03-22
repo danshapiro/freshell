@@ -46,16 +46,19 @@ type RenderHarnessOptions = {
 }
 
 function renderHarness(options: RenderHarnessOptions = {}) {
+  const paneTitle = options.paneTitle ?? 'Codex Pane'
+  const tabOverrides = options.tab ?? {}
   const tab: Tab = {
     id: 'tab-codex',
     createRequestId: 'req-tab',
-    title: 'Codex Tab',
+    title: tabOverrides.title ?? paneTitle,
+    titleSource: tabOverrides.titleSource ?? 'stable',
     status: 'running',
     mode: 'codex',
     shell: 'system',
     terminalId: 'term-live',
     createdAt: 1,
-    ...options.tab,
+    ...tabOverrides,
   }
 
   const pane: TerminalPaneContent = {
@@ -93,7 +96,8 @@ function renderHarness(options: RenderHarnessOptions = {}) {
       panes: {
         layouts: { [tab.id]: layout },
         activePane: { [tab.id]: layout.id },
-        paneTitles: { [tab.id]: { [layout.id]: options.paneTitle ?? 'Codex Pane' } },
+        paneTitles: { [tab.id]: { [layout.id]: paneTitle } },
+        paneTitleSources: { [tab.id]: { [layout.id]: 'stable' } },
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,
@@ -139,7 +143,7 @@ describe('codex activity indicator flow (e2e)', () => {
   })
 
   function getVisibleSinglePaneTab() {
-    // Single-pane tabs surface the pane's visible title when it is an explicit override.
+    // Single-pane tabs surface the shared durable title when tab and pane metadata agree.
     return screen.getByLabelText('Codex Pane')
   }
 
