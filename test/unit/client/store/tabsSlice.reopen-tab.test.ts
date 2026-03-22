@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { addTab, closeTab, reopenClosedTab } from '@/store/tabsSlice'
+import tabsReducer, { addTab, closeTab, hydrateTabs, reopenClosedTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, addPane, updatePaneTitle } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 
@@ -138,6 +138,43 @@ describe('reopenClosedTab', () => {
 
     expect(store.getState().tabs.tabs[0].titleSetByUser).toBe(true)
     expect(store.getState().tabs.tabs[0].title).toBe('Custom Title')
+  })
+
+  it('reopens legacy durable multi-pane tabs with a stable title source', async () => {
+    const store = createStore()
+
+    store.dispatch(hydrateTabs({
+      tabs: [{
+        id: 'legacy-tab',
+        title: 'Detached Session',
+        createRequestId: 'legacy-tab',
+        createdAt: 1,
+        status: 'running',
+        mode: 'shell',
+        shell: 'system',
+      } as any],
+      activeTabId: 'legacy-tab',
+    }))
+
+    expect(store.getState().tabs.tabs[0].titleSource).toBeUndefined()
+
+    store.dispatch(initLayout({
+      tabId: 'legacy-tab',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    store.dispatch(addPane({
+      tabId: 'legacy-tab',
+      newContent: { kind: 'terminal', mode: 'claude' },
+    }))
+
+    await store.dispatch(closeTab('legacy-tab') as any)
+    await store.dispatch(reopenClosedTab() as any)
+
+    expect(store.getState().tabs.tabs[0]).toMatchObject({
+      title: 'Detached Session',
+      titleSource: 'stable',
+      titleSetByUser: false,
+    })
   })
 
   it('clears the corresponding localClosed entry when reopening a tab that had one', async () => {

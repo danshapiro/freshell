@@ -2,6 +2,34 @@ import type { store as appStore } from '@/store/store'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import { syncStableTitleByTerminalId } from '@/store/titleSync'
 
+const SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY = 'freshell.e2e.suppressedTerminalPaneIds'
+
+function loadSuppressedTerminalPaneIds(): string[] {
+  if (typeof localStorage === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === 'string' && value.length > 0)
+      : []
+  } catch {
+    return []
+  }
+}
+
+function persistSuppressedTerminalPaneIds(paneIds: Set<string>) {
+  if (typeof localStorage === 'undefined') return
+  if (paneIds.size === 0) {
+    localStorage.removeItem(SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY)
+    return
+  }
+  localStorage.setItem(
+    SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY,
+    JSON.stringify(Array.from(paneIds)),
+  )
+}
+
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
   dispatch: typeof appStore.dispatch
@@ -51,7 +79,7 @@ export function installTestHarness(
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
   const suppressedAgentChatPaneIds = new Set<string>()
-  const suppressedTerminalPaneIds = new Set<string>()
+  const suppressedTerminalPaneIds = new Set<string>(loadSuppressedTerminalPaneIds())
   const sentWsMessages: unknown[] = []
   const recordSentWsMessage = (msg: unknown) => {
     try {
@@ -90,9 +118,11 @@ export function installTestHarness(
     setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => {
       if (suppressed) {
         suppressedTerminalPaneIds.add(paneId)
+        persistSuppressedTerminalPaneIds(suppressedTerminalPaneIds)
         return
       }
       suppressedTerminalPaneIds.delete(paneId)
+      persistSuppressedTerminalPaneIds(suppressedTerminalPaneIds)
     },
     isTerminalNetworkEffectsSuppressed: (paneId: string) => suppressedTerminalPaneIds.has(paneId),
     registerTerminalBuffer: (terminalId: string, accessor: () => string) => {

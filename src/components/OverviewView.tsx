@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { addTab, setActiveTab } from '@/store/tabsSlice'
+import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
@@ -263,9 +264,8 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           titleOverride: title || undefined,
                           descriptionOverride: description || undefined,
                         })
-                        const existing = tabs.find((x) => x.terminalId === t.terminalId)
-                        if (existing && title) {
-                          dispatch(updateTab({ id: existing.id, updates: { title, source: 'stable' } }))
+                        if (title) {
+                          dispatch(syncPaneTitleByTerminalId({ terminalId: t.terminalId, title }))
                         }
                         await refresh()
                       }}
@@ -326,6 +326,9 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           titleOverride: title || undefined,
                           descriptionOverride: description || undefined,
                         })
+                        if (title) {
+                          dispatch(syncPaneTitleByTerminalId({ terminalId: t.terminalId, title }))
+                        }
                         await refresh()
                       }}
                       onDelete={async () => {

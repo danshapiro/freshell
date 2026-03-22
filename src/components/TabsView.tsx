@@ -361,9 +361,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         trustedLocalRecord,
       })
       : { kind: 'terminal', mode: 'shell' } as const
+    const nextTitle = record.tabName
     dispatch(addTab({
       id: tabId,
-      title: record.tabName,
+      title: nextTitle,
       titleSource: 'stable',
       mode: deriveModeFromRecord(record),
       status: 'creating',
@@ -371,6 +372,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(initLayout({
       tabId,
       content: firstContent,
+      title: nextTitle,
+      titleSource: 'stable',
     }))
     for (const pane of paneSnapshots.slice(1)) {
       dispatch(addPane({
@@ -388,9 +391,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     const state = store.getState()
     const trustedLocalRecord = !!state.panes.layouts[record.tabId]
     const tabId = nanoid()
+    const nextTitle = `${record.tabName} · ${pane.title || pane.kind}`
     dispatch(addTab({
       id: tabId,
-      title: `${record.tabName} · ${pane.title || pane.kind}`,
+      title: nextTitle,
       titleSource: 'stable',
       mode: deriveModeFromRecord(record),
       status: 'creating',
@@ -401,6 +405,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         localServerInstanceId,
         trustedLocalRecord,
       }),
+      title: nextTitle,
+      titleSource: 'stable',
     }))
     onOpenTab?.()
   }

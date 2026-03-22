@@ -153,6 +153,22 @@ describe('panesSlice', () => {
       expect(state.paneTitles['tab-1'][leaf.id]).toBe('Codex')
     })
 
+    it('seeds paneTitles and paneTitleSources from explicit durable metadata', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', mode: 'shell', status: 'running' },
+          title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
+          titleSource: 'stable',
+        } as any),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(state.paneTitles['tab-1'][leaf.id]).toBe('codex resume 019d1213-9c59-7bb0-80ae-70c74427f346')
+      expect(state.paneTitleSources['tab-1'][leaf.id]).toBe('stable')
+    })
+
     it('uses the provided paneId when supplied', () => {
       const state = panesReducer(
         initialState,

@@ -292,7 +292,10 @@ describe('TerminalView renderer mode', () => {
       data: 'still works',
     })
     await waitFor(() => {
-      expect(terminalInstances[0].write).toHaveBeenCalledWith('still works', undefined)
+      expect(terminalInstances[0].write).toHaveBeenCalled()
+      const latestWrite = terminalInstances[0].write.mock.calls.at(-1)
+      expect(latestWrite?.[0]).toBe('still works')
+      expect(latestWrite?.[1]).toEqual(expect.any(Function))
     })
   })
 })

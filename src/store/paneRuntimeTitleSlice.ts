@@ -27,6 +27,12 @@ function clearPaneIds(state: PaneRuntimeTitleState, paneIds: string[]) {
   }
 }
 
+function collectPaneIds(node: PaneNode | undefined): string[] {
+  if (!node) return []
+  if (node.type === 'leaf') return [node.id]
+  return [...collectPaneIds(node.children[0]), ...collectPaneIds(node.children[1])]
+}
+
 function findPaneIdsByTerminalId(node: PaneNode | undefined, terminalId: string): string[] {
   if (!node) return []
   if (node.type === 'leaf') {
@@ -83,14 +89,14 @@ export const paneRuntimeTitleSlice = createSlice({
       .addCase(closePane, (state, action) => {
         delete state.titlesByPaneId[action.payload.paneId]
       })
-      .addCase(removeLayout, (state) => {
-        state.titlesByPaneId = {}
+      .addCase(removeLayout, (state, action) => {
+        clearPaneIds(state, action.payload.paneIds || [])
       })
       .addCase(hydratePanes, (state) => {
         state.titlesByPaneId = {}
       })
-      .addCase(restoreLayout, (state) => {
-        state.titlesByPaneId = {}
+      .addCase(restoreLayout, (state, action) => {
+        clearPaneIds(state, collectPaneIds(action.payload.layout))
       })
   },
 })

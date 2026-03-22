@@ -55,6 +55,14 @@ export class TestHarness {
     }, { id: terminalId, nextTitle: title })
   }
 
+  async setTerminalNetworkEffectsSuppressed(paneId: string, suppressed: boolean): Promise<void> {
+    await this.page.evaluate(({ id, nextSuppressed }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      harness.setTerminalNetworkEffectsSuppressed(id, nextSuppressed)
+    }, { id: paneId, nextSuppressed: suppressed })
+  }
+
   /**
    * Get terminal buffer content via the xterm.js buffer API.
    * This works with all renderers (WebGL, canvas, DOM) unlike DOM scraping.

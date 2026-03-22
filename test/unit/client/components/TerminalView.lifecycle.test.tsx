@@ -7,6 +7,7 @@ import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setServerInstanceId } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { useAppSelector } from '@/store/hooks'
@@ -382,6 +383,26 @@ describe('TerminalView lifecycle updates', () => {
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
 
     const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    const createCalls = wsMocks.send.mock.calls.filter(
+      ([msg]) => msg?.type === 'terminal.create',
+    )
+    expect(createCalls).toHaveLength(0)
+  })
+
+  it('skips terminal create when terminal network suppression is persisted in storage for the pane', () => {
+    setLocalStorageItemForTest(
+      'freshell.e2e.suppressedTerminalPaneIds',
+      JSON.stringify(['pane-theme']),
+    )
+
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal()
+
+    render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
       </Provider>
@@ -2870,6 +2891,7 @@ describe('TerminalView lifecycle updates', () => {
           settings: settingsReducer,
           connection: connectionReducer,
           turnCompletion: turnCompletionReducer,
+          paneRuntimeTitle: paneRuntimeTitleReducer,
         },
         preloadedState: {
           tabs: {
@@ -2982,6 +3004,7 @@ describe('TerminalView lifecycle updates', () => {
           settings: settingsReducer,
           connection: connectionReducer,
           turnCompletion: turnCompletionReducer,
+          paneRuntimeTitle: paneRuntimeTitleReducer,
         },
         preloadedState: {
           tabs: {
@@ -3014,6 +3037,9 @@ describe('TerminalView lifecycle updates', () => {
                 },
               }
               : {},
+          },
+          paneRuntimeTitle: {
+            titlesByPaneId: {},
           },
           settings: createSettingsState(),
           connection: { status: 'connected', error: null },
@@ -4126,6 +4152,128 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('R6')
       expect(writes).toContain('R7')
       expect(writes).toContain('R8')
+    })
+
+    it('does not restore runtime titles from replayed OSC frames, but accepts a later live re-emission', async () => {
+      const { terminalId, term, store, paneId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-runtime-title-replay',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      const titleListener = term.onTitleChange.mock.calls[0]?.[0]
+      expect(titleListener).toBeTypeOf('function')
+
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (String(data).includes('\x1b]0;vim README.md\x07')) {
+          titleListener('vim README.md')
+        }
+        onWritten?.()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x1b]0;vim README.md\x07',
+          attachRequestId: initialAttach.attachRequestId,
+        })
+      })
+
+      expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBeUndefined()
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      act(() => {
+        titleListener('vim README.md')
+      })
+
+      await waitFor(() => {
+        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
+      })
+    })
+
+    it('ignores the first post-replay attach frame for runtime title restoration', async () => {
+      const { terminalId, term, store, paneId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-runtime-title-post-replay',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      const titleListener = term.onTitleChange.mock.calls[0]?.[0]
+      expect(titleListener).toBeTypeOf('function')
+
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (String(data).includes('\x1b]0;vim README.md\x07')) {
+          titleListener('vim README.md')
+        }
+        onWritten?.()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x1b]0;vim README.md\x07',
+          attachRequestId: initialAttach.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: '\x1b]0;vim README.md\x07',
+          attachRequestId: initialAttach.attachRequestId,
+        })
+      })
+
+      expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBeUndefined()
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      act(() => {
+        titleListener('vim README.md')
+      })
+
+      await waitFor(() => {
+        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
+      })
     })
 
     it('keeps continuity through gap + replay tail + live output', async () => {
