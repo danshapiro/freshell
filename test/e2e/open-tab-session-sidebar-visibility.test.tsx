@@ -371,6 +371,90 @@ describe('open tab session sidebar visibility (e2e)', () => {
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
   })
 
+  it('shows the indexed Kimi session exactly once for a restored Kimi tab after bootstrap', async () => {
+    const kimiSessionId = 'kimi-session-1'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/repo/root',
+          sessions: [{
+            provider: 'kimi',
+            sessionId: kimiSessionId,
+            projectPath: '/repo/root',
+            lastActivityAt: 10,
+            title: 'Pinned title from metadata',
+          }],
+        },
+        {
+          projectPath: '/repo/teammate',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'teammate-open',
+            projectPath: '/repo/teammate',
+            lastActivityAt: 9,
+            title: 'Teammate Session',
+          }],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 9,
+      oldestIncludedSessionId: 'codex:teammate-open',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-kimi',
+        title: 'Kimi Restored Tab',
+        mode: 'kimi',
+        resumeSessionId: kimiSessionId,
+      }],
+      panes: {
+        layouts: {
+          'tab-kimi': {
+            type: 'leaf',
+            id: 'pane-kimi',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              createRequestId: 'req-kimi',
+              status: 'running',
+              resumeSessionId: kimiSessionId,
+              sessionRef: {
+                provider: 'kimi',
+                sessionId: kimiSessionId,
+                serverInstanceId: 'srv-local',
+              },
+            },
+          },
+        },
+        activePane: {
+          'tab-kimi': 'pane-kimi',
+        },
+        paneTitles: {
+          'tab-kimi': {
+            'pane-kimi': 'Kimi Restored Tab',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Pinned title from metadata')).toHaveLength(1)
+      expect(screen.getAllByText('Teammate Session').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('root').length).toBeGreaterThan(0)
+    })
+
+    const kimiPane = (store.getState().panes.layouts['tab-kimi'] as any).content
+    expect(kimiPane.resumeSessionId).toBe(kimiSessionId)
+  })
+
   it('recovers CLI availability and sidebar filtering after transient pre-ready failures', async () => {
     const recoveredSettings = {
       ...defaultSettings,

@@ -41,4 +41,25 @@ describe('buildCliCommandSpecsFromEntries', () => {
     expect(spec?.modelArgs?.('moonshot-k2')).toEqual(['--model', 'moonshot-k2'])
     expect(spec?.permissionModeArgsByValue?.bypassPermissions).toEqual(['--yolo'])
   })
+
+  it('compiles Kimi resumeArgs from the manifest into the runtime command map', () => {
+    const specs = buildCliCommandSpecsFromEntries([
+      makeCliEntry({
+        name: 'kimi',
+        label: 'Kimi',
+        cli: {
+          command: 'kimi',
+          resumeArgs: ['--session', '{{sessionId}}'],
+          modelArgs: ['--model', '{{model}}'],
+          permissionModeArgsByValue: {
+            bypassPermissions: ['--yolo'],
+          },
+          supportsPermissionMode: true,
+          supportsModel: true,
+        },
+      }),
+    ])
+
+    expect(specs.get('kimi')?.resumeArgs?.('kimi-session-1')).toEqual(['--session', 'kimi-session-1'])
+  })
 })

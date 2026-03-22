@@ -1012,6 +1012,21 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toEqual(expect.arrayContaining(['--model', 'moonshot-k2', '--yolo']))
     })
+
+    it('adds Kimi session resume args when resuming', () => {
+      const spec = buildSpawnSpec('kimi', '/repo/root', 'system', 'kimi-session-1', {
+        model: 'moonshot-k2',
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--model',
+        'moonshot-k2',
+        '--yolo',
+        '--session',
+        'kimi-session-1',
+      ]))
+    })
   })
 
   describe('environment variables in spawn spec', () => {
@@ -2239,8 +2254,8 @@ describe('TerminalRegistry', () => {
       expect(modeSupportsResume('gemini')).toBe(false)
     })
 
-    it('returns false for kimi (no resumeArgs)', () => {
-      expect(modeSupportsResume('kimi')).toBe(false)
+    it('returns true for kimi once resumeArgs are registered', () => {
+      expect(modeSupportsResume('kimi')).toBe(true)
     })
   })
 

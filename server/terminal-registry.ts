@@ -94,6 +94,7 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     label: 'Kimi',
     envVar: 'KIMI_CMD',
     defaultCommand: 'kimi',
+    resumeArgs: (sessionId: string) => ['--session', sessionId],
     modelArgs: (model: string) => ['--model', model],
     permissionModeArgsByValue: {
       bypassPermissions: ['--yolo'],

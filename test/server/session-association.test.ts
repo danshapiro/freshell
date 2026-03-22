@@ -877,6 +877,33 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
+  it('associates a kimi terminal from onUpdate when the indexed kimi session appears', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    const term = registry.create({ mode: 'kimi', cwd: '/repo/root/packages/app' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/repo/root',
+      sessions: [{
+        provider: 'kimi',
+        sessionId: 'kimi-session-1',
+        projectPath: '/repo/root',
+        cwd: '/repo/root/packages/app',
+        lastActivityAt: Date.now(),
+      }],
+    }], broadcasts)
+
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('kimi-session-1')
+    expect(broadcasts).toContainEqual({
+      type: 'terminal.session.associated',
+      terminalId: term.terminalId,
+      sessionId: 'kimi-session-1',
+    })
+
+    registry.shutdown()
+  })
+
   it('skips providers without resume support', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []

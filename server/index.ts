@@ -22,9 +22,7 @@ import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
-import { claudeProvider } from './coding-cli/providers/claude.js'
-import { codexProvider } from './coding-cli/providers/codex.js'
-import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { codingCliProviders } from './coding-cli/providers/index.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
@@ -163,7 +161,6 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)

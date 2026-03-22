@@ -70,6 +70,7 @@ export const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingC
     envVar: 'KIMI_CMD',
     defaultCommand: 'kimi',
     // Dead-code consistency only: production startup registers manifest-derived specs.
+    resumeArgs: (sessionId) => ['--session', sessionId],
     modelArgs: (model) => ['--model', model],
     permissionModeArgsByValue: {
       bypassPermissions: ['--yolo'],

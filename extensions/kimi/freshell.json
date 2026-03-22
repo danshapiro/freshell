@@ -7,6 +7,7 @@
   "cli": {
     "command": "kimi",
     "envVar": "KIMI_CMD",
+    "resumeArgs": ["--session", "{{sessionId}}"],
     "modelArgs": ["--model", "{{model}}"],
     "permissionModeArgsByValue": {
       "bypassPermissions": ["--yolo"]

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>freshell — Browser Terminal Multiplexer for Coding CLIs</title>
-<meta name="description" content="Self-hosted browser terminal multiplexer for Claude Code, Codex, OpenCode, and more.">
+<meta name="description" content="Self-hosted browser terminal multiplexer for Claude Code, Codex, Kimi, OpenCode, and more.">
 <link rel="icon" type="image/x-icon" href="favicon.ico">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
@@ -399,6 +399,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .sv-session-provider { font-size: 10px; padding: 1px 7px; border-radius: 9px; font-weight: 600; }
 .sv-session-provider.claude { background: hsl(271 91% 65% / .15); color: #a78bfa; }
 .sv-session-provider.codex { background: hsl(217 91% 60% / .12); color: #60a5fa; }
+.sv-session-provider.kimi { background: hsl(142 71% 45% / .14); color: #4ade80; }
 .sv-session-provider.opencode { background: hsl(24 95% 60% / .15); color: #fb923c; }
 .sv-session-time { font-size: 12px; color: hsl(var(--muted-foreground)); margin-left: auto; }
 .sv-session-summary { font-size: 12px; color: hsl(var(--muted-foreground)); margin-top: 4px; line-height: 1.5; }
@@ -510,6 +511,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
                   <span class="picker-shortcut">O</span>
                 </button>
                 <button class="picker-option">
+                  <i data-lucide="bot" class="picker-lucide"></i>
+                  <span class="picker-label">Kimi</span>
+                  <span class="picker-shortcut">K</span>
+                </button>
+                <button class="picker-option">
                   <i data-lucide="file-text" class="picker-lucide"></i>
                   <span class="picker-label">Editor</span>
                   <span class="picker-shortcut">E</span>
@@ -596,7 +602,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
                 <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Add dark mode toggle</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">2 min ago</span></div><div class="sv-session-summary">Added ThemeSelector with system/light/dark options. CSS variables switch themes. Persists to localStorage, respects OS preference via media query listener.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
                 <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Fix WebSocket reconnection</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">1 hour ago</span></div><div class="sv-session-summary">Fixed race condition in reconnect logic — multiple simultaneous reconnect attempts caused duplicate sessions. Added exponential backoff with jitter, max 5 retries.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
                 <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Pane resize keyboard shortcuts</span><span class="sv-session-provider codex">Codex CLI</span><span class="sv-session-time">yesterday</span></div><div class="sv-session-summary">Added arrow key support for pane resizing. 10px increments with Shift modifier for 50px jumps. Respects min pane width/height constraints.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
-                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Add OpenCode resume wiring</span><span class="sv-session-provider opencode">OpenCode</span><span class="sv-session-time">2 days ago</span></div><div class="sv-session-summary">Indexed OpenCode sessions from the local database, mapped them back to projects, and resumed the same conversation from a fresh terminal.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
+                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Restore Kimi sidebar session after restart</span><span class="sv-session-provider kimi">Kimi</span><span class="sv-session-time">2 days ago</span></div><div class="sv-session-summary">Recovered the saved Kimi session from disk metadata, restored the original working directory, and reattached the sidebar row instead of spawning an orphaned terminal.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
               </div>
             </div>
             <div class="sv-project">
@@ -772,7 +778,7 @@ const content = {
     { html: '  <span class="t-dim">Self-hosted browser terminal multiplexer</span>', delay: 60 },
     { html: '', delay: 200 },
     { html: '  <span class="t-success">✓</span> Multi-tab terminal management', delay: 50 },
-    { html: '  <span class="t-success">✓</span> Claude Code, Codex, OpenCode &amp; more', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Claude Code, Codex, Kimi, OpenCode &amp; more', delay: 50 },
     { html: '  <span class="t-success">✓</span> Split panes with browser views', delay: 50 },
     { html: '  <span class="t-success">✓</span> In-pane terminal search with Ctrl+F', delay: 50 },
     { html: '  <span class="t-success">✓</span> Advanced OSC52 clipboard policy (Ask/Always/Never)', delay: 50 },
