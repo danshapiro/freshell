@@ -924,8 +924,8 @@ export class TerminalRegistry extends EventEmitter {
 
   constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
-    // 5 permanent terminal.exit listeners (index, ws-handler, broker, codex-wiring,
-    // terminal-view) plus transient per-terminal listeners during shutdown.
+    // Permanent terminal.exit listeners: index, ws-handler, broker, codex-wiring,
+    // terminal-view. Shutdown uses a single shared listener (no per-terminal scaling).
     this.setMaxListeners(20)
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
@@ -1989,24 +1989,29 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    // Set up exit listeners BEFORE sending signals (avoid race)
+    // Use a single listener + resolver map instead of one listener per terminal,
+    // to avoid exceeding maxListeners when many terminals are running.
+    const resolvers = new Map<string, () => void>()
     const exitPromises = running.map(term =>
       new Promise<void>(resolve => {
         if (term.status === 'exited') { resolve(); return }
-        const handler = (evt: { terminalId: string }) => {
-          if (evt.terminalId === term.terminalId) {
-            this.off('terminal.exit', handler)
-            resolve()
-          }
-        }
-        this.on('terminal.exit', handler)
-        // Re-check after listener setup (TOCTOU guard — status may mutate between filter and here)
+        resolvers.set(term.terminalId, resolve)
+        // TOCTOU guard — status may mutate between filter and here
         if ((term.status as string) === 'exited') {
-          this.off('terminal.exit', handler)
+          resolvers.delete(term.terminalId)
           resolve()
         }
       })
     )
+    const exitHandler = (evt: { terminalId: string }) => {
+      const resolve = resolvers.get(evt.terminalId)
+      if (resolve) {
+        resolvers.delete(evt.terminalId)
+        resolve()
+        if (resolvers.size === 0) this.off('terminal.exit', exitHandler)
+      }
+    }
+    if (resolvers.size > 0) this.on('terminal.exit', exitHandler)
 
     // Send SIGTERM (or plain kill on Windows where signal args are unsupported)
     const isWindows = process.platform === 'win32'
@@ -2029,6 +2034,10 @@ export class TerminalRegistry extends EventEmitter {
       Promise.all(exitPromises),
       new Promise<void>(r => setTimeout(r, timeoutMs)),
     ])
+
+    // Clean up the shared listener if any terminals didn't exit in time
+    this.off('terminal.exit', exitHandler)
+    resolvers.clear()
 
     // Force kill any that didn't exit in time
     let forceKilled = 0
