@@ -73,19 +73,16 @@ type RenderHarnessOptions = {
 }
 
 function renderHarness(options: RenderHarnessOptions) {
-  const paneTitle = options.paneTitle ?? 'Activity Pane'
-  const tabOverrides = options.tab ?? {}
   const tab: Tab = {
     id: 'tab-activity',
     createRequestId: 'req-tab',
-    title: tabOverrides.title ?? paneTitle,
-    titleSource: tabOverrides.titleSource ?? 'stable',
+    title: 'Activity Tab',
     status: 'running',
     mode: options.pane.kind === 'terminal' ? options.pane.mode : 'shell',
     shell: 'system',
     terminalId: options.pane.kind === 'terminal' ? options.pane.terminalId : undefined,
     createdAt: 1,
-    ...tabOverrides,
+    ...options.tab,
   }
 
   const layout: PaneNode = {
@@ -113,8 +110,7 @@ function renderHarness(options: RenderHarnessOptions) {
       panes: {
         layouts: { [tab.id]: layout },
         activePane: { [tab.id]: layout.id },
-        paneTitles: { [tab.id]: { [layout.id]: paneTitle } },
-        paneTitleSources: { [tab.id]: { [layout.id]: 'stable' } },
+        paneTitles: { [tab.id]: { [layout.id]: options.paneTitle ?? 'Activity Pane' } },
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,

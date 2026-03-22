@@ -61,7 +61,6 @@ function createStore(layout: PaneNode) {
         layouts: { 'tab-1': layout },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSources: {},
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,
@@ -109,7 +108,7 @@ describe('title sync flow', () => {
     localStorage.clear()
   })
 
-  it('shows durable stable title updates in both the pane header and single-pane tab label', async () => {
+  it('shows runtime pane title updates in both the pane header and single-pane tab label', async () => {
     const layout: PaneNode = {
       type: 'leaf',
       id: 'pane-1',
@@ -140,7 +139,6 @@ describe('title sync flow', () => {
     })
 
     expect(screen.getAllByText('Release prep').length).toBeGreaterThanOrEqual(2)
-    expect(store.getState().tabs.tabs[0].title).toBe('Release prep')
-    expect(store.getState().tabs.tabs[0].titleSource).toBe('stable')
+    expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
   })
 })
