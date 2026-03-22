@@ -399,6 +399,78 @@ describe('CodingCliSessionIndexer', () => {
     }
   })
 
+  it('ignores unscoped Kimi override and metadata fallbacks when duplicate session ids exist', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('kimi', 'shared-kimi-session')]: {
+          titleOverride: 'Legacy Kimi title',
+          archived: true,
+        },
+        [makeSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: {
+          titleOverride: 'Scoped Kimi title',
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir: tempDir,
+      listSessionsDirect: async () => ([
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 2_000,
+          title: 'Kimi app A',
+        },
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          title: 'Kimi app B',
+        },
+      ]),
+    })
+    const metadataStore = {
+      getAll: vi.fn().mockResolvedValue({
+        [makeSessionKey('kimi', 'shared-kimi-session')]: { sessionType: 'legacy-kimi' },
+        [makeSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: { sessionType: 'scoped-kimi' },
+      }),
+      get: vi.fn(),
+      set: vi.fn(),
+    } as unknown as SessionMetadataStore
+
+    const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects()[0]?.sessions ?? []
+    const appA = sessions.find((session) => session.cwd === '/repo/root/packages/app-a')
+    const appB = sessions.find((session) => session.cwd === '/repo/root/packages/app-b')
+
+    expect(appA).toMatchObject({
+      sessionId: 'shared-kimi-session',
+      title: 'Kimi app A',
+    })
+    expect(appA?.sessionType).toBeUndefined()
+    expect(appA?.archived).toBe(false)
+    expect(appB).toMatchObject({
+      sessionId: 'shared-kimi-session',
+      title: 'Scoped Kimi title',
+      sessionType: 'scoped-kimi',
+    })
+    expect(appB?.archived).toBe(false)
+  })
+
   it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {
     const sessionFile = path.join(tempDir, 'sessions', 'rollout-task-events.jsonl')
     await fsp.mkdir(path.dirname(sessionFile), { recursive: true })

@@ -1,5 +1,6 @@
 import type { CodingCliProviderName } from './coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import { sessionKeyRequiresCwdScope } from './coding-cli-session-key'
 
 // REMOVED: CODING_CLI_PROVIDERS, CODING_CLI_PROVIDER_LABELS, CODING_CLI_PROVIDER_CONFIGS
 // These are now derived from extension entries in Redux state.
@@ -60,6 +61,10 @@ export function isNonShellMode(mode?: string): boolean {
 
 export type ResumeCommandProvider = string
 
+type BuildResumeCommandOptions = {
+  cwd?: string
+}
+
 export function isResumeCommandProvider(value?: string, extensions?: ClientExtensionEntry[]): value is ResumeCommandProvider {
   if (!value) return false
   if (!extensions) return false
@@ -77,11 +82,34 @@ export function buildResumeCommand(
   provider?: string,
   sessionId?: string,
   extensions?: ClientExtensionEntry[],
+  options?: BuildResumeCommandOptions,
 ): string | null {
   if (!sessionId || !provider) return null
   const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
   if (!ext?.cli?.resumeCommandTemplate) return null
-  return ext.cli.resumeCommandTemplate
-    .map(arg => arg.replace('{{sessionId}}', sessionId))
-    .join(' ')
+  const cwd = options?.cwd?.trim()
+  const requiresCwd = sessionKeyRequiresCwdScope(provider)
+  if (requiresCwd && !cwd) return null
+
+  const templateUsesCwd = ext.cli.resumeCommandTemplate.some((arg) => arg.includes('{{cwd}}'))
+  const args = ext.cli.resumeCommandTemplate.map((arg) => (
+    arg
+      .replaceAll('{{sessionId}}', sessionId)
+      .replaceAll('{{cwd}}', cwd ?? '')
+  ))
+  const command = args.map(quoteResumeCommandArg).join(' ')
+
+  if (requiresCwd && cwd && !templateUsesCwd) {
+    return `cd ${quoteResumeCommandArg(cwd)} && ${command}`
+  }
+
+  return command
+}
+
+function quoteResumeCommandArg(arg: string): string {
+  if (arg.length === 0) return "''"
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)) {
+    return arg
+  }
+  return `'${arg.replace(/'/g, `'"'"'`)}'`
 }

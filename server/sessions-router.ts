@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
-import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import { makeSessionKey, parseSessionKey, sessionKeyRequiresCwdScope, type CodingCliProviderName } from './coding-cli/types.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
@@ -64,6 +64,15 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     })
   })
 
+  function resolveCompositeSessionKey(rawId: string, provider: CodingCliProviderName): { compositeKey?: string; error?: string } {
+    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const parsed = parseSessionKey(compositeKey)
+    if (sessionKeyRequiresCwdScope(parsed.provider) && !parsed.cwd) {
+      return { error: `Opaque cwd-scoped session key required for provider '${parsed.provider}'` }
+    }
+    return { compositeKey }
+  }
+
   router.get('/session-directory', async (req, res) => {
     const parsed = SessionDirectoryQuerySchema.safeParse({
       query: typeof req.query.query === 'string' ? req.query.query : undefined,
@@ -116,7 +125,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   router.patch('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
     const parsed = SessionPatchSchema.safeParse(req.body || {})
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
@@ -162,7 +174,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   router.post('/sessions/:sessionId/generate-title', async (req, res) => {
     const rawId = req.params.sessionId
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
 
     const firstMessage = typeof req.body?.firstMessage === 'string' ? req.body.firstMessage : ''
     if (!firstMessage.trim()) {
@@ -207,7 +222,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   router.delete('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
     await configStore.deleteSession(compositeKey)
     await codingCliIndexer.refresh()
     res.json({ ok: true })

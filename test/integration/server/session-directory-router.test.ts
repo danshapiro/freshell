@@ -600,4 +600,54 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(remove.status).toBe(200)
     expect(localDeleteSession).toHaveBeenCalledWith(kimiAppAKey)
   })
+
+  it('rejects unscoped Kimi mutation routes instead of falling back to legacy keys', async () => {
+    const localPatchSessionOverride = vi.fn().mockResolvedValue({ ok: true })
+    const localDeleteSession = vi.fn().mockResolvedValue(undefined)
+    const refresh = vi.fn().mockResolvedValue(undefined)
+
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride: localPatchSessionOverride,
+        deleteSession: localDeleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => [],
+        refresh,
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [],
+      },
+    }))
+
+    const patch = await request(app)
+      .patch('/api/sessions/shared-kimi-session?provider=kimi')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Should fail closed' })
+
+    const generateTitle = await request(app)
+      .post(`/api/sessions/${encodeURIComponent('kimi:shared-kimi-session')}/generate-title?provider=kimi`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ firstMessage: 'name this session' })
+
+    const remove = await request(app)
+      .delete('/api/sessions/shared-kimi-session?provider=kimi')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(patch.status).toBe(400)
+    expect(generateTitle.status).toBe(400)
+    expect(remove.status).toBe(400)
+    expect(localPatchSessionOverride).not.toHaveBeenCalled()
+    expect(localDeleteSession).not.toHaveBeenCalled()
+    expect(refresh).not.toHaveBeenCalled()
+  })
 })

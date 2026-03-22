@@ -24,6 +24,11 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     picker: { shortcut: 'X' },
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
   },
+  {
+    name: 'kimi', version: '1.0.0', label: 'Kimi', description: '', category: 'cli',
+    picker: { shortcut: 'K' },
+    cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['kimi', '--session', '{{sessionId}}'] },
+  },
 ]
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
@@ -1116,6 +1121,35 @@ describe('ContextMenuProvider', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('copies cwd-scoped Kimi resume command from sidebar session context menu', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithDuplicateKimiSessionWindows()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id="shared-kimi-session"
+            data-provider="kimi"
+            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
+          >
+            Kimi Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Kimi Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('cd /repo/root/packages/app-b && kimi --session shared-kimi-session')
   })
 
   it('copies resume command from terminal pane context menu for codex pane', async () => {

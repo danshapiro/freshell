@@ -577,8 +577,8 @@ export function ContextMenuProvider({
     await copyText(JSON.stringify(metadata, null, 2))
   }, [getSessionInfo, getSessionMutationKey, tabsState.tabs, panes, menuState?.target])
 
-  const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string) => {
-    const command = buildResumeCommand(provider, sessionId, extensionEntries)
+  const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string, cwd?: string) => {
+    const command = buildResumeCommand(provider, sessionId, extensionEntries, { cwd })
     if (!command) return
     await copyText(command)
   }, [extensionEntries])
@@ -896,12 +896,18 @@ export function ContextMenuProvider({
 
   const menuItems = useMemo(() => {
     if (!menuState) return []
+    const sessionProjects =
+      menuState.target.kind === 'history-project' || menuState.target.kind === 'history-session'
+        ? historySessions
+        : menuState.target.kind === 'sidebar-session'
+          ? sidebarSessions
+          : sessions
     return buildMenuItems(menuState.target, {
       view,
       sidebarCollapsed,
       tabs: tabsState.tabs,
       paneLayouts: panes,
-      sessions,
+      sessions: sessionProjects,
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
@@ -979,6 +985,8 @@ export function ContextMenuProvider({
     tabsState.tabs,
     panes,
     sessions,
+    historySessions,
+    sidebarSessions,
     expandedProjects,
     platform,
     extensionEntries,

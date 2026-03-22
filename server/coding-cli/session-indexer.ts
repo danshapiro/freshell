@@ -7,7 +7,7 @@ import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
-import { makeSessionKey, parseSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { makeSessionKey, parseSessionKey, sessionKeyRequiresCwdScope, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
@@ -824,9 +824,12 @@ export class CodingCliSessionIndexer {
       if (!cached.baseSession) continue
       const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId, cached.baseSession.cwd)
       const legacyCompositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
+      const allowsLegacyCompositeFallback = !sessionKeyRequiresCwdScope(cached.baseSession.provider)
       let ov = cfg.sessionOverrides?.[compositeKey]
-        || (legacyCompositeKey !== compositeKey ? cfg.sessionOverrides?.[legacyCompositeKey] : undefined)
-        || cfg.sessionOverrides?.[cached.baseSession.sessionId]
+      if (!ov && allowsLegacyCompositeFallback) {
+        ov = (legacyCompositeKey !== compositeKey ? cfg.sessionOverrides?.[legacyCompositeKey] : undefined)
+          || cfg.sessionOverrides?.[cached.baseSession.sessionId]
+      }
       if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
         const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
         if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
@@ -843,7 +846,8 @@ export class CodingCliSessionIndexer {
       // Merge sessionType from metadata store
       const metaKey = makeSessionKey(merged.provider, merged.sessionId, merged.cwd)
       const legacyMetaKey = makeSessionKey(merged.provider, merged.sessionId)
-      const meta = sessionMetadata[metaKey] ?? (legacyMetaKey !== metaKey ? sessionMetadata[legacyMetaKey] : undefined)
+      const meta = sessionMetadata[metaKey]
+        ?? (!sessionKeyRequiresCwdScope(merged.provider) && legacyMetaKey !== metaKey ? sessionMetadata[legacyMetaKey] : undefined)
       if (meta?.sessionType) {
         merged.sessionType = meta.sessionType
       }
