@@ -512,7 +512,6 @@ export class KimiProvider implements CodingCliProvider {
         resolveGitRepoRoot(cwd),
         resolveGitBranchAndDirty(cwd),
       ])
-      if (!projectPath) continue
 
       const cachedWorkDir: KimiCachedWorkDir = {
         cwd,

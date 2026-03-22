@@ -39,9 +39,7 @@ export function createAiRouter(deps: AiRouterDeps): Router {
 
     if (isCodingCli && term.resumeSessionId && deps.readSessionContent) {
       try {
-        const sessionContent = term.cwd === undefined
-          ? await deps.readSessionContent(term.resumeSessionId, term.mode!)
-          : await deps.readSessionContent(term.resumeSessionId, term.mode!, term.cwd)
+        const sessionContent = await deps.readSessionContent(term.resumeSessionId, term.mode!, term.cwd)
         if (sessionContent) {
           const extracted = extractUserMessages(sessionContent, term.mode!)
           if (extracted) {

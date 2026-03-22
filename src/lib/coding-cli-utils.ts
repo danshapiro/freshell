@@ -2,9 +2,6 @@ import type { CodingCliProviderName } from './coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { sessionKeyRequiresCwdScope } from './coding-cli-session-key'
 
-// REMOVED: CODING_CLI_PROVIDERS, CODING_CLI_PROVIDER_LABELS, CODING_CLI_PROVIDER_CONFIGS
-// These are now derived from extension entries in Redux state.
-
 export type CodingCliProviderConfig = {
   name: CodingCliProviderName
   label: string
