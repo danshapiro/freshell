@@ -149,7 +149,7 @@ function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): Proj
   return Array.from(projectMap.values())
 }
 
-function getLoadingKind(args: {
+export function getLoadingKind(args: {
   priority: 'visible' | 'background'
   append: boolean
   trimmedQuery: string
@@ -165,7 +165,7 @@ function getLoadingKind(args: {
 
   const queryChanged = args.trimmedQuery !== args.previousQuery
   const tierChanged = args.nextTier !== args.previousTier
-  if (queryChanged || tierChanged) {
+  if (args.trimmedQuery && (queryChanged || tierChanged)) {
     return 'search'
   }
 

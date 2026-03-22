@@ -8,6 +8,7 @@ const {
   fetchSessionWindow,
   refreshActiveSessionWindow,
   mergeSearchResults,
+  getLoadingKind,
 } = sessionsThunks
 const queueActiveSessionWindowRefresh = ((sessionsThunks as any).queueActiveSessionWindowRefresh ?? refreshActiveSessionWindow) as typeof refreshActiveSessionWindow
 const _resetSessionWindowThunkState = ((sessionsThunks as any)._resetSessionWindowThunkState ?? (() => {})) as () => void
@@ -195,7 +196,7 @@ describe('sessionsThunks', () => {
     expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
   })
 
-  it('keeps tier changes and clearing a non-empty query in the visible search intent', async () => {
+  it('classifies tier changes as search but clearing a query as background', async () => {
     const tierChange = createDeferred<any>()
     const clearSearch = createDeferred<any>()
     searchSessions.mockReturnValueOnce(tierChange.promise)
@@ -254,7 +255,7 @@ describe('sessionsThunks', () => {
     }) as any)
 
     try {
-      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('search')
+      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('background')
     } finally {
       clearSearch.resolve({
         projects: [],
@@ -1545,6 +1546,59 @@ describe('sessionsThunks', () => {
       })
 
       await request.catch(() => {})
+    })
+  })
+
+  describe('getLoadingKind', () => {
+    const baseArgs = {
+      priority: 'visible' as const,
+      append: false,
+      trimmedQuery: '',
+      previousQuery: '',
+      previousTier: 'title' as const,
+      nextTier: 'title' as const,
+      hasCommittedWindow: true,
+      hasCommittedItems: true,
+    }
+
+    it('returns background when clearing search (query goes from non-empty to empty)', () => {
+      const result = getLoadingKind({
+        ...baseArgs,
+        trimmedQuery: '',
+        previousQuery: 'something',
+      })
+      expect(result).toBe('background')
+    })
+
+    it('returns background when clearing search even if tier also changed', () => {
+      const result = getLoadingKind({
+        ...baseArgs,
+        trimmedQuery: '',
+        previousQuery: 'something',
+        previousTier: 'fullText',
+        nextTier: 'title',
+      })
+      expect(result).toBe('background')
+    })
+
+    it('returns search when query changes to a non-empty value', () => {
+      const result = getLoadingKind({
+        ...baseArgs,
+        trimmedQuery: 'needle',
+        previousQuery: '',
+      })
+      expect(result).toBe('search')
+    })
+
+    it('returns search when tier changes with a non-empty query', () => {
+      const result = getLoadingKind({
+        ...baseArgs,
+        trimmedQuery: 'needle',
+        previousQuery: 'needle',
+        previousTier: 'title',
+        nextTier: 'fullText',
+      })
+      expect(result).toBe('search')
     })
   })
 })
