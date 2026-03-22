@@ -34,6 +34,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 import Pane from '@/components/panes/Pane'
 import { api } from '@/lib/api'
+import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 
 const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
@@ -1060,6 +1061,53 @@ describe('ContextMenuProvider', () => {
       `/api/sessions/${encodeURIComponent(kimiSessionKey('/repo/root/packages/app-b'))}`,
       { titleOverride: 'Renamed Kimi app B', summaryOverride: undefined },
     )
+  })
+
+  it('keeps duplicate Kimi session metadata separate when opening both into the same tab', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithDuplicateKimiSessionWindows()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id="shared-kimi-session"
+            data-provider="kimi"
+            data-session-key={kimiSessionKey('/repo/root/packages/app-a')}
+          >
+            Duplicate Kimi App A
+          </div>
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id="shared-kimi-session"
+            data-provider="kimi"
+            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
+          >
+            Duplicate Kimi App B
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Duplicate Kimi App A'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in this tab'))
+    await user.pointer({ target: screen.getByText('Duplicate Kimi App B'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in this tab'))
+
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [makeCodingCliSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-a')]: {
+        sessionType: 'kimi',
+      },
+      [makeCodingCliSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: {
+        sessionType: 'kimi',
+        firstUserMessage: 'generate a title for app b',
+      },
+    })
   })
 
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {

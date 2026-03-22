@@ -20,6 +20,7 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
 // Import the sort function and buildSessionItems for testing
 import { sortSessionItems, buildSessionItems, filterSessionItemsByVisibility } from '@/store/selectors/sidebarSelectors'
 import type { CodingCliSession, ProjectGroup } from '@/store/types'
+import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 
 describe('sidebarSelectors', () => {
   describe('buildSessionItems', () => {
@@ -441,6 +442,92 @@ describe('sidebarSelectors', () => {
         excludeFirstChatSubstrings: ['IMPORTANT:'],
         excludeFirstChatMustStart: true,
       })).toEqual([])
+    })
+
+    it('matches fallback metadata by cwd for duplicate Kimi sessions in the same tab', () => {
+      const duplicateSessionId = 'shared-kimi-session'
+      const tabs = [
+        {
+          id: 'tab-kimi',
+          title: 'Kimi Split',
+          mode: 'kimi',
+          createdAt: 2_000,
+          sessionMetadataByKey: {
+            [makeCodingCliSessionKey('kimi', duplicateSessionId, '/repo/root/packages/app-a')]: {
+              sessionType: 'kimi',
+              firstUserMessage: 'metadata for app a',
+            },
+            [makeCodingCliSessionKey('kimi', duplicateSessionId, '/repo/root/packages/app-b')]: {
+              sessionType: 'kimi',
+              firstUserMessage: 'metadata for app b',
+              isNonInteractive: true,
+            },
+          },
+        },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-kimi': {
+            type: 'split',
+            id: 'split-kimi',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-kimi-a',
+                content: {
+                  kind: 'terminal',
+                  mode: 'kimi',
+                  status: 'running',
+                  createRequestId: 'req-kimi-a',
+                  resumeSessionId: duplicateSessionId,
+                  initialCwd: '/repo/root/packages/app-a',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-kimi-b',
+                content: {
+                  kind: 'terminal',
+                  mode: 'kimi',
+                  status: 'running',
+                  createRequestId: 'req-kimi-b',
+                  resumeSessionId: duplicateSessionId,
+                  initialCwd: '/repo/root/packages/app-b',
+                },
+              },
+            ],
+          },
+        },
+        activePane: {
+          'tab-kimi': 'pane-kimi-a',
+        },
+        paneTitles: {
+          'tab-kimi': {
+            'pane-kimi-a': 'Kimi App A',
+            'pane-kimi-b': 'Kimi App B',
+          },
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+      const appA = items.find((item) => item.cwd === '/repo/root/packages/app-a')
+      const appB = items.find((item) => item.cwd === '/repo/root/packages/app-b')
+
+      expect(appA).toEqual(expect.objectContaining({
+        sessionId: duplicateSessionId,
+        title: 'Kimi App A',
+        firstUserMessage: 'metadata for app a',
+        isNonInteractive: undefined,
+      }))
+      expect(appB).toEqual(expect.objectContaining({
+        sessionId: duplicateSessionId,
+        title: 'Kimi App B',
+        firstUserMessage: 'metadata for app b',
+        isNonInteractive: true,
+      }))
     })
   })
 

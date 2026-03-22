@@ -15,6 +15,7 @@ import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
 import type { Tab } from '../../../../src/store/types'
+import { makeCodingCliSessionKey } from '../../../../src/lib/coding-cli-session-key'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -723,6 +724,30 @@ describe('tabsSlice', () => {
           firstUserMessage: 'IMPORTANT: internal task',
           isSubagent: true,
           isNonInteractive: true,
+        },
+      })
+    })
+
+    it('stores Kimi session metadata under a cwd-scoped key on newly opened tabs', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'shared-kimi-session',
+        provider: 'kimi',
+        cwd: '/repo/root/packages/app-b',
+        firstUserMessage: 'generate a title for app b',
+      }))
+
+      const tab = store.getState().tabs.tabs[0]
+      expect(tab.sessionMetadataByKey).toEqual({
+        [makeCodingCliSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: {
+          sessionType: 'kimi',
+          firstUserMessage: 'generate a title for app b',
         },
       })
     })

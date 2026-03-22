@@ -380,7 +380,7 @@ export const openSessionTab = createAsyncThunk(
     }
 
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
-      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
+      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput, cwd)
 
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,

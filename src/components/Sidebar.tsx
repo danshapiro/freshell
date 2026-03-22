@@ -337,6 +337,7 @@ export default function Sidebar({
           isSubagent: item.isSubagent,
           isNonInteractive: item.isNonInteractive,
         },
+        item.cwd,
       )
       if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
         dispatch(updateTab({

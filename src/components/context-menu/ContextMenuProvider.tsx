@@ -361,6 +361,7 @@ export function ContextMenuProvider({
         isSubagent: session.isSubagent,
         isNonInteractive: session.isNonInteractive,
       },
+      session.cwd,
     )
     if (tab && sessionMetadataByKey !== tab.sessionMetadataByKey) {
       dispatch(updateTab({

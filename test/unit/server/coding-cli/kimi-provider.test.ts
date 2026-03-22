@@ -1,6 +1,7 @@
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
+import { createHash } from 'crypto'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
@@ -67,6 +68,37 @@ describe('KimiProvider', () => {
     expect(sessions.find((session) => session.sessionId === 'legacy-flat-session')?.sourceFile).toMatch(/legacy-flat-session\.jsonl$/)
     expect(sessions.find((session) => session.sessionId === 'context_1')).toBeUndefined()
     expect(sessions.find((session) => session.sessionId === 'context_sub_1')).toBeUndefined()
+  })
+
+  it('prefers the modern context.jsonl transcript over a stale legacy flat transcript with the same session id', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-modern-precedence-'))
+    await fsp.cp(fixtureShareDir, tempShareDir, { recursive: true })
+    const workDirHash = createHash('md5').update('/repo/root/packages/app').digest('hex')
+    const legacyTranscriptPath = path.join(
+      tempShareDir,
+      'sessions',
+      workDirHash,
+      'kimi-session-1.jsonl',
+    )
+    await fsp.writeFile(legacyTranscriptPath, [
+      JSON.stringify({ role: 'user', content: 'stale legacy transcript should not win' }),
+      JSON.stringify({ role: 'assistant', content: 'stale legacy assistant output' }),
+    ].join('\n'))
+
+    try {
+      const provider = new KimiProvider(tempShareDir)
+      const sessions = await provider.listSessionsDirect()
+      const matches = sessions.filter((session) => session.sessionId === 'kimi-session-1')
+
+      expect(matches).toHaveLength(1)
+      expect(matches[0]).toEqual(expect.objectContaining({
+        sourceFile: expect.stringContaining(path.join('kimi-session-1', 'context.jsonl')),
+        firstUserMessage: 'visible-user-token-kimi please investigate the routing bug',
+        title: 'Pinned title from metadata',
+      }))
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
   })
 
   it('flattens visible transcript content and ignores internal records', () => {

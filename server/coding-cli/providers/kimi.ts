@@ -159,7 +159,7 @@ async function listKimiSessionFiles(sessionsDir: string): Promise<KimiSessionCan
     return []
   }
 
-  const candidates: KimiSessionCandidate[] = []
+  const candidatesBySessionId = new Map<string, KimiSessionCandidate>()
   const sortedEntries = [...entries].sort((a, b) => a.name.localeCompare(b.name))
 
   for (const entry of sortedEntries) {
@@ -172,7 +172,7 @@ async function listKimiSessionFiles(sessionsDir: string): Promise<KimiSessionCan
       } catch {
         continue
       }
-      candidates.push({
+      candidatesBySessionId.set(entry.name, {
         sessionId: entry.name,
         contextPath,
         sessionDir,
@@ -185,14 +185,17 @@ async function listKimiSessionFiles(sessionsDir: string): Promise<KimiSessionCan
     }
 
     const sessionId = path.basename(entry.name, '.jsonl')
-    candidates.push({
+    if (candidatesBySessionId.has(sessionId)) {
+      continue
+    }
+    candidatesBySessionId.set(sessionId, {
       sessionId,
       contextPath: path.join(sessionsDir, entry.name),
       sessionDir: path.join(sessionsDir, sessionId),
     })
   }
 
-  return candidates
+  return [...candidatesBySessionId.values()]
 }
 
 async function loadKimiStoredMetadata(sessionDir: string): Promise<KimiStoredMetadata> {
