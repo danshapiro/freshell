@@ -92,7 +92,6 @@ describe('TerminalView exit title behavior', () => {
       title: 'project (exit 0)',
       status: 'exited',
     })
-    expect(getDisplayTitle(store)).toBe('project (exit 0)')
   })
 
   it('keeps a stable durable title plain on exit', () => {

@@ -436,9 +436,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     if (!tabsDirty && !panesDirty) return
 
     const state = store.getState()
-    const shouldWriteTabs = tabsDirty || panesDirty
 
-    if (shouldWriteTabs) {
+    if (tabsDirty) {
       const tabsPayload = {
         tabs: {
           // Persist only stable tab state. Keep ephemeral UI fields out of storage.

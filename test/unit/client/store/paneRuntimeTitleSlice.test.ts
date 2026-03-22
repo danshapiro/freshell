@@ -8,7 +8,6 @@ import panesReducer, {
   removeLayout,
   replacePane,
   restoreLayout,
-  swapPanes,
   updatePaneContent,
 } from '@/store/panesSlice'
 import paneRuntimeTitleReducer, {
@@ -204,58 +203,5 @@ describe('paneRuntimeTitleSlice', () => {
     expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({
       'pane-a': 'vim a.ts',
     })
-  })
-
-  it('clears swapped pane runtime titles so pane ids do not keep stale labels', () => {
-    const store = createStore()
-
-    store.dispatch(hydratePanes({
-      layouts: {
-        'tab-1': {
-          type: 'split',
-          id: 'split-1',
-          direction: 'horizontal',
-          sizes: [50, 50],
-          children: [
-            {
-              type: 'leaf',
-              id: 'pane-a',
-              content: {
-                kind: 'terminal',
-                mode: 'shell',
-                status: 'running',
-                createRequestId: 'req-a',
-                terminalId: 'term-a',
-              },
-            },
-            {
-              type: 'leaf',
-              id: 'pane-b',
-              content: {
-                kind: 'terminal',
-                mode: 'shell',
-                status: 'running',
-                createRequestId: 'req-b',
-                terminalId: 'term-b',
-              },
-            },
-          ],
-        } as any,
-      },
-      activePane: { 'tab-1': 'pane-a' },
-      paneTitles: { 'tab-1': { 'pane-a': 'Shell', 'pane-b': 'Shell' } },
-      paneTitleSources: { 'tab-1': { 'pane-a': 'derived', 'pane-b': 'derived' } },
-      paneTitleSetByUser: {},
-      renameRequestTabId: null,
-      renameRequestPaneId: null,
-      zoomedPane: {},
-      refreshRequestsByPane: {},
-    }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-a', title: 'vim a.ts' }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-b', title: 'htop' }))
-
-    store.dispatch(swapPanes({ tabId: 'tab-1', paneId: 'pane-a', otherId: 'pane-b' }))
-
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({})
   })
 })

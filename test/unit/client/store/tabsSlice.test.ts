@@ -830,7 +830,6 @@ describe('tabsSlice', () => {
       }))
       store.dispatch(initLayout({
         tabId: 'tab-1',
-        paneId: 'pane-1',
         content: {
           kind: 'terminal',
           mode: 'claude',
@@ -902,17 +901,6 @@ describe('tabsSlice', () => {
         terminalId: 'term-1',
         status: 'running',
       }))
-      store.dispatch(initLayout({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        content: {
-          kind: 'terminal',
-          mode: 'claude',
-          status: 'running',
-          createRequestId: 'req-1',
-          terminalId: 'term-1',
-        },
-      }))
 
       await store.dispatch(openSessionTab({
         sessionId: VALID_CLAUDE_SESSION_ID,
@@ -926,8 +914,6 @@ describe('tabsSlice', () => {
         title: 'Claude Session',
         titleSource: 'stable',
       })
-      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Claude Session')
-      expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
     })
 
     it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
@@ -979,7 +965,6 @@ describe('tabsSlice', () => {
       }))
       store.dispatch(initLayout({
         tabId: 'tab-1',
-        paneId: 'pane-1',
         content: {
           kind: 'terminal',
           mode: 'claude',
@@ -998,8 +983,6 @@ describe('tabsSlice', () => {
         title: 'Claude Session',
         titleSource: 'stable',
       })
-      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Claude Session')
-      expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
     })
 
     it('uses capitalized provider label for codex tab title', async () => {

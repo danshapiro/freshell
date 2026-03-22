@@ -65,19 +65,9 @@ function getDurableTabTitleCandidate(
     || paneCandidate.source === tabCandidate.source
     || !shouldReplaceDurableTitleSource(tabCandidate.source, paneCandidate.source)
   ) {
-    if (tabCandidate.source === 'derived') {
-      const prefersStoredExitedTitle = tab.status === 'exited'
-        && typeof tab.title === 'string'
-        && tab.title.length > 0
-        && tab.title !== derivedTabTitle
-      return {
-        title: prefersStoredExitedTitle
-          ? tab.title
-          : (derivedTabTitle || tabCandidate.title || 'Tab'),
-        source: 'derived',
-      }
-    }
-    return tabCandidate
+    return tabCandidate.source === 'derived'
+      ? { title: derivedTabTitle || tabCandidate.title || 'Tab', source: 'derived' }
+      : tabCandidate
   }
 
   return paneCandidate

@@ -8,7 +8,6 @@ import {
   removeLayout,
   replacePane,
   restoreLayout,
-  swapPanes,
   updatePaneTitle,
   updatePaneContent,
 } from './panesSlice'
@@ -98,9 +97,6 @@ export const paneRuntimeTitleSlice = createSlice({
       })
       .addCase(restoreLayout, (state, action) => {
         clearPaneIds(state, collectPaneIds(action.payload.layout))
-      })
-      .addCase(swapPanes, (state, action) => {
-        clearPaneIds(state, [action.payload.paneId, action.payload.otherId])
       })
   },
 })

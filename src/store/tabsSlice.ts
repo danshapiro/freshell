@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, removeLayout, restoreLayout, updatePaneContent, updatePaneTitle } from './panesSlice'
+import { closePane, initLayout, removeLayout, restoreLayout, updatePaneContent } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -27,7 +27,6 @@ import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { buildExactSessionRef } from '@/lib/exact-session-ref'
-import { clearPaneRuntimeTitle } from './paneRuntimeTitleSlice'
 
 
 const log = createLogger('TabsSlice')
@@ -488,17 +487,6 @@ export const openSessionTab = createAsyncThunk(
         title,
         source: 'stable',
       }))
-
-      const layout = state.panes.layouts[tab.id]
-      if (layout?.type !== 'leaf') return
-
-      dispatch(updatePaneTitle({
-        tabId: tab.id,
-        paneId: layout.id,
-        title,
-        source: 'stable',
-      }))
-      dispatch(clearPaneRuntimeTitle({ paneId: layout.id }))
     }
 
     const desiredResumeContent = buildResumeContent({

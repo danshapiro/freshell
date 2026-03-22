@@ -15,7 +15,7 @@ const localStorageMock = (() => {
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer from '@/store/panesSlice'
 import {
   persistMiddleware,
   resetPersistFlushListenersForTests,
@@ -168,85 +168,6 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     })
 
     store.dispatch(updateTab({ id: 'shell-tab', updates: { description: 'persist rewrite' } }))
-    vi.runAllTimers()
-
-    const raw = localStorage.getItem('freshell.tabs.v2')
-    expect(raw).not.toBeNull()
-
-    const parsed = parsePersistedTabsRaw(raw!)
-    expect(parsed).not.toBeNull()
-    expect(parsed!.tabs.tabs.find((tab) => tab.id === 'shell-tab')?.titleSource).toBe('derived')
-    expect(parsed!.tabs.tabs.find((tab) => tab.id === 'session-tab')?.titleSource).toBe('stable')
-  })
-
-  it('rewrites unresolved legacy tab title sources after panes-only actions provide missing context', () => {
-    const durableTitle = 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346'
-    const store = configureStore({
-      reducer: { tabs: tabsReducer, panes: panesReducer },
-      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
-      preloadedState: {
-        tabs: {
-          tabs: [
-            {
-              id: 'shell-tab',
-              createRequestId: 'shell-tab',
-              title: 'Shell',
-              titleSetByUser: false,
-              status: 'running',
-              mode: 'shell',
-              shell: 'system',
-              createdAt: 1,
-            },
-            {
-              id: 'session-tab',
-              createRequestId: 'session-tab',
-              title: durableTitle,
-              titleSetByUser: false,
-              status: 'running',
-              mode: 'codex',
-              shell: 'system',
-              createdAt: 2,
-            },
-          ],
-          activeTabId: 'shell-tab',
-        },
-        panes: {
-          layouts: {},
-          activePane: {},
-          paneTitles: {},
-          paneTitleSetByUser: {},
-          renameRequestTabId: null,
-          renameRequestPaneId: null,
-          zoomedPane: {},
-          refreshRequestsByPane: {},
-        },
-      },
-    })
-
-    store.dispatch(initLayout({
-      tabId: 'shell-tab',
-      paneId: 'pane-shell',
-      content: {
-        kind: 'terminal',
-        createRequestId: 'pane-shell',
-        status: 'running',
-        mode: 'shell',
-        shell: 'system',
-      },
-    }))
-    store.dispatch(initLayout({
-      tabId: 'session-tab',
-      paneId: 'pane-session',
-      content: {
-        kind: 'terminal',
-        createRequestId: 'pane-session',
-        status: 'running',
-        mode: 'codex',
-        shell: 'system',
-      },
-      title: durableTitle,
-      titleSource: 'stable',
-    }))
     vi.runAllTimers()
 
     const raw = localStorage.getItem('freshell.tabs.v2')
