@@ -65,9 +65,6 @@ export class DiscoveredSessionAssociation {
     if (owner === terminalId && terminal.resumeSessionId === session.sessionId) {
       return { associated: false }
     }
-    if (terminal.resumeSessionId && terminal.resumeSessionId !== session.sessionId) {
-      return { associated: false }
-    }
 
     const bound = this.registry.rebindSession(terminalId, session.provider, session.sessionId, 'association')
     if (!bound.ok) return { associated: false }

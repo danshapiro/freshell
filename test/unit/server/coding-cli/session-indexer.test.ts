@@ -531,6 +531,81 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
+  it('reuses one shell snapshot directory scan for truncated codex reparses in the same refresh', async () => {
+    const codexHome = path.join(tempDir, '.codex')
+    const sessionsDir = path.join(codexHome, 'sessions', '2026', '03', '21')
+    const shellSnapshotsDir = path.join(codexHome, 'shell_snapshots')
+    const filePath = path.join(sessionsDir, 'codex-session-truncated.jsonl')
+    await fsp.mkdir(sessionsDir, { recursive: true })
+    await fsp.mkdir(shellSnapshotsDir, { recursive: true })
+    await fsp.writeFile(
+      filePath,
+      [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: {
+            id: 'codex-session-truncated',
+            cwd: '/project/a',
+          },
+          timestamp: '2026-03-21T10:00:00.000Z',
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              {
+                type: 'output_text',
+                text: 'x'.repeat(300_000),
+              },
+            ],
+          },
+          timestamp: '2026-03-21T10:05:00.000Z',
+        }),
+      ].join('\n') + '\n',
+    )
+    await fsp.writeFile(
+      path.join(shellSnapshotsDir, 'codex-session-truncated.sh'),
+      'export FRESHELL_TERMINAL_ID="term-3"\n',
+    )
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const originalReaddir = fsp.readdir.bind(fsp)
+    const readdirSpy = vi.spyOn(fsp, 'readdir').mockImplementation(async (...args) => originalReaddir(...args as Parameters<typeof fsp.readdir>))
+
+    const provider: CodingCliProvider = {
+      ...codexProvider,
+      homeDir: codexHome,
+      getSessionGlob: () => path.join(codexHome, 'sessions', '**', '*.jsonl'),
+      getSessionRoots: () => [path.join(codexHome, 'sessions')],
+      listSessionFiles: async () => [filePath],
+      resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
+    }
+
+    let shellSnapshotReads = 0
+    try {
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+      shellSnapshotReads = readdirSpy.mock.calls.filter(
+        ([dirPath]) => dirPath === shellSnapshotsDir,
+      ).length
+    } finally {
+      readdirSpy.mockRestore()
+    }
+
+    expect(shellSnapshotReads).toBe(1)
+  })
+
   it('treats provider + sessionId as the uniqueness key when detecting new sessions', () => {
     const sessionId = 'shared-session-id'
     const indexer = new CodingCliSessionIndexer([])

@@ -30,6 +30,7 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
+import { buildExactSessionRef } from '@/lib/exact-session-ref'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
@@ -51,6 +52,7 @@ import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
+const EMPTY_FEATURE_FLAGS = {}
 
 
 type MenuState = {
@@ -108,7 +110,8 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
-  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
+  const localServerInstanceId = useAppSelector((s) => s.connection?.serverInstanceId)
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
@@ -440,11 +443,16 @@ export function ContextMenuProvider({
         sessionId: session.sessionId,
         cwd: session.cwd,
         terminalId: runningTerminalId || undefined,
+        sessionRef: buildExactSessionRef({
+          provider: mode,
+          sessionId: session.sessionId,
+          serverInstanceId: localServerInstanceId,
+        }),
         agentChatProviderSettings: providerSettings,
       }),
     }))
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab, localServerInstanceId])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)

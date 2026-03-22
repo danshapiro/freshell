@@ -54,7 +54,12 @@ describe('DiscoveredSessionAssociation', () => {
     const registry = {
       get: vi.fn((terminalId: string) => (
         terminalId === 'term-target'
-          ? { terminalId: 'term-target', mode: 'codex', status: 'running' }
+          ? {
+              terminalId: 'term-target',
+              mode: 'codex',
+              status: 'running',
+              resumeSessionId: 'codex-session-2',
+            }
           : { terminalId: 'term-wrong', mode: 'codex', status: 'running', resumeSessionId: 'codex-session-1' }
       )),
       getSessionOwner: vi.fn(() => 'term-wrong'),

@@ -372,6 +372,11 @@ export const openSessionTab = createAsyncThunk(
     const providerSettings = agentConfig
       ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
       : undefined
+    const exactSessionRef = buildExactSessionRef({
+      provider: resolvedProvider,
+      sessionId,
+      serverInstanceId: localServerInstanceId,
+    })
     const sessionMetadataInput = {
       sessionType: resolvedSessionType,
       firstUserMessage,
@@ -386,12 +391,15 @@ export const openSessionTab = createAsyncThunk(
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
-      sessionRef: buildExactSessionRef({
-        provider: resolvedProvider,
-        sessionId,
-        serverInstanceId: localServerInstanceId,
-      }),
+      sessionRef: exactSessionRef,
       agentChatProviderSettings: providerSettings,
+    })
+    const desiredRunningResumeContent = buildResumeContent({
+      sessionType: resolvedProvider,
+      sessionId,
+      cwd,
+      terminalId,
+      sessionRef: exactSessionRef,
     })
 
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
@@ -404,7 +412,7 @@ export const openSessionTab = createAsyncThunk(
       }))
     }
 
-    const repairExistingTabLayout = (tab: Tab | undefined) => {
+    const repairExistingTabLayout = (tab: Tab | undefined, desiredContent = desiredResumeContent) => {
       if (!tab) return
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
@@ -441,18 +449,32 @@ export const openSessionTab = createAsyncThunk(
 
       if (matchingLeaves.length !== 1) return
       const [{ id: paneId, content }] = matchingLeaves
-      if (content.kind === 'terminal' && content.terminalId) return
+      const sessionRefMatches = (
+        ('sessionRef' in content ? content.sessionRef : undefined)?.provider
+          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.provider
+        && ('sessionRef' in content ? content.sessionRef : undefined)?.sessionId
+          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.sessionId
+        && ('sessionRef' in content ? content.sessionRef : undefined)?.serverInstanceId
+          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.serverInstanceId
+      )
 
-      const needsRepair = desiredResumeContent.kind === 'agent-chat'
-        ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
-        : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
+      const needsRepair = desiredContent.kind === 'agent-chat'
+        ? content.kind !== 'agent-chat'
+          || content.provider !== desiredContent.provider
+          || content.resumeSessionId !== desiredContent.resumeSessionId
+          || !sessionRefMatches
+        : content.kind !== 'terminal'
+          || content.mode !== desiredContent.mode
+          || content.terminalId !== desiredContent.terminalId
+          || content.resumeSessionId !== desiredContent.resumeSessionId
+          || !sessionRefMatches
 
       if (!needsRepair) return
 
       dispatch(updatePaneContent({
         tabId: tab.id,
         paneId,
-        content: desiredResumeContent,
+        content: desiredContent,
       }))
     }
 
@@ -461,12 +483,22 @@ export const openSessionTab = createAsyncThunk(
         const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
+          if (!state.panes.layouts[existingTab.id]) {
+            dispatch(initLayout({
+              tabId: existingTab.id,
+              content: desiredRunningResumeContent,
+            }))
+          } else {
+            repairExistingTabLayout(existingTab, desiredRunningResumeContent)
+          }
           dispatch(setActiveTab(existingTab.id))
           return
         }
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
+      const tabId = nanoid()
       dispatch(addTab({
+        id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
         terminalId,
         status: 'running',
@@ -475,6 +507,10 @@ export const openSessionTab = createAsyncThunk(
         initialCwd: cwd,
         resumeSessionId: sessionId,
         sessionMetadataByKey: buildSessionMetadataByKey(),
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: desiredRunningResumeContent,
       }))
       return
     }

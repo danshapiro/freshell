@@ -140,12 +140,13 @@ function renderWithProvider(ui: React.ReactNode, options?: { platform?: string |
   return { store, ...utils }
 }
 
-function createStoreWithSession() {
+function createStoreWithSession(options?: { serverInstanceId?: string }) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
+      connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
     },
@@ -209,6 +210,11 @@ function createStoreWithSession() {
       },
       extensions: {
         entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: null,
+        serverInstanceId: options?.serverInstanceId,
       },
     },
   })
@@ -897,6 +903,55 @@ describe('ContextMenuProvider', () => {
           expect(newPane.content.mode).toBe('claude')
           expect(newPane.content.resumeSessionId).toBe(VALID_SESSION_ID)
         }
+      }
+    }
+  })
+
+  it('open in this tab preserves exact local identity for a running sidebar session target', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession({ serverInstanceId: 'srv-local' })
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="history"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-running-terminal-id="term-running"
+          >
+            Test Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Test Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in this tab'))
+
+    const newLayout = store.getState().panes.layouts['tab-1']
+    expect(newLayout?.type).toBe('split')
+    if (newLayout?.type === 'split') {
+      const newPane = newLayout.children.find(
+        (child) => child.type === 'leaf' && child.id !== 'pane-1',
+      )
+      expect(newPane).toBeDefined()
+      if (newPane?.type === 'leaf' && newPane.content.kind === 'terminal') {
+        expect(newPane.content).toMatchObject({
+          mode: 'claude',
+          terminalId: 'term-running',
+          status: 'running',
+          resumeSessionId: VALID_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
+        })
       }
     }
   })

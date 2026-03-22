@@ -20,6 +20,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
+import { buildExactSessionRef } from '@/lib/exact-session-ref'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -320,6 +321,11 @@ export default function Sidebar({
       sessionId: item.sessionId,
       cwd: item.cwd,
       terminalId: runningTerminalId,
+      sessionRef: buildExactSessionRef({
+        provider,
+        sessionId: item.sessionId,
+        serverInstanceId: localServerInstanceId,
+      }),
       agentChatProviderSettings: providerSettings,
     })
 

@@ -806,13 +806,8 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('activates existing tab when terminalId is already attached', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
+    it('activates existing tab when terminalId is already attached and seeds a layout-backed pane', async () => {
+      const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({ id: 'tab-1', mode: 'claude', terminalId: 'term-1', status: 'running' }))
       store.dispatch(addTab({ id: 'tab-2', mode: 'shell' }))
@@ -821,15 +816,25 @@ describe('tabsSlice', () => {
 
       expect(store.getState().tabs.activeTabId).toBe('tab-1')
       expect(store.getState().tabs.tabs).toHaveLength(2)
-    })
-
-    it('creates a running tab when terminalId is provided and no existing tab matches', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 'term-1',
+          status: 'running',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
         },
       })
+    })
+
+    it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
+      const store = createOpenSessionStore('srv-local')
 
       await store.dispatch(openSessionTab({
         sessionId: VALID_CLAUDE_SESSION_ID,
@@ -843,6 +848,21 @@ describe('tabsSlice', () => {
       expect(tabs[0].terminalId).toBe('term-2')
       expect(tabs[0].status).toBe('running')
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(store.getState().panes.layouts[tabs[0].id]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 'term-2',
+          status: 'running',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
+        },
+      })
     })
 
     it('uses capitalized provider label for codex tab title', async () => {

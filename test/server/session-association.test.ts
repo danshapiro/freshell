@@ -191,7 +191,7 @@ describe('DiscoveredSessionAssociation integration', () => {
     const onBound = vi.fn()
 
     const wrongTerminal = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'codex-session-abc-123' })
-    const targetTerminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const targetTerminal = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'codex-session-other-999' })
     registry.on('terminal.session.unbound', onUnbound)
     registry.on('terminal.session.bound', onBound)
 
@@ -211,6 +211,7 @@ describe('DiscoveredSessionAssociation integration', () => {
     expect(result).toEqual({ associated: true, terminalId: targetTerminal.terminalId })
     expect(registry.get(wrongTerminal.terminalId)?.resumeSessionId).toBeUndefined()
     expect(registry.get(targetTerminal.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+    expect(registry.getCanonicalRunningTerminalBySession('codex', 'codex-session-other-999')).toBeUndefined()
     expect(registry.getCanonicalRunningTerminalBySession('codex', 'codex-session-abc-123')?.terminalId)
       .toBe(targetTerminal.terminalId)
     expect(onUnbound).toHaveBeenCalledWith(expect.objectContaining({
@@ -1108,7 +1109,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('does not overwrite existing resumeSessionId', () => {
+  it('repairs an existing resumeSessionId when exact codex launch provenance proves a different session owns the terminal', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
     const associateOnUpdate = createOnUpdateAssociator(registry, broadcasts)
@@ -1131,8 +1132,13 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
       }],
     }])
 
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('existing-session')
-    expect(broadcasts).toHaveLength(0)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('different-session')
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0]).toEqual({
+      type: 'terminal.session.associated',
+      terminalId: term.terminalId,
+      sessionId: 'different-session',
+    })
 
     registry.shutdown()
   })

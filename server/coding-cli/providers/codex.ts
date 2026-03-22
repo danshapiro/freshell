@@ -464,12 +464,13 @@ export const codexProvider: CodingCliProvider = {
     return walkJsonlFiles(sessionsDir)
   },
 
-  async parseSessionFile(content: string, filePath: string) {
+  async parseSessionFile(content: string, filePath: string, parseContext) {
     const meta = parseCodexSessionContent(content)
     const sessionId = meta.sessionId || extractSessionIdFromFilename(filePath)
     const launchOrigin = await readCodexShellSnapshotLaunchOrigin(
       path.join(this.homeDir, 'shell_snapshots'),
       sessionId,
+      parseContext?.codexShellSnapshotIndexes,
     )
     return launchOrigin ? { ...meta, launchOrigin } : meta
   },
