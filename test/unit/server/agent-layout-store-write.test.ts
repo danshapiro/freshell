@@ -33,7 +33,6 @@ it('renames a pane in its owning tab', () => {
 
   expect(store.renamePane('pane_1', 'Logs')).toEqual({ tabId: 'tab_a', paneId: 'pane_1' })
   expect((store as any).snapshot.paneTitles.tab_a.pane_1).toBe('Logs')
-  expect((store as any).snapshot.paneTitleSources.tab_a.pane_1).toBe('user')
   expect((store as any).snapshot.paneTitleSetByUser.tab_a.pane_1).toBe(true)
   expect((store as any).snapshot.tabs[0].title).toBe('Logs')
 })
@@ -53,9 +52,7 @@ it('renaming a single-pane tab also renames its only pane', () => {
 
   expect(store.renameTab('tab_a', 'Docs')).toEqual({ tabId: 'tab_a' })
   expect((store as any).snapshot.tabs[0].title).toBe('Docs')
-  expect((store as any).snapshot.tabs[0].titleSource).toBe('user')
   expect((store as any).snapshot.paneTitles.tab_a.pane_1).toBe('Docs')
-  expect((store as any).snapshot.paneTitleSources.tab_a.pane_1).toBe('user')
   expect((store as any).snapshot.paneTitleSetByUser.tab_a.pane_1).toBe(true)
 })
 
@@ -157,38 +154,6 @@ it('preserves user-set pane titles across attach, respawn, and navigate updates'
   ])
 })
 
-it('preserves stable pane titles across attach updates', () => {
-  const store = new LayoutStore()
-  store.updateFromUi({
-    tabs: [{ id: 'tab_a', title: 'Alpha', titleSource: 'stable' }],
-    activeTabId: 'tab_a',
-    layouts: {
-      tab_a: {
-        type: 'leaf',
-        id: 'pane_1',
-        content: { kind: 'terminal', terminalId: 'term_1', mode: 'codex', shell: 'system' },
-      },
-    },
-    activePane: { tab_a: 'pane_1' },
-    paneTitles: { tab_a: { pane_1: 'Session Alpha' } },
-    paneTitleSources: { tab_a: { pane_1: 'stable' } },
-    timestamp: Date.now(),
-  } as any, 'conn-1')
-
-  store.attachPaneContent('tab_a', 'pane_1', {
-    kind: 'terminal',
-    terminalId: 'term_2',
-    mode: 'shell',
-    shell: 'system',
-    status: 'running',
-  })
-
-  expect(store.listPanes('tab_a')).toEqual([
-    expect.objectContaining({ id: 'pane_1', kind: 'terminal', terminalId: 'term_2', title: 'Session Alpha' }),
-  ])
-  expect((store as any).snapshot.paneTitleSources.tab_a.pane_1).toBe('stable')
-})
-
 it('swaps pane titles with pane content so title-based targeting stays aligned', () => {
   const store = new LayoutStore()
   store.updateFromUi({
@@ -208,7 +173,6 @@ it('swaps pane titles with pane content so title-based targeting stays aligned',
     },
     activePane: { tab_a: 'pane_1' },
     paneTitles: { tab_a: { pane_1: 'Codex', pane_2: 'Editor' } },
-    paneTitleSources: { tab_a: { pane_1: 'user', pane_2: 'stable' } },
     timestamp: Date.now(),
   } as any, 'conn-1')
 
@@ -217,8 +181,4 @@ it('swaps pane titles with pane content so title-based targeting stays aligned',
     expect.objectContaining({ id: 'pane_1', kind: 'editor', title: 'Editor' }),
     expect.objectContaining({ id: 'pane_2', kind: 'terminal', terminalId: 'term_1', title: 'Codex' }),
   ])
-  expect((store as any).snapshot.paneTitleSources.tab_a).toEqual({
-    pane_1: 'stable',
-    pane_2: 'user',
-  })
 })

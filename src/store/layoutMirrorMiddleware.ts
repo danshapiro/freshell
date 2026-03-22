@@ -30,7 +30,6 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
         return {
           id: t.id,
           title: t.title,
-          ...(t.titleSource ? { titleSource: t.titleSource } : {}),
           ...(fallbackSessionRef ? { fallbackSessionRef } : {}),
         }
       }),
@@ -38,7 +37,6 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
       layouts: state.panes.layouts,
       activePane: state.panes.activePane,
       paneTitles: state.panes.paneTitles || {},
-      paneTitleSources: state.panes.paneTitleSources || {},
       paneTitleSetByUser: state.panes.paneTitleSetByUser || {},
     }
     const serialized = JSON.stringify(payload)

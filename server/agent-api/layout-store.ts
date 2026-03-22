@@ -2,15 +2,12 @@ import type { SessionLocator } from '../../shared/ws-protocol.js'
 import { nanoid } from 'nanoid'
 import { resolveTarget } from './target-resolver.js'
 
-type DurableTitleSource = 'derived' | 'stable' | 'user'
-
 type UiSnapshot = {
-  tabs: Array<{ id: string; title?: string; titleSource?: DurableTitleSource; fallbackSessionRef?: SessionLocator }>
+  tabs: Array<{ id: string; title?: string; fallbackSessionRef?: SessionLocator }>
   activeTabId?: string | null
   layouts: Record<string, any>
   activePane: Record<string, string>
   paneTitles?: Record<string, Record<string, string>>
-  paneTitleSources?: Record<string, Record<string, DurableTitleSource>>
   paneTitleSetByUser?: Record<string, Record<string, boolean>>
   timestamp?: number
 }
@@ -36,8 +33,6 @@ export class LayoutStore {
     if (!this.snapshot) return
     if (!this.snapshot.paneTitles) this.snapshot.paneTitles = {}
     if (!this.snapshot.paneTitles[tabId]) this.snapshot.paneTitles[tabId] = {}
-    if (!this.snapshot.paneTitleSources) this.snapshot.paneTitleSources = {}
-    if (!this.snapshot.paneTitleSources[tabId]) this.snapshot.paneTitleSources[tabId] = {}
     if (!this.snapshot.paneTitleSetByUser) this.snapshot.paneTitleSetByUser = {}
     if (!this.snapshot.paneTitleSetByUser[tabId]) this.snapshot.paneTitleSetByUser[tabId] = {}
   }
@@ -47,11 +42,10 @@ export class LayoutStore {
     this.ensurePaneTitleMaps(tabId)
 
     const paneTitles = this.snapshot.paneTitles?.[tabId]
-    const paneTitleSources = this.snapshot.paneTitleSources?.[tabId]
     const paneTitleSetByUser = this.snapshot.paneTitleSetByUser?.[tabId]
-    if (!paneTitles || !paneTitleSources || !paneTitleSetByUser) return undefined
+    if (!paneTitles || !paneTitleSetByUser) return undefined
 
-    return { paneTitles, paneTitleSources, paneTitleSetByUser }
+    return { paneTitles, paneTitleSetByUser }
   }
 
   private removePaneMetadata(tabId: string, paneId: string) {
@@ -60,12 +54,6 @@ export class LayoutStore {
       delete this.snapshot.paneTitles[tabId][paneId]
       if (Object.keys(this.snapshot.paneTitles[tabId]).length === 0) {
         delete this.snapshot.paneTitles[tabId]
-      }
-    }
-    if (this.snapshot.paneTitleSources?.[tabId]) {
-      delete this.snapshot.paneTitleSources[tabId][paneId]
-      if (Object.keys(this.snapshot.paneTitleSources[tabId]).length === 0) {
-        delete this.snapshot.paneTitleSources[tabId]
       }
     }
     if (this.snapshot.paneTitleSetByUser?.[tabId]) {
@@ -79,34 +67,7 @@ export class LayoutStore {
   private removeTabMetadata(tabId: string) {
     if (!this.snapshot) return
     delete this.snapshot.paneTitles?.[tabId]
-    delete this.snapshot.paneTitleSources?.[tabId]
     delete this.snapshot.paneTitleSetByUser?.[tabId]
-  }
-
-  private inferPaneTitleSource(
-    title: string | undefined,
-    content: any,
-    setByUser?: boolean,
-  ): DurableTitleSource {
-    if (setByUser) return 'user'
-    const derivedTitle = this.derivePaneTitle(content)
-    if (!title || (derivedTitle && title === derivedTitle)) return 'derived'
-    return 'stable'
-  }
-
-  private setPaneTitleSource(
-    tabId: string,
-    paneId: string,
-    source: DurableTitleSource,
-  ) {
-    const paneTitleMaps = this.getPaneTitleMaps(tabId)
-    if (!paneTitleMaps) return
-    paneTitleMaps.paneTitleSources[paneId] = source
-    if (source === 'user') {
-      paneTitleMaps.paneTitleSetByUser[paneId] = true
-      return
-    }
-    delete paneTitleMaps.paneTitleSetByUser[paneId]
   }
 
   private derivePaneTitle(content: any): string | undefined {
@@ -177,63 +138,12 @@ export class LayoutStore {
     const title = this.derivePaneTitle(content)
     if (!title || !this.snapshot) return
     const paneTitleMaps = this.getPaneTitleMaps(tabId)
-    if (!paneTitleMaps) return
-    const currentSource = paneTitleMaps.paneTitleSources[paneId]
-      ?? this.inferPaneTitleSource(
-        paneTitleMaps.paneTitles[paneId],
-        content,
-        paneTitleMaps.paneTitleSetByUser[paneId],
-      )
-    if (currentSource !== 'derived') return
+    if (!paneTitleMaps || paneTitleMaps.paneTitleSetByUser[paneId]) return
     paneTitleMaps.paneTitles[paneId] = title
-    this.setPaneTitleSource(tabId, paneId, 'derived')
   }
 
   updateFromUi(snapshot: UiSnapshot, connectionId: string) {
-    const normalized: UiSnapshot = {
-      ...snapshot,
-      tabs: snapshot.tabs.map((tab) => ({ ...tab })),
-      activePane: { ...(snapshot.activePane || {}) },
-      layouts: { ...(snapshot.layouts || {}) },
-      paneTitles: { ...(snapshot.paneTitles || {}) },
-      paneTitleSources: { ...(snapshot.paneTitleSources || {}) },
-      paneTitleSetByUser: { ...(snapshot.paneTitleSetByUser || {}) },
-    }
-
-    for (const tab of normalized.tabs) {
-      const root = normalized.layouts?.[tab.id]
-      const leaves = this.collectLeaves(root, [])
-      if (!normalized.paneTitles![tab.id]) normalized.paneTitles![tab.id] = {}
-      if (!normalized.paneTitleSources![tab.id]) normalized.paneTitleSources![tab.id] = {}
-      if (!normalized.paneTitleSetByUser![tab.id]) normalized.paneTitleSetByUser![tab.id] = {}
-
-      for (const leaf of leaves) {
-        const paneTitles = normalized.paneTitles![tab.id]!
-        const paneTitleSources = normalized.paneTitleSources![tab.id]!
-        const paneTitleSetByUser = normalized.paneTitleSetByUser![tab.id]!
-        const source = paneTitleSources[leaf.id]
-          ?? this.inferPaneTitleSource(
-            paneTitles[leaf.id],
-            leaf.content,
-            paneTitleSetByUser[leaf.id],
-          )
-
-        paneTitleSources[leaf.id] = source
-        if (!paneTitles[leaf.id]) {
-          const derivedTitle = this.derivePaneTitle(leaf.content)
-          if (derivedTitle) {
-            paneTitles[leaf.id] = derivedTitle
-          }
-        }
-        if (source === 'user') {
-          paneTitleSetByUser[leaf.id] = true
-        } else {
-          delete paneTitleSetByUser[leaf.id]
-        }
-      }
-    }
-
-    this.snapshot = normalized
+    this.snapshot = snapshot
     this.sourceConnectionId = connectionId
   }
 
@@ -458,7 +368,7 @@ export class LayoutStore {
     const tabId = nanoid()
     const paneId = nanoid()
     const content = this.buildContent({ terminalId, browser, editor })
-    snapshot.tabs.push({ id: tabId, title, titleSource: title ? 'stable' : 'derived' })
+    snapshot.tabs.push({ id: tabId, title })
     snapshot.layouts[tabId] = {
       type: 'leaf',
       id: paneId,
@@ -548,13 +458,12 @@ export class LayoutStore {
     const tab = this.snapshot.tabs.find((t) => t.id === tabId)
     if (!tab) return { message: 'tab not found' as const }
     tab.title = title
-    tab.titleSource = title ? 'user' : tab.titleSource
     const singlePaneId = this.getSinglePaneId(tabId)
     if (singlePaneId && title) {
       const paneTitleMaps = this.getPaneTitleMaps(tabId)
       if (paneTitleMaps) {
         paneTitleMaps.paneTitles[singlePaneId] = title
-        this.setPaneTitleSource(tabId, singlePaneId, 'user')
+        paneTitleMaps.paneTitleSetByUser[singlePaneId] = true
       }
     }
     return { tabId }
@@ -570,14 +479,11 @@ export class LayoutStore {
     if (!paneTitleMaps) return { message: 'no layout snapshot' as const }
 
     paneTitleMaps.paneTitles[paneId] = title
-    this.setPaneTitleSource(pane.tabId, paneId, 'user')
+    paneTitleMaps.paneTitleSetByUser[paneId] = true
     const singlePaneId = this.getSinglePaneId(pane.tabId)
     if (singlePaneId === paneId) {
       const tab = this.snapshot.tabs.find((item) => item.id === pane.tabId)
-      if (tab) {
-        tab.title = title
-        tab.titleSource = 'user'
-      }
+      if (tab) tab.title = title
     }
     return { tabId: pane.tabId, paneId }
   }
@@ -642,20 +548,6 @@ export class LayoutStore {
         delete this.snapshot.paneTitles[targetTab][bId]
       } else {
         this.snapshot.paneTitles[targetTab][bId] = titleA
-      }
-    }
-    if (this.snapshot.paneTitleSources?.[targetTab]) {
-      const sourceA = this.snapshot.paneTitleSources[targetTab][aId]
-      const sourceB = this.snapshot.paneTitleSources[targetTab][bId]
-      if (sourceB === undefined) {
-        delete this.snapshot.paneTitleSources[targetTab][aId]
-      } else {
-        this.snapshot.paneTitleSources[targetTab][aId] = sourceB
-      }
-      if (sourceA === undefined) {
-        delete this.snapshot.paneTitleSources[targetTab][bId]
-      } else {
-        this.snapshot.paneTitleSources[targetTab][bId] = sourceA
       }
     }
     if (this.snapshot.paneTitleSetByUser?.[targetTab]) {

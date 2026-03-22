@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '../../../src/store/tabsSlice'
 import panesReducer, { initLayout, mergePaneContent, updatePaneTitle } from '../../../src/store/panesSlice'
-import paneRuntimeTitleReducer, { setPaneRuntimeTitle } from '../../../src/store/paneRuntimeTitleSlice'
 import { layoutMirrorMiddleware } from '../../../src/store/layoutMirrorMiddleware'
 
 const { mockSend } = vi.hoisted(() => ({
@@ -50,7 +49,6 @@ describe('layoutMirrorMiddleware', () => {
         {
           id: 'tab-1',
           title: 'alpha',
-          titleSource: 'derived',
           fallbackSessionRef: {
             provider: 'codex',
             sessionId: 'older-open',
@@ -61,7 +59,6 @@ describe('layoutMirrorMiddleware', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
-      paneTitleSources: {},
       paneTitleSetByUser: {},
       timestamp: expect.any(Number),
     })
@@ -86,15 +83,15 @@ describe('layoutMirrorMiddleware', () => {
     vi.useRealTimers()
   })
 
-  it('includes durable tab and pane title sources in mirrored layout payloads', () => {
+  it('includes paneTitleSetByUser in mirrored layout payloads', () => {
     mockSend.mockClear()
     vi.useFakeTimers()
     const store = configureStore({
-      reducer: { tabs: tabsReducer, panes: panesReducer, paneRuntimeTitle: paneRuntimeTitleReducer },
+      reducer: { tabs: tabsReducer, panes: panesReducer },
       middleware: (g) => g().concat(layoutMirrorMiddleware),
     })
 
-    store.dispatch(addTab({ title: 'alpha', titleSource: 'stable' }))
+    store.dispatch(addTab({ title: 'alpha' }))
     const tabId = store.getState().tabs.tabs[0]?.id
     expect(tabId).toBeTruthy()
 
@@ -106,29 +103,14 @@ describe('layoutMirrorMiddleware', () => {
 
     mockSend.mockClear()
     store.dispatch(updatePaneTitle({ tabId: tabId!, paneId, title: 'Ops desk' }))
-    store.dispatch(setPaneRuntimeTitle({ paneId, title: 'runtime codex' }))
     vi.runOnlyPendingTimers()
 
     expect(mockSend).toHaveBeenLastCalledWith(expect.objectContaining({
-      tabs: [
-        expect.objectContaining({
-          id: tabId!,
-          titleSource: 'stable',
-        }),
-      ],
-      paneTitleSources: {
-        [tabId!]: {
-          [paneId]: 'user',
-        },
-      },
       paneTitleSetByUser: {
         [tabId!]: {
           [paneId]: true,
         },
       },
-    }))
-    expect(mockSend).toHaveBeenLastCalledWith(expect.not.objectContaining({
-      paneRuntimeTitle: expect.anything(),
     }))
     vi.useRealTimers()
   })

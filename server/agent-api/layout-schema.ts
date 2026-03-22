@@ -1,8 +1,6 @@
 import { z } from 'zod'
 import { SessionLocatorSchema } from '../../shared/ws-protocol.js'
 
-const DurableTitleSourceSchema = z.enum(['derived', 'stable', 'user'])
-
 const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
   z.object({ type: z.literal('leaf'), id: z.string(), content: z.record(z.string(), z.any()) }),
   z.object({
@@ -19,14 +17,12 @@ export const UiLayoutSyncSchema = z.object({
   tabs: z.array(z.object({
     id: z.string(),
     title: z.string().optional(),
-    titleSource: DurableTitleSourceSchema.optional(),
     fallbackSessionRef: SessionLocatorSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), PaneNodeSchema),
   activePane: z.record(z.string(), z.string()),
   paneTitles: z.record(z.string(), z.record(z.string(), z.string())).optional(),
-  paneTitleSources: z.record(z.string(), z.record(z.string(), DurableTitleSourceSchema)).optional(),
   paneTitleSetByUser: z.record(z.string(), z.record(z.string(), z.boolean())).optional(),
   timestamp: z.number(),
 })
