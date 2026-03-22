@@ -128,8 +128,6 @@ function SortableTab({
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
-const EMPTY_PANE_TITLE_SOURCES: Record<string, Record<string, 'derived' | 'stable' | 'user'>> = {}
-const EMPTY_PANE_RUNTIME_TITLES: Record<string, string> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
@@ -150,8 +148,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
-  const paneTitleSources = useAppSelector((s) => s.panes?.paneTitleSources) ?? EMPTY_PANE_TITLE_SOURCES
-  const paneRuntimeTitles = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId ?? EMPTY_PANE_RUNTIME_TITLES)
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
@@ -170,15 +166,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(
-      tab,
-      paneLayouts[tab.id],
-      paneTitles[tab.id],
-      paneTitleSources[tab.id],
-      paneRuntimeTitles,
-      extensions,
-    ),
-    [paneLayouts, paneRuntimeTitles, paneTitleSources, paneTitles, extensions]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles[tab.id], extensions),
+    [paneLayouts, paneTitles, extensions]
   )
 
   const getPaneEntries = useCallback((tab: Tab): Array<{ paneId: string; content: PaneContent }> | undefined => {

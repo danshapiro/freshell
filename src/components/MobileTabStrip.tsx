@@ -10,8 +10,6 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
-const EMPTY_PANE_TITLE_SOURCES: Record<string, Record<string, 'derived' | 'stable' | 'user'>> = {}
-const EMPTY_PANE_RUNTIME_TITLES: Record<string, string> = {}
 
 interface MobileTabStripProps {
   onOpenSwitcher?: () => void
@@ -25,8 +23,6 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
-  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources ?? EMPTY_PANE_TITLE_SOURCES)
-  const paneRuntimeTitles = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId ?? EMPTY_PANE_RUNTIME_TITLES)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const paneRuntimeActivityByPaneId = useAppSelector(
@@ -38,14 +34,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : null
 
   const displayTitle = activeTab
-    ? getTabDisplayTitle(
-      activeTab,
-      paneLayouts[activeTab.id],
-      paneTitles?.[activeTab.id],
-      paneTitleSources?.[activeTab.id],
-      paneRuntimeTitles,
-      extensions,
-    )
+    ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id], paneTitles?.[activeTab.id], extensions)
     : ''
   const isActiveBusy = activeTab
     ? getBusyPaneIdsForTab({

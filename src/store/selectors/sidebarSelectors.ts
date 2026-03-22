@@ -5,7 +5,6 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
-import { getTabDurableDisplayTitle } from '@/lib/tab-title'
 import type { SessionListMetadata } from '../types'
 
 export interface SidebarSessionItem {
@@ -142,7 +141,6 @@ export function buildSessionItems(
 
   const knownKeys = new Set(items.map((item) => `${item.provider}:${item.sessionId}`))
   const paneTitles = panes?.paneTitles ?? {}
-  const paneTitleSources = panes?.paneTitleSources ?? {}
 
   const pushFallbackItem = (input: {
     provider: CodingCliProviderName
@@ -193,12 +191,7 @@ export function buildSessionItems(
       return
     }
 
-    const durableTabTitle = getTabDurableDisplayTitle(
-      tab,
-      panes.layouts?.[tab.id],
-      paneTitles?.[tab.id],
-      paneTitleSources?.[tab.id],
-    )
+    const paneTitle = paneTitles?.[tab.id]?.[node.id]
     const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
 
     if (node.content.kind === 'agent-chat') {
@@ -209,7 +202,7 @@ export function buildSessionItems(
         provider: 'claude',
         sessionId,
         sessionType: node.content.provider || 'claude',
-        title: durableTabTitle,
+        title: paneTitle || tab.title,
         cwd: undefined,
         timestamp: fallbackTimestamp,
         metadata,
@@ -225,7 +218,7 @@ export function buildSessionItems(
       provider: node.content.mode,
       sessionId: node.content.resumeSessionId,
       sessionType: node.content.mode,
-      title: durableTabTitle,
+      title: paneTitle || tab.title,
       cwd: node.content.initialCwd,
       timestamp: fallbackTimestamp,
       metadata,

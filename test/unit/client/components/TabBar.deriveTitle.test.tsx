@@ -8,7 +8,6 @@ import panesReducer from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '../../../../src/store/settingsSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
-import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
 import type { ClientExtensionEntry } from '../../../../shared/extension-types'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
@@ -50,14 +49,10 @@ function createStore(tabsState: any, panesState: any) {
       connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
-      paneRuntimeTitle: paneRuntimeTitleReducer,
     },
     preloadedState: {
       tabs: tabsState,
       panes: panesState,
-      paneRuntimeTitle: {
-        titlesByPaneId: {},
-      },
       extensions: {
         entries: defaultCliExtensions,
       },
@@ -254,107 +249,6 @@ describe('TabBar tab title derivation', () => {
 
     expect(screen.getByText('Release notes')).toBeInTheDocument()
     expect(screen.queryByText('Tab 1')).not.toBeInTheDocument()
-  })
-
-  it('shows a single-pane runtime title when the durable sources are only derived', () => {
-    const store = createStore(
-      {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'Tab 1',
-            titleSource: 'derived',
-            titleSetByUser: false,
-            status: 'running',
-            mode: 'shell',
-            shell: 'system',
-            createdAt: Date.now(),
-          },
-        ],
-        activeTabId: 'tab-1',
-      },
-      {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'shell',
-              createRequestId: 'req-1',
-              status: 'running',
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'derived' } },
-      }
-    )
-    store.dispatch({
-      type: 'paneRuntimeTitle/setPaneRuntimeTitle',
-      payload: { paneId: 'pane-1', title: 'vim README.md' },
-    })
-
-    render(
-      <Provider store={store}>
-        <TabBar />
-      </Provider>
-    )
-
-    expect(screen.getByText('vim README.md')).toBeInTheDocument()
-  })
-
-  it('keeps a stable single-pane title ahead of a later runtime title', () => {
-    const store = createStore(
-      {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-            titleSource: 'stable',
-            titleSetByUser: false,
-            status: 'running',
-            mode: 'codex',
-            shell: 'system',
-            createdAt: Date.now(),
-          },
-        ],
-        activeTabId: 'tab-1',
-      },
-      {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'codex',
-              createRequestId: 'req-1',
-              status: 'running',
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'stable' } },
-      }
-    )
-    store.dispatch({
-      type: 'paneRuntimeTitle/setPaneRuntimeTitle',
-      payload: { paneId: 'pane-1', title: 'codex' },
-    })
-
-    render(
-      <Provider store={store}>
-        <TabBar />
-      </Provider>
-    )
-
-    expect(screen.getByText('codex resume 019d1213-9c59-7bb0-80ae-70c74427f346')).toBeInTheDocument()
-    expect(screen.queryByText(/^codex$/)).not.toBeInTheDocument()
   })
 
   it('derives title from shell terminal using last directory segment', () => {

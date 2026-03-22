@@ -7,7 +7,6 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
-import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -80,7 +79,6 @@ function createStore(
     connection: connectionReducer,
     settings: settingsReducer,
     turnCompletion: turnCompletionReducer,
-    paneRuntimeTitle: paneRuntimeTitleReducer,
     ...(includeCodexActivity ? { codexActivity: codexActivityReducer } : {}),
   }
   const preloadedState: Record<string, unknown> = {
@@ -93,15 +91,10 @@ function createStore(
       layouts,
       activePane,
       paneTitles: {},
-      paneTitleSources: {},
       paneTitleSetByUser: {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
       zoomedPane: {},
-      refreshRequestsByPane: {},
-    },
-    paneRuntimeTitle: {
-      titlesByPaneId: {},
     },
     connection: {
       status: 'ready' as const,
@@ -154,26 +147,6 @@ describe('TabSwitcher', () => {
     expect(screen.getByText('Shell')).toBeInTheDocument()
     expect(screen.getByText('Claude')).toBeInTheDocument()
     expect(screen.getByText('Codex')).toBeInTheDocument()
-  })
-
-  it('uses a runtime title for a single-pane derived tab card', async () => {
-    const { TabSwitcher } = await import('@/components/TabSwitcher')
-    const store = createStore(
-      [createTab('tab-1', 'Tab 1', { titleSource: 'derived' as const })],
-      'tab-1'
-    )
-    store.dispatch({
-      type: 'paneRuntimeTitle/setPaneRuntimeTitle',
-      payload: { paneId: 'pane-tab-1', title: 'npm test' },
-    })
-
-    render(
-      <Provider store={store}>
-        <TabSwitcher onClose={() => {}} />
-      </Provider>
-    )
-
-    expect(screen.getByText('npm test')).toBeInTheDocument()
   })
 
   it('highlights the active tab with a ring', async () => {

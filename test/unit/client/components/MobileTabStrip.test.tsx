@@ -7,7 +7,6 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
-import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -80,7 +79,6 @@ function createStore(
     connection: connectionReducer,
     settings: settingsReducer,
     turnCompletion: turnCompletionReducer,
-    paneRuntimeTitle: paneRuntimeTitleReducer,
     ...(includeCodexActivity ? { codexActivity: codexActivityReducer } : {}),
   }
   const preloadedState: Record<string, unknown> = {
@@ -93,15 +91,10 @@ function createStore(
       layouts,
       activePane,
       paneTitles: {},
-      paneTitleSources: {},
       paneTitleSetByUser: {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
       zoomedPane: {},
-      refreshRequestsByPane: {},
-    },
-    paneRuntimeTitle: {
-      titlesByPaneId: {},
     },
     connection: {
       status: 'ready' as const,
@@ -154,24 +147,6 @@ describe('MobileTabStrip', () => {
     // Title 'Build Server' does not match /^Tab \d+$/ so getTabDisplayTitle returns it directly
     expect(screen.getByText('Build Server')).toBeInTheDocument()
     expect(screen.getByText('2 / 3')).toBeInTheDocument()
-  })
-
-  it('shows the active pane runtime title when the durable title is only derived', async () => {
-    const { MobileTabStrip } = await import('@/components/MobileTabStrip')
-    const tab = createTab('tab-1', 'Tab 1', { titleSource: 'derived' as const })
-    const store = createStore([tab], 'tab-1')
-    store.dispatch({
-      type: 'paneRuntimeTitle/setPaneRuntimeTitle',
-      payload: { paneId: 'pane-tab-1', title: 'vim README.md' },
-    })
-
-    render(
-      <Provider store={store}>
-        <MobileTabStrip />
-      </Provider>
-    )
-
-    expect(screen.getByText('vim README.md')).toBeInTheDocument()
   })
 
   it('has previous and next navigation buttons when not on the last tab', async () => {
