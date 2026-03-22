@@ -60,7 +60,6 @@ describe('tabsSlice', () => {
       expect(state.tabs).toHaveLength(1)
       const tab = state.tabs[0]
       expect(tab.title).toBe('Tab 1')
-      expect(tab.titleSource).toBe('derived')
       expect(tab.status).toBe('creating')
       expect(tab.mode).toBe('shell')
       expect(tab.shell).toBe('system')
@@ -90,13 +89,6 @@ describe('tabsSlice', () => {
       const state = tabsReducer(initialState, addTab({ title: 'My Custom Terminal' }))
 
       expect(state.tabs[0].title).toBe('My Custom Terminal')
-      expect(state.tabs[0].titleSource).toBe('derived')
-    })
-
-    it('preserves an explicit stable title source', () => {
-      const state = tabsReducer(initialState, addTab({ title: 'Session title', titleSource: 'stable' }))
-
-      expect(state.tabs[0].titleSource).toBe('stable')
     })
 
     it('accepts custom mode', () => {
@@ -365,50 +357,6 @@ describe('tabsSlice', () => {
       expect(state.tabs[0].title).toBe('Saved Terminal')
       expect(state.tabs[1].id).toBe('saved-2')
       expect(state.activeTabId).toBe('saved-2')
-    })
-
-    it('canonicalizes only tabs-only-safe legacy title sources during hydration', () => {
-      const state = tabsReducer(
-        initialState,
-        hydrateTabs({
-          tabs: [
-            {
-              id: 'user-tab',
-              createRequestId: 'user-tab',
-              title: 'Named by user',
-              titleSetByUser: true,
-              status: 'running',
-              mode: 'shell',
-              shell: 'system',
-              createdAt: 1,
-            },
-            {
-              id: 'derived-tab',
-              createRequestId: 'derived-tab',
-              title: 'Tab 3',
-              titleSetByUser: false,
-              status: 'running',
-              mode: 'shell',
-              shell: 'system',
-              createdAt: 2,
-            },
-            {
-              id: 'legacy-stable-tab',
-              createRequestId: 'legacy-stable-tab',
-              title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-              titleSetByUser: false,
-              status: 'running',
-              mode: 'codex',
-              shell: 'system',
-              createdAt: 3,
-            },
-          ],
-          activeTabId: 'legacy-stable-tab',
-        })
-      )
-
-      expect(state.tabs.map((tab) => tab.titleSource)).toEqual(['user', 'derived', undefined])
-      expect(state.tabs.map((tab) => tab.titleSetByUser)).toEqual([true, false, false])
     })
 
     it('sets default values for missing properties', () => {
@@ -712,7 +660,6 @@ describe('tabsSlice', () => {
       expect(tabs).toHaveLength(1)
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
       expect(tabs[0].mode).toBe('claude')
-      expect(tabs[0].titleSource).toBe('stable')
     })
 
     it('creates a layout-backed terminal pane immediately for PTY-backed coding sessions', async () => {
@@ -901,7 +848,6 @@ describe('tabsSlice', () => {
       expect(tabs[0].terminalId).toBe('term-2')
       expect(tabs[0].status).toBe('running')
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
-      expect(tabs[0].titleSource).toBe('stable')
       expect(store.getState().panes.layouts[tabs[0].id]).toMatchObject({
         type: 'leaf',
         content: {

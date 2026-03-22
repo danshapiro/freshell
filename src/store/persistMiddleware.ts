@@ -9,12 +9,6 @@ import { PANES_SCHEMA_VERSION } from './persistedState.js'
 import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { migratePersistedPaneContent } from './persisted-pane-migration'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
-import {
-  bootstrapLegacyTabTitleSource,
-  inferLegacyPaneTitleSource,
-  resolveEffectiveLegacyTabTitleSource,
-} from '@/lib/title-source'
 
 
 const log = createLogger('PanesPersist')
@@ -63,39 +57,6 @@ function stripTabVolatileFields(tab: Tab) {
   return {
     ...tab,
     lastInputAt: undefined,
-  }
-}
-
-function canonicalizeTabForPersistence(tab: Tab, panes: PanesState | undefined): Tab {
-  const layout = panes?.layouts?.[tab.id]
-  const paneTitle = layout?.type === 'leaf' ? panes?.paneTitles?.[tab.id]?.[layout.id] : undefined
-  const paneTitleSource = layout?.type === 'leaf'
-    ? inferLegacyPaneTitleSource({
-        storedTitle: paneTitle,
-        derivedTitle: derivePaneTitle(layout.content),
-        titleSetByUser: panes?.paneTitleSetByUser?.[tab.id]?.[layout.id],
-      })
-    : undefined
-
-  const titleSource = tab.titleSource
-    ?? bootstrapLegacyTabTitleSource({
-      title: tab.title,
-      titleSetByUser: tab.titleSetByUser,
-      mode: tab.mode,
-      shell: tab.shell,
-    })
-    ?? resolveEffectiveLegacyTabTitleSource({
-      storedTitle: tab.title,
-      titleSetByUser: tab.titleSetByUser,
-      layout,
-      paneTitle,
-      paneTitleSource,
-    })
-
-  return {
-    ...tab,
-    titleSource,
-    titleSetByUser: titleSource === 'user',
   }
 }
 
@@ -375,9 +336,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         tabs: {
           // Persist only stable tab state. Keep ephemeral UI fields out of storage.
           activeTabId: state.tabs.activeTabId,
-          tabs: state.tabs.tabs
-            .map((tab) => canonicalizeTabForPersistence(tab, state.panes))
-            .map(stripTabVolatileFields),
+          tabs: state.tabs.tabs.map(stripTabVolatileFields),
         },
       }
 

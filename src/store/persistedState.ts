@@ -8,13 +8,11 @@ export const PANES_SCHEMA_VERSION = 6
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
-const zDurableTitleSource = z.enum(['derived', 'stable', 'user'])
 
 const zTab = z.object({
   id: z.string().min(1),
   title: z.string(),
   createdAt: z.number().optional(),
-  titleSource: zDurableTitleSource.optional(),
   titleSetByUser: z.boolean().optional(),
   // Compatibility-only fields (may exist in persisted tabs before pane layout is created).
   mode: zTabMode.optional(),
