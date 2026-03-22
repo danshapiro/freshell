@@ -110,6 +110,79 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
   })
 
+  it('hydrates remote panes but preserves local authoritative coding identity for the same createRequestId', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1, mode: 'codex' } as any],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-live',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-live',
+            status: 'running',
+            terminalId: 'term-live',
+            resumeSessionId: 'codex-local',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-local',
+              serverInstanceId: 'srv-local',
+            },
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-live' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 4,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-live',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-live',
+            status: 'creating',
+            resumeSessionId: 'codex-foreign',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-foreign',
+              serverInstanceId: 'srv-remote',
+            },
+          },
+        },
+      },
+      activePane: { 'tab-1': 'pane-live' },
+      paneTitles: {},
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: PANES_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout?.content?.terminalId).toBe('term-live')
+    expect(layout?.content?.resumeSessionId).toBe('codex-local')
+    expect(layout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-local',
+      serverInstanceId: 'srv-local',
+    })
+  })
+
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {

@@ -77,7 +77,7 @@ import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
 import '@xterm/xterm/css/xterm.css'
 import { createLogger } from '@/lib/client-logger'
-import { buildExactSessionRef } from '@/lib/exact-session-ref'
+import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 
 const log = createLogger('TerminalView')
 
@@ -1400,10 +1400,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
   }, [suppressNetworkEffects, ws, applySeqState])
 
+  const hasExplicitRestoreSessionRef = !!sanitizeExactSessionRef(terminalContent?.sessionRef as any)
   const needsRestoreIdentityGate = !!(
     terminalContent?.terminalId
     && terminalContent.mode !== 'shell'
     && hasTerminalRestoreRequestId(terminalContent.createRequestId)
+    && hasExplicitRestoreSessionRef
   )
   const createIdentityGateKey = (needsRestoreIdentityGate || !terminalContent?.terminalId)
     ? (localServerInstanceId ?? '__unknown__')
@@ -2041,7 +2043,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
       if (currentTerminalId) {
         const restore = getRestoreFlag(createRequestId)
-        if (restore && mode !== 'shell') {
+        if (restore && mode !== 'shell' && !!sanitizeExactSessionRef(contentRef.current?.sessionRef as any)) {
           const restoreTarget = getResumeTarget({
             restore: true,
             mode,

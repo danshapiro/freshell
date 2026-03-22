@@ -633,6 +633,14 @@ describe('open tab session sidebar visibility (e2e)', () => {
       await store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }) as any)
     })
 
+    const openedTabId = store.getState().tabs.activeTabId
+    const openedLayout = openedTabId ? (store.getState().panes.layouts[openedTabId] as any) : undefined
+    expect(openedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'older-open',
+      serverInstanceId: 'srv-local',
+    })
+
     await waitFor(() => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'ui.layout.sync',

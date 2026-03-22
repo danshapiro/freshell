@@ -156,7 +156,6 @@ test.describe('Terminal Exact Session Identity', () => {
             status: 'creating',
             mode: 'codex',
             shell: 'system',
-            terminalId: 'stale-terminal-id',
             resumeSessionId: 'legacy-codex-session',
             createdAt: Date.now(),
           }],
@@ -177,10 +176,6 @@ test.describe('Terminal Exact Session Identity', () => {
     await harness.waitForTabCount(1)
 
     await page.waitForTimeout(500)
-
-    const attachMessages = (await harness.getSentWsMessages())
-      .filter((msg: any) => msg?.type === 'terminal.attach' && msg?.terminalId === 'stale-terminal-id')
-    expect(attachMessages).toHaveLength(0)
 
     const createMessages = (await harness.getSentWsMessages())
       .filter((msg: any) => msg?.type === 'terminal.create' && msg?.requestId === 'req-degraded')

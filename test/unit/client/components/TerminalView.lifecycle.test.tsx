@@ -2073,6 +2073,69 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
+  it('preserves same-server live terminal attach for restored coding panes that only have terminalId authority', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-restore-live-attach'
+    const paneId = 'pane-restore-live-attach'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-restore-live-attach',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-restore-live-attach',
+      resumeSessionId: 'codex-session-live',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-restore-live-attach',
+            terminalId: 'term-restore-live-attach',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId: 'term-restore-live-attach',
+        attachRequestId: expect.any(String),
+      }))
+    })
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
+  })
+
   it('does not send foreign exact resume ids on non-restore creates even when mirrored compatibility metadata is present', async () => {
     const tabId = 'tab-open-foreign-copy'
     const paneId = 'pane-open-foreign-copy'
