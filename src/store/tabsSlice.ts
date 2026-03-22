@@ -484,13 +484,14 @@ export const openSessionTab = createAsyncThunk(
     const maybeUpgradeExistingTabTitle = (tab: Tab | undefined) => {
       if (!tab || !title) return
       if (resolveExistingTabTitleSource(state, tab) !== 'derived') return
+      const layout = state.panes.layouts[tab.id]
+      if (layout && layout.type !== 'leaf') return
       dispatch(setTabTitle({
         id: tab.id,
         title,
         source: 'stable',
       }))
 
-      const layout = state.panes.layouts[tab.id]
       if (layout?.type !== 'leaf') return
 
       dispatch(updatePaneTitle({

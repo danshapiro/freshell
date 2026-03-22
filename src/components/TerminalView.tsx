@@ -1350,6 +1350,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   useEffect(() => {
     paneIdRef.current = paneId
   }, [paneId])
+  const paneRuntimeTitle = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId?.[paneId])
 
   // Track last title we set to avoid churn from spinner animations
   const lastTitleRef = useRef<string | null>(null)
@@ -1359,6 +1360,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     lastTitleRef.current = null
     lastTitleUpdateRef.current = 0
   }, [])
+  const previousPaneRuntimeTitleRef = useRef<string | undefined>(paneRuntimeTitle)
+
+  useEffect(() => {
+    if (previousPaneRuntimeTitleRef.current && !paneRuntimeTitle) {
+      resetRuntimeTitleDeduping()
+    }
+    previousPaneRuntimeTitleRef.current = paneRuntimeTitle
+  }, [paneRuntimeTitle, resetRuntimeTitleDeduping])
 
   // Handle xterm title changes (from terminal escape sequences)
   useEffect(() => {
