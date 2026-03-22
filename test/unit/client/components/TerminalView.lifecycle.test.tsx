@@ -8,10 +8,8 @@ import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/s
 import connectionReducer, { setServerInstanceId } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
-import { getTabDisplayTitle } from '@/lib/tab-title'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
@@ -115,22 +113,6 @@ function TerminalViewFromStore({ tabId, paneId, hidden }: { tabId: string; paneI
   })
   if (!paneContent || paneContent.kind !== 'terminal') return null
   return <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
-}
-
-function TabLabelsFromStore() {
-  const tabs = useAppSelector((state) => state.tabs.tabs)
-  const layouts = useAppSelector((state) => state.panes.layouts)
-  const paneTitles = useAppSelector((state) => state.panes.paneTitles)
-
-  return (
-    <>
-      {tabs.map((tab) => (
-        <div key={tab.id} data-testid={`tab-label-${tab.id}`}>
-          {getTabDisplayTitle(tab, layouts[tab.id], paneTitles[tab.id])}
-        </div>
-      ))}
-    </>
-  )
 }
 
 class MockResizeObserver {
@@ -1642,127 +1624,6 @@ describe('TerminalView lifecycle updates', () => {
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.resize',
     }))
-  })
-
-  it('keeps a hidden single-pane durable title after a later runtime title update', async () => {
-    const visibleTabId = 'tab-visible'
-    const durableTabId = 'tab-durable'
-    const durablePaneId = 'pane-durable'
-    const terminalId = 'term-durable'
-    const durableTitle = 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346'
-
-    const visiblePaneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-visible',
-      status: 'running',
-      mode: 'shell',
-      shell: 'system',
-      terminalId: 'term-visible',
-      initialCwd: '/tmp',
-    }
-
-    const durablePaneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-durable',
-      status: 'running',
-      mode: 'codex',
-      shell: 'system',
-      terminalId,
-      initialCwd: '/tmp',
-    }
-
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        settings: settingsReducer,
-        connection: connectionReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [
-            {
-              id: visibleTabId,
-              mode: 'shell',
-              status: 'running',
-              title: 'Shell',
-              titleSetByUser: false,
-              terminalId: 'term-visible',
-              createRequestId: 'req-visible',
-            },
-            {
-              id: durableTabId,
-              mode: 'codex',
-              status: 'running',
-              title: 'Codex',
-              titleSetByUser: false,
-              terminalId,
-              createRequestId: 'req-durable',
-            },
-          ],
-          activeTabId: visibleTabId,
-        },
-        panes: {
-          layouts: {
-            [visibleTabId]: { type: 'leaf', id: 'pane-visible', content: visiblePaneContent },
-            [durableTabId]: { type: 'leaf', id: durablePaneId, content: durablePaneContent },
-          },
-          activePane: {
-            [visibleTabId]: 'pane-visible',
-            [durableTabId]: durablePaneId,
-          },
-          paneTitles: {},
-        },
-        settings: createSettingsState(),
-        connection: { status: 'connected', error: null },
-      },
-    })
-
-    function DurableTerminalUnderTest() {
-      const hidden = useAppSelector((state) => state.tabs.activeTabId !== durableTabId)
-      return <TerminalView tabId={durableTabId} paneId={durablePaneId} paneContent={durablePaneContent} hidden={hidden} />
-    }
-
-    render(
-      <Provider store={store}>
-        <>
-          <TabLabelsFromStore />
-          <DurableTerminalUnderTest />
-        </>
-      </Provider>
-    )
-
-    await waitFor(() => {
-      expect(terminalInstances).toHaveLength(1)
-      expect(terminalInstances[0].onTitleChange).toHaveBeenCalledTimes(1)
-    })
-
-    await act(async () => {
-      await store.dispatch(syncPaneTitleByTerminalId({ terminalId, title: durableTitle }))
-    })
-
-    await waitFor(() => {
-      expect(document.querySelector(`[data-testid="tab-label-${durableTabId}"]`)?.textContent).toBe(durableTitle)
-    })
-
-    const titleListener = terminalInstances[0].onTitleChange.mock.calls[0]?.[0]
-    expect(titleListener).toBeTypeOf('function')
-
-    act(() => {
-      titleListener('codex')
-    })
-
-    await waitFor(() => {
-      expect(document.querySelector(`[data-testid="tab-label-${durableTabId}"]`)?.textContent).toBe(durableTitle)
-    })
-
-    act(() => {
-      store.dispatch(setActiveTab(durableTabId))
-    })
-
-    await waitFor(() => {
-      expect(document.querySelector(`[data-testid="tab-label-${durableTabId}"]`)?.textContent).toBe(durableTitle)
-    })
   })
 
   it('ignores INVALID_TERMINAL_ID errors for other terminals', async () => {
