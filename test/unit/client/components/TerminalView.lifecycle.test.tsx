@@ -2136,7 +2136,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
   })
 
-  it('does not send foreign exact resume ids on non-restore creates even when mirrored compatibility metadata is present', async () => {
+  it('clears stale foreign exact identity after a fresh local create', async () => {
     const tabId = 'tab-open-foreign-copy'
     const paneId = 'pane-open-foreign-copy'
 
@@ -2172,6 +2172,7 @@ describe('TerminalView lifecycle updates', () => {
             title: 'Codex',
             titleSetByUser: false,
             createRequestId: 'req-open-foreign-copy',
+            resumeSessionId: 'codex-session-123',
           }],
           activeTabId: tabId,
         },
@@ -2198,6 +2199,23 @@ describe('TerminalView lifecycle updates', () => {
         resumeSessionId: undefined,
       }))
     })
+
+    expect(messageHandler).not.toBeNull()
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-open-foreign-copy',
+        terminalId: 'term-open-foreign-copy',
+        createdAt: Date.now(),
+      })
+    })
+
+    const layout = store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>
+    const nextContent = layout.content as TerminalPaneContent
+    expect(nextContent.terminalId).toBe('term-open-foreign-copy')
+    expect(nextContent.sessionRef).toBeUndefined()
+    expect(nextContent.resumeSessionId).toBeUndefined()
+    expect(store.getState().tabs.tabs[0]?.resumeSessionId).toBeUndefined()
   })
 
   it('blocks restore when an exact sessionRef belongs to a different provider than the pane mode', async () => {

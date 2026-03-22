@@ -1785,6 +1785,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
+          const existingExactSessionRef = mode !== 'shell'
+            ? sanitizeExactSessionRef(contentRef.current?.sessionRef as any, mode)
+            : undefined
+          const clearStaleExactIdentity = mode !== 'shell'
+            && !msg.effectiveResumeSessionId
+            && !!existingExactSessionRef
           const exactSessionRef = msg.effectiveResumeSessionId && mode !== 'shell'
             ? buildExactSessionRef({
                 provider: mode,
@@ -1795,8 +1801,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           updateContent({
             terminalId: newId,
             status: 'running',
-            ...(msg.effectiveResumeSessionId ? { resumeSessionId: msg.effectiveResumeSessionId } : {}),
-            ...(exactSessionRef ? { sessionRef: exactSessionRef } : {}),
+            ...(msg.effectiveResumeSessionId
+              ? { resumeSessionId: msg.effectiveResumeSessionId }
+              : (clearStaleExactIdentity ? { resumeSessionId: undefined } : {})),
+            ...(exactSessionRef
+              ? { sessionRef: exactSessionRef }
+              : (clearStaleExactIdentity ? { sessionRef: undefined } : {})),
           })
           // Also update tab for title purposes
           const currentTab = tabRef.current
@@ -1806,7 +1816,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               updates: {
                 terminalId: newId,
                 status: 'running',
-                ...(msg.effectiveResumeSessionId ? { resumeSessionId: msg.effectiveResumeSessionId } : {}),
+                ...(msg.effectiveResumeSessionId
+                  ? { resumeSessionId: msg.effectiveResumeSessionId }
+                  : (clearStaleExactIdentity ? { resumeSessionId: undefined } : {})),
               },
             }))
           }
