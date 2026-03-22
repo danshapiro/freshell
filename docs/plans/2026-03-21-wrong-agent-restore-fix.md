@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every restored coding-agent tab or pane reopen only its own exact session after reload, reconnect, or server restart, and refuse ambiguous degraded-state restores instead of guessing.
+**Goal:** Make every restored coding-agent tab or pane reopen only its own exact session after reload, reconnect, or server restart, while refusing degraded restores that cannot prove exact local identity.
 
-**Architecture:** Treat pane-local `sessionRef` as the only authoritative coding-session identity on the client and persist one durable owner tuple `{tabId, paneId, createRequestId}` on every PTY-backed coding terminal on the server. Replace discovered same-`cwd` session binding with exact provenance: fresh Claude is exact at birth, fresh Codex becomes exact only when indexed shell-snapshot provenance matches the durable owner tuple, and restore paths fail closed unless the client can prove the session is exact and local.
+**Architecture:** Use the exact provenance the system already has instead of inventing a new identity layer. Fresh Claude terminals become exact at birth with `--session-id <uuid>`, Codex discovered-session binding becomes exact by parsing the existing shell snapshot for `FRESHELL_TERMINAL_ID`, and the client treats pane-level `sessionRef` as authoritative for restore. Tab-level `resumeSessionId` stays compatibility metadata only and loses ownership authority when layout is missing or stale.
 
 **Tech Stack:** Node/Express, ws, node-pty, React 18, Redux Toolkit, Zod, Vitest, Playwright
 
@@ -12,16 +12,13 @@
 
 ## Frozen Decisions
 
-1. `sessionRef` on pane content is the only authoritative coding-session identity on the client. Bare `resumeSessionId` remains a compatibility mirror only.
-2. Every PTY-backed coding terminal record stores one durable owner tuple `{tabId, paneId, createRequestId}`. Child-process Freshell env exports are derived from that stored tuple, not from transient request payloads.
-3. Provider + `cwd` + age-window discovered-session association is removed for exactable sessions. Exact provenance or no bind.
-4. Fresh Claude terminals are exact at birth via `--session-id <uuid>`. Non-UUID Claude named resumes stay a narrow compatibility case and must never reuse generic same-`cwd` matching.
-5. Fresh Codex terminals are not exact until indexed launch provenance from the newest matching shell snapshot for that session id (`shell_snapshots/<sessionId>.sh` or `shell_snapshots/<sessionId>.*.sh`) matches the durable owner tuple exactly.
-6. Restore of a coding pane must wait until the client knows `ready.serverInstanceId`, then fail closed unless `sessionRef.serverInstanceId === localServerInstanceId`. Legacy migrated refs without a server id are metadata only and may not authorize restore.
-7. Same-server live attach by `terminalId` stays supported and remains separate from discovered session ownership.
-8. Tab-level mirrors (`tab.resumeSessionId`, `tab.terminalId`, `fallbackSessionRef`) may remain as compatibility metadata, but they may not drive authoritative coding-session restore, lookup, open-session advertising, or busy-state ownership when pane layout is absent.
-9. PTY-backed coding-session tabs must be born with pane layout immediately. A no-layout coding tab is a degraded restore case only.
-10. Protocol cutover is double-read/double-write inside the same landing: exactness comes from `sessionRef`, while legacy fields (`effectiveResumeSessionId`, bare `sessionId`) stay as optional mirrors until all client paths consume `sessionRef`.
+1. `sessionRef` on pane content is the only authoritative persisted coding-session identity on the client. `resumeSessionId` remains a compatibility mirror.
+2. The server fix uses existing exact launch provenance first. For Codex that means the shell snapshot’s `FRESHELL_TERMINAL_ID`; no new owner-tuple system is introduced.
+3. Fresh Claude sessions are exact immediately by launching with `--session-id <uuid>`. Generic same-`cwd` association is removed for Codex and for fresh Claude sessions.
+4. Named Claude resume stays a narrow compatibility path only for terminals that still have `pendingResumeName`. It must not be the generic path for Codex or exact Claude sessions.
+5. Restore of a coding pane must wait for `ready.serverInstanceId` and then fail closed unless the pane has a local exact `sessionRef`.
+6. PTY-backed coding session tabs must be born with pane layout immediately. A no-layout coding tab is a degraded restore case only.
+7. No-layout tab mirrors (`tab.resumeSessionId`, `fallbackSessionRef`) may remain as compatibility metadata, but they may not drive authoritative restore, open-session lookup, or busy-state ownership.
 
 ## User-Visible Contract
 
@@ -29,91 +26,56 @@
 - Clicking a session that is already open must focus the pane that owns that exact session, not another pane that merely shares `cwd` or tab-level fallback metadata.
 - A copied or foreign snapshot must never auto-resume a local coding session unless its `sessionRef` proves it belongs to this server instance.
 - If persisted state is too degraded to prove a coding pane’s exact local identity, the pane must stay inert and print `[Restore blocked: exact session identity missing]` instead of restoring the wrong session.
-- Fresh Claude and Codex creation, same-server `terminalId` reattach, and explicit user-initiated session opens must continue to work.
-
-## Critical Invariants
-
-- `createRequestId` is the stable logical create identity from pane content to `terminal.create` to server owner tuple to child-process env. It must not be regenerated except when the pane intentionally starts a new terminal after `INVALID_TERMINAL_ID`.
-- `TerminalRecord.owner*` is immutable for that terminal’s lifetime. Repair may move a session binding to a different terminal, but it does not mutate a terminal’s owner tuple.
-- `sessionRef` outranks `resumeSessionId` everywhere. If they disagree, preserve `sessionRef` and rewrite or clear the mirror.
-- Cross-tab hydrate may not downgrade a pane from an exact local `sessionRef` to a bare mirrored `resumeSessionId`.
-- No-layout coding tabs may render UI affordances, but they may not claim session ownership, advertise an open session, or auto-resume from tab-only mirrors.
-- Named Claude resume compatibility, if still needed after Task 3, must be scoped only to `pendingResumeName` terminals. No other path may match by `cwd`.
-
-## Non-Goals
-
-- Do not redesign overall layout persistence beyond removing coding-session authority from degraded no-layout fallback.
-- Do not introduce managed per-pane CLI homes or any other heavyweight isolation model.
-- Do not change shell-mode restore semantics.
-- Do not add new heuristics to replace the deleted same-`cwd` association path.
-- Do not update `docs/index.html` unless implementation grows beyond the terminal output message into a new dedicated UI surface.
+- Fresh Claude and Codex creation, same-server live `terminalId` attach, and explicit user-initiated session opens must continue to work.
 
 ## File Map
 
 **Create**
 
-- `server/terminal-owner.ts` — durable owner tuple helpers for PTY-backed coding terminals.
-- `server/discovered-session-association.ts` — exact discovered-session association policy and watermarking.
-- `server/coding-cli/codex-shell-snapshot.ts` — parse Codex shell snapshot launch provenance.
-- `src/store/persisted-pane-migration.ts` — shared migration helpers for persisted pane trees and legacy `resumeSessionId` -> `sessionRef`.
-- `test/unit/server/discovered-session-association.test.ts` — unit coverage for exact discovered-session association policy.
-- `test/unit/server/coding-cli/codex-shell-snapshot.test.ts` — shell snapshot provenance parsing coverage.
-- `test/e2e-browser/specs/terminal-exact-session-identity.spec.ts` — real-browser reload regression for exact session restore.
-
-**Delete**
-
-- `server/session-association-coordinator.ts` — heuristic same-`cwd` association coordinator; its remaining useful behavior moves into exact discovered association.
-- `test/unit/server/session-association-coordinator.test.ts` — replaced by unit coverage for the exact discovered association helper.
+- `server/coding-cli/codex-shell-snapshot.ts` — parse Codex shell snapshot provenance for exact launch identity.
+- `server/discovered-session-association.ts` — exact discovered-session association helper with watermarks for Codex.
+- `src/store/persisted-pane-migration.ts` — shared legacy pane migration to authoritative `sessionRef`.
+- `test/unit/server/coding-cli/codex-shell-snapshot.test.ts` — Codex shell snapshot parsing coverage.
+- `test/unit/server/discovered-session-association.test.ts` — exact discovered-session binding coverage.
+- `test/e2e-browser/specs/terminal-exact-session-identity.spec.ts` — browser reload regression for exact session restore.
 
 **Modify**
 
-- `shared/ws-protocol.ts` — exact lifecycle message contract with `sessionRef` and compatibility mirrors.
-- `server/spawn-spec.ts` — fresh Claude `--session-id` support.
-- `server/terminal-registry.ts` — owner persistence, exact reuse, exact discovered bind and repair.
-- `server/ws-handler.ts` — owner-aware create/reuse wiring and exact lifecycle broadcasts.
-- `server/index.ts` — remove heuristic association and use exact discovered-session association.
-- `server/coding-cli/types.ts` — `SessionLaunchOrigin` / `launchOrigin` support.
-- `server/coding-cli/providers/codex.ts` — read launch provenance from shell snapshots.
-- `server/coding-cli/session-indexer.ts` — carry `launchOrigin` through indexed session projection.
-- `server/agent-api/router.ts` — allocate stable `createRequestId` and owner tuple on all PTY create routes.
-- `src/lib/ui-commands.ts` — preserve PTY `createRequestId` when server-originated tab creation includes pane content.
-- `src/components/terminal-view-utils.ts` — exact restore eligibility helpers.
-- `src/components/TerminalView.tsx` — restore gate, exact `sessionRef` persistence, restore-blocked output.
-- `src/components/TabContent.tsx` — degraded no-layout coding restore only, with existing `createRequestId`.
-- `src/components/TabBar.tsx` — presentation-only fallback synthesis for no-layout tabs; no session ownership leak.
-- `src/store/tabsSlice.ts` — initialize layout immediately for PTY-backed coding session tabs.
-- `src/store/persistedState.ts` — use shared pane migration during raw persisted-state parsing.
-- `src/store/persistMiddleware.ts` — use shared pane migration during cached load/persist bootstrap.
-- `src/store/panesSlice.ts` — preserve authoritative `sessionRef` during hydrate merges.
-- `src/lib/terminal-restore.ts` — register degraded no-layout restore request ids explicitly.
-- `src/lib/session-utils.ts` — exact-pane session lookup only.
-- `src/store/layoutMirrorMiddleware.ts` — stop advertising no-layout coding ownership.
-- `src/store/selectors/sidebarSelectors.ts` — stop treating no-layout coding tabs as authoritative open sessions.
-- `src/lib/pane-activity.ts` — stop deriving busy session ownership from no-layout coding tab mirrors.
-- `src/components/panes/PaneContainer.tsx` — symmetric stale mirror cleanup when the owning pane disappears.
-- `src/components/context-menu/ContextMenuProvider.tsx` — symmetric stale mirror cleanup on close and replace paths.
-- `src/store/types.ts` — document compatibility-only semantics of tab-level mirrors.
+- `server/spawn-spec.ts`
+- `server/terminal-registry.ts`
+- `server/ws-handler.ts`
+- `server/index.ts`
+- `server/session-association-coordinator.ts`
+- `server/coding-cli/types.ts`
+- `server/coding-cli/providers/codex.ts`
+- `server/coding-cli/session-indexer.ts`
+- `src/lib/session-type-utils.ts`
+- `src/store/tabsSlice.ts`
+- `src/lib/ui-commands.ts`
+- `src/components/terminal-view-utils.ts`
+- `src/components/TerminalView.tsx`
+- `src/components/TabContent.tsx`
+- `src/components/TabBar.tsx`
+- `src/store/persistedState.ts`
+- `src/store/persistMiddleware.ts`
+- `src/store/panesSlice.ts`
+- `src/lib/terminal-restore.ts`
+- `src/lib/session-utils.ts`
+- `src/store/layoutMirrorMiddleware.ts`
+- `src/store/selectors/sidebarSelectors.ts`
+- `src/lib/pane-activity.ts`
+- `src/components/panes/PaneContainer.tsx`
+- `src/components/context-menu/ContextMenuProvider.tsx`
+- `src/store/types.ts`
 
 **Tests**
 
-- `test/server/session-association.test.ts`
-- `test/integration/server/codex-session-rebind-regression.test.ts`
-- `test/server/agent-tabs-write.test.ts`
-- `test/server/agent-panes-write.test.ts`
-- `test/server/ws-protocol.test.ts`
-- `test/server/ws-terminal-create-reuse-running-claude.test.ts`
-- `test/server/ws-terminal-create-reuse-running-codex.test.ts`
-- `test/server/ws-terminal-create-session-repair.test.ts`
-- `test/unit/server/terminal-registry.test.ts`
-- `test/unit/server/terminal-env.test.ts`
-- `test/unit/server/spawn-spec.test.ts`
-- `test/unit/server/discovered-session-association.test.ts`
-- `test/unit/server/coding-cli/session-indexer.test.ts`
+- `test/unit/client/store/tabsSlice.test.ts`
+- `test/unit/client/ui-commands.test.ts`
 - `test/unit/client/store/persistedState.test.ts`
 - `test/unit/client/store/panesPersistence.test.ts`
 - `test/unit/client/store/crossTabSync.test.ts`
 - `test/unit/client/store/panesSlice.test.ts`
-- `test/unit/client/store/tabsSlice.test.ts`
 - `test/unit/client/components/TerminalView.resumeSession.test.tsx`
 - `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - `test/unit/client/components/TabContent.test.tsx`
@@ -123,440 +85,147 @@
 - `test/unit/client/lib/pane-activity.test.ts`
 - `test/unit/client/layout-mirror-middleware.test.ts`
 - `test/unit/client/store/selectors/sidebarSelectors.test.ts`
-- `test/unit/client/ui-commands.test.ts`
-- `test/e2e/sidebar-click-opens-pane.test.tsx`
+- `test/unit/client/components/Sidebar.test.tsx`
 - `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
+- `test/e2e/sidebar-click-opens-pane.test.tsx`
 - `test/e2e/replace-pane.test.tsx`
+- `test/unit/server/spawn-spec.test.ts`
+- `test/unit/server/coding-cli/session-indexer.test.ts`
+- `test/unit/server/coding-cli/codex-shell-snapshot.test.ts`
+- `test/unit/server/discovered-session-association.test.ts`
+- `test/unit/server/terminal-registry.findRunningTerminal.test.ts`
+- `test/server/session-association.test.ts`
+- `test/server/ws-terminal-create-reuse-running-claude.test.ts`
+- `test/server/ws-terminal-create-reuse-running-codex.test.ts`
+- `test/server/ws-terminal-create-session-repair.test.ts`
+- `test/integration/server/codex-session-rebind-regression.test.ts`
 
 ## Strategy Gate
 
 Why this is the right fix:
 
-- Fixing only stale tab mirrors would still leave early wrong association, which is one of the two proven systemic sources.
-- Fixing only server association would still let degraded tab-only restore, lookup, and busy-state code attach a valid session to the wrong place.
-- Terminal identity cannot live on `terminalId`; that id dies across restart. The right persistent identity is `{provider, sessionId, serverInstanceId}` on the pane and `{tabId, paneId, createRequestId}` on the live terminal.
-- The codebase already has most of the right primitives: panes already carry `sessionRef`, `terminal.create` already carries `tabId` and `paneId`, and the server already exports Freshell env vars. The missing pieces are durable owner persistence, exact discovery, and a fail-closed restore policy.
-- Extracting shared persisted-pane migration is worth the extra file because exact identity must be migrated the same way for initial load, cached load, `terminal-restore`, and cross-tab sync. Duplicating that logic again would recreate the same class of divergence.
+- The browser-visible bug is a combination of two independent failures: wrong session identity can enter a pane early on the server, and stale tab-level fallback can later restore the wrong thing. Fixing only one side is incomplete.
+- The previous plan overreached by inventing a new owner tuple even though Codex already writes exact launch provenance into `shell_snapshots` and Freshell already exports `FRESHELL_TERMINAL_ID`, `FRESHELL_TAB_ID`, and `FRESHELL_PANE_ID`.
+- The client already has `sessionRef`, `serverInstanceId`, and pane-level persistence. The missing work is to seed exact `sessionRef` at ingress, preserve it through hydrate, gate restore on it, and stop letting no-layout tab mirrors pretend to own sessions.
+- A browser regression has to lead the work. This is a user-visible restore bug, so the highest-fidelity failure needs to exist before implementation starts and go green in the first client task.
 
 Why not these alternatives:
 
-- Do not patch the old same-`cwd` coordinator with more heuristics. It is ambiguous by design.
-- Do not trust migrated legacy `resumeSessionId` alone for restore. That would keep cross-device and stale-tab corruption paths alive.
-- Do not leave PTY-backed `openSessionTab()` as a no-layout path. That keeps the bug alive in brand-new tabs, not just old persisted ones.
+- Do not patch same-`cwd` association with more heuristics. Exact launch provenance already exists for Codex, and fresh Claude can be exact at birth.
+- Do not trust bare migrated `resumeSessionId` for restore. That keeps stale-tab and foreign-snapshot corruption alive.
+- Do not invent a new durable owner tuple unless existing exact provenance proves insufficient during implementation. It is extra state, extra routes, and extra failure surface with no evidence that it is needed.
 
 Acceptance proof for this plan:
 
-1. Two coding panes with the same provider and the same `cwd` reload without cross-swapping sessions.
-2. A degraded no-layout coding tab cannot auto-resume a session from tab-only mirrors.
-3. Fresh Claude and Codex creation still work.
-4. Same-server live `terminalId` attach still works.
-5. `npm run lint`, the new Playwright regression, and `npm test` are green.
+1. The new browser regression proves two persisted same-`cwd` coding tabs reload without cross-swapping sessions.
+2. The browser regression also proves a degraded no-layout coding tab blocks restore instead of guessing.
+3. Codex discovered-session association binds by exact launch provenance, not oldest same-`cwd` terminal.
+4. Fresh Claude terminals are exact immediately and still resume/reuse correctly.
+5. `npm run lint`, the browser regression, and `npm test` are green.
 
-### Task 1: Persist Durable Owner Identity On Every PTY Create Path
-
-**Files:**
-- Create: `server/terminal-owner.ts`
-- Modify: `server/terminal-registry.ts`
-- Modify: `server/ws-handler.ts`
-- Modify: `server/agent-api/router.ts`
-- Modify: `src/lib/ui-commands.ts`
-- Test: `test/unit/server/terminal-registry.test.ts`
-- Test: `test/unit/server/terminal-env.test.ts`
-- Test: `test/server/agent-tabs-write.test.ts`
-- Test: `test/server/agent-panes-write.test.ts`
-- Test: `test/unit/client/ui-commands.test.ts`
-
-- [ ] **Step 1: Write the failing owner-persistence tests**
-
-Add tests proving that PTY-backed coding terminal creation stores one exact owner tuple and exports it to the child environment.
-
-```ts
-expect(record.ownerTabId).toBe('tab-1')
-expect(record.ownerPaneId).toBe('pane-1')
-expect(record.ownerCreateRequestId).toBe('req-1')
-expect(env.FRESHELL_CREATE_REQUEST_ID).toBe('req-1')
-```
-
-Extend the HTTP route tests so `/api/tabs`, `/api/run`, `/panes/:id/split`, and `/panes/:id/respawn` each:
-
-- allocate exactly one `createRequestId`
-- pass the same tuple into `registry.create()`
-- emit pane content carrying that same `createRequestId`
-
-Extend the UI-command test so a server-originated `tab.create` carrying terminal `paneContent.createRequestId` also mirrors that request id onto the created tab. That keeps degraded no-layout fallback aligned with the pane owner identity.
-
-- [ ] **Step 2: Run the focused tests to verify failure**
-
-Run:
-
-```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/terminal-registry.test.ts test/unit/server/terminal-env.test.ts test/server/agent-tabs-write.test.ts test/server/agent-panes-write.test.ts
-npm run test:vitest -- test/unit/client/ui-commands.test.ts
-```
-
-Expected: FAIL because `TerminalRecord` does not persist owner identity, `FRESHELL_CREATE_REQUEST_ID` is absent, HTTP create routes do not keep one stable `createRequestId`, and `ui.command tab.create` currently leaves `tab.createRequestId` on the default tab id instead of the PTY pane request id.
-
-- [ ] **Step 3: Implement the durable owner tuple**
-
-Create `server/terminal-owner.ts`:
-
-```ts
-export type TerminalOwnerIdentity = {
-  tabId: string
-  paneId: string
-  createRequestId: string
-}
-```
-
-Then wire it through:
-
-```ts
-registry.create({
-  mode,
-  shell,
-  cwd,
-  resumeSessionId,
-  owner: { tabId, paneId, createRequestId },
-})
-```
-
-Implementation rules:
-
-- `TerminalRegistry.create()` accepts `owner?: TerminalOwnerIdentity`.
-- `TerminalRecord` persists `ownerTabId`, `ownerPaneId`, and `ownerCreateRequestId`.
-- Child-process env is derived from the persisted owner tuple:
-
-```ts
-FRESHELL_TAB_ID
-FRESHELL_PANE_ID
-FRESHELL_CREATE_REQUEST_ID
-```
-
-- WS `terminal.create` uses `{ tabId: m.tabId, paneId: m.paneId, createRequestId: m.requestId }`.
-- HTTP PTY create routes allocate `createRequestId = nanoid()` once and reuse it for both pane content and `registry.create()`.
-- `ui.command tab.create` mirrors `paneContent.createRequestId` to `addTab({ createRequestId })` when the payload is creating a PTY-backed terminal tab.
-- `/panes/:id/attach` stays attach-only and does not invent session ownership.
-
-- [ ] **Step 4: Run the focused tests to verify pass**
-
-Run the command from Step 2.
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add server/terminal-owner.ts server/terminal-registry.ts server/ws-handler.ts server/agent-api/router.ts src/lib/ui-commands.ts test/unit/server/terminal-registry.test.ts test/unit/server/terminal-env.test.ts test/server/agent-tabs-write.test.ts test/server/agent-panes-write.test.ts test/unit/client/ui-commands.test.ts
-git commit -m "feat: persist exact pane ownership on terminals"
-```
-
-### Task 2: Make Fresh Claude Exact At Birth And Carry Exact `sessionRef` Through Terminal Lifecycle
+### Task 1: Write The Browser Repro First And Make Client Restore Exact
 
 **Files:**
-- Modify: `shared/ws-protocol.ts`
-- Modify: `server/spawn-spec.ts`
-- Modify: `server/terminal-registry.ts`
-- Modify: `server/ws-handler.ts`
-- Test: `test/unit/server/spawn-spec.test.ts`
-- Test: `test/server/ws-protocol.test.ts`
-- Test: `test/server/ws-terminal-create-reuse-running-claude.test.ts`
-- Test: `test/server/ws-terminal-create-session-repair.test.ts`
-
-- [ ] **Step 1: Write the failing exact-Claude lifecycle tests**
-
-Add tests proving:
-
-- fresh Claude launch uses `--session-id <uuid>` when no UUID `resumeSessionId` is provided
-- `terminal.created` carries exact `sessionRef`
-- `terminal.session.associated` carries exact `sessionRef`
-- repaired or reused Claude terminals keep returning the canonical local `sessionRef`
-
-Target message shape:
-
-```ts
-{
-  type: 'terminal.created',
-  requestId: 'req-1',
-  terminalId: 'term-1',
-  createdAt: 1,
-  sessionRef: {
-    provider: 'claude',
-    sessionId: '550e8400-e29b-41d4-a716-446655440000',
-    serverInstanceId: 'srv-1',
-  },
-  effectiveResumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
-}
-```
-
-- [ ] **Step 2: Run the focused tests to verify failure**
-
-Run:
-
-```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/spawn-spec.test.ts test/server/ws-protocol.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-session-repair.test.ts
-```
-
-Expected: FAIL because fresh Claude still launches without `--session-id`, `terminal.created` / `terminal.session.associated` do not carry exact `sessionRef`, and lifecycle messages still rely on bare IDs.
-
-- [ ] **Step 3: Implement exact-at-birth Claude and exact lifecycle messages**
-
-Update the spawn spec so Claude supports both fresh launch and resume:
-
-```ts
-launchArgs: (sessionId) => ['--session-id', sessionId]
-resumeArgs: (sessionId) => ['--resume', sessionId]
-```
-
-Implementation rules:
-
-- When creating a fresh Claude terminal with no UUID `resumeSessionId`, allocate one UUID up front and store it on the record.
-- Do not use `--session-id` for non-UUID named resumes; keep those on `pendingResumeName`.
-- `terminal.created` includes `sessionRef` when the terminal has an exact local session, including reused creates that reattach to an already-running exact terminal.
-- `terminal.session.associated` carries `sessionRef` as the authoritative payload.
-- Keep `effectiveResumeSessionId` and bare `sessionId` as optional mirrors during the cutover; exactness comes from `sessionRef`.
-- `sessionRef.serverInstanceId` is the current server instance id.
-
-- [ ] **Step 4: Run the focused tests to verify pass**
-
-Run the command from Step 2.
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add shared/ws-protocol.ts server/spawn-spec.ts server/terminal-registry.ts server/ws-handler.ts test/unit/server/spawn-spec.test.ts test/server/ws-protocol.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-session-repair.test.ts
-git commit -m "feat: make claude terminal lifecycle exact"
-```
-
-### Task 3: Replace Heuristic Discovered Binding With Exact Provenance
-
-**Files:**
-- Create: `server/discovered-session-association.ts`
-- Create: `server/coding-cli/codex-shell-snapshot.ts`
-- Create: `test/unit/server/discovered-session-association.test.ts`
-- Delete: `server/session-association-coordinator.ts`
-- Delete: `test/unit/server/session-association-coordinator.test.ts`
-- Modify: `server/coding-cli/types.ts`
-- Modify: `server/coding-cli/providers/codex.ts`
-- Modify: `server/coding-cli/session-indexer.ts`
-- Modify: `server/terminal-registry.ts`
-- Modify: `server/index.ts`
-- Modify: `test/integration/server/codex-session-rebind-regression.test.ts`
-- Test: `test/unit/server/coding-cli/codex-shell-snapshot.test.ts`
-- Test: `test/unit/server/discovered-session-association.test.ts`
-- Test: `test/unit/server/coding-cli/session-indexer.test.ts`
-- Test: `test/server/session-association.test.ts`
-- Test: `test/integration/server/codex-session-rebind-regression.test.ts`
-- Test: `test/server/ws-terminal-create-reuse-running-codex.test.ts`
-
-- [ ] **Step 1: Write the failing exact-discovery tests**
-
-Add tests proving:
-
-- Codex session indexing reads launch provenance from the newest matching shell snapshot file for that session id (`<sessionId>.sh` or `<sessionId>.*.sh`)
-- discovered-session association binds only when `terminalId` and the full owner tuple match exactly
-- the oldest same-`cwd` terminal is no longer a valid tie-breaker
-- a poisoned live owner is repaired back to the exact launch terminal
-- a missing or partial `launchOrigin` leaves the session unbound
-- named Claude compatibility, if still needed, is scoped only to `pendingResumeName`
-
-Target launch-origin shape:
-
-```ts
-launchOrigin: {
-  terminalId: 'term-2',
-  tabId: 'tab-2',
-  paneId: 'pane-2',
-  createRequestId: 'req-2',
-}
-```
-
-- [ ] **Step 2: Run the focused tests to verify failure**
-
-Run:
-
-```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/integration/server/codex-session-rebind-regression.test.ts
-```
-
-Expected: FAIL because Codex sessions have no `launchOrigin`, `server/index.ts` still routes through same-`cwd` association, and exact rebind/repair behavior is absent.
-
-- [ ] **Step 3: Implement exact discovered-session association**
-
-Create `server/coding-cli/codex-shell-snapshot.ts` with the only accepted provenance inputs:
-
-```ts
-const SNAPSHOT_EXPORTS: Array<[string, keyof SessionLaunchOrigin]> = [
-  ['FRESHELL_TERMINAL_ID', 'terminalId'],
-  ['FRESHELL_TAB_ID', 'tabId'],
-  ['FRESHELL_PANE_ID', 'paneId'],
-  ['FRESHELL_CREATE_REQUEST_ID', 'createRequestId'],
-]
-```
-
-Implementation rules:
-
-- `CodingCliSession.launchOrigin` is complete only when all four fields are present.
-- Snapshot lookup must accept both `shell_snapshots/<sessionId>.sh` and the newer suffixed form `shell_snapshots/<sessionId>.*.sh`, preferring the newest matching file.
-- `server/discovered-session-association.ts` owns watermarking and association policy.
-- `TerminalRegistry.associateDiscoveredSession()` matches `terminalId` and the full owner tuple before binding.
-- If the discovered provenance proves a different running terminal is exact, repair the session owner to that terminal.
-- If launch provenance is missing or partial, leave the session unbound.
-- `server/index.ts` uses the new exact association helper for both `onUpdate` and `onNewSession`.
-- If the named-Claude-resume tests still need compatibility, keep only a narrow `pendingResumeName` shim. Do not restore generic same-`cwd` matching.
-
-- [ ] **Step 4: Run the focused tests to verify pass**
-
-Run the command from Step 2.
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -A server/discovered-session-association.ts server/coding-cli/codex-shell-snapshot.ts server/session-association-coordinator.ts test/unit/server/session-association-coordinator.test.ts server/coding-cli/types.ts server/coding-cli/providers/codex.ts server/coding-cli/session-indexer.ts server/terminal-registry.ts server/index.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/integration/server/codex-session-rebind-regression.test.ts
-git commit -m "feat: replace heuristic session binding with exact provenance"
-```
-
-### Task 4: Share Persisted Pane Migration And Preserve Exact `sessionRef` Across Hydrate
-
-**Files:**
+- Create: `test/e2e-browser/specs/terminal-exact-session-identity.spec.ts`
 - Create: `src/store/persisted-pane-migration.ts`
+- Modify: `src/lib/session-type-utils.ts`
+- Modify: `src/store/tabsSlice.ts`
+- Modify: `src/lib/ui-commands.ts`
 - Modify: `src/store/persistedState.ts`
 - Modify: `src/store/persistMiddleware.ts`
 - Modify: `src/store/panesSlice.ts`
+- Modify: `src/components/terminal-view-utils.ts`
+- Modify: `src/components/TerminalView.tsx`
+- Modify: `src/components/TabContent.tsx`
+- Modify: `src/lib/terminal-restore.ts`
+- Test: `test/unit/client/store/tabsSlice.test.ts`
+- Test: `test/unit/client/ui-commands.test.ts`
 - Test: `test/unit/client/store/persistedState.test.ts`
 - Test: `test/unit/client/store/panesPersistence.test.ts`
 - Test: `test/unit/client/store/crossTabSync.test.ts`
 - Test: `test/unit/client/store/panesSlice.test.ts`
+- Test: `test/unit/client/components/TerminalView.resumeSession.test.tsx`
+- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+- Test: `test/unit/client/components/TabContent.test.tsx`
+- Test: `test/unit/client/lib/terminal-restore.test.ts`
+- Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
+- Test: `test/e2e-browser/specs/terminal-exact-session-identity.spec.ts`
 
-- [ ] **Step 1: Write the failing persisted-identity tests**
+- [ ] **Step 1: Write the failing browser and client tests**
 
-Add tests proving:
+Add the browser regression with two cases:
 
-- both `parsePersistedPanesRaw()` and `loadPersistedPanes()` migrate legacy pane `resumeSessionId` to `sessionRef` the same way
-- cached load and raw parse agree on `createRequestId` and migrated `sessionRef`
-- `hydratePanes()` preserves local `sessionRef` when incoming state with the same `createRequestId` omits it or conflicts with it
-- cross-tab sync cannot downgrade an exact local `sessionRef` to a stale remote mirror
+1. Seed `freshell.tabs.v2` and `freshell.panes.v2` before `page.goto()` with two same-`cwd` coding tabs whose panes already carry distinct exact `sessionRef` values. Reload, switch tabs, and assert outbound `terminal.create` messages use the correct session for each tab and never cross-swap.
+2. Seed a degraded no-layout coding tab with bare `resumeSessionId`, no pane layout, and coding mode. Assert reload does not restore the wrong session and the steady-state output becomes:
 
-Key hydrate expectation:
-
-```ts
-expect(content.sessionRef).toEqual({
-  provider: 'codex',
-  sessionId: 'session-A',
-  serverInstanceId: 'srv-local',
-})
-expect(content.resumeSessionId).toBe('session-A')
+```text
+[Restore blocked: exact session identity missing]
 ```
+
+Extend the client tests to prove:
+
+- `openSessionTab()` seeds pane layout immediately for PTY-backed coding sessions
+- exact local session opens seed `sessionRef` when `connection.serverInstanceId` is known
+- `ui.command tab.create` and `ui.command pane.attach` preserve `createRequestId` and synthesize `sessionRef` from `mode + resumeSessionId + local serverInstanceId`
+- persisted raw parse and cached pane load migrate legacy `resumeSessionId` to `sessionRef` the same way
+- hydrate preserves the local exact `sessionRef` when incoming state with the same `createRequestId` omits it or conflicts with it
+- restore waits for `ready.serverInstanceId` before deciding whether a pane is local
+- restore of a coding pane only resumes when `sessionRef.serverInstanceId === localServerInstanceId`
+- a foreign or legacy-migrated `sessionRef` never falls back to bare `resumeSessionId`
+- `terminal.created` persists `sessionRef` from `effectiveResumeSessionId + localServerInstanceId`
+- degraded no-layout coding restore reuses `tab.createRequestId` and prints the blocked-restore message instead of minting a fresh identity
 
 - [ ] **Step 2: Run the focused tests to verify failure**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts
+npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-exact-session-identity.spec.ts
+npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
-Expected: FAIL because persisted pane migration is duplicated and incomplete, and hydrate preserves only `resumeSessionId`, not authoritative `sessionRef`.
+Expected: FAIL because exact `sessionRef` is not seeded consistently at client ingress, persisted migration is duplicated, PTY-backed `openSessionTab()` still creates no-layout tabs, restore still trusts degraded fallback state, and the browser regression can still drive the wrong restore behavior.
 
-- [ ] **Step 3: Implement shared pane migration and exact hydrate merge**
-
-Create `src/store/persisted-pane-migration.ts` with helpers like:
-
-```ts
-export function deriveLegacySessionRef(content: Record<string, unknown>): SessionLocator | undefined
-export function migratePersistedPaneContent(content: unknown): unknown
-export function migratePersistedPaneTree(node: unknown): unknown
-```
+- [ ] **Step 3: Implement exact client ingress, migration, and restore gating**
 
 Implementation rules:
 
-- `persistedState.ts` and `persistMiddleware.ts` both call the shared migration helpers.
-- Legacy terminal panes migrate to:
+- `buildResumeContent()` accepts optional exact session identity:
 
 ```ts
-{ sessionRef: { provider: mode, sessionId: resumeSessionId } }
+sessionRef: localServerInstanceId
+  ? { provider, sessionId, serverInstanceId: localServerInstanceId }
+  : undefined
 ```
 
-- Legacy agent-chat panes migrate to:
+- `openSessionTab()` must immediately `initLayout()` for PTY-backed coding sessions, not rely on no-layout fallback later.
+- `handleUiCommand()` must preserve any provided `createRequestId`; when a server-originated coding pane has `mode + resumeSessionId`, synthesize `sessionRef` from `getState().connection.serverInstanceId`.
+- `src/store/persisted-pane-migration.ts` owns legacy `resumeSessionId -> sessionRef` migration for both raw parsing and cached load.
+- `panesSlice` hydrate merge keeps the local `sessionRef` authoritative and rewrites the mirrored `resumeSessionId` to `sessionRef.sessionId` when needed.
+- Replace the resume helper with a restore-aware decision:
 
 ```ts
-{ sessionRef: { provider: 'claude', sessionId: resumeSessionId } }
-```
-
-- `mergeTerminalState()` and the agent-chat hydrate path preserve local `sessionRef` when incoming state with the same `createRequestId` omits or conflicts with it.
-- When preserving local `sessionRef`, preserve or rewrite the mirrored `resumeSessionId` to `sessionRef.sessionId`.
-
-- [ ] **Step 4: Run the focused tests to verify pass**
-
-Run the command from Step 2.
-
-Expected: PASS
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/store/persisted-pane-migration.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/panesSlice.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts
-git commit -m "feat: preserve exact pane identity in persisted state"
-```
-
-### Task 5: Gate Coding Restore In `TerminalView` On Exact Local Identity
-
-**Files:**
-- Modify: `src/components/terminal-view-utils.ts`
-- Modify: `src/components/TerminalView.tsx`
-- Test: `test/unit/client/components/TerminalView.resumeSession.test.tsx`
-- Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
-
-- [ ] **Step 1: Write the failing restore-gate tests**
-
-Add tests proving:
-
-- restore waits for `ready.serverInstanceId` before deciding whether an exact session is local
-- restore of a coding pane only resumes when `sessionRef.serverInstanceId === localServerInstanceId`
-- foreign `sessionRef` does not fall back to mirrored `resumeSessionId`
-- a migrated legacy `sessionRef` without `serverInstanceId` blocks restore
-- `terminal.created` and `terminal.session.associated` both persist exact `sessionRef` and keep `resumeSessionId` as a mirror only
-
-Blocked restore expectation:
-
-```ts
-expect(term.writeln).toHaveBeenCalledWith('\r\n[Restore blocked: exact session identity missing]\r\n')
-```
-
-- [ ] **Step 2: Run the focused tests to verify failure**
-
-Run:
-
-```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-```
-
-Expected: FAIL because restore still trusts bare `resumeSessionId`, does not wait for `serverInstanceId`, and does not treat `sessionRef` as authoritative on `terminal.created` / `terminal.session.associated`.
-
-- [ ] **Step 3: Implement the exact restore gate**
-
-Replace the current helper with a restore-aware version:
-
-```ts
-getSafeResumeSessionId({
+getResumeTarget({
   restore,
+  mode,
   sessionRef,
   mirroredResumeSessionId,
   localServerInstanceId,
 })
 ```
 
-Implementation rules:
-
-- `restore === false`: explicit local user actions may still use `resumeSessionId`.
+- `restore === false`: explicit local actions may still use the mirrored `resumeSessionId`.
 - `restore === true` and `mode !== 'shell'`: only allow resume when `sessionRef` exists and `sessionRef.serverInstanceId === localServerInstanceId`.
 - If `restore === true` and local server identity is not known yet, do not send `terminal.create` yet.
-- If exact local identity cannot be proven, clear `terminalId`, clear stale bare `resumeSessionId`, keep `sessionRef` for metadata, mark the pane errored, and write the restore-blocked terminal message.
-- On `terminal.created`, consume `sessionRef` as authority and mirror `resumeSessionId = sessionRef.sessionId` only when present.
-- On `terminal.session.associated`, write both `sessionRef` and the mirrored `resumeSessionId`.
+- If exact local identity cannot be proven, clear stale `terminalId`, keep `sessionRef` as metadata, mark the pane errored, and write `[Restore blocked: exact session identity missing]`.
+- On `terminal.created`, when `effectiveResumeSessionId` exists for a coding pane, persist both:
+
+```ts
+sessionRef: { provider: mode, sessionId: effectiveResumeSessionId, serverInstanceId: localServerInstanceId }
+resumeSessionId: effectiveResumeSessionId
+```
+
+- `TabContent` degraded no-layout coding restore must reuse `tab.createRequestId`, call `addTerminalRestoreRequestId(tab.createRequestId)`, and never mint a new coding identity.
 
 - [ ] **Step 4: Run the focused tests to verify pass**
 
@@ -567,46 +236,126 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/terminal-view-utils.ts src/components/TerminalView.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "feat: gate coding restore on exact local identity"
+git add test/e2e-browser/specs/terminal-exact-session-identity.spec.ts src/store/persisted-pane-migration.ts src/lib/session-type-utils.ts src/store/tabsSlice.ts src/lib/ui-commands.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/panesSlice.ts src/components/terminal-view-utils.ts src/components/TerminalView.tsx src/components/TabContent.tsx src/lib/terminal-restore.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx
+git commit -m "feat: make client restore use exact session identity"
 ```
 
-### Task 6: Remove No-Layout Coding Authority And Clear Stale Tab Mirrors Symmetrically
+### Task 2: Make Live Session Binding Exact Using Existing Launch Provenance
 
 **Files:**
-- Modify: `src/store/tabsSlice.ts`
-- Modify: `src/components/TabContent.tsx`
-- Modify: `src/components/TabBar.tsx`
-- Modify: `src/lib/terminal-restore.ts`
+- Create: `server/coding-cli/codex-shell-snapshot.ts`
+- Create: `server/discovered-session-association.ts`
+- Modify: `server/coding-cli/types.ts`
+- Modify: `server/coding-cli/providers/codex.ts`
+- Modify: `server/coding-cli/session-indexer.ts`
+- Modify: `server/spawn-spec.ts`
+- Modify: `server/terminal-registry.ts`
+- Modify: `server/ws-handler.ts`
+- Modify: `server/index.ts`
+- Modify: `server/session-association-coordinator.ts`
+- Test: `test/unit/server/spawn-spec.test.ts`
+- Test: `test/unit/server/coding-cli/session-indexer.test.ts`
+- Test: `test/unit/server/coding-cli/codex-shell-snapshot.test.ts`
+- Test: `test/unit/server/discovered-session-association.test.ts`
+- Test: `test/unit/server/terminal-registry.findRunningTerminal.test.ts`
+- Test: `test/server/session-association.test.ts`
+- Test: `test/server/ws-terminal-create-reuse-running-claude.test.ts`
+- Test: `test/server/ws-terminal-create-reuse-running-codex.test.ts`
+- Test: `test/server/ws-terminal-create-session-repair.test.ts`
+- Test: `test/integration/server/codex-session-rebind-regression.test.ts`
+
+- [ ] **Step 1: Write the failing exact-binding tests**
+
+Add tests proving:
+
+- fresh Claude launch uses `--session-id <uuid>` when no UUID `resumeSessionId` was supplied
+- `terminal.created` returns that new exact UUID as `effectiveResumeSessionId`
+- Codex shell snapshot parsing accepts both `shell_snapshots/<sessionId>.sh` and `shell_snapshots/<sessionId>.*.sh`, preferring the newest matching file
+- exact discovered Codex association binds by snapshot `FRESHELL_TERMINAL_ID`, not oldest same-`cwd` terminal
+- repeated index updates preserve the original exact Codex owner
+- `SessionAssociationCoordinator` no longer handles Codex and only remains for narrow Claude named-resume fallback
+
+Target Codex launch-origin shape:
+
+```ts
+launchOrigin: {
+  terminalId: 'term-2',
+  tabId: 'tab-2',
+  paneId: 'pane-2',
+}
+```
+
+- [ ] **Step 2: Run the focused tests to verify failure**
+
+Run:
+
+```bash
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/spawn-spec.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+```
+
+Expected: FAIL because fresh Claude is not exact at birth, Codex sessions have no parsed launch provenance, and discovered binding still uses generic same-`cwd` association.
+
+- [ ] **Step 3: Implement exact live-session binding**
+
+Implementation rules:
+
+- `server/spawn-spec.ts` adds explicit fresh Claude launch args:
+
+```ts
+launchArgs: (sessionId) => ['--session-id', sessionId]
+resumeArgs: (sessionId) => ['--resume', sessionId]
+```
+
+- `terminal-registry.create()` allocates a UUID up front for fresh Claude terminals, binds it immediately, and exposes it as `record.resumeSessionId`.
+- `ws-handler` must send `record.resumeSessionId ?? effectiveResumeSessionId` in `terminal.created`, so fresh Claude creates return the exact UUID that was just allocated.
+- `server/coding-cli/codex-shell-snapshot.ts` parses `FRESHELL_TERMINAL_ID`, `FRESHELL_TAB_ID`, and `FRESHELL_PANE_ID` from the newest matching shell snapshot.
+- `CodingCliSession.launchOrigin` is populated from Codex shell snapshots and carried through the session indexer.
+- `server/discovered-session-association.ts` owns exact Codex watermarking and binding by `launchOrigin.terminalId`.
+- `server/index.ts` uses exact discovered association for Codex sessions and stops routing Codex through same-`cwd` association.
+- `server/session-association-coordinator.ts` becomes Claude-only compatibility code for `pendingResumeName` terminals. It must not handle Codex or fresh exact Claude sessions.
+
+- [ ] **Step 4: Run the focused tests to verify pass**
+
+Run the command from Step 2.
+
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add server/coding-cli/codex-shell-snapshot.ts server/discovered-session-association.ts server/coding-cli/types.ts server/coding-cli/providers/codex.ts server/coding-cli/session-indexer.ts server/spawn-spec.ts server/terminal-registry.ts server/ws-handler.ts server/index.ts server/session-association-coordinator.ts test/unit/server/spawn-spec.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+git commit -m "feat: bind discovered coding sessions by exact provenance"
+```
+
+### Task 3: Remove No-Layout Coding Ownership Leaks And Clear Stale Tab Mirrors
+
+**Files:**
 - Modify: `src/lib/session-utils.ts`
 - Modify: `src/store/layoutMirrorMiddleware.ts`
 - Modify: `src/store/selectors/sidebarSelectors.ts`
 - Modify: `src/lib/pane-activity.ts`
+- Modify: `src/components/TabBar.tsx`
 - Modify: `src/components/panes/PaneContainer.tsx`
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
 - Modify: `src/store/types.ts`
-- Test: `test/unit/client/store/tabsSlice.test.ts`
-- Test: `test/unit/client/components/TabContent.test.tsx`
-- Test: `test/unit/client/components/TabBar.test.tsx`
-- Test: `test/unit/client/lib/terminal-restore.test.ts`
 - Test: `test/unit/client/lib/session-utils.test.ts`
-- Test: `test/unit/client/lib/pane-activity.test.ts`
 - Test: `test/unit/client/layout-mirror-middleware.test.ts`
 - Test: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
+- Test: `test/unit/client/lib/pane-activity.test.ts`
+- Test: `test/unit/client/components/TabBar.test.tsx`
+- Test: `test/unit/client/components/Sidebar.test.tsx`
 - Test: `test/e2e/sidebar-click-opens-pane.test.tsx`
 - Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 - Test: `test/e2e/replace-pane.test.tsx`
 
-- [ ] **Step 1: Write the failing no-layout and stale-mirror tests**
+- [ ] **Step 1: Write the failing no-layout ownership tests**
 
 Add tests proving:
 
-- `openSessionTab()` creates pane layout immediately for PTY-backed coding sessions
-- `TabContent` rehydrates a degraded no-layout coding tab using the tab’s existing `createRequestId`, not a fresh one
-- `terminal-restore` marks that degraded no-layout request id as restore-backed
-- `findTabIdForSession()` / `findPaneForSession()` ignore no-layout coding tab mirrors
+- `findTabIdForSession()` and `findPaneForSession()` ignore no-layout coding tab mirrors
 - `layoutMirrorMiddleware` does not emit `fallbackSessionRef` for no-layout coding tabs
-- `sidebarSelectors` and `pane-activity` do not treat no-layout coding tabs as authoritative open or busy sessions
+- sidebar `hasTab` and busy indicators come only from layout-backed coding panes, not from no-layout tab metadata
+- `TabBar` may still render a no-layout coding tab title, but it must not synthesize session-owning metadata
 - closing or replacing the owning pane clears stale `tab.resumeSessionId`
 
 - [ ] **Step 2: Run the focused tests to verify failure**
@@ -614,27 +363,21 @@ Add tests proving:
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/replace-pane.test.tsx
+npm run test:vitest -- test/unit/client/lib/session-utils.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/components/TabBar.test.tsx test/unit/client/components/Sidebar.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/replace-pane.test.tsx
 ```
 
-Expected: FAIL because PTY-backed `openSessionTab()` still creates no-layout tabs, no-layout coding tabs still advertise fallback ownership, and stale `tab.resumeSessionId` survives pane cleanup.
+Expected: FAIL because no-layout coding tabs still advertise ownership through tab-only metadata and stale `tab.resumeSessionId` survives pane cleanup.
 
-- [ ] **Step 3: Implement the no-layout authority cutover**
+- [ ] **Step 3: Implement no-layout authority removal and mirror cleanup**
 
 Implementation rules:
 
-- `openSessionTab()` must immediately `initLayout()` for PTY-backed coding sessions.
-
-```ts
-dispatch(addTab({ id: tabId, createRequestId: requestId, ... }))
-dispatch(initLayout({ tabId, content: desiredResumeContent }))
-```
-
-- `TabContent` may still synthesize a terminal for a no-layout coding tab, but only as a degraded restore path using `tab.createRequestId`. It must call `addTerminalRestoreRequestId(tab.createRequestId)` before that pane mounts so `TerminalView` treats it as restore, not as a fresh session.
-- `TabBar` fallback synthesis for no-layout tabs is presentation-only. It must not synthesize session-owning metadata that feeds context menus or open-session lookup.
-- `findTabIdForSession()`, `findPaneForSession()`, sidebar selectors, layout mirror sync, and busy-session collection must ignore tab-only coding metadata when no layout exists.
+- `collectSessionLocatorsFromTabs()` and other session lookup helpers must ignore tab-only coding metadata when no layout exists.
+- `layoutMirrorMiddleware` must stop publishing `fallbackSessionRef` for no-layout coding tabs.
+- sidebar selectors and `pane-activity` must stop deriving `hasTab` and busy-session ownership from no-layout coding tab mirrors.
+- `TabBar` fallback synthesis stays presentation-only.
 - `PaneContainer` and `ContextMenuProvider` must clear `tab.resumeSessionId` whenever the surviving layout no longer contains that exact coding session.
-- `tab.resumeSessionId` remains useful as compatibility metadata for a single-pane live tab, but it is never authoritative once layout is absent or changed.
+- Update the `Tab.resumeSessionId` comment to document that it is compatibility metadata only, not authoritative ownership.
 
 - [ ] **Step 4: Run the focused tests to verify pass**
 
@@ -645,30 +388,16 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/tabsSlice.ts src/components/TabContent.tsx src/components/TabBar.tsx src/lib/terminal-restore.ts src/lib/session-utils.ts src/store/layoutMirrorMiddleware.ts src/store/selectors/sidebarSelectors.ts src/lib/pane-activity.ts src/components/panes/PaneContainer.tsx src/components/context-menu/ContextMenuProvider.tsx src/store/types.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/replace-pane.test.tsx
-git commit -m "feat: remove no-layout coding session authority"
+git add src/lib/session-utils.ts src/store/layoutMirrorMiddleware.ts src/store/selectors/sidebarSelectors.ts src/lib/pane-activity.ts src/components/TabBar.tsx src/components/panes/PaneContainer.tsx src/components/context-menu/ContextMenuProvider.tsx src/store/types.ts test/unit/client/lib/session-utils.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/components/TabBar.test.tsx test/unit/client/components/Sidebar.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/replace-pane.test.tsx
+git commit -m "feat: remove no-layout coding session ownership leaks"
 ```
 
-### Task 7: Add The Browser Reload Regression And Run Final Verification
+### Task 4: Run Final Verification
 
 **Files:**
-- Create: `test/e2e-browser/specs/terminal-exact-session-identity.spec.ts`
-- Modify: `test/e2e-browser/helpers/fixtures.ts` only if a tiny helper materially reduces duplication; otherwise keep the spec self-contained
+- Modify: `test/e2e-browser/helpers/fixtures.ts` only if a tiny helper is still needed after earlier tasks; otherwise keep the working tree clean
 
-- [ ] **Step 1: Write the failing browser regression**
-
-Add a Playwright spec with two cases:
-
-1. Seed `freshell.tabs.v2` and `freshell.panes.v2` before `goto()` with two same-`cwd` coding panes that have distinct exact `sessionRef` values and mirrored `resumeSessionId` values. After reload and tab switching, assert the outbound `terminal.create` messages use the correct session per tab and never cross-swap.
-2. Seed a degraded no-layout coding tab in `freshell.tabs.v2` with bare `resumeSessionId`, a coding mode, and no pane layout. Assert no wrong restore happens: either no restore-time `terminal.create` is sent for that tab, or the pane mounts and prints the restore-blocked message before any attach to the wrong session. The expected steady-state user-visible output is:
-
-```text
-[Restore blocked: exact session identity missing]
-```
-
-Use `page.addInitScript()` to seed storage before `page.goto()` and `window.__FRESHELL_TEST_HARNESS__.getSentWsMessages()` to inspect create messages.
-
-- [ ] **Step 2: Run the browser regression to verify failure**
+- [ ] **Step 1: Run the browser acceptance regression**
 
 Run:
 
@@ -676,16 +405,24 @@ Run:
 npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-exact-session-identity.spec.ts
 ```
 
-Expected: FAIL because reload still trusts degraded fallback or cross-swaps same-`cwd` coding panes.
+Expected: PASS
 
-- [ ] **Step 3: Run the browser regression and focused suites to verify pass**
+- [ ] **Step 2: Run focused server verification**
 
 Run:
 
 ```bash
-npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-exact-session-identity.spec.ts
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/server/session-association.test.ts test/server/ws-protocol.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
-npm run test:vitest -- test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/replace-pane.test.tsx
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/spawn-spec.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+```
+
+Expected: PASS
+
+- [ ] **Step 3: Run focused client verification**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/replace-pane.test.tsx
 npm run lint
 ```
 
@@ -700,11 +437,12 @@ npm run test:status
 FRESHELL_TEST_SUMMARY="wrong-agent-restore exact identity" npm test
 ```
 
-Expected: `test:status` shows the coordinator is idle or clearly identifies the current holder, and `npm test` passes once the run starts.
+Expected: `test:status` shows the coordinator state clearly, and `npm test` passes once the coordinated run starts.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit only if Step 1-4 required final helper edits**
 
 ```bash
-git add test/e2e-browser/specs/terminal-exact-session-identity.spec.ts test/e2e-browser/helpers/fixtures.ts
-git commit -m "test: cover exact wrong-agent restore regression"
+git status --short
+git add test/e2e-browser/helpers/fixtures.ts
+git commit -m "test: finalize exact session restore regression"
 ```
