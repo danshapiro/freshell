@@ -86,6 +86,26 @@ describe('persistedState parsers', () => {
       expect(Object.keys(parsed!.layouts)).toEqual(['tab-1'])
     })
 
+    it('accepts persisted paneTitleSources metadata', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Session title' } },
+        paneTitleSources: { 'tab-1': { 'pane-1': 'stable' } },
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.paneTitleSources['tab-1']?.['pane-1']).toBe('stable')
+    })
+
     it('preserves an explicit exact sessionRef from persisted coding panes', () => {
       const raw = JSON.stringify({
         version: PANES_SCHEMA_VERSION,

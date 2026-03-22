@@ -9,9 +9,135 @@ import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import {
+  inferLegacyPaneTitleSource,
+  shouldReplaceDurableTitleSource,
+  type DurableTitleSource,
+} from '@/lib/title-source'
 
 
 const log = createLogger('PanesSlice')
+
+function ensurePaneTitles(state: PanesState, tabId: string): Record<string, string> {
+  if (!state.paneTitles[tabId]) {
+    state.paneTitles[tabId] = {}
+  }
+  return state.paneTitles[tabId]
+}
+
+function ensurePaneTitleSources(state: PanesState, tabId: string): Record<string, DurableTitleSource> {
+  if (!state.paneTitleSources) {
+    state.paneTitleSources = {}
+  }
+  if (!state.paneTitleSources[tabId]) {
+    state.paneTitleSources[tabId] = {}
+  }
+  return state.paneTitleSources[tabId]!
+}
+
+function syncPaneTitleSetByUserMirror(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+  source: DurableTitleSource,
+) {
+  if (!state.paneTitleSetByUser) {
+    state.paneTitleSetByUser = {}
+  }
+
+  if (source === 'user') {
+    if (!state.paneTitleSetByUser[tabId]) {
+      state.paneTitleSetByUser[tabId] = {}
+    }
+    state.paneTitleSetByUser[tabId][paneId] = true
+    return
+  }
+
+  if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+    delete state.paneTitleSetByUser[tabId][paneId]
+    if (Object.keys(state.paneTitleSetByUser[tabId]).length === 0) {
+      delete state.paneTitleSetByUser[tabId]
+    }
+  }
+}
+
+function resolvePaneTitleSource(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+  content: PaneContent,
+): DurableTitleSource {
+  const explicitSource = state.paneTitleSources?.[tabId]?.[paneId]
+  if (explicitSource) return explicitSource
+
+  return inferLegacyPaneTitleSource({
+    storedTitle: state.paneTitles?.[tabId]?.[paneId],
+    derivedTitle: derivePaneTitle(content),
+    titleSetByUser: state.paneTitleSetByUser?.[tabId]?.[paneId],
+  })
+}
+
+function setPaneTitleSource(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+  source: DurableTitleSource,
+) {
+  ensurePaneTitleSources(state, tabId)[paneId] = source
+  syncPaneTitleSetByUserMirror(state, tabId, paneId, source)
+}
+
+function setDerivedPaneTitle(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+  content: PaneContent,
+) {
+  ensurePaneTitles(state, tabId)[paneId] = derivePaneTitle(content)
+  setPaneTitleSource(state, tabId, paneId, 'derived')
+}
+
+function setPaneDurableTitleWithSource(
+  state: PanesState,
+  input: {
+    tabId: string
+    paneId: string
+    title: string
+    source: DurableTitleSource
+    currentContent?: PaneContent
+  },
+): boolean {
+  const currentSource = input.currentContent
+    ? resolvePaneTitleSource(state, input.tabId, input.paneId, input.currentContent)
+    : (state.paneTitleSources?.[input.tabId]?.[input.paneId]
+      ?? (state.paneTitleSetByUser?.[input.tabId]?.[input.paneId] ? 'user' : 'derived'))
+
+  if (!shouldReplaceDurableTitleSource(currentSource, input.source)) {
+    return false
+  }
+
+  ensurePaneTitles(state, input.tabId)[input.paneId] = input.title
+  setPaneTitleSource(state, input.tabId, input.paneId, input.source)
+  return true
+}
+
+function collectPaneTitleSourcesForLayout(
+  layout: PaneNode,
+  paneTitles: Record<string, string> | undefined,
+  paneTitleSources: Record<string, DurableTitleSource> | undefined,
+  paneTitleSetByUser: Record<string, boolean> | undefined,
+): Record<string, DurableTitleSource> {
+  const nextSources: Record<string, DurableTitleSource> = {}
+  for (const leaf of collectLeaves(layout)) {
+    nextSources[leaf.id] = paneTitleSources?.[leaf.id]
+      ?? inferLegacyPaneTitleSource({
+        storedTitle: paneTitles?.[leaf.id],
+        derivedTitle: derivePaneTitle(leaf.content),
+        titleSetByUser: paneTitleSetByUser?.[leaf.id],
+      })
+  }
+  return nextSources
+}
 
 /**
  * Normalize pane content to the full persisted/runtime shape.
@@ -106,6 +232,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
     const nextLayouts = { ...state.layouts }
     const nextActivePane = { ...state.activePane }
     const nextPaneTitles = { ...state.paneTitles }
+    const nextPaneTitleSources = { ...(state.paneTitleSources || {}) }
     const nextPaneTitleSetByUser = { ...state.paneTitleSetByUser }
     const nextRefreshRequestsByPane = { ...state.refreshRequestsByPane }
 
@@ -113,6 +240,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
       delete nextLayouts[tabId]
       delete nextActivePane[tabId]
       delete nextPaneTitles[tabId]
+      delete nextPaneTitleSources[tabId]
       delete nextPaneTitleSetByUser[tabId]
       delete nextRefreshRequestsByPane[tabId]
     }
@@ -122,6 +250,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
       layouts: nextLayouts,
       activePane: nextActivePane,
       paneTitles: nextPaneTitles,
+      paneTitleSources: nextPaneTitleSources,
       paneTitleSetByUser: nextPaneTitleSetByUser,
       refreshRequestsByPane: nextRefreshRequestsByPane,
     }
@@ -139,6 +268,7 @@ function loadInitialPanesState(): PanesState {
     layouts: {},
     activePane: {},
     paneTitles: {},
+    paneTitleSources: {},
     paneTitleSetByUser: {},
     renameRequestTabId: null,
     renameRequestPaneId: null,
@@ -155,6 +285,7 @@ function loadInitialPanesState(): PanesState {
       layouts: loaded.layouts || {},
       activePane: loaded.activePane || {},
       paneTitles: loaded.paneTitles || {},
+      paneTitleSources: loaded.paneTitleSources || {},
       paneTitleSetByUser: loaded.paneTitleSetByUser || {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
@@ -300,9 +431,10 @@ function mergeHydratedPaneMetadata(
   incoming: PanesState,
   layouts: Record<string, PaneNode>,
   incomingLayoutTabIds: Set<string>,
-): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSetByUser'> {
+): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSources' | 'paneTitleSetByUser'> {
   const activePane: Record<string, string> = {}
   const paneTitles: Record<string, Record<string, string>> = {}
+  const paneTitleSources: Record<string, Record<string, DurableTitleSource>> = {}
   const paneTitleSetByUser: Record<string, Record<string, boolean>> = {}
 
   for (const [tabId, layout] of Object.entries(layouts)) {
@@ -311,6 +443,9 @@ function mergeHydratedPaneMetadata(
     const preferredTitleSource = incomingLayoutTabIds.has(tabId)
       ? incoming.paneTitles
       : state.paneTitles
+    const preferredPaneTitleSourcesSource = incomingLayoutTabIds.has(tabId)
+      ? incoming.paneTitleSources
+      : state.paneTitleSources
     const preferredTitleSetByUserSource = incomingLayoutTabIds.has(tabId)
       ? incoming.paneTitleSetByUser
       : state.paneTitleSetByUser
@@ -329,17 +464,33 @@ function mergeHydratedPaneMetadata(
       paneTitles[tabId] = nextPaneTitles
     }
 
+    const nextPaneTitleSources = collectPaneTitleSourcesForLayout(
+      layout,
+      nextPaneTitles,
+      filterPaneMetadataByLayout(preferredPaneTitleSourcesSource, tabId, paneIdSet),
+      filterPaneMetadataByLayout(preferredTitleSetByUserSource, tabId, paneIdSet),
+    )
+    if (Object.keys(nextPaneTitleSources).length > 0) {
+      paneTitleSources[tabId] = nextPaneTitleSources
+    }
+
     const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
       preferredTitleSetByUserSource,
       tabId,
       paneIdSet,
     )
-    if (nextPaneTitleSetByUser) {
-      paneTitleSetByUser[tabId] = nextPaneTitleSetByUser
+    const resolvedPaneTitleSetByUser = Object.fromEntries(
+      Object.entries(nextPaneTitleSources).filter(([, source]) => source === 'user').map(([paneId]) => [paneId, true]),
+    )
+    if (nextPaneTitleSetByUser || Object.keys(resolvedPaneTitleSetByUser).length > 0) {
+      paneTitleSetByUser[tabId] = {
+        ...(nextPaneTitleSetByUser || {}),
+        ...resolvedPaneTitleSetByUser,
+      }
     }
   }
 
-  return { activePane, paneTitles, paneTitleSetByUser }
+  return { activePane, paneTitles, paneTitleSources, paneTitleSetByUser }
 }
 
 /**
@@ -564,14 +715,24 @@ export const panesSlice = createSlice({
       }
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+      state.paneTitleSources = {
+        ...(state.paneTitleSources || {}),
+        [tabId]: { [paneId]: 'derived' },
+      }
+      delete state.paneTitleSetByUser[tabId]
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
     restoreLayout: (
       state,
-      action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string> }>
+      action: PayloadAction<{
+        tabId: string
+        layout: PaneNode
+        paneTitles: Record<string, string>
+        paneTitleSources?: Record<string, DurableTitleSource>
+      }>
     ) => {
-      const { tabId, layout, paneTitles } = action.payload
+      const { tabId, layout, paneTitles, paneTitleSources } = action.payload
       // Don't overwrite existing layout (same guard as initLayout)
       if (state.layouts[tabId]) return
 
@@ -580,6 +741,23 @@ export const panesSlice = createSlice({
       state.layouts[tabId] = normalizedLayout
       state.activePane[tabId] = findFirstLeafId(normalizedLayout)
       state.paneTitles[tabId] = paneTitles
+      state.paneTitleSources = {
+        ...(state.paneTitleSources || {}),
+        [tabId]: collectPaneTitleSourcesForLayout(
+          normalizedLayout,
+          paneTitles,
+          paneTitleSources,
+          state.paneTitleSetByUser?.[tabId],
+        ),
+      }
+      state.paneTitleSetByUser[tabId] = Object.fromEntries(
+        Object.entries(state.paneTitleSources[tabId] || {})
+          .filter(([, source]) => source === 'user')
+          .map(([paneId]) => [paneId, true]),
+      )
+      if (Object.keys(state.paneTitleSetByUser[tabId] || {}).length === 0) {
+        delete state.paneTitleSetByUser[tabId]
+      }
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -597,6 +775,11 @@ export const panesSlice = createSlice({
       }
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+      state.paneTitleSources = {
+        ...(state.paneTitleSources || {}),
+        [tabId]: { [paneId]: 'derived' },
+      }
+      delete state.paneTitleSetByUser[tabId]
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -644,10 +827,7 @@ export const panesSlice = createSlice({
         }
 
         // Initialize title for new pane
-        if (!state.paneTitles[tabId]) {
-          state.paneTitles[tabId] = {}
-        }
-        state.paneTitles[tabId][newPaneId] = derivePaneTitle(normalizedContent)
+        setDerivedPaneTitle(state, tabId, newPaneId, normalizedContent)
         reconcileRefreshRequestsForTab(state, tabId)
       }
     },
@@ -705,10 +885,7 @@ export const panesSlice = createSlice({
       }
 
       // Initialize title for new pane
-      if (!state.paneTitles[tabId]) {
-        state.paneTitles[tabId] = {}
-      }
-      state.paneTitles[tabId][newPaneId] = derivePaneTitle(normalizedContent)
+      setDerivedPaneTitle(state, tabId, newPaneId, normalizedContent)
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -764,6 +941,9 @@ export const panesSlice = createSlice({
         // Clean up pane title and user-set flag
         if (state.paneTitles[tabId]?.[paneId]) {
           delete state.paneTitles[tabId][paneId]
+        }
+        if (state.paneTitleSources?.[tabId]?.[paneId]) {
+          delete state.paneTitleSources[tabId][paneId]
         }
         if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
           delete state.paneTitleSetByUser[tabId][paneId]
@@ -936,6 +1116,21 @@ export const panesSlice = createSlice({
         }
       }
 
+      if (state.paneTitleSources?.[tabId]) {
+        const sources = state.paneTitleSources[tabId]
+        const temp = sources[paneId]
+        if (sources[otherId] === undefined) {
+          delete sources[paneId]
+        } else {
+          sources[paneId] = sources[otherId]
+        }
+        if (temp === undefined) {
+          delete sources[otherId]
+        } else {
+          sources[otherId] = temp
+        }
+      }
+
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -968,16 +1163,7 @@ export const panesSlice = createSlice({
 
       if (!found) return
 
-      // Reset title to picker-derived title ("New Tab")
-      if (!state.paneTitles[tabId]) {
-        state.paneTitles[tabId] = {}
-      }
-      state.paneTitles[tabId][paneId] = derivePaneTitle(pickerContent)
-
-      // Clear user-set flag so title auto-derives again
-      if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-        delete state.paneTitleSetByUser[tabId][paneId]
-      }
+      setDerivedPaneTitle(state, tabId, paneId, pickerContent)
 
       reconcileRefreshRequestsForTab(state, tabId)
     },
@@ -990,10 +1176,12 @@ export const panesSlice = createSlice({
       const root = state.layouts[tabId]
       if (!root) return
       let normalizedContentForTitle: PaneContent | null = null
+      let previousTitleSource: DurableTitleSource | null = null
 
       function updateContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousTitleSource = resolvePaneTitleSource(state, tabId, paneId, node.content)
             const nextContent = normalizePaneContent(content, node.content)
             normalizedContentForTitle = nextContent
             return { ...node, content: nextContent }
@@ -1008,12 +1196,8 @@ export const panesSlice = createSlice({
 
       state.layouts[tabId] = updateContent(root)
 
-      // Update pane title when content changes, unless user explicitly set it
-      if (normalizedContentForTitle && !state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-        if (!state.paneTitles[tabId]) {
-          state.paneTitles[tabId] = {}
-        }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+      if (normalizedContentForTitle && previousTitleSource === 'derived') {
+        setDerivedPaneTitle(state, tabId, paneId, normalizedContentForTitle)
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1028,10 +1212,12 @@ export const panesSlice = createSlice({
       const { tabId, paneId, updates } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      let previousTitleSource: DurableTitleSource | null = null
 
       function mergeContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousTitleSource = resolvePaneTitleSource(state, tabId, paneId, node.content)
             return {
               ...node,
               content: normalizePaneContent({ ...node.content, ...updates } as PaneContentInput | PaneContent, node.content),
@@ -1047,13 +1233,9 @@ export const panesSlice = createSlice({
 
       state.layouts[tabId] = mergeContent(root)
 
-      // Update pane title if content changed in a way that affects it
       const leaf = findLeaf(state.layouts[tabId]!, paneId)
-      if (leaf && !state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-        if (!state.paneTitles[tabId]) {
-          state.paneTitles[tabId] = {}
-        }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+      if (leaf && previousTitleSource === 'derived') {
+        setDerivedPaneTitle(state, tabId, paneId, leaf.content)
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1140,6 +1322,9 @@ export const panesSlice = createSlice({
       delete state.layouts[tabId]
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
+      if (state.paneTitleSources) {
+        delete state.paneTitleSources[tabId]
+      }
       if (state.zoomedPane) {
         delete state.zoomedPane[tabId]
       }
@@ -1188,6 +1373,7 @@ export const panesSlice = createSlice({
       const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
       state.activePane = nextMetadata.activePane
       state.paneTitles = nextMetadata.paneTitles
+      state.paneTitleSources = nextMetadata.paneTitleSources
       state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
       // Ephemeral signals must never be hydrated from remote
       state.renameRequestTabId = null
@@ -1198,26 +1384,25 @@ export const panesSlice = createSlice({
 
     updatePaneTitle: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; title: string; setByUser?: boolean }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        title: string
+        setByUser?: boolean
+        source?: DurableTitleSource
+      }>
     ) => {
-      const { tabId, paneId, title, setByUser } = action.payload
-      // Skip programmatic updates when user has explicitly set the title
-      if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-        return
-      }
-      if (!state.paneTitles[tabId]) {
-        state.paneTitles[tabId] = {}
-      }
-      state.paneTitles[tabId][paneId] = title
-      if (setByUser !== false) {
-        if (!state.paneTitleSetByUser) {
-          state.paneTitleSetByUser = {}
-        }
-        if (!state.paneTitleSetByUser[tabId]) {
-          state.paneTitleSetByUser[tabId] = {}
-        }
-        state.paneTitleSetByUser[tabId][paneId] = true
-      }
+      const { tabId, paneId, title, setByUser, source } = action.payload
+      const tabLayout = state.layouts[tabId]
+      const currentContent = tabLayout ? findLeaf(tabLayout, paneId)?.content : undefined
+      const nextSource = source ?? (setByUser === false ? 'stable' : 'user')
+      setPaneDurableTitleWithSource(state, {
+        tabId,
+        paneId,
+        title,
+        source: nextSource,
+        currentContent: currentContent ?? undefined,
+      })
     },
 
     requestPaneRename: (
@@ -1254,23 +1439,26 @@ export const panesSlice = createSlice({
      */
     updatePaneTitleByTerminalId: (
       state,
-      action: PayloadAction<{ terminalId: string; title: string; setByUser?: boolean }>
+      action: PayloadAction<{
+        terminalId: string
+        title: string
+        setByUser?: boolean
+        source?: DurableTitleSource
+      }>
     ) => {
-      const { terminalId, title, setByUser } = action.payload
+      const { terminalId, title, setByUser, source } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
         const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
         if (paneId) {
-          if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-            continue
-          }
-          if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
-          state.paneTitles[tabId][paneId] = title
-          if (setByUser !== false) {
-            // Mark as user-set so programmatic updates don't overwrite it
-            if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
-            if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
-            state.paneTitleSetByUser[tabId][paneId] = true
-          }
+          const currentContent = findLeaf(state.layouts[tabId], paneId)?.content
+          const nextSource = source ?? (setByUser === false ? 'stable' : 'user')
+          setPaneDurableTitleWithSource(state, {
+            tabId,
+            paneId,
+            title,
+            source: nextSource,
+            currentContent: currentContent ?? undefined,
+          })
         }
       }
     },

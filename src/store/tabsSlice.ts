@@ -357,6 +357,7 @@ export const closeTab = createAsyncThunk(
         tab: { ...tab },
         layout: JSON.parse(JSON.stringify(layout)),
         paneTitles: { ...(stateBeforeClose.panes.paneTitles[tabId] || {}) },
+        paneTitleSources: { ...(stateBeforeClose.panes.paneTitleSources?.[tabId] || {}) },
         closedAt: Date.now(),
       }))
     }
@@ -411,6 +412,7 @@ export const reopenClosedTab = createAsyncThunk(
       tabId: newTabId,
       layout: entry.layout,
       paneTitles: entry.paneTitles,
+      paneTitleSources: entry.paneTitleSources || {},
     }))
   }
 )

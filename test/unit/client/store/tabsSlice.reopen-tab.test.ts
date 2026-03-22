@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, closeTab, reopenClosedTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, addPane } from '@/store/panesSlice'
+import panesReducer, { initLayout, addPane, updatePaneTitle } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 
 function createStore() {
@@ -90,6 +90,35 @@ describe('reopenClosedTab', () => {
     const newTabId = store.getState().tabs.tabs[0].id
     const layoutAfter = store.getState().panes.layouts[newTabId]!
     expect(layoutAfter.type).toBe('split')
+  })
+
+  it('restores paneTitles and paneTitleSources on reopen', async () => {
+    const store = createStore()
+
+    store.dispatch(addTab({ title: 'Session tab', titleSource: 'stable' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'pane-stable',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    store.dispatch(updatePaneTitle({
+      tabId,
+      paneId: 'pane-stable',
+      title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
+      source: 'stable',
+    }))
+
+    await store.dispatch(closeTab(tabId) as any)
+    await store.dispatch(reopenClosedTab() as any)
+
+    const reopenedTabId = store.getState().tabs.tabs[0].id
+    expect(store.getState().panes.paneTitles[reopenedTabId]).toEqual({
+      'pane-stable': 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
+    })
+    expect(store.getState().panes.paneTitleSources[reopenedTabId]).toEqual({
+      'pane-stable': 'stable',
+    })
   })
 
   it('restores titleSetByUser flag', async () => {

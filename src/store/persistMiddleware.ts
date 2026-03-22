@@ -70,7 +70,8 @@ function canonicalizeTabForPersistence(tab: Tab, panes: PanesState | undefined):
   const layout = panes?.layouts?.[tab.id]
   const paneTitle = layout?.type === 'leaf' ? panes?.paneTitles?.[tab.id]?.[layout.id] : undefined
   const paneTitleSource = layout?.type === 'leaf'
-    ? inferLegacyPaneTitleSource({
+    ? panes?.paneTitleSources?.[tab.id]?.[layout.id]
+      ?? inferLegacyPaneTitleSource({
         storedTitle: paneTitle,
         derivedTitle: derivePaneTitle(layout.content),
         titleSetByUser: panes?.paneTitleSetByUser?.[tab.id]?.[layout.id],
@@ -243,6 +244,52 @@ function dropClaudeChatNodes(node: any): any {
   return node
 }
 
+function collectLeafNodes(node: any): Array<{ id: string; content: any }> {
+  if (!node || typeof node !== 'object') return []
+  if (node.type === 'leaf' && typeof node.id === 'string') {
+    return [{ id: node.id, content: node.content }]
+  }
+  if (node.type === 'split' && Array.isArray(node.children) && node.children.length >= 2) {
+    return [
+      ...collectLeafNodes(node.children[0]),
+      ...collectLeafNodes(node.children[1]),
+    ]
+  }
+  return []
+}
+
+function inferPaneTitleSourcesByTab(
+  layouts: Record<string, any>,
+  paneTitles: Record<string, Record<string, string>>,
+  paneTitleSetByUser: Record<string, Record<string, boolean>>,
+  existingPaneTitleSources?: Record<string, Record<string, 'derived' | 'stable' | 'user'>>,
+): Record<string, Record<string, 'derived' | 'stable' | 'user'>> {
+  const nextSources: Record<string, Record<string, 'derived' | 'stable' | 'user'>> = {}
+
+  for (const [tabId, layout] of Object.entries(layouts || {})) {
+    const tabSources: Record<string, 'derived' | 'stable' | 'user'> = {}
+    for (const leaf of collectLeafNodes(layout)) {
+      const existingSource = existingPaneTitleSources?.[tabId]?.[leaf.id]
+      if (existingSource) {
+        tabSources[leaf.id] = existingSource
+        continue
+      }
+
+      tabSources[leaf.id] = inferLegacyPaneTitleSource({
+        storedTitle: paneTitles?.[tabId]?.[leaf.id],
+        derivedTitle: derivePaneTitle(leaf.content),
+        titleSetByUser: paneTitleSetByUser?.[tabId]?.[leaf.id],
+      })
+    }
+
+    if (Object.keys(tabSources).length > 0) {
+      nextSources[tabId] = tabSources
+    }
+  }
+
+  return nextSources
+}
+
 let cachedPersistedPanes: any | null | undefined
 
 export function loadPersistedPanes(): any | null {
@@ -281,6 +328,18 @@ function loadPersistedPanesUncached(): any | null {
         ),
         paneTitles: Object.fromEntries(
           Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ),
+        paneTitleSources: inferPaneTitleSourcesByTab(
+          sanitizedLayouts,
+          Object.fromEntries(
+            Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ),
+          Object.fromEntries(
+            Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ),
+          Object.fromEntries(
+            Object.entries(parsed.paneTitleSources || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ),
         ),
         paneTitleSetByUser: Object.fromEntries(
           Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
@@ -333,17 +392,25 @@ function loadPersistedPanesUncached(): any | null {
       }
     }
 
+    const filteredPaneTitles = Object.fromEntries(
+      Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
+    ) as Record<string, Record<string, string>>
+    const filteredPaneTitleSetByUser = Object.fromEntries(
+      Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+    ) as Record<string, Record<string, boolean>>
+
     return {
       layouts: sanitizedLayouts,
       activePane: Object.fromEntries(
         Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
       ),
-      paneTitles: Object.fromEntries(
-        Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      paneTitles: filteredPaneTitles,
+      paneTitleSources: inferPaneTitleSourcesByTab(
+        sanitizedLayouts,
+        filteredPaneTitles,
+        filteredPaneTitleSetByUser,
       ),
-      paneTitleSetByUser: Object.fromEntries(
-        Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-      ),
+      paneTitleSetByUser: filteredPaneTitleSetByUser,
       version: PANES_SCHEMA_VERSION,
     }
   } catch {
@@ -405,6 +472,12 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         } = state.panes
         const panesPayload = {
           ...persistablePanes,
+          paneTitleSources: state.panes.paneTitleSources
+            || inferPaneTitleSourcesByTab(
+              sanitizedLayouts,
+              state.panes.paneTitles || {},
+              state.panes.paneTitleSetByUser || {},
+            ),
           layouts: sanitizedLayouts,
           version: PANES_SCHEMA_VERSION,
         }
