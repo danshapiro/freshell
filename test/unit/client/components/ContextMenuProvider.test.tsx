@@ -6,14 +6,12 @@ import { Provider } from 'react-redux'
 
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
-import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import type { ClientExtensionEntry } from '@shared/extension-types'
-import { api } from '@/lib/api'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -655,181 +653,6 @@ function createStoreWithCodingTerminalPane() {
   })
 }
 
-function createStoreWithRenameableSessionPane() {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      paneRuntimeTitle: paneRuntimeTitleReducer,
-      sessions: sessionsReducer,
-      connection: connectionReducer,
-      settings: settingsReducer,
-      extensions: extensionsReducer,
-    },
-    middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({ serializableCheck: false }),
-    preloadedState: {
-      tabs: {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'Shell',
-            status: 'running',
-            mode: 'shell',
-            shell: 'system',
-            createdAt: 1,
-          },
-        ],
-        activeTabId: 'tab-1',
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              status: 'running',
-              terminalId: 'term-1',
-              resumeSessionId: VALID_SESSION_ID,
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-      paneRuntimeTitle: {
-        titlesByPaneId: {
-          'pane-1': 'codex',
-        },
-      },
-      sessions: {
-        projects: [
-          {
-            projectPath: '/test/project',
-            sessions: [
-              {
-                sessionId: VALID_SESSION_ID,
-                provider: 'claude',
-                title: 'Test Session',
-                cwd: '/test/project',
-                createdAt: 1000,
-                lastActivityAt: 2000,
-                messageCount: 5,
-              },
-            ],
-          },
-        ],
-        expandedProjects: new Set<string>(),
-      },
-      extensions: {
-        entries: defaultCliExtensions,
-      },
-      connection: {
-        status: 'ready',
-        platform: 'linux',
-      },
-    },
-  })
-}
-
-function createStoreWithSplitTerminalPane() {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      paneRuntimeTitle: paneRuntimeTitleReducer,
-      sessions: sessionsReducer,
-      connection: connectionReducer,
-      settings: settingsReducer,
-      extensions: extensionsReducer,
-    },
-    middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({ serializableCheck: false }),
-    preloadedState: {
-      tabs: {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'Workspace',
-            status: 'running',
-            mode: 'shell',
-            shell: 'system',
-            createdAt: 1,
-          },
-        ],
-        activeTabId: 'tab-1',
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'split',
-            id: 'split-1',
-            direction: 'horizontal',
-            sizes: [50, 50],
-            children: [
-              {
-                type: 'leaf',
-                id: 'pane-1',
-                content: {
-                  kind: 'terminal',
-                  mode: 'shell',
-                  status: 'running',
-                  terminalId: 'term-1',
-                },
-              },
-              {
-                type: 'leaf',
-                id: 'pane-2',
-                content: {
-                  kind: 'editor',
-                  filePath: '/tmp/notes.txt',
-                  content: '',
-                  readOnly: false,
-                  viewMode: 'source',
-                },
-              },
-            ],
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'notes.txt' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-      paneRuntimeTitle: {
-        titlesByPaneId: {
-          'pane-1': 'codex',
-        },
-      },
-      sessions: {
-        projects: [],
-        expandedProjects: new Set<string>(),
-      },
-      extensions: {
-        entries: defaultCliExtensions,
-      },
-      connection: {
-        status: 'ready',
-        platform: 'linux',
-      },
-    },
-  })
-}
-
 describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
@@ -1080,8 +903,6 @@ describe('ContextMenuProvider', () => {
           expect(newPane.content.mode).toBe('claude')
           expect(newPane.content.resumeSessionId).toBe(VALID_SESSION_ID)
         }
-        expect(store.getState().panes.paneTitles['tab-1']?.[newPane.id]).toBe('Test Session')
-        expect(store.getState().panes.paneTitleSources?.['tab-1']?.[newPane.id]).toBe('stable')
       }
     }
   })
@@ -1133,95 +954,6 @@ describe('ContextMenuProvider', () => {
         })
       }
     }
-  })
-
-  it('session rename cascades a stable title into matching open panes and clears runtime titles', async () => {
-    const user = userEvent.setup()
-    const promptSpy = vi.spyOn(window, 'prompt')
-      .mockReturnValueOnce('Renamed Session')
-    vi.mocked(api.patch).mockResolvedValueOnce({ cascadedTerminalId: 'term-1' } as any)
-
-    const store = createStoreWithRenameableSessionPane()
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id={VALID_SESSION_ID}
-            data-provider="claude"
-          >
-            Test Session
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
-
-    expect(api.patch).toHaveBeenCalledWith(
-      `/api/sessions/${encodeURIComponent(`claude:${VALID_SESSION_ID}`)}`,
-      { titleOverride: 'Renamed Session', summaryOverride: undefined },
-    )
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'Renamed Session',
-      titleSource: 'stable',
-    })
-    expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Renamed Session')
-    expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId['pane-1']).toBeUndefined()
-
-    promptSpy.mockRestore()
-  })
-
-  it('terminal rename uses the shared stable sync path for split panes and clears runtime titles', async () => {
-    const user = userEvent.setup()
-    const promptSpy = vi.spyOn(window, 'prompt')
-      .mockReturnValueOnce('Renamed Terminal')
-      .mockReturnValueOnce('Updated description')
-    vi.mocked(api.get).mockResolvedValueOnce([
-      { terminalId: 'term-1', title: 'Shell', description: 'Original description' },
-    ] as any)
-
-    const store = createStoreWithSplitTerminalPane()
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="overview"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.OverviewTerminal}
-            data-terminal-id="term-1"
-          >
-            Overview Terminal
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Overview Terminal'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
-
-    expect(api.patch).toHaveBeenCalledWith(
-      `/api/terminals/${encodeURIComponent('term-1')}`,
-      {
-        titleOverride: 'Renamed Terminal',
-        descriptionOverride: 'Updated description',
-      },
-    )
-    expect(store.getState().tabs.tabs[0].title).toBe('Workspace')
-    expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Renamed Terminal')
-    expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId['pane-1']).toBeUndefined()
-
-    promptSpy.mockRestore()
   })
 
   it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {

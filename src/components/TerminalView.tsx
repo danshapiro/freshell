@@ -1352,10 +1352,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const lastTitleRef = useRef<string | null>(null)
   const lastTitleUpdateRef = useRef<number>(0)
   const TITLE_UPDATE_THROTTLE_MS = 2000
-  const resetRuntimeTitleDeduping = useCallback(() => {
-    lastTitleRef.current = null
-    lastTitleUpdateRef.current = 0
-  }, [])
 
   // Handle xterm title changes (from terminal escape sequences)
   useEffect(() => {
@@ -1956,7 +1952,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             pendingIntent: null,
             pendingSinceSeq: 0,
           }
-          resetRuntimeTitleDeduping()
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           dispatch(clearPaneRuntimeTitleByTerminalId({ terminalId: tid }))
           clearTerminalCursor(tid)
@@ -2109,7 +2104,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             clearTerminalCursor(currentTerminalId)
             forgetSentViewport(currentTerminalId)
             lastSentViewportRef.current = null
-            resetRuntimeTitleDeduping()
             dispatch(clearPaneRuntimeTitleByTerminalId({ terminalId: currentTerminalId }))
             terminalIdRef.current = undefined
             deferredAttachStateRef.current = {
@@ -2265,7 +2259,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     attachTerminal,
     markAttachComplete,
     runRefreshAttach,
-    resetRuntimeTitleDeduping,
   ])
 
   useEffect(() => {

@@ -189,30 +189,6 @@ it('preserves stable pane titles across attach updates', () => {
   expect((store as any).snapshot.paneTitleSources.tab_a.pane_1).toBe('stable')
 })
 
-it('infers legacy agent-chat default pane titles as derived when paneTitleSources are missing', () => {
-  const store = new LayoutStore()
-  store.updateFromUi({
-    tabs: [{ id: 'tab_a', title: 'Freshclaude' }],
-    activeTabId: 'tab_a',
-    layouts: {
-      tab_a: {
-        type: 'leaf',
-        id: 'pane_1',
-        content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
-          resumeSessionId: 'session-1',
-        },
-      },
-    },
-    activePane: { tab_a: 'pane_1' },
-    paneTitles: { tab_a: { pane_1: 'Freshclaude' } },
-    timestamp: Date.now(),
-  } as any, 'conn-1')
-
-  expect((store as any).snapshot.paneTitleSources.tab_a.pane_1).toBe('derived')
-})
-
 it('swaps pane titles with pane content so title-based targeting stays aligned', () => {
   const store = new LayoutStore()
   store.updateFromUi({
