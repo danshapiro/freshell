@@ -4,7 +4,7 @@
 
 **Goal:** Make Kimi a fully supported terminal-mode CLI in Freshell: it must show accurate launch controls in picker/settings, index its sessions into the sidebar and session directory, and restore/resume correctly after server restart.
 
-**Architecture:** Keep Freshell's current split between extension manifests (launch-time capabilities) and handwritten session providers, but complete both layers for Kimi. Implement Kimi as a direct session provider that reads `KIMI_SHARE_DIR` / `~/.kimi`, indexes `context.jsonl` transcripts plus session metadata, and exposes searchable `sourceFile` paths. Extend the launch compiler minimally with value-specific permission-mode args for `--yolo`, and derive the client-facing permission-mode subset from manifest metadata instead of adding a second manifest source of truth.
+**Architecture:** Keep Freshell's current split between extension manifests (launch-time capabilities) and handwritten session providers, but complete both layers for Kimi. Implement Kimi as a direct session provider that reads `KIMI_SHARE_DIR` / `~/.kimi`, indexes `context.jsonl` transcripts plus optional web metadata, and exposes searchable `sourceFile` paths. Extend the launch compiler minimally with value-specific permission-mode args for `--yolo`, and preserve direct-provider file-path lookup in the session indexer so Kimi participates in the same search and lookup paths as file-backed providers.
 
 **Tech Stack:** Node.js, TypeScript, Express, React, Redux Toolkit, Vitest, React Testing Library
 
@@ -34,14 +34,15 @@ After this lands:
    - modern layout: `<sessionDir>/context.jsonl`
    - legacy layout: `<sessionsDir>/<sessionId>.jsonl`
 5. Kimi titles must prefer persisted session metadata when available:
-   - `metadata.json` title when it is present and not `"Untitled"`
+   - optional `metadata.json` title when it is present and not `"Untitled"` (Kimi Web writes this file; plain CLI sessions may not have it)
    - otherwise first `TurnBegin` user input from `wire.jsonl`
    - otherwise first visible user message from the context transcript
 6. Kimi remains terminal-mode only in this task. Upstream `--print --output-format stream-json` does not expose the session-identifying event stream Freshell would need for `CodingCliSessionManager`, so `supportsLiveStreaming()` stays `false`.
 7. The generic permission-mode UI must never advertise unsupported Kimi choices. Kimi may only surface `default` and `bypassPermissions`; `bypassPermissions` must launch `--yolo`.
 8. `modeSupportsResume('kimi')` must not become true until the same task that registers the Kimi session provider. Do not create a mid-plan state where built-in Kimi advertises resume support but still lacks provider wiring.
 9. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
-10. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
+10. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
+11. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
 
 ## Root Cause Summary
 
@@ -96,16 +97,17 @@ No user decision is required.
 7. `server/terminal-registry.ts`
 8. `server/spawn-spec.ts`
    Dead-code consistency only. This file is not imported in production, but keep it aligned with `server/terminal-registry.ts`.
-9. `test/unit/server/extension-manifest.test.ts`
-10. `test/unit/server/extension-manager.test.ts`
-11. `test/unit/client/store/managed-items.test.ts`
-12. `test/unit/client/components/ExtensionsView.test.tsx`
-13. `test/e2e/directory-picker-flow.test.tsx`
-14. `test/unit/server/coding-cli/session-indexer.test.ts`
-15. `test/unit/server/session-directory/service.test.ts`
-16. `test/unit/server/terminal-registry.test.ts`
-17. `test/server/session-association.test.ts`
-18. `docs/index.html`
+9. `server/coding-cli/session-indexer.ts`
+10. `test/unit/server/extension-manifest.test.ts`
+11. `test/unit/server/extension-manager.test.ts`
+12. `test/unit/client/store/managed-items.test.ts`
+13. `test/unit/client/components/ExtensionsView.test.tsx`
+14. `test/e2e/directory-picker-flow.test.tsx`
+15. `test/unit/server/coding-cli/session-indexer.test.ts`
+16. `test/unit/server/session-directory/service.test.ts`
+17. `test/unit/server/terminal-registry.test.ts`
+18. `test/server/session-association.test.ts`
+19. `docs/index.html`
 
 ### Files Expected To Stay Unchanged
 
@@ -270,7 +272,7 @@ Make these concrete changes:
 
 Implementation rules:
 
-- `server/extension-manifest.ts`: add `permissionModeArgsByValue?: Record<PermissionMode, string[]>`.
+- `server/extension-manifest.ts`: add `permissionModeArgsByValue?: Partial<Record<ClaudePermissionMode, string[]>>` and validate its keys against the canonical permission-mode set.
 - `server/index.ts`, `server/terminal-registry.ts`, and `server/spawn-spec.ts`: compile and honor `permissionModeArgsByValue`, preferring it over generic `permissionModeArgs` when both exist.
 - `server/extension-manager.ts`: derive `supportedPermissionModes` for the client registry:
   - if a CLI has `permissionModeArgsByValue`, use `['default', ...mapped values in canonical order]`
@@ -322,6 +324,7 @@ git commit -m "feat: add Kimi launch settings metadata"
 - Create: `server/coding-cli/providers/kimi.ts`
 - Create: `test/unit/server/coding-cli/kimi-provider.test.ts`
 - Create: `test/fixtures/coding-cli/kimi/...`
+- Modify: `server/coding-cli/session-indexer.ts`
 - Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
 - Modify: `test/unit/server/session-directory/service.test.ts`
 
@@ -371,7 +374,7 @@ it('parses persisted context.jsonl lines and ignores _usage records', () => {
 
 Add a `session-directory/service` test that uses `providers: [kimiProvider]`, a Kimi `sourceFile`, and `tier: 'userMessages'` / `tier: 'fullText'` to prove Kimi becomes searchable once indexed.
 
-Add a `session-indexer` test that uses a direct-provider Kimi session and asserts `getFilePathForSession('kimi-session-1', 'kimi')` returns the transcript path.
+Add a `session-indexer` test that uses a direct-provider Kimi session and asserts `getFilePathForSession('kimi-session-1', 'kimi')` returns the transcript path, proving direct providers now populate the same lookup map that file-backed providers use.
 
 Also add one fixture-backed test that a legacy flat transcript (`sessions/<hash>/<sessionId>.jsonl`) is still indexed as a Kimi session.
 
@@ -401,7 +404,7 @@ export class KimiProvider implements CodingCliProvider {
   constructor(readonly homeDir = defaultKimiShareDir()) {}
 
   async listSessionsDirect(): Promise<CodingCliSession[]> { /* enumerate workdirs from kimi.json; read modern + legacy session layouts */ }
-  getSessionGlob(): string { /* broad enough to catch kimi.json, sessions/**, metadata.json, wire.jsonl */ }
+  getSessionGlob(): string { /* broad enough to catch kimi.json, sessions/**, optional metadata.json, and wire.jsonl */ }
   getSessionRoots(): string[] { /* include homeDir and sessions root for late creation */ }
   async listSessionFiles(): Promise<string[]> { return [] }
   async parseSessionFile(): Promise<ParsedSessionMeta> { return {} }
@@ -427,13 +430,14 @@ Implementation requirements:
   - legacy: `<sessionsDir>/<sessionId>.jsonl`
 - Use the real transcript path as `sourceFile`.
 - Derive the session title in this order:
-  - `metadata.json` title if present and not `"Untitled"`
+  - optional `metadata.json` title if present and not `"Untitled"`
   - first `TurnBegin` user input from `wire.jsonl`
   - first visible user message from the transcript
-- Derive `lastActivityAt` from the latest useful wire-record timestamp when available; otherwise fall back to transcript `mtime`.
+- Derive `lastActivityAt` from the transcript file's `mtime`, matching Kimi's own session indexing semantics. If you also expose `createdAt`, derive it from the earliest wire-record timestamp only when that is straightforward and clearly correct; otherwise leave it undefined.
 - Ignore `_usage` records and empty/internal messages when computing titles and `parseEvent()` results.
 - Reuse existing git helpers for `projectPath`, branch, and dirty-state enrichment.
 - Do **not** attempt Kimi live-stream session-manager support in this provider.
+- Update `server/coding-cli/session-indexer.ts` so `updateDirectCacheEntry()` mirrors file-backed behavior for sessions that carry `sourceFile`: remove any previous mapping for the same cache entry, set `sessionKeyToFilePath` for the new `(provider, sessionId)`, and let `deleteCacheEntry()` clean it up on removal.
 
 - [ ] **Step 4: Re-run the targeted tests and make sure they pass**
 
@@ -464,7 +468,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/providers/kimi.ts test/unit/server/coding-cli/kimi-provider.test.ts test/fixtures/coding-cli/kimi test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
+git add server/coding-cli/providers/kimi.ts server/coding-cli/session-indexer.ts test/unit/server/coding-cli/kimi-provider.test.ts test/fixtures/coding-cli/kimi test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
 git commit -m "feat: add Kimi session provider"
 ```
 
