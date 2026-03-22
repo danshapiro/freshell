@@ -50,12 +50,8 @@ export function syncStableTitleByTerminalId(input: {
     const state = getState()
     for (const tab of state.tabs.tabs) {
       const layout = state.panes.layouts[tab.id]
-      const matchesLayoutTerminal =
-        layout?.type === 'leaf'
-        && layout.content.kind === 'terminal'
-        && layout.content.terminalId === input.terminalId
-      const matchesLayoutlessTabTerminal = !layout && tab.terminalId === input.terminalId
-      if (!matchesLayoutTerminal && !matchesLayoutlessTabTerminal) {
+      if (layout?.type !== 'leaf') continue
+      if (layout.content.kind !== 'terminal' || layout.content.terminalId !== input.terminalId) {
         continue
       }
 

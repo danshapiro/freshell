@@ -22,15 +22,9 @@ import panesReducer, {
   toggleZoom,
   PanesState,
 } from '../../../../src/store/panesSlice'
-import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
-const DEFAULT_CLI_EXTENSIONS: ClientExtensionEntry[] = [
-  { name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli' },
-  { name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli' },
-  { name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli' },
-]
 
 // Mock nanoid to return predictable IDs for testing
 let mockIdCounter = 0
@@ -2311,34 +2305,6 @@ describe('panesSlice', () => {
       const state = panesReducer(initialState, hydratePanes(savedStateWithoutTitles))
 
       expect(state.paneTitles).toEqual({})
-    })
-
-    it('uses extension labels when inferring legacy paneTitleSources during hydrate', () => {
-      const state = panesReducer(initialState, hydratePanes({
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              createRequestId: 'req-1',
-              status: 'running',
-              mode: 'codex',
-              shell: 'system',
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: {
-          'tab-1': {
-            'pane-1': 'Codex CLI',
-          },
-        },
-        paneTitleSetByUser: {},
-        extensions: DEFAULT_CLI_EXTENSIONS,
-      } as any))
-
-      expect(state.paneTitleSources['tab-1']?.['pane-1']).toBe('derived')
     })
 
     it('normalizes browserInstanceId from hydratePanes cross-tab payloads', () => {
