@@ -13,6 +13,8 @@ type SessionMatchCandidate = {
   tabId: string
   paneId: string | undefined
   locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -124,19 +126,44 @@ export function collectSessionLocatorsFromContent(content: PaneContent): Array<{
   sessionId: string
   serverInstanceId?: string
 }> {
+  return dedupeBy(
+    buildSessionMatchLocators(content).map((candidate) => candidate.locator),
+    locatorIdentity,
+  )
+}
+
+function buildSessionMatchLocators(content: PaneContent): Array<{
+  locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
+}> {
+  const explicit = extractExplicitSessionLocator(content)
   const locators: Array<{
-    provider: CodingCliProviderName
-    sessionId: string
-    serverInstanceId?: string
+    locator: SessionLocator
+    locatorKind: 'explicit' | 'intrinsic'
+    explicitLocator?: SessionLocator
   }> = []
 
-  const explicit = extractExplicitSessionLocator(content)
   if (explicit) {
-    locators.push(explicit)
+    locators.push({
+      locator: explicit,
+      locatorKind: 'explicit',
+      explicitLocator: explicit,
+    })
   }
 
-  locators.push(...extractIntrinsicSessionLocators(content))
-  return dedupeBy(locators, locatorIdentity)
+  locators.push(
+    ...extractIntrinsicSessionLocators(content).map((locator) => ({
+      locator,
+      locatorKind: 'intrinsic' as const,
+      explicitLocator: explicit,
+    })),
+  )
+
+  return dedupeBy(
+    locators,
+    (candidate) => `${candidate.locatorKind}:${locatorIdentity(candidate.locator)}:${candidate.explicitLocator ? locatorIdentity(candidate.explicitLocator) : ''}`,
+  )
 }
 
 function matchScore(
@@ -155,14 +182,34 @@ function matchScore(
   return 0
 }
 
+function candidateMatchScore(
+  candidate: SessionMatchCandidate,
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): number {
+  if (
+    candidate.locatorKind === 'intrinsic'
+    && candidate.explicitLocator?.serverInstanceId
+  ) {
+    if (target.serverInstanceId && candidate.explicitLocator.serverInstanceId !== target.serverInstanceId) {
+      return 0
+    }
+    if (!target.serverInstanceId && localServerInstanceId && candidate.explicitLocator.serverInstanceId !== localServerInstanceId) {
+      return 0
+    }
+  }
+
+  return matchScore(candidate.locator, target, localServerInstanceId)
+}
+
 function collectPaneSessionMatchCandidates(
   node: PaneNode,
   tabId: string,
   candidates: SessionMatchCandidate[],
 ): void {
   if (node.type === 'leaf') {
-    for (const locator of collectSessionLocatorsFromContent(node.content)) {
-      candidates.push({ tabId, paneId: node.id, locator })
+    for (const locator of buildSessionMatchLocators(node.content)) {
+      candidates.push({ tabId, paneId: node.id, ...locator })
     }
     return
   }
@@ -179,7 +226,7 @@ function selectBestSessionMatch(
   let bestScore = 0
 
   for (const candidate of candidates) {
-    const score = matchScore(candidate.locator, target, localServerInstanceId)
+    const score = candidateMatchScore(candidate, target, localServerInstanceId)
     if (score <= 0) continue
     if (score > bestScore) {
       bestCandidate = candidate
@@ -296,8 +343,8 @@ export function findTabIdForSession(
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (layout) {
-      for (const locator of collectSessionLocatorsFromNode(layout)) {
-        candidates.push({ tabId: tab.id, paneId: undefined, locator })
+      for (const locator of buildNodeSessionMatchLocators(layout)) {
+        candidates.push({ tabId: tab.id, paneId: undefined, ...locator })
       }
     }
   }
@@ -327,6 +374,24 @@ export function findPaneForSession(
 
   const bestMatch = selectBestSessionMatch(candidates, sanitizedTarget, localServerInstanceId)
   return bestMatch ? { tabId: bestMatch.tabId, paneId: bestMatch.paneId } : undefined
+}
+
+function buildNodeSessionMatchLocators(node: PaneNode): Array<{
+  locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
+}> {
+  if (node.type === 'leaf') {
+    return buildSessionMatchLocators(node.content)
+  }
+
+  return dedupeBy(
+    [
+      ...buildNodeSessionMatchLocators(node.children[0]),
+      ...buildNodeSessionMatchLocators(node.children[1]),
+    ],
+    (candidate) => `${candidate.locatorKind}:${locatorIdentity(candidate.locator)}:${candidate.explicitLocator ? locatorIdentity(candidate.explicitLocator) : ''}`,
+  )
 }
 
 /**

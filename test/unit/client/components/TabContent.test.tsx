@@ -230,7 +230,7 @@ describe('TabContent', () => {
       )
     })
 
-    it('keeps stale no-layout coding terminal tabs on restore bookkeeping with the tab createRequestId', () => {
+    it('drops stale terminalId from degraded no-layout coding restores while keeping the tab createRequestId', () => {
       const store = createStore([
         {
           id: 'tab-stale-terminal',
@@ -253,9 +253,9 @@ describe('TabContent', () => {
           defaultContent: expect.objectContaining({
             kind: 'terminal',
             mode: 'codex',
-            terminalId: 'term-stale',
             createRequestId: 'req-stale-terminal',
             resumeSessionId: 'codex-session-123',
+            status: 'creating',
           }),
         }),
         expect.anything(),

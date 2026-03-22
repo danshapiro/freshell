@@ -33,6 +33,7 @@ const terminalThemeMocks = vi.hoisted(() => ({
 const restoreMocks = vi.hoisted(() => ({
   consumeTerminalRestoreRequestId: vi.fn(() => false),
   addTerminalRestoreRequestId: vi.fn(),
+  hasTerminalRestoreRequestId: vi.fn(() => false),
 }))
 
 const runtimeMocks = vi.hoisted(() => ({
@@ -55,6 +56,7 @@ vi.mock('@/lib/terminal-themes', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   consumeTerminalRestoreRequestId: restoreMocks.consumeTerminalRestoreRequestId,
   addTerminalRestoreRequestId: restoreMocks.addTerminalRestoreRequestId,
+  hasTerminalRestoreRequestId: restoreMocks.hasTerminalRestoreRequestId,
 }))
 
 vi.mock('lucide-react', () => ({
@@ -241,6 +243,8 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({})
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    restoreMocks.hasTerminalRestoreRequestId.mockReset()
+    restoreMocks.hasTerminalRestoreRequestId.mockReturnValue(false)
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
@@ -1984,6 +1988,85 @@ describe('TerminalView lifecycle updates', () => {
     await waitFor(() => {
       const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
       expect(createCalls).toHaveLength(0)
+      expect(terminalInstances[0].writeln).toHaveBeenCalledWith(
+        expect.stringContaining('[Restore blocked: exact session identity missing]'),
+      )
+    })
+  })
+
+  it('waits for local identity before attaching a restored coding pane with a persisted terminalId, then blocks foreign ownership', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    restoreMocks.hasTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-restore-foreign-attach'
+    const paneId = 'pane-restore-foreign-attach'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-restore-foreign-attach',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-restore-foreign-attach',
+      resumeSessionId: 'codex-session-foreign',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-foreign',
+        serverInstanceId: 'srv-remote',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-restore-foreign-attach',
+            terminalId: 'term-restore-foreign-attach',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: undefined },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.attach')).toHaveLength(0)
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+    act(() => {
+      store.dispatch(setServerInstanceId('srv-local'))
+    })
+
+    await waitFor(() => {
+      const sent = wsMocks.send.mock.calls.map(([msg]) => msg)
+      expect(sent.filter((msg) => msg?.type === 'terminal.attach')).toHaveLength(0)
+      expect(sent.filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
       expect(terminalInstances[0].writeln).toHaveBeenCalledWith(
         expect.stringContaining('[Restore blocked: exact session identity missing]'),
       )

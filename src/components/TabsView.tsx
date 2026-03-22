@@ -352,7 +352,6 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const openRecordAsUnlinkedCopy = (record: RegistryTabRecord) => {
     const state = store.getState()
     const trustedLocalRecord = !!state.panes.layouts[record.tabId]
-      || !!state.tabRegistry.localClosed[record.tabKey]
     const tabId = nanoid()
     const paneSnapshots = record.panes || []
     const firstPane = paneSnapshots[0]
@@ -387,7 +386,6 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const openPaneInNewTab = (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
     const state = store.getState()
     const trustedLocalRecord = !!state.panes.layouts[record.tabId]
-      || !!state.tabRegistry.localClosed[record.tabKey]
     const tabId = nanoid()
     dispatch(addTab({
       id: tabId,

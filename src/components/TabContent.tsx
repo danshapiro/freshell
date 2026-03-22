@@ -49,7 +49,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   // Build default content based on setting
   let defaultContent: PaneContentInput
 
-  if (tab.terminalId) {
+  if (tab.terminalId && !isNoLayoutPtyCodingRestore) {
     defaultContent = {
       kind: 'terminal',
       mode: tab.mode,

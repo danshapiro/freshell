@@ -309,6 +309,43 @@ describe('findTabIdForSession', () => {
     )).toBe('tab-local')
   })
 
+  it('ignores mirrored fallback ownership on a foreign exact copy when choosing a local tab', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-foreign-copy',
+        tabs: [{ id: 'tab-foreign-copy' }, { id: 'tab-local' }],
+      },
+      panes: {
+        layouts: {
+          'tab-foreign-copy': leaf('pane-foreign-copy', {
+            kind: 'terminal',
+            mode: 'codex',
+            status: 'running',
+            createRequestId: 'req-foreign-copy',
+            resumeSessionId: 'shared',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'shared',
+              serverInstanceId: 'srv-remote',
+            },
+          }),
+          'tab-local': leaf('pane-local', terminalContent('codex', 'shared', {
+            provider: 'codex',
+            sessionId: 'shared',
+            serverInstanceId: 'srv-local',
+          })),
+        },
+        activePane: {},
+      },
+    } as unknown as RootState
+
+    expect(findTabIdForSession(
+      state,
+      { provider: 'codex', sessionId: 'shared' },
+      'srv-local',
+    )).toBe('tab-local')
+  })
+
   it('ignores a foreign copied tab when it is the only match for a local target', () => {
     const state = {
       tabs: {
@@ -322,6 +359,7 @@ describe('findTabIdForSession', () => {
             mode: 'codex',
             status: 'running',
             createRequestId: 'req-remote',
+            resumeSessionId: 'shared',
             sessionRef: {
               provider: 'codex',
               sessionId: 'shared',
@@ -494,6 +532,46 @@ describe('findPaneForSession', () => {
     })
   })
 
+  it('ignores mirrored fallback ownership on a foreign exact copy when choosing a local pane', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-foreign-copy',
+        tabs: [{ id: 'tab-foreign-copy' }, { id: 'tab-local' }],
+      },
+      panes: {
+        layouts: {
+          'tab-foreign-copy': leaf('pane-foreign-copy', {
+            kind: 'terminal',
+            mode: 'codex',
+            status: 'running',
+            createRequestId: 'req-foreign-copy',
+            resumeSessionId: 'shared',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'shared',
+              serverInstanceId: 'srv-remote',
+            },
+          }),
+          'tab-local': leaf('pane-local', terminalContent('codex', 'shared', {
+            provider: 'codex',
+            sessionId: 'shared',
+            serverInstanceId: 'srv-local',
+          })),
+        },
+        activePane: {},
+      },
+    } as unknown as RootState
+
+    expect(findPaneForSession(
+      state,
+      { provider: 'codex', sessionId: 'shared' },
+      'srv-local',
+    )).toEqual({
+      tabId: 'tab-local',
+      paneId: 'pane-local',
+    })
+  })
+
   it('returns tabId and paneId when session is in a leaf', () => {
     const state = {
       tabs: {
@@ -632,6 +710,38 @@ describe('findPaneForSession', () => {
       state,
       { provider: 'claude', sessionId: VALID_SESSION_ID },
       undefined
+    )).toBeUndefined()
+  })
+
+  it('ignores a foreign exact pane with mirrored compatibility metadata when it is the only candidate for a local target', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-remote',
+        tabs: [{ id: 'tab-remote' }],
+      },
+      panes: {
+        layouts: {
+          'tab-remote': leaf('pane-remote', {
+            kind: 'terminal',
+            mode: 'codex',
+            status: 'running',
+            createRequestId: 'req-remote',
+            resumeSessionId: 'shared',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'shared',
+              serverInstanceId: 'srv-remote',
+            },
+          }),
+        },
+        activePane: {},
+      },
+    } as unknown as RootState
+
+    expect(findPaneForSession(
+      state,
+      { provider: 'codex', sessionId: 'shared' },
+      'srv-local',
     )).toBeUndefined()
   })
 

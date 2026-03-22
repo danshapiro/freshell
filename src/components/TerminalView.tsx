@@ -23,7 +23,11 @@ import { getResumeTarget } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
-import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import {
+  consumeTerminalRestoreRequestId,
+  addTerminalRestoreRequestId,
+  hasTerminalRestoreRequestId,
+} from '@/lib/terminal-restore'
 import {
   clearPreReadyResumeAuthority,
   hasPreReadyResumeAuthority,
@@ -1396,7 +1400,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
   }, [suppressNetworkEffects, ws, applySeqState])
 
-  const createIdentityGateKey = terminalContent?.terminalId ? null : (localServerInstanceId ?? '__unknown__')
+  const needsRestoreIdentityGate = !!(
+    terminalContent?.terminalId
+    && terminalContent.mode !== 'shell'
+    && hasTerminalRestoreRequestId(terminalContent.createRequestId)
+  )
+  const createIdentityGateKey = (needsRestoreIdentityGate || !terminalContent?.terminalId)
+    ? (localServerInstanceId ?? '__unknown__')
+    : null
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -2029,6 +2040,23 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
 
       if (currentTerminalId) {
+        const restore = getRestoreFlag(createRequestId)
+        if (restore && mode !== 'shell') {
+          const restoreTarget = getResumeTarget({
+            restore: true,
+            mode,
+            sessionRef: contentRef.current?.sessionRef,
+            mirroredResumeSessionId: contentRef.current?.resumeSessionId,
+            localServerInstanceId,
+          })
+          if (restoreTarget.kind === 'wait') {
+            return
+          }
+          if (restoreTarget.kind === 'blocked') {
+            blockRestore()
+            return
+          }
+        }
         if (hiddenRef.current) {
           const deferred = deferredAttachStateRef.current
           if (deferred.mode === 'live' || (deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent)) {

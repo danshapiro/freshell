@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
-import tabRegistryReducer, { setTabRegistrySnapshot } from '../../../../src/store/tabRegistrySlice'
+import tabRegistryReducer, {
+  recordClosedTabSnapshot,
+  setTabRegistrySnapshot,
+} from '../../../../src/store/tabRegistrySlice'
 import connectionReducer, { setServerInstanceId } from '../../../../src/store/connectionSlice'
 import TabsView from '../../../../src/components/TabsView'
 
@@ -76,6 +79,7 @@ function createStore() {
 
 describe('TabsView', () => {
   beforeEach(() => {
+    cleanup()
     wsMock.sendTabsSyncQuery.mockClear()
   })
 
@@ -303,6 +307,59 @@ describe('TabsView', () => {
       provider: 'codex',
       sessionId: 'codex-session-foreign',
       serverInstanceId: 'srv-remote',
+    })
+  })
+
+  it('does not grant pre-ready resume authority to closed local records before the current server identity is known', () => {
+    const store = createStore()
+    const { deviceId, deviceLabel } = store.getState().tabRegistry
+
+    store.dispatch(recordClosedTabSnapshot({
+      tabKey: `${deviceId}:closed-local-old`,
+      tabId: 'closed-local-old',
+      serverInstanceId: 'srv-old-local',
+      deviceId,
+      deviceLabel,
+      tabName: 'closed local old server',
+      status: 'closed',
+      revision: 4,
+      createdAt: 4,
+      updatedAt: 5,
+      closedAt: 6,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [{
+        paneId: 'pane-closed-local-old',
+        kind: 'terminal',
+        payload: {
+          mode: 'codex',
+          resumeSessionId: 'codex-session-closed-local-old',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-closed-local-old',
+            serverInstanceId: 'srv-old-local',
+          },
+        },
+      }],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const card = screen.getByText(`${deviceLabel}: closed local old server`).closest('article')
+    expect(card).toBeTruthy()
+    fireEvent.click(within(card as HTMLElement).getByText('Open copy'))
+
+    const newTab = store.getState().tabs.tabs.find((tab) => tab.title === 'closed local old server')
+    const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
+    expect(layout?.content?.resumeSessionId).toBeUndefined()
+    expect(layout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-closed-local-old',
+      serverInstanceId: 'srv-old-local',
     })
   })
 })

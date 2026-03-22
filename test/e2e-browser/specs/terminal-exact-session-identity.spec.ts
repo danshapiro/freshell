@@ -178,8 +178,12 @@ test.describe('Terminal Exact Session Identity', () => {
 
     await page.waitForTimeout(500)
 
+    const attachMessages = (await harness.getSentWsMessages())
+      .filter((msg: any) => msg?.type === 'terminal.attach' && msg?.terminalId === 'stale-terminal-id')
+    expect(attachMessages).toHaveLength(0)
+
     const createMessages = (await harness.getSentWsMessages())
-      .filter((msg: any) => msg?.type === 'terminal.create')
+      .filter((msg: any) => msg?.type === 'terminal.create' && msg?.requestId === 'req-degraded')
     expect(createMessages).toHaveLength(0)
 
     const state = await harness.getState()
