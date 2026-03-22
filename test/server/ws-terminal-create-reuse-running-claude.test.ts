@@ -186,6 +186,7 @@ class FakeBuffer {
 class FakeRegistry {
   record: any
   attachCalls: Array<{ terminalId: string; opts?: { suppressOutput?: boolean } }> = []
+  createResumeSessionIdOverride: string | undefined
 
   constructor(terminalId: string) {
     this.record = {
@@ -244,6 +245,24 @@ class FakeRegistry {
   detach(_terminalId: string, ws: WebSocket) {
     this.record.clients.delete(ws)
     return true
+  }
+
+  create(opts: any) {
+    const terminalId = 'term-created'
+    this.record = {
+      terminalId,
+      createdAt: Date.now(),
+      buffer: new FakeBuffer(),
+      title: 'Claude',
+      mode: 'claude',
+      shell: 'system',
+      status: 'running',
+      cols: 80,
+      rows: 24,
+      resumeSessionId: this.createResumeSessionIdOverride ?? opts.resumeSessionId,
+      clients: new Set<WebSocket>(),
+    }
+    return this.record
   }
 
   list() {
@@ -447,6 +466,32 @@ describe('terminal.create reuse running claude terminal', () => {
       }))
       const ready = await attachReadyPromise
       expect(ready.terminalId).toBe(created.terminalId)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('returns the exact fresh claude session id allocated during create', async () => {
+    registry.record.resumeSessionId = undefined
+    registry.createResumeSessionIdOverride = VALID_SESSION_ID
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'fresh-claude-session-id'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+      }))
+
+      const created = await createdPromise
+      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(created.terminalId).toBe('term-created')
     } finally {
       await closeWebSocket(ws)
     }

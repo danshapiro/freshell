@@ -533,6 +533,7 @@ export class CodingCliSessionIndexer {
     const baseSession: CodingCliSession = {
       provider: provider.name,
       sessionId,
+      launchOrigin: meta.launchOrigin,
       projectPath,
       lastActivityAt,
       createdAt,

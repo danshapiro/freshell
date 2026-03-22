@@ -471,6 +471,66 @@ describe('CodingCliSessionIndexer', () => {
     expect(sessionId).toBe('canonical-id')
   })
 
+  it('carries codex launchOrigin from shell snapshots through the indexer', async () => {
+    const codexHome = path.join(tempDir, '.codex')
+    const sessionsDir = path.join(codexHome, 'sessions', '2026', '03', '21')
+    const shellSnapshotsDir = path.join(codexHome, 'shell_snapshots')
+    const filePath = path.join(sessionsDir, 'codex-session-origin.jsonl')
+    await fsp.mkdir(sessionsDir, { recursive: true })
+    await fsp.mkdir(shellSnapshotsDir, { recursive: true })
+    await fsp.writeFile(
+      filePath,
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'codex-session-origin',
+          cwd: '/project/a',
+        },
+        timestamp: '2026-03-21T10:00:00.000Z',
+      }) + '\n',
+    )
+    await fsp.writeFile(
+      path.join(shellSnapshotsDir, 'codex-session-origin.sh'),
+      [
+        'export FRESHELL_TERMINAL_ID="term-2"',
+        'export FRESHELL_TAB_ID="tab-2"',
+        'export FRESHELL_PANE_ID="pane-2"',
+      ].join('\n'),
+    )
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider: CodingCliProvider = {
+      ...codexProvider,
+      homeDir: codexHome,
+      getSessionGlob: () => path.join(codexHome, 'sessions', '**', '*.jsonl'),
+      getSessionRoots: () => [path.join(codexHome, 'sessions')],
+      listSessionFiles: async () => [filePath],
+      resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    expect(indexer.getProjects()[0]?.sessions[0]).toMatchObject({
+      provider: 'codex',
+      sessionId: 'codex-session-origin',
+      launchOrigin: {
+        terminalId: 'term-2',
+        tabId: 'tab-2',
+        paneId: 'pane-2',
+      },
+    })
+  })
+
   it('treats provider + sessionId as the uniqueness key when detecting new sessions', () => {
     const sessionId = 'shared-session-id'
     const indexer = new CodingCliSessionIndexer([])

@@ -49,6 +49,7 @@ import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
+import { DiscoveredSessionAssociation } from './discovered-session-association.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
@@ -325,6 +326,7 @@ async function main() {
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+  const discoveredSessionAssociation = new DiscoveredSessionAssociation(registry)
 
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
@@ -510,11 +512,41 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
-    const nonClaudeProjects = projects.map((project) => ({
+    const codexProjects = projects.map((project) => ({
       ...project,
-      sessions: project.sessions.filter((session) => session.provider !== 'claude'),
+      sessions: project.sessions.filter((session) => session.provider === 'codex'),
     }))
-    for (const session of associationCoordinator.collectNewOrAdvanced(nonClaudeProjects)) {
+    for (const session of discoveredSessionAssociation.collectNewOrAdvanced(codexProjects)) {
+      const result = discoveredSessionAssociation.associateSingleSession(session)
+      if (!result.associated || !result.terminalId) continue
+      log.info({
+        event: 'session_bind_applied',
+        terminalId: result.terminalId,
+        sessionId: session.sessionId,
+        provider: session.provider,
+      }, 'session_bind_applied')
+      try {
+        wsHandler.broadcast({
+          type: 'terminal.session.associated' as const,
+          terminalId: result.terminalId,
+          sessionId: session.sessionId,
+        })
+        const metaUpsert = terminalMetadata.associateSession(
+          result.terminalId,
+          session.provider,
+          session.sessionId,
+        )
+        if (metaUpsert) associationMetaUpserts.push(metaUpsert)
+      } catch (err) {
+        log.warn({ err, terminalId: result.terminalId }, 'Failed to broadcast session association')
+      }
+    }
+
+    const compatibilityProjects = projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.filter((session) => session.provider !== 'claude' && session.provider !== 'codex'),
+    }))
+    for (const session of associationCoordinator.collectNewOrAdvanced(compatibilityProjects)) {
       const result = associationCoordinator.associateSingleSession(session)
       if (!result.associated || !result.terminalId) continue
       log.info({

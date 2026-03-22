@@ -1,14 +1,16 @@
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from './coding-cli/types.js'
-import { modeSupportsResume, type BindSessionResult } from './terminal-registry.js'
+import type { BindSessionResult } from './terminal-registry.js'
 import type { SessionBindingReason } from './terminal-stream/registry-events.js'
 
 type TerminalAssociationCandidate = {
   terminalId: string
-  createdAt: number
+  mode: string
+  status: 'running' | 'exited'
+  resumeSessionId?: string
 }
 
 type AssociationRegistry = {
-  findUnassociatedTerminals: (mode: CodingCliSession['provider'], cwd: string) => TerminalAssociationCandidate[]
+  get: (terminalId: string) => TerminalAssociationCandidate | null | undefined
   bindSession: (
     terminalId: string,
     provider: CodingCliSession['provider'],
@@ -18,18 +20,15 @@ type AssociationRegistry = {
   isSessionBound: (provider: CodingCliSession['provider'], sessionId: string) => boolean
 }
 
-export type SessionAssociationResult = {
+export type DiscoveredSessionAssociationResult = {
   associated: boolean
   terminalId?: string
 }
 
-export class SessionAssociationCoordinator {
+export class DiscoveredSessionAssociation {
   private watermarks = new Map<string, number>()
 
-  constructor(
-    private readonly registry: AssociationRegistry,
-    private readonly maxAssociationAgeMs: number,
-  ) {}
+  constructor(private readonly registry: AssociationRegistry) {}
 
   collectNewOrAdvanced(projects: ProjectGroup[]): CodingCliSession[] {
     const candidates: CodingCliSession[] = []
@@ -43,31 +42,28 @@ export class SessionAssociationCoordinator {
     return candidates
   }
 
-  noteSession(session: CodingCliSession): boolean {
-    if (!this.isAssociationCandidate(session)) return false
-    return this.trackIfAdvanced(session)
-  }
-
-  associateSingleSession(session: CodingCliSession): SessionAssociationResult {
+  associateSingleSession(session: CodingCliSession): DiscoveredSessionAssociationResult {
     if (!this.isAssociationCandidate(session)) return { associated: false }
     if (this.registry.isSessionBound(session.provider, session.sessionId)) return { associated: false }
-    const cwd = session.cwd!
-    const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
-    if (unassociated.length === 0) return { associated: false }
 
-    const term = unassociated.find((candidate) => session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs)
-    if (!term) return { associated: false }
+    const terminalId = session.launchOrigin?.terminalId
+    if (!terminalId) return { associated: false }
 
-    const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId, 'association')
+    const terminal = this.registry.get(terminalId)
+    if (!terminal || terminal.mode !== session.provider || terminal.status !== 'running') {
+      return { associated: false }
+    }
+    if (terminal.resumeSessionId && terminal.resumeSessionId !== session.sessionId) {
+      return { associated: false }
+    }
+
+    const bound = this.registry.bindSession(terminalId, session.provider, session.sessionId, 'association')
     if (!bound.ok) return { associated: false }
-
-    return { associated: true, terminalId: term.terminalId }
+    return { associated: true, terminalId }
   }
 
   private isAssociationCandidate(session: CodingCliSession): boolean {
-    if (session.provider === 'codex') return false
-    if (!modeSupportsResume(session.provider)) return false
-    if (!session.cwd) return false
+    if (session.provider !== 'codex') return false
     if (session.isSubagent) return false
     if (session.isNonInteractive) return false
     return true

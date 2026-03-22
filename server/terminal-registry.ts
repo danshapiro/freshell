@@ -6,6 +6,7 @@ import os from 'os'
 import path from 'path'
 import fs from 'fs'
 import { EventEmitter } from 'events'
+import { randomUUID } from 'crypto'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { ServerSettings } from '../shared/settings.js'
@@ -46,6 +47,7 @@ export type CodingCliCommandSpec = {
   defaultCommand: string
   args?: string[]
   env?: Record<string, string>
+  launchArgs?: (sessionId: string) => string[]
   resumeArgs?: (sessionId: string) => string[]
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
@@ -59,6 +61,7 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     label: 'Claude CLI',
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
+    launchArgs: (sessionId: string) => ['--session-id', sessionId],
     resumeArgs: (sessionId: string) => ['--resume', sessionId],
     permissionModeArgs: (permissionMode: string) => ['--permission-mode', permissionMode],
   }],
@@ -239,7 +242,13 @@ type ProviderSettings = {
   sandbox?: string
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings) {
+function resolveCodingCliCommand(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+  launchSessionId?: string,
+  target: ProviderTarget = 'unix',
+  providerSettings?: ProviderSettings,
+) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
   if (!spec) return null
@@ -250,12 +259,18 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   if (mode === 'opencode') {
     Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
   }
-  let resumeArgs: string[] = []
+  let sessionArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
-      resumeArgs = spec.resumeArgs(resumeSessionId)
+      sessionArgs = spec.resumeArgs(resumeSessionId)
     } else {
       logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
+    }
+  } else if (launchSessionId) {
+    if (spec.launchArgs) {
+      sessionArgs = spec.launchArgs(launchSessionId)
+    } else {
+      logger.warn({ mode, launchSessionId }, 'Launch session requested but no launch args configured')
     }
   }
   const settingsArgs: string[] = []
@@ -288,7 +303,7 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   }
   return {
     command,
-    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
+    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...sessionArgs],
     env: commandEnv,
     label: spec.label,
   }
@@ -714,6 +729,7 @@ export function buildSpawnSpec(
   resumeSessionId?: string,
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
+  launchSessionId?: string,
 ) {
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
@@ -793,7 +809,7 @@ export function buildSpawnSpec(
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
@@ -830,7 +846,7 @@ export function buildSpawnSpec(
         }
         return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
@@ -861,7 +877,7 @@ export function buildSpawnSpec(
       return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -881,7 +897,7 @@ export function buildSpawnSpec(
     return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
+  const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
@@ -1080,6 +1096,9 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
+    const launchSessionId = opts.mode === 'claude' && !resumeForSpawn
+      ? randomUUID()
+      : undefined
 
     const port = Number(process.env.PORT || 3001)
     const baseEnv = {
@@ -1098,6 +1117,7 @@ export class TerminalRegistry extends EventEmitter {
       resumeForSpawn,
       opts.providerSettings,
       baseEnv,
+      launchSessionId,
     )
 
     const endSpawnTimer = startPerfTimer(
@@ -1244,11 +1264,17 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
-    if (modeSupportsResume(opts.mode) && resumeForBinding) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, resumeForBinding, 'resume')
+    const exactSessionId = launchSessionId ?? resumeForBinding
+    if (modeSupportsResume(opts.mode) && exactSessionId) {
+      const bound = this.bindSession(
+        terminalId,
+        opts.mode as CodingCliProviderName,
+        exactSessionId,
+        launchSessionId ? 'launch' : 'resume',
+      )
       if (!bound.ok) {
         logger.warn(
-          { terminalId, mode: opts.mode, sessionId: resumeForBinding, reason: bound.reason },
+          { terminalId, mode: opts.mode, sessionId: exactSessionId, reason: bound.reason },
           'Failed to bind resume session during terminal create',
         )
       }

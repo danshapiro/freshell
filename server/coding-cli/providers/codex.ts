@@ -5,6 +5,7 @@ import { extractTitleFromMessage } from '../../title-utils.js'
 import type { CodingCliProvider } from '../provider.js'
 import { normalizeFirstUserMessage, type CodexTaskEventSnapshot, type NormalizedEvent, type ParsedSessionMeta, type TokenPayload, type TokenSummary } from '../types.js'
 import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
+import { readCodexShellSnapshotLaunchOrigin } from '../codex-shell-snapshot.js'
 
 const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
 // Codex `model_context_window` is reduced by `effective_context_window_percent` (default 95%).
@@ -463,8 +464,14 @@ export const codexProvider: CodingCliProvider = {
     return walkJsonlFiles(sessionsDir)
   },
 
-  async parseSessionFile(content: string, _filePath: string) {
-    return parseCodexSessionContent(content)
+  async parseSessionFile(content: string, filePath: string) {
+    const meta = parseCodexSessionContent(content)
+    const sessionId = meta.sessionId || extractSessionIdFromFilename(filePath)
+    const launchOrigin = await readCodexShellSnapshotLaunchOrigin(
+      path.join(this.homeDir, 'shell_snapshots'),
+      sessionId,
+    )
+    return launchOrigin ? { ...meta, launchOrigin } : meta
   },
 
   async resolveProjectPath(_filePath: string, meta: ParsedSessionMeta): Promise<string> {

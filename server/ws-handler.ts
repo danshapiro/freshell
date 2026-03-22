@@ -1367,7 +1367,7 @@ export class WsHandler {
                 requestId: m.requestId,
                 terminalId: record.terminalId,
                 createdAt: record.createdAt,
-                effectiveResumeSessionId,
+                effectiveResumeSessionId: record.resumeSessionId ?? effectiveResumeSessionId,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for
