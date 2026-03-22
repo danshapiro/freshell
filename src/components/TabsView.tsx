@@ -16,7 +16,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
-import { addPane, initLayout } from '@/store/panesSlice'
+import { addPane, initLayout, updatePaneTitle } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
@@ -362,6 +362,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
       })
       : { kind: 'terminal', mode: 'shell' } as const
     const nextTitle = record.tabName
+    const firstPaneTitle = firstPane?.title?.trim() || undefined
+    const initialPaneTitle = firstPaneTitle ?? (paneSnapshots.length <= 1 ? nextTitle : undefined)
     dispatch(addTab({
       id: tabId,
       title: nextTitle,
@@ -372,8 +374,12 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(initLayout({
       tabId,
       content: firstContent,
-      title: nextTitle,
-      titleSource: 'stable',
+      ...(initialPaneTitle
+        ? {
+            title: initialPaneTitle,
+            titleSource: 'stable' as const,
+          }
+        : {}),
     }))
     for (const pane of paneSnapshots.slice(1)) {
       dispatch(addPane({
@@ -383,6 +389,15 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
           trustedLocalRecord,
         }),
       }))
+      const newPaneId = store.getState().panes.activePane[tabId]
+      if (newPaneId && pane.title?.trim()) {
+        dispatch(updatePaneTitle({
+          tabId,
+          paneId: newPaneId,
+          title: pane.title.trim(),
+          source: 'stable',
+        }))
+      }
     }
     onOpenTab?.()
   }

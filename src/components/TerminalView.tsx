@@ -54,6 +54,7 @@ import {
   normalizeRuntimeTitle,
   resolveEffectiveLegacyTabTitleSource,
   shouldDecorateExitTitle,
+  type DurableTitleSource,
 } from '@/lib/title-source'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
@@ -1975,7 +1976,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const exitTab = tabRef.current
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
-            const updates: { terminalId: undefined; status: 'exited'; title?: string } = { terminalId: undefined, status: 'exited' }
+            const updates: {
+              terminalId: undefined
+              status: 'exited'
+              title?: string
+              source?: DurableTitleSource
+            } = { terminalId: undefined, status: 'exited' }
             const exitTitleSource = resolveTabTitleSourceForLifecycle({
               tab: exitTab,
               layout: tabLayoutRef.current,
@@ -1992,6 +1998,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
                 extensionEntriesRef.current,
               )
               updates.title = exitBaseTitle + (code !== undefined ? ` (exit ${code})` : '')
+              updates.source = 'derived'
             }
             dispatch(updateTab({ id: exitTab.id, updates }))
           }

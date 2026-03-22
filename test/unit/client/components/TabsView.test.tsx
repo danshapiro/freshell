@@ -23,6 +23,12 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMock,
 }))
 
+function collectLeaves(node: any): any[] {
+  if (!node) return []
+  if (node.type === 'leaf') return [node]
+  return [...collectLeaves(node.children?.[0]), ...collectLeaves(node.children?.[1])]
+}
+
 function createStore() {
   const store = configureStore({
     reducer: {
@@ -117,11 +123,12 @@ describe('TabsView', () => {
         revision: 2,
         createdAt: 2,
         updatedAt: 3,
-        paneCount: 1,
+        paneCount: 2,
         titleSetByUser: false,
         panes: [{
           paneId: 'pane-remote',
           kind: 'terminal',
+          title: 'Alpha Session',
           payload: {
             mode: 'codex',
             resumeSessionId: 'codex-session-123',
@@ -130,6 +137,15 @@ describe('TabsView', () => {
               sessionId: 'codex-session-123',
               serverInstanceId: 'srv-remote',
             },
+          },
+        }, {
+          paneId: 'pane-remote-2',
+          kind: 'terminal',
+          title: 'Beta Session',
+          payload: {
+            mode: 'shell',
+            shell: 'system',
+            initialCwd: '/tmp/project',
           },
         }],
       }],
@@ -152,12 +168,17 @@ describe('TabsView', () => {
     expect(newTab).toBeTruthy()
     expect(newTab?.titleSource).toBe('stable')
     const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
-    expect(layout?.content?.resumeSessionId).toBeUndefined()
-    expect(layout?.content?.sessionRef).toEqual({
+    const copiedLeaves = collectLeaves(layout)
+    expect(copiedLeaves[0]?.content?.resumeSessionId).toBeUndefined()
+    expect(copiedLeaves[0]?.content?.sessionRef).toEqual({
       provider: 'codex',
       sessionId: 'codex-session-123',
       serverInstanceId: 'srv-remote',
     })
+    const copiedPaneTitles = Object.values(store.getState().panes.paneTitles[newTab!.id] ?? {})
+    expect(copiedPaneTitles).toEqual(expect.arrayContaining(['Alpha Session', 'Beta Session']))
+    const copiedPaneSources = Object.values(store.getState().panes.paneTitleSources?.[newTab!.id] ?? {})
+    expect(copiedPaneSources).toEqual(expect.arrayContaining(['stable', 'stable']))
   })
 
   it('does not fabricate an exact sessionRef from a named claude resume when reopening on the same server', () => {
