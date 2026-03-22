@@ -89,6 +89,44 @@ describe('DiscoveredSessionAssociation', () => {
     expect(registry.bindSession).toHaveBeenCalledTimes(1)
   })
 
+  it('treats newly discovered launch provenance as advanced even when lastActivityAt is unchanged', () => {
+    const registry = {
+      get: vi.fn((terminalId: string) => (
+        terminalId === 'term-2'
+          ? { terminalId: 'term-2', mode: 'codex', status: 'running' }
+          : null
+      )),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const association = new DiscoveredSessionAssociation(registry as any)
+
+    const firstPass = association.collectNewOrAdvanced([{
+      projectPath: '/repo/project',
+      sessions: [createCodexSession({ lastActivityAt: 10_000 })],
+    }])
+    expect(firstPass).toHaveLength(1)
+    expect(association.associateSingleSession(firstPass[0]!)).toEqual({ associated: false })
+
+    const secondPass = association.collectNewOrAdvanced([{
+      projectPath: '/repo/project',
+      sessions: [createCodexSession({
+        lastActivityAt: 10_000,
+        launchOrigin: {
+          terminalId: 'term-2',
+          tabId: 'tab-2',
+          paneId: 'pane-2',
+        },
+      })],
+    }])
+    expect(secondPass).toHaveLength(1)
+    expect(association.associateSingleSession(secondPass[0]!)).toEqual({
+      associated: true,
+      terminalId: 'term-2',
+    })
+    expect(registry.bindSession).toHaveBeenCalledTimes(1)
+  })
+
   it('does not rebind codex sessions on repeated non-advanced updates after exact binding', () => {
     const registry = {
       get: vi.fn(() => ({ terminalId: 'term-2', mode: 'codex', status: 'running' })),

@@ -143,6 +143,72 @@ describe('TerminalView resumeSessionId', () => {
     })
   })
 
+  it('does not resume from a foreign exact sessionRef during non-restore create', async () => {
+    const tabId = 'tab-foreign'
+    const paneId = 'pane-foreign'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-foreign',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-foreign',
+        serverInstanceId: 'srv-remote',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-foreign',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    let createMessage: Record<string, unknown> | undefined
+    await waitFor(() => {
+      createMessage = wsMocks.send.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .find((msg) => msg?.type === 'terminal.create' && msg?.requestId === 'req-foreign')
+      expect(createMessage).toBeTruthy()
+    })
+
+    expect(createMessage?.resumeSessionId).toBeUndefined()
+  })
+
   it('updates pane resumeSessionId from effectiveResumeSessionId', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'

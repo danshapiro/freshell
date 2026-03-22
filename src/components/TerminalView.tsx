@@ -1905,6 +1905,42 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
+            // Preserve the restore flag so the re-creation bypasses rate limiting.
+            // The original createRequestId's flag was never consumed (we went
+            // through attach, not sendCreate), so check the old ID first.
+            const wasRestore = consumeTerminalRestoreRequestId(requestIdRef.current)
+            if (wasRestore) {
+              const restoreTarget = getResumeTarget({
+                restore: true,
+                mode: current?.mode ?? 'shell',
+                sessionRef: current?.sessionRef,
+                mirroredResumeSessionId: current?.resumeSessionId,
+                localServerInstanceId,
+              })
+              if (restoreTarget.kind === 'blocked') {
+                blockRestore()
+                return
+              }
+              if (restoreTarget.kind === 'wait') {
+                addTerminalRestoreRequestId(requestIdRef.current)
+                clearTerminalCursor(currentTerminalId)
+                forgetSentViewport(currentTerminalId)
+                lastSentViewportRef.current = null
+                terminalIdRef.current = undefined
+                deferredAttachStateRef.current = {
+                  mode: 'none',
+                  pendingIntent: null,
+                  pendingSinceSeq: 0,
+                }
+                applySeqState(createAttachSeqState())
+                updateContent({ terminalId: undefined, status: 'creating' })
+                const currentTab = tabRef.current
+                if (currentTab) {
+                  dispatch(updateTab({ id: currentTab.id, updates: { terminalId: undefined, status: 'creating' } }))
+                }
+                return
+              }
+            }
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
@@ -1913,10 +1949,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               newRequestId,
               resumeSessionId: current?.resumeSessionId,
             })
-            // Preserve the restore flag so the re-creation bypasses rate limiting.
-            // The original createRequestId's flag was never consumed (we went
-            // through attach, not sendCreate), so check the old ID first.
-            const wasRestore = consumeTerminalRestoreRequestId(requestIdRef.current)
             if (wasRestore) {
               addTerminalRestoreRequestId(newRequestId)
             }

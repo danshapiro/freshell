@@ -31,7 +31,6 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   const resumeSessionType = tab ? getTabResumeSessionType(tab) : undefined
   const isNoLayoutPtyCodingRestore = !layout
     && tab?.mode !== 'shell'
-    && !tab?.terminalId
     && !tab?.codingCliSessionId
     && !getAgentChatProviderConfig(resumeSessionType || '')
 
@@ -55,6 +54,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       kind: 'terminal',
       mode: tab.mode,
       shell: tab.shell,
+      ...(isNoLayoutPtyCodingRestore ? { createRequestId: tab.createRequestId } : {}),
       resumeSessionId: tab.resumeSessionId,
       initialCwd: tab.initialCwd,
       terminalId: tab.terminalId,

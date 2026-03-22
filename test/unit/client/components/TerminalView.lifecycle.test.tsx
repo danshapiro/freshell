@@ -328,7 +328,7 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({ isDark: false })
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
 
-    render(
+    const { rerender } = render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
       </Provider>
@@ -359,7 +359,7 @@ describe('TerminalView lifecycle updates', () => {
 
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
 
-    render(
+    const { rerender } = render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
       </Provider>
@@ -376,7 +376,7 @@ describe('TerminalView lifecycle updates', () => {
     installPerfAuditBridge(bridge)
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
 
-    render(
+    const { rerender } = render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
       </Provider>
@@ -415,7 +415,7 @@ describe('TerminalView lifecycle updates', () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({ isDark: true })
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
 
-    render(
+    const { rerender } = render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
       </Provider>
@@ -1982,6 +1982,86 @@ describe('TerminalView lifecycle updates', () => {
     )
 
     await waitFor(() => {
+      const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
+      expect(createCalls).toHaveLength(0)
+      expect(terminalInstances[0].writeln).toHaveBeenCalledWith(
+        expect.stringContaining('[Restore blocked: exact session identity missing]'),
+      )
+    })
+  })
+
+  it('blocks stale no-layout coding terminal reattach after INVALID_TERMINAL_ID instead of recreating from mirrored resume metadata', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-stale-no-layout'
+    const paneId = 'pane-stale-no-layout'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-stale-no-layout',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-stale-no-layout',
+      resumeSessionId: 'codex-session-123',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId: 'term-stale-no-layout',
+            resumeSessionId: 'codex-session-123',
+            createRequestId: 'req-stale-no-layout',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+
+    messageHandler!({
+      type: 'error',
+      code: 'INVALID_TERMINAL_ID',
+      message: 'Unknown terminalId',
+      terminalId: 'term-stale-no-layout',
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+      expect(layout.content.terminalId).toBeUndefined()
+      expect(layout.content.createRequestId).toBe('req-stale-no-layout')
       const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
       expect(createCalls).toHaveLength(0)
       expect(terminalInstances[0].writeln).toHaveBeenCalledWith(

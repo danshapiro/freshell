@@ -156,6 +156,7 @@ test.describe('Terminal Exact Session Identity', () => {
             status: 'creating',
             mode: 'codex',
             shell: 'system',
+            terminalId: 'stale-terminal-id',
             resumeSessionId: 'legacy-codex-session',
             createdAt: Date.now(),
           }],

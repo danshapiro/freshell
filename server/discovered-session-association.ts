@@ -25,8 +25,13 @@ export type DiscoveredSessionAssociationResult = {
   terminalId?: string
 }
 
+type SessionWatermark = {
+  lastActivityAt: number
+  launchOriginKey?: string
+}
+
 export class DiscoveredSessionAssociation {
-  private watermarks = new Map<string, number>()
+  private watermarks = new Map<string, SessionWatermark>()
 
   constructor(private readonly registry: AssociationRegistry) {}
 
@@ -71,11 +76,26 @@ export class DiscoveredSessionAssociation {
 
   private trackIfAdvanced(session: CodingCliSession): boolean {
     const key = makeSessionKey(session.provider, session.sessionId)
-    const next = this.normalizeLastActivityAt(session.lastActivityAt)
+    const nextLastActivityAt = this.normalizeLastActivityAt(session.lastActivityAt)
+    const nextLaunchOriginKey = this.getLaunchOriginKey(session)
     const prev = this.watermarks.get(key)
-    if (prev !== undefined && next <= prev) return false
-    this.watermarks.set(key, next)
+    const launchOriginAdvanced = !!nextLaunchOriginKey && nextLaunchOriginKey !== prev?.launchOriginKey
+    if (prev !== undefined && nextLastActivityAt <= prev.lastActivityAt && !launchOriginAdvanced) {
+      return false
+    }
+    this.watermarks.set(key, {
+      lastActivityAt: Math.max(prev?.lastActivityAt ?? 0, nextLastActivityAt),
+      launchOriginKey: nextLaunchOriginKey ?? prev?.launchOriginKey,
+    })
     return true
+  }
+
+  private getLaunchOriginKey(session: CodingCliSession): string | undefined {
+    const terminalId = session.launchOrigin?.terminalId?.trim()
+    if (!terminalId) return undefined
+    const tabId = session.launchOrigin?.tabId?.trim() ?? ''
+    const paneId = session.launchOrigin?.paneId?.trim() ?? ''
+    return `${terminalId}:${tabId}:${paneId}`
   }
 
   private normalizeLastActivityAt(value: number): number {

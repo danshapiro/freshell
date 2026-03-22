@@ -5,6 +5,7 @@ import { makeSessionKey, type CodingCliSession } from '../../server/coding-cli/t
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { DiscoveredSessionAssociation } from '../../server/discovered-session-association'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
+import { splitAssociationProjectsForUpdate } from '../../server/session-association-routing'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -768,10 +769,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     const compatibility = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
     return (projects: { projectPath: string; sessions: CodingCliSession[] }[]) => {
-      const codexProjects = projects.map((project) => ({
-        ...project,
-        sessions: project.sessions.filter((session) => session.provider === 'codex'),
-      }))
+      const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects)
       for (const session of discovered.collectNewOrAdvanced(codexProjects)) {
         const result = discovered.associateSingleSession(session)
         if (!result.associated || !result.terminalId) continue
@@ -782,10 +780,6 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         })
       }
 
-      const compatibilityProjects = projects.map((project) => ({
-        ...project,
-        sessions: project.sessions.filter((session) => session.provider !== 'claude' && session.provider !== 'codex'),
-      }))
       for (const session of compatibility.collectNewOrAdvanced(compatibilityProjects)) {
         const result = compatibility.associateSingleSession(session)
         if (!result.associated || !result.terminalId) continue
@@ -1011,7 +1005,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('does not route claude sessions through the onUpdate compatibility flow', () => {
+  it('keeps named claude resumes on the onUpdate compatibility flow', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
     const associateOnUpdate = createOnUpdateAssociator(registry, broadcasts)
@@ -1029,8 +1023,13 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
       }],
     }])
 
-    expect(broadcasts).toHaveLength(0)
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0]).toEqual({
+      type: 'terminal.session.associated',
+      terminalId: term.terminalId,
+      sessionId: SESSION_ID_ONE,
+    })
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
     expect(registry.get(term.terminalId)?.pendingResumeName).toBe('137 tour')
 
     registry.shutdown()

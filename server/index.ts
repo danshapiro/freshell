@@ -50,6 +50,7 @@ import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { DiscoveredSessionAssociation } from './discovered-session-association.js'
+import { splitAssociationProjectsForUpdate } from './session-association-routing.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
@@ -512,10 +513,7 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
-    const codexProjects = projects.map((project) => ({
-      ...project,
-      sessions: project.sessions.filter((session) => session.provider === 'codex'),
-    }))
+    const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects)
     for (const session of discoveredSessionAssociation.collectNewOrAdvanced(codexProjects)) {
       const result = discoveredSessionAssociation.associateSingleSession(session)
       if (!result.associated || !result.terminalId) continue
@@ -542,10 +540,6 @@ async function main() {
       }
     }
 
-    const compatibilityProjects = projects.map((project) => ({
-      ...project,
-      sessions: project.sessions.filter((session) => session.provider !== 'claude' && session.provider !== 'codex'),
-    }))
     for (const session of associationCoordinator.collectNewOrAdvanced(compatibilityProjects)) {
       const result = associationCoordinator.associateSingleSession(session)
       if (!result.associated || !result.terminalId) continue

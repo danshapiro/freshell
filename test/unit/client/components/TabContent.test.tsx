@@ -229,6 +229,38 @@ describe('TabContent', () => {
         expect.anything(),
       )
     })
+
+    it('keeps stale no-layout coding terminal tabs on restore bookkeeping with the tab createRequestId', () => {
+      const store = createStore([
+        {
+          id: 'tab-stale-terminal',
+          mode: 'codex',
+          terminalId: 'term-stale',
+          resumeSessionId: 'codex-session-123',
+          createRequestId: 'req-stale-terminal',
+        },
+      ])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-stale-terminal" />
+        </Provider>
+      )
+
+      expect(addTerminalRestoreRequestId).toHaveBeenCalledWith('req-stale-terminal')
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'terminal',
+            mode: 'codex',
+            terminalId: 'term-stale',
+            createRequestId: 'req-stale-terminal',
+            resumeSessionId: 'codex-session-123',
+          }),
+        }),
+        expect.anything(),
+      )
+    })
   })
 
   describe('hidden prop propagation', () => {
