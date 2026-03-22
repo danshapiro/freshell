@@ -22,4 +22,18 @@ describe('terminal-restore', () => {
     // Consumed — second call returns false
     expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(false)
   })
+
+  it('hasTerminalRestoreRequestId observes restore bookkeeping without consuming it', async () => {
+    const {
+      addTerminalRestoreRequestId,
+      hasTerminalRestoreRequestId,
+      consumeTerminalRestoreRequestId,
+    } = await import('@/lib/terminal-restore')
+
+    addTerminalRestoreRequestId('live-attach-id')
+    expect(hasTerminalRestoreRequestId('live-attach-id')).toBe(true)
+    expect(hasTerminalRestoreRequestId('live-attach-id')).toBe(true)
+    expect(consumeTerminalRestoreRequestId('live-attach-id')).toBe(true)
+    expect(hasTerminalRestoreRequestId('live-attach-id')).toBe(false)
+  })
 })

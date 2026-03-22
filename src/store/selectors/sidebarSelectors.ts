@@ -92,6 +92,20 @@ export function buildSessionItems(
     }
   }
 
+  for (const tab of tabs || []) {
+    if (panes.layouts?.[tab.id]) continue
+    const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    const sessionId = tab.resumeSessionId
+    if (!provider || !sessionId) continue
+
+    const key = `${provider}:${sessionId}`
+    if (!tabSessionMap.has(key)) {
+      // No-layout coding tabs remain sidebar presentation hints, even though
+      // they no longer participate in authoritative restore or lookup.
+      tabSessionMap.set(key, { hasTab: true })
+    }
+  }
+
   for (const project of projects || []) {
     for (const session of project.sessions || []) {
       const provider = session.provider || 'claude'

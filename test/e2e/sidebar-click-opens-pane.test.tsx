@@ -75,6 +75,9 @@ function createStore(options: {
     createdAt?: number
     createRequestId?: string
     shell?: string
+    resumeSessionId?: string
+    codingCliProvider?: string
+    terminalId?: string
   }>
   activeTabId?: string | null
   panes?: {
@@ -171,6 +174,9 @@ function createStore(options: {
           createdAt: t.createdAt || Date.now(),
           createRequestId: t.createRequestId || `req-${t.id}`,
           shell: t.shell || 'system',
+          resumeSessionId: t.resumeSessionId,
+          codingCliProvider: t.codingCliProvider,
+          terminalId: t.terminalId,
         })) ?? [],
         activeTabId: options.activeTabId ?? null,
       },
@@ -438,6 +444,80 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.activePane['tab-2']).toBe('pane-2')
     // Layout should be unchanged (still a leaf, no split)
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
+  })
+
+  it('clicking a session already open ignores a no-layout coding mirror and focuses the layout-backed owner', async () => {
+    const targetId = sessionId('layout-owner')
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/home/user/project',
+            lastActivityAt: Date.now(),
+            title: 'Layout-backed session',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [
+        { id: 'tab-1', mode: 'shell' },
+        { id: 'tab-mirror', mode: 'claude', codingCliProvider: 'claude', resumeSessionId: targetId },
+        { id: 'tab-real', mode: 'claude' },
+      ],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+          'tab-real': {
+            type: 'leaf',
+            id: 'pane-real',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-real',
+              status: 'running',
+              resumeSessionId: targetId,
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+          'tab-real': 'pane-real',
+        },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Layout-backed session').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    expect(state.tabs.tabs).toHaveLength(3)
+    expect(state.tabs.activeTabId).toBe('tab-real')
+    expect(state.panes.activePane['tab-real']).toBe('pane-real')
   })
 
   it('clicking a session already open in an agent-chat pane focuses it', async () => {

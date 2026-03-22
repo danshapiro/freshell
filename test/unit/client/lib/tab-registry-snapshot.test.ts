@@ -167,4 +167,33 @@ describe('collectPaneSnapshots', () => {
       expect(snapshots[0].title).toBe('My Extension Pane')
     })
   })
+
+  it('does not synthesize an exact sessionRef from a named claude resume identifier', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-1',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'creating',
+        mode: 'claude',
+        resumeSessionId: 'named-claude-resume',
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'srv-local')
+
+    expect(snapshots).toEqual([{
+      paneId: 'pane-1',
+      kind: 'terminal',
+      title: undefined,
+      payload: {
+        mode: 'claude',
+        shell: undefined,
+        resumeSessionId: 'named-claude-resume',
+        sessionRef: undefined,
+        initialCwd: undefined,
+      },
+    }])
+  })
 })

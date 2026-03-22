@@ -5,6 +5,7 @@ import type { SessionBindingReason } from './terminal-stream/registry-events.js'
 type TerminalAssociationCandidate = {
   terminalId: string
   createdAt: number
+  pendingResumeName?: string
 }
 
 type AssociationRegistry = {
@@ -25,6 +26,7 @@ export type SessionAssociationResult = {
 
 export class SessionAssociationCoordinator {
   private watermarks = new Map<string, number>()
+  private compatibilityProviders = new Set(['claude', 'opencode', 'kimi'])
 
   constructor(
     private readonly registry: AssociationRegistry,
@@ -53,9 +55,12 @@ export class SessionAssociationCoordinator {
     if (this.registry.isSessionBound(session.provider, session.sessionId, session.cwd)) return { associated: false }
     const cwd = session.cwd!
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
-    if (unassociated.length === 0) return { associated: false }
+    const eligible = session.provider === 'claude'
+      ? unassociated.filter((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+      : unassociated
+    if (eligible.length === 0) return { associated: false }
 
-    const term = unassociated.find((candidate) => session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs)
+    const term = eligible.find((candidate) => session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs)
     if (!term) return { associated: false }
 
     const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId, 'association')
@@ -65,10 +70,15 @@ export class SessionAssociationCoordinator {
   }
 
   private isAssociationCandidate(session: CodingCliSession): boolean {
+    if (!this.compatibilityProviders.has(session.provider)) return false
     if (!modeSupportsResume(session.provider)) return false
     if (!session.cwd) return false
     if (session.isSubagent) return false
     if (session.isNonInteractive) return false
+    if (session.provider === 'claude') {
+      return this.registry.findUnassociatedTerminals(session.provider, session.cwd)
+        .some((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+    }
     return true
   }
 

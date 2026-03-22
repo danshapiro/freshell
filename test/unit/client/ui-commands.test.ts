@@ -40,6 +40,80 @@ describe('handleUiCommand', () => {
     expect(actions[1].payload.content.kind).toBe('browser')
   })
 
+  it('preserves createRequestId and synthesizes exact local sessionRef for server-originated coding panes', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: {
+        id: 't1',
+        title: 'Codex',
+        mode: 'codex',
+        resumeSessionId: 'codex-session-123',
+        paneId: 'pane-1',
+        paneContent: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          createRequestId: 'req-codex',
+          resumeSessionId: 'codex-session-123',
+        },
+      },
+    }, {
+      dispatch,
+      getState: () => ({
+        connection: { serverInstanceId: 'srv-local' },
+      } as any),
+    })
+
+    expect(actions[1].payload.content).toMatchObject({
+      createRequestId: 'req-codex',
+      resumeSessionId: 'codex-session-123',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-local',
+      },
+    })
+  })
+
+  it('does not fabricate an exact sessionRef for named claude resume identifiers', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.attach',
+      payload: {
+        tabId: 't1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          shell: 'system',
+          createRequestId: 'req-claude',
+          resumeSessionId: 'named-claude-resume',
+        },
+      },
+    }, {
+      dispatch,
+      getState: () => ({
+        connection: { serverInstanceId: 'srv-local' },
+      } as any),
+    })
+
+    expect(actions[0].payload.content.createRequestId).toBe('req-claude')
+    expect(actions[0].payload.content.sessionRef).toBeUndefined()
+  })
+
   it('passes through newPaneId on pane.split', () => {
     const actions: any[] = []
     const dispatch = (action: any) => {

@@ -587,7 +587,7 @@ describe('tabsSlice', () => {
       expect(state.tabs.activeTabId).toBe(localTab?.id)
     })
 
-    it('activates an id-less local fallback before websocket ready instead of a foreign copied tab', async () => {
+    it('creates a new local tab before websocket ready instead of activating a foreign copied tab or no-layout mirror', async () => {
       const store = createOpenSessionStore()
 
       store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
@@ -609,8 +609,20 @@ describe('tabsSlice', () => {
       await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
 
       const state = store.getState()
-      expect(state.tabs.tabs).toHaveLength(2)
-      expect(state.tabs.activeTabId).toBe('local-fallback')
+      expect(state.tabs.tabs).toHaveLength(3)
+      const localTab = state.tabs.tabs.find((tab) => (
+        tab.id !== 'foreign-tab' && tab.id !== 'local-fallback'
+      ))
+      expect(localTab?.resumeSessionId).toBe('shared')
+      expect(state.tabs.activeTabId).toBe(localTab?.id)
+      expect(state.panes.layouts[localTab!.id]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          resumeSessionId: 'shared',
+        },
+      })
     })
 
     it('activates existing tab when a pane already owns the session', async () => {
@@ -700,6 +712,42 @@ describe('tabsSlice', () => {
       expect(tabs[0].mode).toBe('claude')
     })
 
+    it('creates a layout-backed terminal pane immediately for PTY-backed coding sessions', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      await store.dispatch(openSessionTab({ sessionId: 'codex-session-123', provider: 'codex' }))
+
+      const tab = store.getState().tabs.tabs[0]
+      const layout = store.getState().panes.layouts[tab.id]
+      expect(layout).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          resumeSessionId: 'codex-session-123',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-123',
+            serverInstanceId: 'srv-local',
+          },
+        },
+      })
+    })
+
+    it('keeps named claude resumes compatibility-only when opening a PTY-backed session', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'named-claude-resume',
+        provider: 'claude',
+      }))
+
+      const tab = store.getState().tabs.tabs[0]
+      const layout = store.getState().panes.layouts[tab.id] as any
+      expect(layout.content.resumeSessionId).toBe('named-claude-resume')
+      expect(layout.content.sessionRef).toBeUndefined()
+    })
+
     it('persists session metadata on newly opened tabs for fallback filtering and restored session type', async () => {
       const store = configureStore({
         reducer: {
@@ -752,13 +800,21 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('enriches an existing tab when reopening the same session with session metadata', async () => {
+    it('enriches an existing layout-backed tab when reopening the same session with session metadata', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
         id: 'local-fallback',
         mode: 'claude',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'local-fallback',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
       }))
 
       await store.dispatch(openSessionTab({
@@ -824,13 +880,8 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('activates existing tab when terminalId is already attached', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
+    it('activates existing tab when terminalId is already attached and seeds a layout-backed pane', async () => {
+      const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({ id: 'tab-1', mode: 'claude', terminalId: 'term-1', status: 'running' }))
       store.dispatch(addTab({ id: 'tab-2', mode: 'shell' }))
@@ -839,15 +890,25 @@ describe('tabsSlice', () => {
 
       expect(store.getState().tabs.activeTabId).toBe('tab-1')
       expect(store.getState().tabs.tabs).toHaveLength(2)
-    })
-
-    it('creates a running tab when terminalId is provided and no existing tab matches', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
+      expect(store.getState().panes.layouts['tab-1']).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 'term-1',
+          status: 'running',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
         },
       })
+    })
+
+    it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
+      const store = createOpenSessionStore('srv-local')
 
       await store.dispatch(openSessionTab({
         sessionId: VALID_CLAUDE_SESSION_ID,
@@ -861,6 +922,21 @@ describe('tabsSlice', () => {
       expect(tabs[0].terminalId).toBe('term-2')
       expect(tabs[0].status).toBe('running')
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(store.getState().panes.layouts[tabs[0].id]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 'term-2',
+          status: 'running',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
+        },
+      })
     })
 
     it('uses capitalized provider label for codex tab title', async () => {

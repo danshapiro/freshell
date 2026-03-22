@@ -1808,9 +1808,9 @@ describe('TerminalRegistry', () => {
       expect(record.mode).toBe('claude')
     })
 
-    it('leaves resumeSessionId undefined when not provided', () => {
+    it('leaves resumeSessionId undefined for non-claude terminals when not provided', () => {
       const record = registry.create({
-        mode: 'claude',
+        mode: 'codex',
         cwd: '/home/user/project',
       })
 
@@ -1886,9 +1886,9 @@ describe('TerminalRegistry', () => {
       expect(sessionIds).toEqual([VALID_CLAUDE_SESSION_ID, OTHER_CLAUDE_SESSION_ID])
     })
 
-    it('includes undefined resumeSessionId in list output when not set', () => {
+    it('includes undefined resumeSessionId in list output when not set for non-claude terminals', () => {
       registry.create({
-        mode: 'claude',
+        mode: 'codex',
         cwd: '/home/user/project',
       })
 
@@ -2122,9 +2122,9 @@ describe('TerminalRegistry', () => {
   })
 
   describe('findUnassociatedClaudeTerminals', () => {
-    it('should find claude terminals without resumeSessionId matching cwd', () => {
-      // Create a claude terminal without resumeSessionId
-      const term1 = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+    it('should find named-resume claude terminals awaiting UUID association', () => {
+      // Named Claude resumes remain unassociated until the UUID is discovered.
+      const term1 = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '137 tour' })
       // Create a claude terminal WITH resumeSessionId (should not match)
       registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: VALID_CLAUDE_SESSION_ID })
       // Create a shell terminal (should not match)
@@ -2145,7 +2145,7 @@ describe('TerminalRegistry', () => {
     })
 
     it('should match cwd case-insensitively on Windows', () => {
-      const term = registry.create({ mode: 'claude', cwd: 'C:\\Users\\Dan\\project' })
+      const term = registry.create({ mode: 'claude', cwd: 'C:\\Users\\Dan\\project', resumeSessionId: '137 tour' })
 
       const results = registry.findUnassociatedClaudeTerminals('c:/users/dan/project')
 
@@ -2161,7 +2161,7 @@ describe('TerminalRegistry', () => {
     })
 
     it('should normalize backslashes to forward slashes', () => {
-      const term = registry.create({ mode: 'claude', cwd: 'C:\\Users\\Dan\\project' })
+      const term = registry.create({ mode: 'claude', cwd: 'C:\\Users\\Dan\\project', resumeSessionId: '137 tour' })
 
       const results = registry.findUnassociatedClaudeTerminals('C:/Users/Dan/project')
 
@@ -2171,9 +2171,9 @@ describe('TerminalRegistry', () => {
 
     it('should return results sorted by createdAt (oldest first)', () => {
       // Create terminals with slight delays to ensure different createdAt
-      const term1 = registry.create({ mode: 'claude', cwd: '/home/user/project' })
-      const term2 = registry.create({ mode: 'claude', cwd: '/home/user/project' })
-      const term3 = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const term1 = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '137 tour' })
+      const term2 = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '138 tour' })
+      const term3 = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '139 tour' })
 
       const results = registry.findUnassociatedClaudeTerminals('/home/user/project')
 
@@ -2232,7 +2232,7 @@ describe('TerminalRegistry', () => {
     })
 
     it('should work for claude mode (delegates same logic)', () => {
-      const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const term = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '137 tour' })
       registry.create({ mode: 'codex', cwd: '/home/user/project' })
 
       const results = registry.findUnassociatedTerminals('claude', '/home/user/project')
@@ -2244,7 +2244,7 @@ describe('TerminalRegistry', () => {
 
   describe('findUnassociatedClaudeTerminals delegates to findUnassociatedTerminals', () => {
     it('should return the same results as findUnassociatedTerminals for claude mode', () => {
-      registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '137 tour' })
       registry.create({ mode: 'codex', cwd: '/home/user/project' })
 
       const claude = registry.findUnassociatedClaudeTerminals('/home/user/project')
@@ -2291,7 +2291,7 @@ describe('TerminalRegistry', () => {
     })
 
     it('rejects invalid sessionId for claude terminals', () => {
-      const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const term = registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: '137 tour' })
 
       const result = registry.setResumeSessionId(term.terminalId, 'not-a-uuid')
 
@@ -2459,6 +2459,37 @@ describe('TerminalRegistry', () => {
     it('returns false when session is not bound', () => {
       expect(registry.isSessionBound('codex', '019cf585-9b35-7510-a99c-09b77b1f351a')).toBe(false)
     })
+  })
+})
+
+describe('TerminalRegistry exact Claude session binding', () => {
+  it('uses --session-id for fresh claude launches when an exact session id is provided explicitly', () => {
+    const spec = buildSpawnSpec(
+      'claude',
+      '/home/user/project',
+      'system',
+      undefined,
+      undefined,
+      undefined,
+      VALID_CLAUDE_SESSION_ID,
+    )
+
+    expect(spec.args).toContain('--session-id')
+    expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
+    expect(spec.args).not.toContain('--resume')
+  })
+
+  it('allocates and binds an exact claude session id for fresh terminals', () => {
+    const registry = new TerminalRegistry()
+    try {
+      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+
+      expect(record.resumeSessionId).toBeDefined()
+      expect(isValidClaudeSessionId(record.resumeSessionId)).toBe(true)
+      expect(record.pendingResumeName).toBeUndefined()
+    } finally {
+      registry.shutdown()
+    }
   })
 })
 

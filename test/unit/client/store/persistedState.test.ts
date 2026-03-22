@@ -72,5 +72,37 @@ describe('persistedState parsers', () => {
       expect(parsed!.version).toBe(1)
       expect(Object.keys(parsed!.layouts)).toEqual(['tab-1'])
     })
+
+    it('preserves an explicit exact sessionRef from persisted coding panes', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'creating',
+              resumeSessionId: 'codex-session-123',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'codex-session-123',
+                serverInstanceId: 'srv-local',
+              },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      const parsed = parsePersistedPanesRaw(raw) as any
+      expect(parsed.layouts['tab-1'].content.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-local',
+      })
+    })
   })
 })

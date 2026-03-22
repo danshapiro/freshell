@@ -6,6 +6,7 @@ import os from 'os'
 import path from 'path'
 import fs from 'fs'
 import { EventEmitter } from 'events'
+import { randomUUID } from 'crypto'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { ServerSettings } from '../shared/settings.js'
@@ -53,6 +54,7 @@ export type CodingCliCommandSpec = {
   defaultCommand: string
   args?: string[]
   env?: Record<string, string>
+  launchArgs?: (sessionId: string) => string[]
   resumeArgs?: (sessionId: string) => string[]
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
@@ -67,6 +69,7 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     label: 'Claude CLI',
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
+    launchArgs: (sessionId: string) => ['--session-id', sessionId],
     resumeArgs: (sessionId: string) => ['--resume', sessionId],
     permissionModeArgs: (permissionMode: string) => ['--permission-mode', permissionMode],
   }],
@@ -127,6 +130,11 @@ export function registerCodingCliCommands(specs: Map<string, CodingCliCommandSpe
 export function modeSupportsResume(mode: TerminalMode): boolean {
   if (mode === 'shell') return false
   return !!codingCliCommands.get(mode)?.resumeArgs
+}
+
+function modeSupportsExactLaunch(mode: TerminalMode): boolean {
+  if (mode !== 'claude') return false
+  return !!codingCliCommands.get(mode)?.launchArgs
 }
 
 type ProviderTarget = 'unix' | 'windows'
@@ -252,7 +260,13 @@ type ProviderSettings = {
   sandbox?: string
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings) {
+function resolveCodingCliCommand(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+  launchSessionId?: string,
+  target: ProviderTarget = 'unix',
+  providerSettings?: ProviderSettings,
+) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
   if (!spec) return null
@@ -263,12 +277,18 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   if (mode === 'opencode') {
     Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
   }
-  let resumeArgs: string[] = []
+  let sessionArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
-      resumeArgs = spec.resumeArgs(resumeSessionId)
+      sessionArgs = spec.resumeArgs(resumeSessionId)
     } else {
       logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
+    }
+  } else if (launchSessionId) {
+    if (spec.launchArgs) {
+      sessionArgs = spec.launchArgs(launchSessionId)
+    } else {
+      logger.warn({ mode, launchSessionId }, 'Launch session requested but no launch args configured')
     }
   }
   const settingsArgs: string[] = []
@@ -304,7 +324,7 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   }
   return {
     command,
-    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
+    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...sessionArgs],
     env: commandEnv,
     label: spec.label,
   }
@@ -743,6 +763,7 @@ export function buildSpawnSpec(
   resumeSessionId?: string,
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
+  launchSessionId?: string,
 ) {
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
@@ -822,7 +843,7 @@ export function buildSpawnSpec(
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
@@ -859,7 +880,7 @@ export function buildSpawnSpec(
         }
         return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
@@ -890,7 +911,7 @@ export function buildSpawnSpec(
       return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -910,7 +931,7 @@ export function buildSpawnSpec(
     return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
+  const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
@@ -932,8 +953,8 @@ export class TerminalRegistry extends EventEmitter {
 
   constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
-    // 5 permanent terminal.exit listeners (index, ws-handler, broker, codex-wiring,
-    // terminal-view) plus transient per-terminal listeners during shutdown.
+    // Permanent terminal.exit listeners: index, ws-handler, broker, codex-wiring,
+    // terminal-view. Shutdown uses a single shared listener (no per-terminal scaling).
     this.setMaxListeners(20)
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
@@ -1109,6 +1130,9 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
+    const launchSessionId = modeSupportsExactLaunch(opts.mode) && !resumeForSpawn
+      ? randomUUID()
+      : undefined
 
     const port = Number(process.env.PORT || 3001)
     const baseEnv = {
@@ -1127,6 +1151,7 @@ export class TerminalRegistry extends EventEmitter {
       resumeForSpawn,
       opts.providerSettings,
       baseEnv,
+      launchSessionId,
     )
 
     const endSpawnTimer = startPerfTimer(
@@ -1273,11 +1298,17 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
-    if (modeSupportsResume(opts.mode) && resumeForBinding) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, resumeForBinding, 'resume')
+    const exactSessionId = launchSessionId ?? resumeForBinding
+    if (modeSupportsResume(opts.mode) && exactSessionId) {
+      const bound = this.bindSession(
+        terminalId,
+        opts.mode as CodingCliProviderName,
+        exactSessionId,
+        launchSessionId ? 'launch' : 'resume',
+      )
       if (!bound.ok) {
         logger.warn(
-          { terminalId, mode: opts.mode, sessionId: resumeForBinding, reason: bound.reason },
+          { terminalId, mode: opts.mode, sessionId: exactSessionId, reason: bound.reason },
           'Failed to bind resume session during terminal create',
         )
       }
@@ -1903,6 +1934,23 @@ export class TerminalRegistry extends EventEmitter {
     return { ok: true, terminalId, sessionId: normalized }
   }
 
+  rebindSession(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    reason: SessionBindingReason = 'association',
+  ): BindSessionResult {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return { ok: false, reason: 'invalid_session_id' }
+
+    const owner = this.bindingAuthority.ownerForSession(provider, normalized)
+    if (owner && owner !== terminalId) {
+      this.releaseBinding(owner, 'rebind', { provider, sessionId: normalized })
+    }
+
+    return this.bindSession(terminalId, provider, normalized, reason)
+  }
+
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
@@ -1917,6 +1965,12 @@ export class TerminalRegistry extends EventEmitter {
     const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return false
     return this.bindingAuthority.ownerForSession(provider, normalized, cwd) !== undefined
+  }
+
+  getSessionOwner(provider: CodingCliProviderName, sessionId: string): string | undefined {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return undefined
+    return this.bindingAuthority.ownerForSession(provider, normalized)
   }
 
   /**
@@ -1969,24 +2023,29 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    // Set up exit listeners BEFORE sending signals (avoid race)
+    // Use a single listener + resolver map instead of one listener per terminal,
+    // to avoid exceeding maxListeners when many terminals are running.
+    const resolvers = new Map<string, () => void>()
     const exitPromises = running.map(term =>
       new Promise<void>(resolve => {
         if (term.status === 'exited') { resolve(); return }
-        const handler = (evt: { terminalId: string }) => {
-          if (evt.terminalId === term.terminalId) {
-            this.off('terminal.exit', handler)
-            resolve()
-          }
-        }
-        this.on('terminal.exit', handler)
-        // Re-check after listener setup (TOCTOU guard — status may mutate between filter and here)
+        resolvers.set(term.terminalId, resolve)
+        // TOCTOU guard — status may mutate between filter and here
         if ((term.status as string) === 'exited') {
-          this.off('terminal.exit', handler)
+          resolvers.delete(term.terminalId)
           resolve()
         }
       })
     )
+    const exitHandler = (evt: { terminalId: string }) => {
+      const resolve = resolvers.get(evt.terminalId)
+      if (resolve) {
+        resolvers.delete(evt.terminalId)
+        resolve()
+        if (resolvers.size === 0) this.off('terminal.exit', exitHandler)
+      }
+    }
+    if (resolvers.size > 0) this.on('terminal.exit', exitHandler)
 
     // Send SIGTERM (or plain kill on Windows where signal args are unsupported)
     const isWindows = process.platform === 'win32'
@@ -2009,6 +2068,10 @@ export class TerminalRegistry extends EventEmitter {
       Promise.all(exitPromises),
       new Promise<void>(r => setTimeout(r, timeoutMs)),
     ])
+
+    // Clean up the shared listener if any terminals didn't exit in time
+    this.off('terminal.exit', exitHandler)
+    resolvers.clear()
 
     // Force kill any that didn't exit in time
     let forceKilled = 0

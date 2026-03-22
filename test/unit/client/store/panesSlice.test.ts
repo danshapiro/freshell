@@ -307,6 +307,61 @@ describe('panesSlice', () => {
       }
     })
 
+    it('drops exact sessionRef values whose provider does not match the pane mode', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: VALID_CLAUDE_SESSION_ID,
+              serverInstanceId: 'srv-local',
+            },
+          } as any,
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+        expect(leaf.content.sessionRef).toBeUndefined()
+      }
+    })
+
+    it('preserves exact Claude sessionRef values for agent-chat panes backed by Claude', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: VALID_CLAUDE_SESSION_ID,
+              serverInstanceId: 'srv-local',
+            },
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('agent-chat')
+      if (leaf.content.kind === 'agent-chat') {
+        expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+        expect(leaf.content.sessionRef).toEqual({
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+          serverInstanceId: 'srv-local',
+        })
+      }
+    })
+
     it('does not assign resumeSessionId for shell panes', () => {
       const state = panesReducer(
         initialState,
@@ -1936,6 +1991,66 @@ describe('panesSlice', () => {
       const content = (state.layouts['tab-1'] as any).content
 
       expect(content.resumeSessionId).toBe('session-A')
+    })
+
+    it('keeps the local exact sessionRef authoritative when incoming conflicts for the same createRequestId', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'creating',
+              resumeSessionId: 'session-A',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'session-A',
+                serverInstanceId: 'srv-local',
+              },
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'remote-t1',
+              resumeSessionId: 'session-B',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'session-B',
+                serverInstanceId: 'srv-remote',
+              },
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const content = (state.layouts['tab-1'] as any).content
+
+      expect(content.resumeSessionId).toBe('session-A')
+      expect(content.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'session-A',
+        serverInstanceId: 'srv-local',
+      })
+      expect(content.terminalId).toBe('remote-t1')
     })
 
     it('preserves local resumeSessionId inside split pane trees', () => {

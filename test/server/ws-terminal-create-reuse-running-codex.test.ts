@@ -508,6 +508,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toBe('term-canonical')
+      expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
       expect(dupeRegistry.createCalls).toHaveLength(0)
       expect(dupeRegistry.repairCalls).toHaveLength(1)
       expect(dupeRegistry.repairCalls[0]).toEqual({ mode: 'codex', sessionId: CODEX_SESSION_ID })

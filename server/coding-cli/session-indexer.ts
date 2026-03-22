@@ -6,7 +6,7 @@ import chokidar from 'chokidar'
 import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
-import type { CodingCliProvider, DirectSessionListOptions } from './provider.js'
+import type { CodingCliProvider, DirectSessionListOptions, SessionParseContext } from './provider.js'
 import { makeSessionKey, parseSessionKey, sessionKeyRequiresCwdScope, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
@@ -516,7 +516,12 @@ export class CodingCliSessionIndexer {
     }
   }
 
-  private async updateCacheEntry(provider: CodingCliProvider, filePath: string, cacheKey: string) {
+  private async updateCacheEntry(
+    provider: CodingCliProvider,
+    filePath: string,
+    cacheKey: string,
+    parseContext?: SessionParseContext,
+  ) {
     let stat: Stats
     try {
       stat = await fsp.stat(filePath)
@@ -543,10 +548,10 @@ export class CodingCliSessionIndexer {
     }
 
     const snippet = await readSessionSnippet(filePath)
-    const meta = await provider.parseSessionFile(snippet.content, filePath)
+    const meta = await provider.parseSessionFile(snippet.content, filePath, parseContext)
     if (snippet.truncated && provider.name === 'codex') {
       const tailMeta = snippet.tailContent
-        ? await provider.parseSessionFile(snippet.tailContent, filePath)
+        ? await provider.parseSessionFile(snippet.tailContent, filePath, parseContext)
         : undefined
       meta.codexTaskEvents = sanitizeCodexTaskEventsForTruncatedSnippet(
         meta.codexTaskEvents,
@@ -580,6 +585,7 @@ export class CodingCliSessionIndexer {
     const baseSession: CodingCliSession = {
       provider: provider.name,
       sessionId,
+      launchOrigin: meta.launchOrigin,
       projectPath,
       lastActivityAt,
       createdAt,
@@ -730,6 +736,9 @@ export class CodingCliSessionIndexer {
     let fileCount = 0
     let sessionCount = 0
     let processedEntries = 0
+    const parseContext: SessionParseContext = {
+      codexShellSnapshotIndexes: new Map(),
+    }
 
     const shouldFullScan = this.needsFullScan || this.fileCache.size === 0
     if (shouldFullScan) {
@@ -769,7 +778,7 @@ export class CodingCliSessionIndexer {
           }
           const cacheKey = normalizeFilePath(file)
           seenCacheKeys.add(cacheKey)
-          await this.updateCacheEntry(provider, file, cacheKey)
+          await this.updateCacheEntry(provider, file, cacheKey, parseContext)
         }
       }
 
@@ -827,7 +836,7 @@ export class CodingCliSessionIndexer {
           this.deleteCacheEntry(file)
           continue
         }
-        await this.updateCacheEntry(provider, file, file)
+        await this.updateCacheEntry(provider, file, file, parseContext)
       }
     }
 

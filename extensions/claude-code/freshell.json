@@ -7,6 +7,7 @@
   "cli": {
     "command": "claude",
     "envVar": "CLAUDE_CMD",
+    "launchArgs": ["--session-id", "{{sessionId}}"],
     "resumeArgs": ["--resume", "{{sessionId}}"],
     "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
     "supportsPermissionMode": true

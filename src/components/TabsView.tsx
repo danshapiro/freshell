@@ -20,9 +20,12 @@ import { addPane, initLayout } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { sessionKeyRequiresCwdScope } from '@/lib/coding-cli-session-key'
 import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
+import { addPreReadyResumeAuthority } from '@/lib/pre-ready-resume'
 
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
@@ -30,11 +33,17 @@ type ScopeMode = 'all' | 'local' | 'remote'
 type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
+  const explicit = sanitizeExactSessionRef(value as any)
+  if (explicit) {
+    if (!isNonShellMode(explicit.provider)) return undefined
+    return explicit
+  }
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown }
   if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
     return undefined
   }
+  if (!sessionKeyRequiresCwdScope(candidate.provider)) return undefined
   if (typeof candidate.sessionId !== 'string') return undefined
   return {
     provider: candidate.provider as CodingCliProviderName,
@@ -54,21 +63,32 @@ function resolveSessionRef(options: {
   const explicit = parseSessionLocator(options.payload.sessionRef)
   if (explicit) return explicit
   if (!options.fallbackProvider || !options.fallbackSessionId) return undefined
-  return {
+  const exact = buildExactSessionRef({
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
-    ...(options.fallbackCwd ? { cwd: options.fallbackCwd } : {}),
-    ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
-  }
+    serverInstanceId: options.fallbackServerInstanceId,
+  })
+  if (exact) return exact
+  if (!sessionKeyRequiresCwdScope(options.fallbackProvider)) return undefined
+  return {
+      provider: options.fallbackProvider,
+      sessionId: options.fallbackSessionId,
+      ...(options.fallbackCwd ? { cwd: options.fallbackCwd } : {}),
+      ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
+    }
 }
 
 function sanitizePaneSnapshot(
   record: RegistryTabRecord,
   snapshot: RegistryPaneSnapshot,
-  localServerInstanceId?: string,
+  options: {
+    localServerInstanceId?: string
+    trustedLocalRecord?: boolean
+  } = {},
 ): PaneContentInput {
   const payload = snapshot.payload || {}
-  const sameServer = !!localServerInstanceId && record.serverInstanceId === localServerInstanceId
+  const sameServer = !!options.localServerInstanceId && record.serverInstanceId === options.localServerInstanceId
+  const keepMirroredResumeSessionId = sameServer || (!options.localServerInstanceId && options.trustedLocalRecord)
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
     const resumeSessionId = payload.resumeSessionId as string | undefined
@@ -79,11 +99,22 @@ function sanitizePaneSnapshot(
       fallbackCwd: payload.initialCwd as string | undefined,
       fallbackServerInstanceId: record.serverInstanceId,
     })
+    const createRequestId = !options.localServerInstanceId
+      && options.trustedLocalRecord
+      && keepMirroredResumeSessionId
+      && !!resumeSessionId
+      && !!sessionRef
+      ? nanoid()
+      : undefined
+    if (createRequestId) {
+      addPreReadyResumeAuthority(createRequestId)
+    }
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      ...(createRequestId ? { createRequestId } : {}),
+      resumeSessionId: keepMirroredResumeSessionId ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
     }
@@ -117,7 +148,7 @@ function sanitizePaneSnapshot(
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      resumeSessionId: keepMirroredResumeSessionId ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
@@ -345,11 +376,16 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   }, [groups, query, filterMode, scopeMode, withDisplayDeviceLabel])
 
   const openRecordAsUnlinkedCopy = (record: RegistryTabRecord) => {
+    const state = store.getState()
+    const trustedLocalRecord = !!state.panes.layouts[record.tabId]
     const tabId = nanoid()
     const paneSnapshots = record.panes || []
     const firstPane = paneSnapshots[0]
     const firstContent = firstPane
-      ? sanitizePaneSnapshot(record, firstPane, localServerInstanceId)
+      ? sanitizePaneSnapshot(record, firstPane, {
+        localServerInstanceId,
+        trustedLocalRecord,
+      })
       : { kind: 'terminal', mode: 'shell' } as const
     dispatch(addTab({
       id: tabId,
@@ -364,13 +400,18 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     for (const pane of paneSnapshots.slice(1)) {
       dispatch(addPane({
         tabId,
-        newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+        newContent: sanitizePaneSnapshot(record, pane, {
+          localServerInstanceId,
+          trustedLocalRecord,
+        }),
       }))
     }
     onOpenTab?.()
   }
 
   const openPaneInNewTab = (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
+    const state = store.getState()
+    const trustedLocalRecord = !!state.panes.layouts[record.tabId]
     const tabId = nanoid()
     dispatch(addTab({
       id: tabId,
@@ -380,7 +421,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     }))
     dispatch(initLayout({
       tabId,
-      content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+      content: sanitizePaneSnapshot(record, pane, {
+        localServerInstanceId,
+        trustedLocalRecord,
+      }),
     }))
     onOpenTab?.()
   }

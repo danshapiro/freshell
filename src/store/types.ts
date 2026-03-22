@@ -56,7 +56,7 @@ export interface Tab {
   mode: TabMode
   shell?: ShellType
   initialCwd?: string
-  resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
+  resumeSessionId?: string     // Compatibility mirror of the last associated coding session; not authoritative ownership
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
   titleSetByUser?: boolean     // If true, don't auto-update title

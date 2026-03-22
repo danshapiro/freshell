@@ -429,6 +429,33 @@ describe('ws protocol', () => {
     await closeWebSocket(ws)
   })
 
+  it('drops compatibility-looking resume identifiers for providers without resume support', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-gemini-no-resume'
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'gemini',
+      resumeSessionId: 'gemini-session-123',
+    }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(created.effectiveResumeSessionId).toBeUndefined()
+    expect(registry.createCalls[0]?.resumeSessionId).toBeUndefined()
+
+    await closeWebSocket(ws)
+  })
+
   it('accepts shell parameter with system default', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))

@@ -147,12 +147,13 @@ function renderWithProvider(ui: React.ReactNode, options?: { platform?: string |
   return { store, ...utils }
 }
 
-function createStoreWithSession() {
+function createStoreWithSession(options?: { serverInstanceId?: string }) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
+      connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
     },
@@ -216,6 +217,11 @@ function createStoreWithSession() {
       },
       extensions: {
         entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: null,
+        serverInstanceId: options?.serverInstanceId,
       },
     },
   })
@@ -690,6 +696,70 @@ function createStoreWithTerminalPane() {
   })
 }
 
+function createStoreWithCodingTerminalPane() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Claude',
+            status: 'running',
+            mode: 'claude',
+            shell: 'system',
+            createdAt: 1,
+            terminalId: 'term-1',
+            codingCliProvider: 'claude',
+            resumeSessionId: VALID_SESSION_ID,
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              status: 'running',
+              createRequestId: 'req-1',
+              terminalId: 'term-1',
+              resumeSessionId: VALID_SESSION_ID,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Claude' } },
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: 'linux',
+      },
+    },
+  })
+}
+
 describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
@@ -944,6 +1014,55 @@ describe('ContextMenuProvider', () => {
     }
   })
 
+  it('open in this tab preserves exact local identity for a running sidebar session target', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession({ serverInstanceId: 'srv-local' })
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="history"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-running-terminal-id="term-running"
+          >
+            Test Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Test Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in this tab'))
+
+    const newLayout = store.getState().panes.layouts['tab-1']
+    expect(newLayout?.type).toBe('split')
+    if (newLayout?.type === 'split') {
+      const newPane = newLayout.children.find(
+        (child) => child.type === 'leaf' && child.id !== 'pane-1',
+      )
+      expect(newPane).toBeDefined()
+      if (newPane?.type === 'leaf' && newPane.content.kind === 'terminal') {
+        expect(newPane.content).toMatchObject({
+          mode: 'claude',
+          terminalId: 'term-running',
+          status: 'running',
+          resumeSessionId: VALID_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+            serverInstanceId: 'srv-local',
+          },
+        })
+      }
+    }
+  })
+
   it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSidebarWindowAgentSession()
@@ -1024,7 +1143,14 @@ describe('ContextMenuProvider', () => {
       initialCwd: '/shared/project/history',
       resumeSessionId: VALID_SESSION_ID,
     })
-    expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      },
+    })
   })
 
   it('renames the targeted duplicate Kimi sidebar session using its opaque cwd-scoped key', async () => {
@@ -1742,6 +1868,33 @@ describe('ContextMenuProvider', () => {
 
       // Verify stale tab.terminalId is cleared
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
+    })
+
+    it('clears stale tab.resumeSessionId when replacing the owning coding pane', async () => {
+      const user = userEvent.setup()
+      wsMocks.send.mockClear()
+
+      const store = createStoreWithCodingTerminalPane()
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+              Coding Terminal
+            </div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Coding Terminal'), keys: '[MouseRight]' })
+      await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
+
+      expect(store.getState().tabs.tabs[0].resumeSessionId).toBeUndefined()
     })
 
   })

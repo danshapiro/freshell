@@ -1140,6 +1140,9 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         let effectiveResumeSessionId = m.resumeSessionId
+        if (!modeSupportsResume(m.mode as TerminalMode)) {
+          effectiveResumeSessionId = undefined
+        }
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
@@ -1382,7 +1385,7 @@ export class WsHandler {
                 requestId: m.requestId,
                 terminalId: record.terminalId,
                 createdAt: record.createdAt,
-                effectiveResumeSessionId,
+                effectiveResumeSessionId: record.resumeSessionId ?? effectiveResumeSessionId,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for

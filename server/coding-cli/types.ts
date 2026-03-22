@@ -134,6 +134,12 @@ export interface CodexTaskEventSnapshot {
   latestTurnAbortedAt?: number
 }
 
+export interface SessionLaunchOrigin {
+  terminalId: string
+  tabId?: string
+  paneId?: string
+}
+
 export interface ErrorPayload {
   message: string
   code?: string
@@ -149,6 +155,7 @@ export interface ApprovalPayload {
 
 export interface ParsedSessionMeta {
   sessionId?: string
+  launchOrigin?: SessionLaunchOrigin
   cwd?: string
   createdAt?: number
   lastActivityAt?: number
@@ -181,6 +188,7 @@ export interface CodingCliSessionInfo {
 export interface CodingCliSession {
   provider: CodingCliProviderName
   sessionId: string
+  launchOrigin?: SessionLaunchOrigin
   projectPath: string
   lastActivityAt: number
   createdAt?: number

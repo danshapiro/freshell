@@ -136,6 +136,41 @@ function createDeferred<T>() {
   return { promise, resolve, reject }
 }
 
+function paneTreeContainsExactSessionRef(
+  node: any,
+  expected: { provider: string; sessionId: string; serverInstanceId?: string },
+): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (node.type === 'leaf') {
+    const sessionRef = node.content?.sessionRef
+    return sessionRef?.provider === expected.provider
+      && sessionRef?.sessionId === expected.sessionId
+      && (
+        expected.serverInstanceId === undefined
+        || sessionRef?.serverInstanceId === expected.serverInstanceId
+      )
+  }
+  if (!Array.isArray(node.children)) return false
+  return node.children.some((child) => paneTreeContainsExactSessionRef(child, expected))
+}
+
+function layoutSyncContainsSessionIdentity(
+  message: any,
+  expected: { provider: string; sessionId: string; serverInstanceId?: string },
+): boolean {
+  if (message?.type !== 'ui.layout.sync') return false
+  if (Array.isArray(message.tabs) && message.tabs.some((tab: any) => (
+    tab?.fallbackSessionRef?.provider === expected.provider
+    && tab?.fallbackSessionRef?.sessionId === expected.sessionId
+  ))) {
+    return true
+  }
+
+  return Object.values(message.layouts ?? {}).some((layout) => (
+    paneTreeContainsExactSessionRef(layout, expected)
+  ))
+}
+
 function createStore(options?: {
   tabs?: Array<Record<string, unknown>>
   panes?: {
@@ -803,18 +838,22 @@ describe('open tab session sidebar visibility (e2e)', () => {
       await store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }) as any)
     })
 
+    const openedTabId = store.getState().tabs.activeTabId
+    const openedLayout = openedTabId ? (store.getState().panes.layouts[openedTabId] as any) : undefined
+    expect(openedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'older-open',
+      serverInstanceId: 'srv-local',
+    })
+
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'ui.layout.sync',
-        tabs: expect.arrayContaining([
-          expect.objectContaining({
-            fallbackSessionRef: {
-              provider: 'codex',
-              sessionId: 'older-open',
-            },
-          }),
-        ]),
-      }))
+      expect(wsMocks.send.mock.calls.some(([message]) => (
+        layoutSyncContainsSessionIdentity(message, {
+          provider: 'codex',
+          sessionId: 'older-open',
+          serverInstanceId: 'srv-local',
+        })
+      ))).toBe(true)
     }, { timeout: 2500 })
 
     // Snapshot the call count just before the invalidation event so the
