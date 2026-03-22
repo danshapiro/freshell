@@ -195,6 +195,12 @@ export class CodingCliSessionIndexer {
     })
 
     const schedule = () => this.scheduleRefresh()
+    this.watcher.once('ready', () => {
+      // Files can be created between start() returning and chokidar finishing
+      // its initial scan. Refresh once after ready so those files are indexed.
+      this.needsFullScan = true
+      schedule()
+    })
     this.watcher.on('add', (filePath) => {
       this.markDirty(filePath)
       schedule()
@@ -560,6 +566,11 @@ export class CodingCliSessionIndexer {
   }
 
   private updateDirectCacheEntry(provider: CodingCliProvider, session: CodingCliSession, cacheKey: string) {
+    const cached = this.fileCache.get(cacheKey)
+    if (cached?.baseSession?.sessionId) {
+      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+    }
+
     this.fileCache.set(cacheKey, {
       provider: provider.name,
       mtimeMs: session.lastActivityAt,
@@ -569,6 +580,10 @@ export class CodingCliSessionIndexer {
         provider: provider.name,
       },
     })
+
+    if (session.sourceFile) {
+      this.sessionKeyToFilePath.set(makeSessionKey(provider.name, session.sessionId), session.sourceFile)
+    }
   }
 
   private async refreshDirectProvider(provider: CodingCliProvider): Promise<Set<string>> {

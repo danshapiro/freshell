@@ -8,6 +8,23 @@ import type { TerminalMeta } from '../../../../server/terminal-metadata-service.
 import { querySessionDirectory } from '../../../../server/session-directory/service.js'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude.js'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex.js'
+import { KimiProvider } from '../../../../server/coding-cli/providers/kimi.js'
+
+const kimiFixtureShareDir = path.join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'coding-cli',
+  'kimi',
+  'share-dir',
+)
+const kimiFixtureSessionFile = path.join(
+  kimiFixtureShareDir,
+  'sessions',
+  '4a3dcd71f4774356bb688dad99173808',
+  'kimi-session-1',
+  'context.jsonl',
+)
 
 function makeSession(overrides: Partial<CodingCliSession> & Pick<CodingCliSession, 'sessionId' | 'projectPath' | 'lastActivityAt'>): CodingCliSession {
   return {
@@ -296,6 +313,52 @@ describe('querySessionDirectory file-based search', () => {
 
     expect(page.items).toHaveLength(1)
     expect(page.items[0].matchedIn).toBe('assistantMessage')
+  })
+
+  it('searches Kimi visible transcript text and honors metadata title/archive state', async () => {
+    const projects = [makeProject('/repo/root', [
+      makeSession({
+        provider: 'kimi',
+        sessionId: 'kimi-session-1',
+        projectPath: '/repo/root',
+        lastActivityAt: 1000,
+        title: 'Pinned title from metadata',
+        archived: true,
+        sourceFile: kimiFixtureSessionFile,
+      }),
+    ])]
+    const kimiProvider = new KimiProvider(kimiFixtureShareDir)
+
+    const userPage = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [kimiProvider],
+      query: { priority: 'visible', query: 'visible-user-token-kimi', tier: 'userMessages' },
+    })
+    expect(userPage.items).toHaveLength(1)
+    expect(userPage.items[0]).toMatchObject({
+      sessionId: 'kimi-session-1',
+      title: 'Pinned title from metadata',
+      archived: true,
+      matchedIn: 'userMessage',
+    })
+
+    const assistantPage = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [kimiProvider],
+      query: { priority: 'visible', query: 'visible-assistant-token-kimi', tier: 'fullText' },
+    })
+    expect(assistantPage.items).toHaveLength(1)
+    expect(assistantPage.items[0].matchedIn).toBe('assistantMessage')
+
+    const hiddenPage = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [kimiProvider],
+      query: { priority: 'visible', query: 'hidden-think-token-kimi', tier: 'fullText' },
+    })
+    expect(hiddenPage.items).toHaveLength(0)
   })
 
   it('title tier still works without file I/O (does not require providers)', async () => {

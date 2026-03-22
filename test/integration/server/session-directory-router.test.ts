@@ -7,9 +7,25 @@ import express, { type Express } from 'express'
 import request from 'supertest'
 import { createSessionsRouter } from '../../../server/sessions-router.js'
 import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
+import { KimiProvider } from '../../../server/coding-cli/providers/kimi.js'
 import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
+const kimiFixtureShareDir = path.join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'coding-cli',
+  'kimi',
+  'share-dir',
+)
+const kimiFixtureSessionFile = path.join(
+  kimiFixtureShareDir,
+  'sessions',
+  '4a3dcd71f4774356bb688dad99173808',
+  'kimi-session-1',
+  'context.jsonl',
+)
 
 describe('GET /api/session-directory', () => {
   let app: Express
@@ -265,7 +281,7 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  function createAppWithProjects(projects: ProjectGroup[]) {
+  function createAppWithProjects(projects: ProjectGroup[], codingCliProviders = [claudeProvider]) {
     app = express()
     app.use(express.json())
     app.use('/api', (req, res, next) => {
@@ -282,7 +298,7 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
         getProjects: () => projects,
         refresh: vi.fn().mockResolvedValue(undefined),
       },
-      codingCliProviders: [claudeProvider],
+      codingCliProviders,
       perfConfig: { slowSessionRefreshMs: 500 },
       terminalMetadata: {
         list: () => [],
@@ -419,5 +435,47 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(res.status).toBe(200)
     expect(res.body.items).toHaveLength(1)
     expect(res.body.items[0].matchedIn).toBe('assistantMessage')
+  })
+
+  it('searches Kimi transcripts through the HTTP route while honoring metadata-backed title and archive state', async () => {
+    const kimiProvider = new KimiProvider(kimiFixtureShareDir)
+
+    createAppWithProjects([{
+      projectPath: '/repo/root',
+      sessions: [{
+        provider: 'kimi',
+        sessionId: 'kimi-session-1',
+        projectPath: '/repo/root',
+        lastActivityAt: 100,
+        title: 'Pinned title from metadata',
+        archived: true,
+        sourceFile: kimiFixtureSessionFile,
+      }],
+    }], [kimiProvider])
+
+    const userRes = await request(app)
+      .get('/api/session-directory?priority=visible&query=visible-user-token-kimi&tier=userMessages')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+    expect(userRes.status).toBe(200)
+    expect(userRes.body.items).toHaveLength(1)
+    expect(userRes.body.items[0]).toMatchObject({
+      sessionId: 'kimi-session-1',
+      title: 'Pinned title from metadata',
+      archived: true,
+      matchedIn: 'userMessage',
+    })
+
+    const assistantRes = await request(app)
+      .get('/api/session-directory?priority=visible&query=visible-assistant-token-kimi&tier=fullText')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+    expect(assistantRes.status).toBe(200)
+    expect(assistantRes.body.items).toHaveLength(1)
+    expect(assistantRes.body.items[0].matchedIn).toBe('assistantMessage')
+
+    const hiddenRes = await request(app)
+      .get('/api/session-directory?priority=visible&query=hidden-system-token-kimi&tier=fullText')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+    expect(hiddenRes.status).toBe(200)
+    expect(hiddenRes.body.items).toHaveLength(0)
   })
 })
