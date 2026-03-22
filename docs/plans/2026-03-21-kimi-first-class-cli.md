@@ -18,6 +18,7 @@ After this lands:
 
 - Kimi appears in the pane picker when its CLI is available and enabled.
 - The Extensions settings card for Kimi shows starting directory, model, and only the permission modes Kimi actually supports: `Default` and `Bypass permissions`.
+- Kimi's model field uses Kimi-appropriate or provider-neutral example copy instead of inheriting Claude-specific placeholder text.
 - Saved Kimi settings affect later launches: model adds `--model`, bypass mode adds `--yolo`.
 - New Kimi terminals get durable session binding once the indexed Kimi session appears, so the left sidebar shows the live session under the correct project and marks it running.
 - Indexed Kimi sessions show up after server restart because Freshell can discover them from disk, not just from live terminals.
@@ -45,12 +46,13 @@ After this lands:
 9. Rotated backup and subagent transcript files such as `context_N.jsonl` and `context_sub_N.jsonl` are not top-level sessions. Only `context.jsonl` (or the legacy flat transcript) is authoritative for indexing/search.
 10. Kimi remains terminal-mode only in this task. Upstream `--print --output-format stream-json` does not expose the session-identifying event stream Freshell would need for `CodingCliSessionManager`, so `supportsLiveStreaming()` stays `false`.
 11. The generic permission-mode UI must never advertise unsupported Kimi choices. Kimi may only surface `default` and `bypassPermissions`; `bypassPermissions` must launch `--yolo`.
-12. `modeSupportsResume('kimi')` must not become true until the same task that registers the Kimi session provider. Do not create a mid-plan state where built-in Kimi advertises resume support but still lacks provider wiring.
-13. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
-14. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
-15. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
-16. The fallback command specs in `server/terminal-registry.ts` are only a compatibility seed for tests and pre-bootstrap instances. Kimi-specific launch behavior must be proven against the manifest-compiled command specs that server startup actually registers.
-17. "First class" includes live index refresh, not only cold-start discovery. Updating `metadata.json`, `wire.jsonl`, or the authoritative transcript path must trigger a direct-provider refresh quickly enough for sidebar visibility and association, rather than relying on the periodic full scan.
+12. When a provider exposes only a permission-mode subset, the settings UI must coerce any persisted unsupported value back to `default` before rendering. Do not render a controlled `<select>` with a value outside its option set.
+13. `modeSupportsResume('kimi')` must not become true until the same task that registers the Kimi session provider. Do not create a mid-plan state where built-in Kimi advertises resume support but still lacks provider wiring.
+14. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
+15. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
+16. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
+17. The fallback command specs in `server/terminal-registry.ts` are only a compatibility seed for tests and pre-bootstrap instances. Kimi-specific launch behavior must be proven against the manifest-compiled command specs that server startup actually registers.
+18. "First class" includes live index refresh, not only cold-start discovery. Updating `metadata.json`, `wire.jsonl`, or the authoritative transcript path must trigger a direct-provider refresh quickly enough for sidebar visibility and association, rather than relying on the periodic full scan.
 
 ## Root Cause Summary
 
@@ -106,23 +108,24 @@ No user decision is required.
 3. `shared/extension-types.ts`
 4. `server/extension-manager.ts`
 5. `src/store/managed-items.ts`
-6. `server/index.ts`
-7. `server/terminal-registry.ts`
-8. `server/spawn-spec.ts`
+6. `src/components/ExtensionsView.tsx`
+7. `server/index.ts`
+8. `server/terminal-registry.ts`
+9. `server/spawn-spec.ts`
    Dead-code consistency only. This file is not imported in production, but keep it aligned with `server/terminal-registry.ts`.
-9. `server/coding-cli/session-indexer.ts`
-10. `test/unit/server/extension-manifest.test.ts`
-11. `test/unit/server/extension-manager.test.ts`
-12. `test/unit/client/store/managed-items.test.ts`
-13. `test/unit/client/components/ExtensionsView.test.tsx`
-14. `test/e2e/directory-picker-flow.test.tsx`
-15. `test/unit/server/coding-cli/session-indexer.test.ts`
-16. `test/unit/server/session-directory/service.test.ts`
-17. `test/integration/server/session-directory-router.test.ts`
-18. `test/unit/server/terminal-registry.test.ts`
-19. `test/server/session-association.test.ts`
-20. `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
-21. `docs/index.html`
+10. `server/coding-cli/session-indexer.ts`
+11. `test/unit/server/extension-manifest.test.ts`
+12. `test/unit/server/extension-manager.test.ts`
+13. `test/unit/client/store/managed-items.test.ts`
+14. `test/unit/client/components/ExtensionsView.test.tsx`
+15. `test/e2e/directory-picker-flow.test.tsx`
+16. `test/unit/server/coding-cli/session-indexer.test.ts`
+17. `test/unit/server/session-directory/service.test.ts`
+18. `test/integration/server/session-directory-router.test.ts`
+19. `test/unit/server/terminal-registry.test.ts`
+20. `test/server/session-association.test.ts`
+21. `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
+22. `docs/index.html`
 
 ### Files Expected To Stay Unchanged
 
@@ -143,6 +146,7 @@ Those paths already consume provider/indexed-session data generically or are exp
 - Modify: `shared/extension-types.ts`
 - Modify: `server/extension-manager.ts`
 - Modify: `src/store/managed-items.ts`
+- Modify: `src/components/ExtensionsView.tsx`
 - Modify: `server/index.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `server/spawn-spec.ts`
@@ -231,7 +235,7 @@ it('derives supported permission modes for client registry entries', async () =>
 
 ```ts
 // test/unit/client/store/managed-items.test.ts
-it('filters Kimi permission options to the supported subset while still exposing model and cwd', () => {
+it('filters Kimi permission options to the supported subset and coerces unsupported saved values back to default', () => {
   const kimiExt: ClientExtensionEntry = {
     name: 'kimi',
     version: '1.0.0',
@@ -248,10 +252,11 @@ it('filters Kimi permission options to the supported subset while still exposing
   const items = selectManagedItems(makeState({
     entries: [kimiExt],
     enabledProviders: ['kimi'],
-    providers: { kimi: { model: 'moonshot-k2', permissionMode: 'bypassPermissions' } },
+    providers: { kimi: { model: 'moonshot-k2', permissionMode: 'plan' } },
   }))
 
   const permission = items[0].config.find((field) => field.key === 'permissionMode')
+  expect(permission?.value).toBe('default')
   expect(permission?.options?.map((option) => option.value)).toEqual(['default', 'bypassPermissions'])
 })
 ```
@@ -268,7 +273,7 @@ it('adds Kimi model and yolo args when configured', () => {
 })
 ```
 
-Add `ExtensionsView` coverage that expanding the Kimi card shows model, permission mode, and starting directory, and that choosing `bypassPermissions` PATCHes `codingCli.providers.kimi.permissionMode`.
+Add `ExtensionsView` coverage that expanding the Kimi card shows model, permission mode, and starting directory, that choosing `bypassPermissions` PATCHes `codingCli.providers.kimi.permissionMode`, and that the Kimi model input no longer shows Claude-specific placeholder text. Use a concrete assertion (`e.g. moonshot-k2` or another provider-appropriate/generic placeholder decided in the implementation) so the settings copy regression is pinned.
 
 - [ ] **Step 2: Run the new tests and confirm they are red**
 
@@ -283,7 +288,8 @@ Expected:
 - `extension-manifest` fails because `permissionModeArgsByValue` is unknown.
 - `command-specs` fails because server startup still has no tested path that compiles `permissionModeArgsByValue` into runtime command specs.
 - `extension-manager` fails because the client registry does not expose `supportedPermissionModes`.
-- `managed-items` and `ExtensionsView` fail because Kimi still shows only the default permission list or only the starting-directory field.
+- `managed-items` fails because Kimi still exposes unsupported saved permission values instead of coercing them back to `default`.
+- `ExtensionsView` fails because Kimi still shows only the default permission list or still inherits Claude-specific model placeholder copy.
 - `terminal-registry` fails because Kimi does not emit `--model` / `--yolo`.
 
 - [ ] **Step 3: Implement the minimal launch/settings contract**
@@ -325,7 +331,8 @@ Implementation rules:
   - else if it has `permissionModeValues` but no generic arg template, use `['default', ...mapped values in canonical order]`
   - else if `supportsPermissionMode` is true, expose the full canonical list
 - `shared/extension-types.ts`: add `supportedPermissionModes?: string[]` to the serialized client CLI block. Do not expose raw `permissionModeArgsByValue` to the client.
-- `src/store/managed-items.ts`: build permission options from `ext.cli.supportedPermissionModes ?? CLAUDE_PERMISSION_MODE_VALUES`.
+- `src/store/managed-items.ts`: build permission options from `ext.cli.supportedPermissionModes ?? CLAUDE_PERMISSION_MODE_VALUES`, and coerce any stored permission mode not present in that option set back to `default` before rendering the field value.
+- `src/components/ExtensionsView.tsx`: replace the current `codex ? ... : claude` model placeholder branch with a tiny helper so Kimi gets provider-appropriate or generic placeholder copy instead of inheriting Claude text.
 - `server/terminal-registry.ts`: update the Kimi fallback spec with `modelArgs` and `permissionModeArgsByValue`.
 - `server/spawn-spec.ts`: mirror the same Kimi fallback changes with a comment noting it is dead-code consistency only.
 
@@ -347,6 +354,7 @@ Refactor for clarity only:
 
 - keep permission-mode derivation in one helper in `server/extension-manager.ts`
 - keep the client registry shape minimal
+- keep model placeholder selection in one helper in `src/components/ExtensionsView.tsx`; do not scatter provider-name checks across JSX
 - confirm Kimi settings now affect launch args without changing resume behavior
 
 Then re-run the task suite:
@@ -360,7 +368,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add extensions/kimi/freshell.json server/coding-cli/command-specs.ts server/extension-manifest.ts shared/extension-types.ts server/extension-manager.ts src/store/managed-items.ts server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
+git add extensions/kimi/freshell.json server/coding-cli/command-specs.ts server/extension-manifest.ts shared/extension-types.ts server/extension-manager.ts src/store/managed-items.ts src/components/ExtensionsView.tsx server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
 git commit -m "feat: add Kimi launch settings metadata"
 ```
 
