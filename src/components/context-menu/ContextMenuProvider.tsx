@@ -12,6 +12,7 @@ import {
   resetSplit,
   splitPane as splitPaneAction,
   swapSplit,
+  updatePaneTitle,
 } from '@/store/panesSlice'
 import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
@@ -49,6 +50,7 @@ import {
   copyAgentChatFilePath,
 } from './agent-chat-copy'
 import { nanoid } from 'nanoid'
+import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
@@ -452,6 +454,8 @@ export function ContextMenuProvider({
     const providerSettings = agentConfig
       ? appSettings.agentChat?.providers?.[agentConfig.name]
       : undefined
+    const title = session.title || session.sessionId.slice(0, 8)
+    const previousActivePaneId = store.getState().panes.activePane[activeTabId]
     dispatch(addPane({
       tabId: activeTabId,
       newContent: buildResumeContent({
@@ -467,8 +471,17 @@ export function ContextMenuProvider({
         agentChatProviderSettings: providerSettings,
       }),
     }))
+    const nextActivePaneId = store.getState().panes.activePane[activeTabId]
+    if (nextActivePaneId && nextActivePaneId !== previousActivePaneId) {
+      dispatch(updatePaneTitle({
+        tabId: activeTabId,
+        paneId: nextActivePaneId,
+        title,
+        source: 'stable',
+      }))
+    }
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab, localServerInstanceId])
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab, localServerInstanceId, store])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -483,10 +496,13 @@ export function ContextMenuProvider({
     }
     try {
       const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
-      await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
+      const result = await api.patch<{ cascadedTerminalId?: string }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
         titleOverride: title || undefined,
         summaryOverride: summary,
       })
+      if (result.cascadedTerminalId && title) {
+        dispatch(syncPaneTitleByTerminalId({ terminalId: result.cascadedTerminalId, title }))
+      }
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
@@ -699,9 +715,8 @@ export function ContextMenuProvider({
         titleOverride: title || undefined,
         descriptionOverride: description || undefined,
       })
-      const existing = tabsState.tabs.find((t) => t.terminalId === terminalId)
-      if (existing && title) {
-        dispatch(updateTab({ id: existing.id, updates: { title, source: 'stable' } }))
+      if (title) {
+        dispatch(syncPaneTitleByTerminalId({ terminalId, title }))
       }
     } catch {
       // ignore

@@ -130,12 +130,16 @@ export class LayoutStore {
 
     if (content.kind === 'agent-chat') {
       switch (content.provider) {
+        case 'freshclaude':
+          return 'Freshclaude'
+        case 'kilroy':
+          return 'Kilroy'
         case 'claude':
           return 'Claude'
         case 'codex':
           return 'Codex'
         default:
-          return 'Agent'
+          return 'Agent Chat'
       }
     }
 
