@@ -1196,7 +1196,12 @@ export const panesSlice = createSlice({
 
     updatePaneContent: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string; content: PaneContentInput | PaneContent }>
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        content: PaneContentInput | PaneContent
+        clearRuntimeTitle?: boolean
+      }>
     ) => {
       const { tabId, paneId, content } = action.payload
       const root = state.layouts[tabId]

@@ -16,11 +16,19 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import {
   persistMiddleware,
   resetPersistFlushListenersForTests,
 } from '@/store/persistMiddleware'
 import { parsePersistedTabsRaw } from '@/store/persistedState'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  { name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli' },
+  { name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli' },
+  { name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli' },
+]
 
 function makeStore() {
   return configureStore({
@@ -256,5 +264,69 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     expect(parsed).not.toBeNull()
     expect(parsed!.tabs.tabs.find((tab) => tab.id === 'shell-tab')?.titleSource).toBe('derived')
     expect(parsed!.tabs.tabs.find((tab) => tab.id === 'session-tab')?.titleSource).toBe('stable')
+  })
+
+  it.each([
+    { mode: 'claude', title: 'Claude CLI' },
+    { mode: 'codex', title: 'Codex CLI' },
+    { mode: 'opencode', title: 'OpenCode' },
+  ])('keeps legacy CLI label "$title" derived when persisting with extension metadata', ({ mode, title }) => {
+    const tabId = `${mode}-tab`
+    const paneId = `${mode}-pane`
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, extensions: extensionsReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            createRequestId: tabId,
+            title,
+            titleSetByUser: false,
+            status: 'running',
+            mode,
+            shell: 'system',
+            createdAt: 1,
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: {
+            [tabId]: {
+              type: 'leaf',
+              id: paneId,
+              content: {
+                kind: 'terminal',
+                createRequestId: paneId,
+                status: 'running',
+                mode,
+                shell: 'system',
+              },
+            },
+          },
+          activePane: { [tabId]: paneId },
+          paneTitles: { [tabId]: { [paneId]: title } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+        extensions: {
+          entries: defaultCliExtensions,
+        },
+      },
+    })
+
+    store.dispatch(updateTab({ id: tabId, updates: { description: 'extension title rewrite' } }))
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem('freshell.tabs.v2')
+    expect(raw).not.toBeNull()
+    const parsed = parsePersistedTabsRaw(raw!)
+    expect(parsed?.tabs.tabs.find((tab) => tab.id === tabId)).toMatchObject({
+      title,
+      titleSource: 'derived',
+    })
   })
 })

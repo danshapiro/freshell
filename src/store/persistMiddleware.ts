@@ -15,6 +15,7 @@ import {
   inferLegacyPaneTitleSource,
   resolveEffectiveLegacyTabTitleSource,
 } from '@/lib/title-source'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 
 const log = createLogger('PanesPersist')
@@ -66,14 +67,18 @@ function stripTabVolatileFields(tab: Tab) {
   }
 }
 
-function canonicalizeTabForPersistence(tab: Tab, panes: PanesState | undefined): Tab {
+function canonicalizeTabForPersistence(
+  tab: Tab,
+  panes: PanesState | undefined,
+  extensions?: ClientExtensionEntry[],
+): Tab {
   const layout = panes?.layouts?.[tab.id]
   const paneTitle = layout?.type === 'leaf' ? panes?.paneTitles?.[tab.id]?.[layout.id] : undefined
   const paneTitleSource = layout?.type === 'leaf'
     ? panes?.paneTitleSources?.[tab.id]?.[layout.id]
       ?? inferLegacyPaneTitleSource({
         storedTitle: paneTitle,
-        derivedTitle: derivePaneTitle(layout.content),
+        derivedTitle: derivePaneTitle(layout.content, extensions),
         titleSetByUser: panes?.paneTitleSetByUser?.[tab.id]?.[layout.id],
       })
     : undefined
@@ -84,6 +89,7 @@ function canonicalizeTabForPersistence(tab: Tab, panes: PanesState | undefined):
       titleSetByUser: tab.titleSetByUser,
       mode: tab.mode,
       shell: tab.shell,
+      extensions,
     })
     ?? resolveEffectiveLegacyTabTitleSource({
       storedTitle: tab.title,
@@ -91,6 +97,7 @@ function canonicalizeTabForPersistence(tab: Tab, panes: PanesState | undefined):
       layout,
       paneTitle,
       paneTitleSource,
+      extensions,
     })
 
   return {
@@ -263,6 +270,7 @@ function inferPaneTitleSourcesByTab(
   paneTitles: Record<string, Record<string, string>>,
   paneTitleSetByUser: Record<string, Record<string, boolean>>,
   existingPaneTitleSources?: Record<string, Record<string, 'derived' | 'stable' | 'user'>>,
+  extensions?: ClientExtensionEntry[],
 ): Record<string, Record<string, 'derived' | 'stable' | 'user'>> {
   const nextSources: Record<string, Record<string, 'derived' | 'stable' | 'user'>> = {}
 
@@ -277,7 +285,7 @@ function inferPaneTitleSourcesByTab(
 
       tabSources[leaf.id] = inferLegacyPaneTitleSource({
         storedTitle: paneTitles?.[tabId]?.[leaf.id],
-        derivedTitle: derivePaneTitle(leaf.content),
+        derivedTitle: derivePaneTitle(leaf.content, extensions),
         titleSetByUser: paneTitleSetByUser?.[tabId]?.[leaf.id],
       })
     }
@@ -421,6 +429,9 @@ function loadPersistedPanesUncached(): any | null {
 type PersistState = {
   tabs: TabsState
   panes: PanesState
+  extensions?: {
+    entries: ClientExtensionEntry[]
+  }
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
@@ -437,6 +448,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
     const state = store.getState()
     const shouldWriteTabs = tabsDirty || panesDirty
+    const extensions = state.extensions?.entries
 
     if (shouldWriteTabs) {
       const tabsPayload = {
@@ -444,7 +456,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           // Persist only stable tab state. Keep ephemeral UI fields out of storage.
           activeTabId: state.tabs.activeTabId,
           tabs: state.tabs.tabs
-            .map((tab) => canonicalizeTabForPersistence(tab, state.panes))
+            .map((tab) => canonicalizeTabForPersistence(tab, state.panes, extensions))
             .map(stripTabVolatileFields),
         },
       }
@@ -478,6 +490,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
               sanitizedLayouts,
               state.panes.paneTitles || {},
               state.panes.paneTitleSetByUser || {},
+              undefined,
+              extensions,
             ),
           layouts: sanitizedLayouts,
           version: PANES_SCHEMA_VERSION,

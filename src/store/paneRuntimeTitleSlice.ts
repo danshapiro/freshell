@@ -76,6 +76,7 @@ export const paneRuntimeTitleSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(updatePaneContent, (state, action) => {
+        if (action.payload.clearRuntimeTitle === false) return
         delete state.titlesByPaneId[action.payload.paneId]
       })
       .addCase(updatePaneTitle, (state, action) => {

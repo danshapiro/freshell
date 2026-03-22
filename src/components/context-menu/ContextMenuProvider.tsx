@@ -36,7 +36,7 @@ import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import type { ContextId } from './context-menu-constants'
-import type { ContextTarget } from './context-menu-types'
+import type { ContextTarget, OverviewTerminalContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
@@ -684,13 +684,20 @@ export function ContextMenuProvider({
     await copyText(projectPath)
   }, [])
 
-  const openTerminal = useCallback((terminalId: string) => {
-    const existing = tabsState.tabs.find((t) => t.terminalId === terminalId)
+  const openTerminal = useCallback((target: OverviewTerminalContextTarget) => {
+    const existing = tabsState.tabs.find((t) => t.terminalId === target.terminalId)
     if (existing) {
       dispatch(setActiveTab(existing.id))
       return
     }
-    dispatch(addTab({ terminalId, status: 'running', mode: 'shell' }))
+    const title = target.title?.trim()
+    dispatch(addTab({
+      ...(title ? { title, titleSource: 'stable' as const } : {}),
+      terminalId: target.terminalId,
+      status: target.status ?? 'running',
+      mode: (target.mode as CodingCliProviderName | 'shell' | undefined) ?? 'shell',
+      resumeSessionId: target.resumeSessionId,
+    }))
   }, [dispatch, tabsState.tabs])
 
   const renameTerminal = useCallback(async (terminalId: string) => {

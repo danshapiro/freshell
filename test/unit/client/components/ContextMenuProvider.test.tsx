@@ -1224,6 +1224,45 @@ describe('ContextMenuProvider', () => {
     promptSpy.mockRestore()
   })
 
+  it('opens overview terminals into stable titled tabs when no attached tab exists', async () => {
+    const user = userEvent.setup()
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="overview"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.OverviewTerminal}
+            data-terminal-id="term-1"
+            data-title="Renamed Terminal"
+            data-mode="codex"
+            data-status="running"
+            data-resume-session-id={VALID_SESSION_ID}
+          >
+            Overview Terminal
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Overview Terminal'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Open/focus terminal' }))
+
+    const openedTab = store.getState().tabs.tabs.find((tab) => tab.terminalId === 'term-1')
+    expect(openedTab).toMatchObject({
+      title: 'Renamed Terminal',
+      titleSource: 'stable',
+      terminalId: 'term-1',
+      status: 'running',
+      mode: 'codex',
+      resumeSessionId: VALID_SESSION_ID,
+    })
+  })
+
   it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSidebarWindowAgentSession()

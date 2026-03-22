@@ -7,7 +7,7 @@ import panesReducer, { requestPaneRefresh, updatePaneContent } from '@/store/pan
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setServerInstanceId } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
-import paneRuntimeTitleReducer from '@/store/paneRuntimeTitleSlice'
+import paneRuntimeTitleReducer, { setPaneRuntimeTitle } from '@/store/paneRuntimeTitleSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { useAppSelector } from '@/store/hooks'
@@ -522,6 +522,7 @@ describe('TerminalView lifecycle updates', () => {
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
         settings: settingsReducer,
         connection: connectionReducer,
       },
@@ -541,6 +542,9 @@ describe('TerminalView lifecycle updates', () => {
           layouts: { [tabId]: root },
           activePane: { [tabId]: paneId },
           paneTitles: {},
+        },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
@@ -1464,6 +1468,7 @@ describe('TerminalView lifecycle updates', () => {
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
         settings: settingsReducer,
         connection: connectionReducer,
       },
@@ -1483,6 +1488,9 @@ describe('TerminalView lifecycle updates', () => {
           layouts: { [tabId]: root },
           activePane: { [tabId]: paneId },
           paneTitles: {},
+        },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
@@ -1546,6 +1554,7 @@ describe('TerminalView lifecycle updates', () => {
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
         settings: settingsReducer,
         connection: connectionReducer,
       },
@@ -1824,6 +1833,7 @@ describe('TerminalView lifecycle updates', () => {
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
         settings: settingsReducer,
         connection: connectionReducer,
       },
@@ -2742,6 +2752,7 @@ describe('TerminalView lifecycle updates', () => {
       reducer: {
         tabs: tabsReducer,
         panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
         settings: settingsReducer,
         connection: connectionReducer,
       },
@@ -2761,6 +2772,9 @@ describe('TerminalView lifecycle updates', () => {
           layouts: { [tabId]: root },
           activePane: { [tabId]: paneId },
           paneTitles: {},
+        },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
@@ -2784,6 +2798,8 @@ describe('TerminalView lifecycle updates', () => {
       terminalId: 'term-assoc',
       createdAt: Date.now(),
     })
+    store.dispatch(setPaneRuntimeTitle({ paneId, title: 'vim README.md' }))
+    expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
 
     // Simulate session association
     const sessionId = '550e8400-e29b-41d4-a716-446655440000'
@@ -2806,6 +2822,7 @@ describe('TerminalView lifecycle updates', () => {
     // Verify tab also has resumeSessionId mirrored
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
     expect(tab?.resumeSessionId).toBe(sessionId)
+    expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
   })
 
   it('clears tab terminalId and sets status to creating on INVALID_TERMINAL_ID reconnect', async () => {

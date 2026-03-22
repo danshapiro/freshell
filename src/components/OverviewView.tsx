@@ -452,6 +452,10 @@ function TerminalCard({
       aria-label={`Open terminal ${terminal.title}`}
       data-context={ContextIds.OverviewTerminal}
       data-terminal-id={terminal.terminalId}
+      data-title={terminal.title}
+      data-mode={terminal.mode}
+      data-status={terminal.status}
+      data-resume-session-id={terminal.resumeSessionId}
     >
       <div className="flex items-start gap-4">
         {/* Status */}
