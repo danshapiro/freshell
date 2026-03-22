@@ -751,7 +751,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       tabId,
       paneId,
       content: next,
-      clearRuntimeTitle: false,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
 

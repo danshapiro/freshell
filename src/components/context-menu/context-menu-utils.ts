@@ -76,16 +76,7 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
     case ContextIds.HistorySession:
       return data.sessionId ? { kind: 'history-session', sessionId: data.sessionId, provider: data.provider } : null
     case ContextIds.OverviewTerminal:
-      return data.terminalId
-        ? {
-            kind: 'overview-terminal',
-            terminalId: data.terminalId,
-            title: data.title,
-            mode: data.mode,
-            status: data.status === 'running' || data.status === 'exited' ? data.status : undefined,
-            resumeSessionId: data.resumeSessionId,
-          }
-        : null
+      return data.terminalId ? { kind: 'overview-terminal', terminalId: data.terminalId } : null
     case ContextIds.ClaudeMessage:
       return data.sessionId ? { kind: 'claude-message', sessionId: data.sessionId, provider: data.provider } : null
     case ContextIds.AgentChat:

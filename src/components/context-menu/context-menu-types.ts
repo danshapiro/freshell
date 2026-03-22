@@ -1,15 +1,6 @@
 import React from 'react'
 import type { ContextId } from './context-menu-constants'
 
-export type OverviewTerminalContextTarget = {
-  kind: 'overview-terminal'
-  terminalId: string
-  title?: string
-  mode?: string
-  status?: 'running' | 'exited'
-  resumeSessionId?: string
-}
-
 export type ContextTarget =
   | { kind: 'global' }
   | { kind: 'tab'; tabId: string }
@@ -23,7 +14,7 @@ export type ContextTarget =
   | { kind: 'sidebar-session'; sessionId: string; provider?: string; sessionType?: string; runningTerminalId?: string; hasTab?: boolean }
   | { kind: 'history-project'; projectPath: string }
   | { kind: 'history-session'; sessionId: string; provider?: string }
-  | OverviewTerminalContextTarget
+  | { kind: 'overview-terminal'; terminalId: string }
   | { kind: 'claude-message'; sessionId: string; provider?: string }
   | { kind: 'agent-chat'; sessionId: string }
 

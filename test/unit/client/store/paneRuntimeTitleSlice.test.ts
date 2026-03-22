@@ -84,21 +84,6 @@ describe('paneRuntimeTitleSlice', () => {
         mode: 'shell',
         status: 'running',
         createRequestId: 'req-1',
-        terminalId: 'term-1',
-        resumeSessionId: 'session-1',
-      },
-      clearRuntimeTitle: false,
-    }))
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({ 'pane-1': 'vim README.md' })
-
-    store.dispatch(updatePaneContent({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      content: {
-        kind: 'terminal',
-        mode: 'shell',
-        status: 'running',
-        createRequestId: 'req-1',
         terminalId: 'term-2',
       },
     }))

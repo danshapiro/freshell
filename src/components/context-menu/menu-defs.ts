@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 import { ClipboardPaste, Copy, TextSelect } from 'lucide-react'
-import type { MenuItem, ContextTarget, OverviewTerminalContextTarget } from './context-menu-types'
+import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -49,7 +49,7 @@ export type MenuActions = {
   toggleProjectExpanded: (projectPath: string, expanded: boolean) => void
   openAllSessionsInProject: (projectPath: string) => void
   copyProjectPath: (projectPath: string) => void
-  openTerminal: (target: OverviewTerminalContextTarget) => void
+  openTerminal: (terminalId: string) => void
   renameTerminal: (terminalId: string) => void
   generateTerminalSummary: (terminalId: string) => void
   deleteTerminal: (terminalId: string) => void
@@ -529,7 +529,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'overview-terminal') {
     return [
-      { type: 'item', id: 'overview-open', label: 'Open/focus terminal', onSelect: () => actions.openTerminal(target) },
+      { type: 'item', id: 'overview-open', label: 'Open/focus terminal', onSelect: () => actions.openTerminal(target.terminalId) },
       { type: 'item', id: 'overview-rename', label: 'Rename', onSelect: () => actions.renameTerminal(target.terminalId) },
       ...(ctx.aiEnabled
         ? [{ type: 'item' as const, id: 'overview-summary', label: 'Generate summary', onSelect: () => actions.generateTerminalSummary(target.terminalId) }]
