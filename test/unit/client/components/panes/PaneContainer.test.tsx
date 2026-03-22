@@ -5,7 +5,6 @@ import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
-import paneRuntimeTitleReducer, { type PaneRuntimeTitleState } from '@/store/paneRuntimeTitleSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -213,13 +212,11 @@ function createStore(
   initialConnectionState: Partial<ConnectionState> = {},
   initialSessionsState: Partial<SessionsState> = {},
   initialAgentChatState: Partial<AgentChatState> = {},
-  initialPaneRuntimeTitleState: Partial<PaneRuntimeTitleState> = {},
 ) {
   return configureStore({
     reducer: {
       panes: panesReducer,
       tabs: tabsReducer,
-      paneRuntimeTitle: paneRuntimeTitleReducer,
       settings: settingsReducer,
       connection: connectionReducer,
       extensions: extensionsReducer,
@@ -248,10 +245,6 @@ function createStore(
       tabs: {
         tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
         activeTabId: 'tab-1',
-      },
-      paneRuntimeTitle: {
-        titlesByPaneId: {},
-        ...initialPaneRuntimeTitleState,
       },
       extensions: {
         entries: defaultCliExtensions,
@@ -1265,68 +1258,6 @@ describe('PaneContainer', () => {
 
       expect(screen.getByText('Claude CLI')).toBeInTheDocument()
       expect(screen.getByText('Shell')).toBeInTheDocument()
-    })
-
-    it('shows runtime titles ahead of derived durable pane titles', () => {
-      const node: PaneNode = {
-        type: 'leaf',
-        id: 'pane-1',
-        content: createTerminalContent({ mode: 'shell' }),
-      }
-
-      const store = createStore(
-        {
-          layouts: { 'tab-1': node },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-          paneTitleSources: { 'tab-1': { 'pane-1': 'derived' } },
-        },
-        {},
-        {},
-        {},
-        {
-          titlesByPaneId: { 'pane-1': 'vim README.md' },
-        },
-      )
-
-      renderWithStore(
-        <PaneContainer tabId="tab-1" node={node} />,
-        store
-      )
-
-      expect(screen.getByText('vim README.md')).toBeInTheDocument()
-    })
-
-    it('prefills pane rename requests from the current runtime title when the durable title is derived', async () => {
-      const node: PaneNode = {
-        type: 'leaf',
-        id: 'pane-1',
-        content: createTerminalContent({ mode: 'shell' }),
-      }
-
-      const store = createStore(
-        {
-          layouts: { 'tab-1': node },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-          paneTitleSources: { 'tab-1': { 'pane-1': 'derived' } },
-          renameRequestTabId: 'tab-1',
-          renameRequestPaneId: 'pane-1',
-        },
-        {},
-        {},
-        {},
-        {
-          titlesByPaneId: { 'pane-1': 'vim README.md' },
-        },
-      )
-
-      renderWithStore(
-        <PaneContainer tabId="tab-1" node={node} />,
-        store
-      )
-
-      expect(await screen.findByLabelText('Rename pane')).toHaveValue('vim README.md')
     })
   })
 

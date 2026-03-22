@@ -5,12 +5,7 @@ import panesReducer from '@/store/panesSlice'
 import paneRuntimeTitleReducer, { setPaneRuntimeTitleByTerminalId } from '@/store/paneRuntimeTitleSlice'
 import { syncStableTitleByTerminalId } from '@/store/titleSync'
 import { getTabDisplayTitle, getTabDurableDisplayTitle } from '@/lib/tab-title'
-import {
-  normalizeRuntimeTitle,
-  resolveEffectiveLegacyTabTitleSource,
-  shouldDecorateExitTitle,
-  type DurableTitleSource,
-} from '@/lib/title-source'
+import { normalizeRuntimeTitle, shouldDecorateExitTitle, type DurableTitleSource } from '@/lib/title-source'
 
 function createStore(options?: {
   title?: string
@@ -82,18 +77,8 @@ describe('TerminalView exit title behavior', () => {
   ) {
     const state = store.getState()
     const tab = state.tabs.tabs[0]
-    const paneId = state.panes.layouts['tab-1']?.type === 'leaf'
-      ? state.panes.layouts['tab-1'].id
-      : undefined
-    const resolvedTitleSource = tab.titleSource ?? resolveEffectiveLegacyTabTitleSource({
-      storedTitle: tab.title,
-      titleSetByUser: tab.titleSetByUser,
-      layout: state.panes.layouts['tab-1'],
-      paneTitle: paneId ? state.panes.paneTitles['tab-1']?.[paneId] : undefined,
-      paneTitleSource: paneId ? state.panes.paneTitleSources?.['tab-1']?.[paneId] : undefined,
-    })
-    const updates: { status: 'exited'; title?: string; source?: DurableTitleSource } = { status: 'exited' }
-    if (shouldDecorateExitTitle(resolvedTitleSource)) {
+    const updates: { status: 'exited'; title?: string } = { status: 'exited' }
+    if (shouldDecorateExitTitle(tab.titleSource)) {
       const exitBaseTitle = getTabDurableDisplayTitle(
         tab,
         state.panes.layouts['tab-1'],
@@ -101,7 +86,6 @@ describe('TerminalView exit title behavior', () => {
         state.panes.paneTitleSources?.['tab-1'],
       )
       updates.title = `${exitBaseTitle} (exit ${exitCode})`
-      updates.source = 'derived'
     }
     store.dispatch(updateTab({ id: tab.id, updates }))
   }
@@ -133,62 +117,6 @@ describe('TerminalView exit title behavior', () => {
       status: 'exited',
     })
     expect(getDisplayTitle(store)).toBe('project (exit 1)')
-  })
-
-  it('stamps decorated legacy titles as derived so runtime precedence survives migration paths', () => {
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        paneRuntimeTitle: paneRuntimeTitleReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [{
-            id: 'tab-1',
-            mode: 'shell' as const,
-            status: 'running' as const,
-            title: 'Tab 1',
-            titleSetByUser: false,
-            createRequestId: 'req-1',
-            createdAt: 1,
-          }],
-          activeTabId: 'tab-1',
-        },
-        panes: {
-          layouts: {
-            'tab-1': {
-              type: 'leaf',
-              id: 'pane-1',
-              content: {
-                kind: 'terminal',
-                mode: 'shell',
-                shell: 'system',
-                terminalId: 'term-1',
-                initialCwd: '/tmp/project',
-              },
-            },
-          },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: {},
-          paneTitleSources: {},
-          paneTitleSetByUser: {},
-        },
-        paneRuntimeTitle: {
-          titlesByPaneId: {},
-        },
-      },
-    })
-
-    expect(getDisplayTitle(store as ReturnType<typeof createStore>)).toBe('project')
-
-    applyExitTitle(store as ReturnType<typeof createStore>, 1)
-
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'project (exit 1)',
-      titleSource: 'derived',
-      status: 'exited',
-    })
   })
 
   it('keeps a stable durable title plain on exit', () => {
