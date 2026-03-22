@@ -33,18 +33,6 @@ type ResolveEffectiveLegacyTabTitleSourceInput = {
   extensions?: ClientExtensionEntry[]
 }
 
-type ResolveDurableTabTitleSourceInput = {
-  titleSource?: DurableTitleSource
-  title?: string
-  titleSetByUser?: boolean
-  mode?: TabMode
-  shell?: ShellType
-  layout?: PaneNode
-  paneTitle?: string
-  paneTitleSource?: DurableTitleSource
-  extensions?: ClientExtensionEntry[]
-}
-
 type InferLegacyPaneTitleSourceInput = {
   storedTitle?: string
   derivedTitle: string
@@ -140,31 +128,6 @@ export function resolveEffectiveLegacyTabTitleSource(
   }
 
   return 'stable'
-}
-
-export function resolveDurableTabTitleSource(
-  input: ResolveDurableTabTitleSourceInput,
-): DurableTitleSource | undefined {
-  if (input.titleSource) return input.titleSource
-
-  if (input.layout) {
-    return resolveEffectiveLegacyTabTitleSource({
-      storedTitle: input.title,
-      titleSetByUser: input.titleSetByUser,
-      layout: input.layout,
-      paneTitle: input.paneTitle,
-      paneTitleSource: input.paneTitleSource,
-      extensions: input.extensions,
-    })
-  }
-
-  return bootstrapLegacyTabTitleSource({
-    title: input.title,
-    titleSetByUser: input.titleSetByUser,
-    mode: input.mode,
-    shell: input.shell,
-    extensions: input.extensions,
-  })
 }
 
 export function inferLegacyPaneTitleSource(

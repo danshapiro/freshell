@@ -204,36 +204,6 @@ describe('TabContent', () => {
         expect.anything(),
       )
     })
-
-    it('does not seed durable pane title metadata when reconstructed pane context proves a legacy title is derived', () => {
-      const store = createStore([
-        {
-          id: 'tab-1',
-          mode: 'claude',
-          title: 'Freshclaude',
-          resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
-          sessionMetadataByKey: {
-            'claude:550e8400-e29b-41d4-a716-446655440000': {
-              sessionType: 'freshclaude',
-            },
-          },
-        },
-      ])
-
-      render(
-        <Provider store={store}>
-          <TabContent tabId="tab-1" />
-        </Provider>
-      )
-
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultPaneTitle: undefined,
-          defaultPaneTitleSource: undefined,
-        }),
-        expect.anything(),
-      )
-    })
   })
 
   describe('coding CLI sessions', () => {

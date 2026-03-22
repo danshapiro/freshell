@@ -3,9 +3,9 @@ import { PaneLayout } from './panes'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
-import type { PaneContent, PaneContentInput, PaneNode } from '@/store/paneTypes'
+import type { PaneContentInput } from '@/store/paneTypes'
 import {
-  resolveDurableTabTitleSource,
+  bootstrapLegacyTabTitleSource,
   type DurableTitleSource,
 } from '@/lib/title-source'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -117,22 +117,15 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
     }
   }
 
-  const defaultLayout: PaneNode | undefined = defaultContent.kind === 'picker'
-    ? undefined
-    : {
-      type: 'leaf',
-      id: '__tab-content-default__',
-      content: defaultContent as PaneContent,
-    }
-  const defaultPaneTitleSource: DurableTitleSource | undefined = resolveDurableTabTitleSource({
-    titleSource: tab.titleSource,
-    title: tab.title,
-    titleSetByUser: tab.titleSetByUser,
-    mode: tab.mode,
-    shell: tab.shell,
-    layout: defaultLayout,
-    extensions: extensionEntries,
-  })
+  const defaultPaneTitleSource: DurableTitleSource | undefined = tab.titleSource
+    ?? bootstrapLegacyTabTitleSource({
+      title: tab.title,
+      titleSetByUser: tab.titleSetByUser,
+      mode: tab.mode,
+      shell: tab.shell,
+      extensions: extensionEntries,
+    })
+    ?? (tab.titleSetByUser ? 'user' : 'stable')
   const defaultPaneTitle = defaultPaneTitleSource && defaultPaneTitleSource !== 'derived'
     ? tab.title
     : undefined

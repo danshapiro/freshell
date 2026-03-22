@@ -52,7 +52,7 @@ import {
 } from '@/lib/terminal-attach-seq-state'
 import {
   normalizeRuntimeTitle,
-  resolveDurableTabTitleSource,
+  resolveEffectiveLegacyTabTitleSource,
   shouldDecorateExitTitle,
   type DurableTitleSource,
 } from '@/lib/title-source'
@@ -142,17 +142,16 @@ function resolveTabTitleSourceForLifecycle(input: {
   extensions?: any[]
 }) {
   const paneId = input.layout?.type === 'leaf' ? input.layout.id : undefined
-  return resolveDurableTabTitleSource({
-    titleSource: input.tab.titleSource,
-    title: input.tab.title,
-    titleSetByUser: input.tab.titleSetByUser,
-    mode: input.tab.mode,
-    shell: input.tab.shell,
-    layout: input.layout,
-    paneTitle: paneId ? input.paneTitles?.[paneId] : undefined,
-    paneTitleSource: paneId ? input.paneTitleSources?.[paneId] : undefined,
-    extensions: input.extensions,
-  })
+  return input.tab.titleSource
+    ?? resolveEffectiveLegacyTabTitleSource({
+      storedTitle: input.tab.title,
+      titleSetByUser: input.tab.titleSetByUser,
+      layout: input.layout,
+      paneTitle: paneId ? input.paneTitles?.[paneId] : undefined,
+      paneTitleSource: paneId ? input.paneTitleSources?.[paneId] : undefined,
+      extensions: input.extensions,
+    })
+    ?? (input.tab.titleSetByUser ? 'user' : 'stable')
 }
 
 function createNoopRuntime(): TerminalRuntime {
@@ -735,10 +734,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Helper to update pane content - uses ref to avoid recreation on content changes
   // This is CRITICAL: if updateContent depended on terminalContent directly,
   // it would be recreated on every status update, causing the effect to re-run
-  const updateContent = useCallback((
-    updates: Partial<TerminalPaneContent>,
-    options?: { clearRuntimeTitle?: boolean },
-  ) => {
+  const updateContent = useCallback((updates: Partial<TerminalPaneContent>) => {
     const current = contentRef.current
     if (!current) return
     const next = { ...current, ...updates }
@@ -752,15 +748,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       })
     }
     contentRef.current = next
-    const clearsTerminalIdentity =
-      ('terminalId' in updates && updates.terminalId !== current.terminalId)
-      || ('createRequestId' in updates && updates.createRequestId !== current.createRequestId)
-    const clearRuntimeTitle = options?.clearRuntimeTitle ?? (clearsTerminalIdentity ? undefined : false)
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: next,
-      clearRuntimeTitle,
+      clearRuntimeTitle: false,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
 

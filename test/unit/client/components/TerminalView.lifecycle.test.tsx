@@ -4323,44 +4323,6 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    it('clears the runtime title when terminal.created replaces the backend terminal id', async () => {
-      const { requestId, term, store, paneId, tabId } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-v2-runtime-title-created-rebind',
-      })
-
-      const titleListener = term.onTitleChange.mock.calls[0]?.[0]
-      expect(titleListener).toBeTypeOf('function')
-
-      act(() => {
-        titleListener('vim README.md')
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.created',
-          requestId,
-          terminalId: 'term-v2-runtime-title-created-rebound',
-          createdAt: Date.now(),
-        })
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBeUndefined()
-        expect(store.getState().panes.layouts[tabId]).toMatchObject({
-          type: 'leaf',
-          content: {
-            terminalId: 'term-v2-runtime-title-created-rebound',
-            status: 'running',
-          },
-        })
-      })
-    })
-
     it('restores the same runtime title after exit followed by pane recreation', async () => {
       const { terminalId, term, store, paneId, tabId, rerender } = await renderTerminalHarness({
         status: 'running',
