@@ -6,6 +6,11 @@ it('creates a new tab with a terminal pane', () => {
   const result = store.createTab({ title: 'alpha', terminalId: 'term_1' })
   expect(result.tabId).toBeDefined()
   expect(result.paneId).toBeDefined()
+  expect(store.listPanes(result.tabId)).toEqual([
+    expect.objectContaining({ id: result.paneId, kind: 'terminal', terminalId: 'term_1', title: 'alpha' }),
+  ])
+  expect((store as any).snapshot.paneTitles[result.tabId][result.paneId]).toBe('alpha')
+  expect((store as any).snapshot.paneTitleSources[result.tabId][result.paneId]).toBe('stable')
 })
 
 it('selects pane even when provided tabId is invalid', () => {

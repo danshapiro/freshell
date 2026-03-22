@@ -470,7 +470,15 @@ export class LayoutStore {
     }
     snapshot.activeTabId = tabId
     snapshot.activePane[tabId] = paneId
-    this.seedPaneTitle(tabId, paneId, content)
+    if (title) {
+      const paneTitleMaps = this.getPaneTitleMaps(tabId)
+      if (paneTitleMaps) {
+        paneTitleMaps.paneTitles[paneId] = title
+        this.setPaneTitleSource(tabId, paneId, 'stable')
+      }
+    } else {
+      this.seedPaneTitle(tabId, paneId, content)
+    }
     return { tabId, paneId }
   }
 

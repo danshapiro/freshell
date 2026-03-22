@@ -80,6 +80,7 @@ import {
 } from '@/components/terminal/terminal-runtime'
 import { createLayoutScheduler } from '@/components/terminal/layout-scheduler'
 import { createTerminalWriteQueue, type TerminalWriteQueue } from '@/components/terminal/terminal-write-queue'
+import { getTabDurableDisplayTitle } from '@/lib/tab-title'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal } from '@xterm/xterm'
@@ -1982,7 +1983,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               extensions: extensionEntriesRef.current,
             })
             if (shouldDecorateExitTitle(exitTitleSource)) {
-              updates.title = exitTab.title + (code !== undefined ? ` (exit ${code})` : '')
+              const exitBaseTitle = getTabDurableDisplayTitle(
+                exitTab,
+                tabLayoutRef.current,
+                paneTitlesRef.current,
+                paneTitleSourcesRef.current,
+                extensionEntriesRef.current,
+              )
+              updates.title = exitBaseTitle + (code !== undefined ? ` (exit ${code})` : '')
             }
             dispatch(updateTab({ id: exitTab.id, updates }))
           }

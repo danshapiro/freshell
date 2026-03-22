@@ -1,5 +1,13 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import {
+  initLayout,
+  splitPane,
+  setActivePane,
+  updatePaneContent,
+  resizePanes,
+  swapPanes,
+  updatePaneTitle,
+} from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
@@ -118,6 +126,8 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
           tabId: msg.payload.id,
           paneId: msg.payload.paneId,
           content: hydrateUiCommandPaneContent(msg.payload.paneContent, localServerInstanceId)!,
+          title: msg.payload.title,
+          titleSource: msg.payload.title ? 'stable' : undefined,
         }))
       }
       return
