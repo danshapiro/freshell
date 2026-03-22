@@ -701,7 +701,7 @@ export function ContextMenuProvider({
       })
       const existing = tabsState.tabs.find((t) => t.terminalId === terminalId)
       if (existing && title) {
-        dispatch(updateTab({ id: existing.id, updates: { title } }))
+        dispatch(updateTab({ id: existing.id, updates: { title, source: 'stable' } }))
       }
     } catch {
       // ignore

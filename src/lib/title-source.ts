@@ -146,7 +146,13 @@ export function normalizeRuntimeTitle(title: string | null | undefined): string 
   if (!trimmedTitle) return null
 
   const normalizedTitle = trimmedTitle.replace(BRAILLE_SPINNER_PREFIX, '').trim()
-  return normalizedTitle || null
+  const contentStart = normalizedTitle.match(/[\p{L}\p{N}]/u)
+  if (!contentStart?.index && contentStart?.index !== 0) {
+    return null
+  }
+
+  const cleanedTitle = normalizedTitle.slice(contentStart.index).trim()
+  return cleanedTitle || null
 }
 
 export function shouldDecorateExitTitle(source: DurableTitleSource | undefined): boolean {

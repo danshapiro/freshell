@@ -47,6 +47,14 @@ export class TestHarness {
     })
   }
 
+  async syncStableTitleByTerminalId(terminalId: string, title: string): Promise<void> {
+    await this.page.evaluate(({ id, nextTitle }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      harness.syncStableTitleByTerminalId(id, nextTitle)
+    }, { id: terminalId, nextTitle: title })
+  }
+
   /**
    * Get terminal buffer content via the xterm.js buffer API.
    * This works with all renderers (WebGL, canvas, DOM) unlike DOM scraping.

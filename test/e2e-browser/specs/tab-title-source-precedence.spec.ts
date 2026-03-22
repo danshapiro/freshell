@@ -56,12 +56,7 @@ test.describe('Tab title source precedence', () => {
     const tabs = page.locator('[data-context="tab"]')
     const secondTab = tabs.nth(1)
 
-    await page.evaluate(({ terminalId, title }) => {
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'panes/updatePaneTitleByTerminalId',
-        payload: { terminalId, title, setByUser: false },
-      })
-    }, { terminalId: secondTerminalId, title: durableTitle })
+    await harness.syncStableTitleByTerminalId(secondTerminalId!, durableTitle)
 
     await expect(secondTab).toContainText(durableTitle)
 

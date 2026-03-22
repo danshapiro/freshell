@@ -248,7 +248,14 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: 'shell' }))
+                        dispatch(addTab({
+                          title: t.title,
+                          titleSource: 'stable',
+                          terminalId: t.terminalId,
+                          status: 'running',
+                          mode: (t.mode as any) || 'shell',
+                          resumeSessionId: t.resumeSessionId,
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
@@ -258,7 +265,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         })
                         const existing = tabs.find((x) => x.terminalId === t.terminalId)
                         if (existing && title) {
-                          dispatch(updateTab({ id: existing.id, updates: { title } }))
+                          dispatch(updateTab({ id: existing.id, updates: { title, source: 'stable' } }))
                         }
                         await refresh()
                       }}
@@ -304,7 +311,14 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'exited', mode: 'shell' }))
+                        dispatch(addTab({
+                          title: t.title,
+                          titleSource: 'stable',
+                          terminalId: t.terminalId,
+                          status: 'exited',
+                          mode: (t.mode as any) || 'shell',
+                          resumeSessionId: t.resumeSessionId,
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {

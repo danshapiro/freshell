@@ -1,5 +1,6 @@
 import type { store as appStore } from '@/store/store'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
+import { syncStableTitleByTerminalId } from '@/store/titleSync'
 
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
@@ -15,6 +16,7 @@ export interface FreshellTestHarness {
   getTerminalBuffer: (terminalId?: string) => string | null
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
+  syncStableTitleByTerminalId: (terminalId: string, title: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
   clearSentWsMessages?: () => void
@@ -98,6 +100,9 @@ export function installTestHarness(
     },
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
+    },
+    syncStableTitleByTerminalId: (terminalId: string, title: string) => {
+      store.dispatch(syncStableTitleByTerminalId({ terminalId, title }) as any)
     },
     getPerfAuditSnapshot,
     getSentWsMessages: () => [...sentWsMessages],

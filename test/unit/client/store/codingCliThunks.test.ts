@@ -54,6 +54,7 @@ describe('codingCliThunks', () => {
     expect(tab.codingCliSessionId).toBeDefined()
     expect(tab.status).toBe('creating')
     expect(tab.mode).toBe('codex')
+    expect(tab.titleSource).toBe('stable')
 
     await Promise.resolve()
 

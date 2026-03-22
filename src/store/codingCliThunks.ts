@@ -22,6 +22,7 @@ export const createCodingCliTab = createAsyncThunk(
     dispatch(
       addTab({
         title: prompt.slice(0, 30) + (prompt.length > 30 ? '...' : ''),
+        titleSource: 'stable',
         mode: provider,
         status: 'creating',
         initialCwd: cwd,

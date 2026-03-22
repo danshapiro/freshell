@@ -364,6 +364,7 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(addTab({
       id: tabId,
       title: record.tabName,
+      titleSource: 'stable',
       mode: deriveModeFromRecord(record),
       status: 'creating',
     }))
@@ -390,6 +391,7 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(addTab({
       id: tabId,
       title: `${record.tabName} · ${pane.title || pane.kind}`,
+      titleSource: 'stable',
       mode: deriveModeFromRecord(record),
       status: 'creating',
     }))

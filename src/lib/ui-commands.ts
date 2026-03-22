@@ -103,6 +103,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       dispatch(addTab({
         id: msg.payload.id,
         title: msg.payload.title,
+        titleSource: msg.payload.title ? 'stable' : undefined,
         mode: msg.payload.mode,
         shell: msg.payload.shell,
         terminalId: msg.payload.terminalId,

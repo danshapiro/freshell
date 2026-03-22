@@ -10,13 +10,19 @@ import {
 } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { consumePaneRefreshRequest, splitPane, updatePaneContent } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
+import {
+  clearPaneRuntimeTitleByTerminalId,
+  setPaneRuntimeTitle,
+  setPaneRuntimeTitleByTerminalId,
+} from '@/store/paneRuntimeTitleSlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
+import { syncStableTitleByTerminalId } from '@/store/titleSync'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeTarget } from '@/components/terminal-view-utils'
@@ -44,6 +50,11 @@ import {
   onOutputGap,
   type AttachSeqState,
 } from '@/lib/terminal-attach-seq-state'
+import {
+  normalizeRuntimeTitle,
+  resolveEffectiveLegacyTabTitleSource,
+  shouldDecorateExitTitle,
+} from '@/lib/title-source'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
@@ -75,6 +86,7 @@ import { Terminal } from '@xterm/xterm'
 import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
+import type { Tab } from '@/store/types'
 import '@xterm/xterm/css/xterm.css'
 import { createLogger } from '@/lib/client-logger'
 import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
@@ -102,6 +114,26 @@ const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
+
+function resolveTabTitleSourceForLifecycle(input: {
+  tab: Tab
+  layout: any
+  paneTitles?: Record<string, string>
+  paneTitleSources?: Record<string, any>
+  extensions?: any[]
+}) {
+  const paneId = input.layout?.type === 'leaf' ? input.layout.id : undefined
+  return input.tab.titleSource
+    ?? resolveEffectiveLegacyTabTitleSource({
+      storedTitle: input.tab.title,
+      titleSetByUser: input.tab.titleSetByUser,
+      layout: input.layout,
+      paneTitle: paneId ? input.paneTitles?.[paneId] : undefined,
+      paneTitleSource: paneId ? input.paneTitleSources?.[paneId] : undefined,
+      extensions: input.extensions,
+    })
+    ?? (input.tab.titleSetByUser ? 'user' : 'stable')
 }
 
 function createNoopRuntime(): TerminalRuntime {
@@ -211,10 +243,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
+  const tabLayout = useAppSelector((s) => s.panes.layouts[tabId])
+  const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId])
+  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources?.[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
+  const extensionEntries = useAppSelector((s) => (s as any).extensions?.entries ?? [])
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
   const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])
@@ -1255,6 +1291,26 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     tabRef.current = tab
   }, [tab])
 
+  const tabLayoutRef = useRef(tabLayout)
+  useEffect(() => {
+    tabLayoutRef.current = tabLayout
+  }, [tabLayout])
+
+  const paneTitlesRef = useRef(paneTitles)
+  useEffect(() => {
+    paneTitlesRef.current = paneTitles
+  }, [paneTitles])
+
+  const paneTitleSourcesRef = useRef(paneTitleSources)
+  useEffect(() => {
+    paneTitleSourcesRef.current = paneTitleSources
+  }, [paneTitleSources])
+
+  const extensionEntriesRef = useRef(extensionEntries)
+  useEffect(() => {
+    extensionEntriesRef.current = extensionEntries
+  }, [extensionEntries])
+
   // Ref for paneId to avoid stale closures in title handlers
   const paneIdRef = useRef(paneId)
   useEffect(() => {
@@ -1273,10 +1329,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!term) return
 
     const disposable = term.onTitleChange((rawTitle: string) => {
-      // Strip prefix noise (spinners, status chars) - everything before first letter
-      const match = rawTitle.match(/[a-zA-Z]/)
-      if (!match) return // No letters = all noise, ignore
-      const cleanTitle = rawTitle.slice(match.index)
+      const cleanTitle = normalizeRuntimeTitle(rawTitle)
       if (!cleanTitle) return
 
       // Only update if the cleaned title actually changed
@@ -1289,18 +1342,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       lastTitleRef.current = cleanTitle
       lastTitleUpdateRef.current = now
 
-      // Tab and pane titles are independently guarded:
-      // - Tab title gated by tab.titleSetByUser
-      // - Pane title gated by paneTitleSetByUser (in the reducer)
-      const currentTab = tabRef.current
-      if (currentTab && !currentTab.titleSetByUser) {
-        dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
+      const currentTerminalId = terminalIdRef.current ?? contentRef.current?.terminalId
+      if (currentTerminalId) {
+        dispatch(setPaneRuntimeTitleByTerminalId({ terminalId: currentTerminalId, title: cleanTitle }))
+        return
       }
-      dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle, setByUser: false }))
+      dispatch(setPaneRuntimeTitle({ paneId: paneIdRef.current, title: cleanTitle }))
     })
 
     return () => disposable.dispose()
-  }, [isTerminal, dispatch, tabId])
+  }, [isTerminal, dispatch])
 
   const markAttachComplete = useCallback(() => {
     deferredAttachStateRef.current = {
@@ -1844,6 +1895,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             pendingSinceSeq: 0,
           }
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+          dispatch(clearPaneRuntimeTitleByTerminalId({ terminalId: tid }))
           clearTerminalCursor(tid)
           forgetSentViewport(tid)
           lastSentViewportRef.current = null
@@ -1858,23 +1910,23 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const exitTab = tabRef.current
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
-            // Only modify title if user hasn't manually set it
             const updates: { terminalId: undefined; status: 'exited'; title?: string } = { terminalId: undefined, status: 'exited' }
-            if (!exitTab.titleSetByUser) {
+            const exitTitleSource = resolveTabTitleSourceForLifecycle({
+              tab: exitTab,
+              layout: tabLayoutRef.current,
+              paneTitles: paneTitlesRef.current,
+              paneTitleSources: paneTitleSourcesRef.current,
+              extensions: extensionEntriesRef.current,
+            })
+            if (shouldDecorateExitTitle(exitTitleSource)) {
               updates.title = exitTab.title + (code !== undefined ? ` (exit ${code})` : '')
             }
             dispatch(updateTab({ id: exitTab.id, updates }))
           }
         }
 
-        // Auto-update title from Claude session
-        // Tab and pane titles are independently guarded
         if (msg.type === 'terminal.title.updated' && msg.terminalId === tid && msg.title) {
-          const titleTab = tabRef.current
-          if (titleTab && !titleTab.titleSetByUser) {
-            dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
-          }
-          dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+          dispatch(syncStableTitleByTerminalId({ terminalId: tid, title: msg.title }))
         }
 
         // Handle one-time session association (when Claude creates a new session)
@@ -1994,6 +2046,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             clearTerminalCursor(currentTerminalId)
             forgetSentViewport(currentTerminalId)
             lastSentViewportRef.current = null
+            dispatch(clearPaneRuntimeTitleByTerminalId({ terminalId: currentTerminalId }))
             terminalIdRef.current = undefined
             deferredAttachStateRef.current = {
               mode: 'none',
