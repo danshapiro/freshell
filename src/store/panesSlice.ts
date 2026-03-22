@@ -2,12 +2,12 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
+import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 
 
 const log = createLogger('PanesSlice')
@@ -24,17 +24,8 @@ function normalizePaneContent(
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
+    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any)
     const resumeSessionId = inputResumeSessionId
-    const explicitSessionRef = input.sessionRef
-      && typeof input.sessionRef.provider === 'string'
-      && typeof input.sessionRef.sessionId === 'string'
-      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
-      ? input.sessionRef
-      : undefined
-    const sessionRef = explicitSessionRef
-      ?? (resumeSessionId && mode !== 'shell'
-        ? { provider: mode, sessionId: resumeSessionId }
-        : undefined)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -45,7 +36,7 @@ function normalizePaneContent(
       mode,
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
-      ...(sessionRef ? { sessionRef } : {}),
+      ...(explicitSessionRef ? { sessionRef: explicitSessionRef } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }
   }
@@ -63,16 +54,7 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
-    const explicitSessionRef = input.sessionRef
-      && typeof input.sessionRef.provider === 'string'
-      && typeof input.sessionRef.sessionId === 'string'
-      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
-      ? input.sessionRef
-      : undefined
-    const sessionRef = explicitSessionRef
-      ?? (input.resumeSessionId && isValidClaudeSessionId(input.resumeSessionId)
-        ? { provider: 'claude' as const, sessionId: input.resumeSessionId }
-        : undefined)
+    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any)
     return {
       kind: 'agent-chat',
       provider: input.provider,
@@ -80,7 +62,7 @@ function normalizePaneContent(
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
-      ...(sessionRef ? { sessionRef } : {}),
+      ...(explicitSessionRef ? { sessionRef: explicitSessionRef } : {}),
       initialCwd: input.initialCwd,
       model: input.model,
       permissionMode: input.permissionMode,
@@ -468,6 +450,27 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
         ) {
           return { ...incoming, content: local.content }
         }
+        const localExactSessionRef = sanitizeExactSessionRef(local.content.sessionRef as any)
+        const incomingExactSessionRef = sanitizeExactSessionRef(incoming.content.sessionRef as any)
+        if (
+          localExactSessionRef &&
+          (
+            !incomingExactSessionRef
+            || incomingExactSessionRef.provider !== localExactSessionRef.provider
+            || incomingExactSessionRef.sessionId !== localExactSessionRef.sessionId
+            || incomingExactSessionRef.serverInstanceId !== localExactSessionRef.serverInstanceId
+          )
+        ) {
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: localExactSessionRef.sessionId,
+              sessionRef: localExactSessionRef,
+            },
+          }
+        }
+
         // Guard resumeSessionId: if the local pane has a session and incoming
         // differs, preserve the local session. resumeSessionId is pane identity
         // (which Claude session this pane represents) and must not be silently
@@ -476,7 +479,13 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
           local.content.resumeSessionId &&
           incoming.content.resumeSessionId !== local.content.resumeSessionId
         ) {
-          return { ...incoming, content: { ...incoming.content, resumeSessionId: local.content.resumeSessionId } }
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+            },
+          }
         }
       } else if (local.content.status === 'creating') {
         // Different createRequestId and local is reconnecting: local just

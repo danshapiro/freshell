@@ -8,8 +8,9 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 
 // Hoist mock functions so vi.mock can reference them
-const { mockPaneLayout } = vi.hoisted(() => ({
+const { mockPaneLayout, addTerminalRestoreRequestId } = vi.hoisted(() => ({
   mockPaneLayout: vi.fn(() => <div data-testid="pane-layout" />),
+  addTerminalRestoreRequestId: vi.fn(),
 }))
 
 // Mock PaneLayout to capture props
@@ -22,6 +23,10 @@ vi.mock('@/components/SessionView', () => ({
   default: () => <div data-testid="session-view" />,
 }))
 
+vi.mock('@/lib/terminal-restore', () => ({
+  addTerminalRestoreRequestId,
+}))
+
 interface TabConfig {
   id: string
   mode: string
@@ -29,6 +34,7 @@ interface TabConfig {
   codingCliSessionId?: string
   resumeSessionId?: string
   sessionMetadataByKey?: Record<string, unknown>
+  createRequestId?: string
 }
 
 interface StoreOptions {
@@ -60,7 +66,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
           sessionMetadataByKey: t.sessionMetadataByKey,
-          createRequestId: 'req-1',
+          createRequestId: t.createRequestId || 'req-1',
         })),
         activeTabId: tabs[0]?.id,
       },
@@ -79,6 +85,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
 describe('TabContent', () => {
   beforeEach(() => {
     mockPaneLayout.mockClear()
+    addTerminalRestoreRequestId.mockClear()
   })
 
   afterEach(() => {
@@ -187,6 +194,36 @@ describe('TabContent', () => {
             kind: 'agent-chat',
             provider: 'freshclaude',
             resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+          }),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it('reuses tab.createRequestId for degraded no-layout coding restore requests', () => {
+      const store = createStore([
+        {
+          id: 'tab-restore',
+          mode: 'codex',
+          resumeSessionId: 'codex-session-123',
+          createRequestId: 'req-restore',
+        },
+      ])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-restore" />
+        </Provider>
+      )
+
+      expect(addTerminalRestoreRequestId).toHaveBeenCalledWith('req-restore')
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-restore',
+            resumeSessionId: 'codex-session-123',
           }),
         }),
         expect.anything(),

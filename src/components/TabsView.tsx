@@ -23,6 +23,7 @@ import { isNonShellMode } from '@/lib/coding-cli-utils'
 import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
@@ -30,17 +31,10 @@ type ScopeMode = 'all' | 'local' | 'remote'
 type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
-  if (!value || typeof value !== 'object') return undefined
-  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown }
-  if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
-    return undefined
-  }
-  if (typeof candidate.sessionId !== 'string') return undefined
-  return {
-    provider: candidate.provider as CodingCliProviderName,
-    sessionId: candidate.sessionId,
-    ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
-  }
+  const explicit = sanitizeExactSessionRef(value as any)
+  if (!explicit) return undefined
+  if (!isNonShellMode(explicit.provider)) return undefined
+  return explicit
 }
 
 function resolveSessionRef(options: {
@@ -52,11 +46,11 @@ function resolveSessionRef(options: {
   const explicit = parseSessionLocator(options.payload.sessionRef)
   if (explicit) return explicit
   if (!options.fallbackProvider || !options.fallbackSessionId) return undefined
-  return {
+  return buildExactSessionRef({
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
-    ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
-  }
+    serverInstanceId: options.fallbackServerInstanceId,
+  })
 }
 
 function sanitizePaneSnapshot(

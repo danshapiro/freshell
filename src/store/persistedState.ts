@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { migratePersistedPaneNode } from './persisted-pane-migration'
 
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
@@ -95,7 +96,12 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
 
   return {
     version,
-    layouts: (res.data.layouts || {}) as Record<string, unknown>,
+    layouts: Object.fromEntries(
+      Object.entries((res.data.layouts || {}) as Record<string, unknown>).map(([tabId, node]) => [
+        tabId,
+        migratePersistedPaneNode(node),
+      ]),
+    ),
     activePane: (res.data.activePane || {}) as Record<string, string>,
     paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,

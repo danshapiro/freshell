@@ -4,7 +4,7 @@ import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type { AgentChatPaneInput, SessionLocator, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export interface SessionTypeConfig {
@@ -47,6 +47,7 @@ export function buildResumeContent(opts: {
   sessionId: string
   cwd?: string
   terminalId?: string
+  sessionRef?: SessionLocator
   agentChatProviderSettings?: {
     defaultModel?: string
     defaultPermissionMode?: string
@@ -60,6 +61,7 @@ export function buildResumeContent(opts: {
       kind: 'agent-chat',
       provider: agentConfig.name as AgentChatProviderName,
       resumeSessionId: opts.sessionId,
+      ...(opts.sessionRef ? { sessionRef: opts.sessionRef } : {}),
       initialCwd: opts.cwd,
       model: ps?.defaultModel ?? agentConfig.defaultModel,
       permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,
@@ -74,6 +76,7 @@ export function buildResumeContent(opts: {
     kind: 'terminal',
     mode: provider,
     resumeSessionId: opts.sessionId,
+    ...(opts.sessionRef ? { sessionRef: opts.sessionRef } : {}),
     initialCwd: opts.cwd,
     terminalId: opts.terminalId,
     status: opts.terminalId ? 'running' as const : 'creating' as const,

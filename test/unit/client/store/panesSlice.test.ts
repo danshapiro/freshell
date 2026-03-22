@@ -1938,6 +1938,66 @@ describe('panesSlice', () => {
       expect(content.resumeSessionId).toBe('session-A')
     })
 
+    it('keeps the local exact sessionRef authoritative when incoming conflicts for the same createRequestId', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'creating',
+              resumeSessionId: 'session-A',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'session-A',
+                serverInstanceId: 'srv-local',
+              },
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'remote-t1',
+              resumeSessionId: 'session-B',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'session-B',
+                serverInstanceId: 'srv-remote',
+              },
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const content = (state.layouts['tab-1'] as any).content
+
+      expect(content.resumeSessionId).toBe('session-A')
+      expect(content.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'session-A',
+        serverInstanceId: 'srv-local',
+      })
+      expect(content.terminalId).toBe('remote-t1')
+    })
+
     it('preserves local resumeSessionId inside split pane trees', () => {
       const localState: PanesState = {
         layouts: {

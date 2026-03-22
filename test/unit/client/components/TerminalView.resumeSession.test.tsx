@@ -124,7 +124,7 @@ describe('TerminalView resumeSessionId', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -189,7 +189,7 @@ describe('TerminalView resumeSessionId', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -218,6 +218,11 @@ describe('TerminalView resumeSessionId', () => {
       if (content?.type !== 'leaf') throw new Error('unexpected layout')
       if (content.content.kind !== 'terminal') throw new Error('unexpected content')
       expect(content.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(content.content.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        serverInstanceId: 'srv-local',
+      })
     })
   })
 })

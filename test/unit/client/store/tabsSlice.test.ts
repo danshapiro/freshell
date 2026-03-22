@@ -650,6 +650,42 @@ describe('tabsSlice', () => {
       expect(tabs[0].mode).toBe('claude')
     })
 
+    it('creates a layout-backed terminal pane immediately for PTY-backed coding sessions', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      await store.dispatch(openSessionTab({ sessionId: 'codex-session-123', provider: 'codex' }))
+
+      const tab = store.getState().tabs.tabs[0]
+      const layout = store.getState().panes.layouts[tab.id]
+      expect(layout).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          resumeSessionId: 'codex-session-123',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-123',
+            serverInstanceId: 'srv-local',
+          },
+        },
+      })
+    })
+
+    it('keeps named claude resumes compatibility-only when opening a PTY-backed session', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'named-claude-resume',
+        provider: 'claude',
+      }))
+
+      const tab = store.getState().tabs.tabs[0]
+      const layout = store.getState().panes.layouts[tab.id] as any
+      expect(layout.content.resumeSessionId).toBe('named-claude-resume')
+      expect(layout.content.sessionRef).toBeUndefined()
+    })
+
     it('persists session metadata on newly opened tabs for fallback filtering and restored session type', async () => {
       const store = configureStore({
         reducer: {

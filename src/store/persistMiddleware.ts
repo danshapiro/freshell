@@ -8,6 +8,7 @@ import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import { PANES_SCHEMA_VERSION } from './persistedState.js'
 import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
+import { migratePersistedPaneContent } from './persisted-pane-migration'
 
 
 const log = createLogger('PanesPersist')
@@ -96,17 +97,25 @@ function migratePaneContent(content: any): any {
       devToolsOpen: typeof content.devToolsOpen === 'boolean' ? content.devToolsOpen : false,
     }
   }
-  if (content.kind !== 'terminal') {
-    return content
+  if (content.kind === 'terminal') {
+    const migrated = migratePersistedPaneContent(content) as Record<string, unknown>
+    return {
+      ...migrated,
+      createRequestId: migrated.createRequestId || nanoid(),
+      status: migrated.status || 'creating',
+      mode: migrated.mode || 'shell',
+      shell: migrated.shell || 'system',
+    }
   }
-
-  return {
-    ...content,
-    createRequestId: content.createRequestId || nanoid(),
-    status: content.status || 'creating',
-    mode: content.mode || 'shell',
-    shell: content.shell || 'system',
+  if (content.kind === 'agent-chat') {
+    const migrated = migratePersistedPaneContent(content) as Record<string, unknown>
+    return {
+      ...migrated,
+      createRequestId: migrated.createRequestId || nanoid(),
+      status: migrated.status || 'creating',
+    }
   }
+  return content
 }
 
 function stripEditorContent(content: any): any {

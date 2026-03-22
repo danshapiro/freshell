@@ -102,6 +102,7 @@ function extractSessionLocators(content: PaneContent): Array<{
   const explicit = extractExplicitSessionLocator(content)
   if (explicit) {
     locators.push(explicit)
+    return dedupeBy(locators, locatorIdentity)
   }
 
   if (content.kind === 'agent-chat') {

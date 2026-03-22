@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
+import connectionReducer, { setServerInstanceId } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { useAppSelector } from '@/store/hooks'
@@ -1845,6 +1845,148 @@ describe('TerminalView lifecycle updates', () => {
       const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
       expect(createCalls.length).toBeGreaterThan(0)
       expect(createCalls[0][0].restore).toBe(true)
+    })
+  })
+
+  it('waits for the local server instance id before restoring an exact coding session', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-restore-codex'
+    const paneId = 'pane-restore-codex'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-restore-codex',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      resumeSessionId: 'codex-session-123',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-local',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-restore-codex',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: undefined },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+    act(() => {
+      store.dispatch(setServerInstanceId('srv-local'))
+    })
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-restore-codex',
+        resumeSessionId: 'codex-session-123',
+        restore: true,
+      }))
+    })
+  })
+
+  it('blocks restore when a coding pane cannot prove exact local identity', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-restore-foreign'
+    const paneId = 'pane-restore-foreign'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-restore-foreign',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      resumeSessionId: 'codex-session-123',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-remote',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-restore-foreign',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
+      expect(createCalls).toHaveLength(0)
+      expect(terminalInstances[0].writeln).toHaveBeenCalledWith(
+        expect.stringContaining('[Restore blocked: exact session identity missing]'),
+      )
     })
   })
 

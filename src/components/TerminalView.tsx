@@ -19,7 +19,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
-import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
+import { getResumeTarget } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
@@ -69,6 +69,7 @@ import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
 import '@xterm/xterm/css/xterm.css'
 import { createLogger } from '@/lib/client-logger'
+import { buildExactSessionRef } from '@/lib/exact-session-ref'
 
 const log = createLogger('TerminalView')
 
@@ -285,6 +286,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Refs for terminal lifecycle (only meaningful if isTerminal)
   // CRITICAL: Use refs to avoid callback/effect dependency on changing content
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
+  const createAttemptRef = useRef<{ requestId: string; handled: boolean }>({
+    requestId: terminalContent?.createRequestId || '',
+    handled: false,
+  })
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const attachCounterRef = useRef(0)
@@ -361,6 +366,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         applySeqState(createAttachSeqState({ lastSeq: initialSeq }))
       }
       requestIdRef.current = terminalContent.createRequestId
+      if (createAttemptRef.current.requestId !== terminalContent.createRequestId) {
+        createAttemptRef.current = {
+          requestId: terminalContent.createRequestId,
+          handled: false,
+        }
+      }
       contentRef.current = terminalContent
     }
   }, [terminalContent, paneId, applySeqState])
@@ -377,11 +388,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // 3. The useEffect fires when terminalId transitions from undefined to a
   //    real value, which is exactly when we can register the buffer
   useEffect(() => {
-    const tid = terminalContent?.terminalId
-    if (!window.__FRESHELL_TEST_HARNESS__ || !tid) return
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) return
+    const bufferKey = terminalContent?.terminalId ?? `pane:${paneId}`
 
-    window.__FRESHELL_TEST_HARNESS__.registerTerminalBuffer(
-      tid,
+    harness.registerTerminalBuffer(
+      bufferKey,
       () => {
         const t = termRef.current
         if (!t) return ''
@@ -396,9 +408,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     )
 
     return () => {
-      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(bufferKey)
     }
-  }, [terminalContent?.terminalId])
+  }, [paneId, terminalContent?.terminalId])
 
   useEffect(() => {
     hiddenRef.current = hidden
@@ -1374,6 +1386,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
   }, [suppressNetworkEffects, ws, applySeqState])
 
+  const createIdentityGateKey = terminalContent?.terminalId ? null : (localServerInstanceId ?? '__unknown__')
+
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
     if (!request) return false
@@ -1441,9 +1455,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         })
         return
       }
-      requestTerminalLayout({ fit: true, resize: true })
+      // Revealed panes already have stable geometry, so flush layout work
+      // immediately instead of relying on a later animation frame.
+      layoutSchedulerRef.current?.cancel()
+      const pending = pendingLayoutWorkRef.current
+      pending.fit = true
+      pending.resize = true
+      flushScheduledLayout()
     }
-  }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
+  }, [hidden, isTerminal, attachTerminal, flushScheduledLayout])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1482,18 +1502,61 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       return restoreFlagRef.current
     }
 
-    const sendCreate = (requestId: string) => {
+    const blockRestore = () => {
+      const staleTerminalId = terminalIdRef.current
+      if (staleTerminalId) {
+        clearTerminalCursor(staleTerminalId)
+        forgetSentViewport(staleTerminalId)
+        lastSentViewportRef.current = null
+      }
+      terminalIdRef.current = undefined
+      deferredAttachStateRef.current = {
+        mode: 'none',
+        pendingIntent: null,
+        pendingSinceSeq: 0,
+      }
+      applySeqState(createAttachSeqState())
+      dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+      updateContent({ terminalId: undefined, status: 'error' })
+      term.writeln('\r\n[Restore blocked: exact session identity missing]\r\n')
+      const currentTab = tabRef.current
+      if (currentTab) {
+        dispatch(updateTab({
+          id: currentTab.id,
+          updates: {
+            terminalId: undefined,
+            status: 'error',
+          },
+        }))
+      }
+    }
+
+    const sendCreate = (requestId: string): 'sent' | 'wait' | 'blocked' => {
       const restore = getRestoreFlag(requestId)
-      const resumeId = getResumeSessionIdFromRef(contentRef)
+      const resumeTarget = getResumeTarget({
+        restore,
+        mode,
+        sessionRef: contentRef.current?.sessionRef,
+        mirroredResumeSessionId: contentRef.current?.resumeSessionId,
+        localServerInstanceId,
+      })
+      if (resumeTarget.kind === 'wait') {
+        return 'wait'
+      }
+      if (resumeTarget.kind === 'blocked') {
+        blockRestore()
+        return 'blocked'
+      }
       if (handledCreatedMessageRef.current?.requestId === requestId) {
         handledCreatedMessageRef.current = null
       }
       if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
-        resumeSessionId: resumeId,
+        resumeSessionId: resumeTarget.resumeSessionId,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
+        restore,
       })
       ws.send({
         type: 'terminal.create',
@@ -1501,11 +1564,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         mode,
         shell: shell || 'system',
         cwd: initialCwd,
-        resumeSessionId: resumeId,
+        resumeSessionId: resumeTarget.resumeSessionId,
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
       })
+      return 'sent'
     }
 
     const scheduleRateLimitRetry = (requestId: string) => {
@@ -1695,14 +1759,30 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
-          updateContent({ terminalId: newId, status: 'running' })
+          const exactSessionRef = msg.effectiveResumeSessionId && mode !== 'shell'
+            ? buildExactSessionRef({
+                provider: mode,
+                sessionId: msg.effectiveResumeSessionId,
+                serverInstanceId: localServerInstanceId,
+              })
+            : undefined
+          updateContent({
+            terminalId: newId,
+            status: 'running',
+            ...(msg.effectiveResumeSessionId ? { resumeSessionId: msg.effectiveResumeSessionId } : {}),
+            ...(exactSessionRef ? { sessionRef: exactSessionRef } : {}),
+          })
           // Also update tab for title purposes
           const currentTab = tabRef.current
           if (currentTab) {
-            dispatch(updateTab({ id: currentTab.id, updates: { terminalId: newId, status: 'running' } }))
-          }
-          if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
-            updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
+            dispatch(updateTab({
+              id: currentTab.id,
+              updates: {
+                terminalId: newId,
+                status: 'running',
+                ...(msg.effectiveResumeSessionId ? { resumeSessionId: msg.effectiveResumeSessionId } : {}),
+              },
+            }))
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))
@@ -1771,11 +1851,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           })
           const mode = contentRef.current?.mode
           const sessionRef = mode && mode !== 'shell'
-            ? {
-              provider: mode,
-              sessionId,
-              ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
-            }
+            ? buildExactSessionRef({
+                provider: mode,
+                sessionId,
+                serverInstanceId: localServerInstanceId,
+              })
             : undefined
           updateContent({
             resumeSessionId: sessionId,
@@ -1905,9 +1985,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
       if (currentTerminalId) {
         if (hiddenRef.current) {
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live'
-            ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
-            : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
+          const deferred = deferredAttachStateRef.current
+          if (deferred.mode === 'live' || (deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent)) {
+            setIsAttaching(false)
+            return
+          }
+          deferredAttachStateRef.current = {
+            mode: 'waiting_for_geometry',
+            pendingIntent: 'viewport_hydrate',
+            pendingSinceSeq: 0,
+          }
           setIsAttaching(false)
         } else {
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
@@ -1921,7 +2008,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           pendingIntent: null,
           pendingSinceSeq: 0,
         }
-        sendCreate(createRequestId)
+        if (
+          createAttemptRef.current.requestId !== createRequestId
+          || !createAttemptRef.current.handled
+        ) {
+          createAttemptRef.current = {
+            requestId: createRequestId,
+            handled: false,
+          }
+          const createOutcome = sendCreate(createRequestId)
+          if (createOutcome !== 'wait') {
+            createAttemptRef.current.handled = true
+          }
+        }
       }
     }
 
@@ -1954,6 +2053,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     paneId,
     suppressNetworkEffects,
     terminalContent?.createRequestId,
+    createIdentityGateKey,
     updateContent,
     ws,
     dispatch,

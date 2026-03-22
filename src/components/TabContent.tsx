@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import { PaneLayout } from './panes'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
@@ -7,6 +7,8 @@ import type { PaneContentInput } from '@/store/paneTypes'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getTabResumeSessionType } from '@/lib/session-metadata'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 interface TabContentProps {
   tabId: string
@@ -15,6 +17,7 @@ interface TabContentProps {
 
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
   const previousHiddenRef = useRef(hidden)
 
@@ -25,6 +28,18 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
     getInstalledPerfAuditBridge()?.mark('tab.selected_surface_visible', { tabId })
   }, [hidden, tabId])
 
+  const resumeSessionType = tab ? getTabResumeSessionType(tab) : undefined
+  const isNoLayoutPtyCodingRestore = !layout
+    && tab?.mode !== 'shell'
+    && !tab?.terminalId
+    && !tab?.codingCliSessionId
+    && !getAgentChatProviderConfig(resumeSessionType || '')
+
+  useLayoutEffect(() => {
+    if (!isNoLayoutPtyCodingRestore || !tab) return
+    addTerminalRestoreRequestId(tab.createRequestId)
+  }, [isNoLayoutPtyCodingRestore, tab?.createRequestId])
+
   if (!tab) return null
 
   // For coding CLI session views with no terminal, use SessionView
@@ -34,7 +49,6 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   // Build default content based on setting
   let defaultContent: PaneContentInput
-  const resumeSessionType = getTabResumeSessionType(tab)
 
   if (tab.terminalId) {
     defaultContent = {
@@ -44,6 +58,16 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       resumeSessionId: tab.resumeSessionId,
       initialCwd: tab.initialCwd,
       terminalId: tab.terminalId,
+    }
+  } else if (isNoLayoutPtyCodingRestore) {
+    defaultContent = {
+      kind: 'terminal',
+      mode: tab.mode,
+      shell: tab.shell,
+      createRequestId: tab.createRequestId,
+      status: 'creating',
+      resumeSessionId: tab.resumeSessionId,
+      initialCwd: tab.initialCwd,
     }
   } else if (tab.resumeSessionId && resumeSessionType) {
     defaultContent = buildResumeContent({

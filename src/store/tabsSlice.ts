@@ -20,6 +20,7 @@ import type { RootState } from './store'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
+import { buildExactSessionRef } from '@/lib/exact-session-ref'
 
 
 const log = createLogger('TabsSlice')
@@ -385,6 +386,11 @@ export const openSessionTab = createAsyncThunk(
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
+      sessionRef: buildExactSessionRef({
+        provider: resolvedProvider,
+        sessionId,
+        serverInstanceId: localServerInstanceId,
+      }),
       agentChatProviderSettings: providerSettings,
     })
 
@@ -508,13 +514,19 @@ export const openSessionTab = createAsyncThunk(
       return
     }
 
+    const tabId = nanoid()
     dispatch(addTab({
+      id: tabId,
       title: title || getProviderLabel(resolvedProvider, extensions),
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
       resumeSessionId: sessionId,
       sessionMetadataByKey: buildSessionMetadataByKey(),
+    }))
+    dispatch(initLayout({
+      tabId,
+      content: desiredResumeContent,
     }))
   }
 )

@@ -154,4 +154,51 @@ describe('TabsView', () => {
       serverInstanceId: 'srv-remote',
     })
   })
+
+  it('does not fabricate an exact sessionRef from a named claude resume when reopening on the same server', () => {
+    const store = createStore()
+    store.dispatch(setServerInstanceId('srv-local'))
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [],
+      closed: [{
+        tabKey: 'local:named-claude',
+        tabId: 'closed-named-claude',
+        serverInstanceId: 'srv-local',
+        deviceId: 'remote',
+        deviceLabel: 'remote-device',
+        tabName: 'named claude',
+        status: 'closed',
+        revision: 2,
+        createdAt: 1,
+        updatedAt: 2,
+        closedAt: 3,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-claude',
+          kind: 'terminal',
+          payload: {
+            mode: 'claude',
+            resumeSessionId: 'named-claude-resume',
+          },
+        }],
+      }],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const card = screen.getByText('remote-device: named claude').closest('article')
+    expect(card).toBeTruthy()
+    fireEvent.click(within(card as HTMLElement).getByText('Open copy'))
+
+    const newTab = store.getState().tabs.tabs.find((tab) => tab.title === 'named claude')
+    const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
+    expect(layout?.content?.resumeSessionId).toBe('named-claude-resume')
+    expect(layout?.content?.sessionRef).toBeUndefined()
+  })
 })
