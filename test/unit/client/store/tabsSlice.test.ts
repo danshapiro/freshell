@@ -586,7 +586,7 @@ describe('tabsSlice', () => {
       expect(state.tabs.activeTabId).toBe(localTab?.id)
     })
 
-    it('activates an id-less local fallback before websocket ready instead of a foreign copied tab', async () => {
+    it('creates a new local tab before websocket ready instead of activating a foreign copied tab or no-layout mirror', async () => {
       const store = createOpenSessionStore()
 
       store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
@@ -608,8 +608,20 @@ describe('tabsSlice', () => {
       await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
 
       const state = store.getState()
-      expect(state.tabs.tabs).toHaveLength(2)
-      expect(state.tabs.activeTabId).toBe('local-fallback')
+      expect(state.tabs.tabs).toHaveLength(3)
+      const localTab = state.tabs.tabs.find((tab) => (
+        tab.id !== 'foreign-tab' && tab.id !== 'local-fallback'
+      ))
+      expect(localTab?.resumeSessionId).toBe('shared')
+      expect(state.tabs.activeTabId).toBe(localTab?.id)
+      expect(state.panes.layouts[localTab!.id]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          resumeSessionId: 'shared',
+        },
+      })
     })
 
     it('activates existing tab when a pane already owns the session', async () => {
@@ -714,13 +726,21 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('enriches an existing tab when reopening the same session with session metadata', async () => {
+    it('enriches an existing layout-backed tab when reopening the same session with session metadata', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
         id: 'local-fallback',
         mode: 'claude',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'local-fallback',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
       }))
 
       await store.dispatch(openSessionTab({
