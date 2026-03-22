@@ -4,6 +4,7 @@ import {
   bootstrapLegacyTabTitleSource,
   inferLegacyPaneTitleSource,
   normalizeRuntimeTitle,
+  resolveDurableTabTitleSource,
   resolveEffectiveLegacyTabTitleSource,
   shouldDecorateExitTitle,
   shouldReplaceDurableTitleSource,
@@ -33,6 +34,17 @@ const singleCodexPane: PaneNode = {
   },
 }
 
+const freshclaudePane: PaneNode = {
+  type: 'leaf',
+  id: 'pane-freshclaude',
+  content: {
+    kind: 'agent-chat',
+    provider: 'freshclaude',
+    createRequestId: 'req-freshclaude',
+    status: 'running',
+  },
+}
+
 describe('title-source helpers', () => {
   it('replaces durable titles when the next source has equal precedence', () => {
     expect(shouldReplaceDurableTitleSource('stable', 'stable')).toBe(true)
@@ -57,6 +69,27 @@ describe('title-source helpers', () => {
         titleSetByUser: false,
       }),
     ).toBeUndefined()
+  })
+
+  it('keeps non-obvious legacy titles unresolved until pane or layout context exists', () => {
+    expect(
+      resolveDurableTabTitleSource({
+        title: 'Freshclaude',
+        mode: 'claude',
+        titleSetByUser: false,
+      }),
+    ).toBeUndefined()
+  })
+
+  it('resolves non-obvious legacy titles once pane or layout context proves they are derived', () => {
+    expect(
+      resolveDurableTabTitleSource({
+        title: 'Freshclaude',
+        mode: 'claude',
+        titleSetByUser: false,
+        layout: freshclaudePane,
+      }),
+    ).toBe('derived')
   })
 
   it('resolves a legacy single-shell tab title as derived when it still matches the layout default', () => {
