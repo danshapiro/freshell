@@ -122,12 +122,20 @@ function TabLabelsFromStore() {
   const tabs = useAppSelector((state) => state.tabs.tabs)
   const layouts = useAppSelector((state) => state.panes.layouts)
   const paneTitles = useAppSelector((state) => state.panes.paneTitles)
+  const paneTitleSources = useAppSelector((state) => state.panes.paneTitleSources)
+  const paneRuntimeTitles = useAppSelector((state) => state.paneRuntimeTitle.titlesByPaneId)
 
   return (
     <>
       {tabs.map((tab) => (
         <div key={tab.id} data-testid={`tab-label-${tab.id}`}>
-          {getTabDisplayTitle(tab, layouts[tab.id], paneTitles[tab.id])}
+          {getTabDisplayTitle(
+            tab,
+            layouts[tab.id],
+            paneTitles[tab.id],
+            paneTitleSources?.[tab.id],
+            paneRuntimeTitles,
+          )}
         </div>
       ))}
     </>
@@ -321,6 +329,7 @@ describe('TerminalView lifecycle updates', () => {
         panes: panesReducer,
         settings: settingsReducer,
         connection: connectionReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
       },
       preloadedState: {
         tabs: {
@@ -590,6 +599,7 @@ describe('TerminalView lifecycle updates', () => {
         panes: panesReducer,
         settings: settingsReducer,
         connection: connectionReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
       },
       preloadedState: {
         tabs: {
@@ -1622,6 +1632,7 @@ describe('TerminalView lifecycle updates', () => {
         panes: panesReducer,
         settings: settingsReducer,
         connection: connectionReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
       },
       preloadedState: {
         tabs: {
@@ -1643,6 +1654,9 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
+        },
       },
     })
 
@@ -1698,6 +1712,7 @@ describe('TerminalView lifecycle updates', () => {
         panes: panesReducer,
         settings: settingsReducer,
         connection: connectionReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
       },
       preloadedState: {
         tabs: {
@@ -1736,6 +1751,9 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
+        },
       },
     })
 
