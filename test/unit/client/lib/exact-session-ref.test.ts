@@ -45,6 +45,20 @@ describe('exact-session-ref', () => {
     })).toBeUndefined()
   })
 
+  it('refuses to synthesize exact refs for providers without authoritative resume support', () => {
+    expect(buildExactSessionRef({
+      provider: 'gemini',
+      sessionId: 'gemini-session-123',
+      serverInstanceId: 'srv-local',
+    })).toBeUndefined()
+
+    expect(buildExactSessionRef({
+      provider: 'kimi',
+      sessionId: 'kimi-session-123',
+      serverInstanceId: 'srv-local',
+    })).toBeUndefined()
+  })
+
   it('sanitizes explicit refs using the same provider-aware exactness rule', () => {
     expect(sanitizeExactSessionRef({
       provider: 'codex',
@@ -65,6 +79,12 @@ describe('exact-session-ref', () => {
     expect(sanitizeExactSessionRef({
       provider: 'codex',
       sessionId: 'codex-session-123',
+    })).toBeUndefined()
+
+    expect(sanitizeExactSessionRef({
+      provider: 'gemini',
+      sessionId: 'gemini-session-123',
+      serverInstanceId: 'srv-local',
     })).toBeUndefined()
   })
 

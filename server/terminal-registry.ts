@@ -119,6 +119,11 @@ export function modeSupportsResume(mode: TerminalMode): boolean {
   return !!codingCliCommands.get(mode)?.resumeArgs
 }
 
+function modeSupportsExactLaunch(mode: TerminalMode): boolean {
+  if (mode !== 'claude') return false
+  return !!codingCliCommands.get(mode)?.launchArgs
+}
+
 type ProviderTarget = 'unix' | 'windows'
 
 const DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-orchestration')
@@ -1096,7 +1101,7 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
-    const launchSessionId = opts.mode === 'claude' && !resumeForSpawn
+    const launchSessionId = modeSupportsExactLaunch(opts.mode) && !resumeForSpawn
       ? randomUUID()
       : undefined
 

@@ -247,4 +247,62 @@ describe('TabsView', () => {
       serverInstanceId: 'srv-local',
     })
   })
+
+  it('drops mirrored resumeSessionId for same-device foreign exact snapshots before local server identity is ready', () => {
+    const store = createStore()
+    const localDeviceId = store.getState().tabRegistry.deviceId
+    const localDeviceLabel = store.getState().tabRegistry.deviceLabel
+
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [],
+      closed: [{
+        tabKey: `${localDeviceId}:foreign-closed`,
+        tabId: 'foreign-closed',
+        serverInstanceId: 'srv-remote',
+        deviceId: localDeviceId,
+        deviceLabel: localDeviceLabel,
+        tabName: 'foreign same-device closed',
+        status: 'closed',
+        revision: 3,
+        createdAt: 3,
+        updatedAt: 4,
+        closedAt: 5,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-foreign-closed',
+          kind: 'terminal',
+          payload: {
+            mode: 'codex',
+            resumeSessionId: 'codex-session-foreign',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-session-foreign',
+              serverInstanceId: 'srv-remote',
+            },
+          },
+        }],
+      }],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const card = screen.getByText(`${localDeviceLabel}: foreign same-device closed`).closest('article')
+    expect(card).toBeTruthy()
+    fireEvent.click(within(card as HTMLElement).getByText('Open copy'))
+
+    const newTab = store.getState().tabs.tabs.find((tab) => tab.title === 'foreign same-device closed')
+    const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
+    expect(layout?.content?.resumeSessionId).toBeUndefined()
+    expect(layout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-foreign',
+      serverInstanceId: 'srv-remote',
+    })
+  })
 })

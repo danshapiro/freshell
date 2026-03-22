@@ -7,6 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { addPreReadyResumeAuthority } from '@/lib/pre-ready-resume'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -212,6 +213,7 @@ describe('TerminalView resumeSessionId', () => {
   it('uses mirrored resumeSessionId for an explicit local exact pane before server identity is ready', async () => {
     const tabId = 'tab-local-pending-ready'
     const paneId = 'pane-local-pending-ready'
+    addPreReadyResumeAuthority('req-local-pending-ready')
 
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
@@ -272,6 +274,73 @@ describe('TerminalView resumeSessionId', () => {
         resumeSessionId: 'codex-session-local',
       }))
     })
+  })
+
+  it('does not resume from a foreign mirrored exact pane before server identity is ready', async () => {
+    const tabId = 'tab-foreign-pending-ready'
+    const paneId = 'pane-foreign-pending-ready'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-foreign-pending-ready',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+      resumeSessionId: 'codex-session-foreign',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-foreign',
+        serverInstanceId: 'srv-remote',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-foreign-pending-ready',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: undefined },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    let createMessage: Record<string, unknown> | undefined
+    await waitFor(() => {
+      createMessage = wsMocks.send.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .find((msg) => msg?.type === 'terminal.create' && msg?.requestId === 'req-foreign-pending-ready')
+      expect(createMessage).toBeTruthy()
+    })
+
+    expect(createMessage?.resumeSessionId).toBeUndefined()
   })
 
   it('updates pane resumeSessionId from effectiveResumeSessionId', async () => {

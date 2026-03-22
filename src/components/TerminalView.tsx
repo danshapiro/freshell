@@ -24,6 +24,10 @@ import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
 import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import {
+  clearPreReadyResumeAuthority,
+  hasPreReadyResumeAuthority,
+} from '@/lib/pre-ready-resume'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
@@ -339,6 +343,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [])
 
   // Keep refs in sync with props
+  useEffect(() => {
+    return () => {
+      clearPreReadyResumeAuthority(requestIdRef.current)
+    }
+  }, [])
+
   useEffect(() => {
     if (terminalContent) {
       const prev = contentRef.current
@@ -1503,6 +1513,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
 
     const blockRestore = () => {
+      clearPreReadyResumeAuthority(requestIdRef.current)
       const staleTerminalId = terminalIdRef.current
       if (staleTerminalId) {
         clearTerminalCursor(staleTerminalId)
@@ -1539,6 +1550,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         sessionRef: contentRef.current?.sessionRef,
         mirroredResumeSessionId: contentRef.current?.resumeSessionId,
         localServerInstanceId,
+        allowMirroredExactResumeBeforeReady: hasPreReadyResumeAuthority(requestId),
       })
       if (resumeTarget.kind === 'wait') {
         return 'wait'
@@ -1732,6 +1744,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
+          clearPreReadyResumeAuthority(msg.requestId)
           clearRateLimitRetry()
           const newId = msg.terminalId as string
           const handled = handledCreatedMessageRef.current

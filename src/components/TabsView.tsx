@@ -24,6 +24,7 @@ import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
+import { addPreReadyResumeAuthority } from '@/lib/pre-ready-resume'
 
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
@@ -57,14 +58,13 @@ function sanitizePaneSnapshot(
   record: RegistryTabRecord,
   snapshot: RegistryPaneSnapshot,
   options: {
-    localDeviceId?: string
     localServerInstanceId?: string
+    trustedLocalRecord?: boolean
   } = {},
 ): PaneContentInput {
   const payload = snapshot.payload || {}
-  const sameDevice = !!options.localDeviceId && record.deviceId === options.localDeviceId
   const sameServer = !!options.localServerInstanceId && record.serverInstanceId === options.localServerInstanceId
-  const keepMirroredResumeSessionId = sameServer || (!options.localServerInstanceId && sameDevice)
+  const keepMirroredResumeSessionId = sameServer || (!options.localServerInstanceId && options.trustedLocalRecord)
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
     const resumeSessionId = payload.resumeSessionId as string | undefined
@@ -74,10 +74,21 @@ function sanitizePaneSnapshot(
       fallbackSessionId: resumeSessionId,
       fallbackServerInstanceId: record.serverInstanceId,
     })
+    const createRequestId = !options.localServerInstanceId
+      && options.trustedLocalRecord
+      && keepMirroredResumeSessionId
+      && !!resumeSessionId
+      && !!sessionRef
+      ? nanoid()
+      : undefined
+    if (createRequestId) {
+      addPreReadyResumeAuthority(createRequestId)
+    }
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
+      ...(createRequestId ? { createRequestId } : {}),
       resumeSessionId: keepMirroredResumeSessionId ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
@@ -339,13 +350,16 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   }, [groups, query, filterMode, scopeMode, withDisplayDeviceLabel])
 
   const openRecordAsUnlinkedCopy = (record: RegistryTabRecord) => {
+    const state = store.getState()
+    const trustedLocalRecord = !!state.panes.layouts[record.tabId]
+      || !!state.tabRegistry.localClosed[record.tabKey]
     const tabId = nanoid()
     const paneSnapshots = record.panes || []
     const firstPane = paneSnapshots[0]
     const firstContent = firstPane
       ? sanitizePaneSnapshot(record, firstPane, {
-        localDeviceId: deviceId,
         localServerInstanceId,
+        trustedLocalRecord,
       })
       : { kind: 'terminal', mode: 'shell' } as const
     dispatch(addTab({
@@ -362,8 +376,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
       dispatch(addPane({
         tabId,
         newContent: sanitizePaneSnapshot(record, pane, {
-          localDeviceId: deviceId,
           localServerInstanceId,
+          trustedLocalRecord,
         }),
       }))
     }
@@ -371,6 +385,9 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   }
 
   const openPaneInNewTab = (record: RegistryTabRecord, pane: RegistryPaneSnapshot) => {
+    const state = store.getState()
+    const trustedLocalRecord = !!state.panes.layouts[record.tabId]
+      || !!state.tabRegistry.localClosed[record.tabKey]
     const tabId = nanoid()
     dispatch(addTab({
       id: tabId,
@@ -381,8 +398,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     dispatch(initLayout({
       tabId,
       content: sanitizePaneSnapshot(record, pane, {
-        localDeviceId: deviceId,
         localServerInstanceId,
+        trustedLocalRecord,
       }),
     }))
     onOpenTab?.()

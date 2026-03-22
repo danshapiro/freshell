@@ -18,6 +18,7 @@ export function getResumeTarget(input: {
   sessionRef?: TerminalPaneContent['sessionRef']
   mirroredResumeSessionId?: string
   localServerInstanceId?: string
+  allowMirroredExactResumeBeforeReady?: boolean
 }): ResumeTargetDecision {
   const rawExactSessionRef = sanitizeExactSessionRef(input.sessionRef)
   const exactSessionRef = sanitizeExactSessionRef(input.sessionRef, input.mode)
@@ -26,7 +27,9 @@ export function getResumeTarget(input: {
       if (!input.localServerInstanceId) {
         return {
           kind: 'send',
-          resumeSessionId: input.mirroredResumeSessionId,
+          resumeSessionId: input.allowMirroredExactResumeBeforeReady
+            ? input.mirroredResumeSessionId
+            : undefined,
         }
       }
       const localExactSessionId = exactSessionRef && input.localServerInstanceId

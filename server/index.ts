@@ -69,14 +69,7 @@ import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-
-function compileArgTemplate(
-  template: string[] | undefined,
-  placeholder: string,
-): ((value: string) => string[]) | undefined {
-  if (!template) return undefined
-  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
-}
+import { buildCodingCliCommandSpec } from './extension-manifest.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -201,24 +194,10 @@ async function main() {
   const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
   for (const ext of extensionManager.getAll()) {
     if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const cli = ext.manifest.cli
-    const spec: CodingCliCommandSpec = {
+    const spec: CodingCliCommandSpec = buildCodingCliCommandSpec({
       label: ext.manifest.label,
-      envVar: cli.envVar || '',
-      defaultCommand: cli.command,
-      args: cli.args,
-      env: cli.env,
-      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
-      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
-      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
-      permissionModeEnvVar: cli.permissionModeEnvVar,
-      permissionModeEnvValues: cli.permissionModeValues,
-    }
-    if (cli.resumeArgs) {
-      const template = cli.resumeArgs
-      spec.resumeArgs = (sessionId: string) =>
-        template.map(arg => arg.replace('{{sessionId}}', sessionId))
-    }
+      cli: ext.manifest.cli,
+    })
     cliCommandsMap.set(ext.manifest.name, spec)
   }
   registerCodingCliCommands(cliCommandsMap)
