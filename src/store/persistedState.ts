@@ -4,7 +4,7 @@ import { migratePersistedPaneNode } from './persisted-pane-migration'
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
 export const TABS_SCHEMA_VERSION = 1
-export const PANES_SCHEMA_VERSION = 7
+export const PANES_SCHEMA_VERSION = 6
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -61,7 +61,6 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
 }
 
 const zPaneTitles = z.record(z.string(), z.record(z.string(), z.string()))
-const zPaneTitleSources = z.record(z.string(), z.record(z.string(), zDurableTitleSource))
 const zPaneTitleSetByUser = z.record(z.string(), z.record(z.string(), z.boolean()))
 
 const zPersistedPanesPayload = z.object({
@@ -71,7 +70,6 @@ const zPersistedPanesPayload = z.object({
   layouts: z.record(z.string(), z.unknown()).optional(),
   activePane: z.record(z.string(), z.string()).optional(),
   paneTitles: zPaneTitles.optional(),
-  paneTitleSources: zPaneTitleSources.optional(),
   paneTitleSetByUser: zPaneTitleSetByUser.optional(),
 }).passthrough()
 
@@ -80,7 +78,6 @@ export type ParsedPersistedPanes = {
   layouts: Record<string, unknown>
   activePane: Record<string, string>
   paneTitles: Record<string, Record<string, string>>
-  paneTitleSources: Record<string, Record<string, 'derived' | 'stable' | 'user'>>
   paneTitleSetByUser: Record<string, Record<string, boolean>>
 }
 
@@ -109,7 +106,6 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
     ),
     activePane: (res.data.activePane || {}) as Record<string, string>,
     paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
-    paneTitleSources: (res.data.paneTitleSources || {}) as Record<string, Record<string, 'derived' | 'stable' | 'user'>>,
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
   }
 }

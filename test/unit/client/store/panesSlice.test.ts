@@ -40,7 +40,6 @@ describe('panesSlice', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
-      paneTitleSources: {},
       paneTitleSetByUser: {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
@@ -78,7 +77,6 @@ describe('panesSlice', () => {
       layouts,
       activePane,
       paneTitles: {},
-      paneTitleSources: {},
       paneTitleSetByUser: {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
@@ -2749,7 +2747,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': initialLayout },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSources: {},
       }
 
       const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'My Terminal' }))
@@ -2763,57 +2760,12 @@ describe('panesSlice', () => {
         layouts: {},
         activePane: {},
         paneTitles: { 'tab-1': { 'pane-2': 'Other Pane' } },
-        paneTitleSources: {},
       }
 
       const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'First Pane' }))
 
       expect(result.paneTitles['tab-1']['pane-1']).toBe('First Pane')
       expect(result.paneTitles['tab-1']['pane-2']).toBe('Other Pane')
-    })
-
-    it('allows stable durable updates to replace derived titles but not user titles', () => {
-      const derivedState: PanesState = {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'derived' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      }
-
-      const upgraded = panesReducer(derivedState, updatePaneTitle({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-        source: 'stable',
-      }))
-      expect(upgraded.paneTitles['tab-1']['pane-1']).toBe('codex resume 019d1213-9c59-7bb0-80ae-70c74427f346')
-      expect(upgraded.paneTitleSources['tab-1']['pane-1']).toBe('stable')
-
-      const userState: PanesState = {
-        ...derivedState,
-        paneTitles: { 'tab-1': { 'pane-1': 'Pinned title' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'user' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
-      }
-      const preserved = panesReducer(userState, updatePaneTitle({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        title: 'System override attempt',
-        source: 'stable',
-      }))
-      expect(preserved.paneTitles['tab-1']['pane-1']).toBe('Pinned title')
-      expect(preserved.paneTitleSources['tab-1']['pane-1']).toBe('user')
     })
   })
 
@@ -2828,7 +2780,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': leaf },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSources: {},
       }
 
       const result = panesReducer(state, splitPane({
@@ -2856,7 +2807,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': leaf },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSources: {},
       }
 
       const result = panesReducer(state, addPane({
@@ -2881,12 +2831,9 @@ describe('panesSlice', () => {
       },
       activePane: { 'tab-1': 'pane-1' },
       paneTitles: { 'tab-1': { 'pane-1': 'User Title' } },
-      paneTitleSources: { 'tab-1': { 'pane-1': setByUser ? 'user' : 'derived' } },
       paneTitleSetByUser: setByUser ? { 'tab-1': { 'pane-1': true } } : {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
-      zoomedPane: {},
-      refreshRequestsByPane: {},
     })
 
     it('updatePaneContent does NOT overwrite title when paneTitleSetByUser is true', () => {
@@ -2910,23 +2857,6 @@ describe('panesSlice', () => {
 
       // Without extensions, derivePaneTitle capitalizes the provider name
       expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
-      expect(result.paneTitleSources['tab-1']['pane-1']).toBe('derived')
-    })
-
-    it('updatePaneContent preserves stable durable titles', () => {
-      const state: PanesState = {
-        ...makeState(false),
-        paneTitles: { 'tab-1': { 'pane-1': 'Session title' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'stable' } },
-      }
-      const result = panesReducer(state, updatePaneContent({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
-      }))
-
-      expect(result.paneTitles['tab-1']['pane-1']).toBe('Session title')
-      expect(result.paneTitleSources['tab-1']['pane-1']).toBe('stable')
     })
 
     it('updatePaneTitle sets paneTitleSetByUser to true', () => {

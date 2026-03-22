@@ -80,7 +80,6 @@ describe('crossTabSync', () => {
       },
       activePane: { 'tab-1': 'pane-a' },
       paneTitles: {},
-      paneTitleSources: {},
 
     }))
 
@@ -102,7 +101,6 @@ describe('crossTabSync', () => {
       },
       activePane: { 'tab-1': 'pane-b' },
       paneTitles: {},
-      paneTitleSources: { 'tab-1': { 'pane-a': 'derived', 'pane-b': 'stable' } },
 
     })
 
@@ -110,10 +108,6 @@ describe('crossTabSync', () => {
 
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
-    expect(store.getState().panes.paneTitleSources['tab-1']).toEqual({
-      'pane-a': 'derived',
-      'pane-b': 'stable',
-    })
   })
 
   it('hydrates remote panes but preserves local authoritative coding identity for the same createRequestId', () => {

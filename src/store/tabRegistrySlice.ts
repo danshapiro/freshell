@@ -216,7 +216,6 @@ export interface ClosedTabEntry {
   tab: Tab
   layout: PaneNode
   paneTitles: Record<string, string>
-  paneTitleSources?: Record<string, 'derived' | 'stable' | 'user'>
   closedAt: number
 }
 

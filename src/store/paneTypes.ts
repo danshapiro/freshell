@@ -1,4 +1,3 @@
-import type { DurableTitleSource } from '@/lib/title-source'
 import type { TerminalStatus, TabMode, ShellType } from './types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
@@ -190,9 +189,7 @@ export interface PanesState {
    * Used to keep user-edited or derived titles stable across renders.
    */
   paneTitles: Record<string, Record<string, string>>
-  /** Authoritative durable pane title sources (`derived`, `stable`, `user`). */
-  paneTitleSources?: Record<string, Record<string, DurableTitleSource>>
-  /** Compatibility mirror of paneTitleSources === 'user'. */
+  /** Map of tabId -> paneId -> whether the user explicitly set the title */
   paneTitleSetByUser: Record<string, Record<string, boolean>>
   /**
    * Ephemeral UI signal: request PaneContainer to enter inline rename mode.

@@ -7,7 +7,6 @@ function emptySt(): PanesState {
     layouts: {},
     activePane: {},
     paneTitles: {},
-    paneTitleSources: {},
     paneTitleSetByUser: {},
     renameRequestTabId: null,
     renameRequestPaneId: null,
@@ -35,7 +34,6 @@ describe('restoreLayout', () => {
       tabId: 'tab-1',
       layout,
       paneTitles: { p1: 'My Shell' },
-      paneTitleSources: { p1: 'stable' },
     }))
 
     expect(state.layouts['tab-1']).toBeDefined()
@@ -49,7 +47,6 @@ describe('restoreLayout', () => {
       expect(restored.content.createRequestId).not.toBe('stale-crq')
     }
     expect(state.paneTitles['tab-1']?.p1).toBe('My Shell')
-    expect(state.paneTitleSources['tab-1']?.p1).toBe('stable')
     expect(state.activePane['tab-1']).toBe('p1')
   })
 
@@ -88,7 +85,6 @@ describe('restoreLayout', () => {
       tabId: 'tab-2',
       layout,
       paneTitles: { p1: 'Shell', p2: 'Browser' },
-      paneTitleSources: { p1: 'derived', p2: 'derived' },
     }))
 
     const root = state.layouts['tab-2']!
@@ -138,7 +134,6 @@ describe('restoreLayout', () => {
       tabId: 'tab-1',
       layout: newLayout,
       paneTitles: {},
-      paneTitleSources: {},
     }))
 
     // Should not overwrite — existing layout preserved

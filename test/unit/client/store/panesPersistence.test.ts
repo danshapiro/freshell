@@ -18,14 +18,7 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 // Now import slices - they'll see our mocked localStorage
 import tabsReducer, { hydrateTabs, addTab } from '../../../../src/store/tabsSlice'
-import panesReducer, {
-  hydratePanes,
-  initLayout,
-  requestPaneRefresh,
-  splitPane,
-  updatePaneTitle,
-} from '../../../../src/store/panesSlice'
-import paneRuntimeTitleReducer, { setPaneRuntimeTitle } from '../../../../src/store/paneRuntimeTitleSlice'
+import panesReducer, { hydratePanes, initLayout, requestPaneRefresh, splitPane } from '../../../../src/store/panesSlice'
 import {
   loadPersistedPanes,
   loadPersistedTabs,
@@ -207,43 +200,6 @@ describe('Panes Persistence Integration', () => {
     expect(loaded).not.toBeNull()
     expect(loaded!.layouts[tabId]).toBeDefined()
     expect(loaded!.layouts[tabId].type).toBe('split')
-  })
-
-  it('round-trips paneTitleSources and excludes runtime titles from persisted panes payloads', () => {
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        paneRuntimeTitle: paneRuntimeTitleReducer,
-      },
-      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
-    })
-
-    store.dispatch(addTab({ mode: 'shell' }))
-    const tabId = store.getState().tabs.tabs[0].id
-    store.dispatch(initLayout({
-      tabId,
-      paneId: 'pane-1',
-      content: { kind: 'terminal', mode: 'shell' },
-    }))
-    store.dispatch(updatePaneTitle({
-      tabId,
-      paneId: 'pane-1',
-      title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-      source: 'stable',
-    }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-1', title: 'vim README.md' }))
-
-    vi.runAllTimers()
-
-    const savedPanes = JSON.parse(localStorage.getItem('freshell.panes.v2') || '{}')
-    expect(savedPanes.paneTitleSources).toEqual({
-      [tabId]: { 'pane-1': 'stable' },
-    })
-    expect(savedPanes.paneRuntimeTitle).toBeUndefined()
-
-    const loaded = loadPersistedPanes()
-    expect(loaded?.paneTitleSources[tabId]).toEqual({ 'pane-1': 'stable' })
   })
 
   it('strips editor content when persisting panes', () => {
