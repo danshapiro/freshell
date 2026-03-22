@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
@@ -49,6 +49,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
+  const wasSearchingRef = useRef(false)
 
   useEffect(() => {
     if (historyWindow || topLevelSessionCount > 0) return
@@ -59,35 +60,45 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     }) as any)
   }, [dispatch, historyWindow, topLevelSessionCount])
 
-  const filtered = useMemo(() => {
-    const q = filter.trim().toLowerCase()
-    if (!q) return projects ?? []
-    return (projects ?? [])
-      .map((p) => ({
-        ...p,
-        sessions: p.sessions.filter((s) => {
-          const title = (s.title || s.sessionId).toLowerCase()
-          const sum = (s.summary || '').toLowerCase()
-          const cwd = (s.cwd || '').toLowerCase()
-          const provider = getProviderLabel(s.provider).toLowerCase()
-          return (
-            title.includes(q) ||
-            sum.includes(q) ||
-            p.projectPath.toLowerCase().includes(q) ||
-            cwd.includes(q) ||
-            provider.includes(q)
-          )
-        }),
-      }))
-      .filter((p) => p.sessions.length > 0)
-  }, [projects, filter])
+  useEffect(() => {
+    const query = filter.trim()
+    if (!query) {
+      if (wasSearchingRef.current) {
+        wasSearchingRef.current = false
+        void dispatch(fetchSessionWindow({
+          surface: 'history',
+          priority: 'visible',
+        }) as any)
+      }
+      return
+    }
+
+    const timeoutId = setTimeout(() => {
+      wasSearchingRef.current = true
+      void dispatch(fetchSessionWindow({
+        surface: 'history',
+        priority: 'visible',
+        query,
+        searchTier: 'fullText',
+      }) as any)
+    }, 300)
+
+    return () => {
+      clearTimeout(timeoutId)
+    }
+  }, [dispatch, filter])
 
   async function refresh() {
     setLoading(true)
     try {
+      const query = filter.trim()
       await dispatch(fetchSessionWindow({
         surface: 'history',
         priority: 'visible',
+        ...(query ? {
+          query,
+          searchTier: 'fullText' as const,
+        } : {}),
       }) as any)
     } finally {
       setLoading(false)
@@ -178,7 +189,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
         <div className="space-y-2 px-3 py-4 md:px-6">
-          {filtered.length === 0 ? (
+          {(projects ?? []).length === 0 ? (
             <div className="py-12 text-center">
               <p className="text-muted-foreground">No sessions found</p>
               {filter && (
@@ -191,7 +202,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
               )}
             </div>
           ) : (
-            filtered.map((project) => (
+            (projects ?? []).map((project) => (
               <ProjectCard
                 key={project.projectPath}
                 project={project}
