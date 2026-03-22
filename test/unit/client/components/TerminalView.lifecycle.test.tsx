@@ -1990,6 +1990,135 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
+  it('does not send foreign exact resume ids on non-restore creates even when mirrored compatibility metadata is present', async () => {
+    const tabId = 'tab-open-foreign-copy'
+    const paneId = 'pane-open-foreign-copy'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-open-foreign-copy',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      resumeSessionId: 'codex-session-123',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-remote',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-open-foreign-copy',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-open-foreign-copy',
+        resumeSessionId: undefined,
+      }))
+    })
+  })
+
+  it('blocks restore when an exact sessionRef belongs to a different provider than the pane mode', async () => {
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
+    const tabId = 'tab-restore-provider-mismatch'
+    const paneId = 'pane-restore-provider-mismatch'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-restore-provider-mismatch',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+        serverInstanceId: 'srv-local',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-restore-provider-mismatch',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
+      expect(createCalls).toHaveLength(0)
+      expect(terminalInstances[0].writeln).toHaveBeenCalledWith(
+        expect.stringContaining('[Restore blocked: exact session identity missing]'),
+      )
+    })
+  })
+
   it('blocks stale no-layout coding terminal reattach after INVALID_TERMINAL_ID instead of recreating from mirrored resume metadata', async () => {
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
     const tabId = 'tab-stale-no-layout'

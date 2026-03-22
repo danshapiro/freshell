@@ -24,7 +24,7 @@ function normalizePaneContent(
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
-    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any)
+    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, mode)
     const resumeSessionId = inputResumeSessionId
     return {
       kind: 'terminal',
@@ -54,7 +54,7 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
-    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any)
+    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, input.provider)
     return {
       kind: 'agent-chat',
       provider: input.provider,

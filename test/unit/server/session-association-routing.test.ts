@@ -10,7 +10,7 @@ function createProject(sessions: CodingCliSession[]): ProjectGroup {
 }
 
 describe('splitAssociationProjectsForUpdate', () => {
-  it('keeps Claude sessions on the compatibility update path while reserving Codex for exact provenance binding', () => {
+  it('keeps only Claude and Opencode on the compatibility update path while reserving Codex for exact provenance binding', () => {
     const projects = [createProject([
       {
         provider: 'claude',
@@ -29,6 +29,13 @@ describe('splitAssociationProjectsForUpdate', () => {
       {
         provider: 'opencode',
         sessionId: 'opencode-session-1',
+        projectPath: '/repo/project',
+        lastActivityAt: 1_000,
+        cwd: '/repo/project',
+      },
+      {
+        provider: 'gemini',
+        sessionId: 'gemini-session-1',
         projectPath: '/repo/project',
         lastActivityAt: 1_000,
         cwd: '/repo/project',

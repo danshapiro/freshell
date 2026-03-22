@@ -33,8 +33,8 @@ describe('DiscoveredSessionAssociation', () => {
         }
         return null
       }),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
-      isSessionBound: vi.fn(() => false),
+      getSessionOwner: vi.fn(() => undefined),
+      rebindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
     }
     const association = new DiscoveredSessionAssociation(registry as any)
 
@@ -47,7 +47,37 @@ describe('DiscoveredSessionAssociation', () => {
     }))
 
     expect(result).toEqual({ associated: true, terminalId: 'term-2' })
-    expect(registry.bindSession).toHaveBeenCalledWith('term-2', 'codex', 'codex-session-1', 'association')
+    expect(registry.rebindSession).toHaveBeenCalledWith('term-2', 'codex', 'codex-session-1', 'association')
+  })
+
+  it('corrects a stale codex owner when exact launch provenance points at a different running terminal', () => {
+    const registry = {
+      get: vi.fn((terminalId: string) => (
+        terminalId === 'term-target'
+          ? { terminalId: 'term-target', mode: 'codex', status: 'running' }
+          : { terminalId: 'term-wrong', mode: 'codex', status: 'running', resumeSessionId: 'codex-session-1' }
+      )),
+      getSessionOwner: vi.fn(() => 'term-wrong'),
+      rebindSession: vi.fn(() => ({ ok: true, terminalId: 'term-target', sessionId: 'codex-session-1' })),
+    }
+    const association = new DiscoveredSessionAssociation(registry as any)
+
+    const result = association.associateSingleSession(createCodexSession({
+      launchOrigin: {
+        terminalId: 'term-target',
+        tabId: 'tab-target',
+        paneId: 'pane-target',
+      },
+    }))
+
+    expect(result).toEqual({ associated: true, terminalId: 'term-target' })
+    expect(registry.getSessionOwner).toHaveBeenCalledWith('codex', 'codex-session-1')
+    expect(registry.rebindSession).toHaveBeenCalledWith(
+      'term-target',
+      'codex',
+      'codex-session-1',
+      'association',
+    )
   })
 
   it('tracks advanced codex sessions, leaves unproven sessions unbound, and binds once provenance appears', () => {
@@ -57,8 +87,8 @@ describe('DiscoveredSessionAssociation', () => {
           ? { terminalId: 'term-2', mode: 'codex', status: 'running' }
           : null
       )),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
-      isSessionBound: vi.fn(() => false),
+      getSessionOwner: vi.fn(() => undefined),
+      rebindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
     }
     const association = new DiscoveredSessionAssociation(registry as any)
 
@@ -68,7 +98,7 @@ describe('DiscoveredSessionAssociation', () => {
     }])
     expect(firstPass).toHaveLength(1)
     expect(association.associateSingleSession(firstPass[0]!)).toEqual({ associated: false })
-    expect(registry.bindSession).not.toHaveBeenCalled()
+    expect(registry.rebindSession).not.toHaveBeenCalled()
 
     const secondPass = association.collectNewOrAdvanced([{
       projectPath: '/repo/project',
@@ -86,7 +116,7 @@ describe('DiscoveredSessionAssociation', () => {
       associated: true,
       terminalId: 'term-2',
     })
-    expect(registry.bindSession).toHaveBeenCalledTimes(1)
+    expect(registry.rebindSession).toHaveBeenCalledTimes(1)
   })
 
   it('treats newly discovered launch provenance as advanced even when lastActivityAt is unchanged', () => {
@@ -96,8 +126,8 @@ describe('DiscoveredSessionAssociation', () => {
           ? { terminalId: 'term-2', mode: 'codex', status: 'running' }
           : null
       )),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
-      isSessionBound: vi.fn(() => false),
+      getSessionOwner: vi.fn(() => undefined),
+      rebindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
     }
     const association = new DiscoveredSessionAssociation(registry as any)
 
@@ -124,16 +154,16 @@ describe('DiscoveredSessionAssociation', () => {
       associated: true,
       terminalId: 'term-2',
     })
-    expect(registry.bindSession).toHaveBeenCalledTimes(1)
+    expect(registry.rebindSession).toHaveBeenCalledTimes(1)
   })
 
   it('does not rebind codex sessions on repeated non-advanced updates after exact binding', () => {
     const registry = {
       get: vi.fn(() => ({ terminalId: 'term-2', mode: 'codex', status: 'running' })),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
-      isSessionBound: vi.fn()
-        .mockReturnValueOnce(false)
-        .mockReturnValue(true),
+      getSessionOwner: vi.fn()
+        .mockReturnValueOnce(undefined)
+        .mockReturnValue('term-2'),
+      rebindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'codex-session-1' })),
     }
     const association = new DiscoveredSessionAssociation(registry as any)
     const projects = [{
@@ -157,6 +187,6 @@ describe('DiscoveredSessionAssociation', () => {
 
     const repeated = association.collectNewOrAdvanced(projects)
     expect(repeated).toHaveLength(0)
-    expect(registry.bindSession).toHaveBeenCalledTimes(1)
+    expect(registry.rebindSession).toHaveBeenCalledTimes(1)
   })
 })

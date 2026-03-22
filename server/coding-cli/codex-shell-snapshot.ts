@@ -45,11 +45,19 @@ export async function readCodexShellSnapshotLaunchOrigin(
 
   if (candidates.length === 0) return undefined
 
-  const dated = await Promise.all(candidates.map(async (filePath) => ({
-    filePath,
-    stat: await fsp.stat(filePath),
-  })))
-  dated.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
+  const dated: Array<{ filePath: string; stat: Awaited<ReturnType<typeof fsp.stat>> }> = []
+  for (const filePath of candidates) {
+    try {
+      dated.push({
+        filePath,
+        stat: await fsp.stat(filePath),
+      })
+    } catch {
+      // Snapshot files can disappear between readdir() and stat(); ignore the race.
+    }
+  }
+  if (dated.length === 0) return undefined
+  dated.sort((a, b) => Number(b.stat.mtimeMs) - Number(a.stat.mtimeMs))
 
   let content: string
   try {

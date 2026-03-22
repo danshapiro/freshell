@@ -1895,6 +1895,23 @@ export class TerminalRegistry extends EventEmitter {
     return { ok: true, terminalId, sessionId: normalized }
   }
 
+  rebindSession(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    reason: SessionBindingReason = 'association',
+  ): BindSessionResult {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return { ok: false, reason: 'invalid_session_id' }
+
+    const owner = this.bindingAuthority.ownerForSession(provider, normalized)
+    if (owner && owner !== terminalId) {
+      this.releaseBinding(owner, 'rebind', { provider, sessionId: normalized })
+    }
+
+    return this.bindSession(terminalId, provider, normalized, reason)
+  }
+
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
@@ -1909,6 +1926,12 @@ export class TerminalRegistry extends EventEmitter {
     const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return false
     return this.bindingAuthority.ownerForSession(provider, normalized) !== undefined
+  }
+
+  getSessionOwner(provider: CodingCliProviderName, sessionId: string): string | undefined {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return undefined
+    return this.bindingAuthority.ownerForSession(provider, normalized)
   }
 
   /**

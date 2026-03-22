@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
@@ -56,5 +56,36 @@ describe('readCodexShellSnapshotLaunchOrigin', () => {
     await expect(
       readCodexShellSnapshotLaunchOrigin(shellSnapshotsDir, 'missing-session'),
     ).resolves.toBeUndefined()
+  })
+
+  it('ignores snapshot files that disappear between readdir and stat', async () => {
+    const shellSnapshotsDir = path.join(tempDir, 'shell_snapshots')
+    await fsp.mkdir(shellSnapshotsDir, { recursive: true })
+
+    const sessionId = 'codex-session-1'
+    const missingSnapshot = path.join(shellSnapshotsDir, `${sessionId}.1700000000000.sh`)
+    const stableSnapshot = path.join(shellSnapshotsDir, `${sessionId}.1699999999000.sh`)
+
+    await fsp.writeFile(missingSnapshot, 'export FRESHELL_TERMINAL_ID="term-missing"\n')
+    await fsp.writeFile(
+      stableSnapshot,
+      [
+        'export FRESHELL_TERMINAL_ID="term-stable"',
+        'export FRESHELL_TAB_ID="tab-stable"',
+      ].join('\n'),
+    )
+
+    const originalStat = fsp.stat.bind(fsp)
+    vi.spyOn(fsp, 'stat').mockImplementation(async (filePath) => {
+      if (String(filePath) === missingSnapshot) {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      }
+      return originalStat(filePath)
+    })
+
+    await expect(readCodexShellSnapshotLaunchOrigin(shellSnapshotsDir, sessionId)).resolves.toEqual({
+      terminalId: 'term-stable',
+      tabId: 'tab-stable',
+    })
   })
 })

@@ -183,6 +183,51 @@ describe('DiscoveredSessionAssociation integration', () => {
 
     registry.shutdown()
   })
+
+  it('corrects a stale codex owner when exact launch provenance points at the original terminal', () => {
+    const registry = new TerminalRegistry()
+    const association = new DiscoveredSessionAssociation(registry)
+    const onUnbound = vi.fn()
+    const onBound = vi.fn()
+
+    const wrongTerminal = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'codex-session-abc-123' })
+    const targetTerminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    registry.on('terminal.session.unbound', onUnbound)
+    registry.on('terminal.session.bound', onBound)
+
+    const result = association.associateSingleSession({
+      provider: 'codex',
+      sessionId: 'codex-session-abc-123',
+      projectPath: '/home/user/project',
+      lastActivityAt: Date.now(),
+      cwd: '/home/user/project',
+      launchOrigin: {
+        terminalId: targetTerminal.terminalId,
+        tabId: 'tab-target',
+        paneId: 'pane-target',
+      },
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: targetTerminal.terminalId })
+    expect(registry.get(wrongTerminal.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(registry.get(targetTerminal.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+    expect(registry.getCanonicalRunningTerminalBySession('codex', 'codex-session-abc-123')?.terminalId)
+      .toBe(targetTerminal.terminalId)
+    expect(onUnbound).toHaveBeenCalledWith(expect.objectContaining({
+      terminalId: wrongTerminal.terminalId,
+      provider: 'codex',
+      sessionId: 'codex-session-abc-123',
+      reason: 'rebind',
+    }))
+    expect(onBound).toHaveBeenCalledWith(expect.objectContaining({
+      terminalId: targetTerminal.terminalId,
+      provider: 'codex',
+      sessionId: 'codex-session-abc-123',
+      reason: 'association',
+    }))
+
+    registry.shutdown()
+  })
 })
 
 describe('Session-Terminal metadata broadcasts', () => {
@@ -1031,6 +1076,34 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     })
     expect(registry.get(term.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
     expect(registry.get(term.terminalId)?.pendingResumeName).toBe('137 tour')
+
+    registry.shutdown()
+  })
+
+  it('does not use onUpdate compatibility association for plain unbound claude terminals', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+    const associateOnUpdate = createOnUpdateAssociator(registry, broadcasts)
+
+    const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+    const record = registry.get(term.terminalId)
+    if (!record) throw new Error('Expected Claude terminal record')
+    record.resumeSessionId = undefined
+    record.pendingResumeName = undefined
+
+    associateOnUpdate([{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: SESSION_ID_ONE,
+        projectPath: '/home/user/project',
+        lastActivityAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }])
+
+    expect(broadcasts).toHaveLength(0)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
 
     registry.shutdown()
   })

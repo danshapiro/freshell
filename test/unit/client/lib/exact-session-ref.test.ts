@@ -67,4 +67,22 @@ describe('exact-session-ref', () => {
       sessionId: 'codex-session-123',
     })).toBeUndefined()
   })
+
+  it('drops explicit refs when the expected provider does not match', () => {
+    expect(sanitizeExactSessionRef({
+      provider: 'claude',
+      sessionId: VALID_CLAUDE_SESSION_ID,
+      serverInstanceId: 'srv-local',
+    }, 'codex')).toBeUndefined()
+
+    expect(sanitizeExactSessionRef({
+      provider: 'codex',
+      sessionId: 'codex-session-123',
+      serverInstanceId: 'srv-local',
+    }, 'codex')).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-123',
+      serverInstanceId: 'srv-local',
+    })
+  })
 })

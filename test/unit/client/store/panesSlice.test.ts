@@ -307,6 +307,31 @@ describe('panesSlice', () => {
       }
     })
 
+    it('drops exact sessionRef values whose provider does not match the pane mode', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: VALID_CLAUDE_SESSION_ID,
+              serverInstanceId: 'srv-local',
+            },
+          } as any,
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+        expect(leaf.content.sessionRef).toBeUndefined()
+      }
+    })
+
     it('does not assign resumeSessionId for shell panes', () => {
       const state = panesReducer(
         initialState,

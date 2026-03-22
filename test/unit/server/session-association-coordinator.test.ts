@@ -63,7 +63,7 @@ describe('SessionAssociationCoordinator', () => {
 
   it('associates regular sessions with matching unassociated terminals', () => {
     const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
       isSessionBound: vi.fn(() => false),
     }
@@ -94,7 +94,7 @@ describe('SessionAssociationCoordinator', () => {
 
   it('does not skip association when isSessionBound returns false', () => {
     const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
       isSessionBound: vi.fn(() => false),
     }
@@ -127,7 +127,7 @@ describe('SessionAssociationCoordinator', () => {
 
   it('keeps named claude resumes eligible on the compatibility path', () => {
     const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: '550e8400-e29b-41d4-a716-446655440000' })),
       isSessionBound: vi.fn(() => false),
     }
@@ -140,6 +140,24 @@ describe('SessionAssociationCoordinator', () => {
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
     expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
+  })
+
+  it('does not use the compatibility path for plain claude terminals without a named resume', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: '550e8400-e29b-41d4-a716-446655440000' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession({
+      provider: 'claude',
+      sessionId: '550e8400-e29b-41d4-a716-446655440000',
+    }))
+
+    expect(result).toEqual({ associated: false })
+    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
+    expect(registry.bindSession).not.toHaveBeenCalled()
   })
 
   it('keeps opencode on the compatibility path', () => {

@@ -36,9 +36,13 @@ export function sanitizeExactSessionRef(
     sessionId?: unknown
     serverInstanceId?: unknown
   } | null,
+  expectedProvider?: string,
 ): SessionLocator | undefined {
   if (!locator) return undefined
   if (!isNonEmptyString(locator.provider) || !isNonEmptyString(locator.sessionId)) {
+    return undefined
+  }
+  if (isNonEmptyString(expectedProvider) && locator.provider !== expectedProvider) {
     return undefined
   }
   return buildExactSessionRef({

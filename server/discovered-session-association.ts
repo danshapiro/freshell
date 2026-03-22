@@ -11,13 +11,16 @@ type TerminalAssociationCandidate = {
 
 type AssociationRegistry = {
   get: (terminalId: string) => TerminalAssociationCandidate | null | undefined
-  bindSession: (
+  rebindSession: (
     terminalId: string,
     provider: CodingCliSession['provider'],
     sessionId: string,
     reason: SessionBindingReason,
   ) => BindSessionResult
-  isSessionBound: (provider: CodingCliSession['provider'], sessionId: string) => boolean
+  getSessionOwner: (
+    provider: CodingCliSession['provider'],
+    sessionId: string,
+  ) => string | undefined
 }
 
 export type DiscoveredSessionAssociationResult = {
@@ -49,7 +52,6 @@ export class DiscoveredSessionAssociation {
 
   associateSingleSession(session: CodingCliSession): DiscoveredSessionAssociationResult {
     if (!this.isAssociationCandidate(session)) return { associated: false }
-    if (this.registry.isSessionBound(session.provider, session.sessionId)) return { associated: false }
 
     const terminalId = session.launchOrigin?.terminalId
     if (!terminalId) return { associated: false }
@@ -58,11 +60,16 @@ export class DiscoveredSessionAssociation {
     if (!terminal || terminal.mode !== session.provider || terminal.status !== 'running') {
       return { associated: false }
     }
+
+    const owner = this.registry.getSessionOwner(session.provider, session.sessionId)
+    if (owner === terminalId && terminal.resumeSessionId === session.sessionId) {
+      return { associated: false }
+    }
     if (terminal.resumeSessionId && terminal.resumeSessionId !== session.sessionId) {
       return { associated: false }
     }
 
-    const bound = this.registry.bindSession(terminalId, session.provider, session.sessionId, 'association')
+    const bound = this.registry.rebindSession(terminalId, session.provider, session.sessionId, 'association')
     if (!bound.ok) return { associated: false }
     return { associated: true, terminalId }
   }
