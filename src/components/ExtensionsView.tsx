@@ -44,6 +44,17 @@ function groupLabel(kind: 'cli' | 'server' | 'client') {
   }
 }
 
+function getModelPlaceholder(itemId: string): string {
+  switch (itemId) {
+    case 'codex':
+      return 'e.g. gpt-5-codex'
+    case 'kimi':
+      return 'e.g. moonshot-k2'
+    default:
+      return 'e.g. claude-3-5-sonnet'
+  }
+}
+
 interface ConfigFieldProps {
   item: ManagedItem
   field: ManagedItemConfig
@@ -135,7 +146,7 @@ function ConfigField({ item, field, onConfigChange, cwdDrafts, cwdErrors }: Conf
         id={fieldId}
         type="text"
         value={field.value as string}
-        placeholder={field.key === 'model' ? (item.id === 'codex' ? 'e.g. gpt-5-codex' : 'e.g. claude-3-5-sonnet') : undefined}
+        placeholder={field.key === 'model' ? getModelPlaceholder(item.id) : undefined}
         aria-label={field.label}
         onChange={(e) => onConfigChange(item, field.key, e.target.value)}
         className="h-8 w-full px-2 text-xs bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border sm:max-w-[14rem]"

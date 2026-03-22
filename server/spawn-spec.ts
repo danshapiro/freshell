@@ -2,6 +2,7 @@ import { logger } from './logger.js'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import type { ClaudePermissionMode } from '../shared/settings.js'
 import {
   isWindows, isWsl, isWindowsLike,
   getWindowsExe, getWindowsDefaultCwd,
@@ -25,6 +26,7 @@ type CodingCliCommandSpec = {
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
   permissionModeArgs?: (permissionMode: string) => string[]
+  permissionModeArgsByValue?: Partial<Record<ClaudePermissionMode, string[]>>
   permissionModeEnvVar?: string
   permissionModeEnvValues?: Record<string, string>
 }
@@ -67,6 +69,11 @@ export const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingC
     label: 'Kimi',
     envVar: 'KIMI_CMD',
     defaultCommand: 'kimi',
+    // Dead-code consistency only: production startup registers manifest-derived specs.
+    modelArgs: (model) => ['--model', model],
+    permissionModeArgsByValue: {
+      bypassPermissions: ['--yolo'],
+    },
   },
 }
 
@@ -227,7 +234,9 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   if (effectiveModel && spec.modelArgs) settingsArgs.push(...spec.modelArgs(effectiveModel))
   if (providerSettings?.sandbox && spec.sandboxArgs) settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
   if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
-    if (spec.permissionModeArgs) settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
+    const permissionModeArgs = spec.permissionModeArgsByValue?.[providerSettings.permissionMode as ClaudePermissionMode]
+    if (permissionModeArgs) settingsArgs.push(...permissionModeArgs)
+    else if (spec.permissionModeArgs) settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
     if (spec.permissionModeEnvVar) {
       const permissionValue =
         spec.permissionModeEnvValues?.[providerSettings.permissionMode] ??

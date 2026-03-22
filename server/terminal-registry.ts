@@ -22,6 +22,7 @@ import type {
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
+import type { ClaudePermissionMode } from '../shared/settings.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -50,6 +51,7 @@ export type CodingCliCommandSpec = {
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
   permissionModeArgs?: (permissionMode: string) => string[]
+  permissionModeArgsByValue?: Partial<Record<ClaudePermissionMode, string[]>>
   permissionModeEnvVar?: string
   permissionModeEnvValues?: Record<string, string>
 }
@@ -92,6 +94,10 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     label: 'Kimi',
     envVar: 'KIMI_CMD',
     defaultCommand: 'kimi',
+    modelArgs: (model: string) => ['--model', model],
+    permissionModeArgsByValue: {
+      bypassPermissions: ['--yolo'],
+    },
   }],
 ]
 
@@ -269,7 +275,10 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
     settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
   }
   if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
-    if (spec.permissionModeArgs) {
+    const permissionModeArgs = spec.permissionModeArgsByValue?.[providerSettings.permissionMode as ClaudePermissionMode]
+    if (permissionModeArgs) {
+      settingsArgs.push(...permissionModeArgs)
+    } else if (spec.permissionModeArgs) {
       settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
     }
     if (spec.permissionModeEnvVar) {

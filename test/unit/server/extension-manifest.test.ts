@@ -95,6 +95,22 @@ describe('ExtensionManifestSchema', () => {
     expect(result.success).toBe(true)
   })
 
+  it('accepts value-specific permission args for CLI manifests', () => {
+    const result = ExtensionManifestSchema.safeParse({
+      ...validCliManifest,
+      cli: {
+        command: 'kimi',
+        modelArgs: ['--model', '{{model}}'],
+        permissionModeArgsByValue: {
+          bypassPermissions: ['--yolo'],
+        },
+        supportsPermissionMode: true,
+        supportsModel: true,
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('rejects missing required fields', () => {
     const result = ExtensionManifestSchema.safeParse({ name: 'x' })
     expect(result.success).toBe(false)

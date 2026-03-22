@@ -1003,6 +1003,15 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
     })
+
+    it('adds Kimi model and yolo args when configured', () => {
+      const spec = buildSpawnSpec('kimi', '/repo/root', 'system', undefined, {
+        model: 'moonshot-k2',
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining(['--model', 'moonshot-k2', '--yolo']))
+    })
   })
 
   describe('environment variables in spawn spec', () => {

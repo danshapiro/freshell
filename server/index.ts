@@ -15,7 +15,8 @@ import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
-import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands } from './terminal-registry.js'
+import { buildCliCommandSpecsFromEntries } from './coding-cli/command-specs.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
@@ -67,14 +68,6 @@ import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-
-function compileArgTemplate(
-  template: string[] | undefined,
-  placeholder: string,
-): ((value: string) => string[]) | undefined {
-  if (!template) return undefined
-  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
-}
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -195,31 +188,7 @@ async function main() {
   const builtinExtDir = path.join(process.cwd(), 'extensions')
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
 
-  // Build CLI commands from extension manifests
-  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
-  for (const ext of extensionManager.getAll()) {
-    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const cli = ext.manifest.cli
-    const spec: CodingCliCommandSpec = {
-      label: ext.manifest.label,
-      envVar: cli.envVar || '',
-      defaultCommand: cli.command,
-      args: cli.args,
-      env: cli.env,
-      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
-      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
-      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
-      permissionModeEnvVar: cli.permissionModeEnvVar,
-      permissionModeEnvValues: cli.permissionModeValues,
-    }
-    if (cli.resumeArgs) {
-      const template = cli.resumeArgs
-      spec.resumeArgs = (sessionId: string) =>
-        template.map(arg => arg.replace('{{sessionId}}', sessionId))
-    }
-    cliCommandsMap.set(ext.manifest.name, spec)
-  }
-  registerCodingCliCommands(cliCommandsMap)
+  registerCodingCliCommands(buildCliCommandSpecsFromEntries(extensionManager.getAll()))
 
   // Build CLI detection specs from extension manifests
   const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
