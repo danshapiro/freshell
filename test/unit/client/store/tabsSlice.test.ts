@@ -886,36 +886,6 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('upgrades a terminalId-matched derived tab to a stable explicit session title', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
-
-      store.dispatch(addTab({
-        id: 'tab-1',
-        title: 'Tab 1',
-        mode: 'claude',
-        terminalId: 'term-1',
-        status: 'running',
-      }))
-
-      await store.dispatch(openSessionTab({
-        sessionId: VALID_CLAUDE_SESSION_ID,
-        provider: 'claude',
-        terminalId: 'term-1',
-        title: 'Claude Session',
-      }))
-
-      expect(store.getState().tabs.activeTabId).toBe('tab-1')
-      expect(store.getState().tabs.tabs[0]).toMatchObject({
-        title: 'Claude Session',
-        titleSource: 'stable',
-      })
-    })
-
     it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
       const store = createOpenSessionStore('srv-local')
 
@@ -946,42 +916,6 @@ describe('tabsSlice', () => {
             serverInstanceId: 'srv-local',
           },
         },
-      })
-    })
-
-    it('upgrades an existing derived session tab to a stable explicit session title', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
-
-      store.dispatch(addTab({
-        id: 'tab-1',
-        title: 'Tab 1',
-        mode: 'claude',
-        resumeSessionId: VALID_CLAUDE_SESSION_ID,
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-1',
-        content: {
-          kind: 'terminal',
-          mode: 'claude',
-          resumeSessionId: VALID_CLAUDE_SESSION_ID,
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        sessionId: VALID_CLAUDE_SESSION_ID,
-        provider: 'claude',
-        title: 'Claude Session',
-      }))
-
-      expect(store.getState().tabs.activeTabId).toBe('tab-1')
-      expect(store.getState().tabs.tabs[0]).toMatchObject({
-        title: 'Claude Session',
-        titleSource: 'stable',
       })
     })
 

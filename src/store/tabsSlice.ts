@@ -12,7 +12,6 @@ import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry, clearClosedTa
 import { clearDraft } from '@/lib/draft-store'
 import {
   bootstrapLegacyTabTitleSource,
-  resolveEffectiveLegacyTabTitleSource,
   type DurableTitleSource,
 } from '@/lib/title-source'
 import {
@@ -44,7 +43,7 @@ function setTabTitleSource(tab: Tab, source: DurableTitleSource | undefined) {
   tab.titleSetByUser = source === 'user'
 }
 
-function normalizeLoadedTab(tab: Partial<Tab> & Pick<Tab, 'id' | 'title'>): Tab {
+function normalizeLoadedTab(tab: Tab): Tab {
   const legacyClaudeSessionId = (tab as any).claudeSessionId as string | undefined
   const titleSource = tab.titleSource ?? bootstrapLegacyTabTitleSource({
     title: tab.title,
@@ -74,21 +73,6 @@ function resolveAddTabTitleSource(payload: AddTabPayload): DurableTitleSource {
   return 'derived'
 }
 
-function resolveExistingTabTitleSource(state: RootState, tab: Tab): DurableTitleSource {
-  const layout = state.panes.layouts[tab.id]
-  const paneId = layout?.type === 'leaf' ? layout.id : undefined
-  return tab.titleSource
-    ?? resolveEffectiveLegacyTabTitleSource({
-      storedTitle: tab.title,
-      titleSetByUser: tab.titleSetByUser,
-      layout,
-      paneTitle: paneId ? state.panes.paneTitles[tab.id]?.[paneId] : undefined,
-      paneTitleSource: paneId ? state.panes.paneTitleSources?.[tab.id]?.[paneId] : undefined,
-      extensions: state.extensions?.entries,
-    })
-    ?? (tab.titleSetByUser ? 'user' : 'stable')
-}
-
 export interface TabsState {
   tabs: Tab[]
   activeTabId: string | null
@@ -111,12 +95,12 @@ function loadInitialTabsState(): TabsState {
     if (!raw) return defaultState
     const parsed = parsePersistedTabsRaw(raw)
     if (!parsed) return defaultState
-    const tabsState = parsed.tabs
+    const tabsState = parsed.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
     log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
 
-    const mappedTabs = tabsState.tabs.map((t) => normalizeLoadedTab(t))
+    const mappedTabs = tabsState.tabs.map((t: Tab) => normalizeLoadedTab(t))
     const desired = tabsState.activeTabId
     const has = desired && mappedTabs.some((t) => t.id === desired)
 
@@ -474,16 +458,6 @@ export const openSessionTab = createAsyncThunk(
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
       mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
 
-    const maybeUpgradeExistingTabTitle = (tab: Tab | undefined) => {
-      if (!tab || !title) return
-      if (resolveExistingTabTitleSource(state, tab) !== 'derived') return
-      dispatch(setTabTitle({
-        id: tab.id,
-        title,
-        source: 'stable',
-      }))
-    }
-
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,
       sessionId,
@@ -588,7 +562,6 @@ export const openSessionTab = createAsyncThunk(
           } else {
             repairExistingTabLayout(existingTab, desiredRunningResumeContent)
           }
-          maybeUpgradeExistingTabTitle(existingTab)
           dispatch(setActiveTab(existingTab.id))
           return
         }
@@ -624,7 +597,6 @@ export const openSessionTab = createAsyncThunk(
         const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
         updateExistingTabMetadata(existingTab)
         repairExistingTabLayout(existingTab)
-        maybeUpgradeExistingTabTitle(existingTab)
         dispatch(setActiveTab(existingTabId))
         return
       }

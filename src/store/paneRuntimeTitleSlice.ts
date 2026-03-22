@@ -8,7 +8,6 @@ import {
   removeLayout,
   replacePane,
   restoreLayout,
-  updatePaneTitle,
   updatePaneContent,
 } from './panesSlice'
 import { normalizeRuntimeTitle } from '@/lib/title-source'
@@ -69,9 +68,6 @@ export const paneRuntimeTitleSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(updatePaneContent, (state, action) => {
-        delete state.titlesByPaneId[action.payload.paneId]
-      })
-      .addCase(updatePaneTitle, (state, action) => {
         delete state.titlesByPaneId[action.payload.paneId]
       })
       .addCase(mergePaneContent, (state, action) => {

@@ -80,6 +80,5 @@ describe('BackgroundSessions', () => {
     expect(tabs[0].mode).toBe('codex')
     expect(tabs[0].resumeSessionId).toBe('codex-sess-abc')
     expect(tabs[0].terminalId).toBe('term-codex-1')
-    expect(tabs[0].titleSource).toBe('stable')
   })
 })

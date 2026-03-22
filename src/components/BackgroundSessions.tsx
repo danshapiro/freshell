@@ -97,14 +97,7 @@ export default function BackgroundSessions() {
                     size="sm"
                     variant="outline"
                     onClick={() => {
-                      dispatch(addTab({
-                        title: t.title,
-                        titleSource: 'stable',
-                        terminalId: t.terminalId,
-                        status: 'running',
-                        mode: (t.mode as any) || 'shell',
-                        resumeSessionId: t.resumeSessionId,
-                      }))
+                      dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: (t.mode as any) || 'shell', resumeSessionId: t.resumeSessionId }))
                     }}
                   >
                     Attach

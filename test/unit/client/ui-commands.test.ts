@@ -20,7 +20,6 @@ describe('handleUiCommand', () => {
 
     handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 't1', title: 'Alpha' } }, dispatch)
     expect(actions[0].type).toBe('tabs/addTab')
-    expect(actions[0].payload.titleSource).toBe('stable')
   })
 
   it('initializes layout when tab.create includes pane content', () => {

@@ -1,172 +1,389 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
-import paneRuntimeTitleReducer, { setPaneRuntimeTitleByTerminalId } from '@/store/paneRuntimeTitleSlice'
-import { syncStableTitleByTerminalId } from '@/store/titleSync'
-import { getTabDisplayTitle } from '@/lib/tab-title'
-import { normalizeRuntimeTitle, shouldDecorateExitTitle, type DurableTitleSource } from '@/lib/title-source'
+import panesReducer, { updatePaneTitle } from '@/store/panesSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import connectionReducer from '@/store/connectionSlice'
 
-function createStore(options?: {
-  title?: string
-  titleSource?: DurableTitleSource
-  paneTitles?: Record<string, string>
-  paneTitleSources?: Record<string, DurableTitleSource>
-}) {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      paneRuntimeTitle: paneRuntimeTitleReducer,
-    },
-    preloadedState: {
-      tabs: {
-        tabs: [{
-          id: 'tab-1',
-          mode: 'shell' as const,
-          status: 'running' as const,
-          title: options?.title ?? 'Terminal',
-          titleSource: options?.titleSource ?? 'derived',
-          titleSetByUser: options?.titleSource === 'user',
-          createRequestId: 'req-1',
-          createdAt: 1,
-        }],
-        activeTabId: 'tab-1',
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'shell',
-              shell: 'system',
-              terminalId: 'term-1',
-              initialCwd: '/tmp/project',
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: options?.paneTitles ? { 'tab-1': options.paneTitles } : {},
-        paneTitleSources: options?.paneTitleSources ? { 'tab-1': options.paneTitleSources } : {},
-        paneTitleSetByUser: {},
-      },
-      paneRuntimeTitle: {
-        titlesByPaneId: {},
-      },
-    },
-  })
-}
-
-function getDisplayTitle(store: ReturnType<typeof createStore>): string {
-  const state = store.getState()
-  return getTabDisplayTitle(
-    state.tabs.tabs[0],
-    state.panes.layouts['tab-1'],
-    state.panes.paneTitles['tab-1'],
-    state.panes.paneTitleSources?.['tab-1'],
-    state.paneRuntimeTitle.titlesByPaneId,
-  )
-}
+// Since TerminalView is complex with xterm dependencies, we test the title update
+// logic separately by simulating what the component does when a terminal.exit message arrives.
 
 describe('TerminalView exit title behavior', () => {
-  function applyExitTitle(
-    store: ReturnType<typeof createStore>,
-    exitCode: number,
-  ) {
-    const tab = store.getState().tabs.tabs[0]
-    const updates: { status: 'exited'; title?: string } = { status: 'exited' }
-    if (shouldDecorateExitTitle(tab.titleSource)) {
-      updates.title = `${tab.title} (exit ${exitCode})`
-    }
-    store.dispatch(updateTab({ id: tab.id, updates }))
+  afterEach(() => {
+    cleanup()
+  })
+
+  function createStore(tabOptions: { titleSetByUser?: boolean }) {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: 'My Custom Title',
+            titleSetByUser: tabOptions.titleSetByUser ?? false,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: 'tab-1',
+        },
+        panes: { layouts: {}, activePane: {} },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
+    })
   }
 
-  it('appends exit code when the durable title is still derived', () => {
-    const store = createStore({ title: 'project', titleSource: 'derived' })
+  it('appends exit code to title when titleSetByUser is false', () => {
+    const store = createStore({ titleSetByUser: false })
+    const tab = store.getState().tabs.tabs[0]
 
-    applyExitTitle(store, 0)
+    // Simulate what TerminalView does on terminal.exit
+    const code = 0
+    const updates: { status: 'exited'; title?: string } = { status: 'exited' }
+    if (!tab.titleSetByUser) {
+      updates.title = tab.title + (code !== undefined ? ` (exit ${code})` : '')
+    }
+    store.dispatch(updateTab({ id: tab.id, updates }))
 
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'project (exit 0)',
-      status: 'exited',
-    })
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('My Custom Title (exit 0)')
+    expect(updatedTab.status).toBe('exited')
   })
 
-  it('keeps a stable durable title plain on exit', () => {
-    const store = createStore({ title: 'codex resume 019d', titleSource: 'stable' })
+  it('preserves title when titleSetByUser is true', () => {
+    const store = createStore({ titleSetByUser: true })
+    const tab = store.getState().tabs.tabs[0]
 
-    applyExitTitle(store, 1)
+    // Simulate what TerminalView does on terminal.exit
+    const code = 0
+    const updates: { status: 'exited'; title?: string } = { status: 'exited' }
+    if (!tab.titleSetByUser) {
+      updates.title = tab.title + (code !== undefined ? ` (exit ${code})` : '')
+    }
+    store.dispatch(updateTab({ id: tab.id, updates }))
 
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'codex resume 019d',
-      status: 'exited',
-    })
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('My Custom Title') // Title unchanged
+    expect(updatedTab.status).toBe('exited')
   })
 
-  it('keeps a user title plain on exit', () => {
-    const store = createStore({ title: 'Ops desk', titleSource: 'user' })
+  it('appends exit code for non-zero exit when titleSetByUser is false', () => {
+    const store = createStore({ titleSetByUser: false })
+    const tab = store.getState().tabs.tabs[0]
 
-    applyExitTitle(store, 1)
+    const code = 1
+    const updates: { status: 'exited'; title?: string } = { status: 'exited' }
+    if (!tab.titleSetByUser) {
+      updates.title = tab.title + (code !== undefined ? ` (exit ${code})` : '')
+    }
+    store.dispatch(updateTab({ id: tab.id, updates }))
 
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'Ops desk',
-      status: 'exited',
-    })
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('My Custom Title (exit 1)')
   })
 })
 
-describe('TerminalView runtime title handling', () => {
-  it('normalizes spinner-prefixed runtime titles', () => {
-    expect(normalizeRuntimeTitle('⠋ codex')).toBe('codex')
-    expect(normalizeRuntimeTitle('  vim README.md  ')).toBe('vim README.md')
-    expect(normalizeRuntimeTitle('***')).toBe(null)
+describe('TerminalView xterm title change behavior', () => {
+  afterEach(() => {
+    cleanup()
   })
 
-  it('routes raw runtime titles into the runtime slice only', async () => {
-    const store = createStore()
-
-    await store.dispatch(setPaneRuntimeTitleByTerminalId({
-      terminalId: 'term-1',
-      title: '⠋ vim README.md',
-    }) as any)
-
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'Terminal',
-      titleSource: 'derived',
+  function createStore(tabOptions: { titleSetByUser?: boolean; title?: string }) {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: tabOptions.title ?? 'Terminal',
+            titleSetByUser: tabOptions.titleSetByUser ?? false,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: 'tab-1',
+        },
+        panes: { layouts: {}, activePane: {} },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
     })
-    expect(store.getState().panes.paneTitles['tab-1']).toBeUndefined()
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId['pane-1']).toBe('vim README.md')
-    expect(getDisplayTitle(store)).toBe('vim README.md')
+  }
+
+  // This tests the logic that should happen when xterm emits onTitleChange
+  // The actual implementation needs to add term.onTitleChange() listener
+
+  it('updates tab title when xterm title changes and titleSetByUser is false', () => {
+    const store = createStore({ titleSetByUser: false, title: 'Terminal' })
+    const tab = store.getState().tabs.tabs[0]
+
+    // Simulate what TerminalView should do on term.onTitleChange
+    const newTitle = 'user@host:~/project'
+    if (!tab.titleSetByUser && newTitle) {
+      store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+    }
+
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('user@host:~/project')
   })
 
-  it('keeps a stable durable title ahead of later runtime titles', async () => {
-    const store = createStore()
-    const durableTitle = 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346'
+  it('preserves tab title when xterm title changes but titleSetByUser is true', () => {
+    const store = createStore({ titleSetByUser: true, title: 'My Custom Name' })
+    const tab = store.getState().tabs.tabs[0]
 
-    await store.dispatch(setPaneRuntimeTitleByTerminalId({
-      terminalId: 'term-1',
-      title: 'vim README.md',
-    }) as any)
-    await store.dispatch(syncStableTitleByTerminalId({
-      terminalId: 'term-1',
-      title: durableTitle,
-    }) as any)
+    // Simulate what TerminalView should do on term.onTitleChange
+    const newTitle = 'user@host:~/project'
+    if (!tab.titleSetByUser && newTitle) {
+      store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+    }
 
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: durableTitle,
-      titleSource: 'stable',
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('My Custom Name') // Title unchanged
+  })
+
+  it('ignores empty title changes', () => {
+    const store = createStore({ titleSetByUser: false, title: 'Terminal' })
+    const tab = store.getState().tabs.tabs[0]
+
+    // Simulate what TerminalView should do on term.onTitleChange with empty string
+    const newTitle = ''
+    if (!tab.titleSetByUser && newTitle) {
+      store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+    }
+
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('Terminal') // Title unchanged - empty ignored
+  })
+
+  it('handles multiple title changes', () => {
+    const store = createStore({ titleSetByUser: false, title: 'Terminal' })
+
+    // Simulate multiple title changes
+    const titles = ['user@host:~', 'user@host:~/project', 'vim README.md']
+    for (const newTitle of titles) {
+      const tab = store.getState().tabs.tabs[0]
+      if (!tab.titleSetByUser && newTitle) {
+        store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+      }
+    }
+
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.title).toBe('vim README.md') // Last title wins
+  })
+})
+
+describe('TerminalView title normalization', () => {
+  // Helper that mirrors the normalization logic in TerminalView
+  function normalizeTitle(rawTitle: string): string | null {
+    const match = rawTitle.match(/[a-zA-Z]/)
+    if (!match) return null // No letters = all noise
+    const cleanTitle = rawTitle.slice(match.index)
+    return cleanTitle || null
+  }
+
+  it('strips spinner prefix from title', () => {
+    expect(normalizeTitle('* Building...')).toBe('Building...')
+    expect(normalizeTitle('⠋ Loading...')).toBe('Loading...')
+    expect(normalizeTitle('● Running tests')).toBe('Running tests')
+    expect(normalizeTitle('→ user@host:~')).toBe('user@host:~')
+  })
+
+  it('preserves title without prefix', () => {
+    expect(normalizeTitle('user@host:~/project')).toBe('user@host:~/project')
+    expect(normalizeTitle('vim README.md')).toBe('vim README.md')
+  })
+
+  it('returns null for empty result', () => {
+    expect(normalizeTitle('')).toBe(null)
+    expect(normalizeTitle('***')).toBe(null)
+    expect(normalizeTitle('123')).toBe(null)
+  })
+
+  it('deduplicates spinner changes (same cleaned title)', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: 'Terminal',
+            titleSetByUser: false,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: 'tab-1',
+        },
+        panes: { layouts: {}, activePane: {} },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
     })
-    expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe(durableTitle)
-    expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId['pane-1']).toBeUndefined()
 
-    await store.dispatch(setPaneRuntimeTitleByTerminalId({
-      terminalId: 'term-1',
-      title: 'codex',
-    }) as any)
+    // Simulate the deduplication logic from TerminalView
+    let lastTitle: string | null = null
+    const rawTitles = ['⠋ Building...', '⠙ Building...', '⠹ Building...', '✓ Done']
+    let updateCount = 0
 
-    expect(getDisplayTitle(store)).toBe(durableTitle)
+    for (const rawTitle of rawTitles) {
+      const cleanTitle = normalizeTitle(rawTitle)
+      if (cleanTitle && cleanTitle !== lastTitle) {
+        lastTitle = cleanTitle
+        store.dispatch(updateTab({ id: 'tab-1', updates: { title: cleanTitle } }))
+        updateCount++
+      }
+    }
+
+    // Should only have 2 updates: "Building..." and "Done"
+    expect(updateCount).toBe(2)
+    expect(store.getState().tabs.tabs[0].title).toBe('Done')
+  })
+})
+
+describe('TerminalView decoupled title guards', () => {
+  // Tab and pane title auto-updates should be independently guarded:
+  // - Tab title gated by tab.titleSetByUser
+  // - Pane title gated by paneTitleSetByUser (in the reducer)
+  // Renaming one should NOT block auto-updates on the other.
+
+  const TAB_ID = 'tab-1'
+  const PANE_ID = 'pane-1'
+
+  function createStore(opts: {
+    tabTitleSetByUser: boolean
+    paneTitleSetByUser: boolean
+    tabTitle?: string
+    paneTitle?: string
+  }) {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: TAB_ID,
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: opts.tabTitle ?? 'Terminal',
+            titleSetByUser: opts.tabTitleSetByUser,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: TAB_ID,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: { [TAB_ID]: { [PANE_ID]: opts.paneTitle ?? 'Terminal' } },
+          paneTitleSetByUser: opts.paneTitleSetByUser
+            ? { [TAB_ID]: { [PANE_ID]: true } }
+            : {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
+    })
+  }
+
+  /** Simulate the DESIRED decoupled title update logic from TerminalView. */
+  function simulateDecoupledTitleUpdate(
+    store: ReturnType<typeof createStore>,
+    newTitle: string
+  ) {
+    const tab = store.getState().tabs.tabs[0]
+
+    // Tab title: only gated by tab.titleSetByUser
+    if (!tab.titleSetByUser && newTitle) {
+      store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+    }
+
+    // Pane title: always dispatched with setByUser:false — reducer handles guard
+    if (newTitle) {
+      store.dispatch(updatePaneTitle({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        title: newTitle,
+        setByUser: false,
+      }))
+    }
+  }
+
+  it('updates pane title even when tab title is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: true,
+      paneTitleSetByUser: false,
+      tabTitle: 'My Custom Tab',
+      paneTitle: 'Terminal',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    // Tab title should NOT change (user renamed it)
+    expect(store.getState().tabs.tabs[0].title).toBe('My Custom Tab')
+    // Pane title SHOULD update (pane was not renamed by user)
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('user@host:~/project')
+  })
+
+  it('updates tab title even when pane title is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: false,
+      paneTitleSetByUser: true,
+      tabTitle: 'Terminal',
+      paneTitle: 'My Custom Pane',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    // Tab title SHOULD update (tab was not renamed by user)
+    expect(store.getState().tabs.tabs[0].title).toBe('user@host:~/project')
+    // Pane title should NOT change (user renamed it, reducer blocks setByUser:false)
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('My Custom Pane')
+  })
+
+  it('updates both when neither is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: false,
+      paneTitleSetByUser: false,
+    })
+
+    simulateDecoupledTitleUpdate(store, 'vim README.md')
+
+    expect(store.getState().tabs.tabs[0].title).toBe('vim README.md')
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('vim README.md')
+  })
+
+  it('updates neither when both are user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: true,
+      paneTitleSetByUser: true,
+      tabTitle: 'My Tab',
+      paneTitle: 'My Pane',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    expect(store.getState().tabs.tabs[0].title).toBe('My Tab')
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('My Pane')
   })
 })

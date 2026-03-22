@@ -320,13 +320,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
     if (result.method === 'terminal') {
       const tabId = nanoid()
-      dispatch(addTab({
-        id: tabId,
-        title: 'Firewall Setup',
-        titleSource: 'stable',
-        mode: 'shell',
-        shell: 'system',
-      }))
+      dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
       dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
       onFirewallTerminal?.({ tabId, command: result.command })
       // Dismiss the wizard overlay so the user can interact with the

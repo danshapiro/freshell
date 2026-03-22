@@ -150,7 +150,6 @@ describe('TabsView', () => {
     const tabs = store.getState().tabs.tabs
     const newTab = tabs.find((tab) => tab.title === 'session remote')
     expect(newTab).toBeTruthy()
-    expect(newTab?.titleSource).toBe('stable')
     const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
     expect(layout?.content?.resumeSessionId).toBeUndefined()
     expect(layout?.content?.sessionRef).toEqual({

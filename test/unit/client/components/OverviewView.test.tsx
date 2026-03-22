@@ -60,10 +60,7 @@ function renderWithStore(ui: React.ReactElement) {
   const store = configureStore({
     reducer: { tabs: tabsReducer },
   })
-  return {
-    store,
-    ...render(<Provider store={store}>{ui}</Provider>),
-  }
+  return render(<Provider store={store}>{ui}</Provider>)
 }
 
 async function waitForTerminalsLoaded() {
@@ -93,21 +90,6 @@ describe('OverviewView Refresh All', () => {
     renderWithStore(<OverviewView />)
     await waitForTerminalsLoaded()
     expect(getRefreshAllButton()).toBeInTheDocument()
-  })
-
-  it('opens a tracked terminal with a stable title source', async () => {
-    const { store } = renderWithStore(<OverviewView />)
-    await waitForTerminalsLoaded()
-
-    fireEvent.click(screen.getByLabelText('Open terminal Shell'))
-
-    const tabs = store.getState().tabs.tabs
-    expect(tabs).toHaveLength(1)
-    expect(tabs[0]).toMatchObject({
-      title: 'Shell',
-      titleSource: 'stable',
-      terminalId: 't1',
-    })
   })
 
   it('dispatches summary requests for all terminals on first click', async () => {
