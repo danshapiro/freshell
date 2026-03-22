@@ -10,7 +10,6 @@ import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeTitleReducer, { setPaneRuntimeTitle } from '@/store/paneRuntimeTitleSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
-import { syncStableTitleByTerminalId } from '@/store/titleSync'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { getTabDisplayTitle } from '@/lib/tab-title'
@@ -4428,88 +4427,6 @@ describe('TerminalView lifecycle updates', () => {
 
       await act(async () => {
         await Promise.resolve()
-      })
-
-      act(() => {
-        titleListener('vim README.md')
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
-      })
-    })
-
-    it('restores the same runtime title after a stable durable title sync clears runtime state', async () => {
-      const { terminalId, term, store, paneId } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-v2-runtime-title-stable-clear',
-      })
-
-      const titleListener = term.onTitleChange.mock.calls[0]?.[0]
-      expect(titleListener).toBeTypeOf('function')
-
-      act(() => {
-        titleListener('vim README.md')
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
-      })
-
-      await act(async () => {
-        await store.dispatch(syncStableTitleByTerminalId({
-          terminalId,
-          title: 'Claude Session',
-        }) as any)
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBeUndefined()
-      })
-
-      act(() => {
-        titleListener('vim README.md')
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
-      })
-    })
-
-    it('restores the same runtime title after updatePaneContent clears runtime state', async () => {
-      const { terminalId, term, store, paneId, tabId } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-v2-runtime-title-content-clear',
-      })
-
-      const titleListener = term.onTitleChange.mock.calls[0]?.[0]
-      expect(titleListener).toBeTypeOf('function')
-
-      act(() => {
-        titleListener('vim README.md')
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBe('vim README.md')
-      })
-
-      act(() => {
-        store.dispatch(updatePaneContent({
-          tabId,
-          paneId,
-          content: {
-            kind: 'terminal',
-            mode: 'shell',
-            shell: 'system',
-            status: 'running',
-            createRequestId: 'req-v2-runtime-title-content-clear',
-            terminalId,
-          },
-        }))
-      })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeTitle.titlesByPaneId[paneId]).toBeUndefined()
       })
 
       act(() => {

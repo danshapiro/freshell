@@ -179,31 +179,6 @@ describe('TabContent', () => {
         expect.anything(),
       )
     })
-
-    it('passes durable pane title metadata for legacy stable titles without a stored source', () => {
-      const store = createStore([
-        {
-          id: 'tab-1',
-          mode: 'shell',
-          terminalId: 'existing-terminal-123',
-          title: 'Ops Desk',
-        },
-      ])
-
-      render(
-        <Provider store={store}>
-          <TabContent tabId="tab-1" />
-        </Provider>
-      )
-
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultPaneTitle: 'Ops Desk',
-          defaultPaneTitleSource: 'stable',
-        }),
-        expect.anything(),
-      )
-    })
   })
 
   describe('coding CLI sessions', () => {

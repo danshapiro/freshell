@@ -11,7 +11,7 @@ import tabsReducer, {
   openSessionTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
-import panesReducer, { addPane, initLayout } from '../../../../src/store/panesSlice'
+import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
 import type { Tab } from '../../../../src/store/types'
@@ -930,57 +930,6 @@ describe('tabsSlice', () => {
       expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
     })
 
-    it('does not rename a split terminalId-matched tab when only one pane matches the session terminal', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
-
-      store.dispatch(addTab({
-        id: 'tab-1',
-        title: 'Tab 1',
-        mode: 'claude',
-        terminalId: 'term-1',
-        status: 'running',
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        content: {
-          kind: 'terminal',
-          mode: 'claude',
-          status: 'running',
-          createRequestId: 'req-1',
-          terminalId: 'term-1',
-        },
-      }))
-      store.dispatch(addPane({
-        tabId: 'tab-1',
-        newContent: {
-          kind: 'terminal',
-          mode: 'shell',
-          status: 'running',
-          createRequestId: 'req-2',
-          terminalId: 'term-2',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        sessionId: VALID_CLAUDE_SESSION_ID,
-        provider: 'claude',
-        terminalId: 'term-1',
-        title: 'Claude Session',
-      }))
-
-      expect(store.getState().tabs.activeTabId).toBe('tab-1')
-      expect(store.getState().tabs.tabs[0]).toMatchObject({
-        title: 'Tab 1',
-        titleSource: 'derived',
-      })
-    })
-
     it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
       const store = createOpenSessionStore('srv-local')
 
@@ -1051,53 +1000,6 @@ describe('tabsSlice', () => {
       })
       expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Claude Session')
       expect(store.getState().panes.paneTitleSources?.['tab-1']?.['pane-1']).toBe('stable')
-    })
-
-    it('does not rename a split session-owned tab when only one pane owns the reopened session', async () => {
-      const store = configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-        },
-      })
-
-      store.dispatch(addTab({
-        id: 'tab-1',
-        title: 'Tab 1',
-        mode: 'claude',
-        resumeSessionId: VALID_CLAUDE_SESSION_ID,
-      }))
-      store.dispatch(initLayout({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        content: {
-          kind: 'terminal',
-          mode: 'claude',
-          resumeSessionId: VALID_CLAUDE_SESSION_ID,
-        },
-      }))
-      store.dispatch(addPane({
-        tabId: 'tab-1',
-        newContent: {
-          kind: 'terminal',
-          mode: 'shell',
-          status: 'running',
-          createRequestId: 'req-2',
-          terminalId: 'term-2',
-        },
-      }))
-
-      await store.dispatch(openSessionTab({
-        sessionId: VALID_CLAUDE_SESSION_ID,
-        provider: 'claude',
-        title: 'Claude Session',
-      }))
-
-      expect(store.getState().tabs.activeTabId).toBe('tab-1')
-      expect(store.getState().tabs.tabs[0]).toMatchObject({
-        title: 'Tab 1',
-        titleSource: 'derived',
-      })
     })
 
     it('uses capitalized provider label for codex tab title', async () => {

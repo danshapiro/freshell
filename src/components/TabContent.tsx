@@ -4,29 +4,22 @@ import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
-import {
-  bootstrapLegacyTabTitleSource,
-  type DurableTitleSource,
-} from '@/lib/title-source'
+import type { DurableTitleSource } from '@/lib/title-source'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getTabResumeSessionType } from '@/lib/session-metadata'
 import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import type { ClientExtensionEntry } from '@shared/extension-types'
 
 interface TabContentProps {
   tabId: string
   hidden?: boolean
 }
 
-const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
-
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const previousHiddenRef = useRef(hidden)
 
   useEffect(() => {
@@ -118,14 +111,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   }
 
   const defaultPaneTitleSource: DurableTitleSource | undefined = tab.titleSource
-    ?? bootstrapLegacyTabTitleSource({
-      title: tab.title,
-      titleSetByUser: tab.titleSetByUser,
-      mode: tab.mode,
-      shell: tab.shell,
-      extensions: extensionEntries,
-    })
-    ?? (tab.titleSetByUser ? 'user' : 'stable')
+    ?? (tab.titleSetByUser ? 'user' : undefined)
   const defaultPaneTitle = defaultPaneTitleSource && defaultPaneTitleSource !== 'derived'
     ? tab.title
     : undefined
