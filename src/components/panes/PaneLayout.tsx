@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { initLayout, addPane, splitPane } from '@/store/panesSlice'
 import type { PaneContentInput, PaneNode } from '@/store/paneTypes'
-import type { DurableTitleSource } from '@/lib/title-source'
 import PaneContainer from './PaneContainer'
 import FloatingActionButton from './FloatingActionButton'
 import IntersectionDragOverlay from './IntersectionDragOverlay'
@@ -16,18 +15,10 @@ function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' 
 interface PaneLayoutProps {
   tabId: string
   defaultContent: PaneContentInput
-  defaultPaneTitle?: string
-  defaultPaneTitleSource?: DurableTitleSource
   hidden?: boolean
 }
 
-export default function PaneLayout({
-  tabId,
-  defaultContent,
-  defaultPaneTitle,
-  defaultPaneTitleSource,
-  hidden,
-}: PaneLayoutProps) {
+export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayoutProps) {
   const dispatch = useAppDispatch()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
@@ -38,12 +29,7 @@ export default function PaneLayout({
   // Initialize layout if not exists
   useEffect(() => {
     if (!layout) {
-      dispatch(initLayout({
-        tabId,
-        content: defaultContent,
-        title: defaultPaneTitle,
-        titleSource: defaultPaneTitleSource,
-      }))
+      dispatch(initLayout({ tabId, content: defaultContent }))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dispatch, tabId, layout])

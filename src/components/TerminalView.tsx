@@ -114,22 +114,9 @@ const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_PANE_TITLE_SOURCES: Record<string, 'derived' | 'stable' | 'user'> = {}
 const EMPTY_EXTENSION_ENTRIES: any[] = []
-const E2E_SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY = 'freshell.e2e.suppressedTerminalPaneIds'
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
-}
-
-function isTerminalNetworkEffectsPersistedAsSuppressed(paneId: string): boolean {
-  if (typeof window === 'undefined') return false
-  try {
-    const raw = window.localStorage?.getItem(E2E_SUPPRESSED_TERMINAL_PANE_IDS_STORAGE_KEY)
-    if (!raw) return false
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) && parsed.includes(paneId)
-  } catch {
-    return false
-  }
 }
 
 function resolveTabTitleSourceForLifecycle(input: {
@@ -276,10 +263,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const ws = useMemo(() => getWsClient(), [])
   // Playwright can opt a pane into state-only mode so activity chrome tests
   // don't race the live terminal create/attach lifecycle.
-  const suppressNetworkEffects = typeof window !== 'undefined' && (
-    window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
-    || isTerminalNetworkEffectsPersistedAsSuppressed(paneId)
-  )
+  const suppressNetworkEffects = typeof window !== 'undefined'
+    && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
@@ -383,7 +368,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const refreshRequestRef = useRef<PaneRefreshRequest | null>(refreshRequest)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const hasMountedRefreshEffectRef = useRef(false)
-  const suppressRuntimeTitleEventsRef = useRef(0)
 
   const applySeqState = useCallback((
     nextState: AttachSeqState,
@@ -874,12 +858,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const handleTerminalOutput = useCallback((
-    raw: string,
-    mode: TerminalPaneContent['mode'],
-    tid?: string,
-    options?: { suppressRuntimeTitle?: boolean },
-  ) => {
+  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
     const osc = extractOsc52Events(raw, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
@@ -911,19 +890,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
 
     if (cleaned) {
-      if (options?.suppressRuntimeTitle) {
-        enqueueTerminalWrite(cleaned, () => {
-          suppressRuntimeTitleEventsRef.current = Math.max(0, suppressRuntimeTitleEventsRef.current - 1)
-        })
-      } else {
-        enqueueTerminalWrite(cleaned)
-      }
+      enqueueTerminalWrite(cleaned)
     }
 
     for (const event of osc.events) {
       handleOsc52Event(event)
     }
-    return Boolean(cleaned)
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, tabId])
 
   const sendInput = useCallback((data: string) => {
@@ -1360,13 +1332,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!term) return
 
     const disposable = term.onTitleChange((rawTitle: string) => {
-      if (
-        suppressRuntimeTitleEventsRef.current > 0
-        || deferredAttachStateRef.current.mode === 'attaching'
-      ) {
-        return
-      }
-
       const cleanTitle = normalizeRuntimeTitle(rawTitle)
       if (!cleanTitle) return
 
@@ -1392,21 +1357,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [isTerminal, dispatch])
 
   const markAttachComplete = useCallback(() => {
-    const applyLiveMode = () => {
-      if (deferredAttachStateRef.current.mode !== 'attaching') return
-      deferredAttachStateRef.current = {
-        mode: 'live',
-        pendingIntent: null,
-        pendingSinceSeq: 0,
-      }
+    deferredAttachStateRef.current = {
+      mode: 'live',
+      pendingIntent: null,
+      pendingSinceSeq: 0,
     }
-
-    if (typeof queueMicrotask === 'function') {
-      queueMicrotask(applyLiveMode)
-      return
-    }
-
-    Promise.resolve().then(applyLiveMode).catch(() => {})
   }, [])
 
   const isCurrentAttachMessage = useCallback((msg: {
@@ -1768,17 +1723,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          const shouldSuppressRuntimeTitle = Boolean(previousSeqState.pendingReplay)
-            || deferredAttachStateRef.current.mode === 'attaching'
-          if (shouldSuppressRuntimeTitle) {
-            suppressRuntimeTitleEventsRef.current += 1
-          }
-          const wroteOutput = handleTerminalOutput(raw, mode, tid, {
-            suppressRuntimeTitle: shouldSuppressRuntimeTitle,
-          })
-          if (shouldSuppressRuntimeTitle && !wroteOutput) {
-            suppressRuntimeTitleEventsRef.current = Math.max(0, suppressRuntimeTitleEventsRef.current - 1)
-          }
+          handleTerminalOutput(raw, mode, tid)
           if (
             raw.length > 0
             && !terminalFirstOutputMarkedRef.current

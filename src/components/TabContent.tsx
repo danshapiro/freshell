@@ -4,7 +4,6 @@ import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
-import type { DurableTitleSource } from '@/lib/title-source'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getTabResumeSessionType } from '@/lib/session-metadata'
@@ -110,25 +109,11 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
     }
   }
 
-  const defaultPaneTitleSource: DurableTitleSource | undefined = tab.titleSource
-    ?? (tab.titleSetByUser ? 'user' : undefined)
-  const defaultPaneTitle = defaultPaneTitleSource && defaultPaneTitleSource !== 'derived'
-    ? tab.title
-    : undefined
-
   // Use PaneLayout for all terminal-based tabs
   return (
     <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
       <ErrorBoundary key={tabId} label="Tab">
-        <PaneLayout
-          tabId={tabId}
-          defaultContent={defaultContent}
-          defaultPaneTitle={defaultPaneTitle}
-          defaultPaneTitleSource={defaultPaneTitleSource && defaultPaneTitleSource !== 'derived'
-            ? defaultPaneTitleSource
-            : undefined}
-          hidden={hidden}
-        />
+        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
       </ErrorBoundary>
     </div>
   )

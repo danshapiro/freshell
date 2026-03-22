@@ -707,15 +707,9 @@ export const panesSlice = createSlice({
   reducers: {
     initLayout: (
       state,
-      action: PayloadAction<{
-        tabId: string
-        content: PaneContentInput
-        paneId?: string
-        title?: string
-        titleSource?: DurableTitleSource
-      }>
+      action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
     ) => {
-      const { tabId, content, paneId: providedPaneId, title, titleSource } = action.payload
+      const { tabId, content, paneId: providedPaneId } = action.payload
       // Don't overwrite existing layout
       if (state.layouts[tabId]) return
 
@@ -727,24 +721,12 @@ export const panesSlice = createSlice({
         content: normalized,
       }
       state.activePane[tabId] = paneId
-      if (typeof title === 'string' && titleSource && titleSource !== 'derived') {
-        state.paneTitles[tabId] = { [paneId]: title }
-        state.paneTitleSources = {
-          ...(state.paneTitleSources || {}),
-          [tabId]: { [paneId]: titleSource },
-        }
-        syncPaneTitleSetByUserMirror(state, tabId, paneId, titleSource)
-        if (titleSource !== 'user') {
-          delete ensurePaneTitleSetByUserMap(state)[tabId]
-        }
-      } else {
-        state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
-        state.paneTitleSources = {
-          ...(state.paneTitleSources || {}),
-          [tabId]: { [paneId]: 'derived' },
-        }
-        delete ensurePaneTitleSetByUserMap(state)[tabId]
+      state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+      state.paneTitleSources = {
+        ...(state.paneTitleSources || {}),
+        [tabId]: { [paneId]: 'derived' },
       }
+      delete ensurePaneTitleSetByUserMap(state)[tabId]
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -1341,7 +1323,7 @@ export const panesSlice = createSlice({
 
     removeLayout: (
       state,
-      action: PayloadAction<{ tabId: string; paneIds?: string[] }>
+      action: PayloadAction<{ tabId: string }>
     ) => {
       const { tabId } = action.payload
       delete state.layouts[tabId]

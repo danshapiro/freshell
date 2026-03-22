@@ -26,15 +26,4 @@ describe('test harness perf audit helpers', () => {
     const harness = installHarnessForTest()
     expect(harness.getPerfAuditSnapshot()?.milestones).toBeDefined()
   })
-
-  it('hydrates terminal network suppression from storage and persists updates', () => {
-    localStorage.setItem('freshell.e2e.suppressedTerminalPaneIds', JSON.stringify(['pane-1']))
-
-    const harness = installHarnessForTest()
-
-    expect(harness.isTerminalNetworkEffectsSuppressed('pane-1')).toBe(true)
-    harness.setTerminalNetworkEffectsSuppressed('pane-1', false)
-    expect(harness.isTerminalNetworkEffectsSuppressed('pane-1')).toBe(false)
-    expect(localStorage.getItem('freshell.e2e.suppressedTerminalPaneIds')).toBeNull()
-  })
 })

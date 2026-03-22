@@ -369,13 +369,8 @@ export const closeTab = createAsyncThunk(
 
     // Always push to reopen stack (Alt+H should reopen any closed tab)
     if (tab && layout) {
-      const reopenTitleSource = resolveExistingTabTitleSource(stateBeforeClose, tab)
       dispatch(pushReopenEntry({
-        tab: {
-          ...tab,
-          titleSource: reopenTitleSource,
-          titleSetByUser: reopenTitleSource === 'user',
-        },
+        tab: { ...tab },
         layout: JSON.parse(JSON.stringify(layout)),
         paneTitles: { ...(stateBeforeClose.panes.paneTitles[tabId] || {}) },
         paneTitleSources: { ...(stateBeforeClose.panes.paneTitleSources?.[tabId] || {}) },
@@ -388,7 +383,7 @@ export const closeTab = createAsyncThunk(
     const paneIds = collectPaneIds(currentLayout)
 
     dispatch(removeTab(tabId))
-    dispatch(removeLayout({ tabId, paneIds }))
+    dispatch(removeLayout({ tabId }))
 
     // Clean up attention and drafts for the tab and all its panes
     dispatch(clearTabAttention({ tabId }))
@@ -639,12 +634,10 @@ export const openSessionTab = createAsyncThunk(
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
     if (isAgentChatProviderName(resolvedSessionType)) {
       const tabId = nanoid()
-      const nextTitle = title || getAgentChatProviderLabel(resolvedSessionType)
-      const nextTitleSource = title ? 'stable' : 'derived'
       dispatch(addTab({
         id: tabId,
-        title: nextTitle,
-        titleSource: nextTitleSource,
+        title: title || getAgentChatProviderLabel(resolvedSessionType),
+        titleSource: title ? 'stable' : 'derived',
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
@@ -654,8 +647,6 @@ export const openSessionTab = createAsyncThunk(
       dispatch(initLayout({
         tabId,
         content: desiredResumeContent,
-        title: nextTitle,
-        titleSource: nextTitleSource,
       }))
       return
     }

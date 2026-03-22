@@ -7,7 +7,6 @@ import panesReducer, {
   mergePaneContent,
   removeLayout,
   replacePane,
-  restoreLayout,
   updatePaneContent,
 } from '@/store/panesSlice'
 import paneRuntimeTitleReducer, {
@@ -127,81 +126,7 @@ describe('paneRuntimeTitleSlice', () => {
     expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({})
 
     store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-1', title: 'bash' }))
-    store.dispatch(removeLayout({ tabId: 'tab-1', paneIds: ['pane-1'] }))
+    store.dispatch(removeLayout({ tabId: 'tab-1' }))
     expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({})
-  })
-
-  it('keeps unrelated runtime titles when removing one tab layout', () => {
-    const store = createStore()
-
-    store.dispatch(initLayout({
-      tabId: 'tab-a',
-      paneId: 'pane-a',
-      content: {
-        kind: 'terminal',
-        mode: 'shell',
-        status: 'running',
-        createRequestId: 'req-a',
-        terminalId: 'term-a',
-      },
-    }))
-    store.dispatch(initLayout({
-      tabId: 'tab-b',
-      paneId: 'pane-b',
-      content: {
-        kind: 'terminal',
-        mode: 'shell',
-        status: 'running',
-        createRequestId: 'req-b',
-        terminalId: 'term-b',
-      },
-    }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-a', title: 'vim a.ts' }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-b', title: 'htop' }))
-
-    store.dispatch(removeLayout({ tabId: 'tab-b', paneIds: ['pane-b'] }))
-
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({
-      'pane-a': 'vim a.ts',
-    })
-  })
-
-  it('keeps unrelated runtime titles when restoring one tab layout', () => {
-    const store = createStore()
-
-    store.dispatch(initLayout({
-      tabId: 'tab-a',
-      paneId: 'pane-a',
-      content: {
-        kind: 'terminal',
-        mode: 'shell',
-        status: 'running',
-        createRequestId: 'req-a',
-        terminalId: 'term-a',
-      },
-    }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-a', title: 'vim a.ts' }))
-    store.dispatch(setPaneRuntimeTitle({ paneId: 'pane-b', title: 'stale runtime title' }))
-
-    store.dispatch(restoreLayout({
-      tabId: 'tab-b',
-      layout: {
-        type: 'leaf',
-        id: 'pane-b',
-        content: {
-          kind: 'terminal',
-          mode: 'shell',
-          status: 'running',
-          createRequestId: 'req-b',
-          terminalId: 'term-b',
-        },
-      },
-      paneTitles: { 'pane-b': 'Shell' },
-      paneTitleSources: { 'pane-b': 'derived' },
-    }))
-
-    expect(store.getState().paneRuntimeTitle.titlesByPaneId).toEqual({
-      'pane-a': 'vim a.ts',
-    })
   })
 })

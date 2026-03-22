@@ -3,7 +3,6 @@ import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/re
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '../../../../src/store/tabsSlice'
-import panesReducer from '../../../../src/store/panesSlice'
 
 // Mock api module
 vi.mock('@/lib/api', () => ({
@@ -57,26 +56,9 @@ function setupDefaultMocks() {
   mockPatch.mockResolvedValue({})
 }
 
-function renderWithStore(ui: React.ReactElement, preloadedState: Record<string, unknown> = {}) {
+function renderWithStore(ui: React.ReactElement) {
   const store = configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-    },
-    preloadedState: {
-      panes: {
-        layouts: {},
-        activePane: {},
-        paneTitles: {},
-        paneTitleSources: {},
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-      ...preloadedState,
-    } as any,
+    reducer: { tabs: tabsReducer },
   })
   return {
     store,
@@ -125,130 +107,6 @@ describe('OverviewView Refresh All', () => {
       title: 'Shell',
       titleSource: 'stable',
       terminalId: 't1',
-    })
-  })
-
-  it('renames all open running terminal tabs through durable terminal-id sync', async () => {
-    mockGet.mockResolvedValue([terminals[0]])
-    const { store } = renderWithStore(<OverviewView />, {
-      tabs: {
-        tabs: [
-          {
-            id: 'tab-1',
-            title: 'Shell',
-            titleSource: 'stable',
-            terminalId: 't1',
-            createRequestId: 'tab-1',
-            mode: 'shell',
-            status: 'running',
-            createdAt: 1,
-          },
-          {
-            id: 'tab-2',
-            title: 'Shell copy',
-            titleSource: 'stable',
-            terminalId: 't1',
-            createRequestId: 'tab-2',
-            mode: 'shell',
-            status: 'running',
-            createdAt: 2,
-          },
-        ],
-        activeTabId: 'tab-1',
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: { kind: 'terminal', mode: 'shell', terminalId: 't1', createRequestId: 'req-1', status: 'running', shell: 'system' },
-          },
-          'tab-2': {
-            type: 'leaf',
-            id: 'pane-2',
-            content: { kind: 'terminal', mode: 'shell', terminalId: 't1', createRequestId: 'req-2', status: 'running', shell: 'system' },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' }, 'tab-2': { 'pane-2': 'Shell copy' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'stable' }, 'tab-2': { 'pane-2': 'stable' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-    })
-    await waitFor(() => expect(screen.getByText('Shell')).toBeInTheDocument())
-
-    fireEvent.click(screen.getByLabelText('Edit terminal'))
-    fireEvent.change(screen.getByLabelText('Terminal title'), { target: { value: 'Durable Rename' } })
-    fireEvent.click(screen.getByText('Save'))
-
-    await waitFor(() => {
-      expect(store.getState().tabs.tabs[0]).toMatchObject({ title: 'Durable Rename', titleSource: 'stable' })
-      expect(store.getState().tabs.tabs[1]).toMatchObject({ title: 'Durable Rename', titleSource: 'stable' })
-      expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Durable Rename')
-      expect(store.getState().panes.paneTitles['tab-2']['pane-2']).toBe('Durable Rename')
-      expect(store.getState().panes.paneTitleSources['tab-1']['pane-1']).toBe('stable')
-      expect(store.getState().panes.paneTitleSources['tab-2']['pane-2']).toBe('stable')
-    })
-  })
-
-  it('renames open exited terminal tabs through durable terminal-id sync', async () => {
-    mockGet.mockResolvedValue([
-      {
-        terminalId: 't1',
-        title: 'Shell',
-        mode: 'shell',
-        createdAt: 1000,
-        lastActivityAt: 2000,
-        status: 'exited',
-        hasClients: false,
-      },
-    ])
-    const { store } = renderWithStore(<OverviewView />, {
-      tabs: {
-        tabs: [{
-          id: 'tab-1',
-          title: 'Shell',
-          titleSource: 'stable',
-          terminalId: 't1',
-          createRequestId: 'tab-1',
-          mode: 'shell',
-          status: 'exited',
-          createdAt: 1,
-        }],
-        activeTabId: 'tab-1',
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: { kind: 'terminal', mode: 'shell', terminalId: 't1', createRequestId: 'req-1', status: 'exited', shell: 'system' },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSources: { 'tab-1': { 'pane-1': 'stable' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-    })
-    await waitFor(() => expect(screen.getByText('Shell')).toBeInTheDocument())
-
-    fireEvent.click(screen.getByLabelText('Edit terminal'))
-    fireEvent.change(screen.getByLabelText('Terminal title'), { target: { value: 'Archived Rename' } })
-    fireEvent.click(screen.getByText('Save'))
-
-    await waitFor(() => {
-      expect(store.getState().tabs.tabs[0]).toMatchObject({ title: 'Archived Rename', titleSource: 'stable' })
-      expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Archived Rename')
-      expect(store.getState().panes.paneTitleSources['tab-1']['pane-1']).toBe('stable')
     })
   })
 

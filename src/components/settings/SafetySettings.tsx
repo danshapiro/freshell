@@ -327,20 +327,14 @@ export default function SafetySettings({
 
     if (result.method === 'terminal') {
       const tabId = nanoid()
-      const title = 'Firewall Setup'
       dispatch(addTab({
         id: tabId,
-        title,
+        title: 'Firewall Setup',
         titleSource: 'stable',
         mode: 'shell',
         shell: 'system',
       }))
-      dispatch(initLayout({
-        tabId,
-        content: { kind: 'terminal', mode: 'shell' },
-        title,
-        titleSource: 'stable',
-      }))
+      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
       onFirewallTerminal?.({ tabId, command: result.command })
       onNavigate?.('terminal')
       return

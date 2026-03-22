@@ -30,8 +30,6 @@ vi.mock('@/lib/terminal-restore', () => ({
 interface TabConfig {
   id: string
   mode: string
-  title?: string
-  titleSource?: 'derived' | 'stable' | 'user'
   terminalId?: string
   codingCliSessionId?: string
   resumeSessionId?: string
@@ -63,8 +61,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           id: t.id,
           mode: t.mode as any,
           status: 'running' as const,
-          title: t.title ?? 'Test',
-          titleSource: t.titleSource,
+          title: 'Test',
           terminalId: t.terminalId,
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
@@ -151,32 +148,6 @@ describe('TabContent', () => {
           }),
         }),
         expect.anything()
-      )
-    })
-
-    it('passes durable pane title metadata when the tab title source is stable', () => {
-      const store = createStore([
-        {
-          id: 'tab-1',
-          mode: 'shell',
-          terminalId: 'existing-terminal-123',
-          title: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-          titleSource: 'stable',
-        },
-      ])
-
-      render(
-        <Provider store={store}>
-          <TabContent tabId="tab-1" />
-        </Provider>
-      )
-
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultPaneTitle: 'codex resume 019d1213-9c59-7bb0-80ae-70c74427f346',
-          defaultPaneTitleSource: 'stable',
-        }),
-        expect.anything(),
       )
     })
   })
