@@ -17,6 +17,7 @@ vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
 
 import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
 import { resolveGitBranchAndDirty, resolveGitRepoRoot } from '../../../../server/coding-cli/utils'
+import { SessionDirectoryItemSchema } from '../../../../shared/read-models'
 
 const fixtureShareDir = path.join(
   process.cwd(),
@@ -225,6 +226,47 @@ describe('KimiProvider', () => {
       expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(2)
       expect(resolveGitRepoRoot).toHaveBeenCalledTimes(5)
       expect(resolveGitBranchAndDirty).toHaveBeenCalledTimes(5)
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns integer lastActivityAt even when filesystem mtimeMs has sub-millisecond precision', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-float-mtime-'))
+    const workDirHash = createHash('md5').update('/test/project').digest('hex')
+    const sessionDir = path.join(tempShareDir, 'sessions', workDirHash, 'float-mtime-session')
+    await fsp.mkdir(sessionDir, { recursive: true })
+    await fsp.writeFile(
+      path.join(tempShareDir, 'kimi.json'),
+      JSON.stringify({
+        work_dirs: [{ path: '/test/project', last_session_id: 'float-mtime-session' }],
+      }),
+    )
+    const contextPath = path.join(sessionDir, 'context.jsonl')
+    await fsp.writeFile(
+      contextPath,
+      JSON.stringify({ role: 'user', content: 'test message' }) + '\n',
+    )
+    // Set mtime to a value that will have sub-millisecond precision on most filesystems.
+    // Note: utimes accepts seconds, so 1774212239.4580225 -> mtimeMs ~ 1774212239458.0225
+    const floatTimeSec = 1774212239.4580225
+    await fsp.utimes(contextPath, floatTimeSec, floatTimeSec)
+
+    try {
+      const provider = new KimiProvider(tempShareDir)
+      const sessions = await provider.listSessionsDirect()
+      const session = sessions.find((s) => s.sessionId === 'float-mtime-session')
+
+      expect(session).toBeDefined()
+      expect(Number.isInteger(session!.lastActivityAt)).toBe(true)
+
+      // Must pass Zod schema validation
+      expect(() =>
+        SessionDirectoryItemSchema.parse({
+          ...session,
+          isRunning: false,
+        }),
+      ).not.toThrow()
     } finally {
       await fsp.rm(tempShareDir, { recursive: true, force: true })
     }
