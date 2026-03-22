@@ -423,8 +423,8 @@ async function main() {
   app.use('/api/ai', createAiRouter({
     registry,
     perfConfig,
-    readSessionContent: async (sessionId, provider) => {
-      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName)
+    readSessionContent: async (sessionId, provider, cwd) => {
+      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName, cwd)
       if (!filePath) return null
       try {
         const content = await fsp.readFile(filePath, 'utf-8')

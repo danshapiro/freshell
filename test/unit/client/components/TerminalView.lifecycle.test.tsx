@@ -2107,6 +2107,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(layout.content.sessionRef).toEqual({
       provider: 'claude',
       sessionId,
+      cwd: '/tmp',
       serverInstanceId: 'srv-local',
     })
 

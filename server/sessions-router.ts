@@ -260,6 +260,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const SessionMetadataPostSchema = z.object({
     provider: sessionMetadataProviderSchema,
     sessionId: z.string().min(1),
+    cwd: z.string().min(1).optional(),
     sessionType: z.string().min(1),
   })
 
@@ -271,8 +272,11 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Missing required fields: provider, sessionId, sessionType', details: parsed.error.issues })
     }
-    const { provider, sessionId, sessionType } = parsed.data
-    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType })
+    const { provider, sessionId, cwd, sessionType } = parsed.data
+    if (sessionKeyRequiresCwdScope(provider) && !cwd) {
+      return res.status(400).json({ error: `Opaque cwd-scoped session key required for provider '${provider}'` })
+    }
+    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType }, cwd)
     await codingCliIndexer.refresh()
     res.json({ ok: true })
   })

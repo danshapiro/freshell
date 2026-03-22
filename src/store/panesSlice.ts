@@ -25,6 +25,7 @@ function normalizePaneContent(
       ? input.resumeSessionId
       : undefined
     const resumeSessionId = inputResumeSessionId
+    const initialCwd = typeof input.initialCwd === 'string' ? input.initialCwd : undefined
     const explicitSessionRef = input.sessionRef
       && typeof input.sessionRef.provider === 'string'
       && typeof input.sessionRef.sessionId === 'string'
@@ -33,7 +34,7 @@ function normalizePaneContent(
       : undefined
     const sessionRef = explicitSessionRef
       ?? (resumeSessionId && mode !== 'shell'
-        ? { provider: mode, sessionId: resumeSessionId }
+        ? { provider: mode, sessionId: resumeSessionId, ...(initialCwd ? { cwd: initialCwd } : {}) }
         : undefined)
     return {
       kind: 'terminal',
@@ -46,7 +47,7 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
-      initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
+      initialCwd,
     }
   }
   if (input.kind === 'browser') {
@@ -63,6 +64,7 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
+    const initialCwd = typeof input.initialCwd === 'string' ? input.initialCwd : undefined
     const explicitSessionRef = input.sessionRef
       && typeof input.sessionRef.provider === 'string'
       && typeof input.sessionRef.sessionId === 'string'
@@ -71,7 +73,7 @@ function normalizePaneContent(
       : undefined
     const sessionRef = explicitSessionRef
       ?? (input.resumeSessionId && isValidClaudeSessionId(input.resumeSessionId)
-        ? { provider: 'claude' as const, sessionId: input.resumeSessionId }
+        ? { provider: 'claude' as const, sessionId: input.resumeSessionId, ...(initialCwd ? { cwd: initialCwd } : {}) }
         : undefined)
     return {
       kind: 'agent-chat',
@@ -81,7 +83,7 @@ function normalizePaneContent(
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
-      initialCwd: input.initialCwd,
+      initialCwd,
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,

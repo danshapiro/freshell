@@ -37,6 +37,42 @@ describe('shouldKeepClosedTab', () => {
 })
 
 describe('collectPaneSnapshots', () => {
+  it('includes cwd in fallback terminal session refs for cwd-scoped providers', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-kimi',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-kimi',
+        status: 'running',
+        mode: 'kimi',
+        shell: 'system',
+        resumeSessionId: 'team:alpha',
+        initialCwd: '/repo/worktrees/app',
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'server-1')
+
+    expect(snapshots).toEqual([{
+      paneId: 'pane-kimi',
+      kind: 'terminal',
+      title: undefined,
+      payload: {
+        mode: 'kimi',
+        shell: 'system',
+        resumeSessionId: 'team:alpha',
+        sessionRef: {
+          provider: 'kimi',
+          sessionId: 'team:alpha',
+          serverInstanceId: 'server-1',
+          cwd: '/repo/worktrees/app',
+        },
+        initialCwd: '/repo/worktrees/app',
+      },
+    }])
+  })
+
   describe('extension content', () => {
     it('serializes extension pane content with correct kind and payload', () => {
       const node: PaneNode = {

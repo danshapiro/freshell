@@ -1779,6 +1779,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             ? {
               provider: mode,
               sessionId,
+              ...(contentRef.current?.initialCwd ? { cwd: contentRef.current.initialCwd } : {}),
               ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
             }
             : undefined

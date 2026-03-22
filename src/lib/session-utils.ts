@@ -57,7 +57,7 @@ function dedupeBy<T>(values: T[], getKey: (value: T) => string): T[] {
 }
 
 export function sanitizeSessionLocator(
-  locator?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } | null,
+  locator?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown } | null,
 ): SessionLocator | undefined {
   if (!locator || !isNonEmptyString(locator.provider) || !isNonEmptyString(locator.sessionId)) {
     return undefined
@@ -66,12 +66,13 @@ export function sanitizeSessionLocator(
   return {
     provider: locator.provider,
     sessionId: locator.sessionId,
+    ...(isNonEmptyString(locator.cwd) ? { cwd: locator.cwd } : {}),
     ...(isNonEmptyString(locator.serverInstanceId) ? { serverInstanceId: locator.serverInstanceId } : {}),
   }
 }
 
 export function sanitizeSessionLocators(
-  locators: ReadonlyArray<{ provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } | null | undefined>,
+  locators: ReadonlyArray<{ provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown } | null | undefined>,
 ): SessionLocator[] {
   return dedupeBy(
     locators.flatMap((locator) => {
@@ -85,10 +86,7 @@ export function sanitizeSessionLocators(
 function sanitizeSessionMatchLocator(locator?: SessionLocatorInput | null): SessionMatchLocator | undefined {
   const sanitized = sanitizeSessionLocator(locator)
   if (!sanitized) return undefined
-  return {
-    ...sanitized,
-    ...(isNonEmptyString(locator?.cwd) ? { cwd: locator.cwd } : {}),
-  }
+  return sanitized
 }
 
 function extractExplicitSessionLocator(content: PaneContent): {

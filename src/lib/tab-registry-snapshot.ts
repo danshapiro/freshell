@@ -19,6 +19,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
             ? {
                 provider: content.mode,
                 sessionId: content.resumeSessionId,
+                cwd: content.initialCwd,
                 serverInstanceId,
               }
             : undefined)
@@ -49,6 +50,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
             ? {
                 provider: 'claude',
                 sessionId: content.resumeSessionId,
+                cwd: content.initialCwd,
                 serverInstanceId,
               }
             : undefined)

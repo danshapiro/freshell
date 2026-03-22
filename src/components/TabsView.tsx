@@ -31,7 +31,7 @@ type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
-  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown }
+  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown }
   if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
     return undefined
   }
@@ -39,6 +39,7 @@ function parseSessionLocator(value: unknown): SessionLocator | undefined {
   return {
     provider: candidate.provider as CodingCliProviderName,
     sessionId: candidate.sessionId,
+    ...(typeof candidate.cwd === 'string' ? { cwd: candidate.cwd } : {}),
     ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
   }
 }
@@ -47,6 +48,7 @@ function resolveSessionRef(options: {
   payload: Record<string, unknown>
   fallbackProvider?: CodingCliProviderName
   fallbackSessionId?: string
+  fallbackCwd?: string
   fallbackServerInstanceId?: string
 }): SessionLocator | undefined {
   const explicit = parseSessionLocator(options.payload.sessionRef)
@@ -55,6 +57,7 @@ function resolveSessionRef(options: {
   return {
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
+    ...(options.fallbackCwd ? { cwd: options.fallbackCwd } : {}),
     ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
   }
 }
@@ -73,6 +76,7 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: mode !== 'shell' ? mode : undefined,
       fallbackSessionId: resumeSessionId,
+      fallbackCwd: payload.initialCwd as string | undefined,
       fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
@@ -107,6 +111,7 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: 'claude',
       fallbackSessionId: resumeSessionId,
+      fallbackCwd: payload.initialCwd as string | undefined,
       fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
