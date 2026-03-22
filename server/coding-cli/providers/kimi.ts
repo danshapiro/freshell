@@ -578,7 +578,7 @@ export class KimiProvider implements CodingCliProvider {
       sessionId: sessionCandidate.sessionId,
       cwd: workDir.cwd,
       projectPath: workDir.projectPath,
-      lastActivityAt: contextStat.mtimeMs || contextStat.mtime.getTime(),
+      lastActivityAt: Math.trunc(contextStat.mtimeMs || contextStat.mtime.getTime()),
       createdAt: wireSummary.createdAt,
       archived: storedMetadata.archived,
       messageCount: contextSummary.messageCount,
