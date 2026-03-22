@@ -12,12 +12,17 @@ export interface SpawnOptions {
   disallowedTools?: string[]
 }
 
+export interface DirectSessionListOptions {
+  changedFiles?: string[]
+  deletedFiles?: string[]
+}
+
 export interface CodingCliProvider {
   readonly name: CodingCliProviderName
   readonly displayName: string
   readonly homeDir: string
 
-  listSessionsDirect?(): Promise<CodingCliSession[]>
+  listSessionsDirect?(options?: DirectSessionListOptions): Promise<CodingCliSession[]>
   getSessionGlob(): string
   getSessionRoots(): string[]
   listSessionFiles(): Promise<string[]>

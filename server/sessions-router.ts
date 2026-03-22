@@ -71,6 +71,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   ): { compositeKey?: string; error?: string } {
     const parsedRaw = parseSessionKey(rawId)
     const rawProviderIsKnown = validCliProviders.has(parsedRaw.provider)
+    const requestedProviderRequiresCwd = providerQuery ? sessionKeyRequiresCwdScope(providerQuery) : false
     const rawLooksScopedComposite = rawProviderIsKnown
       && sessionKeyRequiresCwdScope(parsedRaw.provider)
       && rawId.startsWith(`${parsedRaw.provider}:cwd=`)
@@ -78,6 +79,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     const rawLooksLegacyComposite = rawProviderIsKnown
       && !sessionKeyRequiresCwdScope(parsedRaw.provider)
       && rawId.startsWith(`${parsedRaw.provider}:`)
+      && (!requestedProviderRequiresCwd || providerQuery === parsedRaw.provider)
 
     if (rawLooksScopedComposite || rawLooksLegacyComposite) {
       if (providerQuery && providerQuery !== parsedRaw.provider) {
@@ -87,6 +89,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
         return { error: `Opaque cwd-scoped session key required for provider '${parsedRaw.provider}'` }
       }
       return { compositeKey: rawId }
+    }
+
+    if (!providerQuery && rawProviderIsKnown && sessionKeyRequiresCwdScope(parsedRaw.provider)) {
+      return { error: `Opaque cwd-scoped session key required for provider '${parsedRaw.provider}'` }
     }
 
     const provider = providerQuery ?? 'claude'

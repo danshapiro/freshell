@@ -100,6 +100,7 @@ describe('ExtensionManifestSchema', () => {
       ...validCliManifest,
       cli: {
         command: 'kimi',
+        resumeArgs: ['--session', '{{sessionId}}'],
         modelArgs: ['--model', '{{model}}'],
         permissionModeArgsByValue: {
           bypassPermissions: ['--yolo'],

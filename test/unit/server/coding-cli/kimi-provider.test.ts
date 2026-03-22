@@ -229,4 +229,62 @@ describe('KimiProvider', () => {
       await fsp.rm(tempShareDir, { recursive: true, force: true })
     }
   })
+
+  it('reuses cached Kimi sessions and rereads only the changed session on incremental refresh', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-incremental-'))
+    await fsp.cp(fixtureShareDir, tempShareDir, { recursive: true })
+    const provider = new KimiProvider(tempShareDir)
+    const metadataPath = path.join(
+      tempShareDir,
+      'sessions',
+      '60934fecd4200ec4efe2eccf0cabafa4',
+      'context-title-session',
+      'metadata.json',
+    )
+    const unrelatedContextPath = path.join(
+      tempShareDir,
+      'sessions',
+      '4a3dcd71f4774356bb688dad99173808',
+      'kimi-session-1',
+      'context.jsonl',
+    )
+
+    try {
+      await provider.listSessionsDirect()
+
+      const readFileSpy = vi.spyOn(fsp, 'readFile')
+      vi.mocked(resolveGitRepoRoot).mockClear()
+      vi.mocked(resolveGitBranchAndDirty).mockClear()
+
+      await fsp.writeFile(metadataPath, JSON.stringify({
+        title: 'Incremental metadata title',
+        archived: true,
+      }))
+
+      const sessions = await provider.listSessionsDirect({
+        changedFiles: [metadataPath],
+        deletedFiles: [],
+      })
+
+      expect(sessions.find((session) => session.sessionId === 'context-title-session')).toEqual(
+        expect.objectContaining({
+          title: 'Incremental metadata title',
+          archived: true,
+        }),
+      )
+
+      const readPaths = readFileSpy.mock.calls
+        .map(([target]) => (typeof target === 'string' ? target : ''))
+        .filter((target) => target.startsWith(tempShareDir))
+
+      expect(readPaths).toContain(metadataPath)
+      expect(readPaths).not.toContain(unrelatedContextPath)
+      expect(resolveGitRepoRoot).not.toHaveBeenCalled()
+      expect(resolveGitBranchAndDirty).not.toHaveBeenCalled()
+
+      readFileSpy.mockRestore()
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
+  })
 })

@@ -6,7 +6,7 @@ import chokidar from 'chokidar'
 import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
-import type { CodingCliProvider } from './provider.js'
+import type { CodingCliProvider, DirectSessionListOptions } from './provider.js'
 import { makeSessionKey, parseSessionKey, sessionKeyRequiresCwdScope, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
@@ -170,7 +170,7 @@ export class CodingCliSessionIndexer {
   private initialized = false
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
-  private dirtyProviders = new Set<CodingCliProviderName>()
+  private dirtyDirectProviderFiles = new Map<CodingCliProviderName, DirectSessionListOptions>()
 
   constructor(
     private providers: CodingCliProvider[],
@@ -365,8 +365,7 @@ export class CodingCliSessionIndexer {
     const normalized = normalizeFilePath(filePath)
     const provider = this.resolveProviderForFile(filePath)
     if (provider?.listSessionsDirect) {
-      this.dirtyProviders.add(provider.name)
-      this.deletedFiles.delete(normalized)
+      this.recordDirectProviderChange(provider.name, normalized, 'changed')
       this.urgentRefreshNeeded = true
       return
     }
@@ -386,8 +385,7 @@ export class CodingCliSessionIndexer {
     const normalized = normalizeFilePath(filePath)
     const provider = this.resolveProviderForFile(filePath)
     if (provider?.listSessionsDirect) {
-      this.dirtyProviders.add(provider.name)
-      this.dirtyFiles.delete(normalized)
+      this.recordDirectProviderChange(provider.name, normalized, 'deleted')
       return
     }
     this.dirtyFiles.delete(normalized)
@@ -409,6 +407,29 @@ export class CodingCliSessionIndexer {
     }
 
     return matched
+  }
+
+  private recordDirectProviderChange(
+    providerName: CodingCliProviderName,
+    filePath: string,
+    kind: 'changed' | 'deleted',
+  ) {
+    const existing = this.dirtyDirectProviderFiles.get(providerName) ?? { changedFiles: [], deletedFiles: [] }
+    const changedFiles = new Set(existing.changedFiles ?? [])
+    const deletedFiles = new Set(existing.deletedFiles ?? [])
+
+    if (kind === 'changed') {
+      deletedFiles.delete(filePath)
+      changedFiles.add(filePath)
+    } else {
+      changedFiles.delete(filePath)
+      deletedFiles.add(filePath)
+    }
+
+    this.dirtyDirectProviderFiles.set(providerName, {
+      changedFiles: Array.from(changedFiles),
+      deletedFiles: Array.from(deletedFiles),
+    })
   }
 
   private deleteCacheEntry(cacheKey: string) {
@@ -610,13 +631,16 @@ export class CodingCliSessionIndexer {
     }
   }
 
-  private async refreshDirectProvider(provider: CodingCliProvider): Promise<Set<string>> {
+  private async refreshDirectProvider(
+    provider: CodingCliProvider,
+    options?: DirectSessionListOptions,
+  ): Promise<Set<string>> {
     if (!provider.listSessionsDirect) return new Set()
 
     const seenKeys = new Set<string>()
     let sessions: CodingCliSession[] = []
     try {
-      sessions = await provider.listSessionsDirect()
+      sessions = await provider.listSessionsDirect(options)
     } catch (err) {
       logger.warn({ err, provider: provider.name }, 'Could not list provider sessions directly')
       return seenKeys
@@ -712,7 +736,7 @@ export class CodingCliSessionIndexer {
       this.needsFullScan = false
       this.dirtyFiles.clear()
       this.deletedFiles.clear()
-      this.dirtyProviders.clear()
+      this.dirtyDirectProviderFiles.clear()
 
       const seenCacheKeys = new Set<string>()
       for (const provider of this.providers) {
@@ -762,16 +786,16 @@ export class CodingCliSessionIndexer {
     } else {
       const deletedFiles = Array.from(this.deletedFiles)
       const dirtyFiles = Array.from(this.dirtyFiles)
-      const dirtyProviders = Array.from(this.dirtyProviders)
+      const dirtyDirectProviders = Array.from(this.dirtyDirectProviderFiles.entries())
       this.deletedFiles.clear()
       this.dirtyFiles.clear()
-      this.dirtyProviders.clear()
+      this.dirtyDirectProviderFiles.clear()
 
       for (const file of deletedFiles) {
         this.deleteCacheEntry(file)
       }
 
-      for (const providerName of dirtyProviders) {
+      for (const [providerName, options] of dirtyDirectProviders) {
         const provider = this.providers.find((candidate) => candidate.name === providerName)
         if (!provider?.listSessionsDirect) continue
         if (!enabledSet.has(provider.name)) {
@@ -782,7 +806,7 @@ export class CodingCliSessionIndexer {
           }
           continue
         }
-        await this.refreshDirectProvider(provider)
+        await this.refreshDirectProvider(provider, options)
       }
 
       for (const file of dirtyFiles) {

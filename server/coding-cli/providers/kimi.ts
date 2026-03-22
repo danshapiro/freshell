@@ -1,10 +1,13 @@
+import fs from 'fs'
 import { createHash } from 'crypto'
 import os from 'os'
 import path from 'path'
 import fsp from 'fs/promises'
+import { createInterface } from 'node:readline'
 import { extractTitleFromMessage } from '../../title-utils.js'
-import type { CodingCliProvider } from '../provider.js'
+import type { CodingCliProvider, DirectSessionListOptions } from '../provider.js'
 import {
+  makeSessionKey,
   normalizeFirstUserMessage,
   type CodingCliSession,
   type NormalizedEvent,
@@ -14,6 +17,7 @@ import { resolveGitBranchAndDirty, resolveGitRepoRoot } from '../utils.js'
 
 const LOCAL_KAOS_NAME = 'local'
 const KIMI_TITLE_MAX_CHARS = 200
+const IS_WINDOWS = process.platform === 'win32'
 
 type KimiWorkDirMeta = {
   path?: string
@@ -29,6 +33,19 @@ type KimiSessionCandidate = {
   sessionId: string
   contextPath: string
   sessionDir: string
+}
+
+type KimiCachedWorkDir = {
+  cwd: string
+  sessionsDir: string
+  projectPath: string
+  gitBranch?: string
+  isDirty?: boolean
+}
+
+type KimiTrackedSessionRef = {
+  workDir: KimiCachedWorkDir
+  sessionId: string
 }
 
 type KimiContextSummary = {
@@ -48,6 +65,11 @@ type KimiStoredMetadata = {
 
 function md5Hex(value: string): string {
   return createHash('md5').update(value).digest('hex')
+}
+
+function normalizeTrackedPath(filePath: string): string {
+  const resolved = path.resolve(filePath)
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved
 }
 
 function isIgnoredLegacyTranscript(fileName: string): boolean {
@@ -198,6 +220,46 @@ async function listKimiSessionFiles(sessionsDir: string): Promise<KimiSessionCan
   return [...candidatesBySessionId.values()]
 }
 
+async function resolveKimiSessionCandidate(
+  sessionsDir: string,
+  sessionId: string,
+): Promise<KimiSessionCandidate | undefined> {
+  const modernSessionDir = path.join(sessionsDir, sessionId)
+  const modernContextPath = path.join(modernSessionDir, 'context.jsonl')
+  try {
+    const stat = await fsp.stat(modernContextPath)
+    if (stat.isFile()) {
+      return {
+        sessionId,
+        contextPath: modernContextPath,
+        sessionDir: modernSessionDir,
+      }
+    }
+  } catch {
+    // Fall back to the legacy flat transcript when the modern layout is absent.
+  }
+
+  const legacyContextPath = path.join(sessionsDir, `${sessionId}.jsonl`)
+  if (isIgnoredLegacyTranscript(path.basename(legacyContextPath))) {
+    return undefined
+  }
+
+  try {
+    const stat = await fsp.stat(legacyContextPath)
+    if (!stat.isFile()) {
+      return undefined
+    }
+  } catch {
+    return undefined
+  }
+
+  return {
+    sessionId,
+    contextPath: legacyContextPath,
+    sessionDir: modernSessionDir,
+  }
+}
+
 async function loadKimiStoredMetadata(sessionDir: string): Promise<KimiStoredMetadata> {
   const metadata = await readJsonFile<Record<string, unknown>>(path.join(sessionDir, 'metadata.json'))
   if (!metadata) {
@@ -257,33 +319,38 @@ async function loadKimiWireSummary(sessionDir: string): Promise<KimiWireSummary>
 }
 
 async function loadKimiContextSummary(contextPath: string): Promise<KimiContextSummary> {
-  let raw: string
-  try {
-    raw = await fsp.readFile(contextPath, 'utf8')
-  } catch {
-    return {}
-  }
-
   let firstUserMessage: string | undefined
   let messageCount = 0
 
-  for (const line of raw.split(/\r?\n/)) {
-    if (!line.trim()) continue
-    let parsed: unknown
+  try {
+    const lines = createInterface({
+      input: fs.createReadStream(contextPath, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    })
     try {
-      parsed = JSON.parse(line)
-    } catch {
-      continue
-    }
+      for await (const line of lines) {
+        if (!line.trim()) continue
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(line)
+        } catch {
+          continue
+        }
 
-    const events = parseKimiContextRecord(parsed)
-    for (const event of events) {
-      if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
-      messageCount += 1
-      if (!firstUserMessage && event.type === 'message.user') {
-        firstUserMessage = normalizeFirstUserMessage(event.message?.content ?? '')
+        const events = parseKimiContextRecord(parsed)
+        for (const event of events) {
+          if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
+          messageCount += 1
+          if (!firstUserMessage && event.type === 'message.user') {
+            firstUserMessage = normalizeFirstUserMessage(event.message?.content ?? '')
+          }
+        }
       }
+    } finally {
+      lines.close()
     }
+  } catch {
+    return {}
   }
 
   return {
@@ -325,59 +392,203 @@ export function defaultKimiShareDir(): string {
 export class KimiProvider implements CodingCliProvider {
   readonly name = 'kimi' as const
   readonly displayName = 'Kimi'
+  private readonly metadataPath: string
+  private readonly sessionsRoot: string
+  private cacheInitialized = false
+  private workDirsBySessionsDir = new Map<string, KimiCachedWorkDir>()
+  private sessionsByKey = new Map<string, CodingCliSession>()
 
-  constructor(readonly homeDir: string = defaultKimiShareDir()) {}
+  constructor(readonly homeDir: string = defaultKimiShareDir()) {
+    this.metadataPath = path.resolve(homeDir, 'kimi.json')
+    this.sessionsRoot = path.resolve(homeDir, 'sessions')
+  }
 
-  async listSessionsDirect(): Promise<CodingCliSession[]> {
+  async listSessionsDirect(options?: DirectSessionListOptions): Promise<CodingCliSession[]> {
+    if (!options || !this.cacheInitialized) {
+      return this.refreshAllSessions()
+    }
+
+    const changedFiles = options.changedFiles ?? []
+    const deletedFiles = options.deletedFiles ?? []
+    if (changedFiles.length === 0 && deletedFiles.length === 0) {
+      return this.snapshotSessions()
+    }
+
+    const trackedSessions = this.collectTrackedSessions(changedFiles, deletedFiles)
+    if (trackedSessions === null) {
+      return this.refreshAllSessions()
+    }
+
+    for (const trackedSession of trackedSessions.values()) {
+      await this.refreshTrackedSession(trackedSession.workDir, trackedSession.sessionId)
+    }
+
+    return this.snapshotSessions()
+  }
+
+  private snapshotSessions(): CodingCliSession[] {
+    return Array.from(this.sessionsByKey.values())
+  }
+
+  private collectTrackedSessions(
+    changedFiles: string[],
+    deletedFiles: string[],
+  ): Map<string, KimiTrackedSessionRef> | null {
+    const trackedSessions = new Map<string, KimiTrackedSessionRef>()
+
+    for (const filePath of [...changedFiles, ...deletedFiles]) {
+      const trackedSession = this.resolveTrackedSession(filePath)
+      if (trackedSession === 'full') {
+        return null
+      }
+      if (!trackedSession) {
+        continue
+      }
+      trackedSessions.set(makeSessionKey(this.name, trackedSession.sessionId, trackedSession.workDir.cwd), trackedSession)
+    }
+
+    return trackedSessions
+  }
+
+  private resolveTrackedSession(filePath: string): KimiTrackedSessionRef | 'full' | undefined {
+    const resolved = path.resolve(filePath)
+    const normalized = normalizeTrackedPath(resolved)
+    if (normalized === normalizeTrackedPath(this.metadataPath)) {
+      return 'full'
+    }
+
+    const relative = path.relative(this.sessionsRoot, resolved)
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
+      return 'full'
+    }
+
+    const relativeParts = relative.split(path.sep).filter(Boolean)
+    if (relativeParts.length < 2) {
+      return undefined
+    }
+
+    const sessionsDir = path.join(this.sessionsRoot, relativeParts[0])
+    const workDir = this.workDirsBySessionsDir.get(normalizeTrackedPath(sessionsDir))
+    if (!workDir) {
+      return 'full'
+    }
+
+    if (relativeParts.length === 2) {
+      const fileName = relativeParts[1]
+      if (path.extname(fileName) !== '.jsonl' || isIgnoredLegacyTranscript(fileName)) {
+        return undefined
+      }
+      return {
+        workDir,
+        sessionId: path.basename(fileName, '.jsonl'),
+      }
+    }
+
+    if (relativeParts.length === 3) {
+      const leaf = relativeParts[2]
+      if (leaf === 'context.jsonl' || leaf === 'wire.jsonl' || leaf === 'metadata.json') {
+        return {
+          workDir,
+          sessionId: relativeParts[1],
+        }
+      }
+      return undefined
+    }
+
+    return undefined
+  }
+
+  private async refreshAllSessions(): Promise<CodingCliSession[]> {
     const metadata = await loadKimiMetadata(this.homeDir)
-    const sessions: CodingCliSession[] = []
+    const sessionsByKey = new Map<string, CodingCliSession>()
+    const workDirsBySessionsDir = new Map<string, KimiCachedWorkDir>()
 
     for (const workDir of metadata.work_dirs ?? []) {
       const cwd = typeof workDir.path === 'string' ? workDir.path : undefined
       const sessionsDir = resolveSessionDirName(this.homeDir, workDir)
       if (!cwd || !sessionsDir) continue
 
-      const sessionCandidates = await listKimiSessionFiles(sessionsDir)
       const [projectPath, gitMetadata] = await Promise.all([
         resolveGitRepoRoot(cwd),
         resolveGitBranchAndDirty(cwd),
       ])
       if (!projectPath) continue
 
+      const cachedWorkDir: KimiCachedWorkDir = {
+        cwd,
+        sessionsDir: path.resolve(sessionsDir),
+        projectPath,
+        gitBranch: gitMetadata.branch,
+        isDirty: gitMetadata.isDirty,
+      }
+      workDirsBySessionsDir.set(normalizeTrackedPath(cachedWorkDir.sessionsDir), cachedWorkDir)
+
+      const sessionCandidates = await listKimiSessionFiles(cachedWorkDir.sessionsDir)
+
       for (const sessionCandidate of sessionCandidates) {
-        let contextStat: import('fs').Stats
-        try {
-          contextStat = await fsp.stat(sessionCandidate.contextPath)
-        } catch {
-          continue
-        }
-
-        const [storedMetadata, wireSummary, contextSummary] = await Promise.all([
-          loadKimiStoredMetadata(sessionCandidate.sessionDir),
-          loadKimiWireSummary(sessionCandidate.sessionDir),
-          loadKimiContextSummary(sessionCandidate.contextPath),
-        ])
-
-        const title = deriveKimiTitle(storedMetadata, wireSummary, contextSummary)
-        sessions.push({
-          provider: this.name,
-          sessionId: sessionCandidate.sessionId,
-          cwd,
-          projectPath,
-          lastActivityAt: contextStat.mtimeMs || contextStat.mtime.getTime(),
-          createdAt: wireSummary.createdAt,
-          archived: storedMetadata.archived,
-          messageCount: contextSummary.messageCount,
-          title,
-          firstUserMessage: contextSummary.firstUserMessage,
-          gitBranch: gitMetadata.branch,
-          isDirty: gitMetadata.isDirty,
-          sourceFile: sessionCandidate.contextPath,
-        })
+        const session = await this.loadSessionCandidate(cachedWorkDir, sessionCandidate)
+        if (!session) continue
+        sessionsByKey.set(makeSessionKey(this.name, session.sessionId, session.cwd), session)
       }
     }
 
-    return sessions
+    this.workDirsBySessionsDir = workDirsBySessionsDir
+    this.sessionsByKey = sessionsByKey
+    this.cacheInitialized = true
+    return this.snapshotSessions()
+  }
+
+  private async refreshTrackedSession(workDir: KimiCachedWorkDir, sessionId: string): Promise<void> {
+    const sessionKey = makeSessionKey(this.name, sessionId, workDir.cwd)
+    const session = await this.loadSessionById(workDir, sessionId)
+    if (session) {
+      this.sessionsByKey.set(sessionKey, session)
+    } else {
+      this.sessionsByKey.delete(sessionKey)
+    }
+  }
+
+  private async loadSessionById(workDir: KimiCachedWorkDir, sessionId: string): Promise<CodingCliSession | undefined> {
+    const sessionCandidate = await resolveKimiSessionCandidate(workDir.sessionsDir, sessionId)
+    if (!sessionCandidate) {
+      return undefined
+    }
+    return this.loadSessionCandidate(workDir, sessionCandidate)
+  }
+
+  private async loadSessionCandidate(
+    workDir: KimiCachedWorkDir,
+    sessionCandidate: KimiSessionCandidate,
+  ): Promise<CodingCliSession | undefined> {
+    let contextStat: import('fs').Stats
+    try {
+      contextStat = await fsp.stat(sessionCandidate.contextPath)
+    } catch {
+      return undefined
+    }
+
+    const [storedMetadata, wireSummary, contextSummary] = await Promise.all([
+      loadKimiStoredMetadata(sessionCandidate.sessionDir),
+      loadKimiWireSummary(sessionCandidate.sessionDir),
+      loadKimiContextSummary(sessionCandidate.contextPath),
+    ])
+
+    const title = deriveKimiTitle(storedMetadata, wireSummary, contextSummary)
+    return {
+      provider: this.name,
+      sessionId: sessionCandidate.sessionId,
+      cwd: workDir.cwd,
+      projectPath: workDir.projectPath,
+      lastActivityAt: contextStat.mtimeMs || contextStat.mtime.getTime(),
+      createdAt: wireSummary.createdAt,
+      archived: storedMetadata.archived,
+      messageCount: contextSummary.messageCount,
+      title,
+      firstUserMessage: contextSummary.firstUserMessage,
+      gitBranch: workDir.gitBranch,
+      isDirty: workDir.isDirty,
+      sourceFile: sessionCandidate.contextPath,
+    }
   }
 
   getSessionGlob(): string {

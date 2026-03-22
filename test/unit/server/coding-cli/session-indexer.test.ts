@@ -399,6 +399,72 @@ describe('CodingCliSessionIndexer', () => {
     }
   })
 
+  it('passes changed direct-provider files into incremental Kimi refreshes', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const homeDir = path.join(tempDir, 'kimi-home')
+    const sessionFile = path.join(homeDir, 'sessions', 'session-a.jsonl')
+    await fsp.mkdir(path.dirname(sessionFile), { recursive: true })
+    await fsp.writeFile(sessionFile, '{"role":"user","content":"initial"}\n')
+
+    const listSessionsDirect = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          provider: 'kimi' as const,
+          sessionId: 'session-a',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          sourceFile: sessionFile,
+        },
+      ])
+      .mockResolvedValue([
+        {
+          provider: 'kimi' as const,
+          sessionId: 'session-a',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_100,
+          sourceFile: sessionFile,
+        },
+      ])
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir,
+      listSessionsDirect,
+      getSessionGlob: () => path.join(homeDir, '**', '*.jsonl'),
+      getSessionRoots: () => [path.join(homeDir, 'sessions')],
+    })
+    const indexer = new CodingCliSessionIndexer([provider], {
+      debounceMs: 25,
+      throttleMs: 0,
+      fullScanIntervalMs: 0,
+    })
+
+    await indexer.refresh()
+    listSessionsDirect.mockClear()
+
+    ;(indexer as any).markDirty(sessionFile)
+    await indexer.refresh()
+
+    expect(listSessionsDirect.mock.calls).toContainEqual([
+      expect.objectContaining({
+        changedFiles: [sessionFile],
+        deletedFiles: [],
+      }),
+    ])
+  })
+
   it('ignores unscoped Kimi override and metadata fallbacks when duplicate session ids exist', async () => {
     vi.mocked(configStore.snapshot).mockResolvedValueOnce({
       sessionOverrides: {
