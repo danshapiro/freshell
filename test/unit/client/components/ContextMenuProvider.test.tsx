@@ -1161,7 +1161,6 @@ describe('ContextMenuProvider', () => {
       </Provider>
     )
 
-    await user.pointer({ target: screen.getByText('Test Session'), keys: '[MouseRight]' })
     await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
 
     expect(api.patch).toHaveBeenCalledWith(

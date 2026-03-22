@@ -36,11 +36,15 @@ describe('handleUiCommand', () => {
       payload: { id: 't1', title: 'Alpha', paneId: 'pane-1', paneContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } },
     }, dispatch)
 
-    expect(actions.map((a) => a.type)).toEqual(['tabs/addTab', 'panes/initLayout'])
+    expect(actions.map((a) => a.type)).toEqual(['tabs/addTab', 'panes/initLayout', 'panes/updatePaneTitle'])
     expect(actions[1].payload.paneId).toBe('pane-1')
     expect(actions[1].payload.content.kind).toBe('browser')
-    expect(actions[1].payload.title).toBe('Alpha')
-    expect(actions[1].payload.titleSource).toBe('stable')
+    expect(actions[2].payload).toEqual({
+      tabId: 't1',
+      paneId: 'pane-1',
+      title: 'Alpha',
+      source: 'stable',
+    })
   })
 
   it('preserves createRequestId and synthesizes exact local sessionRef for server-originated coding panes', () => {
