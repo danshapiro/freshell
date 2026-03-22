@@ -100,6 +100,10 @@ function buildSyntheticTerminalContent(tab: Tab): TerminalPaneContent | null {
   }
 }
 
+function isNoLayoutCodingMirror(tab: Tab): boolean {
+  return Boolean(tab.codingCliProvider || (tab.mode && tab.mode !== 'shell'))
+}
+
 export function resolvePaneActivity(input: {
   paneId: string
   content: PaneContent
@@ -164,6 +168,8 @@ export function getBusyPaneIdsForTab(input: {
 }): string[] {
   const layout = input.paneLayouts[input.tab.id]
   if (!layout) {
+    if (isNoLayoutCodingMirror(input.tab)) return []
+
     const syntheticContent = buildSyntheticTerminalContent(input.tab)
     if (!syntheticContent) return []
 
@@ -208,6 +214,8 @@ export function collectBusySessionKeys(input: {
   for (const tab of input.tabs) {
     const layout = input.paneLayouts[tab.id]
     if (!layout) {
+      if (isNoLayoutCodingMirror(tab)) continue
+
       const syntheticContent = buildSyntheticTerminalContent(tab)
       if (!syntheticContent) continue
 

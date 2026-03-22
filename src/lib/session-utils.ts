@@ -84,11 +84,11 @@ function extractExplicitSessionLocator(content: PaneContent): {
 }
 
 /**
- * Extract exact and intrinsic session locators from a single pane's content.
- * Explicit sessionRef preserves cross-device identity; resumeSessionId is kept as an
+ * Extract intrinsic session locators from a single pane's content.
+ * resumeSessionId is kept as an
  * intrinsic local fallback for local-session matching before serverInstanceId is known.
  */
-function extractSessionLocators(content: PaneContent): Array<{
+function extractIntrinsicSessionLocators(content: PaneContent): Array<{
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
@@ -98,12 +98,6 @@ function extractSessionLocators(content: PaneContent): Array<{
     sessionId: string
     serverInstanceId?: string
   }> = []
-
-  const explicit = extractExplicitSessionLocator(content)
-  if (explicit) {
-    locators.push(explicit)
-    return dedupeBy(locators, locatorIdentity)
-  }
 
   if (content.kind === 'agent-chat') {
     const sessionId = content.resumeSessionId
@@ -120,11 +114,29 @@ function extractSessionLocators(content: PaneContent): Array<{
   return dedupeBy(locators, locatorIdentity)
 }
 
-function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): SessionLocator | undefined {
-  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-  const sessionId = tab.resumeSessionId
-  if (!provider || !sessionId) return undefined
-  return sanitizeSessionLocator({ provider, sessionId })
+/**
+ * Extract exact and intrinsic session locators from a single pane's content.
+ * Explicit sessionRef preserves cross-device identity while resumeSessionId provides
+ * an intrinsic local fallback until the local server identity is known.
+ */
+export function collectSessionLocatorsFromContent(content: PaneContent): Array<{
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+}> {
+  const locators: Array<{
+    provider: CodingCliProviderName
+    sessionId: string
+    serverInstanceId?: string
+  }> = []
+
+  const explicit = extractExplicitSessionLocator(content)
+  if (explicit) {
+    locators.push(explicit)
+  }
+
+  locators.push(...extractIntrinsicSessionLocators(content))
+  return dedupeBy(locators, locatorIdentity)
 }
 
 function matchScore(
@@ -149,7 +161,7 @@ function collectPaneSessionMatchCandidates(
   candidates: SessionMatchCandidate[],
 ): void {
   if (node.type === 'leaf') {
-    for (const locator of extractSessionLocators(node.content)) {
+    for (const locator of collectSessionLocatorsFromContent(node.content)) {
       candidates.push({ tabId, paneId: node.id, locator })
     }
     return
@@ -184,12 +196,22 @@ export function collectSessionLocatorsFromNode(node: PaneNode): Array<{
   serverInstanceId?: string
 }> {
   if (node.type === 'leaf') {
-    return extractSessionLocators(node.content)
+    return collectSessionLocatorsFromContent(node.content)
   }
   return dedupeBy([
     ...collectSessionLocatorsFromNode(node.children[0]),
     ...collectSessionLocatorsFromNode(node.children[1]),
   ], locatorIdentity)
+}
+
+export function collectSessionRefsFromContent(content: PaneContent): SessionRef[] {
+  return dedupeBy(
+    collectSessionLocatorsFromContent(content).map((locator) => ({
+      provider: locator.provider,
+      sessionId: locator.sessionId,
+    })),
+    sessionKey,
+  )
 }
 
 export function collectSessionRefsFromNode(node: PaneNode): SessionRef[] {
@@ -218,13 +240,8 @@ export function collectSessionLocatorsFromTabs(
 
   for (const tab of tabs || []) {
     const layout = panes.layouts[tab.id]
-    if (layout) {
-      locators.push(...collectSessionLocatorsFromNode(layout))
-      continue
-    }
-
-    const fallbackLocator = buildTabFallbackLocator(tab)
-    if (fallbackLocator) locators.push(fallbackLocator)
+    if (!layout) continue
+    locators.push(...collectSessionLocatorsFromNode(layout))
   }
 
   return dedupeBy(locators, locatorIdentity)
@@ -282,12 +299,6 @@ export function findTabIdForSession(
       for (const locator of collectSessionLocatorsFromNode(layout)) {
         candidates.push({ tabId: tab.id, paneId: undefined, locator })
       }
-      continue
-    }
-
-    const locator = buildTabFallbackLocator(tab)
-    if (locator) {
-      candidates.push({ tabId: tab.id, paneId: undefined, locator })
     }
   }
 
@@ -297,7 +308,6 @@ export function findTabIdForSession(
 /**
  * Find the tab and pane that contain a specific session.
  * Walks all tabs' pane trees looking for a pane (terminal or agent-chat) matching the provider + sessionId.
- * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
  */
 export function findPaneForSession(
   state: RootState,
@@ -312,12 +322,6 @@ export function findPaneForSession(
     const layout = state.panes.layouts[tab.id]
     if (layout) {
       collectPaneSessionMatchCandidates(layout, tab.id, candidates)
-      continue
-    }
-
-    const locator = buildTabFallbackLocator(tab)
-    if (locator) {
-      candidates.push({ tabId: tab.id, paneId: undefined, locator })
     }
   }
 

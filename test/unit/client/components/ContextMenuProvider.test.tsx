@@ -583,6 +583,70 @@ function createStoreWithTerminalPane() {
   })
 }
 
+function createStoreWithCodingTerminalPane() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Claude',
+            status: 'running',
+            mode: 'claude',
+            shell: 'system',
+            createdAt: 1,
+            terminalId: 'term-1',
+            codingCliProvider: 'claude',
+            resumeSessionId: VALID_SESSION_ID,
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              status: 'running',
+              createRequestId: 'req-1',
+              terminalId: 'term-1',
+              resumeSessionId: VALID_SESSION_ID,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Claude' } },
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: 'linux',
+      },
+    },
+  })
+}
+
 describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
@@ -917,7 +981,14 @@ describe('ContextMenuProvider', () => {
       initialCwd: '/shared/project/history',
       resumeSessionId: VALID_SESSION_ID,
     })
-    expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      },
+    })
   })
 
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
@@ -1439,6 +1510,33 @@ describe('ContextMenuProvider', () => {
 
       // Verify stale tab.terminalId is cleared
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
+    })
+
+    it('clears stale tab.resumeSessionId when replacing the owning coding pane', async () => {
+      const user = userEvent.setup()
+      wsMocks.send.mockClear()
+
+      const store = createStoreWithCodingTerminalPane()
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+              Coding Terminal
+            </div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Coding Terminal'), keys: '[MouseRight]' })
+      await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
+
+      expect(store.getState().tabs.tabs[0].resumeSessionId).toBeUndefined()
     })
 
   })

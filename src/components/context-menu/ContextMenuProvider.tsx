@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { addTab, closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
@@ -22,7 +22,7 @@ import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
-import { collectSessionRefsFromNode } from '@/lib/session-utils'
+import { collectSessionRefsFromContent, collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
@@ -99,6 +99,7 @@ export function ContextMenuProvider({
   children,
 }: ContextMenuProviderProps) {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
   const tabsState = useAppSelector((s) => s.tabs)
   const panes = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
@@ -244,6 +245,31 @@ export function ContextMenuProvider({
     }
   }, [dispatch, tabsState.tabs])
 
+  const clearStaleTabResumeSessionId = useCallback((tabId: string, removedContent: Parameters<typeof collectSessionRefsFromContent>[0]) => {
+    const removedSession = collectSessionRefsFromContent(removedContent)[0]
+    if (!removedSession) return
+
+    const state = store.getState()
+    const tab = state.tabs.tabs.find((candidate) => candidate.id === tabId)
+    if (!tab?.resumeSessionId) return
+
+    const currentProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    if (currentProvider !== removedSession.provider || tab.resumeSessionId !== removedSession.sessionId) {
+      return
+    }
+
+    const survivingLayout = state.panes.layouts[tabId]
+    const stillOwnsSession = survivingLayout
+      ? collectSessionRefsFromNode(survivingLayout).some((sessionRef) => (
+        sessionRef.provider === removedSession.provider
+        && sessionRef.sessionId === removedSession.sessionId
+      ))
+      : false
+    if (stillOwnsSession) return
+
+    dispatch(updateTab({ id: tabId, updates: { resumeSessionId: undefined } }))
+  }, [dispatch, store])
+
   const replacePaneAction = useCallback((tabId: string, paneId: string) => {
     if (!panes[tabId]) return
     const content = findPaneContent(panes[tabId], paneId)
@@ -252,7 +278,10 @@ export function ContextMenuProvider({
       clearStaleTabTerminalId(tabId, content.terminalId)
     }
     dispatch(replacePane({ tabId, paneId }))
-  }, [dispatch, panes, ws, clearStaleTabTerminalId])
+    if (content) {
+      clearStaleTabResumeSessionId(tabId, content)
+    }
+  }, [dispatch, panes, ws, clearStaleTabResumeSessionId, clearStaleTabTerminalId])
 
   const closeTabById = useCallback((tabId: string) => {
     const layout = panes[tabId]
@@ -923,6 +952,9 @@ export function ContextMenuProvider({
             clearStaleTabTerminalId(tabId, content.terminalId)
           }
           dispatch(closePaneWithCleanup({ tabId, paneId }))
+          if (content) {
+            clearStaleTabResumeSessionId(tabId, content)
+          }
         },
         getTerminalActions: getTerminalActions,
         getEditorActions: getEditorActions,
@@ -986,6 +1018,7 @@ export function ContextMenuProvider({
     renamePane,
     refreshPaneAction,
     replacePaneAction,
+    clearStaleTabResumeSessionId,
     clearStaleTabTerminalId,
     ws,
     dispatch,
