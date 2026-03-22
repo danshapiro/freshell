@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getPaneDisplayTitle } from '@/lib/tab-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import { collectSessionRefsFromContent, collectSessionRefsFromNode } from '@/lib/session-utils'
 import {
@@ -48,6 +48,8 @@ import { saveServerSettingsPatch } from '@/store/settingsThunks'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
+const EMPTY_PANE_TITLE_SOURCES: Record<string, 'derived' | 'stable' | 'user'> = {}
+const EMPTY_PANE_RUNTIME_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
@@ -166,6 +168,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
+  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources?.[tabId] ?? EMPTY_PANE_TITLE_SOURCES)
+  const paneRuntimeTitles = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId ?? EMPTY_PANE_RUNTIME_TITLES)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
@@ -218,12 +222,19 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
+    const currentTitle = getPaneDisplayTitle(
+      node.id,
+      node.content,
+      paneTitles,
+      paneTitleSources,
+      paneRuntimeTitles,
+      extensionEntries,
+    )
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneRuntimeTitles, paneTitleSources, paneTitles, dispatch, extensionEntries])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
@@ -407,8 +418,14 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
 
   // Render a leaf pane
   if (node.type === 'leaf') {
-    const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
+    const paneTitle = getPaneDisplayTitle(
+      node.id,
+      node.content,
+      paneTitles,
+      paneTitleSources,
+      paneRuntimeTitles,
+      extensionEntries,
+    )
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'

@@ -12,6 +12,8 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+const EMPTY_PANE_TITLE_SOURCES: Record<string, Record<string, 'derived' | 'stable' | 'user'>> = {}
+const EMPTY_PANE_RUNTIME_TITLES: Record<string, string> = {}
 
 interface TabSwitcherProps {
   onClose: () => void
@@ -38,6 +40,8 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
+  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources ?? EMPTY_PANE_TITLE_SOURCES)
+  const paneRuntimeTitles = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId ?? EMPTY_PANE_RUNTIME_TITLES)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const paneRuntimeActivityByPaneId = useAppSelector(
@@ -46,8 +50,15 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles?.[tab.id], extensions),
-    [paneLayouts, paneTitles, extensions]
+    (tab: Tab): string => getTabDisplayTitle(
+      tab,
+      paneLayouts[tab.id],
+      paneTitles?.[tab.id],
+      paneTitleSources?.[tab.id],
+      paneRuntimeTitles,
+      extensions,
+    ),
+    [paneLayouts, paneRuntimeTitles, paneTitleSources, paneTitles, extensions]
   )
 
   const handleCardClick = useCallback(

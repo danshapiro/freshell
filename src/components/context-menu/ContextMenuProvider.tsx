@@ -105,6 +105,8 @@ export function ContextMenuProvider({
   const tabsState = useAppSelector((s) => s.tabs)
   const panes = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
+  const paneTitleSources = useAppSelector((s) => s.panes.paneTitleSources ?? {})
+  const paneRuntimeTitles = useAppSelector((s) => s.paneRuntimeTitle?.titlesByPaneId ?? {})
   const sessions = useAppSelector((s) => s.sessions.projects)
   const sidebarSessions = useAppSelector((s) => s.sessions.windows?.sidebar?.projects ?? s.sessions.projects)
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
@@ -173,16 +175,30 @@ export function ContextMenuProvider({
   const showKeyboardShortcuts = useCallback(() => setShortcutsDialogOpen(true), [])
 
   const copyTabNames = useCallback(async () => {
-    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id], paneTitles?.[tab.id], extensionEntries))
+    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(
+      tab,
+      panes[tab.id],
+      paneTitles?.[tab.id],
+      paneTitleSources?.[tab.id],
+      paneRuntimeTitles,
+      extensionEntries,
+    ))
     await copyText(names.join('\n'))
-  }, [tabsState.tabs, panes, paneTitles, extensionEntries])
+  }, [tabsState.tabs, panes, paneRuntimeTitles, paneTitleSources, paneTitles, extensionEntries])
 
   const copyTabName = useCallback(async (tabId: string) => {
     const tab = tabsState.tabs.find((t) => t.id === tabId)
     if (!tab) return
-    const name = getTabDisplayTitle(tab, panes[tab.id], paneTitles?.[tab.id], extensionEntries)
+    const name = getTabDisplayTitle(
+      tab,
+      panes[tab.id],
+      paneTitles?.[tab.id],
+      paneTitleSources?.[tab.id],
+      paneRuntimeTitles,
+      extensionEntries,
+    )
     await copyText(name)
-  }, [tabsState.tabs, panes, paneTitles, extensionEntries])
+  }, [tabsState.tabs, panes, paneRuntimeTitles, paneTitleSources, paneTitles, extensionEntries])
 
   const newDefaultTab = useCallback(() => {
     dispatch(addTab({ mode: 'shell' }))

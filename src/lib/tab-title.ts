@@ -1,38 +1,130 @@
 import { deriveTabName } from './deriveTabName'
 import { derivePaneTitle } from './derivePaneTitle'
+import {
+  inferLegacyPaneTitleSource,
+  resolveEffectiveLegacyTabTitleSource,
+  shouldReplaceDurableTitleSource,
+  type DurableTitleSource,
+} from './title-source'
 import type { Tab } from '@/store/types'
-import type { PaneNode } from '@/store/paneTypes'
+import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
-function getSinglePaneOverrideTitle(
+type TitleCandidate = {
+  title: string
+  source: DurableTitleSource
+}
+
+function getDurablePaneTitleCandidate(
+  paneId: string,
+  content: PaneContent,
+  paneTitles: Record<string, string> | undefined,
+  paneTitleSources: Record<string, DurableTitleSource> | undefined,
+  extensions?: ClientExtensionEntry[],
+): TitleCandidate {
+  const derivedPaneTitle = derivePaneTitle(content, extensions)
+  return {
+    title: paneTitles?.[paneId] || derivedPaneTitle,
+    source: paneTitleSources?.[paneId]
+      ?? inferLegacyPaneTitleSource({
+        storedTitle: paneTitles?.[paneId],
+        derivedTitle: derivedPaneTitle,
+      }),
+  }
+}
+
+function getDurableTabTitleCandidate(
+  tab: Tab,
   layout: PaneNode | undefined,
   paneTitles: Record<string, string> | undefined,
+  paneTitleSources: Record<string, DurableTitleSource> | undefined,
   extensions?: ClientExtensionEntry[],
-): string | null {
-  if (!layout || layout.type !== 'leaf') return null
-  const storedTitle = paneTitles?.[layout.id]
-  if (!storedTitle) return null
-  const derivedPaneTitle = derivePaneTitle(layout.content, extensions)
-  return storedTitle !== derivedPaneTitle ? storedTitle : null
+): TitleCandidate {
+  const derivedTabTitle = layout ? deriveTabName(layout, extensions) : (tab.title || 'Tab')
+
+  const paneCandidate = layout?.type === 'leaf'
+    ? getDurablePaneTitleCandidate(layout.id, layout.content, paneTitles, paneTitleSources, extensions)
+    : null
+  const tabSource = tab.titleSource
+    ?? resolveEffectiveLegacyTabTitleSource({
+      storedTitle: tab.title,
+      titleSetByUser: tab.titleSetByUser,
+      layout,
+      paneTitle: paneCandidate?.title,
+      paneTitleSource: paneCandidate?.source,
+      extensions,
+    })
+    ?? (tab.titleSetByUser ? 'user' : 'stable')
+  const tabCandidate: TitleCandidate = {
+    title: tab.title || derivedTabTitle || 'Tab',
+    source: tabSource,
+  }
+
+  if (
+    !paneCandidate
+    || paneCandidate.source === tabCandidate.source
+    || !shouldReplaceDurableTitleSource(tabCandidate.source, paneCandidate.source)
+  ) {
+    return tabCandidate.source === 'derived'
+      ? { title: derivedTabTitle || tabCandidate.title || 'Tab', source: 'derived' }
+      : tabCandidate
+  }
+
+  return paneCandidate
+}
+
+export function getTabDurableDisplayTitle(
+  tab: Tab,
+  layout?: PaneNode,
+  paneTitles?: Record<string, string>,
+  paneTitleSources?: Record<string, DurableTitleSource>,
+  extensions?: ClientExtensionEntry[],
+): string {
+  return getDurableTabTitleCandidate(tab, layout, paneTitles, paneTitleSources, extensions).title
+}
+
+export function getPaneDisplayTitle(
+  paneId: string,
+  content: PaneContent,
+  paneTitles?: Record<string, string>,
+  paneTitleSources?: Record<string, DurableTitleSource>,
+  paneRuntimeTitles?: Record<string, string>,
+  extensions?: ClientExtensionEntry[],
+): string {
+  const durableCandidate = getDurablePaneTitleCandidate(
+    paneId,
+    content,
+    paneTitles,
+    paneTitleSources,
+    extensions,
+  )
+  if (durableCandidate.source === 'derived' && paneRuntimeTitles?.[paneId]) {
+    return paneRuntimeTitles[paneId]
+  }
+  return durableCandidate.title
 }
 
 export function getTabDisplayTitle(
   tab: Tab,
   layout?: PaneNode,
   paneTitles?: Record<string, string>,
+  paneTitleSources?: Record<string, DurableTitleSource>,
+  paneRuntimeTitles?: Record<string, string>,
   extensions?: ClientExtensionEntry[],
 ): string {
-  const title = tab.title ?? ''
-  const singlePaneTitle = getSinglePaneOverrideTitle(layout, paneTitles, extensions)
-  const derivedName = layout ? deriveTabName(layout, extensions) : null
-  if (tab.titleSetByUser) {
-    return title || singlePaneTitle || derivedName || (layout?.type === 'leaf' ? derivePaneTitle(layout.content, extensions) : null) || 'Tab'
+  const durableCandidate = getDurableTabTitleCandidate(
+    tab,
+    layout,
+    paneTitles,
+    paneTitleSources,
+    extensions,
+  )
+  if (
+    layout?.type === 'leaf'
+    && durableCandidate.source === 'derived'
+    && paneRuntimeTitles?.[layout.id]
+  ) {
+    return paneRuntimeTitles[layout.id]
   }
-  if (singlePaneTitle) {
-    return singlePaneTitle
-  }
-  if (title && !title.match(/^Tab \d+$/) && title !== derivedName) {
-    return title
-  }
-  return derivedName ?? (title || 'Tab')
+  return durableCandidate.title
 }

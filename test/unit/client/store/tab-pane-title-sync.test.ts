@@ -199,13 +199,13 @@ describe('tab-pane title sync for single-pane tabs', () => {
       // Pane title should be updated
       expect(store.getState().panes.paneTitles[tabId][firstPaneId]).toBe('Session Rename')
 
-      // Tab title should NOT be updated (multi-pane)
+      // Tab title should NOT be updated; the display stays on the tab-derived label.
       expect(store.getState().tabs.tabs[0].title).toBe('Original Title')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
-      )).toBe('Original Title')
+      )).toBe('Claude')
     })
 
     it('updates the display title across multiple single-pane tabs sharing a terminalId', async () => {
@@ -278,13 +278,13 @@ describe('tab-pane title sync for single-pane tabs', () => {
         store.getState().panes.layouts[tab1Id],
         store.getState().panes.paneTitles[tab1Id],
       )).toBe('New Name')
-      // Multi-pane tab: stored and display titles stay unchanged.
+      // Multi-pane tab: stored title stays unchanged and display stays on the tab-derived label.
       expect(store.getState().tabs.tabs[1].title).toBe('Multi Pane Tab')
       expect(getTabDisplayTitle(
         store.getState().tabs.tabs[1],
         store.getState().panes.layouts[tab2Id],
         store.getState().panes.paneTitles[tab2Id],
-      )).toBe('Multi Pane Tab')
+      )).toBe('Claude')
     })
 
     it('does nothing when no pane matches the terminalId', async () => {
@@ -304,7 +304,7 @@ describe('tab-pane title sync for single-pane tabs', () => {
         store.getState().tabs.tabs[0],
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
-      )).toBe('Some Tab')
+      )).toBe('Shell')
     })
   })
 })
