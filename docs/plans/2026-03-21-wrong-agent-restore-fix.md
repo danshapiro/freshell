@@ -81,6 +81,7 @@
 - `test/unit/client/components/TerminalView.resumeSession.test.tsx`
 - `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - `test/unit/client/components/TabContent.test.tsx`
+- `test/unit/client/components/TabsView.test.tsx`
 - `test/unit/client/lib/exact-session-ref.test.ts`
 - `test/unit/client/lib/tab-registry-snapshot.test.ts`
 - `test/unit/lib/terminal-restore.test.ts`
@@ -156,6 +157,7 @@ Acceptance proof for this plan:
 - Test: `test/unit/client/components/TerminalView.resumeSession.test.tsx`
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - Test: `test/unit/client/components/TabContent.test.tsx`
+- Test: `test/unit/client/components/TabsView.test.tsx`
 - Test: `test/unit/client/lib/exact-session-ref.test.ts`
 - Test: `test/unit/client/lib/tab-registry-snapshot.test.ts`
 - Test: `test/unit/lib/terminal-restore.test.ts`
@@ -167,7 +169,7 @@ Acceptance proof for this plan:
 
 Add the browser regression with two cases:
 
-1. Seed `freshell.tabs.v2` and `freshell.panes.v2` before `page.goto()` with two same-`cwd` coding tabs whose panes already carry distinct exact `sessionRef` values. Reload, switch tabs, and assert outbound `terminal.create` messages use the correct session for each tab and never cross-swap.
+1. Use `page.addInitScript()` plus manual `page.goto()`/harness setup (not the auto-navigating `freshellPage` fixture) so the spec can seed `freshell.tabs.v2` and `freshell.panes.v2` before bootstrap. Seed two same-`cwd` coding tabs whose panes already carry distinct exact `sessionRef` values. Reload, switch tabs, and assert outbound `terminal.create` messages use the correct session for each tab and never cross-swap.
 2. Seed a degraded no-layout coding tab with bare `resumeSessionId`, no pane layout, and coding mode. Assert reload does not restore the wrong session and the steady-state output becomes:
 
 ```text
@@ -195,7 +197,7 @@ Run:
 
 ```bash
 npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-exact-session-identity.spec.ts
-npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/tabs-view-flow.test.tsx
+npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/tabs-view-flow.test.tsx
 ```
 
 Expected: FAIL because exact `sessionRef` is not seeded consistently at client ingress, named Claude resumes can still masquerade as exact identity in some client paths, persisted migration is duplicated, PTY-backed `openSessionTab()` still creates no-layout tabs, restore still trusts degraded fallback state, copied tab snapshots can still fabricate exact-looking identity, and the browser regression can still drive the wrong restore behavior.
@@ -257,7 +259,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add test/e2e-browser/specs/terminal-exact-session-identity.spec.ts src/lib/exact-session-ref.ts src/store/persisted-pane-migration.ts src/lib/session-type-utils.ts src/store/tabsSlice.ts src/lib/ui-commands.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/panesSlice.ts src/components/terminal-view-utils.ts src/components/TerminalView.tsx src/components/TabContent.tsx src/components/TabsView.tsx src/lib/tab-registry-snapshot.ts src/lib/terminal-restore.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/tabs-view-flow.test.tsx
+git add test/e2e-browser/specs/terminal-exact-session-identity.spec.ts src/lib/exact-session-ref.ts src/store/persisted-pane-migration.ts src/lib/session-type-utils.ts src/store/tabsSlice.ts src/lib/ui-commands.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/panesSlice.ts src/components/terminal-view-utils.ts src/components/TerminalView.tsx src/components/TabContent.tsx src/components/TabsView.tsx src/lib/tab-registry-snapshot.ts src/lib/terminal-restore.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/tabs-view-flow.test.tsx
 git commit -m "feat: make client restore use exact session identity"
 ```
 
@@ -269,7 +271,6 @@ git commit -m "feat: make client restore use exact session identity"
 - Modify: `server/coding-cli/types.ts`
 - Modify: `server/coding-cli/providers/codex.ts`
 - Modify: `server/coding-cli/session-indexer.ts`
-- Modify: `server/spawn-spec.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `server/ws-handler.ts`
 - Modify: `server/index.ts`
@@ -295,6 +296,7 @@ Add tests proving:
 - Codex shell snapshot parsing accepts both `shell_snapshots/<sessionId>.sh` and `shell_snapshots/<sessionId>.*.sh`, preferring the newest matching file
 - exact discovered Codex association binds by snapshot `FRESHELL_TERMINAL_ID`, not oldest same-`cwd` terminal
 - repeated index updates preserve the original exact Codex owner
+- if a Codex session first appears before its shell snapshot is available, Freshell leaves it unbound on that pass and binds it exactly on a later advanced update when launch provenance appears, never by same-`cwd` fallback
 - `SessionAssociationCoordinator` no longer handles Codex, while named Claude resume and Opencode stay on the compatibility path until they have exact provenance
 - `SessionAssociationCoordinator` unit coverage explicitly proves named Claude resume stays eligible while exact Codex and fresh exact Claude do not
 - existing Opencode same-`cwd` association coverage stays green as an explicit non-regression
@@ -335,6 +337,7 @@ resumeArgs: (sessionId) => ['--resume', sessionId]
 - `server/coding-cli/codex-shell-snapshot.ts` parses `FRESHELL_TERMINAL_ID`, `FRESHELL_TAB_ID`, and `FRESHELL_PANE_ID` from the newest matching shell snapshot.
 - `CodingCliSession.launchOrigin` is populated from Codex shell snapshots and carried through the session indexer.
 - `server/discovered-session-association.ts` owns exact Codex watermarking and binding by `launchOrigin.terminalId`.
+- If a Codex session has not yet gained launch provenance, exact association must leave it unbound and retry on later advanced index updates; it must never fall back to same-`cwd` guessing.
 - `server/index.ts` uses exact discovered association for Codex sessions, stops routing Codex through same-`cwd` association, and keeps providers without exact provenance on the compatibility path.
 - `server/session-association-coordinator.ts` remains compatibility code for providers without exact provenance, currently named Claude resume terminals and Opencode. It must not handle Codex or fresh exact Claude sessions.
 
@@ -347,7 +350,7 @@ Expected: PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add server/coding-cli/codex-shell-snapshot.ts server/discovered-session-association.ts server/coding-cli/types.ts server/coding-cli/providers/codex.ts server/coding-cli/session-indexer.ts server/spawn-spec.ts server/terminal-registry.ts server/ws-handler.ts server/index.ts server/session-association-coordinator.ts test/unit/server/terminal-registry.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
+git add server/coding-cli/codex-shell-snapshot.ts server/discovered-session-association.ts server/coding-cli/types.ts server/coding-cli/providers/codex.ts server/coding-cli/session-indexer.ts server/terminal-registry.ts server/ws-handler.ts server/index.ts server/session-association-coordinator.ts test/unit/server/terminal-registry.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-shell-snapshot.test.ts test/unit/server/discovered-session-association.test.ts test/unit/server/session-association-coordinator.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/session-association.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts test/integration/server/codex-session-rebind-regression.test.ts
 git commit -m "feat: bind discovered coding sessions by exact provenance"
 ```
 
@@ -438,7 +441,7 @@ Expected: PASS
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/replace-pane.test.tsx test/e2e/tabs-view-flow.test.tsx
+npm run test:vitest -- test/unit/client/store/tabsSlice.test.ts test/unit/client/ui-commands.test.ts test/unit/client/store/persistedState.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TabContent.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/lib/exact-session-ref.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/unit/lib/terminal-restore.test.ts test/unit/client/lib/session-utils.test.ts test/unit/client/lib/pane-activity.test.ts test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/replace-pane.test.tsx test/e2e/tabs-view-flow.test.tsx
 npm run lint
 ```
 
