@@ -11,12 +11,17 @@ import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProvid
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry, clearClosedTabSnapshot } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
+  bootstrapLegacyTabTitleSource,
+  type DurableTitleSource,
+} from '@/lib/title-source'
+import {
   buildClosedTabRegistryRecord,
   countPaneLeaves,
   shouldKeepClosedTab,
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
+import { parsePersistedTabsRaw } from './persistedState.js'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
@@ -24,6 +29,49 @@ import { buildExactSessionRef } from '@/lib/exact-session-ref'
 
 
 const log = createLogger('TabsSlice')
+
+type TabUpdateFields = Partial<Tab> & {
+  source?: DurableTitleSource
+}
+
+function setTabTitleSource(tab: Tab, source: DurableTitleSource | undefined) {
+  if (source) {
+    tab.titleSource = source
+  } else {
+    delete tab.titleSource
+  }
+  tab.titleSetByUser = source === 'user'
+}
+
+function normalizeLoadedTab(tab: Tab): Tab {
+  const legacyClaudeSessionId = (tab as any).claudeSessionId as string | undefined
+  const titleSource = tab.titleSource ?? bootstrapLegacyTabTitleSource({
+    title: tab.title,
+    titleSetByUser: tab.titleSetByUser,
+    mode: tab.mode,
+    shell: tab.shell,
+  })
+
+  return {
+    ...tab,
+    codingCliSessionId: tab.codingCliSessionId || legacyClaudeSessionId,
+    codingCliProvider: tab.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+    createdAt: tab.createdAt || Date.now(),
+    createRequestId: (tab as any).createRequestId || tab.id,
+    status: tab.status || 'creating',
+    mode: tab.mode || 'shell',
+    shell: tab.shell || 'system',
+    lastInputAt: tab.lastInputAt,
+    titleSource,
+    titleSetByUser: titleSource === 'user',
+  }
+}
+
+function resolveAddTabTitleSource(payload: AddTabPayload): DurableTitleSource {
+  if (payload.titleSource) return payload.titleSource
+  if (payload.titleSetByUser) return 'user'
+  return 'derived'
+}
 
 export interface TabsState {
   tabs: Tab[]
@@ -45,28 +93,14 @@ function loadInitialTabsState(): TabsState {
   try {
     const raw = localStorage.getItem(TABS_STORAGE_KEY)
     if (!raw) return defaultState
-    const parsed = JSON.parse(raw)
-    // The persisted format is { tabs: TabsState }
-    const tabsState = parsed?.tabs as Partial<TabsState> | undefined
+    const parsed = parsePersistedTabsRaw(raw)
+    if (!parsed) return defaultState
+    const tabsState = parsed.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
     log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
 
-    // Apply same transformations as hydrateTabs to ensure consistency
-    const mappedTabs = tabsState.tabs.map((t: Tab) => {
-      const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
-      return {
-        ...t,
-        codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
-        codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
-        createdAt: t.createdAt || Date.now(),
-        createRequestId: (t as any).createRequestId || t.id,
-        status: t.status || 'creating',
-        mode: t.mode || 'shell',
-        shell: t.shell || 'system',
-        lastInputAt: t.lastInputAt,
-      }
-    })
+    const mappedTabs = tabsState.tabs.map((t: Tab) => normalizeLoadedTab(t))
     const desired = tabsState.activeTabId
     const has = desired && mappedTabs.some((t) => t.id === desired)
 
@@ -86,6 +120,7 @@ const initialState: TabsState = loadInitialTabsState()
 type AddTabPayload = {
   id?: string
   title?: string
+  titleSource?: DurableTitleSource
   titleSetByUser?: boolean
   description?: string
   terminalId?: string
@@ -131,9 +166,11 @@ export const tabsSlice = createSlice({
         resumeSessionId: payload.resumeSessionId,
         sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),
-        titleSetByUser: payload.titleSetByUser,
+        titleSource: resolveAddTabTitleSource(payload),
+        titleSetByUser: false,
         lastInputAt: undefined,
       }
+      setTabTitleSource(tab, tab.titleSource)
       state.tabs.push(tab)
       state.activeTabId = id
     },
@@ -146,9 +183,51 @@ export const tabsSlice = createSlice({
     clearTabRenameRequest: (state) => {
       state.renameRequestTabId = null
     },
-    updateTab: (state, action: PayloadAction<{ id: string; updates: Partial<Tab> }>) => {
+    setTabTitle: (state, action: PayloadAction<{ id: string; title: string; source: DurableTitleSource }>) => {
       const tab = state.tabs.find((t) => t.id === action.payload.id)
-      if (tab) Object.assign(tab, action.payload.updates)
+      if (!tab) return
+      tab.title = action.payload.title
+      setTabTitleSource(tab, action.payload.source)
+    },
+    updateTab: (state, action: PayloadAction<{ id: string; updates: TabUpdateFields }>) => {
+      const tab = state.tabs.find((t) => t.id === action.payload.id)
+      if (!tab) return
+
+      const updates = action.payload.updates
+      const nextSource = tab.titleSource
+
+      const hasTitle = Object.prototype.hasOwnProperty.call(updates, 'title')
+      const hasExplicitSource = Object.prototype.hasOwnProperty.call(updates, 'source')
+        || Object.prototype.hasOwnProperty.call(updates, 'titleSource')
+      const explicitSource = Object.prototype.hasOwnProperty.call(updates, 'source')
+        ? updates.source
+        : updates.titleSource
+
+      if (hasTitle) {
+        tab.title = updates.title as string
+      }
+
+      const { title: _title, titleSource: _titleSource, titleSetByUser: legacyTitleSetByUser, source: _source, ...rest } = updates
+      Object.assign(tab, rest)
+
+      if (hasExplicitSource) {
+        setTabTitleSource(tab, explicitSource)
+        return
+      }
+
+      if (legacyTitleSetByUser === true) {
+        setTabTitleSource(tab, 'user')
+        return
+      }
+
+      if (legacyTitleSetByUser === false && nextSource === 'user') {
+        setTabTitleSource(tab, 'derived')
+        return
+      }
+
+      if (hasTitle) {
+        setTabTitleSource(tab, nextSource)
+      }
     },
     removeTab: (state, action: PayloadAction<string>) => {
       const removedTabId = action.payload
@@ -169,19 +248,7 @@ export const tabsSlice = createSlice({
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
       // Basic sanity: ensure dates exist, status defaults.
-      state.tabs = (action.payload.tabs || []).map((t) => {
-        const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
-        return {
-          ...t,
-          codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
-          codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
-          createdAt: t.createdAt || Date.now(),
-          createRequestId: (t as any).createRequestId || t.id,
-          status: t.status || 'creating',
-          mode: t.mode || 'shell',
-          shell: t.shell || 'system',
-        }
-      })
+      state.tabs = (action.payload.tabs || []).map((t) => normalizeLoadedTab(t))
       const desired = action.payload.activeTabId
       const has = desired && state.tabs.some((t) => t.id === desired)
       state.activeTabId = has ? desired! : (state.tabs[0]?.id ?? null)
@@ -216,6 +283,7 @@ export const {
   setActiveTab,
   requestTabRename,
   clearTabRenameRequest,
+  setTabTitle,
   updateTab,
   removeTab,
   hydrateTabs,
@@ -328,6 +396,7 @@ export const reopenClosedTab = createAsyncThunk(
     dispatch(addTab({
       id: newTabId,
       title: entry.tab.title,
+      titleSource: entry.tab.titleSource,
       titleSetByUser: entry.tab.titleSetByUser,
       mode: entry.tab.mode,
       shell: entry.tab.shell,
@@ -500,6 +569,7 @@ export const openSessionTab = createAsyncThunk(
       dispatch(addTab({
         id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
+        titleSource: title ? 'stable' : 'derived',
         terminalId,
         status: 'running',
         mode: resolvedProvider,
@@ -537,6 +607,7 @@ export const openSessionTab = createAsyncThunk(
       dispatch(addTab({
         id: tabId,
         title: title || getAgentChatProviderLabel(resolvedSessionType),
+        titleSource: title ? 'stable' : 'derived',
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
@@ -554,6 +625,7 @@ export const openSessionTab = createAsyncThunk(
     dispatch(addTab({
       id: tabId,
       title: title || getProviderLabel(resolvedProvider, extensions),
+      titleSource: title ? 'stable' : 'derived',
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,

@@ -1,5 +1,6 @@
 export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
 
+import type { DurableTitleSource } from '@/lib/title-source'
 import type {
   AgentChatEffort,
   AttentionDismiss,
@@ -59,7 +60,8 @@ export interface Tab {
   resumeSessionId?: string     // Compatibility mirror of the last associated coding session; not authoritative ownership
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
-  titleSetByUser?: boolean     // If true, don't auto-update title
+  titleSource?: DurableTitleSource
+  titleSetByUser?: boolean     // Compatibility mirror of titleSource === 'user'
   lastInputAt?: number
 }
 

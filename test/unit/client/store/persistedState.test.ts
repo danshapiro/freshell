@@ -41,6 +41,19 @@ describe('persistedState parsers', () => {
       expect(parsed!.version).toBe(0)
       expect(parsed!.tabs.tabs[0].id).toBe('t1')
     })
+
+    it('accepts persisted tabs with titleSource metadata', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 't1',
+          tabs: [{ id: 't1', title: 'Session title', titleSource: 'stable', createdAt: 1 }],
+        },
+      })
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed).not.toBeNull()
+      expect(parsed!.tabs.tabs[0].titleSource).toBe('stable')
+    })
   })
 
   describe('parsePersistedPanesRaw', () => {
