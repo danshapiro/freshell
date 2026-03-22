@@ -1211,15 +1211,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -1271,15 +1274,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {

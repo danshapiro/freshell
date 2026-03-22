@@ -129,6 +129,63 @@ describe('querySessionDirectory', () => {
     expect(page.revision).toBe(1_500)
   })
 
+  it('joins Kimi running state by cwd when duplicate named session ids exist', async () => {
+    const kimiProjects = [
+      makeProject('/repo/root', [
+        makeSession({
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_100,
+          cwd: '/repo/root/packages/app-a',
+          title: 'Kimi app A',
+        }),
+        makeSession({
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          cwd: '/repo/root/packages/app-b',
+          title: 'Kimi app B',
+        }),
+      ]),
+    ]
+
+    const kimiTerminalMeta = [
+      makeTerminalMeta({
+        terminalId: 'term-kimi-a',
+        updatedAt: 1_600,
+        provider: 'kimi',
+        sessionId: 'shared-kimi-session',
+        cwd: '/repo/root/packages/app-a',
+      }),
+    ]
+
+    const page = await querySessionDirectory({
+      projects: kimiProjects,
+      terminalMeta: kimiTerminalMeta,
+      query: {
+        priority: 'visible',
+      },
+    })
+
+    expect(page.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        provider: 'kimi',
+        sessionId: 'shared-kimi-session',
+        cwd: '/repo/root/packages/app-a',
+        isRunning: true,
+        runningTerminalId: 'term-kimi-a',
+      }),
+      expect.objectContaining({
+        provider: 'kimi',
+        sessionId: 'shared-kimi-session',
+        cwd: '/repo/root/packages/app-b',
+        isRunning: false,
+      }),
+    ]))
+  })
+
   it('searches titles and snippets on the server and bounds snippet length', async () => {
     const page = await querySessionDirectory({
       projects,

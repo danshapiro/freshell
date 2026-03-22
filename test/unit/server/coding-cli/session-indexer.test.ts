@@ -282,6 +282,49 @@ describe('CodingCliSessionIndexer', () => {
     )
   })
 
+  it('disambiguates duplicate Kimi session ids by cwd for transcript lookup', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir: tempDir,
+      listSessionsDirect: async () => ([
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          sourceFile: '/tmp/kimi-a/context.jsonl',
+        },
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_100,
+          sourceFile: '/tmp/kimi-b/context.jsonl',
+        },
+      ]),
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi')).toBeUndefined()
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi', '/repo/root/packages/app-a')).toBe('/tmp/kimi-a/context.jsonl')
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi', '/repo/root/packages/app-b')).toBe('/tmp/kimi-b/context.jsonl')
+  })
+
   it('refreshes direct-provider Kimi title/archive state and transcript lookups when metadata or wire files change', async () => {
     vi.mocked(configStore.snapshot).mockResolvedValue({
       sessionOverrides: {},

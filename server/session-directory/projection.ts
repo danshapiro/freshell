@@ -1,4 +1,4 @@
-import type { CodingCliSession, ProjectGroup } from '../coding-cli/types.js'
+import { makeSessionKey, type CodingCliProviderName, type CodingCliSession, type ProjectGroup } from '../coding-cli/types.js'
 import type { SessionDirectoryItem } from './types.js'
 
 export type SessionDirectoryComparableItem = Omit<
@@ -6,8 +6,8 @@ export type SessionDirectoryComparableItem = Omit<
   'isRunning' | 'runningTerminalId' | 'snippet' | 'matchedIn'
 >
 
-function buildSessionKey(item: { provider: string; sessionId: string }): string {
-  return `${item.provider}:${item.sessionId}`
+function buildSessionKey(item: { provider: string; sessionId: string; cwd?: string }): string {
+  return makeSessionKey(item.provider as CodingCliProviderName, item.sessionId, item.cwd)
 }
 
 function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirectoryComparableItem): boolean {

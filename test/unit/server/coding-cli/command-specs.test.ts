@@ -1,6 +1,8 @@
+import path from 'path'
 import { describe, expect, it } from 'vitest'
 import { buildCliCommandSpecsFromEntries } from '../../../../server/coding-cli/command-specs.js'
-import type { ExtensionRegistryEntry } from '../../../../server/extension-manager.js'
+import { ExtensionManager, type ExtensionRegistryEntry } from '../../../../server/extension-manager.js'
+import { buildSpawnSpec, registerCodingCliCommands } from '../../../../server/terminal-registry.js'
 
 function makeCliEntry(overrides: Partial<ExtensionRegistryEntry['manifest']> = {}): ExtensionRegistryEntry {
   return {
@@ -61,5 +63,52 @@ describe('buildCliCommandSpecsFromEntries', () => {
     ])
 
     expect(specs.get('kimi')?.resumeArgs?.('kimi-session-1')).toEqual(['--session', 'kimi-session-1'])
+  })
+
+  it('drives buildSpawnSpec through registerCodingCliCommands using the manifest-compiled runtime map', () => {
+    const manager = new ExtensionManager()
+    manager.scan([path.join(process.cwd(), 'extensions')])
+    const baselineSpecs = buildCliCommandSpecsFromEntries(manager.getAll())
+
+    const kimiEntry = manager.getAll().find((entry) => entry.manifest.name === 'kimi')
+    expect(kimiEntry).toBeTruthy()
+
+    const mutatedEntries = manager.getAll().map((entry) => (
+      entry.manifest.name !== 'kimi'
+        ? entry
+        : {
+          ...entry,
+          manifest: {
+            ...entry.manifest,
+            cli: {
+              ...entry.manifest.cli!,
+              modelArgs: ['--registered-model', '{{model}}'],
+              permissionModeArgsByValue: {
+                bypassPermissions: ['--registered-yolo'],
+              },
+              resumeArgs: ['--registered-session', '{{sessionId}}'],
+            },
+          },
+        }
+    ))
+
+    registerCodingCliCommands(buildCliCommandSpecsFromEntries(mutatedEntries))
+    try {
+      const spec = buildSpawnSpec('kimi', '/repo/root', 'system', 'kimi-session-1', {
+        model: 'moonshot-k2',
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--registered-model',
+        'moonshot-k2',
+        '--registered-yolo',
+        '--registered-session',
+        'kimi-session-1',
+      ]))
+      expect(spec.args).not.toEqual(expect.arrayContaining(['--model', '--yolo', '--session']))
+    } finally {
+      registerCodingCliCommands(baselineSpecs)
+    }
   })
 })

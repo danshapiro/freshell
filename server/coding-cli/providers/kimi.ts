@@ -340,6 +340,12 @@ export class KimiProvider implements CodingCliProvider {
       if (!cwd || !sessionsDir) continue
 
       const sessionCandidates = await listKimiSessionFiles(sessionsDir)
+      const [projectPath, gitMetadata] = await Promise.all([
+        resolveGitRepoRoot(cwd),
+        resolveGitBranchAndDirty(cwd),
+      ])
+      if (!projectPath) continue
+
       for (const sessionCandidate of sessionCandidates) {
         let contextStat: import('fs').Stats
         try {
@@ -348,15 +354,11 @@ export class KimiProvider implements CodingCliProvider {
           continue
         }
 
-        const [storedMetadata, wireSummary, contextSummary, projectPath, gitMetadata] = await Promise.all([
+        const [storedMetadata, wireSummary, contextSummary] = await Promise.all([
           loadKimiStoredMetadata(sessionCandidate.sessionDir),
           loadKimiWireSummary(sessionCandidate.sessionDir),
           loadKimiContextSummary(sessionCandidate.contextPath),
-          resolveGitRepoRoot(cwd),
-          resolveGitBranchAndDirty(cwd),
         ])
-
-        if (!projectPath) continue
 
         const title = deriveKimiTitle(storedMetadata, wireSummary, contextSummary)
         sessions.push({

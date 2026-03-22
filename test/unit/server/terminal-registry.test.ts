@@ -1993,6 +1993,27 @@ describe('TerminalRegistry', () => {
       expect(found[0].terminalId).toBe(first.terminalId)
       expect(second.resumeSessionId).toBeUndefined()
     })
+
+    it('allows duplicate Kimi session ids in different cwd values and matches by cwd', () => {
+      const first = registry.create({
+        mode: 'kimi',
+        cwd: '/repo/root/packages/app-a',
+        resumeSessionId: 'shared-kimi-session',
+      })
+      const second = registry.create({
+        mode: 'kimi',
+        cwd: '/repo/root/packages/app-b',
+        resumeSessionId: 'shared-kimi-session',
+      })
+
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session')).toHaveLength(2)
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session', '/repo/root/packages/app-a')).toEqual([
+        expect.objectContaining({ terminalId: first.terminalId }),
+      ])
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')).toEqual([
+        expect.objectContaining({ terminalId: second.terminalId }),
+      ])
+    })
   })
 
   describe('findTerminalsBySession() ignores cwd parameter', () => {

@@ -1,4 +1,6 @@
 import path from 'path'
+import os from 'os'
+import fsp from 'fs/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
@@ -13,6 +15,7 @@ vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
 })
 
 import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
+import { resolveGitBranchAndDirty, resolveGitRepoRoot } from '../../../../server/coding-cli/utils'
 
 const fixtureShareDir = path.join(
   process.cwd(),
@@ -86,5 +89,37 @@ describe('KimiProvider', () => {
     expect(provider.parseEvent('{"role":"_usage","token_count":42}')).toEqual([])
     expect(provider.supportsLiveStreaming()).toBe(false)
     expect(provider.supportsSessionResume()).toBe(true)
+  })
+
+  it('resolves git metadata once per cwd even when multiple sessions share a workdir', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-share-dir-'))
+    await fsp.cp(fixtureShareDir, tempShareDir, { recursive: true })
+    await fsp.mkdir(path.join(
+      tempShareDir,
+      'sessions',
+      '4a3dcd71f4774356bb688dad99173808',
+      'kimi-session-2',
+    ), { recursive: true })
+    await fsp.writeFile(path.join(
+      tempShareDir,
+      'sessions',
+      '4a3dcd71f4774356bb688dad99173808',
+      'kimi-session-2',
+      'context.jsonl',
+    ), '{"role":"user","content":"Another session in the same cwd"}\n')
+
+    vi.mocked(resolveGitRepoRoot).mockClear()
+    vi.mocked(resolveGitBranchAndDirty).mockClear()
+
+    try {
+      const provider = new KimiProvider(tempShareDir)
+      const sessions = await provider.listSessionsDirect()
+
+      expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(2)
+      expect(resolveGitRepoRoot).toHaveBeenCalledTimes(5)
+      expect(resolveGitBranchAndDirty).toHaveBeenCalledTimes(5)
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
   })
 })

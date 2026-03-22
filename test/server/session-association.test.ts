@@ -111,6 +111,52 @@ describe('SessionAssociationCoordinator integration', () => {
 
     registry.shutdown()
   })
+
+  it('tracks and associates duplicate Kimi session ids independently by cwd', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+    const now = Date.now()
+
+    const terminalA = registry.create({ mode: 'kimi', cwd: '/repo/root/packages/app-a' })
+    const terminalB = registry.create({ mode: 'kimi', cwd: '/repo/root/packages/app-b' })
+
+    const sessionA: CodingCliSession = {
+      provider: 'kimi',
+      sessionId: 'shared-kimi-session',
+      projectPath: '/repo/root',
+      lastActivityAt: now,
+      cwd: '/repo/root/packages/app-a',
+    }
+    const sessionB: CodingCliSession = {
+      provider: 'kimi',
+      sessionId: 'shared-kimi-session',
+      projectPath: '/repo/root',
+      lastActivityAt: now + 100,
+      cwd: '/repo/root/packages/app-b',
+    }
+
+    expect(coordinator.collectNewOrAdvanced([
+      { projectPath: '/repo/root', sessions: [sessionA, sessionB] },
+    ])).toEqual([sessionA, sessionB])
+
+    expect(coordinator.associateSingleSession(sessionA)).toEqual({
+      associated: true,
+      terminalId: terminalA.terminalId,
+    })
+    expect(coordinator.associateSingleSession(sessionB)).toEqual({
+      associated: true,
+      terminalId: terminalB.terminalId,
+    })
+
+    expect(registry.get(terminalA.terminalId)?.resumeSessionId).toBe('shared-kimi-session')
+    expect(registry.get(terminalB.terminalId)?.resumeSessionId).toBe('shared-kimi-session')
+    expect(coordinator.noteSession({
+      ...sessionA,
+      lastActivityAt: now + 50,
+    })).toBe(true)
+
+    registry.shutdown()
+  })
 })
 
 describe('Session-Terminal metadata broadcasts', () => {

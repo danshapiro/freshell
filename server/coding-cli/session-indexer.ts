@@ -7,7 +7,7 @@ import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
-import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { makeSessionKey, parseSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
@@ -327,9 +327,22 @@ export class CodingCliSessionIndexer {
     return this.projects
   }
 
-  getFilePathForSession(sessionId: string, provider?: CodingCliProviderName): string | undefined {
+  getFilePathForSession(sessionId: string, provider?: CodingCliProviderName, cwd?: string): string | undefined {
     if (provider) {
-      return this.sessionKeyToFilePath.get(makeSessionKey(provider, sessionId))
+      if (cwd) {
+        return this.sessionKeyToFilePath.get(makeSessionKey(provider, sessionId, cwd))
+      }
+
+      let match: string | undefined
+      for (const [key, filePath] of this.sessionKeyToFilePath) {
+        const parsed = parseSessionKey(key)
+        if (parsed.provider !== provider || parsed.sessionId !== sessionId) continue
+        if (match && match !== filePath) {
+          return undefined
+        }
+        match = filePath
+      }
+      return match
     }
 
     // Session repair currently resolves Claude sessions by bare session ID.
@@ -338,9 +351,8 @@ export class CodingCliSessionIndexer {
     if (claudePath) return claudePath
 
     let match: string | undefined
-    const suffix = `:${sessionId}`
     for (const [key, filePath] of this.sessionKeyToFilePath) {
-      if (!key.endsWith(suffix)) continue
+      if (parseSessionKey(key).sessionId !== sessionId) continue
       if (match && match !== filePath) {
         return undefined
       }
@@ -402,13 +414,17 @@ export class CodingCliSessionIndexer {
   private deleteCacheEntry(cacheKey: string) {
     const cached = this.fileCache.get(cacheKey)
     if (cached?.baseSession?.sessionId) {
-      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+      this.sessionKeyToFilePath.delete(makeSessionKey(
+        cached.baseSession.provider,
+        cached.baseSession.sessionId,
+        cached.baseSession.cwd,
+      ))
     }
     this.fileCache.delete(cacheKey)
   }
 
-  private makeDirectCacheKey(provider: CodingCliProviderName, sessionId: string): string {
-    return `direct:${provider}:${sessionId}`
+  private makeDirectCacheKey(provider: CodingCliProviderName, sessionId: string, cwd?: string): string {
+    return `direct:${makeSessionKey(provider, sessionId, cwd)}`
   }
 
   private isDirectCacheKey(cacheKey: string): boolean {
@@ -432,7 +448,7 @@ export class CodingCliSessionIndexer {
   }
 
   private detectNewSessions(sessions: CodingCliSession[]) {
-    const currentIds = new Set<string>(sessions.map((s) => makeSessionKey(s.provider, s.sessionId)))
+    const currentIds = new Set<string>(sessions.map((s) => makeSessionKey(s.provider, s.sessionId, s.cwd)))
 
     // Prune knownSessionIds to only contain IDs that still exist
     for (const id of this.knownSessionIds) {
@@ -448,7 +464,7 @@ export class CodingCliSessionIndexer {
     for (const session of sessions) {
       if (!session.cwd) continue
 
-      const sessionKey = makeSessionKey(session.provider, session.sessionId)
+      const sessionKey = makeSessionKey(session.provider, session.sessionId, session.cwd)
       const wasKnown = this.knownSessionIds.has(sessionKey)
       if (!wasKnown) this.knownSessionIds.add(sessionKey)
 
@@ -465,7 +481,7 @@ export class CodingCliSessionIndexer {
         const diff = a.lastActivityAt - b.lastActivityAt
         return diff !== 0
           ? diff
-          : makeSessionKey(a.provider, a.sessionId).localeCompare(makeSessionKey(b.provider, b.sessionId))
+          : makeSessionKey(a.provider, a.sessionId, a.cwd).localeCompare(makeSessionKey(b.provider, b.sessionId, b.cwd))
       })
       for (const session of newSessions) {
         for (const h of this.onNewSessionHandlers) {
@@ -498,7 +514,11 @@ export class CodingCliSessionIndexer {
 
     // Clean up previous session mapping before re-parsing
     if (cached?.baseSession?.sessionId) {
-      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+      this.sessionKeyToFilePath.delete(makeSessionKey(
+        cached.baseSession.provider,
+        cached.baseSession.sessionId,
+        cached.baseSession.cwd,
+      ))
     }
 
     const snippet = await readSessionSnippet(filePath)
@@ -562,13 +582,17 @@ export class CodingCliSessionIndexer {
       size,
       baseSession,
     })
-    this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
+    this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId, baseSession.cwd), filePath)
   }
 
   private updateDirectCacheEntry(provider: CodingCliProvider, session: CodingCliSession, cacheKey: string) {
     const cached = this.fileCache.get(cacheKey)
     if (cached?.baseSession?.sessionId) {
-      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+      this.sessionKeyToFilePath.delete(makeSessionKey(
+        cached.baseSession.provider,
+        cached.baseSession.sessionId,
+        cached.baseSession.cwd,
+      ))
     }
 
     this.fileCache.set(cacheKey, {
@@ -582,7 +606,7 @@ export class CodingCliSessionIndexer {
     })
 
     if (session.sourceFile) {
-      this.sessionKeyToFilePath.set(makeSessionKey(provider.name, session.sessionId), session.sourceFile)
+      this.sessionKeyToFilePath.set(makeSessionKey(provider.name, session.sessionId, session.cwd), session.sourceFile)
     }
   }
 
@@ -599,7 +623,7 @@ export class CodingCliSessionIndexer {
     }
 
     for (const session of sessions) {
-      const cacheKey = this.makeDirectCacheKey(provider.name, session.sessionId)
+      const cacheKey = this.makeDirectCacheKey(provider.name, session.sessionId, session.cwd)
       seenKeys.add(cacheKey)
       this.updateDirectCacheEntry(provider, session, cacheKey)
     }
@@ -798,8 +822,11 @@ export class CodingCliSessionIndexer {
         continue
       }
       if (!cached.baseSession) continue
-      const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
-      let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[cached.baseSession.sessionId]
+      const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId, cached.baseSession.cwd)
+      const legacyCompositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
+      let ov = cfg.sessionOverrides?.[compositeKey]
+        || (legacyCompositeKey !== compositeKey ? cfg.sessionOverrides?.[legacyCompositeKey] : undefined)
+        || cfg.sessionOverrides?.[cached.baseSession.sessionId]
       if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
         const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
         if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
@@ -814,8 +841,9 @@ export class CodingCliSessionIndexer {
       const merged = applyOverride(cached.baseSession, ov)
       if (!merged) continue
       // Merge sessionType from metadata store
-      const metaKey = makeSessionKey(merged.provider, merged.sessionId)
-      const meta = sessionMetadata[metaKey]
+      const metaKey = makeSessionKey(merged.provider, merged.sessionId, merged.cwd)
+      const legacyMetaKey = makeSessionKey(merged.provider, merged.sessionId)
+      const meta = sessionMetadata[metaKey] ?? (legacyMetaKey !== metaKey ? sessionMetadata[legacyMetaKey] : undefined)
       if (meta?.sessionType) {
         merged.sessionType = meta.sessionType
       }
