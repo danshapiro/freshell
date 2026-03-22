@@ -202,6 +202,36 @@ describe('NetworkManager', () => {
     expect(status.accessUrl).not.toContain('192.168.1.100')
   })
 
+  it('keeps requested WSL remote access healthy when the port is reachable and the planner says noop', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockResolvedValue(true)
+    vi.mocked(computeWslPortForwardingPlanAsync).mockResolvedValue({
+      status: 'noop',
+      wslIp: '172.30.149.249',
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(testPort, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.remoteAccessRequested).toBe(true)
+    expect(status.remoteAccessNeedsRepair).toBe(false)
+    expect(status.firewall.portOpen).toBe(true)
+    expect(status.accessUrl).toContain(`192.168.1.100:${testPort}`)
+  })
+
   it('keeps the LAN share URL when WSL reachability checks fail but remote access is still requested', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     const portReachable = await import('is-port-reachable')

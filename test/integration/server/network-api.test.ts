@@ -240,6 +240,48 @@ describe('Network API integration', () => {
       expect(res.body.remoteAccessNeedsRepair).toBe(false)
     })
 
+    it('reports healthy WSL remote access and skips repair prompting when the planner is noop', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'noop',
+        wslIp: '172.24.0.2',
+      })
+
+      const statusRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusRes.status).toBe(200)
+      expect(statusRes.body.remoteAccessEnabled).toBe(true)
+      expect(statusRes.body.remoteAccessRequested).toBe(true)
+      expect(statusRes.body.remoteAccessNeedsRepair).toBe(false)
+      expect(statusRes.body.firewall.portOpen).toBe(true)
+      expect(statusRes.body.accessUrl).toContain('192.168.1.100')
+
+      const repairRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(repairRes.status).toBe(200)
+      expect(repairRes.body).toEqual({
+        method: 'none',
+        message: 'No configuration changes required',
+      })
+    })
+
     it('falls back to localhost accessUrl when WSL port probe fails and port forwarding is disabled by env', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
@@ -843,6 +885,99 @@ describe('Network API integration', () => {
       expect(confirmedRes.body).toEqual({ method: 'wsl2', status: 'started' })
 
       networkManager.setFirewallConfiguring(false)
+    })
+
+    it('keeps WSL repair healthy after callback-time verification recomputes to noop', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+      let portReachable = false
+      vi.mocked(isPortReachable).mockImplementation(async () => portReachable)
+
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockImplementation(async () => {
+        if (!portReachable) {
+          return {
+            status: 'ready',
+            wslIp: '172.24.0.2',
+            scriptKind: 'full',
+            script: '$null # mock script',
+          }
+        }
+
+        return {
+          status: 'noop',
+          wslIp: '172.24.0.2',
+        }
+      })
+
+      const cp = await import('node:child_process')
+      let finishRepair: (() => void) | null = null
+      vi.mocked(cp.execFile).mockImplementation((cmd: any, _args: any, _opts: any, cb: any) => {
+        if (typeof cmd === 'string' && cmd.includes('powershell.exe')) {
+          finishRepair = () => {
+            portReachable = true
+            cb?.(null, '', '')
+          }
+          return { on: vi.fn() } as any
+        }
+
+        cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+        return { on: vi.fn() } as any
+      })
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'wsl2', status: 'started' })
+
+      finishRepair?.()
+
+      await vi.waitFor(() => {
+        expect(vi.mocked(wslModule.persistManagedWslRemoteAccessPorts)).toHaveBeenCalledWith(
+          networkManager.getRemoteAccessPorts(),
+        )
+      })
+
+      await vi.waitFor(async () => {
+        const statusRes = await request(app)
+          .get('/api/network/status')
+          .set('x-auth-token', token)
+
+        expect(statusRes.status).toBe(200)
+        expect(statusRes.body.firewall.configuring).toBe(false)
+        expect(statusRes.body.remoteAccessEnabled).toBe(true)
+        expect(statusRes.body.remoteAccessRequested).toBe(true)
+        expect(statusRes.body.remoteAccessNeedsRepair).toBe(false)
+      })
+
+      const followUpRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(followUpRes.status).toBe(200)
+      expect(followUpRes.body).toEqual({
+        method: 'none',
+        message: 'No configuration changes required',
+      })
     })
 
     it('consumes the WSL2 confirmation token when remote access is disabled before confirmed repair', async () => {
