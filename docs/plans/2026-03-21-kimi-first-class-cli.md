@@ -23,6 +23,7 @@ After this lands:
 - Indexed Kimi sessions show up after server restart because Freshell can discover them from disk, not just from live terminals.
 - Restored Kimi panes reuse their saved `resumeSessionId`, launch `kimi --session <id>` from the original working directory, and reconnect to the same indexed session instead of creating an orphaned terminal.
 - Session-directory `title`, `userMessages`, and `fullText` search works for Kimi by scanning persisted session transcripts.
+- Kimi session-directory rows honor persisted `metadata.json` state where present: pinned titles win over wire-derived fallbacks, archived sessions stay archived, and transcript search only indexes visible user/assistant text instead of `_system_prompt`, `_checkpoint`, `_usage`, or hidden `think` blocks.
 - Claude-only repair/history behavior remains Claude-only. This task does not widen `sessionRepairService`, `session-history-loader`, or `CodingCliSessionManager` support for Kimi.
 
 ## Contracts And Invariants
@@ -30,25 +31,31 @@ After this lands:
 1. A CLI is not "first class" unless both layers exist: manifest launch metadata and a registered `CodingCliProvider`.
 2. Kimi share-dir resolution uses `process.env.KIMI_SHARE_DIR` when present, otherwise `~/.kimi`. Do not invent `KIMI_HOME`.
 3. Kimi resume is `(cwd, sessionId)` sensitive. Freshell must preserve the original launch working directory when resuming `kimi --session <id>`, because upstream session lookup is scoped by work directory.
-4. Indexed Kimi sessions must carry `sourceFile` pointing at the persisted transcript file used for search:
+4. Kimi session IDs are opaque strings. Do not coerce them to UUIDs or reject named sessions; Freshell must resume exactly the ID Kimi created.
+5. Indexed Kimi sessions must carry `sourceFile` pointing at the persisted transcript file used for search:
    - modern layout: `<sessionDir>/context.jsonl`
    - legacy layout: `<sessionsDir>/<sessionId>.jsonl`
-5. Kimi titles must prefer persisted session metadata when available:
+6. Kimi workdir hashing must match upstream exactly: `md5(path)` for local entries, `${kaos}_${md5(path)}` for non-local entries. Do not approximate the sessions directory path.
+7. Kimi titles and archive state must prefer persisted session metadata when available:
    - optional `metadata.json` title when it is present and not `"Untitled"` (Kimi Web writes this file; plain CLI sessions may not have it)
+   - optional `metadata.json` archived flag when it is present
    - otherwise first `TurnBegin` user input from `wire.jsonl`
    - otherwise first visible user message from the context transcript
-6. Kimi remains terminal-mode only in this task. Upstream `--print --output-format stream-json` does not expose the session-identifying event stream Freshell would need for `CodingCliSessionManager`, so `supportsLiveStreaming()` stays `false`.
-7. The generic permission-mode UI must never advertise unsupported Kimi choices. Kimi may only surface `default` and `bypassPermissions`; `bypassPermissions` must launch `--yolo`.
-8. `modeSupportsResume('kimi')` must not become true until the same task that registers the Kimi session provider. Do not create a mid-plan state where built-in Kimi advertises resume support but still lacks provider wiring.
-9. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
-10. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
-11. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
+8. Kimi transcript parsing must flatten both string content and array content blocks into visible text. `_system_prompt`, `_checkpoint`, `_usage`, and `assistant` `think` blocks are internal noise and must not become searchable message content.
+9. Rotated backup and subagent transcript files such as `context_N.jsonl` and `context_sub_N.jsonl` are not top-level sessions. Only `context.jsonl` (or the legacy flat transcript) is authoritative for indexing/search.
+10. Kimi remains terminal-mode only in this task. Upstream `--print --output-format stream-json` does not expose the session-identifying event stream Freshell would need for `CodingCliSessionManager`, so `supportsLiveStreaming()` stays `false`.
+11. The generic permission-mode UI must never advertise unsupported Kimi choices. Kimi may only surface `default` and `bypassPermissions`; `bypassPermissions` must launch `--yolo`.
+12. `modeSupportsResume('kimi')` must not become true until the same task that registers the Kimi session provider. Do not create a mid-plan state where built-in Kimi advertises resume support but still lacks provider wiring.
+13. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
+14. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
+15. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
 
 ## Root Cause Summary
 
 - Kimi currently exists only as a spawnable extension manifest, so it can open a terminal but never enters the session indexer/session manager/provider stack.
 - The manifest does not describe Kimi's permission-mode subset or `--yolo` launch mapping, so Freshell cannot expose accurate settings even though the extension is visible.
 - Kimi session discovery depends on Kimi-owned metadata (`kimi.json`) plus session files. That workdir mapping is not representable in Freshell's current manifest schema, so a handwritten provider is required.
+- Kimi's persisted session contract is richer than a bare `context.jsonl`: titles and archived state may live in `metadata.json`, session IDs are not UUID-only, and real transcripts contain internal/system records plus assistant content arrays that must be normalized before search.
 - The sidebar mostly renders indexed sessions, not raw open terminals. Without a Kimi provider, Kimi terminals disappear from the left panel after restart even if the tabs come back.
 
 ## Strategy Gate
@@ -80,11 +87,11 @@ No user decision is required.
 2. `server/coding-cli/providers/index.ts`
    Single export point for session-aware providers and provider-name lookup used by server bootstrap and invariant tests.
 3. `test/unit/server/coding-cli/kimi-provider.test.ts`
-   Provider contract coverage for share-dir resolution, title precedence, legacy-layout handling, direct listing, and persisted-context parsing.
+   Provider contract coverage for share-dir resolution, title/archived precedence, non-UUID session IDs, legacy-layout handling, direct listing, and persisted-context parsing.
 4. `test/unit/server/coding-cli/provider-registry.test.ts`
    Guardrail that every built-in resume-capable CLI manifest has a registered session provider.
 5. `test/fixtures/coding-cli/kimi/...`
-   Fixture share-dir tree with `kimi.json`, hashed session directories, `context.jsonl`, `wire.jsonl`, optional `metadata.json`, and at least one legacy flat transcript.
+   Fixture share-dir tree with `kimi.json`, hashed session directories, `context.jsonl`, `wire.jsonl`, optional `metadata.json`, rotated backup/subagent context files that must be ignored, and at least one legacy flat transcript.
 
 ### Files to Modify
 
@@ -105,9 +112,11 @@ No user decision is required.
 14. `test/e2e/directory-picker-flow.test.tsx`
 15. `test/unit/server/coding-cli/session-indexer.test.ts`
 16. `test/unit/server/session-directory/service.test.ts`
-17. `test/unit/server/terminal-registry.test.ts`
-18. `test/server/session-association.test.ts`
-19. `docs/index.html`
+17. `test/integration/server/session-directory-router.test.ts`
+18. `test/unit/server/terminal-registry.test.ts`
+19. `test/server/session-association.test.ts`
+20. `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
+21. `docs/index.html`
 
 ### Files Expected To Stay Unchanged
 
@@ -327,6 +336,7 @@ git commit -m "feat: add Kimi launch settings metadata"
 - Modify: `server/coding-cli/session-indexer.ts`
 - Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
 - Modify: `test/unit/server/session-directory/service.test.ts`
+- Modify: `test/integration/server/session-directory-router.test.ts`
 
 - [ ] **Step 1: Add the failing provider, indexer, and search tests**
 
@@ -334,7 +344,7 @@ Add fixture-backed tests that pin the actual Kimi disk contract:
 
 ```ts
 // test/unit/server/coding-cli/kimi-provider.test.ts
-it('lists Kimi sessions from kimi.json workdir metadata and prefers metadata.json titles', async () => {
+it('lists Kimi sessions from kimi.json workdir metadata, preserves named session ids, and prefers metadata.json title/archive state', async () => {
   process.env.KIMI_SHARE_DIR = fixtureShareDir
   const provider = new KimiProvider()
 
@@ -347,7 +357,10 @@ it('lists Kimi sessions from kimi.json workdir metadata and prefers metadata.jso
     projectPath: '/repo/root',
     sourceFile: expect.stringContaining('context.jsonl'),
     title: 'Pinned title from metadata',
+    archived: true,
   }))
+
+  expect(sessions.find((s) => s.sessionId === 'named-kimi-session')?.sessionId).toBe('named-kimi-session')
 })
 
 it('falls back from metadata.json to wire.jsonl title, then to first user message', async () => {
@@ -358,14 +371,26 @@ it('falls back from metadata.json to wire.jsonl title, then to first user messag
 
   expect(sessions.find((s) => s.sessionId === 'wire-title-session')?.title).toBe('Fix the left sidebar refresh bug')
   expect(sessions.find((s) => s.sessionId === 'context-title-session')?.title).toBe('Message-only fallback title')
+  expect(sessions.find((s) => s.sessionId === 'legacy-flat-session')?.sourceFile).toMatch(/legacy-flat-session\.jsonl$/)
 })
 
-it('parses persisted context.jsonl lines and ignores _usage records', () => {
+it('flattens visible transcript content and ignores internal records', () => {
   const provider = new KimiProvider('/tmp/.kimi')
 
   expect(provider.parseEvent('{\"role\":\"user\",\"content\":\"List files\"}')).toEqual([
-    expect.objectContaining({ type: 'message.user' }),
+    expect.objectContaining({
+      type: 'message.user',
+      message: expect.objectContaining({ content: 'List files' }),
+    }),
   ])
+  expect(provider.parseEvent('{\"role\":\"assistant\",\"content\":[{\"type\":\"think\",\"think\":\"hidden\"},{\"type\":\"text\",\"text\":\"Visible answer\"}]}')).toEqual([
+    expect.objectContaining({
+      type: 'message.assistant',
+      message: expect.objectContaining({ content: 'Visible answer' }),
+    }),
+  ])
+  expect(provider.parseEvent('{\"role\":\"_system_prompt\",\"content\":\"hidden\"}')).toEqual([])
+  expect(provider.parseEvent('{\"role\":\"_checkpoint\",\"id\":3}')).toEqual([])
   expect(provider.parseEvent('{\"role\":\"_usage\",\"token_count\":42}')).toEqual([])
   expect(provider.supportsLiveStreaming()).toBe(false)
   expect(provider.supportsSessionResume()).toBe(true)
@@ -374,22 +399,28 @@ it('parses persisted context.jsonl lines and ignores _usage records', () => {
 
 Add a `session-directory/service` test that uses `providers: [kimiProvider]`, a Kimi `sourceFile`, and `tier: 'userMessages'` / `tier: 'fullText'` to prove Kimi becomes searchable once indexed.
 
+Add a `session-directory-router` integration test that mounts `createSessionsRouter()` with `codingCliProviders: [kimiProvider]` and proves `/api/session-directory?query=...&tier=fullText` finds assistant text from a real Kimi transcript fixture. This catches route-level provider wiring and the real `parseEvent()` path together.
+
 Add a `session-indexer` test that uses a direct-provider Kimi session and asserts `getFilePathForSession('kimi-session-1', 'kimi')` returns the transcript path, proving direct providers now populate the same lookup map that file-backed providers use.
 
-Also add one fixture-backed test that a legacy flat transcript (`sessions/<hash>/<sessionId>.jsonl`) is still indexed as a Kimi session.
+Also add fixture-backed tests that:
+
+- a legacy flat transcript (`sessions/<hash>/<sessionId>.jsonl`) is still indexed as a Kimi session
+- rotated backup/subagent files (`context_1.jsonl`, `context_sub_1.jsonl`) are ignored as top-level sessions
 
 - [ ] **Step 2: Run the new tests and confirm they are red**
 
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
+npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts test/integration/server/session-directory-router.test.ts
 ```
 
 Expected:
 
 - `kimi-provider` fails because the provider file does not exist yet.
 - `session-directory/service` fails because no Kimi provider can parse the transcript.
+- `session-directory-router` fails because the route cannot yet search Kimi transcript files through a real provider.
 - `session-indexer` direct-provider file-path test fails because there is no Kimi direct-provider path to index.
 
 - [ ] **Step 3: Implement `KimiProvider` as a direct provider**
@@ -424,17 +455,21 @@ export class KimiProvider implements CodingCliProvider {
 Implementation requirements:
 
 - Resolve the share dir from `KIMI_SHARE_DIR` first, then `~/.kimi`.
-- Read `kimi.json` and reconstruct each workdir's hashed sessions directory the same way upstream does.
+- Read `kimi.json` and reconstruct each workdir's hashed sessions directory the same way upstream does, including the `${kaos}_` prefix for non-local entries.
 - Support both upstream layouts:
   - modern: `<sessionsDir>/<sessionId>/context.jsonl`
   - legacy: `<sessionsDir>/<sessionId>.jsonl`
+- Treat session IDs as opaque strings throughout; do not require UUIDs.
 - Use the real transcript path as `sourceFile`.
 - Derive the session title in this order:
   - optional `metadata.json` title if present and not `"Untitled"`
   - first `TurnBegin` user input from `wire.jsonl`
   - first visible user message from the transcript
+- Copy `metadata.json` archived state onto `CodingCliSession.archived` when present.
 - Derive `lastActivityAt` from the transcript file's `mtime`, matching Kimi's own session indexing semantics. If you also expose `createdAt`, derive it from the earliest wire-record timestamp only when that is straightforward and clearly correct; otherwise leave it undefined.
-- Ignore `_usage` records and empty/internal messages when computing titles and `parseEvent()` results.
+- Ignore `_system_prompt`, `_checkpoint`, `_usage`, empty/internal messages, and hidden `think` blocks when computing titles and `parseEvent()` results.
+- Flatten both string and array-form `content` into visible text so `fullText` search works on real Kimi assistant replies.
+- Ignore rotated backup/subagent transcripts (`context_N.jsonl`, `context_sub_N.jsonl`) when enumerating top-level sessions.
 - Reuse existing git helpers for `projectPath`, branch, and dirty-state enrichment.
 - Do **not** attempt Kimi live-stream session-manager support in this provider.
 - Update `server/coding-cli/session-indexer.ts` so `updateDirectCacheEntry()` mirrors file-backed behavior for sessions that carry `sourceFile`: remove any previous mapping for the same cache entry, set `sessionKeyToFilePath` for the new `(provider, sessionId)`, and let `deleteCacheEntry()` clean it up on removal.
@@ -444,7 +479,7 @@ Implementation requirements:
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
+npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts test/integration/server/session-directory-router.test.ts
 ```
 
 Expected: all PASS.
@@ -460,7 +495,7 @@ Refactor for clarity and resilience:
 Then re-run the task suite:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
+npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts test/integration/server/session-directory-router.test.ts
 ```
 
 Expected: all PASS.
@@ -468,7 +503,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/providers/kimi.ts server/coding-cli/session-indexer.ts test/unit/server/coding-cli/kimi-provider.test.ts test/fixtures/coding-cli/kimi test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts
+git add server/coding-cli/providers/kimi.ts server/coding-cli/session-indexer.ts test/unit/server/coding-cli/kimi-provider.test.ts test/fixtures/coding-cli/kimi test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/service.test.ts test/integration/server/session-directory-router.test.ts
 git commit -m "feat: add Kimi session provider"
 ```
 
@@ -484,6 +519,7 @@ git commit -m "feat: add Kimi session provider"
 - Modify: `test/unit/server/terminal-registry.test.ts`
 - Modify: `test/server/session-association.test.ts`
 - Modify: `test/e2e/directory-picker-flow.test.tsx`
+- Modify: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 - Modify: `docs/index.html`
 
 - [ ] **Step 1: Add the failing runtime, association, and guardrail tests**
@@ -548,12 +584,20 @@ it('registers every built-in CLI manifest that advertises resumeArgs as a sessio
 
 Extend `test/e2e/directory-picker-flow.test.tsx` with a Kimi scenario that proves the user can pick Kimi, choose a directory, and persist that directory under `codingCli.providers.kimi.cwd`. If that scenario is already green once Task 1 lands, keep it as the required end-to-end proof rather than forcing an unnecessary code change.
 
+Extend `test/e2e/open-tab-session-sidebar-visibility.test.tsx` with a restored-Kimi bootstrap scenario using the existing HTTP-owned sidebar harness:
+
+- restore a Kimi tab/pane with `resumeSessionId`
+- return an indexed Kimi session row from the bootstrapped sidebar snapshot
+- assert the indexed Kimi title is visible exactly once after bootstrap, under the correct project, instead of relying on raw fallback tab state alone
+
+This is the user-visible regression proof for the original "left hand panel after server reset" complaint.
+
 - [ ] **Step 2: Run the new tests and confirm the red failures**
 
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx
+npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected:
@@ -561,13 +605,14 @@ Expected:
 - `terminal-registry` still says Kimi does not support resume and does not emit `--session`.
 - `session-association` fails because Kimi is still outside the runtime provider registry.
 - `provider-registry` fails because there is no centralized provider registry, and Kimi is not yet included.
+- `open-tab-session-sidebar-visibility` fails because the restored Kimi session cannot yet rely on indexed sidebar data after bootstrap.
 
 - [ ] **Step 3: Wire Kimi through runtime registration and restore**
 
 Implement the wiring in one steady-state pass:
 
 - Create `server/coding-cli/providers/index.ts` exporting `codingCliProviders` and `codingCliProvidersByName`.
-- Update `server/index.ts` to import that registry instead of hand-building `[claudeProvider, codexProvider, opencodeProvider]`.
+- Update `server/index.ts` to import that registry instead of hand-building `[claudeProvider, codexProvider, opencodeProvider]`. After this change, there should be exactly one built-in provider list in the server codepath.
 - Add `resumeArgs` to `extensions/kimi/freshell.json` now:
 
 ```json
@@ -597,7 +642,7 @@ kimi: {
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx
+npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: all PASS.
@@ -628,6 +673,6 @@ Expected:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/providers/index.ts extensions/kimi/freshell.json server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx docs/index.html
+git add server/coding-cli/providers/index.ts extensions/kimi/freshell.json server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx docs/index.html
 git commit -m "feat: wire Kimi session registration and resume"
 ```
