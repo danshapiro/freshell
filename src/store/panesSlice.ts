@@ -8,6 +8,7 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 
 const log = createLogger('PanesSlice')
@@ -54,7 +55,8 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
-    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, input.provider)
+    const codingCliProvider = getAgentChatProviderConfig(input.provider)?.codingCliProvider
+    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, codingCliProvider)
     return {
       kind: 'agent-chat',
       provider: input.provider,

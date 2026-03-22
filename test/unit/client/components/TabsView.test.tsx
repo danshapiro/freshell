@@ -201,4 +201,50 @@ describe('TabsView', () => {
     expect(layout?.content?.resumeSessionId).toBe('named-claude-resume')
     expect(layout?.content?.sessionRef).toBeUndefined()
   })
+
+  it('preserves resumeSessionId for same-device exact copies before local server identity is ready', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+
+    store.dispatch(addTab({ id: 'local-codex', title: 'local codex', mode: 'codex', status: 'running' }))
+    store.dispatch(initLayout({
+      tabId: 'local-codex',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        resumeSessionId: 'codex-session-local',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-local',
+          serverInstanceId: 'srv-local',
+        },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const localCard = screen.getByText(/: local codex$/).closest('article')
+    expect(localCard).toBeTruthy()
+    fireEvent.click(within(localCard as HTMLElement).getByText('Open copy'))
+
+    const copiedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'local-codex')
+    expect(copiedTab?.title).toBe('local codex')
+    const copiedLayout = copiedTab ? (store.getState().panes.layouts[copiedTab.id] as any) : undefined
+    expect(copiedLayout?.content?.resumeSessionId).toBe('codex-session-local')
+    expect(copiedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-local',
+      serverInstanceId: 'srv-local',
+    })
+  })
 })

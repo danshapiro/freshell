@@ -56,10 +56,15 @@ function resolveSessionRef(options: {
 function sanitizePaneSnapshot(
   record: RegistryTabRecord,
   snapshot: RegistryPaneSnapshot,
-  localServerInstanceId?: string,
+  options: {
+    localDeviceId?: string
+    localServerInstanceId?: string
+  } = {},
 ): PaneContentInput {
   const payload = snapshot.payload || {}
-  const sameServer = !!localServerInstanceId && record.serverInstanceId === localServerInstanceId
+  const sameDevice = !!options.localDeviceId && record.deviceId === options.localDeviceId
+  const sameServer = !!options.localServerInstanceId && record.serverInstanceId === options.localServerInstanceId
+  const keepMirroredResumeSessionId = sameServer || (!options.localServerInstanceId && sameDevice)
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
     const resumeSessionId = payload.resumeSessionId as string | undefined
@@ -73,7 +78,7 @@ function sanitizePaneSnapshot(
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      resumeSessionId: keepMirroredResumeSessionId ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
     }
@@ -106,7 +111,7 @@ function sanitizePaneSnapshot(
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      resumeSessionId: keepMirroredResumeSessionId ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
@@ -338,7 +343,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     const paneSnapshots = record.panes || []
     const firstPane = paneSnapshots[0]
     const firstContent = firstPane
-      ? sanitizePaneSnapshot(record, firstPane, localServerInstanceId)
+      ? sanitizePaneSnapshot(record, firstPane, {
+        localDeviceId: deviceId,
+        localServerInstanceId,
+      })
       : { kind: 'terminal', mode: 'shell' } as const
     dispatch(addTab({
       id: tabId,
@@ -353,7 +361,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     for (const pane of paneSnapshots.slice(1)) {
       dispatch(addPane({
         tabId,
-        newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+        newContent: sanitizePaneSnapshot(record, pane, {
+          localDeviceId: deviceId,
+          localServerInstanceId,
+        }),
       }))
     }
     onOpenTab?.()
@@ -369,7 +380,10 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     }))
     dispatch(initLayout({
       tabId,
-      content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+      content: sanitizePaneSnapshot(record, pane, {
+        localDeviceId: deviceId,
+        localServerInstanceId,
+      }),
     }))
     onOpenTab?.()
   }

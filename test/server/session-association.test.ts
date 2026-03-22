@@ -815,7 +815,18 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     const compatibility = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
     return (projects: { projectPath: string; sessions: CodingCliSession[] }[]) => {
-      const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects)
+      const pendingNamedClaudeResumeByCwd = new Map<string, boolean>()
+      const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects, {
+        includeClaudeSession: (session) => {
+          if (session.provider !== 'claude' || !session.cwd) return false
+          const cached = pendingNamedClaudeResumeByCwd.get(session.cwd)
+          if (cached !== undefined) return cached
+          const hasPendingNamedResume = registry.findUnassociatedTerminals('claude', session.cwd)
+            .some((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+          pendingNamedClaudeResumeByCwd.set(session.cwd, hasPendingNamedResume)
+          return hasPendingNamedResume
+        },
+      })
       for (const session of discovered.collectNewOrAdvanced(codexProjects)) {
         const result = discovered.associateSingleSession(session)
         if (!result.associated || !result.terminalId) continue

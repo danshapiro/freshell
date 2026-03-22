@@ -513,7 +513,19 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
-    const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects)
+    const pendingNamedClaudeResumeByCwd = new Map<string, boolean>()
+    const shouldIncludeClaudeUpdateSession = (session: CodingCliSession): boolean => {
+      if (session.provider !== 'claude' || !session.cwd) return false
+      const cached = pendingNamedClaudeResumeByCwd.get(session.cwd)
+      if (cached !== undefined) return cached
+      const hasPendingNamedResume = registry.findUnassociatedTerminals('claude', session.cwd)
+        .some((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+      pendingNamedClaudeResumeByCwd.set(session.cwd, hasPendingNamedResume)
+      return hasPendingNamedResume
+    }
+    const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects, {
+      includeClaudeSession: shouldIncludeClaudeUpdateSession,
+    })
     for (const session of discoveredSessionAssociation.collectNewOrAdvanced(codexProjects)) {
       const result = discoveredSessionAssociation.associateSingleSession(session)
       if (!result.associated || !result.terminalId) continue

@@ -75,6 +75,10 @@ export class SessionAssociationCoordinator {
     if (!session.cwd) return false
     if (session.isSubagent) return false
     if (session.isNonInteractive) return false
+    if (session.provider === 'claude') {
+      return this.registry.findUnassociatedTerminals(session.provider, session.cwd)
+        .some((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+    }
     return true
   }
 

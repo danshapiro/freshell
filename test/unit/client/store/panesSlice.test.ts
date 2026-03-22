@@ -332,6 +332,36 @@ describe('panesSlice', () => {
       }
     })
 
+    it('preserves exact Claude sessionRef values for agent-chat panes backed by Claude', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: VALID_CLAUDE_SESSION_ID,
+              serverInstanceId: 'srv-local',
+            },
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('agent-chat')
+      if (leaf.content.kind === 'agent-chat') {
+        expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+        expect(leaf.content.sessionRef).toEqual({
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+          serverInstanceId: 'srv-local',
+        })
+      }
+    })
+
     it('does not assign resumeSessionId for shell panes', () => {
       const state = panesReducer(
         initialState,

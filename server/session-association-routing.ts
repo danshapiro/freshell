@@ -1,8 +1,15 @@
-import type { ProjectGroup } from './coding-cli/types.js'
+import type { CodingCliSession, ProjectGroup } from './coding-cli/types.js'
 
-const COMPATIBILITY_UPDATE_PROVIDERS = new Set(['claude', 'opencode'])
+const COMPATIBILITY_UPDATE_PROVIDERS = new Set(['opencode'])
 
-export function splitAssociationProjectsForUpdate(projects: ProjectGroup[]): {
+type SplitAssociationProjectsForUpdateOptions = {
+  includeClaudeSession?: (session: CodingCliSession) => boolean
+}
+
+export function splitAssociationProjectsForUpdate(
+  projects: ProjectGroup[],
+  options: SplitAssociationProjectsForUpdateOptions = {},
+): {
   codexProjects: ProjectGroup[]
   compatibilityProjects: ProjectGroup[]
 } {
@@ -13,7 +20,11 @@ export function splitAssociationProjectsForUpdate(projects: ProjectGroup[]): {
     })),
     compatibilityProjects: projects.map((project) => ({
       ...project,
-      sessions: project.sessions.filter((session) => COMPATIBILITY_UPDATE_PROVIDERS.has(session.provider)),
+      sessions: project.sessions.filter((session) => {
+        if (COMPATIBILITY_UPDATE_PROVIDERS.has(session.provider)) return true
+        if (session.provider !== 'claude') return false
+        return options.includeClaudeSession?.(session) ?? false
+      }),
     })),
   }
 }

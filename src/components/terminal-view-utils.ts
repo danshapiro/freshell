@@ -23,6 +23,12 @@ export function getResumeTarget(input: {
   const exactSessionRef = sanitizeExactSessionRef(input.sessionRef, input.mode)
   if (!input.restore) {
     if (rawExactSessionRef) {
+      if (!input.localServerInstanceId) {
+        return {
+          kind: 'send',
+          resumeSessionId: input.mirroredResumeSessionId,
+        }
+      }
       const localExactSessionId = exactSessionRef && input.localServerInstanceId
         && exactSessionRef.serverInstanceId === input.localServerInstanceId
         ? exactSessionRef.sessionId

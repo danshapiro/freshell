@@ -209,6 +209,71 @@ describe('TerminalView resumeSessionId', () => {
     expect(createMessage?.resumeSessionId).toBeUndefined()
   })
 
+  it('uses mirrored resumeSessionId for an explicit local exact pane before server identity is ready', async () => {
+    const tabId = 'tab-local-pending-ready'
+    const paneId = 'pane-local-pending-ready'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-local-pending-ready',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+      resumeSessionId: 'codex-session-local',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-local',
+        serverInstanceId: 'srv-local',
+      },
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-local-pending-ready',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: undefined },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-local-pending-ready',
+        resumeSessionId: 'codex-session-local',
+      }))
+    })
+  })
+
   it('updates pane resumeSessionId from effectiveResumeSessionId', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'
