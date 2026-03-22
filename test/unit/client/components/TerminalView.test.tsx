@@ -4,7 +4,7 @@ import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import paneRuntimeTitleReducer, { setPaneRuntimeTitleByTerminalId } from '@/store/paneRuntimeTitleSlice'
 import { syncStableTitleByTerminalId } from '@/store/titleSync'
-import { getTabDisplayTitle, getTabDurableDisplayTitle } from '@/lib/tab-title'
+import { getTabDisplayTitle } from '@/lib/tab-title'
 import { normalizeRuntimeTitle, shouldDecorateExitTitle, type DurableTitleSource } from '@/lib/title-source'
 
 function createStore(options?: {
@@ -75,17 +75,10 @@ describe('TerminalView exit title behavior', () => {
     store: ReturnType<typeof createStore>,
     exitCode: number,
   ) {
-    const state = store.getState()
-    const tab = state.tabs.tabs[0]
+    const tab = store.getState().tabs.tabs[0]
     const updates: { status: 'exited'; title?: string } = { status: 'exited' }
     if (shouldDecorateExitTitle(tab.titleSource)) {
-      const exitBaseTitle = getTabDurableDisplayTitle(
-        tab,
-        state.panes.layouts['tab-1'],
-        state.panes.paneTitles['tab-1'],
-        state.panes.paneTitleSources?.['tab-1'],
-      )
-      updates.title = `${exitBaseTitle} (exit ${exitCode})`
+      updates.title = `${tab.title} (exit ${exitCode})`
     }
     store.dispatch(updateTab({ id: tab.id, updates }))
   }
@@ -100,23 +93,6 @@ describe('TerminalView exit title behavior', () => {
       status: 'exited',
     })
     expect(getDisplayTitle(store)).toBe('project (exit 0)')
-  })
-
-  it('decorates the resolved derived display title instead of the stored fallback tab title', () => {
-    const store = createStore({
-      title: 'Tab 1',
-      titleSource: 'derived',
-    })
-
-    expect(getDisplayTitle(store)).toBe('project')
-
-    applyExitTitle(store, 1)
-
-    expect(store.getState().tabs.tabs[0]).toMatchObject({
-      title: 'project (exit 1)',
-      status: 'exited',
-    })
-    expect(getDisplayTitle(store)).toBe('project (exit 1)')
   })
 
   it('keeps a stable durable title plain on exit', () => {

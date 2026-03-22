@@ -3400,50 +3400,6 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-2']['pane-b']).toBe('Shared Title')
     })
 
-    it('updates every matching pane inside the same split tab', () => {
-      const state: PanesState = {
-        layouts: {
-          'tab-1': {
-            type: 'split',
-            id: 'split-root',
-            direction: 'horizontal',
-            sizes: [50, 50],
-            children: [
-              {
-                type: 'leaf',
-                id: 'pane-a',
-                content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-1', status: 'running', mode: 'shell' },
-              },
-              {
-                type: 'leaf',
-                id: 'pane-b',
-                content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-2', status: 'running', mode: 'shell' },
-              },
-            ],
-          },
-        },
-        activePane: { 'tab-1': 'pane-a' },
-        paneTitles: {},
-        paneTitleSources: {},
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-      }
-
-      const result = panesReducer(
-        state,
-        updatePaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Shared Title', source: 'stable' }),
-      )
-
-      expect(result.paneTitles['tab-1']['pane-a']).toBe('Shared Title')
-      expect(result.paneTitles['tab-1']['pane-b']).toBe('Shared Title')
-      expect(result.paneTitleSources?.['tab-1']).toEqual({
-        'pane-a': 'stable',
-        'pane-b': 'stable',
-      })
-    })
-
     it('skips non-terminal panes', () => {
       const leaf: PaneNode = {
         type: 'leaf',

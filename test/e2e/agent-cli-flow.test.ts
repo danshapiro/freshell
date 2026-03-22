@@ -422,7 +422,7 @@ describe('cli e2e flow', () => {
     }
   })
 
-  it('lists pane titles and preserves explicit tab.create titles on the initial pane', async () => {
+  it('lists and resolves derived pane titles without an explicit rename', async () => {
     const server = await startTestServerWithRealLayoutStore()
     try {
       const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
@@ -449,7 +449,7 @@ describe('cli e2e flow', () => {
         '--json',
       ])
       expect(listed.data.panes).toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: firstPaneId, title: 'Workspace' }),
+        expect.objectContaining({ id: firstPaneId, title: 'Codex CLI' }),
         expect.objectContaining({ id: split.data.paneId, title: 'example.txt' }),
       ]))
 
@@ -462,7 +462,7 @@ describe('cli e2e flow', () => {
       expect(listedRows.every((row) => row.length === 4)).toBe(true)
 
       const listedWithTitles = await runCli(server.url, ['list-panes', '--titles'])
-      expect(listedWithTitles.stdout).toContain('Workspace')
+      expect(listedWithTitles.stdout).toContain('Codex CLI')
       expect(listedWithTitles.stdout).toContain('example.txt')
 
       await runCli(server.url, ['select-pane', '-t', 'example.txt'])

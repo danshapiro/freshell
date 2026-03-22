@@ -310,19 +310,18 @@ function loadInitialPanesState(): PanesState {
 const initialState: PanesState = loadInitialPanesState()
 
 /**
- * Recursively walk a pane tree and collect every leaf pane ID whose terminal
- * content has the given terminalId.
+ * Recursively walk a pane tree to find the leaf pane ID whose terminal
+ * content has the given terminalId. Returns undefined if no match.
  */
-function findPaneIdsByTerminalId(node: PaneNode, terminalId: string, matches: string[] = []): string[] {
+function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
   if (node.type === 'leaf') {
     if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
-      matches.push(node.id)
+      return node.id
     }
-    return matches
+    return undefined
   }
-  findPaneIdsByTerminalId(node.children[0], terminalId, matches)
-  findPaneIdsByTerminalId(node.children[1], terminalId, matches)
-  return matches
+  return findPaneIdByTerminalId(node.children[0], terminalId)
+    ?? findPaneIdByTerminalId(node.children[1], terminalId)
 }
 
 // Helper to find and replace a node (leaf or split) in the tree
@@ -1474,8 +1473,8 @@ export const panesSlice = createSlice({
     ) => {
       const { terminalId, title, setByUser, source } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
-        const paneIds = findPaneIdsByTerminalId(state.layouts[tabId], terminalId)
-        for (const paneId of paneIds) {
+        const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
+        if (paneId) {
           const currentContent = findLeaf(state.layouts[tabId], paneId)?.content
           const nextSource = source ?? (setByUser === false ? 'stable' : 'user')
           setPaneDurableTitleWithSource(state, {
