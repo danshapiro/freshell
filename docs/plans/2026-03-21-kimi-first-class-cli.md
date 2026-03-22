@@ -49,6 +49,8 @@ After this lands:
 13. Direct-provider invalidation must trigger when Kimi workdir metadata or any indexed Kimi transcript/title source changes.
 14. Direct-provider sessions with `sourceFile` must populate `CodingCliSessionIndexer`'s `sessionKeyToFilePath` lookup, or Kimi's transcript-backed lookup paths will stay broken even after the provider exists.
 15. This task does not change `server/session-history-loader.ts`, `server/session-scanner/service.ts`, or `server/coding-cli/session-manager.ts`.
+16. The fallback command specs in `server/terminal-registry.ts` are only a compatibility seed for tests and pre-bootstrap instances. Kimi-specific launch behavior must be proven against the manifest-compiled command specs that server startup actually registers.
+17. "First class" includes live index refresh, not only cold-start discovery. Updating `metadata.json`, `wire.jsonl`, or the authoritative transcript path must trigger a direct-provider refresh quickly enough for sidebar visibility and association, rather than relying on the periodic full scan.
 
 ## Root Cause Summary
 
@@ -86,11 +88,15 @@ No user decision is required.
    Kimi direct provider: share-dir resolution, workdir-hash lookup, session enumeration, metadata synthesis, persisted-context parsing, and title/activity derivation.
 2. `server/coding-cli/providers/index.ts`
    Single export point for session-aware providers and provider-name lookup used by server bootstrap and invariant tests.
-3. `test/unit/server/coding-cli/kimi-provider.test.ts`
+3. `server/coding-cli/command-specs.ts`
+   Shared manifest-to-runtime compiler for CLI command specs so startup wiring is unit-testable instead of living inline in `server/index.ts`.
+4. `test/unit/server/coding-cli/command-specs.test.ts`
+   Guardrail for manifest-compiled runtime command specs, including Kimi's value-specific permission args and later resume args.
+5. `test/unit/server/coding-cli/kimi-provider.test.ts`
    Provider contract coverage for share-dir resolution, title/archived precedence, non-UUID session IDs, legacy-layout handling, direct listing, and persisted-context parsing.
-4. `test/unit/server/coding-cli/provider-registry.test.ts`
+6. `test/unit/server/coding-cli/provider-registry.test.ts`
    Guardrail that every built-in resume-capable CLI manifest has a registered session provider.
-5. `test/fixtures/coding-cli/kimi/...`
+7. `test/fixtures/coding-cli/kimi/...`
    Fixture share-dir tree with `kimi.json`, hashed session directories, `context.jsonl`, `wire.jsonl`, optional `metadata.json`, rotated backup/subagent context files that must be ignored, and at least one legacy flat transcript.
 
 ### Files to Modify
@@ -130,6 +136,8 @@ Those paths already consume provider/indexed-session data generically or are exp
 ## Task 1: Land Kimi Launch Settings And Accurate Permission-Mode UI
 
 **Files:**
+- Create: `server/coding-cli/command-specs.ts`
+- Create: `test/unit/server/coding-cli/command-specs.test.ts`
 - Modify: `extensions/kimi/freshell.json`
 - Modify: `server/extension-manifest.ts`
 - Modify: `shared/extension-types.ts`
@@ -139,12 +147,13 @@ Those paths already consume provider/indexed-session data generically or are exp
 - Modify: `server/terminal-registry.ts`
 - Modify: `server/spawn-spec.ts`
 - Test: `test/unit/server/extension-manifest.test.ts`
+- Test: `test/unit/server/coding-cli/command-specs.test.ts`
 - Test: `test/unit/server/extension-manager.test.ts`
 - Test: `test/unit/client/store/managed-items.test.ts`
 - Test: `test/unit/client/components/ExtensionsView.test.tsx`
 - Test: `test/unit/server/terminal-registry.test.ts`
 
-- [ ] **Step 1: Add the failing manifest, client-registry, UI, and launch-arg tests**
+- [ ] **Step 1: Add the failing manifest, runtime-compiler, client-registry, UI, and launch-arg tests**
 
 Add red coverage for the missing launch contract:
 
@@ -164,6 +173,31 @@ it('accepts value-specific permission args for CLI manifests', () => {
     },
   })
   expect(result.success).toBe(true)
+})
+```
+
+```ts
+// test/unit/server/coding-cli/command-specs.test.ts
+it('compiles Kimi value-specific permission args into the runtime command map used by server startup', () => {
+  const specs = buildCliCommandSpecsFromEntries([
+    makeCliEntry({
+      name: 'kimi',
+      label: 'Kimi',
+      cli: {
+        command: 'kimi',
+        modelArgs: ['--model', '{{model}}'],
+        permissionModeArgsByValue: {
+          bypassPermissions: ['--yolo'],
+        },
+        supportsPermissionMode: true,
+        supportsModel: true,
+      },
+    }),
+  ])
+
+  const spec = specs.get('kimi')
+  expect(spec?.modelArgs?.('moonshot-k2')).toEqual(['--model', 'moonshot-k2'])
+  expect(spec?.permissionModeArgsByValue?.bypassPermissions).toEqual(['--yolo'])
 })
 ```
 
@@ -241,12 +275,13 @@ Add `ExtensionsView` coverage that expanding the Kimi card shows model, permissi
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
+npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
 ```
 
 Expected:
 
 - `extension-manifest` fails because `permissionModeArgsByValue` is unknown.
+- `command-specs` fails because server startup still has no tested path that compiles `permissionModeArgsByValue` into runtime command specs.
 - `extension-manager` fails because the client registry does not expose `supportedPermissionModes`.
 - `managed-items` and `ExtensionsView` fail because Kimi still shows only the default permission list or only the starting-directory field.
 - `terminal-registry` fails because Kimi does not emit `--model` / `--yolo`.
@@ -282,7 +317,9 @@ Make these concrete changes:
 Implementation rules:
 
 - `server/extension-manifest.ts`: add `permissionModeArgsByValue?: Partial<Record<ClaudePermissionMode, string[]>>` and validate its keys against the canonical permission-mode set.
-- `server/index.ts`, `server/terminal-registry.ts`, and `server/spawn-spec.ts`: compile and honor `permissionModeArgsByValue`, preferring it over generic `permissionModeArgs` when both exist.
+- `server/coding-cli/command-specs.ts`: move the manifest-to-`CodingCliCommandSpec` compiler out of `server/index.ts`, including `compileArgTemplate()` and `permissionModeArgsByValue` support, so startup wiring is unit-testable.
+- `server/index.ts`: stop compiling CLI command specs inline; instead call the helper from `server/coding-cli/command-specs.ts` and register its result.
+- `server/terminal-registry.ts` and `server/spawn-spec.ts`: honor `permissionModeArgsByValue`, preferring it over generic `permissionModeArgs` when both exist.
 - `server/extension-manager.ts`: derive `supportedPermissionModes` for the client registry:
   - if a CLI has `permissionModeArgsByValue`, use `['default', ...mapped values in canonical order]`
   - else if it has `permissionModeValues` but no generic arg template, use `['default', ...mapped values in canonical order]`
@@ -299,7 +336,7 @@ Do **not** add `resumeArgs` yet in this task.
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
+npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
 ```
 
 Expected: all PASS.
@@ -315,7 +352,7 @@ Refactor for clarity only:
 Then re-run the task suite:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
+npm run test:vitest -- --run test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
 ```
 
 Expected: all PASS.
@@ -323,7 +360,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add extensions/kimi/freshell.json server/extension-manifest.ts shared/extension-types.ts server/extension-manager.ts src/store/managed-items.ts server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/extension-manifest.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
+git add extensions/kimi/freshell.json server/coding-cli/command-specs.ts server/extension-manifest.ts shared/extension-types.ts server/extension-manager.ts src/store/managed-items.ts server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/extension-manifest.test.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/extension-manager.test.ts test/unit/client/store/managed-items.test.ts test/unit/client/components/ExtensionsView.test.tsx test/unit/server/terminal-registry.test.ts
 git commit -m "feat: add Kimi launch settings metadata"
 ```
 
@@ -403,6 +440,11 @@ Add a `session-directory-router` integration test that mounts `createSessionsRou
 
 Add a `session-indexer` test that uses a direct-provider Kimi session and asserts `getFilePathForSession('kimi-session-1', 'kimi')` returns the transcript path, proving direct providers now populate the same lookup map that file-backed providers use.
 
+Add watcher-backed `session-indexer` coverage that starts a real `CodingCliSessionIndexer` with `KimiProvider` and proves direct-provider refresh happens on file changes that matter to live sidebar state:
+
+- changing `metadata.json` updates the indexed title / archived flag without a manual full scan
+- changing `wire.jsonl` upgrades a context-fallback title to the first `TurnBegin` title
+
 Also add fixture-backed tests that:
 
 - a legacy flat transcript (`sessions/<hash>/<sessionId>.jsonl`) is still indexed as a Kimi session
@@ -443,7 +485,7 @@ export class KimiProvider implements CodingCliProvider {
   extractSessionId(filePath: string, meta?: ParsedSessionMeta): string { /* session dir name or legacy file stem */ }
 
   getCommand(): string { return process.env.KIMI_CMD || 'kimi' }
-  getStreamArgs(): string[] { return [] }
+  getStreamArgs(_options: SpawnOptions): string[] { return [] }
   getResumeArgs(sessionId: string): string[] { return ['--session', sessionId] }
   parseEvent(line: string): NormalizedEvent[] { /* parse persisted Message JSON only */ }
 
@@ -456,6 +498,7 @@ Implementation requirements:
 
 - Resolve the share dir from `KIMI_SHARE_DIR` first, then `~/.kimi`.
 - Read `kimi.json` and reconstruct each workdir's hashed sessions directory the same way upstream does, including the `${kaos}_` prefix for non-local entries.
+- Watch the real Kimi title/archive inputs, not only the transcript: `getSessionGlob()` must cover `kimi.json`, `wire.jsonl`, `metadata.json`, modern `context.jsonl`, and legacy flat `*.jsonl` files so live direct-provider refresh works before the periodic full scan.
 - Support both upstream layouts:
   - modern: `<sessionsDir>/<sessionId>/context.jsonl`
   - legacy: `<sessionsDir>/<sessionId>.jsonl`
@@ -463,8 +506,9 @@ Implementation requirements:
 - Use the real transcript path as `sourceFile`.
 - Derive the session title in this order:
   - optional `metadata.json` title if present and not `"Untitled"`
-  - first `TurnBegin` user input from `wire.jsonl`
+  - first `TurnBegin` user input from `wire.jsonl` (skip the wire metadata header line)
   - first visible user message from the transcript
+- Use existing title helpers for wire/context fallbacks so Kimi titles are truncated consistently with the other providers instead of dumping whole prompts into the sidebar.
 - Copy `metadata.json` archived state onto `CodingCliSession.archived` when present.
 - Derive `lastActivityAt` from the transcript file's `mtime`, matching Kimi's own session indexing semantics. If you also expose `createdAt`, derive it from the earliest wire-record timestamp only when that is straightforward and clearly correct; otherwise leave it undefined.
 - Ignore `_system_prompt`, `_checkpoint`, `_usage`, empty/internal messages, and hidden `think` blocks when computing titles and `parseEvent()` results.
@@ -516,6 +560,7 @@ git commit -m "feat: add Kimi session provider"
 - Modify: `server/index.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `server/spawn-spec.ts`
+- Modify: `test/unit/server/coding-cli/command-specs.test.ts`
 - Modify: `test/unit/server/terminal-registry.test.ts`
 - Modify: `test/server/session-association.test.ts`
 - Modify: `test/e2e/directory-picker-flow.test.tsx`
@@ -567,6 +612,30 @@ it('associates a kimi terminal from onUpdate when the indexed kimi session appea
 ```
 
 ```ts
+// test/unit/server/coding-cli/command-specs.test.ts
+it('compiles Kimi resumeArgs from the manifest into the runtime command map', () => {
+  const specs = buildCliCommandSpecsFromEntries([
+    makeCliEntry({
+      name: 'kimi',
+      label: 'Kimi',
+      cli: {
+        command: 'kimi',
+        resumeArgs: ['--session', '{{sessionId}}'],
+        modelArgs: ['--model', '{{model}}'],
+        permissionModeArgsByValue: {
+          bypassPermissions: ['--yolo'],
+        },
+        supportsPermissionMode: true,
+        supportsModel: true,
+      },
+    }),
+  ])
+
+  expect(specs.get('kimi')?.resumeArgs?.('kimi-session-1')).toEqual(['--session', 'kimi-session-1'])
+})
+```
+
+```ts
 // test/unit/server/coding-cli/provider-registry.test.ts
 it('registers every built-in CLI manifest that advertises resumeArgs as a session provider', () => {
   const manager = new ExtensionManager()
@@ -597,11 +666,12 @@ This is the user-visible regression proof for the original "left hand panel afte
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:vitest -- --run test/unit/server/coding-cli/command-specs.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected:
 
+- `command-specs` fails because the manifest-compiled Kimi runtime spec still drops `resumeArgs`.
 - `terminal-registry` still says Kimi does not support resume and does not emit `--session`.
 - `session-association` fails because Kimi is still outside the runtime provider registry.
 - `provider-registry` fails because there is no centralized provider registry, and Kimi is not yet included.
@@ -619,7 +689,8 @@ Implement the wiring in one steady-state pass:
 "resumeArgs": ["--session", "{{sessionId}}"]
 ```
 
-- Keep the existing manifest compiler path in `server/index.ts`, but make sure the compiled Kimi spec now includes `resumeArgs`.
+- Keep the manifest-driven registration path in `server/index.ts`, but make sure `server/coding-cli/command-specs.ts` now compiles Kimi `resumeArgs`.
+- Extend the `server/coding-cli/command-specs.ts` test coverage so manifest-compiled runtime specs, not fallback specs alone, prove Kimi resume support.
 - Update the Kimi fallback specs in `server/terminal-registry.ts` and `server/spawn-spec.ts`:
 
 ```ts
@@ -642,7 +713,7 @@ kimi: {
 Run:
 
 ```bash
-npm run test:vitest -- --run test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:vitest -- --run test/unit/server/coding-cli/command-specs.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: all PASS.
@@ -673,6 +744,6 @@ Expected:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/providers/index.ts extensions/kimi/freshell.json server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx docs/index.html
+git add server/coding-cli/providers/index.ts extensions/kimi/freshell.json server/index.ts server/terminal-registry.ts server/spawn-spec.ts test/unit/server/coding-cli/command-specs.test.ts test/unit/server/terminal-registry.test.ts test/server/session-association.test.ts test/unit/server/coding-cli/provider-registry.test.ts test/e2e/directory-picker-flow.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx docs/index.html
 git commit -m "feat: wire Kimi session registration and resume"
 ```
