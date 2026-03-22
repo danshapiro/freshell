@@ -9,11 +9,13 @@ import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { setRegistry } from './extensionsSlice'
 import {
   inferLegacyPaneTitleSource,
   shouldReplaceDurableTitleSource,
   type DurableTitleSource,
 } from '@/lib/title-source'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 
 const log = createLogger('PanesSlice')
@@ -133,17 +135,52 @@ function collectPaneTitleSourcesForLayout(
   paneTitles: Record<string, string> | undefined,
   paneTitleSources: Record<string, DurableTitleSource> | undefined,
   paneTitleSetByUser: Record<string, boolean> | undefined,
+  extensions?: ClientExtensionEntry[],
 ): Record<string, DurableTitleSource> {
   const nextSources: Record<string, DurableTitleSource> = {}
   for (const leaf of collectLeaves(layout)) {
     nextSources[leaf.id] = paneTitleSources?.[leaf.id]
       ?? inferLegacyPaneTitleSource({
         storedTitle: paneTitles?.[leaf.id],
-        derivedTitle: derivePaneTitle(leaf.content),
+        derivedTitle: derivePaneTitle(leaf.content, extensions),
         titleSetByUser: paneTitleSetByUser?.[leaf.id],
       })
   }
   return nextSources
+}
+
+function repairLegacyPaneTitleSourcesWithExtensions(
+  state: PanesState,
+  extensions: ClientExtensionEntry[] | undefined,
+  tabIds?: Iterable<string>,
+) {
+  if (!extensions || extensions.length === 0) return
+
+  const targetTabIds = tabIds ? Array.from(tabIds) : Object.keys(state.layouts)
+  for (const tabId of targetTabIds) {
+    const layout = state.layouts[tabId]
+    if (!layout) continue
+
+    for (const leaf of collectLeaves(layout)) {
+      if (state.paneTitleSetByUser?.[tabId]?.[leaf.id]) {
+        setPaneTitleSource(state, tabId, leaf.id, 'user')
+        continue
+      }
+
+      const currentSource = state.paneTitleSources?.[tabId]?.[leaf.id]
+      const inferredSource = inferLegacyPaneTitleSource({
+        storedTitle: state.paneTitles?.[tabId]?.[leaf.id],
+        derivedTitle: derivePaneTitle(leaf.content, extensions),
+      })
+      if (
+        !currentSource
+        || currentSource === 'derived'
+        || (currentSource === 'stable' && inferredSource === 'derived')
+      ) {
+        setPaneTitleSource(state, tabId, leaf.id, inferredSource)
+      }
+    }
+  }
 }
 
 /**
@@ -439,6 +476,7 @@ function mergeHydratedPaneMetadata(
   incoming: PanesState,
   layouts: Record<string, PaneNode>,
   incomingLayoutTabIds: Set<string>,
+  extensions?: ClientExtensionEntry[],
 ): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSources' | 'paneTitleSetByUser'> {
   const activePane: Record<string, string> = {}
   const paneTitles: Record<string, Record<string, string>> = {}
@@ -477,6 +515,7 @@ function mergeHydratedPaneMetadata(
       nextPaneTitles,
       filterPaneMetadataByLayout(preferredPaneTitleSourcesSource, tabId, paneIdSet),
       filterPaneMetadataByLayout(preferredTitleSetByUserSource, tabId, paneIdSet),
+      extensions,
     )
     if (Object.keys(nextPaneTitleSources).length > 0) {
       paneTitleSources[tabId] = nextPaneTitleSources
@@ -756,9 +795,10 @@ export const panesSlice = createSlice({
         layout: PaneNode
         paneTitles: Record<string, string>
         paneTitleSources?: Record<string, DurableTitleSource>
+        extensions?: ClientExtensionEntry[]
       }>
     ) => {
-      const { tabId, layout, paneTitles, paneTitleSources } = action.payload
+      const { tabId, layout, paneTitles, paneTitleSources, extensions } = action.payload
       // Don't overwrite existing layout (same guard as initLayout)
       if (state.layouts[tabId]) return
 
@@ -774,6 +814,7 @@ export const panesSlice = createSlice({
           paneTitles,
           paneTitleSources,
           state.paneTitleSetByUser?.[tabId],
+          extensions,
         ),
       }
       ensurePaneTitleSetByUserMap(state)[tabId] = Object.fromEntries(
@@ -784,6 +825,7 @@ export const panesSlice = createSlice({
       if (Object.keys(state.paneTitleSetByUser?.[tabId] || {}).length === 0) {
         delete ensurePaneTitleSetByUserMap(state)[tabId]
       }
+      repairLegacyPaneTitleSourcesWithExtensions(state, extensions, [tabId])
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -1367,8 +1409,12 @@ export const panesSlice = createSlice({
       }
     },
 
-    hydratePanes: (state, action: PayloadAction<PanesState>) => {
+    hydratePanes: (
+      state,
+      action: PayloadAction<PanesState & { extensions?: ClientExtensionEntry[] }>,
+    ) => {
       const incoming = action.payload
+      const extensions = action.payload.extensions
 
       // Merge layouts: preserve local terminal assignments that are more
       // advanced than the incoming (remote) state. This prevents cross-tab
@@ -1401,11 +1447,18 @@ export const panesSlice = createSlice({
       }
 
       state.layouts = mergedLayouts
-      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
+      const nextMetadata = mergeHydratedPaneMetadata(
+        state,
+        incoming,
+        mergedLayouts,
+        incomingLayoutTabIds,
+        extensions,
+      )
       state.activePane = nextMetadata.activePane
       state.paneTitles = nextMetadata.paneTitles
       state.paneTitleSources = nextMetadata.paneTitleSources
       state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
+      repairLegacyPaneTitleSourcesWithExtensions(state, extensions)
       // Ephemeral signals must never be hydrated from remote
       state.renameRequestTabId = null
       state.renameRequestPaneId = null
@@ -1493,6 +1546,11 @@ export const panesSlice = createSlice({
         }
       }
     },
+  },
+  extraReducers: (builder) => {
+    builder.addCase(setRegistry, (state, action) => {
+      repairLegacyPaneTitleSourcesWithExtensions(state, action.payload)
+    })
   },
 })
 

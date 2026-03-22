@@ -194,4 +194,50 @@ describe('TerminalView runtime title handling', () => {
 
     expect(getDisplayTitle(store)).toBe(durableTitle)
   })
+
+  it('promotes layoutless mirrored tabs by terminalId when a stable rename arrives', async () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        paneRuntimeTitle: paneRuntimeTitleReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            mode: 'codex' as const,
+            status: 'running' as const,
+            title: 'Codex CLI',
+            titleSource: 'derived' as const,
+            terminalId: 'term-1',
+            createRequestId: 'req-1',
+            createdAt: 1,
+          }],
+          activeTabId: 'tab-1',
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSources: {},
+          paneTitleSetByUser: {},
+        },
+        paneRuntimeTitle: {
+          titlesByPaneId: {},
+        },
+      },
+    })
+
+    await store.dispatch(syncStableTitleByTerminalId({
+      terminalId: 'term-1',
+      title: 'Renamed Session',
+    }) as any)
+
+    expect(store.getState().tabs.tabs[0]).toMatchObject({
+      title: 'Renamed Session',
+      titleSource: 'stable',
+      terminalId: 'term-1',
+    })
+  })
 })

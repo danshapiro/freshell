@@ -356,6 +356,79 @@ describe('sidebarSelectors', () => {
         excludeFirstChatMustStart: true,
       })).toEqual([])
     })
+
+    it('uses each leaf pane title for split-tab fallback session rows', () => {
+      const tabs = [
+        { id: 'tab-split', title: 'Workspace', mode: 'shell', createdAt: 4_000 },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-split': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-left',
+                content: {
+                  kind: 'terminal',
+                  mode: 'codex',
+                  status: 'running',
+                  createRequestId: 'req-left',
+                  resumeSessionId: 'codex-left',
+                  initialCwd: '/tmp/project-left',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-right',
+                content: {
+                  kind: 'terminal',
+                  mode: 'codex',
+                  status: 'running',
+                  createRequestId: 'req-right',
+                  resumeSessionId: 'codex-right',
+                  initialCwd: '/tmp/project-right',
+                },
+              },
+            ],
+          },
+        },
+        activePane: {
+          'tab-split': 'pane-left',
+        },
+        paneTitles: {
+          'tab-split': {
+            'pane-left': 'Left Session',
+            'pane-right': 'Right Session',
+          },
+        },
+        paneTitleSources: {
+          'tab-split': {
+            'pane-left': 'stable',
+            'pane-right': 'stable',
+          },
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          sessionId: 'codex-left',
+          title: 'Left Session',
+          hasTab: true,
+        }),
+        expect.objectContaining({
+          sessionId: 'codex-right',
+          title: 'Right Session',
+          hasTab: true,
+        }),
+      ]))
+    })
   })
 
   describe('sortSessionItems', () => {

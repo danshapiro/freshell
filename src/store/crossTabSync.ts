@@ -78,6 +78,7 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
 
   const state = store.getState()
   const localActiveByTab = (state?.panes?.activePane || {}) as Record<string, string>
+  const extensions = state?.extensions?.entries
 
   const nextActive: Record<string, string> = {}
 
@@ -108,6 +109,7 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
       paneTitles: parsed.paneTitles,
       paneTitleSources: parsed.paneTitleSources,
       paneTitleSetByUser: parsed.paneTitleSetByUser,
+      extensions,
     } as any),
     meta: { skipPersist: true, source: 'cross-tab' },
   })

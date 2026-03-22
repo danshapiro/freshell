@@ -300,7 +300,10 @@ function inferPaneTitleSourcesByTab(
 
 let cachedPersistedPanes: any | null | undefined
 
-export function loadPersistedPanes(): any | null {
+export function loadPersistedPanes(extensions?: ClientExtensionEntry[]): any | null {
+  if (extensions) {
+    return loadPersistedPanesUncached(extensions)
+  }
   // Memoize: legacy migrations generate nanoid() values, so both callers
   // (panesSlice and terminal-restore) must see the same result.
   if (cachedPersistedPanes !== undefined) return cachedPersistedPanes
@@ -308,7 +311,7 @@ export function loadPersistedPanes(): any | null {
   return cachedPersistedPanes
 }
 
-function loadPersistedPanesUncached(): any | null {
+function loadPersistedPanesUncached(extensions?: ClientExtensionEntry[]): any | null {
   try {
     const raw = localStorage.getItem(PANES_STORAGE_KEY)
     if (!raw) return null
@@ -537,6 +540,10 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         scheduleFlush()
       }
       if (a.type.startsWith('panes/')) {
+        panesDirty = true
+        scheduleFlush()
+      }
+      if (a.type === 'extensions/setRegistry') {
         panesDirty = true
         scheduleFlush()
       }

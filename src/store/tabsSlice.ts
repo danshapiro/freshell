@@ -435,6 +435,7 @@ export const reopenClosedTab = createAsyncThunk(
       layout: entry.layout,
       paneTitles: entry.paneTitles,
       paneTitleSources: entry.paneTitleSources || {},
+      extensions: state.extensions?.entries,
     }))
   }
 )

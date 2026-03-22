@@ -26,6 +26,7 @@ import panesReducer, {
   updatePaneTitle,
 } from '../../../../src/store/panesSlice'
 import paneRuntimeTitleReducer, { setPaneRuntimeTitle } from '../../../../src/store/paneRuntimeTitleSlice'
+import extensionsReducer, { setRegistry } from '../../../../src/store/extensionsSlice'
 import {
   loadPersistedPanes,
   loadPersistedTabs,
@@ -34,6 +35,13 @@ import {
   resetPersistedPanesCacheForTests,
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  { name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli' },
+  { name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli' },
+  { name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli' },
+]
 
 describe('Panes Persistence Integration', () => {
   beforeEach(() => {
@@ -244,6 +252,80 @@ describe('Panes Persistence Integration', () => {
 
     const loaded = loadPersistedPanes()
     expect(loaded?.paneTitleSources[tabId]).toEqual({ 'pane-1': 'stable' })
+  })
+
+  it('reclassifies legacy extension placeholder pane titles after the registry arrives and persists the corrected source', () => {
+    localStorage.setItem('freshell.panes.v2', JSON.stringify({
+      version: PANES_SCHEMA_VERSION,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-1',
+            status: 'running',
+            mode: 'codex',
+            shell: 'system',
+          },
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: { 'tab-1': { 'pane-1': 'Codex CLI' } },
+      paneTitleSetByUser: {},
+    }))
+    resetPersistedPanesCacheForTests()
+
+    const persistedPanes = loadPersistedPanes()
+    expect(persistedPanes?.paneTitleSources['tab-1']?.['pane-1']).toBe('stable')
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            title: 'Codex CLI',
+            mode: 'codex',
+            status: 'running',
+            createRequestId: 'req-tab-1',
+            createdAt: 1,
+          }],
+          activeTabId: 'tab-1',
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSources: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+        extensions: {
+          entries: [],
+        },
+      },
+    })
+
+    store.dispatch(hydratePanes(persistedPanes as any))
+    expect(store.getState().panes.paneTitleSources['tab-1']?.['pane-1']).toBe('stable')
+
+    store.dispatch(setRegistry(defaultCliExtensions))
+
+    expect(store.getState().panes.paneTitleSources['tab-1']?.['pane-1']).toBe('derived')
+
+    vi.runAllTimers()
+
+    const savedPanes = JSON.parse(localStorage.getItem('freshell.panes.v2') || '{}')
+    expect(savedPanes.paneTitleSources['tab-1']?.['pane-1']).toBe('derived')
   })
 
   it('strips editor content when persisting panes', () => {
