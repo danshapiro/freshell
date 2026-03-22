@@ -79,6 +79,7 @@ export interface CodingCliSession {
   provider: CodingCliProviderName
   sessionType?: string
   sessionId: string
+  sessionKey?: string
   projectPath: string
   createdAt?: number
   lastActivityAt: number

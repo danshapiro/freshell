@@ -418,6 +418,56 @@ describe('querySessionDirectory file-based search', () => {
     expect(hiddenPage.items).toHaveLength(0)
   })
 
+  it('keeps duplicate Kimi session ids in different cwd values distinct during file search', async () => {
+    const appASessionFile = path.join(tempDir, 'kimi-app-a-context.jsonl')
+    const appBSessionFile = path.join(tempDir, 'kimi-app-b-context.jsonl')
+    await fsp.writeFile(appASessionFile, [
+      '{"role":"user","content":"shared-kimi-token-app-a"}',
+      '{"role":"assistant","content":[{"type":"text","text":"response-a"}]}',
+    ].join('\n'))
+    await fsp.writeFile(appBSessionFile, [
+      '{"role":"user","content":"shared-kimi-token-app-b"}',
+      '{"role":"assistant","content":[{"type":"text","text":"response-b"}]}',
+    ].join('\n'))
+
+    const projects = [makeProject('/repo/root', [
+      makeSession({
+        provider: 'kimi',
+        sessionId: 'shared-kimi-session',
+        projectPath: '/repo/root',
+        lastActivityAt: 1_000,
+        cwd: '/repo/root/packages/app-a',
+        title: 'Kimi app A',
+        sourceFile: appASessionFile,
+      }),
+      makeSession({
+        provider: 'kimi',
+        sessionId: 'shared-kimi-session',
+        projectPath: '/repo/root',
+        lastActivityAt: 900,
+        cwd: '/repo/root/packages/app-b',
+        title: 'Kimi app B',
+        sourceFile: appBSessionFile,
+      }),
+    ])]
+    const kimiProvider = new KimiProvider(kimiFixtureShareDir)
+
+    const page = await querySessionDirectory({
+      projects,
+      terminalMeta: [],
+      providers: [kimiProvider],
+      query: { priority: 'visible', query: 'shared-kimi-token-app-a', tier: 'userMessages' },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]).toMatchObject({
+      provider: 'kimi',
+      sessionId: 'shared-kimi-session',
+      cwd: '/repo/root/packages/app-a',
+      matchedIn: 'userMessage',
+    })
+  })
+
   it('title tier still works without file I/O (does not require providers)', async () => {
     const projects = [makeProject('/repo', [
       makeSession({

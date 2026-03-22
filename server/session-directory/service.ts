@@ -132,7 +132,7 @@ async function applyFileSearch(
   for (const project of input.projects) {
     for (const session of project.sessions) {
       if (session.sourceFile) {
-        sourceFiles.set(buildSessionKey({ provider: session.provider, sessionId: session.sessionId }), session.sourceFile)
+        sourceFiles.set(buildSessionKey({ provider: session.provider, sessionId: session.sessionId, cwd: session.cwd }), session.sourceFile)
       }
     }
   }

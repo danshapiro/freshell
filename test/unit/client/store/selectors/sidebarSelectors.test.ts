@@ -244,6 +244,92 @@ describe('sidebarSelectors', () => {
       expect(items[0].hasTab).toBe(true)
     })
 
+    it('keeps duplicate Kimi session ids distinct by cwd for running and tab state', () => {
+      const projects = [
+        makeProject([
+          {
+            sessionId: 'shared-kimi-session',
+            provider: 'kimi',
+            title: 'Kimi app A',
+            cwd: '/repo/root/packages/app-a',
+            projectPath: '/repo/root',
+            lastActivityAt: 2_000,
+          },
+          {
+            sessionId: 'shared-kimi-session',
+            provider: 'kimi',
+            title: 'Kimi app B',
+            cwd: '/repo/root/packages/app-b',
+            projectPath: '/repo/root',
+            lastActivityAt: 1_900,
+          },
+        ], '/repo/root'),
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-kimi-b',
+          title: 'Kimi app B tab',
+          mode: 'kimi',
+          resumeSessionId: 'shared-kimi-session',
+          initialCwd: '/repo/root/packages/app-b',
+          createdAt: 3_000,
+        },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-kimi-b': {
+            type: 'leaf',
+            id: 'pane-kimi-b',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              status: 'running',
+              createRequestId: 'req-kimi-b',
+              resumeSessionId: 'shared-kimi-session',
+              initialCwd: '/repo/root/packages/app-b',
+            },
+          },
+        },
+        activePane: {
+          'tab-kimi-b': 'pane-kimi-b',
+        },
+      } as any
+
+      const terminals = [
+        {
+          terminalId: 'term-kimi-a',
+          title: 'Kimi app A',
+          createdAt: 1,
+          lastActivityAt: 2_500,
+          cwd: '/repo/root/packages/app-a',
+          status: 'running',
+          hasClients: false,
+          mode: 'kimi',
+          resumeSessionId: 'shared-kimi-session',
+        },
+      ] as any
+
+      const items = buildSessionItems(projects, tabs, panes, terminals, emptyActivity)
+      const byCwd = new Map(items.map((item) => [item.cwd, item]))
+
+      expect(items).toHaveLength(2)
+      expect(byCwd.get('/repo/root/packages/app-a')).toMatchObject({
+        sessionId: 'shared-kimi-session',
+        provider: 'kimi',
+        isRunning: true,
+        hasTab: false,
+        runningTerminalId: 'term-kimi-a',
+      })
+      expect(byCwd.get('/repo/root/packages/app-b')).toMatchObject({
+        sessionId: 'shared-kimi-session',
+        provider: 'kimi',
+        isRunning: false,
+        hasTab: true,
+      })
+    })
+
     it('synthesizes a local fallback row for restored open sessions that are not in the current server window', () => {
       const fallbackSessionId = 'codex-restored'
       const tabs = [

@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
-import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
@@ -138,14 +138,13 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     let cascadedTerminalId: string | undefined
     if (cleanTitle && deps.terminalMetadata) {
       try {
-        const parts = compositeKey.split(':')
-        const sessionProvider = (parts.length >= 2 ? parts[0] : provider) as CodingCliProviderName
-        const sessionId = parts.length >= 2 ? parts.slice(1).join(':') : rawId
+        const parsedKey = parseSessionKey(compositeKey)
         cascadedTerminalId = await cascadeSessionRenameToTerminal(
           deps.terminalMetadata.list(),
-          sessionProvider,
-          sessionId,
+          parsedKey.provider,
+          parsedKey.sessionId,
           cleanTitle,
+          parsedKey.cwd,
         )
         if (cascadedTerminalId) {
           deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)

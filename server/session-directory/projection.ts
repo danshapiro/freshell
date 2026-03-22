@@ -14,6 +14,7 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
   return (
     a.provider === b.provider &&
     a.sessionId === b.sessionId &&
+    a.sessionKey === b.sessionKey &&
     a.projectPath === b.projectPath &&
     a.title === b.title &&
     a.summary === b.summary &&
@@ -32,6 +33,7 @@ export function toSessionDirectoryComparableItem(session: CodingCliSession): Ses
   return {
     provider: session.provider,
     sessionId: session.sessionId,
+    sessionKey: buildSessionKey(session),
     projectPath: session.projectPath,
     title: session.title,
     summary: session.summary,
@@ -57,7 +59,7 @@ export function compareSessionDirectoryComparableItems(
   const byLastActivityAt = b.lastActivityAt - a.lastActivityAt
   if (byLastActivityAt !== 0) return byLastActivityAt
 
-  return buildSessionKey(b).localeCompare(buildSessionKey(a))
+  return (b.sessionKey ?? buildSessionKey(b)).localeCompare(a.sessionKey ?? buildSessionKey(a))
 }
 
 export function buildSessionDirectoryComparableSnapshot(projects: ProjectGroup[]): SessionDirectoryComparableItem[] {

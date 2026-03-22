@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
 
 export { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
@@ -10,10 +11,9 @@ export interface SessionActivityState {
   sessions: Record<string, number>
 }
 
-function makeSessionKey(sessionId: string, provider?: string): string {
+function makeSessionKey(sessionId: string, provider?: string, cwd?: string): string {
   if (sessionId.includes(':')) return sessionId
-  if (provider) return `${provider}:${sessionId}`
-  return sessionId
+  return makeCodingCliSessionKey(provider, sessionId, cwd)
 }
 
 function canUseStorage(): boolean {
@@ -80,10 +80,10 @@ export const sessionActivitySlice = createSlice({
   reducers: {
     updateSessionActivity: (
       state,
-      action: PayloadAction<{ sessionId: string; provider?: string; lastInputAt: number }>
+      action: PayloadAction<{ sessionId: string; provider?: string; cwd?: string; lastInputAt: number }>
     ) => {
-      const { sessionId, provider, lastInputAt } = action.payload
-      const key = makeSessionKey(sessionId, provider)
+      const { sessionId, provider, cwd, lastInputAt } = action.payload
+      const key = makeSessionKey(sessionId, provider, cwd)
       const existing = state.sessions[key] || 0
 
       if (lastInputAt > existing) {

@@ -28,6 +28,7 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 import Pane from '@/components/panes/Pane'
+import { api } from '@/lib/api'
 
 const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
@@ -439,6 +440,106 @@ function createStoreWithOverlappingSessionWindows() {
                     cwd: '/shared/project/history',
                     createdAt: 1000,
                     updatedAt: 2000,
+                  },
+                ],
+              },
+            ],
+            lastLoadedAt: 1,
+          },
+        },
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: null,
+      },
+    },
+  })
+}
+
+function kimiSessionKey(cwd: string): string {
+  return `kimi:cwd=${Buffer.from(cwd, 'utf8').toString('base64url')}:sid=${Buffer.from('shared-kimi-session', 'utf8').toString('base64url')}`
+}
+
+function createStoreWithDuplicateKimiSessionWindows() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+      sessions: {
+        projects: [],
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [
+              {
+                projectPath: '/repo/root',
+                sessions: [
+                  {
+                    sessionId: 'shared-kimi-session',
+                    provider: 'kimi',
+                    title: 'Kimi app A',
+                    cwd: '/repo/root/packages/app-a',
+                    sessionKey: kimiSessionKey('/repo/root/packages/app-a'),
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                  {
+                    sessionId: 'shared-kimi-session',
+                    provider: 'kimi',
+                    title: 'Kimi app B',
+                    cwd: '/repo/root/packages/app-b',
+                    sessionKey: kimiSessionKey('/repo/root/packages/app-b'),
+                    createdAt: 1100,
+                    updatedAt: 2100,
+                    firstUserMessage: 'generate a title for app b',
                   },
                 ],
               },
@@ -918,6 +1019,42 @@ describe('ContextMenuProvider', () => {
       resumeSessionId: VALID_SESSION_ID,
     })
     expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
+  })
+
+  it('renames the targeted duplicate Kimi sidebar session using its opaque cwd-scoped key', async () => {
+    const user = userEvent.setup()
+    const promptSpy = vi.spyOn(window, 'prompt')
+      .mockReturnValueOnce('Renamed Kimi app B')
+    const store = createStoreWithDuplicateKimiSessionWindows()
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id="shared-kimi-session"
+            data-provider="kimi"
+            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
+          >
+            Duplicate Kimi Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Duplicate Kimi Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
+
+    expect(promptSpy).toHaveBeenCalledWith('Rename session', 'Kimi app B')
+    expect(vi.mocked(api.patch)).toHaveBeenCalledWith(
+      `/api/sessions/${encodeURIComponent(kimiSessionKey('/repo/root/packages/app-b'))}`,
+      { titleOverride: 'Renamed Kimi app B', summaryOverride: undefined },
+    )
   })
 
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {

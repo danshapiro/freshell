@@ -6,6 +6,7 @@ import HistoryView from '@/components/HistoryView'
 import sessionsReducer from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
+import { api } from '@/lib/api'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -14,6 +15,13 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue({
+    projects: [],
+    totalSessions: 0,
+    oldestIncludedTimestamp: 0,
+    oldestIncludedSessionId: '',
+    hasMore: false,
+  }),
 }))
 
 function renderHistoryView(onOpenSession = vi.fn()) {
@@ -173,5 +181,78 @@ describe('HistoryView mobile behavior', () => {
         })
       }
     })
+  })
+
+  it('renames the targeted duplicate Kimi history session using its opaque cwd-scoped key', async () => {
+    const projectPath = '/repo/root'
+    const store = configureStore({
+      reducer: {
+        sessions: sessionsReducer,
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        sessions: {
+          projects: [
+            {
+              projectPath,
+              sessions: [
+                {
+                  provider: 'kimi',
+                  sessionId: 'shared-kimi-session',
+                  sessionKey: `kimi:cwd=${Buffer.from('/repo/root/packages/app-a', 'utf8').toString('base64url')}:sid=${Buffer.from('shared-kimi-session', 'utf8').toString('base64url')}`,
+                  projectPath,
+                  cwd: '/repo/root/packages/app-a',
+                  lastActivityAt: Date.now(),
+                  title: 'Kimi app A',
+                },
+                {
+                  provider: 'kimi',
+                  sessionId: 'shared-kimi-session',
+                  sessionKey: `kimi:cwd=${Buffer.from('/repo/root/packages/app-b', 'utf8').toString('base64url')}:sid=${Buffer.from('shared-kimi-session', 'utf8').toString('base64url')}`,
+                  projectPath,
+                  cwd: '/repo/root/packages/app-b',
+                  lastActivityAt: Date.now() - 1000,
+                  title: 'Kimi app B',
+                },
+              ],
+            },
+          ],
+          expandedProjects: new Set([projectPath]),
+        },
+        tabs: { tabs: [], activeTabId: null },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as any,
+    })
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>
+    )
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Edit session' })[1])
+    fireEvent.change(screen.getByLabelText('Session title'), { target: { value: 'Renamed Kimi app B' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(vi.mocked(api.patch)).toHaveBeenCalledWith(
+      `/api/sessions/${encodeURIComponent(`kimi:cwd=${Buffer.from('/repo/root/packages/app-b', 'utf8').toString('base64url')}:sid=${Buffer.from('shared-kimi-session', 'utf8').toString('base64url')}`)}`,
+      { titleOverride: 'Renamed Kimi app B', summaryOverride: undefined },
+    )
   })
 })

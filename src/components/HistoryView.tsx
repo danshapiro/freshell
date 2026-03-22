@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import { toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
@@ -98,9 +99,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
-    // Use composite key format: provider:sessionId
-    const compositeKey = `${provider || 'claude'}:${sessionId}`
+  async function renameSession(session: CodingCliSession, titleOverride?: string, summaryOverride?: string) {
+    const compositeKey = getCodingCliSessionKey(session)
     const result = await api.patch<{ cascadedTerminalId?: string }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     if (result.cascadedTerminalId && titleOverride) {
       dispatch(syncPaneTitleByTerminalId({ terminalId: result.cascadedTerminalId, title: titleOverride }))
@@ -108,9 +108,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function deleteSession(provider: CodingCliProviderName | undefined, sessionId: string) {
-    // Use composite key format: provider:sessionId
-    const compositeKey = `${provider || 'claude'}:${sessionId}`
+  async function deleteSession(session: CodingCliSession) {
+    const compositeKey = getCodingCliSessionKey(session)
     await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
     await refresh()
   }
@@ -201,8 +200,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
                 onToggle={() => dispatch(toggleProjectExpanded(project.projectPath))}
                 onColorChange={(color) => setProjectColor(project.projectPath, color)}
                 onOpenSession={(session) => openSession(session)}
-                onRenameSession={(provider, sessionId, title, summary) => renameSession(provider, sessionId, title, summary)}
-                onDeleteSession={(provider, sessionId) => deleteSession(provider, sessionId)}
+                onRenameSession={(session, title, summary) => renameSession(session, title, summary)}
+                onDeleteSession={(session) => deleteSession(session)}
                 onShowSessionDetails={(sheetState) => setMobileSessionSheet(sheetState)}
               />
             ))
@@ -245,8 +244,8 @@ function ProjectCard({
   onToggle: () => void
   onColorChange: (color: string) => void
   onOpenSession: (session: CodingCliSession) => void
-  onRenameSession: (provider: CodingCliProviderName | undefined, sessionId: string, title?: string, summary?: string) => void
-  onDeleteSession: (provider: CodingCliProviderName | undefined, sessionId: string) => void
+  onRenameSession: (session: CodingCliSession, title?: string, summary?: string) => void
+  onDeleteSession: (session: CodingCliSession) => void
   onShowSessionDetails: (sheetState: MobileSessionSheetState) => void
 }) {
   const color = project.color || '#6b7280'
@@ -316,17 +315,17 @@ function ProjectCard({
               .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
               .map((session) => (
                 <SessionRow
-                  key={session.sessionId}
+                  key={getCodingCliSessionKey(session)}
                   isMobile={isMobile}
                   session={session}
                   onOpen={() => onOpenSession(session)}
-                  onRename={(title, summary) => onRenameSession(session.provider, session.sessionId, title, summary)}
-                  onDelete={() => onDeleteSession(session.provider, session.sessionId)}
+                  onRename={(title, summary) => onRenameSession(session, title, summary)}
+                  onDelete={() => onDeleteSession(session)}
                   onShowDetails={() => onShowSessionDetails({
                     session,
                     onOpen: () => onOpenSession(session),
-                    onRename: (title, summary) => onRenameSession(session.provider, session.sessionId, title, summary),
-                    onDelete: () => onDeleteSession(session.provider, session.sessionId),
+                    onRename: (title, summary) => onRenameSession(session, title, summary),
+                    onDelete: () => onDeleteSession(session),
                   })}
                 />
               ))}
@@ -403,6 +402,7 @@ function SessionRow({
       className="group w-full px-4 py-3 hover:bg-muted/30 transition-colors rounded-md"
       data-context={ContextIds.HistorySession}
       data-session-id={session.sessionId}
+      data-session-key={getCodingCliSessionKey(session)}
       data-provider={session.provider}
     >
       <div className="flex items-start gap-3">
