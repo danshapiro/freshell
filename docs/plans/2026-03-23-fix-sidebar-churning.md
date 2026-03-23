@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate unnecessary sidebar re-renders (~every 5 seconds) caused by `lastActivityAt` and `createdAt` timestamp changes propagating through the `sessions.changed` broadcast pipeline when the only thing that changed on an active coding CLI session is its timestamp.
 
-**Architecture:** Remove `lastActivityAt` and `createdAt` from the server-side deep-diff equality check in `comparableItemsEqual()`, from the `SessionDirectoryComparableItem` type, and from the `toSessionDirectoryComparableItem()` mapping function. Keep these fields in `compareSessionDirectoryComparableItems()` (the sort comparator) since sorting by recency is still needed for snapshot ordering. Update existing tests to match the new contract, and add new tests that verify timestamp-only changes are correctly suppressed.
+**Architecture:** Remove `lastActivityAt` and `createdAt` from the equality check in `comparableItemsEqual()` only. Keep both fields on the `SessionDirectoryComparableItem` type, in `toSessionDirectoryComparableItem()`, and in `compareSessionDirectoryComparableItems()`. The type and mapping must retain these fields because `toItems()` in `server/session-directory/service.ts` spreads `SessionDirectoryComparableItem` into `SessionDirectoryItem` for client responses -- removing them from the mapping would silently drop `createdAt` from the session directory API, breaking client features (e.g. delete confirmation shows "Created: unknown"). Update existing tests to match the new contract, and add new tests that verify timestamp-only changes are correctly suppressed.
 
 **Tech Stack:** TypeScript, Vitest
 
@@ -23,17 +23,24 @@ The `comparableItemsEqual()` function answers one question: "has the sidebar-vis
 
 The only user-visible effect of a timestamp change would be if the sidebar displayed relative time ("3 minutes ago"), but even then the client can update that locally without a server broadcast.
 
-### Why we also remove timestamps from the type and mapping function
+### Why we keep timestamps on the type and mapping function (and only remove them from equality)
 
-`SessionDirectoryComparableItem` exists solely to define the fields that matter for the equality check. Including fields that are deliberately excluded from the equality comparison creates a misleading contract: future maintainers would see `lastActivityAt` on the type and reasonably assume it participates in equality checking. Removing it from the type makes the intent unambiguous.
+The task input suggested removing `lastActivityAt` and `createdAt` from the `SessionDirectoryComparableItem` type and `toSessionDirectoryComparableItem()` for consistency. However, this would break the data pipeline:
 
-The sort function `compareSessionDirectoryComparableItems()` needs `lastActivityAt` for ordering, but it reads from the same items that `buildSessionDirectoryComparableSnapshot()` produces. Since those items still come from `CodingCliSession` objects that have `lastActivityAt`, we need to keep the field available for sorting. The cleanest approach is to keep `lastActivityAt` on the comparable item type for sorting purposes but exclude it from the equality check. However, the task input specifically asks to remove them from the type and mapping function too. This creates a type error in the sort function.
+1. **Sort function dependency:** `compareSessionDirectoryComparableItems()` uses `lastActivityAt` for recency-based ordering. Removing it from the type breaks type safety.
 
-**Resolution:** We will keep `lastActivityAt` on the `SessionDirectoryComparableItem` type because the sort function `compareSessionDirectoryComparableItems()` needs it, and that function's signature accepts `SessionDirectoryComparableItem` arguments. Removing `lastActivityAt` from the type would break the sort function's type safety or require a second type, both of which add complexity for no benefit. We **will** remove `createdAt` from the type and mapping function since it is not used by the sort function at all. We **will** remove both fields from `comparableItemsEqual()` (the equality check), which is the actual fix for the churning.
+2. **Client-facing data dependency (critical):** `toItems()` in `server/session-directory/service.ts` (line 110) builds `SessionDirectoryItem` objects by spreading `SessionDirectoryComparableItem`: `{ ...item, isRunning: false }`. If `createdAt` is removed from `toSessionDirectoryComparableItem()`, it will be silently absent from all session directory API responses. The client uses `createdAt` in multiple places:
+   - Delete confirmation dialog in `ContextMenuProvider.tsx` shows "Created: {formatDate(createdAt)}" -- would display "Created: unknown"
+   - `api.ts:groupDirectoryItemsAsProjects()` and search results pass `createdAt` through to Redux state
+   - `createdAt` is optional on `SessionDirectoryItem` (Zod `.optional()`), so no type error would surface -- the bug would be silent
+
+3. **The type name is `SessionDirectoryComparableItem`, not `SessionDirectoryEqualityItem`.** The type serves multiple roles: equality checking, sorting, and data projection for the directory service. Having fields on the type that don't participate in equality is not misleading -- equality is just one of its uses.
+
+**Resolution:** Keep both `lastActivityAt` and `createdAt` on the type and in the mapping function. Only remove them from `comparableItemsEqual()`. This is the minimal correct fix.
 
 To summarize the final state:
-- `lastActivityAt`: stays on `SessionDirectoryComparableItem` type and in `toSessionDirectoryComparableItem()`, **removed from `comparableItemsEqual()`**
-- `createdAt`: **removed from type, mapping function, and `comparableItemsEqual()`**
+- `lastActivityAt`: stays on type and in mapping, **removed from `comparableItemsEqual()` only**
+- `createdAt`: stays on type and in mapping, **removed from `comparableItemsEqual()` only**
 
 ### The diff module (`sessions-sync/diff.ts`) is a separate concern
 
@@ -47,7 +54,7 @@ To summarize the final state:
 
 ## File structure
 
-- **Modify:** `server/session-directory/projection.ts` -- remove `createdAt` from type/mapping/equality; remove `lastActivityAt` from equality only
+- **Modify:** `server/session-directory/projection.ts` -- remove `lastActivityAt` and `createdAt` from `comparableItemsEqual()` only (keep on type and in mapping)
 - **Modify:** `test/unit/server/session-directory/projection.test.ts` -- update existing tests, add new tests for timestamp suppression
 - **Modify:** `test/unit/server/sessions-sync/service.test.ts` -- add integration-level test verifying `SessionsSyncService` suppresses broadcast on timestamp-only changes
 
@@ -117,17 +124,12 @@ it('returns true when a sidebar-relevant field changes alongside timestamps', ()
 })
 ```
 
-Also update the `toSessionDirectoryComparableItem` projection test to remove `createdAt` from the expected output (since it will no longer be on the type):
-
-```typescript
-// In the existing 'projects only directory-visible fields from a session' test,
-// remove createdAt from the expected output object
-```
+The existing `toSessionDirectoryComparableItem` projection test (`projects only directory-visible fields from a session`) does NOT need updating -- `createdAt` stays on the type and in the mapping function.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npm run test:vitest -- --run test/unit/server/session-directory/projection.test.ts`
-Expected: FAIL -- the updated test expects `false` for timestamp-only changes but gets `true`; the projection test expects no `createdAt` field but gets one
+Expected: FAIL -- the updated test expects `false` for timestamp-only changes but gets `true`
 
 - [ ] **Step 3: Commit the red tests**
 
@@ -139,22 +141,11 @@ git commit -m "test: add failing tests for sidebar churning timestamp suppressio
 ### Task 2: Implement the projection changes
 
 **Files:**
-- Modify: `server/session-directory/projection.ts:4-8` (type), `server/session-directory/projection.ts:13-30` (equality), `server/session-directory/projection.ts:32-49` (mapping)
+- Modify: `server/session-directory/projection.ts:13-30` (equality function only)
 
-- [ ] **Step 1: Remove `createdAt` from `SessionDirectoryComparableItem` type**
+- [ ] **Step 1: Remove `lastActivityAt` and `createdAt` from `comparableItemsEqual()`**
 
-The type is defined as an `Omit` of `SessionDirectoryItem`. Add `'createdAt'` to the `Omit` union:
-
-```typescript
-export type SessionDirectoryComparableItem = Omit<
-  SessionDirectoryItem,
-  'isRunning' | 'runningTerminalId' | 'snippet' | 'matchedIn' | 'createdAt'
->
-```
-
-- [ ] **Step 2: Remove `lastActivityAt` and `createdAt` from `comparableItemsEqual()`**
-
-Remove lines 21-22 (`a.lastActivityAt === b.lastActivityAt` and `a.createdAt === b.createdAt`) from the equality function:
+Remove lines 21-22 (`a.lastActivityAt === b.lastActivityAt` and `a.createdAt === b.createdAt`) from the equality function. Do NOT change the type definition or the mapping function -- both fields must remain for sorting and client data flow.
 
 ```typescript
 function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirectoryComparableItem): boolean {
@@ -175,44 +166,20 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
 }
 ```
 
-- [ ] **Step 3: Remove `createdAt` from `toSessionDirectoryComparableItem()`**
-
-Remove the `createdAt: session.createdAt` line from the mapping function. Keep `lastActivityAt` because it is still on the type (needed for sorting):
-
-```typescript
-export function toSessionDirectoryComparableItem(session: CodingCliSession): SessionDirectoryComparableItem {
-  return {
-    provider: session.provider,
-    sessionId: session.sessionId,
-    sessionKey: buildSessionKey(session),
-    projectPath: session.projectPath,
-    title: session.title,
-    summary: session.summary,
-    lastActivityAt: session.lastActivityAt,
-    archived: session.archived,
-    cwd: session.cwd,
-    sessionType: session.sessionType,
-    isSubagent: session.isSubagent,
-    isNonInteractive: session.isNonInteractive,
-    firstUserMessage: session.firstUserMessage,
-  }
-}
-```
-
-- [ ] **Step 4: Run the projection tests to verify they pass**
+- [ ] **Step 2: Run the projection tests to verify they pass**
 
 Run: `npm run test:vitest -- --run test/unit/server/session-directory/projection.test.ts`
 Expected: PASS
 
-- [ ] **Step 5: Refactor and run the broader suite**
+- [ ] **Step 3: Refactor and run the broader suite**
 
-Review the changes for clarity. Verify no other code in the codebase reads `createdAt` from `SessionDirectoryComparableItem`. Then run the full suite:
+Review the two-line removal for clarity. Then run the full suite:
 
 Run: `npm run test:vitest -- --run test/unit/server/session-directory/projection.test.ts`
 Run: `npm test`
 Expected: all PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add server/session-directory/projection.ts
@@ -370,7 +337,7 @@ git commit -m "test: verify SessionsSyncService suppresses broadcast on timestam
 - [ ] **Step 1: Run full test suite including typecheck**
 
 Run: `npm run check`
-Expected: all PASS -- typecheck confirms no type errors from `createdAt` removal, all tests pass
+Expected: all PASS -- typecheck confirms no type errors, all tests pass
 
 - [ ] **Step 2: Verify the e2e sidebar test still passes**
 
