@@ -63,7 +63,11 @@ export function compareSessionDirectoryComparableItems(
 export function buildSessionDirectoryComparableSnapshot(projects: ProjectGroup[]): SessionDirectoryComparableItem[] {
   return projects
     .flatMap((project) => project.sessions.map((session) => toSessionDirectoryComparableItem(session)))
-    .sort(compareSessionDirectoryComparableItems)
+    .sort((a, b) => {
+      const keyA = a.sessionKey ?? buildSessionKey(a)
+      const keyB = b.sessionKey ?? buildSessionKey(b)
+      return keyA.localeCompare(keyB)
+    })
 }
 
 export function hasSessionDirectorySnapshotChange(prevProjects: ProjectGroup[], nextProjects: ProjectGroup[]): boolean {
