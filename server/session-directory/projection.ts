@@ -18,8 +18,6 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
     a.projectPath === b.projectPath &&
     a.title === b.title &&
     a.summary === b.summary &&
-    a.lastActivityAt === b.lastActivityAt &&
-    a.createdAt === b.createdAt &&
     a.archived === b.archived &&
     a.cwd === b.cwd &&
     a.sessionType === b.sessionType &&
