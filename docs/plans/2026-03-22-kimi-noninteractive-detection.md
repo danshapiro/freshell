@@ -146,15 +146,32 @@ expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).
 
 Then add the test block in `session-visibility.test.ts`:
 
-Add the following imports at the top of `session-visibility.test.ts`, alongside the existing vitest and parser imports:
+First, add a `vi.mock` for the git utility functions **before** any imports that depend on them. `KimiProvider.listSessionsDirect()` calls `resolveGitRepoRoot` and `resolveGitBranchAndDirty` for each workdir, which would spawn real `git` subprocesses on non-existent fixture paths without this mock. This matches the pattern used in `kimi-provider.test.ts`.
+
+Add the mock and imports at the top of `session-visibility.test.ts`:
 
 ```typescript
+import { vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
 import { createHash } from 'crypto'
+
+vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../server/coding-cli/utils')>()
+  return {
+    ...actual,
+    resolveGitRepoRoot: vi.fn(async (cwd: string) => (
+      cwd.startsWith('/repo/root/packages/') ? '/repo/root' : cwd
+    )),
+    resolveGitBranchAndDirty: vi.fn(async () => ({})),
+  }
+})
+
 import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
 ```
+
+Note: The `vi.mock()` call must appear before the `KimiProvider` import so Vitest hoists it correctly. The existing `import { describe, it, expect } from 'vitest'` should be updated to also import `vi`.
 
 Then add the fixture path constant and test block:
 
