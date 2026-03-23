@@ -50,14 +50,23 @@ describe('session visibility flags', () => {
   })
 
   describe('Claude isNonInteractive detection', () => {
-    it('sets isNonInteractive when queue-operation events are present', () => {
+    it('sets isNonInteractive when entrypoint is sdk-cli', () => {
       const content = [
-        JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
-        JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Automated task' } }),
+        JSON.stringify({ entrypoint: 'sdk-cli', cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Automated task' } }),
       ].join('\n')
 
       const meta = parseSessionContent(content)
       expect(meta.isNonInteractive).toBe(true)
+    })
+
+    it('does not set isNonInteractive for queue-operation records (interactive signal)', () => {
+      const content = [
+        JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Help me' } }),
+        JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', content: 'queued message' }),
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+      expect(meta.isNonInteractive).toBeFalsy()
     })
 
     it('does not set isNonInteractive for normal Claude sessions', () => {
