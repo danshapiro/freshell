@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { setActiveTab, updateTab } from '@/store/tabsSlice'
+import { createTerminalPaneBackedTab } from '@/store/workspaceActions'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
@@ -248,7 +249,15 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: 'shell' }))
+                        dispatch(createTerminalPaneBackedTab({
+                          tab: {
+                            title: t.title,
+                            terminalId: t.terminalId,
+                            status: 'running',
+                            mode: (t.mode as any) || 'shell',
+                            resumeSessionId: t.resumeSessionId,
+                          },
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
@@ -304,7 +313,15 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'exited', mode: 'shell' }))
+                        dispatch(createTerminalPaneBackedTab({
+                          tab: {
+                            title: t.title,
+                            terminalId: t.terminalId,
+                            status: 'exited',
+                            mode: (t.mode as any) || 'shell',
+                            resumeSessionId: t.resumeSessionId,
+                          },
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {

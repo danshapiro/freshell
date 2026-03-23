@@ -1791,6 +1791,83 @@ describe('ContextMenuProvider', () => {
       expect(screen.getByText('New Browser tab')).toBeInTheDocument()
       expect(screen.getByText('New Editor tab')).toBeInTheDocument()
     })
+
+    it('creates a pane-backed browser tab from the tab-add context menu', async () => {
+      const user = userEvent.setup()
+      const store = createStoreWithTerminalPane()
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div data-context={ContextIds.TabAdd}>Add Tab</div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+      await user.click(screen.getByText('New Browser tab'))
+
+      const createdTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
+      expect(createdTab).toMatchObject({
+        title: 'Tab 2',
+        mode: 'shell',
+        shell: 'system',
+      })
+      expect(store.getState().tabs.activeTabId).toBe(createdTab?.id)
+      expect(store.getState().panes.layouts[createdTab!.id]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'browser',
+          url: '',
+          devToolsOpen: false,
+        },
+      })
+    })
+  })
+
+  it('opens an overview terminal into a new pane-backed tab', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithTerminalPane()
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.OverviewTerminal} data-terminal-id="term-remote-2">
+            Remote Terminal
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Remote Terminal'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Open/focus terminal' }))
+
+    const createdTab = store.getState().tabs.tabs.find((tab) => tab.terminalId === 'term-remote-2')
+    expect(createdTab).toMatchObject({
+      status: 'running',
+      mode: 'shell',
+      terminalId: 'term-remote-2',
+    })
+    expect(store.getState().tabs.activeTabId).toBe(createdTab?.id)
+    expect(store.getState().panes.layouts[createdTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        terminalId: 'term-remote-2',
+        status: 'running',
+        mode: 'shell',
+      },
+    })
   })
 
   it('renders Copy, Paste, and Select all as the first terminal menu section with icons', async () => {

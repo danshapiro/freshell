@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, screen } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabContent from '@/components/TabContent'
@@ -39,6 +39,8 @@ interface TabConfig {
 
 interface StoreOptions {
   defaultNewPane?: 'ask' | 'shell' | 'browser' | 'editor'
+  layouts?: Record<string, unknown>
+  activePane?: Record<string, string>
 }
 
 function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
@@ -71,8 +73,10 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
         activeTabId: tabs[0]?.id,
       },
       panes: {
-        layouts: {},
-        activePane: {},
+        layouts: options.layouts || {},
+        activePane: options.activePane || {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
       },
       settings: {
         settings,
@@ -80,6 +84,21 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
       },
     },
   })
+}
+
+function createLeafLayout(content: Record<string, unknown> = {}) {
+  return {
+    type: 'leaf',
+    id: 'pane-1',
+    content: {
+      kind: 'terminal',
+      createRequestId: 'pane-req-1',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      ...content,
+    },
+  }
 }
 
 describe('TabContent', () => {
@@ -94,7 +113,10 @@ describe('TabContent', () => {
 
   describe('terminalId passthrough', () => {
     it('passes terminalId to PaneLayout defaultContent when tab has terminalId', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'existing-terminal-123' }])
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell', terminalId: 'existing-terminal-123' }],
+        { layouts: { 'tab-1': createLeafLayout({ terminalId: 'existing-terminal-123' }) } },
+      )
 
       render(
         <Provider store={store}>
@@ -113,7 +135,10 @@ describe('TabContent', () => {
     })
 
     it('shows picker when tab has no terminalId and defaultNewPane is ask', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'ask' })
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell' }],
+        { defaultNewPane: 'ask', layouts: { 'tab-1': createLeafLayout() } },
+      )
 
       render(
         <Provider store={store}>
@@ -132,7 +157,10 @@ describe('TabContent', () => {
     })
 
     it('passes undefined terminalId when tab has no terminalId and defaultNewPane is shell', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'shell' })
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell' }],
+        { defaultNewPane: 'shell', layouts: { 'tab-1': createLeafLayout() } },
+      )
 
       render(
         <Provider store={store}>
@@ -168,7 +196,7 @@ describe('TabContent', () => {
       expect(mockPaneLayout).not.toHaveBeenCalled()
     })
 
-    it('restores agent-chat default content for no-layout tabs using persisted session metadata', () => {
+    it('renders an explicit integrity error when a pane-backed agent-chat tab is missing its layout', () => {
       const store = createStore([
         {
           id: 'tab-1',
@@ -188,19 +216,12 @@ describe('TabContent', () => {
         </Provider>
       )
 
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultContent: expect.objectContaining({
-            kind: 'agent-chat',
-            provider: 'freshclaude',
-            resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
-          }),
-        }),
-        expect.anything(),
-      )
+      expect(screen.getByTestId('missing-layout-error')).toBeInTheDocument()
+      expect(mockPaneLayout).not.toHaveBeenCalled()
+      expect(addTerminalRestoreRequestId).not.toHaveBeenCalled()
     })
 
-    it('reuses tab.createRequestId for degraded no-layout coding restore requests', () => {
+    it('renders an explicit integrity error instead of issuing a degraded coding restore request', () => {
       const store = createStore([
         {
           id: 'tab-restore',
@@ -216,56 +237,37 @@ describe('TabContent', () => {
         </Provider>
       )
 
-      expect(addTerminalRestoreRequestId).toHaveBeenCalledWith('req-restore')
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultContent: expect.objectContaining({
-            kind: 'terminal',
-            mode: 'codex',
-            createRequestId: 'req-restore',
-            resumeSessionId: 'codex-session-123',
-          }),
-        }),
-        expect.anything(),
-      )
+      expect(screen.getByTestId('missing-layout-error')).toBeInTheDocument()
+      expect(addTerminalRestoreRequestId).not.toHaveBeenCalled()
+      expect(mockPaneLayout).not.toHaveBeenCalled()
     })
 
-    it('preserves live terminalId for no-layout coding tabs while keeping the tab createRequestId', () => {
+    it('shows the integrity error for pane-backed shell tabs whose layout is missing', () => {
       const store = createStore([
         {
-          id: 'tab-stale-terminal',
-          mode: 'codex',
-          terminalId: 'term-stale',
-          resumeSessionId: 'codex-session-123',
-          createRequestId: 'req-stale-terminal',
+          id: 'tab-shell-missing-layout',
+          mode: 'shell',
         },
       ])
 
       render(
         <Provider store={store}>
-          <TabContent tabId="tab-stale-terminal" />
+          <TabContent tabId="tab-shell-missing-layout" />
         </Provider>
       )
 
-      expect(addTerminalRestoreRequestId).toHaveBeenCalledWith('req-stale-terminal')
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultContent: expect.objectContaining({
-            kind: 'terminal',
-            mode: 'codex',
-            createRequestId: 'req-stale-terminal',
-            resumeSessionId: 'codex-session-123',
-            terminalId: 'term-stale',
-          }),
-        }),
-        expect.anything(),
-      )
+      expect(screen.getByTestId('missing-layout-error')).toBeInTheDocument()
+      expect(addTerminalRestoreRequestId).not.toHaveBeenCalled()
+      expect(mockPaneLayout).not.toHaveBeenCalled()
     })
   })
 
   describe('hidden prop propagation', () => {
     it('passes hidden=true to PaneLayout when hidden prop is true', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }],
+        { layouts: { 'tab-1': createLeafLayout({ terminalId: 'term-1' }) } },
+      )
 
       render(
         <Provider store={store}>
@@ -280,7 +282,10 @@ describe('TabContent', () => {
     })
 
     it('passes hidden=false to PaneLayout when hidden prop is false', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }],
+        { layouts: { 'tab-1': createLeafLayout({ terminalId: 'term-1' }) } },
+      )
 
       render(
         <Provider store={store}>
@@ -295,7 +300,10 @@ describe('TabContent', () => {
     })
 
     it('passes hidden=undefined to PaneLayout when hidden prop is not provided', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore(
+        [{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }],
+        { layouts: { 'tab-1': createLeafLayout({ terminalId: 'term-1' }) } },
+      )
 
       render(
         <Provider store={store}>

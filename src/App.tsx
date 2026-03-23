@@ -6,7 +6,8 @@ import {
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { addTab, closeTab, switchToNextTab, switchToPrevTab, reopenClosedTab } from '@/store/tabsSlice'
+import { closeTab, switchToNextTab, switchToPrevTab, reopenClosedTab } from '@/store/tabsSlice'
+import { createDefaultPaneBackedTab } from '@/store/workspaceActions'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
   fetchSessionWindow,
@@ -936,7 +937,7 @@ export default function App() {
       if (lifecycleAction) {
         e.preventDefault()
         if (lifecycleAction === 'new') {
-          dispatch(addTab())
+          dispatch(createDefaultPaneBackedTab())
         } else if (lifecycleAction === 'reopen') {
           dispatch(reopenClosedTab())
         } else {
@@ -958,7 +959,7 @@ export default function App() {
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {
     if (tabs.length === 0) {
-      dispatch(addTab({ mode: 'shell' }))
+      dispatch(createDefaultPaneBackedTab())
     }
   }, [tabs.length, dispatch])
 

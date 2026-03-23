@@ -66,6 +66,25 @@ test.describe('Terminal Exact Session Identity', () => {
     })
 
     await page.addInitScript((seed) => {
+      window.localStorage.setItem('freshell.workspace.v1', JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId: 'tab-codex-1',
+          tabs: [seed.first.tab, seed.second.tab],
+        },
+        panes: {
+          layouts: {
+            [seed.first.tab.id]: seed.first.pane,
+            [seed.second.tab.id]: seed.second.pane,
+          },
+          activePane: {
+            [seed.first.tab.id]: seed.first.pane.id,
+            [seed.second.tab.id]: seed.second.pane.id,
+          },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+      }))
       window.localStorage.setItem('freshell.tabs.v2', JSON.stringify({
         version: 1,
         tabs: {
@@ -145,6 +164,44 @@ test.describe('Terminal Exact Session Identity', () => {
 
   test('blocks degraded no-layout coding restore instead of guessing', async ({ page, serverInfo, harness }) => {
     await page.addInitScript(() => {
+      window.localStorage.setItem('freshell.workspace.v1', JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId: 'tab-degraded',
+          tabs: [{
+            id: 'tab-degraded',
+            title: 'Degraded Codex',
+            createRequestId: 'req-degraded',
+            status: 'creating',
+            mode: 'codex',
+            shell: 'system',
+            resumeSessionId: 'legacy-codex-session',
+            createdAt: Date.now(),
+          }],
+        },
+        panes: {
+          layouts: {
+            'tab-degraded': {
+              type: 'leaf',
+              id: 'pane-degraded',
+              content: {
+                kind: 'terminal',
+                createRequestId: 'req-degraded',
+                status: 'creating',
+                mode: 'codex',
+                shell: 'system',
+                initialCwd: '/workspace/shared',
+                resumeSessionId: 'legacy-codex-session',
+              },
+            },
+          },
+          activePane: {
+            'tab-degraded': 'pane-degraded',
+          },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+      }))
       window.localStorage.setItem('freshell.tabs.v2', JSON.stringify({
         version: 1,
         tabs: {
@@ -163,8 +220,24 @@ test.describe('Terminal Exact Session Identity', () => {
       }))
       window.localStorage.setItem('freshell.panes.v2', JSON.stringify({
         version: 6,
-        layouts: {},
-        activePane: {},
+        layouts: {
+          'tab-degraded': {
+            type: 'leaf',
+            id: 'pane-degraded',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-degraded',
+              status: 'creating',
+              mode: 'codex',
+              shell: 'system',
+              initialCwd: '/workspace/shared',
+              resumeSessionId: 'legacy-codex-session',
+            },
+          },
+        },
+        activePane: {
+          'tab-degraded': 'pane-degraded',
+        },
         paneTitles: {},
         paneTitleSetByUser: {},
       }))
@@ -184,6 +257,7 @@ test.describe('Terminal Exact Session Identity', () => {
     const state = await harness.getState()
     expect(state.panes.layouts['tab-degraded']).toMatchObject({
       type: 'leaf',
+      id: 'pane-degraded',
       content: {
         kind: 'terminal',
         createRequestId: 'req-degraded',

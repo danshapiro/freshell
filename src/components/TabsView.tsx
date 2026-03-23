@@ -15,8 +15,9 @@ import {
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
-import { addTab, setActiveTab } from '@/store/tabsSlice'
-import { addPane, initLayout } from '@/store/panesSlice'
+import { setActiveTab } from '@/store/tabsSlice'
+import { addPane } from '@/store/panesSlice'
+import { createPaneBackedTab } from '@/store/workspaceActions'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
@@ -387,14 +388,13 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         trustedLocalRecord,
       })
       : { kind: 'terminal', mode: 'shell' } as const
-    dispatch(addTab({
-      id: tabId,
-      title: record.tabName,
-      mode: deriveModeFromRecord(record),
-      status: 'creating',
-    }))
-    dispatch(initLayout({
-      tabId,
+    dispatch(createPaneBackedTab({
+      tab: {
+        id: tabId,
+        title: record.tabName,
+        mode: deriveModeFromRecord(record),
+        status: 'creating',
+      },
       content: firstContent,
     }))
     for (const pane of paneSnapshots.slice(1)) {
@@ -413,14 +413,13 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     const state = store.getState()
     const trustedLocalRecord = !!state.panes.layouts[record.tabId]
     const tabId = nanoid()
-    dispatch(addTab({
-      id: tabId,
-      title: `${record.tabName} · ${pane.title || pane.kind}`,
-      mode: deriveModeFromRecord(record),
-      status: 'creating',
-    }))
-    dispatch(initLayout({
-      tabId,
+    dispatch(createPaneBackedTab({
+      tab: {
+        id: tabId,
+        title: `${record.tabName} · ${pane.title || pane.kind}`,
+        mode: deriveModeFromRecord(record),
+        status: 'creating',
+      },
       content: sanitizePaneSnapshot(record, pane, {
         localServerInstanceId,
         trustedLocalRecord,

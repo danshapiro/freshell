@@ -583,6 +583,20 @@ describe('loadInitialPanesState consistency', () => {
   it('initial pane state matches loadPersistedPanes output for migrated data', async () => {
     // Simulate v1 data (no lifecycle fields) that needs migration
     localStorageMock.clear()
+    localStorage.setItem('freshell.tabs.v2', JSON.stringify({
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{
+          id: 'tab-1',
+          title: 'Migrated Tab',
+          createRequestId: 'req-tab-1',
+          status: 'creating',
+          mode: 'shell',
+          shell: 'system',
+          createdAt: 1,
+        }],
+      },
+    }))
     localStorage.setItem('freshell.panes.v2', JSON.stringify({
       layouts: {
         'tab-1': {

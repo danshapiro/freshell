@@ -1,5 +1,6 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import { splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import { createPaneBackedTab } from '@/store/workspaceActions'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
@@ -100,7 +101,25 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
 
   switch (msg.command) {
     case 'tab.create':
-      dispatch(addTab({
+      if (msg.payload.paneContent) {
+        return dispatch(createPaneBackedTab({
+          tab: {
+            id: msg.payload.id,
+            title: msg.payload.title,
+            mode: msg.payload.mode,
+            shell: msg.payload.shell,
+            terminalId: msg.payload.terminalId,
+            initialCwd: msg.payload.initialCwd,
+            resumeSessionId: msg.payload.resumeSessionId,
+            status: msg.payload.status,
+            createRequestId: msg.payload.createRequestId
+              || msg.payload.paneContent?.createRequestId,
+          },
+          paneId: msg.payload.paneId,
+          content: hydrateUiCommandPaneContent(msg.payload.paneContent, localServerInstanceId)!,
+        }))
+      }
+      return dispatch(addTab({
         id: msg.payload.id,
         title: msg.payload.title,
         mode: msg.payload.mode,
@@ -109,17 +128,8 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         initialCwd: msg.payload.initialCwd,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
-        createRequestId: msg.payload.createRequestId
-          || msg.payload.paneContent?.createRequestId,
+        createRequestId: msg.payload.createRequestId,
       }))
-      if (msg.payload.paneId && msg.payload.paneContent) {
-        return dispatch(initLayout({
-          tabId: msg.payload.id,
-          paneId: msg.payload.paneId,
-          content: hydrateUiCommandPaneContent(msg.payload.paneContent, localServerInstanceId)!,
-        }))
-      }
-      return
     case 'tab.select':
       return dispatch(setActiveTab(msg.payload.id))
     case 'tab.rename':

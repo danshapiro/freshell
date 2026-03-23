@@ -5,10 +5,17 @@ import { setLocalSettings } from './settingsSlice'
 import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
-import { parsePersistedPanesRaw, parsePersistedTabsRaw, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './persistedState'
+import { parsePersistedPanesRaw, parsePersistedTabsRaw } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
-import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  PANES_STORAGE_KEY,
+  TABS_STORAGE_KEY,
+  WORKSPACE_STORAGE_KEY,
+} from './storage-keys'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
+import { hydrateWorkspaceSnapshot } from './workspaceActions'
+import { parsePersistedWorkspaceRaw } from './workspacePersistence'
 
 type StoreLike = {
   dispatch: (action: any) => any
@@ -46,25 +53,71 @@ function collectPaneIdsSafe(node: unknown): string[] {
   return ids
 }
 
+function resolveHydratedActiveTabId(
+  localActiveTabId: string | null | undefined,
+  remoteTabs: Array<{ id?: string }>,
+  remoteActiveTabId: string | null | undefined,
+) {
+  const remoteIds = new Set(
+    remoteTabs
+      .map((tab) => tab?.id)
+      .filter((id): id is string => typeof id === 'string'),
+  )
+
+  const desiredActiveTabId =
+    localActiveTabId && remoteIds.has(localActiveTabId)
+      ? localActiveTabId
+      : remoteActiveTabId
+
+  return desiredActiveTabId && remoteIds.has(desiredActiveTabId)
+    ? desiredActiveTabId
+    : (remoteTabs[0]?.id ?? null)
+}
+
+function resolveHydratedActivePaneByTab(
+  layouts: Record<string, unknown>,
+  remoteActivePane: Record<string, string> | undefined,
+  localActivePaneByTab: Record<string, string>,
+) {
+  const nextActivePane: Record<string, string> = {}
+
+  for (const [tabId, node] of Object.entries(layouts || {})) {
+    const leafIds = collectPaneIdsSafe(node)
+    if (leafIds.length === 0) continue
+    const leafSet = new Set(leafIds)
+
+    const localDesired = localActivePaneByTab[tabId]
+    if (typeof localDesired === 'string' && leafSet.has(localDesired)) {
+      nextActivePane[tabId] = localDesired
+      continue
+    }
+
+    const remoteDesired = remoteActivePane?.[tabId]
+    if (typeof remoteDesired === 'string' && leafSet.has(remoteDesired)) {
+      nextActivePane[tabId] = remoteDesired
+      continue
+    }
+
+    nextActivePane[tabId] = leafIds[leafIds.length - 1]
+  }
+
+  return nextActivePane
+}
+
 function dispatchHydrateTabsFromPersisted(store: StoreLike, raw: string) {
   const parsed = parsePersistedTabsRaw(raw)
   if (!parsed) return
 
-  const remoteTabs = parsed.tabs.tabs
-  const remoteIds = new Set(remoteTabs.map((t: any) => t?.id).filter((id: any): id is string => typeof id === 'string'))
-
   const state = store.getState()
-  const localActive = state?.tabs?.activeTabId as string | null | undefined
-
-  const desired = (localActive && remoteIds.has(localActive)) ? localActive : parsed.tabs.activeTabId
-  const activeTabId =
-    desired && remoteIds.has(desired)
-      ? desired
-      : (remoteTabs[0]?.id ?? null)
+  const activeTabId = resolveHydratedActiveTabId(
+    state?.tabs?.activeTabId as string | null | undefined,
+    parsed.tabs.tabs as Array<{ id?: string }>,
+    parsed.tabs.activeTabId,
+  )
 
   store.dispatch({
     ...hydrateTabs({
-      tabs: remoteTabs,
+      tabs: parsed.tabs.tabs,
       activeTabId,
       renameRequestTabId: null,
     } as any),
@@ -77,37 +130,57 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
   if (!parsed) return
 
   const state = store.getState()
-  const localActiveByTab = (state?.panes?.activePane || {}) as Record<string, string>
-
-  const nextActive: Record<string, string> = {}
-
-  for (const [tabId, node] of Object.entries(parsed.layouts || {})) {
-    const leafIds = collectPaneIdsSafe(node)
-    if (leafIds.length === 0) continue
-    const leafSet = new Set(leafIds)
-
-    const localDesired = localActiveByTab[tabId]
-    if (typeof localDesired === 'string' && leafSet.has(localDesired)) {
-      nextActive[tabId] = localDesired
-      continue
-    }
-
-    const remoteDesired = parsed.activePane?.[tabId]
-    if (typeof remoteDesired === 'string' && leafSet.has(remoteDesired)) {
-      nextActive[tabId] = remoteDesired
-      continue
-    }
-
-    nextActive[tabId] = leafIds[leafIds.length - 1]
-  }
+  const nextActivePane = resolveHydratedActivePaneByTab(
+    parsed.layouts,
+    parsed.activePane,
+    (state?.panes?.activePane || {}) as Record<string, string>,
+  )
 
   store.dispatch({
     ...hydratePanes({
       layouts: parsed.layouts as any,
-      activePane: nextActive,
+      activePane: nextActivePane,
       paneTitles: parsed.paneTitles,
       paneTitleSetByUser: parsed.paneTitleSetByUser,
     } as any),
+    meta: { skipPersist: true, source: 'cross-tab' },
+  })
+}
+
+function dispatchHydrateWorkspaceFromPersisted(store: StoreLike, raw: string) {
+  const parsed = parsePersistedWorkspaceRaw(raw)
+  if (!parsed) return
+
+  const state = store.getState()
+  const activeTabId = resolveHydratedActiveTabId(
+    state?.tabs?.activeTabId as string | null | undefined,
+    parsed.tabs.tabs as Array<{ id?: string }>,
+    parsed.tabs.activeTabId,
+  )
+  const nextActivePane = resolveHydratedActivePaneByTab(
+    parsed.panes.layouts,
+    parsed.panes.activePane,
+    (state?.panes?.activePane || {}) as Record<string, string>,
+  )
+
+  store.dispatch({
+    ...hydrateWorkspaceSnapshot({
+      tabs: {
+        tabs: parsed.tabs.tabs as any,
+        activeTabId,
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: parsed.panes.layouts as any,
+        activePane: nextActivePane,
+        paneTitles: parsed.panes.paneTitles,
+        paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+    }),
     meta: { skipPersist: true, source: 'cross-tab' },
   })
 }
@@ -160,7 +233,9 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
 }
 
 function handleIncomingRaw(store: StoreLike, key: string, raw: string, previousRaw?: string) {
-  if (key === TABS_STORAGE_KEY) {
+  if (key === WORKSPACE_STORAGE_KEY) {
+    dispatchHydrateWorkspaceFromPersisted(store, raw)
+  } else if (key === TABS_STORAGE_KEY) {
     dispatchHydrateTabsFromPersisted(store, raw)
   } else if (key === PANES_STORAGE_KEY) {
     dispatchHydratePanesFromPersisted(store, raw)
@@ -172,29 +247,38 @@ function handleIncomingRaw(store: StoreLike, key: string, raw: string, previousR
 export function installCrossTabSync(store: StoreLike): () => void {
   if (typeof window === 'undefined') return () => {}
 
-  // Storage events and BroadcastChannel can both deliver the same persisted payload.
-  // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
-  for (const key of [TABS_STORAGE_KEY, PANES_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
+  for (const key of [
+    WORKSPACE_STORAGE_KEY,
+    TABS_STORAGE_KEY,
+    PANES_STORAGE_KEY,
+    BROWSER_PREFERENCES_STORAGE_KEY,
+  ]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
     }
   }
 
+  const hasAuthoritativeWorkspace = () => typeof localStorage.getItem(WORKSPACE_STORAGE_KEY) === 'string'
+
+  const shouldIgnoreMirrorEvent = (key: string) =>
+    key !== WORKSPACE_STORAGE_KEY
+    && (key === TABS_STORAGE_KEY || key === PANES_STORAGE_KEY)
+    && hasAuthoritativeWorkspace()
+
   const handleIncomingRawDeduped = (key: string, raw: string) => {
+    if (shouldIgnoreMirrorEvent(key)) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (previousRaw === raw) return
     lastProcessedRawByKey.set(key, raw)
     handleIncomingRaw(store, key, raw, previousRaw)
   }
 
-  // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
-  // then diverge locally (persisted raw changes), a later remote event with the original raw
-  // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
     if (
-      msg.key !== TABS_STORAGE_KEY
+      msg.key !== WORKSPACE_STORAGE_KEY
+      && msg.key !== TABS_STORAGE_KEY
       && msg.key !== PANES_STORAGE_KEY
       && msg.key !== BROWSER_PREFERENCES_STORAGE_KEY
     ) {
@@ -207,7 +291,8 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
     if (
-      key !== TABS_STORAGE_KEY
+      key !== WORKSPACE_STORAGE_KEY
+      && key !== TABS_STORAGE_KEY
       && key !== PANES_STORAGE_KEY
       && key !== BROWSER_PREFERENCES_STORAGE_KEY
     ) {

@@ -3,13 +3,17 @@ import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest, SessionLocator } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
-import { loadPersistedPanes } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
-import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import {
+  createPaneBackedTab,
+  hydrateWorkspaceSnapshot,
+  restorePaneBackedTab,
+} from './workspaceActions'
+import { loadPersistedWorkspaceSnapshot } from './workspacePersistence'
 
 
 const log = createLogger('PanesSlice')
@@ -131,57 +135,43 @@ function normalizePaneContent(
 
 /**
  * Remove pane layouts/activePane/paneTitles for tabs that no longer exist.
- * Reads the tab list from localStorage (already loaded by tabsSlice at this point).
+ * Uses the tab IDs from the already-loaded workspace snapshot.
  */
-function cleanOrphanedLayouts(state: PanesState): PanesState {
-  try {
-    const rawTabs = localStorage.getItem(TABS_STORAGE_KEY)
-    if (!rawTabs) return state
-    const parsedTabs = JSON.parse(rawTabs)
-    const tabs = parsedTabs?.tabs?.tabs
-    if (!Array.isArray(tabs)) return state
+function cleanOrphanedLayouts(state: PanesState, tabIds: Iterable<string>): PanesState {
+  const tabIdSet = new Set(tabIds)
+  const layoutTabIds = Object.keys(state.layouts)
+  const orphaned = layoutTabIds.filter(id => !tabIdSet.has(id))
 
-    const tabIds = new Set(tabs.map((t: any) => t?.id).filter(Boolean))
-    const layoutTabIds = Object.keys(state.layouts)
-    const orphaned = layoutTabIds.filter(id => !tabIds.has(id))
+  if (orphaned.length === 0) return state
 
-    if (orphaned.length === 0) return state
+  log.debug('Cleaning orphaned pane layouts:', orphaned)
 
-    log.debug('Cleaning orphaned pane layouts:', orphaned)
+  const nextLayouts = { ...state.layouts }
+  const nextActivePane = { ...state.activePane }
+  const nextPaneTitles = { ...state.paneTitles }
+  const nextPaneTitleSetByUser = { ...state.paneTitleSetByUser }
+  const nextRefreshRequestsByPane = { ...state.refreshRequestsByPane }
 
-    const nextLayouts = { ...state.layouts }
-    const nextActivePane = { ...state.activePane }
-    const nextPaneTitles = { ...state.paneTitles }
-    const nextPaneTitleSetByUser = { ...state.paneTitleSetByUser }
-    const nextRefreshRequestsByPane = { ...state.refreshRequestsByPane }
+  for (const tabId of orphaned) {
+    delete nextLayouts[tabId]
+    delete nextActivePane[tabId]
+    delete nextPaneTitles[tabId]
+    delete nextPaneTitleSetByUser[tabId]
+    delete nextRefreshRequestsByPane[tabId]
+  }
 
-    for (const tabId of orphaned) {
-      delete nextLayouts[tabId]
-      delete nextActivePane[tabId]
-      delete nextPaneTitles[tabId]
-      delete nextPaneTitleSetByUser[tabId]
-      delete nextRefreshRequestsByPane[tabId]
-    }
-
-    return {
-      ...state,
-      layouts: nextLayouts,
-      activePane: nextActivePane,
-      paneTitles: nextPaneTitles,
-      paneTitleSetByUser: nextPaneTitleSetByUser,
-      refreshRequestsByPane: nextRefreshRequestsByPane,
-    }
-  } catch {
-    return state
+  return {
+    ...state,
+    layouts: nextLayouts,
+    activePane: nextActivePane,
+    paneTitles: nextPaneTitles,
+    paneTitleSetByUser: nextPaneTitleSetByUser,
+    refreshRequestsByPane: nextRefreshRequestsByPane,
   }
 }
 
-// Load persisted panes state directly at module initialization time
-// This ensures the initial state includes persisted data BEFORE the store is created.
-// Delegates to loadPersistedPanes() so that both Redux initial state and
-// terminal-restore.ts see identically migrated data.
-function loadInitialPanesState(): PanesState {
-  const defaultState: PanesState = {
+function createDefaultPanesState(): PanesState {
+  return {
     layouts: {},
     activePane: {},
     paneTitles: {},
@@ -191,14 +181,111 @@ function loadInitialPanesState(): PanesState {
     zoomedPane: {},
     refreshRequestsByPane: {},
   }
+}
+
+function applyInitLayoutState(
+  state: PanesState,
+  payload: { tabId: string; content: PaneContentInput; paneId?: string },
+) {
+  const { tabId, content, paneId: providedPaneId } = payload
+  // Don't overwrite existing layout
+  if (state.layouts[tabId]) return
+
+  const paneId = providedPaneId ?? nanoid()
+  const normalized = normalizePaneContent(content)
+  state.layouts[tabId] = {
+    type: 'leaf',
+    id: paneId,
+    content: normalized,
+  }
+  state.activePane[tabId] = paneId
+  state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+  reconcileRefreshRequestsForTab(state, tabId)
+}
+
+function applyRestoreLayoutState(
+  state: PanesState,
+  payload: { tabId: string; layout: PaneNode; paneTitles: Record<string, string> },
+) {
+  const { tabId, layout, paneTitles } = payload
+  // Don't overwrite existing layout (same guard as initLayout)
+  if (state.layouts[tabId]) return
+
+  // Deep-normalize all leaf content (clears stale terminalId, generates fresh createRequestId)
+  const normalizedLayout = normalizeRestoredTree(layout)
+  state.layouts[tabId] = normalizedLayout
+  state.activePane[tabId] = findFirstLeafId(normalizedLayout)
+  state.paneTitles[tabId] = paneTitles
+  reconcileRefreshRequestsForTab(state, tabId)
+}
+
+function applyHydratedPanesState(
+  state: PanesState,
+  incoming: PanesState,
+  options?: {
+    preserveLocalOnlyLayouts?: boolean
+  },
+) {
+  const preserveLocalOnlyLayouts = options?.preserveLocalOnlyLayouts ?? true
+  // Merge layouts: preserve local terminal assignments that are more
+  // advanced than the incoming (remote) state. This prevents cross-tab
+  // sync from clobbering in-progress terminal creation/attachment.
+  const mergedLayouts: Record<string, PaneNode> = {}
+  const incomingLayoutTabIds = new Set<string>()
+  for (const [tabId, incomingNode] of Object.entries(incoming.layouts || {})) {
+    const localNode = state.layouts[tabId]
+    const incomingHasShape = hasPaneTreeShape(incomingNode)
+    const mergedNode = localNode
+      ? mergeTerminalState(incomingNode as PaneNode, localNode)
+      : (incomingHasShape ? incomingNode as PaneNode : null)
+    const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
+    if (normalizedNode) {
+      mergedLayouts[tabId] = normalizedNode
+      if (incomingHasShape && normalizedNode !== localNode) {
+        incomingLayoutTabIds.add(tabId)
+      }
+    }
+  }
+  if (preserveLocalOnlyLayouts) {
+    // Include any local-only tabs not in incoming for split-key pane hydration.
+    // The combined workspace hydrate path is authoritative and must drop them.
+    for (const tabId of Object.keys(state.layouts)) {
+      if (!(tabId in mergedLayouts)) {
+        const normalizedLocalNode = normalizePaneTree(state.layouts[tabId])
+        if (normalizedLocalNode) {
+          mergedLayouts[tabId] = normalizedLocalNode
+        }
+      }
+    }
+  }
+
+  state.layouts = mergedLayouts
+  const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
+  state.activePane = nextMetadata.activePane
+  state.paneTitles = nextMetadata.paneTitles
+  state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
+  // Ephemeral signals must never be hydrated from remote
+  state.renameRequestTabId = null
+  state.renameRequestPaneId = null
+  state.zoomedPane = {}
+  state.refreshRequestsByPane = {}
+}
+
+// Load persisted panes state directly at module initialization time
+// This ensures the initial state includes persisted data BEFORE the store is created.
+// Delegates to loadPersistedPanes() so that both Redux initial state and
+// terminal-restore.ts see identically migrated data.
+function loadInitialPanesState(): PanesState {
+  const defaultState = createDefaultPanesState()
 
   try {
-    const loaded = loadPersistedPanes()
+    const loadedWorkspace = loadPersistedWorkspaceSnapshot()
+    const loaded = loadedWorkspace?.panes
     if (!loaded) return defaultState
 
     log.debug('Loaded initial state from localStorage:', Object.keys(loaded.layouts || {}))
     let state: PanesState = {
-      layouts: loaded.layouts || {},
+      layouts: (loaded.layouts || {}) as Record<string, PaneNode>,
       activePane: loaded.activePane || {},
       paneTitles: loaded.paneTitles || {},
       paneTitleSetByUser: loaded.paneTitleSetByUser || {},
@@ -207,7 +294,10 @@ function loadInitialPanesState(): PanesState {
       zoomedPane: {},
       refreshRequestsByPane: {},
     }
-    state = cleanOrphanedLayouts(state)
+    state = cleanOrphanedLayouts(
+      state,
+      loadedWorkspace?.tabs.tabs.map((tab) => tab.id) ?? [],
+    )
     return state
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
@@ -597,36 +687,14 @@ export const panesSlice = createSlice({
       state,
       action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
     ) => {
-      const { tabId, content, paneId: providedPaneId } = action.payload
-      // Don't overwrite existing layout
-      if (state.layouts[tabId]) return
-
-      const paneId = providedPaneId ?? nanoid()
-      const normalized = normalizePaneContent(content)
-      state.layouts[tabId] = {
-        type: 'leaf',
-        id: paneId,
-        content: normalized,
-      }
-      state.activePane[tabId] = paneId
-      state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
-      reconcileRefreshRequestsForTab(state, tabId)
+      applyInitLayoutState(state, action.payload)
     },
 
     restoreLayout: (
       state,
       action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string> }>
     ) => {
-      const { tabId, layout, paneTitles } = action.payload
-      // Don't overwrite existing layout (same guard as initLayout)
-      if (state.layouts[tabId]) return
-
-      // Deep-normalize all leaf content (clears stale terminalId, generates fresh createRequestId)
-      const normalizedLayout = normalizeRestoredTree(layout)
-      state.layouts[tabId] = normalizedLayout
-      state.activePane[tabId] = findFirstLeafId(normalizedLayout)
-      state.paneTitles[tabId] = paneTitles
-      reconcileRefreshRequestsForTab(state, tabId)
+      applyRestoreLayoutState(state, action.payload)
     },
 
     resetLayout: (
@@ -1198,48 +1266,7 @@ export const panesSlice = createSlice({
     },
 
     hydratePanes: (state, action: PayloadAction<PanesState>) => {
-      const incoming = action.payload
-
-      // Merge layouts: preserve local terminal assignments that are more
-      // advanced than the incoming (remote) state. This prevents cross-tab
-      // sync from clobbering in-progress terminal creation/attachment.
-      const mergedLayouts: Record<string, PaneNode> = {}
-      const incomingLayoutTabIds = new Set<string>()
-      for (const [tabId, incomingNode] of Object.entries(incoming.layouts || {})) {
-        const localNode = state.layouts[tabId]
-        const incomingHasShape = hasPaneTreeShape(incomingNode)
-        const mergedNode = localNode
-          ? mergeTerminalState(incomingNode as PaneNode, localNode)
-          : (incomingHasShape ? incomingNode as PaneNode : null)
-        const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
-        if (normalizedNode) {
-          mergedLayouts[tabId] = normalizedNode
-          if (incomingHasShape && normalizedNode !== localNode) {
-            incomingLayoutTabIds.add(tabId)
-          }
-        }
-      }
-      // Include any local-only tabs not in incoming (shouldn't normally happen,
-      // but defensive)
-      for (const tabId of Object.keys(state.layouts)) {
-        if (!(tabId in mergedLayouts)) {
-          const normalizedLocalNode = normalizePaneTree(state.layouts[tabId])
-          if (normalizedLocalNode) {
-            mergedLayouts[tabId] = normalizedLocalNode
-          }
-        }
-      }
-
-      state.layouts = mergedLayouts
-      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
-      state.activePane = nextMetadata.activePane
-      state.paneTitles = nextMetadata.paneTitles
-      state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
-      // Ephemeral signals must never be hydrated from remote
-      state.renameRequestTabId = null
-      state.renameRequestPaneId = null
-      state.zoomedPane = {}
-      state.refreshRequestsByPane = {}
+      applyHydratedPanesState(state, action.payload)
     },
 
     updatePaneTitle: (
@@ -1320,6 +1347,28 @@ export const panesSlice = createSlice({
         }
       }
     },
+  },
+  extraReducers: (builder) => {
+    builder
+      .addCase(createPaneBackedTab, (state, action) => {
+        applyInitLayoutState(state, {
+          tabId: action.payload.tab.id,
+          content: action.payload.content,
+          paneId: action.payload.paneId,
+        })
+      })
+      .addCase(restorePaneBackedTab, (state, action) => {
+        applyRestoreLayoutState(state, {
+          tabId: action.payload.tab.id,
+          layout: action.payload.layout,
+          paneTitles: action.payload.paneTitles,
+        })
+      })
+      .addCase(hydrateWorkspaceSnapshot, (state, action) => {
+        applyHydratedPanesState(state, action.payload.panes, {
+          preserveLocalOnlyLayouts: false,
+        })
+      })
   },
 })
 

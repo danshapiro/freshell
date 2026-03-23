@@ -27,6 +27,7 @@ import {
   buildOffscreenTabBrowserStorageSeed,
   buildTerminalBrowserStorageSeed,
 } from './seed-browser-storage.js'
+import { serializeWorkspaceSnapshot } from '@/store/workspacePersistence'
 import {
   seedVisibleFirstAuditServerHome,
   type VisibleFirstAuditHomeSeedResult,
@@ -248,10 +249,8 @@ async function bootstrapReconnectScenario(
   })
 
   return {
-    browserStorageSeed: {
-      freshell_version: '3',
-      'freshell.tabs.v2': JSON.stringify({
-        version: 2,
+    browserStorageSeed: (() => {
+      const serialized = serializeWorkspaceSnapshot({
         tabs: {
           activeTabId: 'tab-terminal-reconnect',
           tabs: [
@@ -266,35 +265,50 @@ async function bootstrapReconnectScenario(
               terminalId,
             },
           ],
+          renameRequestTabId: null,
         },
-      }),
-      'freshell.panes.v2': JSON.stringify({
-        version: 3,
-        layouts: {
-          'tab-terminal-reconnect': {
-            type: 'leaf',
-            id: 'pane-terminal-reconnect',
-            content: {
-              kind: 'terminal',
-              createRequestId: TERMINAL_RECONNECT_CREATE_REQUEST_ID,
-              status: 'running',
-              mode: 'shell',
-              shell: 'system',
-              terminalId,
+        panes: {
+          layouts: {
+            'tab-terminal-reconnect': {
+              type: 'leaf',
+              id: 'pane-terminal-reconnect',
+              content: {
+                kind: 'terminal',
+                createRequestId: TERMINAL_RECONNECT_CREATE_REQUEST_ID,
+                status: 'running',
+                mode: 'shell',
+                shell: 'system',
+                terminalId,
+              },
             },
           },
-        },
-        activePane: {
-          'tab-terminal-reconnect': 'pane-terminal-reconnect',
-        },
-        paneTitles: {
-          'tab-terminal-reconnect': {
-            'pane-terminal-reconnect': 'Reconnect Audit',
+          activePane: {
+            'tab-terminal-reconnect': 'pane-terminal-reconnect',
           },
+          paneTitles: {
+            'tab-terminal-reconnect': {
+              'pane-terminal-reconnect': 'Reconnect Audit',
+            },
+          },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
         },
-        paneTitleSetByUser: {},
-      }),
-    },
+      } as any)
+
+      if (!serialized.ok) {
+        throw new Error(`Invalid reconnect browser storage seed: ${serialized.missingLayoutTabIds.join(', ')}`)
+      }
+
+      return {
+        freshell_version: '3',
+        'freshell.workspace.v1': serialized.workspaceRaw,
+        'freshell.tabs.v2': serialized.tabsRaw,
+        'freshell.panes.v2': serialized.panesRaw,
+      }
+    })(),
   }
 }
 

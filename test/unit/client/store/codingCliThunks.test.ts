@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
+import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import { createCodingCliTab } from '@/store/codingCliThunks'
@@ -24,10 +25,21 @@ function createStore() {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
+      panes: panesReducer,
       codingCli: codingCliReducer,
     },
     preloadedState: {
       tabs: { tabs: [], activeTabId: null },
+      panes: {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
       codingCli: { sessions: {}, pendingRequests: {} },
     },
   })
@@ -54,6 +66,7 @@ describe('codingCliThunks', () => {
     expect(tab.codingCliSessionId).toBeDefined()
     expect(tab.status).toBe('creating')
     expect(tab.mode).toBe('codex')
+    expect(store.getState().panes.layouts).toEqual({})
 
     await Promise.resolve()
 
@@ -78,6 +91,7 @@ describe('codingCliThunks', () => {
     const updatedTab = store.getState().tabs.tabs[0]
     expect(updatedTab.codingCliSessionId).toBe('session-123')
     expect(updatedTab.status).toBe('running')
+    expect(store.getState().panes.layouts).toEqual({})
     expect(store.getState().codingCli.sessions['session-123']).toBeDefined()
   })
 

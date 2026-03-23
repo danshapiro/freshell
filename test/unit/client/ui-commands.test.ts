@@ -35,9 +35,9 @@ describe('handleUiCommand', () => {
       payload: { id: 't1', title: 'Alpha', paneId: 'pane-1', paneContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } },
     }, dispatch)
 
-    expect(actions.map((a) => a.type)).toEqual(['tabs/addTab', 'panes/initLayout'])
-    expect(actions[1].payload.paneId).toBe('pane-1')
-    expect(actions[1].payload.content.kind).toBe('browser')
+    expect(actions.map((a) => a.type)).toEqual(['workspace/createPaneBackedTab'])
+    expect(actions[0].payload.paneId).toBe('pane-1')
+    expect(actions[0].payload.content.kind).toBe('browser')
   })
 
   it('preserves createRequestId and synthesizes exact local sessionRef for server-originated coding panes', () => {
@@ -71,7 +71,8 @@ describe('handleUiCommand', () => {
       } as any),
     })
 
-    expect(actions[1].payload.content).toMatchObject({
+    expect(actions[0].type).toBe('workspace/createPaneBackedTab')
+    expect(actions[0].payload.content).toMatchObject({
       createRequestId: 'req-codex',
       resumeSessionId: 'codex-session-123',
       sessionRef: {

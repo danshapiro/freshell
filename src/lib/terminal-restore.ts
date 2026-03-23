@@ -1,4 +1,4 @@
-import { loadPersistedPanes } from '@/store/persistMiddleware'
+import { loadPersistedWorkspaceSnapshot } from '@/store/workspacePersistence'
 
 type PaneNode = {
   type: 'leaf' | 'split'
@@ -23,9 +23,9 @@ function collectCreateRequestIds(node: PaneNode | null | undefined): void {
   }
 }
 
-const persisted = loadPersistedPanes()
-if (persisted?.layouts && typeof persisted.layouts === 'object') {
-  for (const node of Object.values(persisted.layouts)) {
+const persistedWorkspace = loadPersistedWorkspaceSnapshot()
+if (persistedWorkspace?.panes.layouts && typeof persistedWorkspace.panes.layouts === 'object') {
+  for (const node of Object.values(persistedWorkspace.panes.layouts)) {
     collectCreateRequestIds(node as PaneNode)
   }
 }

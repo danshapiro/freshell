@@ -1,6 +1,7 @@
 import { Plus, X } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, setActiveTab } from '@/store/tabsSlice'
+import { setActiveTab } from '@/store/tabsSlice'
+import { createDefaultPaneBackedTab } from '@/store/workspaceActions'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { useCallback, useMemo } from 'react'
@@ -61,7 +62,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
 
   const handleNewTab = useCallback(() => {
     triggerHapticFeedback()
-    dispatch(addTab({ mode: 'shell' }))
+    dispatch(createDefaultPaneBackedTab())
     onClose()
   }, [dispatch, onClose])
 

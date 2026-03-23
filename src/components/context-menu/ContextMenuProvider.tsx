@@ -1,10 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { addTab, closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
+import { closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
-  initLayout,
   replacePane,
   requestPaneRefresh,
   requestPaneRename,
@@ -13,6 +12,12 @@ import {
   splitPane as splitPaneAction,
   swapSplit,
 } from '@/store/panesSlice'
+import {
+  createBrowserPaneBackedTab,
+  createDefaultPaneBackedTab,
+  createEditorPaneBackedTab,
+  createTerminalPaneBackedTab,
+} from '@/store/workspaceActions'
 import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -186,37 +191,29 @@ export function ContextMenuProvider({
   }, [tabsState.tabs, panes, paneTitles, extensionEntries])
 
   const newDefaultTab = useCallback(() => {
-    dispatch(addTab({ mode: 'shell' }))
+    dispatch(createDefaultPaneBackedTab())
   }, [dispatch])
 
   const newTabWithPane = useCallback((type: 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor') => {
     if (type === 'browser') {
-      const id = nanoid()
-      dispatch(addTab({ id, mode: 'shell' }))
-      dispatch(initLayout({ tabId: id, content: { kind: 'browser', url: '', devToolsOpen: false } }))
+      dispatch(createBrowserPaneBackedTab({
+        tab: { mode: 'shell' },
+      }))
       return
     }
     if (type === 'editor') {
-      const id = nanoid()
-      dispatch(addTab({ id, mode: 'shell' }))
-      dispatch(initLayout({
-        tabId: id,
-        content: {
-          kind: 'editor',
-          filePath: null,
-          language: null,
-          readOnly: false,
-          content: '',
-          viewMode: 'source',
-        },
+      dispatch(createEditorPaneBackedTab({
+        tab: { mode: 'shell' },
       }))
       return
     }
     if (type === 'cmd' || type === 'powershell' || type === 'wsl') {
-      dispatch(addTab({ mode: 'shell', shell: type }))
+      dispatch(createTerminalPaneBackedTab({
+        tab: { mode: 'shell', shell: type },
+      }))
       return
     }
-    dispatch(addTab({ mode: 'shell', shell: 'system' }))
+    dispatch(createDefaultPaneBackedTab({ shell: 'system' }))
   }, [dispatch])
 
   const renameTab = useCallback((tabId: string) => {
@@ -682,7 +679,13 @@ export function ContextMenuProvider({
       dispatch(setActiveTab(existing.id))
       return
     }
-    dispatch(addTab({ terminalId, status: 'running', mode: 'shell' }))
+    dispatch(createTerminalPaneBackedTab({
+      tab: {
+        terminalId,
+        status: 'running',
+        mode: 'shell',
+      },
+    }))
   }, [dispatch, tabsState.tabs])
 
   const renameTerminal = useCallback(async (terminalId: string) => {

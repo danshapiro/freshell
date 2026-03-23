@@ -199,7 +199,7 @@ describe('PaneLayout', () => {
       const defaultContent = createTerminalContent()
 
       renderWithStore(
-        <PaneLayout tabId={tabId} defaultContent={defaultContent} />,
+        <PaneLayout tabId={tabId} defaultContent={defaultContent} allowAutoInit={true} />,
         store
       )
 
@@ -243,12 +243,27 @@ describe('PaneLayout', () => {
       expect((state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content.kind).toBe('browser')
     })
 
+    it('does not initialize layout when auto-init is disabled', async () => {
+      const store = createStore()
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} allowAutoInit={false} />,
+        store,
+      )
+
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      })
+
+      expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+    })
+
     it('sets active pane when initializing layout', async () => {
       const store = createStore()
       const tabId = 'tab-1'
 
       renderWithStore(
-        <PaneLayout tabId={tabId} defaultContent={createTerminalContent()} />,
+        <PaneLayout tabId={tabId} defaultContent={createTerminalContent()} allowAutoInit={true} />,
         store
       )
 

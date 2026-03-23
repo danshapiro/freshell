@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef } from 'react'
+import { useEffect, useRef } from 'react'
 import { PaneLayout } from './panes'
+import MissingLayoutError from './panes/MissingLayoutError'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
@@ -7,8 +8,8 @@ import type { PaneContentInput } from '@/store/paneTypes'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getTabResumeSessionType } from '@/lib/session-metadata'
-import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { detectMissingLayoutCorruption } from '@/lib/tab-layout-integrity'
 
 interface TabContentProps {
   tabId: string
@@ -28,22 +29,24 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
     getInstalledPerfAuditBridge()?.mark('tab.selected_surface_visible', { tabId })
   }, [hidden, tabId])
 
-  const resumeSessionType = tab ? getTabResumeSessionType(tab) : undefined
-  const isNoLayoutPtyCodingRestore = !layout
-    && tab?.mode !== 'shell'
-    && !tab?.codingCliSessionId
-    && !getAgentChatProviderConfig(resumeSessionType || '')
-
-  useLayoutEffect(() => {
-    if (!isNoLayoutPtyCodingRestore || !tab) return
-    addTerminalRestoreRequestId(tab.createRequestId)
-  }, [isNoLayoutPtyCodingRestore, tab?.createRequestId])
-
   if (!tab) return null
+
+  const missingLayoutCorruption = detectMissingLayoutCorruption({ tab, layout })
+  const resumeSessionType = tab ? getTabResumeSessionType(tab) : undefined
 
   // For coding CLI session views with no terminal, use SessionView
   if (tab.codingCliSessionId && !tab.terminalId) {
     return <SessionView sessionId={tab.codingCliSessionId} hidden={hidden} />
+  }
+
+  if (missingLayoutCorruption) {
+    return (
+      <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
+        <ErrorBoundary key={tabId} label="Tab">
+          <MissingLayoutError tabTitle={tab.title} />
+        </ErrorBoundary>
+      </div>
+    )
   }
 
   // Build default content based on setting
@@ -54,20 +57,9 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       kind: 'terminal',
       mode: tab.mode,
       shell: tab.shell,
-      ...(isNoLayoutPtyCodingRestore ? { createRequestId: tab.createRequestId } : {}),
       resumeSessionId: tab.resumeSessionId,
       initialCwd: tab.initialCwd,
       terminalId: tab.terminalId,
-    }
-  } else if (isNoLayoutPtyCodingRestore) {
-    defaultContent = {
-      kind: 'terminal',
-      mode: tab.mode,
-      shell: tab.shell,
-      createRequestId: tab.createRequestId,
-      status: 'creating',
-      resumeSessionId: tab.resumeSessionId,
-      initialCwd: tab.initialCwd,
     }
   } else if (tab.resumeSessionId && resumeSessionType) {
     defaultContent = buildResumeContent({
@@ -113,7 +105,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   return (
     <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
       <ErrorBoundary key={tabId} label="Tab">
-        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
+        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} allowAutoInit={false} />
       </ErrorBoundary>
     </div>
   )

@@ -77,6 +77,16 @@ function createStore() {
   return store
 }
 
+function attachActionLog(store: ReturnType<typeof createStore>) {
+  const actions: any[] = []
+  const baseDispatch = store.dispatch.bind(store)
+  store.dispatch = ((action: any) => {
+    actions.push(action)
+    return baseDispatch(action)
+  }) as typeof store.dispatch
+  return actions
+}
+
 describe('TabsView', () => {
   beforeEach(() => {
     cleanup()
@@ -103,6 +113,7 @@ describe('TabsView', () => {
 
   it('drops resumeSessionId when opening remote copy from another server instance', () => {
     const store = createStore()
+    const actions = attachActionLog(store)
     store.dispatch(setServerInstanceId('srv-local'))
     store.dispatch(setTabRegistrySnapshot({
       localOpen: [],
@@ -147,6 +158,9 @@ describe('TabsView', () => {
     expect(remoteCard).toBeTruthy()
     fireEvent.click(within(remoteCard as HTMLElement).getByText('Open copy'))
 
+    expect(actions.map((action) => action.type)).toContain('workspace/createPaneBackedTab')
+    expect(actions.map((action) => action.type)).not.toContain('tabs/addTab')
+    expect(actions.map((action) => action.type)).not.toContain('panes/initLayout')
     const tabs = store.getState().tabs.tabs
     const newTab = tabs.find((tab) => tab.title === 'session remote')
     expect(newTab).toBeTruthy()
@@ -215,6 +229,7 @@ describe('TabsView', () => {
         connection: connectionReducer,
       },
     })
+    const actions = attachActionLog(store as ReturnType<typeof createStore>)
 
     store.dispatch(addTab({ id: 'local-codex', title: 'local codex', mode: 'codex', status: 'running' }))
     store.dispatch(initLayout({
@@ -230,6 +245,7 @@ describe('TabsView', () => {
         },
       },
     }))
+    actions.length = 0
 
     render(
       <Provider store={store}>
@@ -241,6 +257,9 @@ describe('TabsView', () => {
     expect(localCard).toBeTruthy()
     fireEvent.click(within(localCard as HTMLElement).getByText('Open copy'))
 
+    expect(actions.map((action) => action.type)).toContain('workspace/createPaneBackedTab')
+    expect(actions.map((action) => action.type)).not.toContain('tabs/addTab')
+    expect(actions.map((action) => action.type)).not.toContain('panes/initLayout')
     const copiedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'local-codex')
     expect(copiedTab?.title).toBe('local codex')
     const copiedLayout = copiedTab ? (store.getState().panes.layouts[copiedTab.id] as any) : undefined

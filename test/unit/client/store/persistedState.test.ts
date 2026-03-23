@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import {
+  parsePersistedPanesPayload,
   parsePersistedTabsRaw,
   parsePersistedPanesRaw,
   TABS_STORAGE_KEY,
@@ -103,6 +104,62 @@ describe('persistedState parsers', () => {
         sessionId: 'codex-session-123',
         serverInstanceId: 'srv-local',
       })
+    })
+
+    it('drops malformed pane layouts and their pane metadata in validated mode', () => {
+      const payload = {
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-valid': {
+            type: 'leaf',
+            id: 'pane-valid',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-valid',
+              status: 'creating',
+              mode: 'shell',
+              shell: 'system',
+            },
+          },
+          'tab-malformed': {},
+        },
+        activePane: {
+          'tab-valid': 'pane-valid',
+          'tab-malformed': 'pane-malformed',
+        },
+        paneTitles: {
+          'tab-valid': { 'pane-valid': 'Valid' },
+          'tab-malformed': { 'pane-malformed': 'Malformed' },
+        },
+        paneTitleSetByUser: {
+          'tab-malformed': { 'pane-malformed': true },
+        },
+      }
+
+      const parsed = parsePersistedPanesPayload(payload, {
+        requireWellFormedLayouts: true,
+      })
+      expect(parsed).not.toBeNull()
+      expect(parsed?.layouts).toEqual({
+        'tab-valid': {
+          type: 'leaf',
+          id: 'pane-valid',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-valid',
+            status: 'creating',
+            mode: 'shell',
+            shell: 'system',
+          },
+        },
+      })
+      expect(parsed?.activePane).toEqual({
+        'tab-valid': 'pane-valid',
+      })
+      expect(parsed?.paneTitles).toEqual({
+        'tab-valid': { 'pane-valid': 'Valid' },
+      })
+      expect(parsed?.paneTitleSetByUser).toEqual({})
     })
   })
 })

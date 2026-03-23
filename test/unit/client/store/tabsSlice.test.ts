@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import tabsReducer, {
   addTab,
   setActiveTab,
@@ -9,11 +9,18 @@ import tabsReducer, {
   closeTab,
   reorderTabs,
   openSessionTab,
+  reopenClosedTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
+import {
+  createPaneBackedTab,
+  hydrateWorkspaceSnapshot,
+  restorePaneBackedTab,
+} from '../../../../src/store/workspaceActions'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
+import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 import type { Tab } from '../../../../src/store/types'
 import { makeCodingCliSessionKey } from '../../../../src/lib/coding-cli-session-key'
 
@@ -38,6 +45,37 @@ function createOpenSessionStore(serverInstanceId?: string) {
   })
 }
 
+function createActionRecordingStore(serverInstanceId?: string) {
+  const actions: Array<{ type: string }> = []
+  const actionRecorder: Middleware = () => (next) => (action) => {
+    if (action && typeof action === 'object' && 'type' in action && typeof action.type === 'string') {
+      actions.push(action as { type: string })
+    }
+    return next(action)
+  }
+
+  const store = configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      connection: connectionReducer,
+      tabRegistry: tabRegistryReducer,
+    },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(actionRecorder),
+    preloadedState: {
+      connection: {
+        status: serverInstanceId ? 'ready' : 'connected',
+        serverInstanceId,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
+    },
+  })
+
+  return { store, actions }
+}
+
 // Mock nanoid to return predictable IDs for testing
 vi.mock('nanoid', () => ({
   nanoid: vi.fn(() => 'test-id-' + Math.random().toString(36).substr(2, 9)),
@@ -50,6 +88,7 @@ describe('tabsSlice', () => {
     initialState = {
       tabs: [],
       activeTabId: null,
+      renameRequestTabId: null,
     }
     vi.clearAllMocks()
   })
@@ -560,7 +599,136 @@ describe('tabsSlice', () => {
     })
   })
 
+  describe('shared workspace actions', () => {
+    it('normalizes created pane-backed tabs through createPaneBackedTab', () => {
+      const state = tabsReducer(
+        initialState,
+        createPaneBackedTab({
+          tab: {
+            id: 'pane-tab',
+            title: 'Pane Tab',
+            mode: 'codex',
+            resumeSessionId: 'codex-session-1',
+          },
+          paneId: 'pane-1',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'create-1',
+            mode: 'codex',
+            resumeSessionId: 'codex-session-1',
+          },
+        }),
+      )
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({
+          id: 'pane-tab',
+          title: 'Pane Tab',
+          mode: 'codex',
+          status: 'creating',
+          shell: 'system',
+          createRequestId: 'pane-tab',
+          resumeSessionId: 'codex-session-1',
+        }),
+      ])
+      expect(state.activeTabId).toBe('pane-tab')
+    })
+
+    it('normalizes restored pane-backed tabs through restorePaneBackedTab', () => {
+      const state = tabsReducer(
+        initialState,
+        restorePaneBackedTab({
+          tab: {
+            id: 'restored-tab',
+            title: 'Restored Tab',
+            mode: 'claude',
+          },
+          layout: {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'stale-create-id',
+              terminalId: 'stale-terminal-id',
+              status: 'running',
+              mode: 'claude',
+            },
+          },
+          paneTitles: {
+            'pane-1': 'Restored Session',
+          },
+        }),
+      )
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({
+          id: 'restored-tab',
+          title: 'Restored Tab',
+          mode: 'claude',
+          status: 'creating',
+          shell: 'system',
+          createRequestId: 'restored-tab',
+        }),
+      ])
+      expect(state.tabs[0].createdAt).toBeTypeOf('number')
+      expect(state.activeTabId).toBe('restored-tab')
+    })
+
+    it('hydrates tabs through hydrateWorkspaceSnapshot with the same defaults as hydrateTabs', () => {
+      const state = tabsReducer(
+        initialState,
+        hydrateWorkspaceSnapshot({
+          tabs: {
+            tabs: [
+              {
+                id: 'hydrated-tab',
+                title: 'Hydrated Tab',
+                mode: 'shell',
+              },
+            ],
+            activeTabId: 'missing-tab',
+            renameRequestTabId: 'stale-rename-request',
+          },
+          panes: {
+            layouts: {},
+            activePane: {},
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
+          },
+        }),
+      )
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({
+          id: 'hydrated-tab',
+          title: 'Hydrated Tab',
+          mode: 'shell',
+          status: 'creating',
+          shell: 'system',
+          createRequestId: 'hydrated-tab',
+        }),
+      ])
+      expect(state.activeTabId).toBe('hydrated-tab')
+      expect(state.renameRequestTabId).toBeNull()
+    })
+  })
+
   describe('openSessionTab', () => {
+    it('dispatches createPaneBackedTab when opening a new pane-backed coding tab', async () => {
+      const { store, actions } = createActionRecordingStore('srv-local')
+
+      await store.dispatch(openSessionTab({ sessionId: 'codex-session-123', provider: 'codex' }))
+
+      const actionTypes = actions.map((action) => action.type)
+      expect(actionTypes).toContain('workspace/createPaneBackedTab')
+      expect(actionTypes).not.toContain('tabs/addTab')
+      expect(actionTypes).not.toContain('panes/initLayout')
+    })
+
     it('creates a new local tab instead of activating a foreign copied tab', async () => {
       const store = createOpenSessionStore('srv-local')
 
@@ -880,11 +1048,21 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('activates existing tab when terminalId is already attached and seeds a layout-backed pane', async () => {
+    it('activates existing tab when terminalId is already attached and preserves its layout-backed pane', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({ id: 'tab-1', mode: 'claude', terminalId: 'term-1', status: 'running' }))
       store.dispatch(addTab({ id: 'tab-2', mode: 'shell' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          terminalId: 'term-1',
+          status: 'running',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      }))
 
       await store.dispatch(openSessionTab({ sessionId: VALID_CLAUDE_SESSION_ID, provider: 'claude', terminalId: 'term-1' }))
 
@@ -905,6 +1083,20 @@ describe('tabsSlice', () => {
           },
         },
       })
+    })
+
+    it('does not repair an existing running tab whose layout is missing', async () => {
+      const { store, actions } = createActionRecordingStore('srv-local')
+
+      store.dispatch(addTab({ id: 'tab-1', mode: 'claude', terminalId: 'term-1', status: 'running' }))
+      actions.length = 0
+
+      await store.dispatch(openSessionTab({ sessionId: VALID_CLAUDE_SESSION_ID, provider: 'claude', terminalId: 'term-1' }))
+
+      const actionTypes = actions.map((action) => action.type)
+      expect(actionTypes).toContain('tabs/setActiveTab')
+      expect(actionTypes).not.toContain('panes/initLayout')
+      expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
     })
 
     it('creates a layout-backed running tab when terminalId is provided and no existing tab matches', async () => {
@@ -990,6 +1182,28 @@ describe('tabsSlice', () => {
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
       expect(tabs[0].title).toBe('Codex CLI')
+    })
+  })
+
+  describe('reopenClosedTab', () => {
+    it('dispatches restorePaneBackedTab when reopening a closed pane-backed tab', async () => {
+      const { store, actions } = createActionRecordingStore('srv-local')
+
+      store.dispatch(addTab({ id: 'tab-1', title: 'Original Tab', mode: 'shell' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        content: { kind: 'terminal', mode: 'shell' },
+      }))
+
+      await store.dispatch(closeTab('tab-1'))
+      actions.length = 0
+
+      await store.dispatch(reopenClosedTab())
+
+      const actionTypes = actions.map((action) => action.type)
+      expect(actionTypes).toContain('workspace/restorePaneBackedTab')
+      expect(actionTypes).not.toContain('tabs/addTab')
+      expect(actionTypes).not.toContain('panes/restoreLayout')
     })
   })
 
