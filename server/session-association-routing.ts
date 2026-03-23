@@ -1,6 +1,6 @@
 import type { CodingCliSession, ProjectGroup } from './coding-cli/types.js'
 
-const COMPATIBILITY_UPDATE_PROVIDERS = new Set(['opencode'])
+const COMPATIBILITY_UPDATE_PROVIDERS = new Set(['opencode', 'kimi'])
 
 type SplitAssociationProjectsForUpdateOptions = {
   includeClaudeSession?: (session: CodingCliSession) => boolean

@@ -1,0 +1,29 @@
+{
+  "work_dirs": [
+    {
+      "path": "/repo/root/packages/app",
+      "kaos": "local",
+      "last_session_id": "kimi-session-1"
+    },
+    {
+      "path": "/repo/root/packages/context",
+      "kaos": "local",
+      "last_session_id": "context-title-session"
+    },
+    {
+      "path": "/repo/root/packages/wire",
+      "kaos": "local",
+      "last_session_id": "wire-title-session"
+    },
+    {
+      "path": "/repo/root/packages/legacy",
+      "kaos": "local",
+      "last_session_id": "legacy-flat-session"
+    },
+    {
+      "path": "/repo/root/packages/remote-app",
+      "kaos": "ssh-prod",
+      "last_session_id": "named-kimi-session"
+    }
+  ]
+}

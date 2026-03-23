@@ -1,6 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
-import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
+import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest, SessionLocator } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes } from './persistMiddleware.js'
@@ -9,9 +9,45 @@ import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 
 const log = createLogger('PanesSlice')
+
+function sanitizePortableSessionRef(sessionRef: unknown, expectedProvider?: string): SessionLocator | undefined {
+  const exact = sanitizeExactSessionRef(sessionRef as any, expectedProvider)
+  if (exact) return exact
+  if (!sessionRef || typeof sessionRef !== 'object') return undefined
+  const candidate = sessionRef as {
+    provider?: unknown
+    sessionId?: unknown
+    cwd?: unknown
+    serverInstanceId?: unknown
+  }
+  if (typeof candidate.provider !== 'string' || typeof candidate.sessionId !== 'string') return undefined
+  if (expectedProvider && candidate.provider !== expectedProvider) return undefined
+  if (candidate.provider === 'claude' && !isValidClaudeSessionId(candidate.sessionId)) return undefined
+  return {
+    provider: candidate.provider as SessionLocator['provider'],
+    sessionId: candidate.sessionId,
+    ...(typeof candidate.cwd === 'string' ? { cwd: candidate.cwd } : {}),
+    ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
+  }
+}
+
+function buildFallbackSessionRef(
+  provider: string,
+  sessionId: string | undefined,
+  cwd?: string,
+): SessionLocator | undefined {
+  if (!sessionId) return undefined
+  if (provider !== 'kimi') return undefined
+  return {
+    provider: provider as SessionLocator['provider'],
+    sessionId,
+    ...(typeof cwd === 'string' ? { cwd } : {}),
+  }
+}
 
 /**
  * Normalize pane content to the full persisted/runtime shape.
@@ -25,8 +61,13 @@ function normalizePaneContent(
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
-    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, mode)
     const resumeSessionId = inputResumeSessionId
+    const initialCwd = typeof input.initialCwd === 'string' ? input.initialCwd : undefined
+    const explicitSessionRef = sanitizePortableSessionRef(input.sessionRef as any, mode)
+    const sessionRef = explicitSessionRef
+      ?? (resumeSessionId && mode !== 'shell'
+        ? buildFallbackSessionRef(mode, resumeSessionId, initialCwd)
+        : undefined)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -37,8 +78,8 @@ function normalizePaneContent(
       mode,
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
-      ...(explicitSessionRef ? { sessionRef: explicitSessionRef } : {}),
-      initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
+      ...(sessionRef ? { sessionRef } : {}),
+      initialCwd,
     }
   }
   if (input.kind === 'browser') {
@@ -55,8 +96,13 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
+    const initialCwd = typeof input.initialCwd === 'string' ? input.initialCwd : undefined
     const codingCliProvider = getAgentChatProviderConfig(input.provider)?.codingCliProvider
-    const explicitSessionRef = sanitizeExactSessionRef(input.sessionRef as any, codingCliProvider)
+    const explicitSessionRef = sanitizePortableSessionRef(input.sessionRef as any, codingCliProvider)
+    const sessionRef = explicitSessionRef
+      ?? (input.resumeSessionId && codingCliProvider
+        ? buildFallbackSessionRef(codingCliProvider, input.resumeSessionId, initialCwd)
+        : undefined)
     return {
       kind: 'agent-chat',
       provider: input.provider,
@@ -64,8 +110,8 @@ function normalizePaneContent(
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
-      ...(explicitSessionRef ? { sessionRef: explicitSessionRef } : {}),
-      initialCwd: input.initialCwd,
+      ...(sessionRef ? { sessionRef } : {}),
+      initialCwd,
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,

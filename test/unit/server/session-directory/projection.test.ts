@@ -35,6 +35,7 @@ describe('session-directory projection', () => {
     })).toEqual({
       provider: 'codex',
       sessionId: 's1',
+      sessionKey: 'codex:s1',
       projectPath: '/repo',
       lastActivityAt: 100,
       createdAt: 50,

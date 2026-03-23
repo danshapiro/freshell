@@ -11,6 +11,7 @@ import net from 'net'
 import os from 'os'
 import path from 'path'
 import { spawn, type ChildProcess } from 'child_process'
+import { CLAUDE_PERMISSION_MODE_VALUES } from '../shared/settings.js'
 import { ExtensionManifestSchema, type ExtensionManifest } from './extension-manifest.js'
 import { logger } from './logger.js'
 import type { ClientExtensionEntry } from '../shared/extension-types.js'
@@ -43,6 +44,29 @@ interface RunningProcess {
 
 const MANIFEST_FILE = 'freshell.json'
 const GRACEFUL_SHUTDOWN_MS = 5000
+
+function deriveSupportedPermissionModes(manifest: ExtensionManifest): string[] | undefined {
+  const cli = manifest.cli
+  if (!cli) return undefined
+
+  if (cli.permissionModeArgsByValue) {
+    return CLAUDE_PERMISSION_MODE_VALUES.filter(
+      (mode) => mode === 'default' || !!cli.permissionModeArgsByValue?.[mode],
+    )
+  }
+
+  if (cli.permissionModeValues && !cli.permissionModeArgs) {
+    return CLAUDE_PERMISSION_MODE_VALUES.filter(
+      (mode) => mode === 'default' || !!cli.permissionModeValues?.[mode],
+    )
+  }
+
+  if (cli.supportsPermissionMode) {
+    return [...CLAUDE_PERMISSION_MODE_VALUES]
+  }
+
+  return undefined
+}
 
 export class ExtensionManager extends EventEmitter {
   private registry = new Map<string, ExtensionRegistryEntry>()
@@ -178,6 +202,7 @@ export class ExtensionManager extends EventEmitter {
           : undefined
         clientEntry.cli = {
           supportsPermissionMode: manifest.cli.supportsPermissionMode,
+          supportedPermissionModes: deriveSupportedPermissionModes(manifest),
           supportsModel: manifest.cli.supportsModel,
           supportsSandbox: manifest.cli.supportsSandbox,
           supportsResume: !!manifest.cli.resumeArgs,

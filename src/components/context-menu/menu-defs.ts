@@ -2,12 +2,18 @@ import { createElement } from 'react'
 import { ClipboardPaste, Copy, TextSelect } from 'lucide-react'
 import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
-import type { Tab, ProjectGroup } from '@/store/types'
+import type { ShellType, Tab, ProjectGroup } from '@/store/types'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
+import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
-import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import {
+  buildResumeCommand,
+  isResumeCommandProvider,
+  type BuildResumeCommandOptions,
+  type ResumeCommandProvider,
+} from '@/lib/coding-cli-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export type MenuActions = {
@@ -44,7 +50,7 @@ export type MenuActions = {
   copySessionCwd: (sessionId: string, provider?: string) => void
   copySessionSummary: (sessionId: string, provider?: string) => void
   copySessionMetadata: (sessionId: string, provider?: string) => void
-  copyResumeCommand: (provider: ResumeCommandProvider, sessionId: string) => void
+  copyResumeCommand: (provider: ResumeCommandProvider, sessionId: string, options?: BuildResumeCommandOptions) => void
   setProjectColor: (projectPath: string) => void
   toggleProjectExpanded: (projectPath: string, expanded: boolean) => void
   openAllSessionsInProject: (projectPath: string) => void
@@ -84,9 +90,14 @@ function isWindowsLike(platform: string | null): boolean {
   return platform === 'win32' || platform === 'wsl'
 }
 
-function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: string) {
+function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: string, sessionKey?: string) {
   for (const project of projects) {
-    const session = project.sessions.find((s) => s.sessionId === sessionId)
+    const session = project.sessions.find((s) => {
+      if (sessionKey) {
+        return getCodingCliSessionKey(s) === sessionKey
+      }
+      return s.sessionId === sessionId && (!provider || s.provider === provider)
+    })
     if (session && (!provider || session.provider === provider)) return { session, project }
   }
   return null
@@ -95,6 +106,8 @@ function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: 
 type ResumeCommandCandidate = {
   provider: ResumeCommandProvider
   sessionId?: string
+  cwd?: string
+  shell?: ShellType
 }
 
 function getTabProvider(tab?: Tab): string | undefined {
@@ -110,6 +123,8 @@ function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab, e
   return {
     provider: content.mode,
     sessionId,
+    cwd: content.initialCwd,
+    shell: content.shell,
   }
 }
 
@@ -119,18 +134,31 @@ function getResumeCandidateForLegacyTab(tab?: Tab, extensions?: ClientExtensionE
   return {
     provider,
     sessionId: tab?.resumeSessionId,
+    cwd: tab?.initialCwd,
+    shell: tab?.shell,
   }
 }
 
-function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, actions: MenuActions, extensions?: ClientExtensionEntry[]): MenuItem {
-  const canCopy = !!buildResumeCommand(candidate.provider, candidate.sessionId, extensions)
+function buildCopyResumeMenuItem(
+  id: string,
+  candidate: ResumeCommandCandidate,
+  actions: MenuActions,
+  platform: string | null,
+  extensions?: ClientExtensionEntry[],
+): MenuItem {
+  const options = {
+    cwd: candidate.cwd,
+    shell: candidate.shell,
+    platform,
+  }
+  const canCopy = !!buildResumeCommand(candidate.provider, candidate.sessionId, extensions, options)
   return {
     type: 'item',
     id,
     label: 'Copy resume command',
     onSelect: () => {
       if (!candidate.sessionId) return
-      actions.copyResumeCommand(candidate.provider, candidate.sessionId)
+      actions.copyResumeCommand(candidate.provider, candidate.sessionId, options)
     },
     disabled: !canCopy,
   }
@@ -178,13 +206,18 @@ function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
   const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform, extensions } = ctx
-  const isSessionOpen = (sessionId: string, provider?: string) => {
+  const isSessionOpen = (sessionId: string, provider?: string, sessionKey?: string) => {
     const keyProvider = provider || 'claude'
     for (const tab of tabs) {
       const layout = paneLayouts[tab.id]
       if (!layout) continue
       const refs = collectSessionRefsFromNode(layout)
-      if (refs.some((ref) => ref.provider === keyProvider && ref.sessionId === sessionId)) {
+      if (refs.some((ref) => {
+        if (sessionKey) {
+          return getCodingCliSessionKey(ref) === sessionKey
+        }
+        return ref.provider === keyProvider && ref.sessionId === sessionId
+      })) {
         return true
       }
     }
@@ -247,7 +280,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
           ? getResumeCandidateForLegacyTab(tab, extensions)
           : null
     const tabResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('tab-copy-resume-command', resumeCandidate, actions, extensions)]
+      ? [buildCopyResumeMenuItem('tab-copy-resume-command', resumeCandidate, actions, platform, extensions)]
       : []
     const isFirst = index <= 0
     const isLast = index === tabs.length - 1
@@ -296,7 +329,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const paneContent = layout ? findPaneContent(layout, target.paneId) : null
     const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab, extensions) : null
     const paneResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions, extensions)]
+      ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions, platform, extensions)]
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
@@ -332,7 +365,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const paneContent = layout ? findPaneContent(layout, target.paneId) : null
     const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab, extensions) : null
     const terminalResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, extensions)]
+      ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, platform, extensions)]
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
@@ -453,18 +486,19 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   }
 
   if (target.kind === 'sidebar-session') {
-    const sessionInfo = getSessionById(sessions, target.sessionId, target.provider)
+    const sessionInfo = getSessionById(sessions, target.sessionId, target.provider, target.sessionKey)
     const archived = sessionInfo?.session.archived ?? false
     const isRunning = !!target.runningTerminalId
-    const provider = target.provider || 'claude'
+    const provider = (sessionInfo?.session.provider || target.provider || 'claude') as ResumeCommandProvider
     const resumeCandidate = isResumeCommandProvider(provider, extensions)
       ? {
           provider,
-          sessionId: target.sessionId,
+          sessionId: sessionInfo?.session.sessionId || target.sessionId,
+          cwd: sessionInfo?.session.cwd,
         }
       : null
     const sidebarResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions, extensions)]
+      ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions, platform, extensions)]
       : []
 
     return [
@@ -513,9 +547,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   }
 
   if (target.kind === 'history-session') {
-    const sessionInfo = getSessionById(sessions, target.sessionId, target.provider)
+    const sessionInfo = getSessionById(sessions, target.sessionId, target.provider, target.sessionKey)
     const hasSummary = !!sessionInfo?.session.summary
-    const isOpen = isSessionOpen(target.sessionId, target.provider)
+    const isOpen = isSessionOpen(target.sessionId, target.provider, target.sessionKey)
     return [
       { type: 'item', id: 'history-session-open', label: 'Open session', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'history-session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider, true) },

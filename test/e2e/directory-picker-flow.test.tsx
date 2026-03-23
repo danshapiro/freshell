@@ -30,6 +30,11 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     picker: { shortcut: 'X' },
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
   },
+  {
+    name: 'kimi', version: '1.0.0', label: 'Kimi', description: '', category: 'cli',
+    picker: { shortcut: 'K' },
+    cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['kimi', '--session', '{{sessionId}}'] },
+  },
 ]
 
 const { mockApiGet, mockApiPost, mockApiPatch, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
@@ -125,6 +130,80 @@ function renderPickerFlow() {
           codingCli: {
             enabledProviders: ['claude'],
             providers: { claude: { cwd: '/home/user/work' } },
+          },
+          logging: { debug: false },
+        },
+        local: {
+          theme: 'system',
+          uiScale: 1,
+          terminal: {
+            fontSize: 14,
+            fontFamily: 'monospace',
+            lineHeight: 1.2,
+            cursorBlink: true,
+            theme: 'auto',
+          },
+          sidebar: {
+            sortMode: 'activity',
+            showProjectBadges: true,
+            width: 288,
+            collapsed: false,
+          },
+        },
+      }),
+    },
+  })
+
+  render(
+    <Provider store={store}>
+      <PaneContainer tabId="tab-1" node={node} />
+    </Provider>
+  )
+
+  return { store }
+}
+
+function renderKimiPickerFlow() {
+  const node: PaneNode = {
+    type: 'leaf',
+    id: 'pane-1',
+    content: { kind: 'picker' },
+  }
+
+  const store = configureStore({
+    reducer: {
+      panes: panesReducer,
+      tabs: tabsReducer,
+      settings: settingsReducer,
+      connection: connectionReducer,
+      extensions: extensionsReducer,
+    },
+    preloadedState: {
+      panes: {
+        layouts: { 'tab-1': node },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      },
+      tabs: {
+        tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
+        activeTabId: 'tab-1',
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready' as const,
+        platform: 'linux',
+        availableClis: { kimi: true },
+      },
+      settings: createSettingsState({
+        server: {
+          terminal: { scrollback: 5000 },
+          safety: { autoKillIdleMinutes: 180 },
+          panes: { defaultNewPane: 'ask' },
+          codingCli: {
+            enabledProviders: ['kimi'],
+            providers: { kimi: { cwd: '/repo/default' } },
           },
           logging: { debug: false },
         },
@@ -291,6 +370,38 @@ describe('directory picker flow (e2e)', () => {
       codingCli: {
         providers: {
           claude: expect.objectContaining({ cwd: '/home/user/next' }),
+        },
+      },
+    })
+  })
+
+  it('launches Kimi from the picker with the confirmed directory and persists that directory', async () => {
+    mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/repo/root/packages/app' })
+
+    const { store } = renderKimiPickerFlow()
+
+    const picker = document.querySelector('[data-context="pane-picker"]')
+    if (!picker) throw new Error('Pane picker not found')
+    fireEvent.keyDown(picker, { key: 'k' })
+    fireEvent.transitionEnd(picker)
+
+    const input = screen.getByLabelText('Starting directory for Kimi')
+    fireEvent.change(input, { target: { value: '/repo/root/packages/app' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const content = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(content.kind).toBe('terminal')
+      if (content.kind === 'terminal') {
+        expect(content.mode).toBe('kimi')
+        expect(content.initialCwd).toBe('/repo/root/packages/app')
+      }
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      codingCli: {
+        providers: {
+          kimi: expect.objectContaining({ cwd: '/repo/root/packages/app' }),
         },
       },
     })

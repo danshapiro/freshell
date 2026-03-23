@@ -22,10 +22,11 @@ import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
+import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { collectSessionRefsFromContent, collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
-import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import { buildResumeCommand, type BuildResumeCommandOptions, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -349,15 +350,26 @@ export function ContextMenuProvider({
 
   const getSessionInfo = useCallback((sessionId: string, provider?: string, target?: ContextTarget | null) => {
     for (const projects of getProjectCollections(target)) {
+      const targetSessionKey =
+        target?.kind === 'sidebar-session' || target?.kind === 'history-session'
+          ? target.sessionKey
+          : undefined
       for (const project of projects) {
-        const session = project.sessions.find((s) =>
-          s.sessionId === sessionId && (!provider || s.provider === provider)
-        )
+        const session = project.sessions.find((s) => {
+          if (targetSessionKey) {
+            return getCodingCliSessionKey(s) === targetSessionKey
+          }
+          return s.sessionId === sessionId && (!provider || s.provider === provider)
+        })
         if (session) return { session, project }
       }
     }
     return null
   }, [getProjectCollections])
+
+  const getSessionMutationKey = useCallback((session: CodingCliSession) => (
+    getCodingCliSessionKey(session)
+  ), [])
 
   const getProjectInfo = useCallback((projectPath: string, target?: ContextTarget | null) => {
     for (const projects of getProjectCollections(target)) {
@@ -380,6 +392,7 @@ export function ContextMenuProvider({
         isSubagent: session.isSubagent,
         isNonInteractive: session.isNonInteractive,
       },
+      session.cwd,
     )
     if (tab && sessionMetadataByKey !== tab.sessionMetadataByKey) {
       dispatch(updateTab({
@@ -398,7 +411,7 @@ export function ContextMenuProvider({
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
     const runningTerminalId =
-      target?.kind === 'sidebar-session' && target.sessionId === sessionId
+      target?.kind === 'sidebar-session' && (!target.sessionKey || target.sessionKey === getSessionMutationKey(session))
         ? target.runningTerminalId
         : undefined
     dispatch(openSessionTab({
@@ -413,7 +426,7 @@ export function ContextMenuProvider({
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
     }))
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, getSessionInfo, getSessionMutationKey, menuState?.target])
 
   const openSessionInThisTab = useCallback((sessionId: string, provider?: string) => {
     const activeTabId = tabsState.activeTabId
@@ -429,7 +442,7 @@ export function ContextMenuProvider({
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
     const runningTerminalId =
-      target?.kind === 'sidebar-session' && target.sessionId === sessionId
+      target?.kind === 'sidebar-session' && (!target.sessionKey || target.sessionKey === getSessionMutationKey(session))
         ? target.runningTerminalId
         : undefined
     const agentConfig = getAgentChatProviderConfig(sessionType)
@@ -447,12 +460,17 @@ export function ContextMenuProvider({
           provider: mode,
           sessionId: session.sessionId,
           serverInstanceId: localServerInstanceId,
-        }),
+        }) ?? (mode === 'kimi' ? {
+          provider: mode,
+          sessionId: session.sessionId,
+          ...(session.cwd ? { cwd: session.cwd } : {}),
+          ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
+        } : undefined),
         agentChatProviderSettings: providerSettings,
       }),
     }))
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab, localServerInstanceId])
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, getSessionMutationKey, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab, localServerInstanceId])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -466,7 +484,7 @@ export function ContextMenuProvider({
       summary = nextSummary || undefined
     }
     try {
-      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+      const compositeKey = getSessionMutationKey(info.session)
       await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
         titleOverride: title || undefined,
         summaryOverride: summary,
@@ -475,7 +493,7 @@ export function ContextMenuProvider({
     } catch {
       // ignore
     }
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, getSessionInfo, getSessionMutationKey, menuState?.target])
 
   const generateSessionTitle = useCallback(async (sessionId: string, provider?: string) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -483,23 +501,25 @@ export function ContextMenuProvider({
     const firstMessage = info.session.firstUserMessage || info.session.title || ''
     if (!firstMessage) return
     try {
-      const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+      const compositeKey = getSessionMutationKey(info.session)
       await api.post(`/api/sessions/${encodeURIComponent(compositeKey)}/generate-title`, { firstMessage })
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore — AI may not be configured
     }
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, getSessionInfo, getSessionMutationKey, menuState?.target])
 
   const toggleArchiveSession = useCallback(async (sessionId: string, provider: string | undefined, next: boolean) => {
+    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    if (!info) return
     try {
-      const compositeKey = `${provider || 'claude'}:${sessionId}`
+      const compositeKey = getSessionMutationKey(info.session)
       await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { archived: next })
       await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
-  }, [dispatch])
+  }, [dispatch, getSessionInfo, getSessionMutationKey, menuState?.target])
 
   const deleteSession = useCallback((sessionId: string, provider?: string) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -527,7 +547,7 @@ export function ContextMenuProvider({
       ),
       onConfirm: async () => {
         try {
-          const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+          const compositeKey = getSessionMutationKey(info.session)
           await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
           await dispatch(refreshActiveSessionWindow() as any)
         } catch {
@@ -537,7 +557,7 @@ export function ContextMenuProvider({
         }
       },
     })
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, getSessionInfo, getSessionMutationKey, menuState?.target])
 
   const copySessionId = useCallback(async (sessionId: string) => {
     await copyText(sessionId)
@@ -561,24 +581,24 @@ export function ContextMenuProvider({
     const info = getSessionInfo(sessionId, provider, menuState?.target)
     if (!info) return
     const { session, project } = info
-    const keyProvider = (provider || session.provider || 'claude')
+    const sessionKey = getSessionMutationKey(session)
     const relatedTabs = tabsState.tabs.filter((t) => {
       const layout = panes[t.id]
       if (!layout) return false
       const refs = collectSessionRefsFromNode(layout)
-      return refs.some((ref) => ref.provider === keyProvider && ref.sessionId === sessionId)
+      return refs.some((ref) => getCodingCliSessionKey(ref) === sessionKey)
     })
     const hasTab = relatedTabs.length > 0
     const tabLastInputAt = relatedTabs.reduce((max, tab) => Math.max(max, tab.lastInputAt ?? 0), 0) || undefined
     const runningTerminalId =
-      menuState?.target.kind === 'sidebar-session' && menuState?.target.sessionId === sessionId
+      menuState?.target.kind === 'sidebar-session' && (!menuState.target.sessionKey || menuState.target.sessionKey === sessionKey)
         ? menuState?.target.runningTerminalId
         : undefined
     const metadata = {
       title: session.title,
       sessionId: session.sessionId,
       provider: session.provider,
-      compositeKey: `${session.provider || 'claude'}:${session.sessionId}`,
+      compositeKey: sessionKey,
       projectPath: project.projectPath,
       cwd: session.cwd,
       createdAt: session.createdAt,
@@ -597,10 +617,14 @@ export function ContextMenuProvider({
       projectColor: project.color,
     }
     await copyText(JSON.stringify(metadata, null, 2))
-  }, [getSessionInfo, tabsState.tabs, panes, menuState?.target])
+  }, [getSessionInfo, getSessionMutationKey, tabsState.tabs, panes, menuState?.target])
 
-  const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string) => {
-    const command = buildResumeCommand(provider, sessionId, extensionEntries)
+  const copyResumeCommand = useCallback(async (
+    provider: ResumeCommandProvider,
+    sessionId: string,
+    options?: BuildResumeCommandOptions,
+  ) => {
+    const command = buildResumeCommand(provider, sessionId, extensionEntries, options)
     if (!command) return
     await copyText(command)
   }, [extensionEntries])
@@ -918,12 +942,18 @@ export function ContextMenuProvider({
 
   const menuItems = useMemo(() => {
     if (!menuState) return []
+    const sessionProjects =
+      menuState.target.kind === 'history-project' || menuState.target.kind === 'history-session'
+        ? historySessions
+        : menuState.target.kind === 'sidebar-session'
+          ? sidebarSessions
+          : sessions
     return buildMenuItems(menuState.target, {
       view,
       sidebarCollapsed,
       tabs: tabsState.tabs,
       paneLayouts: panes,
-      sessions,
+      sessions: sessionProjects,
       expandedProjects,
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
@@ -1004,6 +1034,8 @@ export function ContextMenuProvider({
     tabsState.tabs,
     panes,
     sessions,
+    historySessions,
+    sidebarSessions,
     expandedProjects,
     platform,
     extensionEntries,
@@ -1033,6 +1065,7 @@ export function ContextMenuProvider({
     openSessionInNewTab,
     openSessionInThisTab,
     renameSession,
+    generateSessionTitle,
     toggleArchiveSession,
     deleteSession,
     copySessionId,

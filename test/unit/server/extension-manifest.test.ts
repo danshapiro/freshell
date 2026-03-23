@@ -99,6 +99,23 @@ describe('ExtensionManifestSchema', () => {
     expect(result.success).toBe(true)
   })
 
+  it('accepts value-specific permission args for CLI manifests', () => {
+    const result = ExtensionManifestSchema.safeParse({
+      ...validCliManifest,
+      cli: {
+        command: 'kimi',
+        resumeArgs: ['--session', '{{sessionId}}'],
+        modelArgs: ['--model', '{{model}}'],
+        permissionModeArgsByValue: {
+          bypassPermissions: ['--yolo'],
+        },
+        supportsPermissionMode: true,
+        supportsModel: true,
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('compiles the bundled Claude CLI manifest with fresh-session launch args intact', () => {
     const manifestPath = path.resolve(process.cwd(), 'extensions/claude-code/freshell.json')
     const manifest = ExtensionManifestSchema.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf8')))

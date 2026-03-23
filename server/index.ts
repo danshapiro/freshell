@@ -15,15 +15,14 @@ import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
-import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands } from './terminal-registry.js'
+import { buildCliCommandSpecsFromEntries } from './coding-cli/command-specs.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
-import { claudeProvider } from './coding-cli/providers/claude.js'
-import { codexProvider } from './coding-cli/providers/codex.js'
-import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { codingCliProviders } from './coding-cli/providers/index.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
@@ -69,7 +68,6 @@ import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-import { buildCodingCliCommandSpec } from './extension-manifest.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -165,7 +163,6 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -190,17 +187,7 @@ async function main() {
   const builtinExtDir = path.join(process.cwd(), 'extensions')
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
 
-  // Build CLI commands from extension manifests
-  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
-  for (const ext of extensionManager.getAll()) {
-    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const spec: CodingCliCommandSpec = buildCodingCliCommandSpec({
-      label: ext.manifest.label,
-      cli: ext.manifest.cli,
-    })
-    cliCommandsMap.set(ext.manifest.name, spec)
-  }
-  registerCodingCliCommands(cliCommandsMap)
+  registerCodingCliCommands(buildCliCommandSpecsFromEntries(extensionManager.getAll()))
 
   // Build CLI detection specs from extension manifests
   const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
@@ -439,8 +426,8 @@ async function main() {
   app.use('/api/ai', createAiRouter({
     registry,
     perfConfig,
-    readSessionContent: async (sessionId, provider) => {
-      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName)
+    readSessionContent: async (sessionId, provider, cwd) => {
+      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName, cwd)
       if (!filePath) return null
       try {
         const content = await fsp.readFile(filePath, 'utf-8')

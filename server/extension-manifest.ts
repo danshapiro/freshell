@@ -6,6 +6,7 @@
  * to reject unknown keys (catches typos in manifest files).
  */
 import { z } from 'zod'
+import { CLAUDE_PERMISSION_MODE_VALUES, type ClaudePermissionMode } from '../shared/settings.js'
 import type { CodingCliCommandSpec } from './terminal-registry.js'
 
 // ──────────────────────────────────────────────────────────────
@@ -43,6 +44,20 @@ const ServerConfigSchema = z.strictObject({
   singleton: z.boolean().optional().default(true),
 })
 
+const PermissionModeValuesSchema = z.strictObject({
+  default: z.string().optional(),
+  plan: z.string().optional(),
+  acceptEdits: z.string().optional(),
+  bypassPermissions: z.string().optional(),
+})
+
+const PermissionModeArgsByValueSchema = z.strictObject({
+  default: z.array(z.string()).optional(),
+  plan: z.array(z.string()).optional(),
+  acceptEdits: z.array(z.string()).optional(),
+  bypassPermissions: z.array(z.string()).optional(),
+}) satisfies z.ZodType<Partial<Record<ClaudePermissionMode, string[]>>>
+
 const CliConfigSchema = z.strictObject({
   command: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
@@ -54,7 +69,8 @@ const CliConfigSchema = z.strictObject({
   sandboxArgs: z.array(z.string()).optional(), // template with {{sandbox}} placeholder
   permissionModeArgs: z.array(z.string()).optional(), // template with {{permissionMode}} placeholder
   permissionModeEnvVar: z.string().optional(),
-  permissionModeValues: z.record(z.string(), z.string()).optional(),
+  permissionModeValues: PermissionModeValuesSchema.optional(),
+  permissionModeArgsByValue: PermissionModeArgsByValueSchema.optional(),
   supportsPermissionMode: z.boolean().optional(),
   supportsModel: z.boolean().optional(),      // shows model field in SettingsView
   supportsSandbox: z.boolean().optional(),    // shows sandbox selector in SettingsView

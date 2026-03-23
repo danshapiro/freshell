@@ -17,12 +17,29 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
       {
         const sessionRef = sanitizeExactSessionRef(content.sessionRef)
           || (
+            content.sessionRef && typeof content.sessionRef.provider === 'string' && typeof content.sessionRef.sessionId === 'string'
+              ? {
+                  provider: content.sessionRef.provider,
+                  sessionId: content.sessionRef.sessionId,
+                  ...(content.sessionRef.cwd ? { cwd: content.sessionRef.cwd } : {}),
+                  ...(content.sessionRef.serverInstanceId ? { serverInstanceId: content.sessionRef.serverInstanceId } : {}),
+                }
+              : undefined
+          )
+          || (
             content.resumeSessionId && content.mode !== 'shell'
-              ? buildExactSessionRef({
-                  provider: content.mode,
-                  sessionId: content.resumeSessionId,
-                  serverInstanceId,
-                })
+              ? (
+                  buildExactSessionRef({
+                    provider: content.mode,
+                    sessionId: content.resumeSessionId,
+                    serverInstanceId,
+                  }) ?? (content.mode === 'kimi' ? {
+                    provider: content.mode,
+                    sessionId: content.resumeSessionId,
+                    cwd: content.initialCwd,
+                    serverInstanceId,
+                  } : undefined)
+                )
               : undefined
           )
         return {
@@ -49,12 +66,24 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
       {
         const sessionRef = sanitizeExactSessionRef(content.sessionRef)
           || (
+            content.sessionRef && typeof content.sessionRef.provider === 'string' && typeof content.sessionRef.sessionId === 'string'
+              ? {
+                  provider: content.sessionRef.provider,
+                  sessionId: content.sessionRef.sessionId,
+                  ...(content.sessionRef.cwd ? { cwd: content.sessionRef.cwd } : {}),
+                  ...(content.sessionRef.serverInstanceId ? { serverInstanceId: content.sessionRef.serverInstanceId } : {}),
+                }
+              : undefined
+          )
+          || (
             content.resumeSessionId
-              ? buildExactSessionRef({
-                  provider: 'claude',
-                  sessionId: content.resumeSessionId,
-                  serverInstanceId,
-                })
+              ? (
+                  buildExactSessionRef({
+                    provider: 'claude',
+                    sessionId: content.resumeSessionId,
+                    serverInstanceId,
+                  })
+                )
               : undefined
           )
         return {

@@ -137,7 +137,7 @@ describe('AI API - coding CLI aware summary', () => {
     expect(res.body.source).toBe('heuristic')
     expect(res.body.description).toBeTruthy()
     // Verify readSessionContent was called with the session ID and provider
-    expect(mockSessionFileReader).toHaveBeenCalledWith('session-abc', 'claude')
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-abc', 'claude', undefined)
   })
 
   it('falls back to scrollback for shell-mode terminals', async () => {
@@ -170,7 +170,7 @@ describe('AI API - coding CLI aware summary', () => {
     expect(res.status).toBe(200)
     expect(res.body.description).toContain('claude running')
     // readSessionContent was still called, but returned null
-    expect(mockSessionFileReader).toHaveBeenCalledWith('session-xyz', 'claude')
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-xyz', 'claude', undefined)
   })
 
   it('falls back to scrollback when readSessionContent throws an error', async () => {
@@ -189,6 +189,30 @@ describe('AI API - coding CLI aware summary', () => {
     expect(res.body.source).toBe('heuristic')
     // Falls back to scrollback-based heuristic
     expect(res.body.description).toContain('scrollback fallback content')
-    expect(mockSessionFileReader).toHaveBeenCalledWith('session-err', 'claude')
+    expect(mockSessionFileReader).toHaveBeenCalledWith('session-err', 'claude', undefined)
+  })
+
+  it('passes cwd when summarizing a Kimi terminal and prefers transcript content over scrollback', async () => {
+    const sessionContent = [
+      JSON.stringify({ role: 'user', content: 'Transcript-first task' }),
+      JSON.stringify({ role: 'assistant', content: 'I handled it.' }),
+    ].join('\n')
+
+    mockRegistry.get.mockReturnValue({
+      buffer: { snapshot: () => 'scrollback fallback content only' },
+      mode: 'kimi',
+      resumeSessionId: 'team:alpha',
+      cwd: '/repo/worktrees/app',
+    })
+
+    mockSessionFileReader.mockResolvedValue(sessionContent)
+
+    const res = await request(app)
+      .post('/api/ai/terminals/term-kimi/summary')
+
+    expect(res.status).toBe(200)
+    expect(res.body.description).toContain('Transcript-first task')
+    expect(res.body.description).not.toContain('scrollback fallback content only')
+    expect(mockSessionFileReader).toHaveBeenCalledWith('team:alpha', 'kimi', '/repo/worktrees/app')
   })
 })

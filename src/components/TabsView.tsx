@@ -20,6 +20,7 @@ import { addPane, initLayout } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { sessionKeyRequiresCwdScope } from '@/lib/coding-cli-session-key'
 import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
@@ -33,25 +34,48 @@ type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   const explicit = sanitizeExactSessionRef(value as any)
-  if (!explicit) return undefined
-  if (!isNonShellMode(explicit.provider)) return undefined
-  return explicit
+  if (explicit) {
+    if (!isNonShellMode(explicit.provider)) return undefined
+    return explicit
+  }
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown }
+  if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
+    return undefined
+  }
+  if (!sessionKeyRequiresCwdScope(candidate.provider)) return undefined
+  if (typeof candidate.sessionId !== 'string') return undefined
+  return {
+    provider: candidate.provider as CodingCliProviderName,
+    sessionId: candidate.sessionId,
+    ...(typeof candidate.cwd === 'string' ? { cwd: candidate.cwd } : {}),
+    ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
+  }
 }
 
 function resolveSessionRef(options: {
   payload: Record<string, unknown>
   fallbackProvider?: CodingCliProviderName
   fallbackSessionId?: string
+  fallbackCwd?: string
   fallbackServerInstanceId?: string
 }): SessionLocator | undefined {
   const explicit = parseSessionLocator(options.payload.sessionRef)
   if (explicit) return explicit
   if (!options.fallbackProvider || !options.fallbackSessionId) return undefined
-  return buildExactSessionRef({
+  const exact = buildExactSessionRef({
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
     serverInstanceId: options.fallbackServerInstanceId,
   })
+  if (exact) return exact
+  if (!sessionKeyRequiresCwdScope(options.fallbackProvider)) return undefined
+  return {
+      provider: options.fallbackProvider,
+      sessionId: options.fallbackSessionId,
+      ...(options.fallbackCwd ? { cwd: options.fallbackCwd } : {}),
+      ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
+    }
 }
 
 function sanitizePaneSnapshot(
@@ -72,6 +96,7 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: mode !== 'shell' ? mode : undefined,
       fallbackSessionId: resumeSessionId,
+      fallbackCwd: payload.initialCwd as string | undefined,
       fallbackServerInstanceId: record.serverInstanceId,
     })
     const createRequestId = !options.localServerInstanceId
@@ -117,6 +142,7 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: 'claude',
       fallbackSessionId: resumeSessionId,
+      fallbackCwd: payload.initialCwd as string | undefined,
       fallbackServerInstanceId: record.serverInstanceId,
     })
     return {

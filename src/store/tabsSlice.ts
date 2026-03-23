@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
+import { getCodingCliSessionKey, makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, removeLayout, restoreLayout, updatePaneContent } from './panesSlice'
@@ -385,7 +386,7 @@ export const openSessionTab = createAsyncThunk(
     }
 
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
-      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
+      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput, cwd)
 
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,
@@ -417,25 +418,39 @@ export const openSessionTab = createAsyncThunk(
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
 
+      const targetSessionKey = makeCodingCliSessionKey(resolvedProvider, sessionId, cwd)
       const matchingLeaves: Array<{ id: string; content: any }> = []
       const visit = (node: PaneNode) => {
         if (node.type === 'leaf') {
           const content = node.content
-          const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
+          const contentInitialCwd =
+            content.kind === 'terminal' || content.kind === 'agent-chat'
+              ? content.initialCwd
+              : undefined
+          const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown; cwd?: unknown } }).sessionRef
+          const explicitSessionKey =
+            typeof sessionRef?.provider === 'string' && typeof sessionRef?.sessionId === 'string'
+              ? getCodingCliSessionKey({
+                provider: sessionRef.provider,
+                sessionId: sessionRef.sessionId,
+                cwd: typeof sessionRef.cwd === 'string' ? sessionRef.cwd : contentInitialCwd,
+              })
+              : undefined
           const matchesExplicitSessionRef =
-            typeof sessionRef?.provider === 'string'
-            && typeof sessionRef?.sessionId === 'string'
-            && sessionRef.provider === resolvedProvider
-            && sessionRef.sessionId === sessionId
-          const matchesImplicitSessionRef = (
-            content.kind === 'terminal'
-            && content.mode === resolvedProvider
-            && content.resumeSessionId === sessionId
-          ) || (
-            content.kind === 'agent-chat'
-            && resolvedProvider === 'claude'
-            && content.resumeSessionId === sessionId
-          )
+            explicitSessionKey === targetSessionKey
+          const implicitProvider = content.kind === 'terminal'
+            ? content.mode
+            : resolvedProvider === 'claude'
+              ? 'claude'
+              : undefined
+          const implicitSessionId = content.kind === 'terminal' || content.kind === 'agent-chat'
+            ? content.resumeSessionId
+            : undefined
+          const matchesImplicitSessionRef =
+            typeof implicitProvider === 'string'
+            && implicitProvider !== 'shell'
+            && typeof implicitSessionId === 'string'
+            && makeCodingCliSessionKey(implicitProvider, implicitSessionId, contentInitialCwd) === targetSessionKey
           if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
             matchingLeaves.push({ id: node.id, content })
           }
@@ -518,7 +533,7 @@ export const openSessionTab = createAsyncThunk(
     if (!forceNew) {
       const existingTabId = findTabIdForSession(
         state,
-        { provider: resolvedProvider, sessionId },
+        { provider: resolvedProvider, sessionId, cwd },
         localServerInstanceId,
       )
       if (existingTabId) {

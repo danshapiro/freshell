@@ -1140,7 +1140,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {
             lastSessionActivityAtRef.current = now
             const provider = currentContent.mode
-            dispatch(updateSessionActivity({ sessionId: resumeSessionId, provider, lastInputAt: now }))
+            dispatch(updateSessionActivity({
+              sessionId: resumeSessionId,
+              provider,
+              cwd: currentContent.initialCwd,
+              lastInputAt: now,
+            }))
           }
         }
       }
@@ -1889,11 +1894,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           })
           const mode = contentRef.current?.mode
           const sessionRef = mode && mode !== 'shell'
-            ? buildExactSessionRef({
-                provider: mode,
-                sessionId,
-                serverInstanceId: localServerInstanceId,
-              })
+            ? (
+                buildExactSessionRef({
+                  provider: mode,
+                  sessionId,
+                  serverInstanceId: localServerInstanceId,
+                }) ?? (mode === 'kimi' ? {
+                  provider: mode,
+                  sessionId,
+                  ...(contentRef.current?.initialCwd ? { cwd: contentRef.current.initialCwd } : {}),
+                  ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
+                } : undefined)
+              )
             : undefined
           updateContent({
             resumeSessionId: sessionId,

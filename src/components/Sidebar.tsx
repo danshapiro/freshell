@@ -11,6 +11,7 @@ import { findPaneForSession } from '@/lib/session-utils'
 import { findFirstPickerPane } from '@/lib/pane-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -191,7 +192,7 @@ export default function Sidebar({
     if (!tabId) return null
     const ref = getActiveSessionRefForTab(s, tabId)
     if (!ref) return null
-    return `${ref.provider}:${ref.sessionId}`
+    return getCodingCliSessionKey(ref)
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
@@ -277,7 +278,7 @@ export default function Sidebar({
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(
       state,
-      { provider, sessionId: item.sessionId },
+      { provider, sessionId: item.sessionId, cwd: item.cwd },
       localServerInstanceId,
     )
     if (existing) {
@@ -342,6 +343,7 @@ export default function Sidebar({
           isSubagent: item.isSubagent,
           isNonInteractive: item.isNonInteractive,
         },
+        item.cwd,
       )
       if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
         dispatch(updateTab({
@@ -695,7 +697,7 @@ export default function Sidebar({
             >
               <div ref={listContentRef}>
                 {sortedItems.map((item) => {
-                  const sessionKey = `${item.provider}:${item.sessionId}`
+                  const sessionKey = item.sessionKey
                   const isActive = computeIsActive({
                     isRunning: item.isRunning,
                     runningTerminalId: item.runningTerminalId,
@@ -783,6 +785,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           )}
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
+          data-session-key={item.sessionKey}
           data-provider={item.provider}
           data-session-type={item.sessionType}
           data-running-terminal-id={item.runningTerminalId}

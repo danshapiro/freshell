@@ -66,6 +66,42 @@ describe('layoutMirrorMiddleware', () => {
     vi.useRealTimers()
   })
 
+  it('includes cwd in fallbackSessionRef for no-layout Kimi tabs', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+
+    store.dispatch(addTab({
+      id: 'tab-kimi',
+      title: 'kimi tab',
+      mode: 'kimi',
+      resumeSessionId: 'team:alpha',
+      initialCwd: '/repo/worktrees/app',
+    }))
+
+    vi.runOnlyPendingTimers()
+
+    expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ui.layout.sync',
+      tabs: [
+        {
+          id: 'tab-kimi',
+          title: 'kimi tab',
+          fallbackSessionRef: {
+            provider: 'kimi',
+            sessionId: 'team:alpha',
+            cwd: '/repo/worktrees/app',
+          },
+        },
+      ],
+    }))
+
+    vi.useRealTimers()
+  })
+
   it('dedupes unchanged layout payloads', () => {
     mockSend.mockClear()
     vi.useFakeTimers()

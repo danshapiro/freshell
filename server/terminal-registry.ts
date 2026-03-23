@@ -12,7 +12,13 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import type { ServerSettings } from '../shared/settings.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
-import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import {
+  makeSessionKey,
+  normalizeSessionCwdForKey,
+  parseSessionKey,
+  sessionKeyRequiresCwdScope,
+  type CodingCliProviderName,
+} from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
   SessionBindingReason,
@@ -23,6 +29,7 @@ import type {
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
+import type { ClaudePermissionMode } from '../shared/settings.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -52,6 +59,7 @@ export type CodingCliCommandSpec = {
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
   permissionModeArgs?: (permissionMode: string) => string[]
+  permissionModeArgsByValue?: Partial<Record<ClaudePermissionMode, string[]>>
   permissionModeEnvVar?: string
   permissionModeEnvValues?: Record<string, string>
 }
@@ -95,6 +103,11 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     label: 'Kimi',
     envVar: 'KIMI_CMD',
     defaultCommand: 'kimi',
+    resumeArgs: (sessionId: string) => ['--session', sessionId],
+    modelArgs: (model: string) => ['--model', model],
+    permissionModeArgsByValue: {
+      bypassPermissions: ['--yolo'],
+    },
   }],
 ]
 
@@ -289,7 +302,10 @@ function resolveCodingCliCommand(
     settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
   }
   if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
-    if (spec.permissionModeArgs) {
+    const permissionModeArgs = spec.permissionModeArgsByValue?.[providerSettings.permissionMode as ClaudePermissionMode]
+    if (permissionModeArgs) {
+      settingsArgs.push(...permissionModeArgs)
+    } else if (spec.permissionModeArgs) {
       settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
     }
     if (spec.permissionModeEnvVar) {
@@ -335,6 +351,19 @@ function normalizeResumeForBinding(mode: TerminalMode, resumeSessionId?: string)
   if (mode !== 'claude') return resumeSessionId
   if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
   return undefined
+}
+
+function matchesSessionScope(mode: TerminalMode, terminalCwd?: string, sessionCwd?: string): boolean {
+  if (mode === 'shell') return false
+  if (!sessionKeyRequiresCwdScope(mode as CodingCliProviderName)) return true
+  if (!sessionCwd) return true
+  return normalizeSessionCwdForKey(terminalCwd) === normalizeSessionCwdForKey(sessionCwd)
+}
+
+function matchesScopedSession(mode: TerminalMode, term: TerminalRecord, sessionId: string, cwd?: string): boolean {
+  return term.mode === mode
+    && term.resumeSessionId === sessionId
+    && matchesSessionScope(mode, term.cwd, cwd)
 }
 
 function getModeLabel(mode: TerminalMode): string {
@@ -1448,7 +1477,7 @@ export class TerminalRegistry extends EventEmitter {
   private releaseBinding(
     terminalId: string,
     reason: SessionUnbindReason,
-    explicit?: { provider?: CodingCliProviderName; sessionId?: string },
+    explicit?: { provider?: CodingCliProviderName; sessionId?: string; cwd?: string },
   ): void {
     const rec = this.terminals.get(terminalId)
     const existingBinding = this.bindingAuthority.sessionForTerminal(terminalId)
@@ -1459,7 +1488,6 @@ export class TerminalRegistry extends EventEmitter {
     const sessionId = explicit?.sessionId
       ?? existing?.sessionId
       ?? rec?.resumeSessionId
-
     this.bindingAuthority.unbindTerminal(terminalId)
     if (rec) rec.resumeSessionId = undefined
     if (!provider || !sessionId) return
@@ -1653,13 +1681,13 @@ export class TerminalRegistry extends EventEmitter {
 
   /**
    * Find provider-mode terminals that match a session by exact resumeSessionId.
-   * The cwd parameter is kept for API compatibility but ignored.
+   * Providers with cwd-scoped session IDs (such as Kimi) also filter by cwd
+   * when one is supplied.
    */
-  findTerminalsBySession(mode: TerminalMode, sessionId: string, _cwd?: string): TerminalRecord[] {
+  findTerminalsBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord[] {
     const results: TerminalRecord[] = []
     for (const term of this.terminals.values()) {
-      if (term.mode !== mode) continue
-      if (term.resumeSessionId === sessionId) {
+      if (matchesScopedSession(mode, term, sessionId, cwd)) {
         results.push(term)
       }
     }
@@ -1669,51 +1697,57 @@ export class TerminalRegistry extends EventEmitter {
   /**
    * Find a running terminal of the given mode that already owns the given sessionId.
    */
-  findRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+  findRunningTerminalBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord | undefined {
     if (modeSupportsResume(mode)) {
-      const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
+      const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId, cwd)
       if (owner) {
         const rec = this.terminals.get(owner)
-        if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+        if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
           return rec
         }
-        this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
+        this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
       }
     }
-    for (const term of this.terminals.values()) {
-      if (term.mode !== mode) continue
-      if (term.status !== 'running') continue
-      if (term.resumeSessionId === sessionId) return term
+    const matches = Array.from(this.terminals.values())
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
+    if (mode !== 'shell' && sessionKeyRequiresCwdScope(mode as CodingCliProviderName) && !cwd && matches.length !== 1) {
+      return undefined
     }
-    return undefined
+    return matches[0]
   }
 
-  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord | undefined {
     if (!modeSupportsResume(mode)) return undefined
 
-    const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
+    const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId, cwd)
     if (owner) {
       const rec = this.terminals.get(owner)
-      if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+      if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
         return rec
       }
-      this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
+      this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
     }
 
     const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+    if (mode !== 'shell' && sessionKeyRequiresCwdScope(mode as CodingCliProviderName) && !cwd && matches.length !== 1) {
+      return undefined
+    }
 
     return matches[0]
   }
 
-  repairLegacySessionOwners(mode: TerminalMode, sessionId: string): RepairLegacySessionOwnersResult {
+  repairLegacySessionOwners(mode: TerminalMode, sessionId: string, cwd?: string): RepairLegacySessionOwnersResult {
     if (!modeSupportsResume(mode)) {
+      return { repaired: false, clearedTerminalIds: [] }
+    }
+    if (mode !== 'shell' && sessionKeyRequiresCwdScope(mode as CodingCliProviderName) && !cwd) {
       return { repaired: false, clearedTerminalIds: [] }
     }
 
     const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
     if (matches.length === 0) {
       return { repaired: false, clearedTerminalIds: [] }
@@ -1721,8 +1755,8 @@ export class TerminalRegistry extends EventEmitter {
 
     const provider = mode as CodingCliProviderName
     const canonical = matches[0]
-    const owner = this.bindingAuthority.ownerForSession(provider, sessionId)
-    const canonicalKey = makeSessionKey(provider, sessionId)
+    const owner = this.bindingAuthority.ownerForSession(provider, sessionId, cwd)
+    const canonicalKey = makeSessionKey(provider, sessionId, canonical.cwd)
     const canonicalBinding = this.bindingAuthority.sessionForTerminal(canonical.terminalId)
     const needsCanonicalBind = owner !== canonical.terminalId || canonicalBinding !== canonicalKey
     const clearedTerminalIds: string[] = []
@@ -1730,7 +1764,7 @@ export class TerminalRegistry extends EventEmitter {
 
     if (owner && owner !== canonical.terminalId) {
       const ownerIsDuplicate = matches.some((term) => term.terminalId === owner)
-      this.releaseBinding(owner, ownerIsDuplicate ? 'repair_duplicate' : 'stale_owner', { provider, sessionId })
+      this.releaseBinding(owner, ownerIsDuplicate ? 'repair_duplicate' : 'stale_owner', { provider, sessionId, cwd })
       if (ownerIsDuplicate) {
         clearedTerminalIds.push(owner)
         clearedTerminals.add(owner)
@@ -1760,7 +1794,7 @@ export class TerminalRegistry extends EventEmitter {
 
     for (const duplicate of matches.slice(1)) {
       if (clearedTerminals.has(duplicate.terminalId)) continue
-      this.releaseBinding(duplicate.terminalId, 'repair_duplicate', { provider, sessionId })
+      this.releaseBinding(duplicate.terminalId, 'repair_duplicate', { provider, sessionId, cwd })
       clearedTerminalIds.push(duplicate.terminalId)
     }
 
@@ -1843,9 +1877,9 @@ export class TerminalRegistry extends EventEmitter {
     if (!normalized) return { ok: false, reason: 'invalid_session_id' }
 
     const currentBinding = this.bindingAuthority.sessionForTerminal(terminalId)
-    const currentKey = currentBinding ?? (term.resumeSessionId ? makeSessionKey(provider, term.resumeSessionId) : undefined)
-    const nextKey = makeSessionKey(provider, normalized)
-    const owner = this.bindingAuthority.ownerForSession(provider, normalized)
+    const currentKey = currentBinding ?? (term.resumeSessionId ? makeSessionKey(provider, term.resumeSessionId, term.cwd) : undefined)
+    const nextKey = makeSessionKey(provider, normalized, term.cwd)
+    const owner = this.bindingAuthority.ownerForSession(provider, normalized, term.cwd)
     if (owner && owner !== terminalId) {
       logger.warn(
         {
@@ -1864,7 +1898,7 @@ export class TerminalRegistry extends EventEmitter {
       this.releaseBinding(terminalId, 'rebind', current)
     }
 
-    const bound = this.bindingAuthority.bind({ provider, sessionId: normalized, terminalId })
+    const bound = this.bindingAuthority.bind({ provider, sessionId: normalized, cwd: term.cwd, terminalId })
     if (!bound.ok) {
       if (bound.reason === 'session_already_owned') {
         logger.warn(
@@ -1927,10 +1961,10 @@ export class TerminalRegistry extends EventEmitter {
   /**
    * Check whether a session is already bound to any terminal.
    */
-  isSessionBound(provider: CodingCliProviderName, sessionId: string): boolean {
+  isSessionBound(provider: CodingCliProviderName, sessionId: string, cwd?: string): boolean {
     const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return false
-    return this.bindingAuthority.ownerForSession(provider, normalized) !== undefined
+    return this.bindingAuthority.ownerForSession(provider, normalized, cwd) !== undefined
   }
 
   getSessionOwner(provider: CodingCliProviderName, sessionId: string): string | undefined {

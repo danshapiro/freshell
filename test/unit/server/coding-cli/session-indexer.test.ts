@@ -9,6 +9,7 @@ import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex'
+import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
 
 vi.mock('../../../../server/config-store', () => ({
   configStore: {
@@ -87,6 +88,37 @@ const codexTaskEventsFixturePath = path.join(
   'codex',
   'task-events.sanitized.jsonl',
 )
+const kimiFixtureShareDir = path.join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'coding-cli',
+  'kimi',
+  'share-dir',
+)
+const kimiAppHash = '4a3dcd71f4774356bb688dad99173808'
+const kimiContextHash = '60934fecd4200ec4efe2eccf0cabafa4'
+
+async function copyKimiFixtureShareDir(rootDir: string): Promise<string> {
+  const targetDir = path.join(rootDir, 'kimi-share-dir')
+  await fsp.cp(kimiFixtureShareDir, targetDir, { recursive: true })
+  return targetDir
+}
+
+function findIndexedSession(indexer: CodingCliSessionIndexer, sessionId: string) {
+  return indexer.getProjects()
+    .flatMap((project) => project.sessions)
+    .find((session) => session.sessionId === sessionId)
+}
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error('Timed out waiting for condition')
+}
 
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coding-cli-'))
@@ -228,6 +260,281 @@ describe('CodingCliSessionIndexer', () => {
         ],
       },
     ])
+  })
+
+  it('maps direct-provider Kimi sessions with sourceFile paths for lookup', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const shareDir = await copyKimiFixtureShareDir(tempDir)
+    const indexer = new CodingCliSessionIndexer([new KimiProvider(shareDir)])
+    await indexer.refresh()
+
+    expect(indexer.getFilePathForSession('kimi-session-1', 'kimi')).toBe(
+      path.join(shareDir, 'sessions', kimiAppHash, 'kimi-session-1', 'context.jsonl'),
+    )
+  })
+
+  it('disambiguates duplicate Kimi session ids by cwd for transcript lookup', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir: tempDir,
+      listSessionsDirect: async () => ([
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          sourceFile: '/tmp/kimi-a/context.jsonl',
+        },
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_100,
+          sourceFile: '/tmp/kimi-b/context.jsonl',
+        },
+      ]),
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi')).toBeUndefined()
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi', '/repo/root/packages/app-a')).toBe('/tmp/kimi-a/context.jsonl')
+    expect(indexer.getFilePathForSession('shared-kimi-session', 'kimi', '/repo/root/packages/app-b')).toBe('/tmp/kimi-b/context.jsonl')
+  })
+
+  it('refreshes direct-provider Kimi title/archive state and transcript lookups when metadata or wire files change', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const shareDir = await copyKimiFixtureShareDir(tempDir)
+    const provider = new KimiProvider(shareDir)
+    const indexer = new CodingCliSessionIndexer([provider], {
+      debounceMs: 25,
+      throttleMs: 0,
+      fullScanIntervalMs: 0,
+    })
+
+    const contextSourceFile = path.join(
+      shareDir,
+      'sessions',
+      kimiContextHash,
+      'context-title-session',
+      'context.jsonl',
+    )
+    const metadataPath = path.join(
+      shareDir,
+      'sessions',
+      kimiContextHash,
+      'context-title-session',
+      'metadata.json',
+    )
+    const wireUpgradePath = path.join(
+      shareDir,
+      'sessions',
+      kimiContextHash,
+      'wire-upgrade-session',
+      'wire.jsonl',
+    )
+
+    await indexer.start()
+
+    try {
+      expect(indexer.getFilePathForSession('context-title-session', 'kimi')).toBe(contextSourceFile)
+      expect(findIndexedSession(indexer, 'context-title-session')?.title).toBe('Message-only fallback title')
+      expect(findIndexedSession(indexer, 'legacy-flat-session')).toBeDefined()
+      expect(findIndexedSession(indexer, 'context_1')).toBeUndefined()
+      expect(findIndexedSession(indexer, 'context_sub_1')).toBeUndefined()
+
+      const metadataRefresh = waitForCondition(() => {
+        const session = findIndexedSession(indexer, 'context-title-session')
+        return session?.title === 'Pinned later metadata title' && session.archived === true
+      })
+      await fsp.writeFile(metadataPath, JSON.stringify({
+        title: 'Pinned later metadata title',
+        archived: true,
+      }))
+      await metadataRefresh
+
+      const wireRefresh = waitForCondition(() => {
+        const session = findIndexedSession(indexer, 'wire-upgrade-session')
+        return session?.title === 'Wire upgrade title'
+      })
+      await fsp.writeFile(wireUpgradePath, [
+        '{"type":"metadata","protocol_version":"1.2"}',
+        '{"timestamp":1710000100.0,"message":{"type":"TurnBegin","payload":{"user_input":"Wire upgrade title"}}}',
+      ].join('\n'))
+      await wireRefresh
+    } finally {
+      indexer.stop()
+    }
+  })
+
+  it('passes changed direct-provider files into incremental Kimi refreshes', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const homeDir = path.join(tempDir, 'kimi-home')
+    const sessionFile = path.join(homeDir, 'sessions', 'session-a.jsonl')
+    await fsp.mkdir(path.dirname(sessionFile), { recursive: true })
+    await fsp.writeFile(sessionFile, '{"role":"user","content":"initial"}\n')
+
+    const listSessionsDirect = vi.fn()
+      .mockResolvedValueOnce([
+        {
+          provider: 'kimi' as const,
+          sessionId: 'session-a',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          sourceFile: sessionFile,
+        },
+      ])
+      .mockResolvedValue([
+        {
+          provider: 'kimi' as const,
+          sessionId: 'session-a',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_100,
+          sourceFile: sessionFile,
+        },
+      ])
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir,
+      listSessionsDirect,
+      getSessionGlob: () => path.join(homeDir, '**', '*.jsonl'),
+      getSessionRoots: () => [path.join(homeDir, 'sessions')],
+    })
+    const indexer = new CodingCliSessionIndexer([provider], {
+      debounceMs: 25,
+      throttleMs: 0,
+      fullScanIntervalMs: 0,
+    })
+
+    await indexer.refresh()
+    listSessionsDirect.mockClear()
+
+    ;(indexer as any).markDirty(sessionFile)
+    await indexer.refresh()
+
+    expect(listSessionsDirect.mock.calls).toContainEqual([
+      expect.objectContaining({
+        changedFiles: [sessionFile],
+        deletedFiles: [],
+      }),
+    ])
+  })
+
+  it('ignores unscoped Kimi override and metadata fallbacks when duplicate session ids exist', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('kimi', 'shared-kimi-session')]: {
+          titleOverride: 'Legacy Kimi title',
+          archived: true,
+        },
+        [makeSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: {
+          titleOverride: 'Scoped Kimi title',
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['kimi'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([], {
+      name: 'kimi',
+      displayName: 'Kimi',
+      homeDir: tempDir,
+      listSessionsDirect: async () => ([
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-a',
+          projectPath: '/repo/root',
+          lastActivityAt: 2_000,
+          title: 'Kimi app A',
+        },
+        {
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          projectPath: '/repo/root',
+          lastActivityAt: 1_000,
+          title: 'Kimi app B',
+        },
+      ]),
+    })
+    const metadataStore = {
+      getAll: vi.fn().mockResolvedValue({
+        [makeSessionKey('kimi', 'shared-kimi-session')]: { sessionType: 'legacy-kimi' },
+        [makeSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: { sessionType: 'scoped-kimi' },
+      }),
+      get: vi.fn(),
+      set: vi.fn(),
+    } as unknown as SessionMetadataStore
+
+    const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+    await indexer.refresh()
+
+    const sessions = indexer.getProjects()[0]?.sessions ?? []
+    const appA = sessions.find((session) => session.cwd === '/repo/root/packages/app-a')
+    const appB = sessions.find((session) => session.cwd === '/repo/root/packages/app-b')
+
+    expect(appA).toMatchObject({
+      sessionId: 'shared-kimi-session',
+      title: 'Kimi app A',
+    })
+    expect(appA?.sessionType).toBeUndefined()
+    expect(appA?.archived).toBe(false)
+    expect(appB).toMatchObject({
+      sessionId: 'shared-kimi-session',
+      title: 'Scoped Kimi title',
+      sessionType: 'scoped-kimi',
+    })
+    expect(appB?.archived).toBe(false)
   })
 
   it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {

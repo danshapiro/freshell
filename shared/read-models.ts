@@ -40,6 +40,7 @@ export const SessionDirectoryQuerySchema = z.object({
 export const SessionDirectoryItemSchema = z.object({
   sessionId: z.string().min(1),
   provider: z.string().min(1),
+  sessionKey: z.string().min(1).optional(),
   projectPath: z.string().min(1),
   title: z.string().optional(),
   summary: z.string().optional(),

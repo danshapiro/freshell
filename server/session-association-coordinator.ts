@@ -16,7 +16,7 @@ type AssociationRegistry = {
     sessionId: string,
     reason: SessionBindingReason,
   ) => BindSessionResult
-  isSessionBound: (provider: CodingCliSession['provider'], sessionId: string) => boolean
+  isSessionBound: (provider: CodingCliSession['provider'], sessionId: string, cwd?: string) => boolean
 }
 
 export type SessionAssociationResult = {
@@ -26,7 +26,7 @@ export type SessionAssociationResult = {
 
 export class SessionAssociationCoordinator {
   private watermarks = new Map<string, number>()
-  private compatibilityProviders = new Set(['claude', 'opencode'])
+  private compatibilityProviders = new Set(['claude', 'opencode', 'kimi'])
 
   constructor(
     private readonly registry: AssociationRegistry,
@@ -52,7 +52,7 @@ export class SessionAssociationCoordinator {
 
   associateSingleSession(session: CodingCliSession): SessionAssociationResult {
     if (!this.isAssociationCandidate(session)) return { associated: false }
-    if (this.registry.isSessionBound(session.provider, session.sessionId)) return { associated: false }
+    if (this.registry.isSessionBound(session.provider, session.sessionId, session.cwd)) return { associated: false }
     const cwd = session.cwd!
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
     const eligible = session.provider === 'claude'
@@ -83,7 +83,7 @@ export class SessionAssociationCoordinator {
   }
 
   private trackIfAdvanced(session: CodingCliSession): boolean {
-    const key = makeSessionKey(session.provider, session.sessionId)
+    const key = makeSessionKey(session.provider, session.sessionId, session.cwd)
     const next = this.normalizeLastActivityAt(session.lastActivityAt)
     const prev = this.watermarks.get(key)
     if (prev !== undefined && next <= prev) return false

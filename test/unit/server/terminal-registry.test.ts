@@ -1003,6 +1003,30 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
     })
+
+    it('adds Kimi model and yolo args when configured', () => {
+      const spec = buildSpawnSpec('kimi', '/repo/root', 'system', undefined, {
+        model: 'moonshot-k2',
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining(['--model', 'moonshot-k2', '--yolo']))
+    })
+
+    it('adds Kimi session resume args when resuming', () => {
+      const spec = buildSpawnSpec('kimi', '/repo/root', 'system', 'kimi-session-1', {
+        model: 'moonshot-k2',
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--model',
+        'moonshot-k2',
+        '--yolo',
+        '--session',
+        'kimi-session-1',
+      ]))
+    })
   })
 
   describe('environment variables in spawn spec', () => {
@@ -1969,6 +1993,27 @@ describe('TerminalRegistry', () => {
       expect(found[0].terminalId).toBe(first.terminalId)
       expect(second.resumeSessionId).toBeUndefined()
     })
+
+    it('allows duplicate Kimi session ids in different cwd values and matches by cwd', () => {
+      const first = registry.create({
+        mode: 'kimi',
+        cwd: '/repo/root/packages/app-a',
+        resumeSessionId: 'shared-kimi-session',
+      })
+      const second = registry.create({
+        mode: 'kimi',
+        cwd: '/repo/root/packages/app-b',
+        resumeSessionId: 'shared-kimi-session',
+      })
+
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session')).toHaveLength(2)
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session', '/repo/root/packages/app-a')).toEqual([
+        expect.objectContaining({ terminalId: first.terminalId }),
+      ])
+      expect(registry.findTerminalsBySession('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')).toEqual([
+        expect.objectContaining({ terminalId: second.terminalId }),
+      ])
+    })
   })
 
   describe('findTerminalsBySession() ignores cwd parameter', () => {
@@ -2230,8 +2275,8 @@ describe('TerminalRegistry', () => {
       expect(modeSupportsResume('gemini')).toBe(false)
     })
 
-    it('returns false for kimi (no resumeArgs)', () => {
-      expect(modeSupportsResume('kimi')).toBe(false)
+    it('returns true for kimi once resumeArgs are registered', () => {
+      expect(modeSupportsResume('kimi')).toBe(true)
     })
   })
 

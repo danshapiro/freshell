@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
+import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import sessionActivityReducer, {
   updateSessionActivity,
   selectSessionActivity,
@@ -107,6 +108,24 @@ describe('sessionActivitySlice - ratchet persistence', () => {
     const state = store.getState()
     expect(selectSessionActivity(state, 'claude:session-1')).toBe(time1)
     expect(selectSessionActivity(state, 'codex:session-2')).toBe(time2)
+  })
+
+  it('rewrites named Kimi session ids with colons into cwd-scoped keys', () => {
+    const store = createStore()
+    const timestamp = Date.now()
+    const kimiKey = makeCodingCliSessionKey('kimi', 'team:alpha', '/repo/root/packages/app-b')
+
+    store.dispatch(updateSessionActivity({
+      sessionId: 'team:alpha',
+      provider: 'kimi',
+      cwd: '/repo/root/packages/app-b',
+      lastInputAt: timestamp,
+    } as any))
+
+    const state = store.getState()
+    expect(selectSessionActivity(state, kimiKey)).toBe(timestamp)
+    expect(selectSessionActivity(state, 'team:alpha')).toBeUndefined()
+    expect(selectSessionActivity(state, 'kimi:team:alpha')).toBeUndefined()
   })
 
   it('prunes sessions older than the retention window', () => {

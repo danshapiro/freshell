@@ -1,14 +1,20 @@
 import fsp from 'fs/promises'
 import path from 'path'
 import { logger } from './logger.js'
+import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 
 export interface SessionMetadataEntry {
   sessionType?: string
 }
 
-interface MetadataFile {
+interface MetadataFileV1 {
   version: 1
   sessions: Record<string, Record<string, SessionMetadataEntry>>
+}
+
+interface MetadataFile {
+  version: 2
+  sessions: Record<string, SessionMetadataEntry>
 }
 
 /**
@@ -63,13 +69,21 @@ export class SessionMetadataStore {
     try {
       const raw = await fsp.readFile(this.filePath(), 'utf-8')
       const parsed = JSON.parse(raw)
-      if (parsed?.version === 1 && parsed?.sessions) {
-        // Convert parsed objects to null-prototype records
-        const sessions = safeRecord<Record<string, SessionMetadataEntry>>()
-        for (const [provider, providerSessions] of Object.entries(parsed.sessions)) {
-          sessions[provider] = toSafeRecord(providerSessions as Record<string, SessionMetadataEntry>)
+      if (parsed?.version === 2 && parsed?.sessions) {
+        this.cache = {
+          version: 2,
+          sessions: toSafeRecord(parsed.sessions as Record<string, SessionMetadataEntry>),
         }
-        this.cache = { version: 1, sessions }
+        return this.cache
+      }
+      if (parsed?.version === 1 && parsed?.sessions) {
+        const sessions = safeRecord<SessionMetadataEntry>()
+        for (const [provider, providerSessions] of Object.entries((parsed as MetadataFileV1).sessions)) {
+          for (const [sessionId, entry] of Object.entries(providerSessions)) {
+            sessions[makeSessionKey(provider as CodingCliProviderName, sessionId)] = { ...entry }
+          }
+        }
+        this.cache = { version: 2, sessions }
         return this.cache
       }
     } catch (err) {
@@ -77,7 +91,7 @@ export class SessionMetadataStore {
         logger.warn({ err, event: 'session_metadata_read_error' }, 'Failed to read session metadata')
       }
     }
-    this.cache = { version: 1, sessions: safeRecord() }
+    this.cache = { version: 2, sessions: safeRecord() }
     return this.cache
   }
 
@@ -93,41 +107,30 @@ export class SessionMetadataStore {
     this.cache = data
   }
 
-  async get(provider: string, sessionId: string): Promise<SessionMetadataEntry | undefined> {
+  async get(provider: string, sessionId: string, cwd?: string): Promise<SessionMetadataEntry | undefined> {
     const data = await this.load()
-    const entry = data.sessions[provider]?.[sessionId]
+    const entry = data.sessions[makeSessionKey(provider as CodingCliProviderName, sessionId, cwd)]
     return entry ? { ...entry } : undefined
   }
 
-  /**
-   * Returns all entries as a flat record keyed by `provider:sessionId`.
-   * Assumes provider names do not contain colons (they are a controlled set
-   * like 'claude', 'codex', etc.).
-   */
   async getAll(): Promise<Record<string, SessionMetadataEntry>> {
     const data = await this.load()
     const result: Record<string, SessionMetadataEntry> = {}
-    for (const [provider, sessions] of Object.entries(data.sessions)) {
-      for (const [sessionId, entry] of Object.entries(sessions)) {
-        result[`${provider}:${sessionId}`] = { ...entry }
-      }
+    for (const [sessionKey, entry] of Object.entries(data.sessions)) {
+      result[sessionKey] = { ...entry }
     }
     return result
   }
 
-  async set(provider: string, sessionId: string, entry: SessionMetadataEntry): Promise<void> {
+  async set(provider: string, sessionId: string, entry: SessionMetadataEntry, cwd?: string): Promise<void> {
     return this.writeMutex.acquire(async () => {
       const current = await this.load()
-      // Build a new data object so the cache is untouched if save() fails
-      const sessions = safeRecord<Record<string, SessionMetadataEntry>>()
-      for (const [p, pSessions] of Object.entries(current.sessions)) {
-        sessions[p] = toSafeRecord(pSessions)
+      const sessions = safeRecord<SessionMetadataEntry>()
+      for (const [sessionKey, currentEntry] of Object.entries(current.sessions)) {
+        sessions[sessionKey] = { ...currentEntry }
       }
-      if (!sessions[provider]) {
-        sessions[provider] = safeRecord()
-      }
-      sessions[provider][sessionId] = { ...entry }
-      await this.save({ version: 1, sessions })
+      sessions[makeSessionKey(provider as CodingCliProviderName, sessionId, cwd)] = { ...entry }
+      await this.save({ version: 2, sessions })
     })
   }
 }

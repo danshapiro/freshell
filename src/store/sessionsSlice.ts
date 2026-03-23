@@ -1,4 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { ProjectGroup } from './types'
 
 export type SessionWindowLoadingKind = 'initial' | 'search' | 'background' | 'pagination'
@@ -21,7 +22,7 @@ export interface SessionWindowState {
 }
 
 function sessionKey(s: any): string {
-  return `${s.provider || 'claude'}:${s.sessionId}`
+  return getCodingCliSessionKey(s)
 }
 
 function normalizeProjects(payload: unknown): ProjectGroup[] {

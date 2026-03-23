@@ -12,10 +12,11 @@ export interface AiRouterDeps {
       buffer: { snapshot: () => string }
       mode?: string
       resumeSessionId?: string
+      cwd?: string
     } | undefined
   }
   perfConfig: { slowAiSummaryMs: number }
-  readSessionContent?: (sessionId: string, provider: string) => Promise<string | null>
+  readSessionContent?: (sessionId: string, provider: string, cwd?: string) => Promise<string | null>
 }
 
 export function createAiRouter(deps: AiRouterDeps): Router {
@@ -38,7 +39,7 @@ export function createAiRouter(deps: AiRouterDeps): Router {
 
     if (isCodingCli && term.resumeSessionId && deps.readSessionContent) {
       try {
-        const sessionContent = await deps.readSessionContent(term.resumeSessionId, term.mode!)
+        const sessionContent = await deps.readSessionContent(term.resumeSessionId, term.mode!, term.cwd)
         if (sessionContent) {
           const extracted = extractUserMessages(sessionContent, term.mode!)
           if (extracted) {

@@ -919,6 +919,41 @@ describe('sessionsThunks', () => {
       const merged = mergeSearchResults(titleResults as any, deepResults as any)
       expect(merged).toHaveLength(2)
     })
+
+    it('keeps duplicate Kimi session ids in different cwd values separate', () => {
+      const titleResults = [
+        makeResult({ provider: 'kimi', sessionId: 'shared-kimi-session', cwd: '/repo/root/packages/app-a', title: 'Kimi app A' }),
+        makeResult({ provider: 'kimi', sessionId: 'shared-kimi-session', cwd: '/repo/root/packages/app-b', title: 'Kimi app B' }),
+      ]
+      const deepResults = [
+        makeResult({
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          title: 'Kimi app B',
+          matchedIn: 'userMessage',
+          snippet: 'deep match for app b',
+        }),
+      ]
+
+      const merged = mergeSearchResults(titleResults as any, deepResults as any)
+      expect(merged).toHaveLength(2)
+      expect(merged).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-a',
+          matchedIn: 'title',
+        }),
+        expect.objectContaining({
+          provider: 'kimi',
+          sessionId: 'shared-kimi-session',
+          cwd: '/repo/root/packages/app-b',
+          matchedIn: 'userMessage',
+          snippet: 'deep match for app b',
+        }),
+      ]))
+    })
   })
 
   describe('two-phase search', () => {

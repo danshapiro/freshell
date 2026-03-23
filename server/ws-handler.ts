@@ -140,6 +140,7 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
   const candidate = value as {
     provider?: unknown
     sessionId?: unknown
+    cwd?: unknown
     serverInstanceId?: unknown
   }
   const provider = CodingCliProviderSchema.safeParse(candidate.provider)
@@ -147,6 +148,9 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
   return {
     provider: provider.data,
     sessionId: candidate.sessionId,
+    ...(isNonEmptyString(candidate.cwd)
+      ? { cwd: candidate.cwd }
+      : {}),
     ...(isNonEmptyString(candidate.serverInstanceId)
       ? { serverInstanceId: candidate.serverInstanceId }
       : {}),
@@ -164,7 +168,11 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   const kind = content.kind
   if (kind === 'agent-chat') {
     if (isNonEmptyString(content.resumeSessionId)) {
-      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+      locators.push({
+        provider: 'claude',
+        sessionId: content.resumeSessionId,
+        ...(isNonEmptyString(content.initialCwd) ? { cwd: content.initialCwd } : {}),
+      })
     }
     return locators
   }
@@ -179,6 +187,7 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   locators.push({
     provider: mode.data,
     sessionId: content.resumeSessionId,
+    ...(isNonEmptyString(content.initialCwd) ? { cwd: content.initialCwd } : {}),
   })
   return locators
 }
@@ -1214,15 +1223,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -1274,15 +1286,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {

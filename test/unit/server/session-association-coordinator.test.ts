@@ -90,7 +90,7 @@ describe('SessionAssociationCoordinator', () => {
     }))
 
     expect(result).toEqual({ associated: false })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('opencode', 'opencode-session-bound')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('opencode', 'opencode-session-bound', '/repo/project')
     expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
     expect(registry.bindSession).not.toHaveBeenCalled()
   })
@@ -106,7 +106,7 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('claude', 'session-main')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('claude', 'session-main', '/repo/project')
     expect(registry.bindSession).toHaveBeenCalled()
   })
 
