@@ -47,7 +47,10 @@ The test at `session-visibility.test.ts:53` tests the old `queue-operation` heur
 
 - [ ] **Step 1: Run the existing test to confirm it fails**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts`
+
+**Important:** Server-side tests live under `test/unit/server/` which is excluded from the default vitest config. All test runs in this plan must use `--config vitest.server.config.ts` to select the server config.
+
 Expected: FAIL — the test "sets isNonInteractive when queue-operation events are present" should fail because the code no longer uses `queue-operation` to set `isNonInteractive`.
 
 - [ ] **Step 2: Update the test to match the new `entrypoint` heuristic**
@@ -67,7 +70,7 @@ Replace the test case at lines 53-61 with:
 
 - [ ] **Step 3: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts`
 Expected: PASS — all tests in session-visibility.test.ts should pass.
 
 - [ ] **Step 4: Add a test that `queue-operation` no longer triggers isNonInteractive**
@@ -88,7 +91,7 @@ Add after the existing "does not set isNonInteractive for normal Claude sessions
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
@@ -133,12 +136,29 @@ First, create the `--print` mode fixture files:
 
 Note: This fixture uses the existing workdir hash `4a3dcd71f4774356bb688dad99173808` (which maps to `/repo/root/packages/app` in the fixture `kimi.json`), so it will be discovered alongside `kimi-session-1` by `listSessionsDirect()`.
 
-Then add the test block in `session-visibility.test.ts`:
+**Important side-effect of adding this fixture:** The existing `kimi-provider.test.ts` test "resolves git metadata once per cwd even when multiple sessions share a workdir" copies the fixture dir, adds `kimi-session-2`, and asserts `toHaveLength(2)` at line 226 for sessions with `cwd === '/repo/root/packages/app'`. With the new `print-mode-session` in the same workdir hash directory, this count must be updated from 2 to 3 (`kimi-session-1` + `print-mode-session` + test-added `kimi-session-2`). Update `kimi-provider.test.ts:226`:
 
 ```typescript
-import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
+// Before: expect(sessions.filter(...)).toHaveLength(2)
+// After:
+expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(3)
+```
 
-// Add at the top, alongside fixtureShareDir from kimi-provider.test.ts
+Then add the test block in `session-visibility.test.ts`:
+
+Add the following imports at the top of `session-visibility.test.ts`, alongside the existing vitest and parser imports:
+
+```typescript
+import path from 'path'
+import os from 'os'
+import fsp from 'fs/promises'
+import { createHash } from 'crypto'
+import { KimiProvider } from '../../../../server/coding-cli/providers/kimi'
+```
+
+Then add the fixture path constant and test block:
+
+```typescript
 const kimiFixtureShareDir = path.join(
   process.cwd(),
   'test',
@@ -210,7 +230,7 @@ describe('Kimi isNonInteractive detection', () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts`
 Expected: FAIL — the Kimi tests should fail because `isNonInteractive` is not yet returned by the provider.
 
 - [ ] **Step 3: Implement the minimal code**
@@ -312,7 +332,7 @@ The `|| undefined` ensures falsy values (`false`, `undefined`) become `undefined
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts`
 Expected: PASS — all Kimi and Claude/Codex tests should pass.
 
 - [ ] **Step 5: Refactor and verify**
@@ -321,13 +341,13 @@ Review the implementation for:
 - The refactored `loadKimiWireSummary` now checks TurnBegin type in a single block instead of having a separate `!title` guard outside; verify the title extraction behavior is preserved by running the existing kimi-provider tests.
 - Ensure `isNonInteractive` field is properly typed as optional.
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts test/unit/server/coding-cli/kimi-provider.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts test/unit/server/coding-cli/kimi-provider.test.ts`
 Expected: all PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/coding-cli/providers/kimi.ts test/unit/server/coding-cli/session-visibility.test.ts test/fixtures/coding-cli/kimi/share-dir/sessions/4a3dcd71f4774356bb688dad99173808/print-mode-session/
+git add server/coding-cli/providers/kimi.ts test/unit/server/coding-cli/session-visibility.test.ts test/unit/server/coding-cli/kimi-provider.test.ts test/fixtures/coding-cli/kimi/share-dir/sessions/4a3dcd71f4774356bb688dad99173808/print-mode-session/
 git commit -m "feat: detect non-interactive Kimi sessions via wire.jsonl user_input type
 
 Kimi --print mode sessions (trycycle subagents, pipe invocations) have
@@ -389,7 +409,7 @@ Note: The existing `kimi-session-1` fixture already has a string `user_input` ("
 
 - [ ] **Step 2: Run test to verify it passes** (it should pass immediately since the implementation was done in Task 2)
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/kimi-provider.test.ts`
 Expected: PASS
 
 - [ ] **Step 3: Verify incremental refresh preserves isNonInteractive**
@@ -441,14 +461,14 @@ Add a test that modifies a wire.jsonl during incremental refresh and confirms th
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/kimi-provider.test.ts`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
 
 Run the full related test suite:
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-visibility.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/kimi-provider.test.ts test/unit/server/coding-cli/session-visibility.test.ts`
 Expected: all PASS
 
 - [ ] **Step 6: Commit**
@@ -480,7 +500,7 @@ Create a temporary Node.js script that:
 4. Reports any mismatches between the provider's `isNonInteractive` flag and the raw signal
 
 ```bash
-node -e "
+npx tsx -e "
 const { KimiProvider } = await import('./server/coding-cli/providers/kimi.js');
 const fs = await import('fs/promises');
 const path = await import('path');
@@ -514,7 +534,7 @@ for (const s of sessions) {
   }
 }
 console.log('Results:', { match, mismatch, noWire, total: sessions.length });
-" --input-type=module
+"
 ```
 
 Expected: `{ match: N, mismatch: 0, noWire: M, total: T }` with zero mismatches.
@@ -525,10 +545,10 @@ Document the validation output. If there are mismatches, investigate and fix. If
 
 - [ ] **Step 3: Run the full test suite**
 
-Run: `npm run test:vitest -- --run`
+Run: `npm test`
 Expected: all PASS (no regressions across the entire test suite)
 
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/session-visibility.test.ts test/unit/server/coding-cli/kimi-provider.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/session-visibility.test.ts test/unit/server/coding-cli/kimi-provider.test.ts`
 Expected: all PASS
 
 - [ ] **Step 4: No commit needed** — this task produces no permanent code changes.
@@ -542,16 +562,9 @@ Expected: all PASS
 Run: `npm test`
 Expected: all PASS
 
-- [ ] **Step 2: Verify no regressions in existing kimi-provider tests**
+- [ ] **Step 2: Verify no regressions in kimi-provider tests**
 
-The existing `kimi-provider.test.ts` test "resolves git metadata once per cwd even when multiple sessions share a workdir" copies the fixture dir and adds `kimi-session-2`, then asserts `toHaveLength(2)` at line 226 for sessions with `cwd === '/repo/root/packages/app'`. With the new `print-mode-session` fixture in the same workdir hash directory, this count must be updated from 2 to 3 (`kimi-session-1` + `print-mode-session` + test-added `kimi-session-2`).
+The `kimi-provider.test.ts` count update (toHaveLength 2 → 3) was already applied in Task 2 when the fixture was created. Confirm it still passes:
 
-Update `kimi-provider.test.ts:226`:
-```typescript
-// Before: expect(sessions.filter(...)).toHaveLength(2)
-// After:
-expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(3)
-```
-
-Run: `npm run test:vitest -- --run test/unit/server/coding-cli/kimi-provider.test.ts`
+Run: `npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/coding-cli/kimi-provider.test.ts`
 Expected: all PASS
