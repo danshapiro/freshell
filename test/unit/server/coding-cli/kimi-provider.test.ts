@@ -223,7 +223,7 @@ describe('KimiProvider', () => {
       const provider = new KimiProvider(tempShareDir)
       const sessions = await provider.listSessionsDirect()
 
-      expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(2)
+      expect(sessions.filter((session) => session.cwd === '/repo/root/packages/app')).toHaveLength(3)
       expect(resolveGitRepoRoot).toHaveBeenCalledTimes(5)
       expect(resolveGitBranchAndDirty).toHaveBeenCalledTimes(5)
     } finally {

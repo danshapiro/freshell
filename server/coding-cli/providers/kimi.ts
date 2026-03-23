@@ -56,6 +56,7 @@ type KimiContextSummary = {
 type KimiWireSummary = {
   createdAt?: number
   title?: string
+  isNonInteractive?: boolean
 }
 
 type KimiStoredMetadata = {
@@ -286,6 +287,7 @@ async function loadKimiWireSummary(sessionDir: string): Promise<KimiWireSummary>
 
   let createdAt: number | undefined
   let title: string | undefined
+  let isNonInteractive: boolean | undefined
 
   for (const line of raw.split(/\r?\n/)) {
     if (!line.trim()) continue
@@ -304,10 +306,16 @@ async function loadKimiWireSummary(sessionDir: string): Promise<KimiWireSummary>
         createdAt = createdAt === undefined ? timestamp : Math.min(createdAt, timestamp)
       }
 
-      if (!title && parsed.message?.type === 'TurnBegin') {
-        const userInput = flattenVisibleText(parsed.message.payload?.user_input, 'user')
-        if (userInput) {
-          title = extractTitleFromMessage(userInput, KIMI_TITLE_MAX_CHARS)
+      if (parsed.message?.type === 'TurnBegin') {
+        const rawUserInput = parsed.message.payload?.user_input
+        if (!title) {
+          const userInput = flattenVisibleText(rawUserInput, 'user')
+          if (userInput) {
+            title = extractTitleFromMessage(userInput, KIMI_TITLE_MAX_CHARS)
+          }
+        }
+        if (isNonInteractive === undefined && rawUserInput !== undefined) {
+          isNonInteractive = typeof rawUserInput === 'string'
         }
       }
     } catch {
@@ -315,7 +323,7 @@ async function loadKimiWireSummary(sessionDir: string): Promise<KimiWireSummary>
     }
   }
 
-  return { createdAt, title }
+  return { createdAt, title, isNonInteractive }
 }
 
 async function loadKimiContextSummary(contextPath: string): Promise<KimiContextSummary> {
@@ -587,6 +595,7 @@ export class KimiProvider implements CodingCliProvider {
       gitBranch: workDir.gitBranch,
       isDirty: workDir.isDirty,
       sourceFile: sessionCandidate.contextPath,
+      isNonInteractive: wireSummary.isNonInteractive || undefined,
     }
   }
 
