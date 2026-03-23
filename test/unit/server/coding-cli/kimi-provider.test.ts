@@ -329,4 +329,72 @@ describe('KimiProvider', () => {
       await fsp.rm(tempShareDir, { recursive: true, force: true })
     }
   })
+
+  it('sets isNonInteractive for print-mode sessions and leaves interactive sessions unset', async () => {
+    process.env.KIMI_SHARE_DIR = fixtureShareDir
+    const provider = new KimiProvider()
+
+    const sessions = await provider.listSessionsDirect()
+
+    // print-mode-session fixture has string user_input → isNonInteractive
+    const printSession = sessions.find((s) => s.sessionId === 'print-mode-session')
+    expect(printSession).toBeDefined()
+    expect(printSession!.isNonInteractive).toBe(true)
+
+    // kimi-session-1 fixture has string user_input → also isNonInteractive
+    const session1 = sessions.find((s) => s.sessionId === 'kimi-session-1')
+    expect(session1).toBeDefined()
+    expect(session1!.isNonInteractive).toBe(true)
+
+    // wire-title-session fixture has array user_input → interactive
+    const wireSession = sessions.find((s) => s.sessionId === 'wire-title-session')
+    expect(wireSession).toBeDefined()
+    expect(wireSession!.isNonInteractive).toBeFalsy()
+
+    // context-title-session has no wire.jsonl → defaults to interactive
+    const contextSession = sessions.find((s) => s.sessionId === 'context-title-session')
+    expect(contextSession).toBeDefined()
+    expect(contextSession!.isNonInteractive).toBeFalsy()
+  })
+
+  it('updates isNonInteractive on incremental refresh when wire.jsonl changes', async () => {
+    const tempShareDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'kimi-provider-nonint-refresh-'))
+    const workDirHash = createHash('md5').update('/test/refresh-nonint').digest('hex')
+    const sessionDir = path.join(tempShareDir, 'sessions', workDirHash, 'refresh-session')
+    await fsp.mkdir(sessionDir, { recursive: true })
+    await fsp.writeFile(
+      path.join(tempShareDir, 'kimi.json'),
+      JSON.stringify({ work_dirs: [{ path: '/test/refresh-nonint' }] }),
+    )
+    await fsp.writeFile(
+      path.join(sessionDir, 'context.jsonl'),
+      JSON.stringify({ role: 'user', content: 'test' }) + '\n',
+    )
+    // Start with string user_input (non-interactive)
+    const wirePath = path.join(sessionDir, 'wire.jsonl')
+    await fsp.writeFile(wirePath, [
+      '{"type":"metadata","protocol_version":"1.2"}',
+      '{"timestamp":1710000300.0,"message":{"type":"TurnBegin","payload":{"user_input":"automated task"}}}',
+    ].join('\n'))
+
+    try {
+      const provider = new KimiProvider(tempShareDir)
+      let sessions = await provider.listSessionsDirect()
+      expect(sessions.find((s) => s.sessionId === 'refresh-session')!.isNonInteractive).toBe(true)
+
+      // Change to array user_input (interactive) and do incremental refresh
+      await fsp.writeFile(wirePath, [
+        '{"type":"metadata","protocol_version":"1.2"}',
+        '{"timestamp":1710000300.0,"message":{"type":"TurnBegin","payload":{"user_input":[{"type":"text","text":"human task"}]}}}',
+      ].join('\n'))
+
+      sessions = await provider.listSessionsDirect({
+        changedFiles: [wirePath],
+        deletedFiles: [],
+      })
+      expect(sessions.find((s) => s.sessionId === 'refresh-session')!.isNonInteractive).toBeFalsy()
+    } finally {
+      await fsp.rm(tempShareDir, { recursive: true, force: true })
+    }
+  })
 })
