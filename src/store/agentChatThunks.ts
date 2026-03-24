@@ -71,6 +71,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
         timelineSessionId ?? sessionId,
         {
           priority: 'visible',
+          includeBodies: true,
           ...(cursor ? { cursor } : {}),
         },
         { signal: controller.signal },
@@ -87,16 +88,27 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       const newestTurn = page.items[0]
       if (!newestTurn) return
 
-      const turn = await getAgentTurnBody(
-        timelineSessionId ?? sessionId,
-        newestTurn.turnId,
-        { signal: controller.signal },
-      )
-      dispatch(turnBodyReceived({
-        sessionId,
-        turnId: newestTurn.turnId,
-        message: turn.message,
-      }))
+      // Use inlined bodies when available (avoids separate HTTP request per turn)
+      const inlinedBody = page.bodies?.[newestTurn.turnId]
+      if (inlinedBody) {
+        dispatch(turnBodyReceived({
+          sessionId,
+          turnId: newestTurn.turnId,
+          message: inlinedBody.message,
+        }))
+      } else {
+        // Fall back to separate request (backward compatibility with older servers)
+        const turn = await getAgentTurnBody(
+          timelineSessionId ?? sessionId,
+          newestTurn.turnId,
+          { signal: controller.signal },
+        )
+        dispatch(turnBodyReceived({
+          sessionId,
+          turnId: newestTurn.turnId,
+          message: turn.message,
+        }))
+      }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw error
