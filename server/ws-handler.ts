@@ -311,6 +311,7 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
+  private loadSessionHistoryFn: (sessionId: string) => Promise<ChatMessage[] | null>
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
@@ -345,9 +346,11 @@ export class WsHandler {
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
     codexActivityListProvider?: () => CodexActivityRecord[],
+    loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>,
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
+    this.loadSessionHistoryFn = loadSessionHistoryFn ?? loadSessionHistory
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
@@ -1711,7 +1714,7 @@ export class WsHandler {
           // becomes interactive, preventing user messages from being overwritten.
           if (m.resumeSessionId) {
             try {
-              const messages = await loadSessionHistory(m.resumeSessionId)
+              const messages = await this.loadSessionHistoryFn(m.resumeSessionId)
               this.send(ws, {
                 type: 'sdk.session.snapshot',
                 sessionId: session.sessionId,
@@ -1884,7 +1887,7 @@ export class WsHandler {
         if (!session) {
           if (isValidClaudeSessionId(m.sessionId)) {
             try {
-              const historicalMessages = await loadSessionHistory(m.sessionId)
+              const historicalMessages = await this.loadSessionHistoryFn(m.sessionId)
               if (historicalMessages !== null) {
                 this.send(ws, {
                   type: 'sdk.session.snapshot',
@@ -1934,7 +1937,7 @@ export class WsHandler {
         let historyMessages: ChatMessage[] = session.messages
         if (session.resumeSessionId) {
           try {
-            const jsonlMessages = await loadSessionHistory(session.resumeSessionId)
+            const jsonlMessages = await this.loadSessionHistoryFn(session.resumeSessionId)
             if (jsonlMessages && jsonlMessages.length > session.messages.length) {
               historyMessages = jsonlMessages
             }

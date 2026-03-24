@@ -63,6 +63,7 @@ import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
+import { SessionContentCache } from './session-content-cache.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
@@ -234,6 +235,18 @@ async function main() {
     }
   }
 
+  // Shared parsed content cache for .jsonl session files.
+  // Used by both WsHandler (for sdk.create/attach history) and the
+  // agent-timeline service (for timeline page + turn body requests).
+  const sessionContentCache = new SessionContentCache()
+
+  /** Load session history using path resolution + content caching. */
+  const loadSessionHistoryWithCache = (sessionId: string) =>
+    loadSessionHistory(sessionId, undefined, {
+      resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
+      contentCache: sessionContentCache,
+    })
+
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
     server,
@@ -260,6 +273,7 @@ async function main() {
     layoutStore,
     extensionManager,
     () => codexActivity.tracker.list(),
+    loadSessionHistoryWithCache,
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
@@ -406,7 +420,7 @@ async function main() {
 
   app.use('/api', createAgentTimelineRouter({
     service: createAgentTimelineService({
-      loadSessionHistory,
+      loadSessionHistory: loadSessionHistoryWithCache,
     }),
   }))
 
