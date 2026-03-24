@@ -30,6 +30,7 @@ import type {
 } from './terminal-stream/registry-events.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import type { ClaudePermissionMode } from '../shared/settings.js'
+import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -139,95 +140,23 @@ function modeSupportsExactLaunch(mode: TerminalMode): boolean {
 
 type ProviderTarget = 'unix' | 'windows'
 
-const DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-orchestration')
-const LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-automation-tmux-style')
-const DEFAULT_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-demo-creation')
-const LEGACY_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'demo-creating')
-const DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
-const LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-automation-tmux-style')
-const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex')
+function providerNotificationArgs(
+  mode: TerminalMode,
+  target: ProviderTarget,
+  terminalId: string,
+  cwd?: string,
+): { args: string[]; env: Record<string, string> } {
+  const mcpInjection = generateMcpInjection(mode, terminalId, cwd, target)
 
-function firstExistingPath(candidates: Array<string | undefined>): string | undefined {
-  for (const candidate of candidates) {
-    if (!candidate) continue
-    try {
-      if (fs.existsSync(candidate)) return candidate
-    } catch {
-      // Ignore filesystem errors and fall through to the next candidate.
-    }
-  }
-  return undefined
-}
-
-function encodeTomlString(value: string): string {
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
-}
-
-function firstExistingPaths(candidates: Array<string | undefined>): string[] {
-  const unique = new Set<string>()
-  for (const candidate of candidates) {
-    if (!candidate || unique.has(candidate)) continue
-    try {
-      if (fs.existsSync(candidate)) unique.add(candidate)
-    } catch {
-      // Ignore filesystem errors and continue collecting matches.
-    }
-  }
-  return Array.from(unique)
-}
-
-function codexSkillsDir(): string {
-  const codexHome = process.env.CODEX_HOME || DEFAULT_CODEX_HOME
-  return path.join(codexHome, 'skills')
-}
-
-function codexOrchestrationSkillArgs(): string[] {
-  const skillsDir = codexSkillsDir()
-  const skillPath = firstExistingPath([
-    process.env.FRESHELL_ORCHESTRATION_SKILL_DIR,
-    DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR,
-    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
-    path.join(skillsDir, 'freshell-orchestration'),
-    path.join(skillsDir, 'freshell-automation-tmux-style'),
-  ])
-  if (!skillPath) return []
-  const disablePaths = firstExistingPaths([
-    process.env.FRESHELL_DEMO_SKILL_DIR,
-    DEFAULT_FRESHELL_DEMO_SKILL_DIR,
-    LEGACY_FRESHELL_DEMO_SKILL_DIR,
-    path.join(skillsDir, 'demo-creating'),
-    path.join(skillsDir, 'freshell-demo-creation'),
-    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
-    path.join(skillsDir, 'freshell-automation-tmux-style'),
-  ]).filter((entryPath) => entryPath !== skillPath)
-
-  const entries: Array<{ path: string; enabled: boolean }> = [
-    { path: skillPath, enabled: true },
-    ...disablePaths.map((entryPath) => ({ path: entryPath, enabled: false })),
-  ]
-  const tomlEntries = entries.map(
-    (entry) => `{path = ${encodeTomlString(entry.path)}, enabled = ${entry.enabled}}`
-  )
-  return ['-c', `skills.config=[${tomlEntries.join(', ')}]`]
-}
-
-function claudePluginArgs(): string[] {
-  const pluginDir = firstExistingPath([
-    process.env.FRESHELL_CLAUDE_PLUGIN_DIR,
-    DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR,
-    LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR,
-  ])
-  if (!pluginDir) return []
-  return ['--plugin-dir', pluginDir]
-}
-
-function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
   if (mode === 'codex') {
-    return [
-      '-c', 'tui.notification_method=bel',
-      '-c', "tui.notifications=['agent-turn-complete']",
-      ...codexOrchestrationSkillArgs(),
-    ]
+    return {
+      args: [
+        '-c', 'tui.notification_method=bel',
+        '-c', "tui.notifications=['agent-turn-complete']",
+        ...mcpInjection.args,
+      ],
+      env: mcpInjection.env,
+    }
   }
 
   if (mode === 'claude') {
@@ -248,10 +177,13 @@ function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): s
         ],
       },
     }
-    return [...claudePluginArgs(), '--settings', JSON.stringify(settings)]
+    return {
+      args: ['--settings', JSON.stringify(settings), ...mcpInjection.args],
+      env: mcpInjection.env,
+    }
   }
 
-  return []
+  return { args: mcpInjection.args, env: mcpInjection.env }
 }
 
 type ProviderSettings = {
@@ -266,14 +198,17 @@ function resolveCodingCliCommand(
   launchSessionId?: string,
   target: ProviderTarget = 'unix',
   providerSettings?: ProviderSettings,
+  terminalId?: string,
+  cwd?: string,
 ) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
   if (!spec) return null
   const command = (spec.envVar && process.env[spec.envVar]) || spec.defaultCommand
-  const providerArgs = providerNotificationArgs(mode, target)
+  const notification = providerNotificationArgs(mode, target, terminalId || '', cwd)
+  const providerArgs = notification.args
   const baseArgs = spec.args || []
-  const commandEnv: Record<string, string> = { ...(spec.env || {}) }
+  const commandEnv: Record<string, string> = { ...(spec.env || {}), ...notification.env }
   if (mode === 'opencode') {
     Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
   }
@@ -397,6 +332,8 @@ export type TerminalRecord = {
   status: 'running' | 'exited'
   exitCode?: number
   cwd?: string
+  /** Normalized cwd used for MCP config injection (may differ from raw cwd on WSL). */
+  mcpCwd?: string
   cols: number
   rows: number
   clients: Set<WebSocket>
@@ -764,6 +701,7 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
   launchSessionId?: string,
+  terminalId?: string,
 ) {
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
@@ -832,25 +770,28 @@ export function buildSpawnSpec(
       const args: string[] = []
       if (distro) args.push('-d', distro)
 
-      if (cwd) {
-        // cwd must be a Linux path inside WSL.
-        const wslCwd = isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd)
+      // cwd must be a Linux path inside WSL for both the --cd arg and MCP injection.
+      const wslCwd = cwd
+        ? (isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd))
+        : undefined
+      if (wslCwd) {
         args.push('--cd', wslCwd)
       }
 
       if (mode === 'shell') {
         args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, env }
+        return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
+      // Pass wslCwd (Linux-normalized) so MCP injection receives a valid POSIX path
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings, terminalId, wslCwd)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, env }
+        return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
       }
 
       args.push('--exec', cli.command, ...cli.args)
-      return { file: wsl, args, cwd: undefined, env: { ...env, ...cli.env } }
+      return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env: { ...env, ...cli.env } }
     }
 
     // Option B: Native Windows shells (PowerShell/cmd)
@@ -876,15 +817,17 @@ export function buildSpawnSpec(
       if (mode === 'shell') {
         if (inWsl && winCwd) {
           // Use /K with cd command to change to Windows directory
-          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, env }
+          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
         }
-        return { file, args: ['/K'], cwd: procCwd, env }
+        return { file, args: ['/K'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
+      // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
+      const cmdMcpCwd = resolveUnixShellCwd(cwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings, terminalId, cmdMcpCwd)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
-      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env: cli ? { ...env, ...cli.env } : env }
+      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, mcpCwd: cmdMcpCwd, env: cli ? { ...env, ...cli.env } : env }
     }
 
     // default to PowerShell
@@ -906,12 +849,14 @@ export function buildSpawnSpec(
     if (mode === 'shell') {
       if (inWsl && winCwd) {
         // Use Set-Location to change to Windows directory
-        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, env }
+        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
       }
-      return { file, args: ['-NoLogo'], cwd: procCwd, env }
+      return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings)
+    // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
+    const psMcpCwd = resolveUnixShellCwd(cwd)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'windows', providerSettings, terminalId, psMcpCwd)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -920,6 +865,7 @@ export function buildSpawnSpec(
       file,
       args: ['-NoLogo', '-NoExit', '-Command', command],
       cwd: procCwd,
+      mcpCwd: psMcpCwd,
       env: cli ? { ...env, ...cli.env } : env,
     }
   }
@@ -928,13 +874,17 @@ export function buildSpawnSpec(
   const unixCwd = resolveUnixShellCwd(cwd)
 
   if (mode === 'shell') {
-    return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
+    return { file: systemShell, args: ['-l'], cwd: unixCwd, mcpCwd: unixCwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings)
+  // Pass the resolved unixCwd (not raw cwd) so that MCP config injection
+  // (via providerNotificationArgs → generateMcpInjection) receives a valid
+  // Linux path. On WSL, raw cwd could be a Windows-style path (e.g. D:\project)
+  // which would fail existsSync checks in config-writer.ts.
+  const cli = resolveCodingCliCommand(mode, normalizedResume, launchSessionId, 'unix', providerSettings, terminalId, unixCwd)
   const cmd = cli?.command || mode
   const args = cli?.args || []
-  return { file: cmd, args, cwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
+  return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
 }
 
 export class TerminalRegistry extends EventEmitter {
@@ -1144,7 +1094,7 @@ export class TerminalRegistry extends EventEmitter {
       ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
     }
 
-    const { file, args, env, cwd: procCwd } = buildSpawnSpec(
+    const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
       cwd,
       opts.shell || 'system',
@@ -1152,6 +1102,7 @@ export class TerminalRegistry extends EventEmitter {
       opts.providerSettings,
       baseEnv,
       launchSessionId,
+      terminalId,
     )
 
     const endSpawnTimer = startPerfTimer(
@@ -1162,13 +1113,22 @@ export class TerminalRegistry extends EventEmitter {
 
     logger.info({ terminalId, file, args, cwd: procCwd, mode: opts.mode, shell: opts.shell || 'system' }, 'Spawning terminal')
 
-    const ptyProc = pty.spawn(file, args, {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd: procCwd,
-      env: env as any,
-    })
+    let ptyProc: ReturnType<typeof pty.spawn>
+    try {
+      ptyProc = pty.spawn(file, args, {
+        name: 'xterm-256color',
+        cols,
+        rows,
+        cwd: procCwd,
+        env: env as any,
+      })
+    } catch (err) {
+      // Clean up MCP config temp files that were created before the spawn attempt.
+      // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
+      // (which may be undefined for WSL cmd/powershell paths).
+      cleanupMcpConfig(terminalId, opts.mode, mcpCwd)
+      throw err
+    }
     endSpawnTimer({ cwd: procCwd })
 
     const title = getModeLabel(opts.mode)
@@ -1183,6 +1143,7 @@ export class TerminalRegistry extends EventEmitter {
       lastActivityAt: createdAt,
       status: 'running',
       cwd,
+      mcpCwd,
       cols,
       rows,
       clients: new Set(),
@@ -1285,6 +1246,7 @@ export class TerminalRegistry extends EventEmitter {
       const now = Date.now()
       record.lastActivityAt = now
       record.exitedAt = now
+      cleanupMcpConfig(terminalId, opts.mode, record.mcpCwd)
       for (const client of record.clients) {
         this.flushOutputBuffer(client)
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
@@ -1397,6 +1359,7 @@ export class TerminalRegistry extends EventEmitter {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     if (term.status === 'exited') return true
+    cleanupMcpConfig(terminalId, term.mode, term.mcpCwd)
     try {
       term.pty.kill()
     } catch (err) {
