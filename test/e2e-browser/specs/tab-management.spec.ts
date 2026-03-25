@@ -41,6 +41,11 @@ test.describe('Tab Management', () => {
     const addButton = page.locator('[data-context="tab-add"]')
     await addButton.click()
     await harness.waitForTabCount(2)
+
+    const state = await harness.getState()
+    const activeTabId = state.tabs.activeTabId as string | null
+    expect(activeTabId).toBeTruthy()
+    expect(state.panes.layouts[activeTabId!]).toBeTruthy()
   })
 
   test('clicking tab switches to it', async ({ freshellPage, page, harness }) => {

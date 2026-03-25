@@ -35,9 +35,84 @@ describe('handleUiCommand', () => {
       payload: { id: 't1', title: 'Alpha', paneId: 'pane-1', paneContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } },
     }, dispatch)
 
-    expect(actions.map((a) => a.type)).toEqual(['tabs/addTab', 'panes/initLayout'])
-    expect(actions[1].payload.paneId).toBe('pane-1')
-    expect(actions[1].payload.content.kind).toBe('browser')
+    expect(actions.map((a) => a.type)).toEqual(['workspace/createPaneBackedTab'])
+    expect(actions[0].payload.paneId).toBe('pane-1')
+    expect(actions[0].payload.content.kind).toBe('browser')
+  })
+
+  it('preserves createRequestId and synthesizes exact local sessionRef for server-originated coding panes', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: {
+        id: 't1',
+        title: 'Codex',
+        mode: 'codex',
+        resumeSessionId: 'codex-session-123',
+        paneId: 'pane-1',
+        paneContent: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          createRequestId: 'req-codex',
+          resumeSessionId: 'codex-session-123',
+        },
+      },
+    }, {
+      dispatch,
+      getState: () => ({
+        connection: { serverInstanceId: 'srv-local' },
+      } as any),
+    })
+
+    expect(actions[0].type).toBe('workspace/createPaneBackedTab')
+    expect(actions[0].payload.content).toMatchObject({
+      createRequestId: 'req-codex',
+      resumeSessionId: 'codex-session-123',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        serverInstanceId: 'srv-local',
+      },
+    })
+  })
+
+  it('does not fabricate an exact sessionRef for named claude resume identifiers', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.attach',
+      payload: {
+        tabId: 't1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          shell: 'system',
+          createRequestId: 'req-claude',
+          resumeSessionId: 'named-claude-resume',
+        },
+      },
+    }, {
+      dispatch,
+      getState: () => ({
+        connection: { serverInstanceId: 'srv-local' },
+      } as any),
+    })
+
+    expect(actions[0].payload.content.createRequestId).toBe('req-claude')
+    expect(actions[0].payload.content.sessionRef).toBeUndefined()
   })
 
   it('passes through newPaneId on pane.split', () => {

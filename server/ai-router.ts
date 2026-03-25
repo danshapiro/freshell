@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
+import { extractUserMessages } from './ai-user-message-extractor.js'
 import { startPerfTimer } from './perf-logger.js'
 import { logger } from './logger.js'
 
@@ -7,9 +8,15 @@ const log = logger.child({ component: 'ai-router' })
 
 export interface AiRouterDeps {
   registry: {
-    get: (id: string) => { buffer: { snapshot: () => string } } | undefined
+    get: (id: string) => {
+      buffer: { snapshot: () => string }
+      mode?: string
+      resumeSessionId?: string
+      cwd?: string
+    } | undefined
   }
   perfConfig: { slowAiSummaryMs: number }
+  readSessionContent?: (sessionId: string, provider: string, cwd?: string) => Promise<string | null>
 }
 
 export function createAiRouter(deps: AiRouterDeps): Router {
@@ -23,9 +30,39 @@ export function createAiRouter(deps: AiRouterDeps): Router {
 
     const snapshot = term.buffer.snapshot().slice(-20_000)
 
+    // Determine input strategy: user-messages for coding CLIs, scrollback for shells
+    let summaryInput: string
+    let promptConfig: typeof PROMPTS.terminalSummary | typeof PROMPTS.codingCliSummary
+
+    const isCodingCli = term.mode && term.mode !== 'shell'
+    let userMessages: string | null = null
+
+    if (isCodingCli && term.resumeSessionId && deps.readSessionContent) {
+      try {
+        const sessionContent = await deps.readSessionContent(term.resumeSessionId, term.mode!, term.cwd)
+        if (sessionContent) {
+          const extracted = extractUserMessages(sessionContent, term.mode!)
+          if (extracted) {
+            userMessages = extracted
+          }
+        }
+      } catch (err) {
+        log.warn({ err, terminalId }, 'Failed to read session content for coding CLI summary')
+      }
+    }
+
+    if (userMessages) {
+      summaryInput = userMessages
+      promptConfig = PROMPTS.codingCliSummary
+    } else {
+      summaryInput = snapshot
+      promptConfig = PROMPTS.terminalSummary
+    }
+
     // Fallback heuristic if AI not configured or fails.
     const heuristic = () => {
-      const cleaned = stripAnsi(snapshot)
+      const text = userMessages || snapshot
+      const cleaned = stripAnsi(text)
       const lines = cleaned.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
       const first = lines[0] || 'Terminal session'
       const second = lines[1] || ''
@@ -39,7 +76,7 @@ export function createAiRouter(deps: AiRouterDeps): Router {
 
     const endSummaryTimer = startPerfTimer(
       'ai_summary',
-      { terminalId, snapshotChars: snapshot.length },
+      { terminalId, snapshotChars: summaryInput.length },
       { minDurationMs: perfConfig.slowAiSummaryMs, level: 'warn' },
     )
     let summarySource: 'ai' | 'heuristic' = 'ai'
@@ -48,9 +85,8 @@ export function createAiRouter(deps: AiRouterDeps): Router {
     try {
       const { generateText } = await import('ai')
       const { google } = await import('@ai-sdk/google')
-      const promptConfig = PROMPTS.terminalSummary
       const model = google(promptConfig.model)
-      const prompt = promptConfig.build(snapshot)
+      const prompt = promptConfig.build(summaryInput)
 
       const result = await generateText({
         model,

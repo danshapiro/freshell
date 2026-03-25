@@ -9,7 +9,21 @@ description: "Use when interacting with Freshell panes, panels, or tabs from the
 
 Freshell injects `FRESHELL_URL` and `FRESHELL_TOKEN` into every spawned terminal. They are already set in your environment.
 
-Use the repo-local CLI entrypoint (no build needed):
+## MCP tool (preferred)
+
+If you have the `freshell` MCP tool available, use it directly -- it's faster and doesn't require Bash approval for each command.
+
+Quick start:
+- `freshell({action: "help"})` -- see all available commands
+- `freshell({action: "list-tabs"})` -- see open tabs
+- `freshell({action: "new-tab", params: {name: "Work", mode: "claude"}})` -- create a tab
+- `freshell({action: "send-keys", params: {target: "p1", keys: "hello\n"}})` -- send input
+
+The MCP tool accepts the same commands as the CLI below but with structured JSON input instead of positional arguments.
+
+## CLI fallback
+
+If the MCP tool is not available (e.g., running outside Freshell or in a context without MCP support), use the CLI:
 
 ```bash
 FSH="npx tsx server/cli/index.ts"

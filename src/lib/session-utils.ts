@@ -3,16 +3,26 @@
  */
 
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { getCodingCliSessionKey, sessionKeyRequiresCwdScope } from '@/lib/coding-cli-session-key'
 import type { PaneContent, PaneNode, SessionLocator } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
-type SessionRef = Pick<SessionLocator, 'provider' | 'sessionId'>
+type SessionRef = Pick<SessionLocator, 'provider' | 'sessionId'> & { cwd?: string }
+type SessionLocatorInput = {
+  provider?: unknown
+  sessionId?: unknown
+  serverInstanceId?: unknown
+  cwd?: unknown
+}
+type SessionMatchLocator = SessionRef & { serverInstanceId?: string }
 type SessionMatchCandidate = {
   tabId: string
   paneId: string | undefined
   locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -28,12 +38,12 @@ function isValidSessionRef(provider: string, sessionId: string): provider is Cod
   return true
 }
 
-function locatorIdentity(locator: SessionLocator): string {
-  return `${locator.provider}:${locator.sessionId}:${locator.serverInstanceId ?? ''}`
+function locatorIdentity(locator: SessionMatchLocator): string {
+  return `${getCodingCliSessionKey(locator)}:${locator.serverInstanceId ?? ''}`
 }
 
 function sessionKey(locator: SessionRef): string {
-  return `${locator.provider}:${locator.sessionId}`
+  return getCodingCliSessionKey(locator)
 }
 
 function dedupeBy<T>(values: T[], getKey: (value: T) => string): T[] {
@@ -49,7 +59,7 @@ function dedupeBy<T>(values: T[], getKey: (value: T) => string): T[] {
 }
 
 export function sanitizeSessionLocator(
-  locator?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } | null,
+  locator?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown } | null,
 ): SessionLocator | undefined {
   if (!locator || !isNonEmptyString(locator.provider) || !isNonEmptyString(locator.sessionId)) {
     return undefined
@@ -58,12 +68,13 @@ export function sanitizeSessionLocator(
   return {
     provider: locator.provider,
     sessionId: locator.sessionId,
+    ...(isNonEmptyString(locator.cwd) ? { cwd: locator.cwd } : {}),
     ...(isNonEmptyString(locator.serverInstanceId) ? { serverInstanceId: locator.serverInstanceId } : {}),
   }
 }
 
 export function sanitizeSessionLocators(
-  locators: ReadonlyArray<{ provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } | null | undefined>,
+  locators: ReadonlyArray<{ provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown; cwd?: unknown } | null | undefined>,
 ): SessionLocator[] {
   return dedupeBy(
     locators.flatMap((locator) => {
@@ -74,40 +85,44 @@ export function sanitizeSessionLocators(
   )
 }
 
+function sanitizeSessionMatchLocator(locator?: SessionLocatorInput | null): SessionMatchLocator | undefined {
+  const sanitized = sanitizeSessionLocator(locator)
+  if (!sanitized) return undefined
+  return sanitized
+}
+
 function extractExplicitSessionLocator(content: PaneContent): {
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
+  cwd?: string
 } | undefined {
-  const explicit = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } }).sessionRef
-  return sanitizeSessionLocator(explicit)
+  const explicit = (content as { sessionRef?: SessionLocatorInput }).sessionRef
+  return sanitizeSessionMatchLocator(explicit)
 }
 
 /**
- * Extract exact and intrinsic session locators from a single pane's content.
- * Explicit sessionRef preserves cross-device identity; resumeSessionId is kept as an
+ * Extract intrinsic session locators from a single pane's content.
+ * resumeSessionId is kept as an
  * intrinsic local fallback for local-session matching before serverInstanceId is known.
  */
-function extractSessionLocators(content: PaneContent): Array<{
+function extractIntrinsicSessionLocators(content: PaneContent): Array<{
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
+  cwd?: string
 }> {
   const locators: Array<{
     provider: CodingCliProviderName
     sessionId: string
     serverInstanceId?: string
+    cwd?: string
   }> = []
-
-  const explicit = extractExplicitSessionLocator(content)
-  if (explicit) {
-    locators.push(explicit)
-  }
 
   if (content.kind === 'agent-chat') {
     const sessionId = content.resumeSessionId
     if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
-    locators.push({ provider: 'claude', sessionId })
+    locators.push({ provider: 'claude', sessionId, cwd: content.initialCwd })
     return dedupeBy(locators, locatorIdentity)
   }
   if (content.kind !== 'terminal') return dedupeBy(locators, locatorIdentity)
@@ -115,23 +130,70 @@ function extractSessionLocators(content: PaneContent): Array<{
   if (!isNonShellMode(content.mode)) return dedupeBy(locators, locatorIdentity)
   const sessionId = content.resumeSessionId
   if (!sessionId) return dedupeBy(locators, locatorIdentity)
-  locators.push({ provider: content.mode, sessionId })
+  locators.push({ provider: content.mode, sessionId, cwd: content.initialCwd })
   return dedupeBy(locators, locatorIdentity)
 }
 
-function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): SessionLocator | undefined {
-  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-  const sessionId = tab.resumeSessionId
-  if (!provider || !sessionId) return undefined
-  return sanitizeSessionLocator({ provider, sessionId })
+/**
+ * Extract exact and intrinsic session locators from a single pane's content.
+ * Explicit sessionRef preserves cross-device identity while resumeSessionId provides
+ * an intrinsic local fallback until the local server identity is known.
+ */
+export function collectSessionLocatorsFromContent(content: PaneContent): Array<{
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+  cwd?: string
+}> {
+  return dedupeBy(
+    buildSessionMatchLocators(content).map((candidate) => candidate.locator),
+    locatorIdentity,
+  )
+}
+
+function buildSessionMatchLocators(content: PaneContent): Array<{
+  locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
+}> {
+  const explicit = extractExplicitSessionLocator(content)
+  const locators: Array<{
+    locator: SessionLocator
+    locatorKind: 'explicit' | 'intrinsic'
+    explicitLocator?: SessionLocator
+  }> = []
+
+  if (explicit) {
+    locators.push({
+      locator: explicit,
+      locatorKind: 'explicit',
+      explicitLocator: explicit,
+    })
+  }
+
+  locators.push(
+    ...extractIntrinsicSessionLocators(content).map((locator) => ({
+      locator,
+      locatorKind: 'intrinsic' as const,
+      explicitLocator: explicit,
+    })),
+  )
+
+  return dedupeBy(
+    locators,
+    (candidate) => `${candidate.locatorKind}:${locatorIdentity(candidate.locator)}:${candidate.explicitLocator ? locatorIdentity(candidate.explicitLocator) : ''}`,
+  )
 }
 
 function matchScore(
-  candidate: SessionLocator,
-  target: SessionLocator,
+  candidate: SessionMatchLocator,
+  target: SessionMatchLocator,
   localServerInstanceId?: string,
 ): number {
   if (candidate.provider !== target.provider || candidate.sessionId !== target.sessionId) return 0
+  if (sessionKeyRequiresCwdScope(target.provider) && target.cwd) {
+    if (getCodingCliSessionKey(candidate) !== getCodingCliSessionKey(target)) return 0
+  }
   if (target.serverInstanceId) {
     if (candidate.serverInstanceId === target.serverInstanceId) return 3
     if (target.serverInstanceId === localServerInstanceId && candidate.serverInstanceId == null) return 2
@@ -142,14 +204,34 @@ function matchScore(
   return 0
 }
 
+function candidateMatchScore(
+  candidate: SessionMatchCandidate,
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): number {
+  if (
+    candidate.locatorKind === 'intrinsic'
+    && candidate.explicitLocator?.serverInstanceId
+  ) {
+    if (target.serverInstanceId && candidate.explicitLocator.serverInstanceId !== target.serverInstanceId) {
+      return 0
+    }
+    if (!target.serverInstanceId && localServerInstanceId && candidate.explicitLocator.serverInstanceId !== localServerInstanceId) {
+      return 0
+    }
+  }
+
+  return matchScore(candidate.locator, target, localServerInstanceId)
+}
+
 function collectPaneSessionMatchCandidates(
   node: PaneNode,
   tabId: string,
   candidates: SessionMatchCandidate[],
 ): void {
   if (node.type === 'leaf') {
-    for (const locator of extractSessionLocators(node.content)) {
-      candidates.push({ tabId, paneId: node.id, locator })
+    for (const locator of buildSessionMatchLocators(node.content)) {
+      candidates.push({ tabId, paneId: node.id, ...locator })
     }
     return
   }
@@ -159,14 +241,14 @@ function collectPaneSessionMatchCandidates(
 
 function selectBestSessionMatch(
   candidates: SessionMatchCandidate[],
-  target: SessionLocator,
+  target: SessionMatchLocator,
   localServerInstanceId?: string,
 ): SessionMatchCandidate | undefined {
   let bestCandidate: SessionMatchCandidate | undefined
   let bestScore = 0
 
   for (const candidate of candidates) {
-    const score = matchScore(candidate.locator, target, localServerInstanceId)
+    const score = candidateMatchScore(candidate, target, localServerInstanceId)
     if (score <= 0) continue
     if (score > bestScore) {
       bestCandidate = candidate
@@ -181,9 +263,10 @@ export function collectSessionLocatorsFromNode(node: PaneNode): Array<{
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
+  cwd?: string
 }> {
   if (node.type === 'leaf') {
-    return extractSessionLocators(node.content)
+    return collectSessionLocatorsFromContent(node.content)
   }
   return dedupeBy([
     ...collectSessionLocatorsFromNode(node.children[0]),
@@ -191,11 +274,22 @@ export function collectSessionLocatorsFromNode(node: PaneNode): Array<{
   ], locatorIdentity)
 }
 
+export function collectSessionRefsFromContent(content: PaneContent): SessionRef[] {
+  return dedupeBy(
+    collectSessionLocatorsFromContent(content).map((locator) => ({
+      provider: locator.provider,
+      sessionId: locator.sessionId,
+    })),
+    sessionKey,
+  )
+}
+
 export function collectSessionRefsFromNode(node: PaneNode): SessionRef[] {
   return dedupeBy(
     collectSessionLocatorsFromNode(node).map((locator) => ({
       provider: locator.provider,
       sessionId: locator.sessionId,
+      cwd: locator.cwd,
     })),
     sessionKey,
   )
@@ -208,22 +302,19 @@ export function collectSessionLocatorsFromTabs(
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
+  cwd?: string
 }> {
   const locators: Array<{
     provider: CodingCliProviderName
     sessionId: string
     serverInstanceId?: string
+    cwd?: string
   }> = []
 
   for (const tab of tabs || []) {
     const layout = panes.layouts[tab.id]
-    if (layout) {
-      locators.push(...collectSessionLocatorsFromNode(layout))
-      continue
-    }
-
-    const fallbackLocator = buildTabFallbackLocator(tab)
-    if (fallbackLocator) locators.push(fallbackLocator)
+    if (!layout) continue
+    locators.push(...collectSessionLocatorsFromNode(layout))
   }
 
   return dedupeBy(locators, locatorIdentity)
@@ -237,6 +328,7 @@ export function collectSessionRefsFromTabs(
     collectSessionLocatorsFromTabs(tabs, panes).map((locator) => ({
       provider: locator.provider,
       sessionId: locator.sessionId,
+      cwd: locator.cwd,
     })),
     sessionKey,
   )
@@ -268,25 +360,19 @@ export function getTabSessionRefs(state: RootState, tabId: string): SessionRef[]
 
 export function findTabIdForSession(
   state: RootState,
-  target: SessionLocator,
+  target: SessionLocator & { cwd?: string },
   localServerInstanceId?: string,
 ): string | undefined {
-  const sanitizedTarget = sanitizeSessionLocator(target)
+  const sanitizedTarget = sanitizeSessionMatchLocator(target)
   if (!sanitizedTarget) return undefined
 
   const candidates: SessionMatchCandidate[] = []
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (layout) {
-      for (const locator of collectSessionLocatorsFromNode(layout)) {
-        candidates.push({ tabId: tab.id, paneId: undefined, locator })
+      for (const locator of buildNodeSessionMatchLocators(layout)) {
+        candidates.push({ tabId: tab.id, paneId: undefined, ...locator })
       }
-      continue
-    }
-
-    const locator = buildTabFallbackLocator(tab)
-    if (locator) {
-      candidates.push({ tabId: tab.id, paneId: undefined, locator })
     }
   }
 
@@ -296,14 +382,13 @@ export function findTabIdForSession(
 /**
  * Find the tab and pane that contain a specific session.
  * Walks all tabs' pane trees looking for a pane (terminal or agent-chat) matching the provider + sessionId.
- * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
  */
 export function findPaneForSession(
   state: RootState,
-  target: SessionLocator,
+  target: SessionLocator & { cwd?: string },
   localServerInstanceId?: string,
 ): { tabId: string; paneId: string | undefined } | undefined {
-  const sanitizedTarget = sanitizeSessionLocator(target)
+  const sanitizedTarget = sanitizeSessionMatchLocator(target)
   if (!sanitizedTarget) return undefined
 
   const candidates: SessionMatchCandidate[] = []
@@ -311,17 +396,29 @@ export function findPaneForSession(
     const layout = state.panes.layouts[tab.id]
     if (layout) {
       collectPaneSessionMatchCandidates(layout, tab.id, candidates)
-      continue
-    }
-
-    const locator = buildTabFallbackLocator(tab)
-    if (locator) {
-      candidates.push({ tabId: tab.id, paneId: undefined, locator })
     }
   }
 
   const bestMatch = selectBestSessionMatch(candidates, sanitizedTarget, localServerInstanceId)
   return bestMatch ? { tabId: bestMatch.tabId, paneId: bestMatch.paneId } : undefined
+}
+
+function buildNodeSessionMatchLocators(node: PaneNode): Array<{
+  locator: SessionLocator
+  locatorKind: 'explicit' | 'intrinsic'
+  explicitLocator?: SessionLocator
+}> {
+  if (node.type === 'leaf') {
+    return buildSessionMatchLocators(node.content)
+  }
+
+  return dedupeBy(
+    [
+      ...buildNodeSessionMatchLocators(node.children[0]),
+      ...buildNodeSessionMatchLocators(node.children[1]),
+    ],
+    (candidate) => `${candidate.locatorKind}:${locatorIdentity(candidate.locator)}:${candidate.explicitLocator ? locatorIdentity(candidate.explicitLocator) : ''}`,
+  )
 }
 
 /**

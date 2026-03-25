@@ -1,6 +1,8 @@
 import { z } from 'zod'
+import { migratePersistedPaneNode } from './persisted-pane-migration'
+import { isWellFormedPaneTree } from './paneTreeValidation'
 
-export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+export { WORKSPACE_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
 export const TABS_SCHEMA_VERSION = 1
 export const PANES_SCHEMA_VERSION = 6
@@ -34,15 +36,8 @@ export type ParsedPersistedTabs = {
   tabs: z.infer<typeof zPersistedTabsState>
 }
 
-export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    return null
-  }
-
-  const res = zPersistedTabsPayload.safeParse(parsed)
+export function parsePersistedTabsPayload(payload: unknown): ParsedPersistedTabs | null {
+  const res = zPersistedTabsPayload.safeParse(payload)
   if (!res.success) return null
 
   const version = typeof res.data.version === 'number' ? res.data.version : 0
@@ -55,6 +50,17 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
       activeTabId: res.data.tabs.activeTabId ?? null,
     },
   }
+}
+
+export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+
+  return parsePersistedTabsPayload(parsed)
 }
 
 const zPaneTitles = z.record(z.string(), z.record(z.string(), z.string()))
@@ -78,6 +84,60 @@ export type ParsedPersistedPanes = {
   paneTitleSetByUser: Record<string, Record<string, boolean>>
 }
 
+export function parsePersistedPanesPayload(
+  payload: unknown,
+  options?: {
+    requireWellFormedLayouts?: boolean
+  },
+): ParsedPersistedPanes | null {
+  const res = zPersistedPanesPayload.safeParse(payload)
+  if (!res.success) return null
+
+  let version = typeof res.data.version === 'number' ? res.data.version : 1
+  if (version < 1) version = 1
+  if (version > PANES_SCHEMA_VERSION) return null
+
+  const migratedLayouts = Object.fromEntries(
+    Object.entries((res.data.layouts || {}) as Record<string, unknown>).map(([tabId, node]) => [
+      tabId,
+      migratePersistedPaneNode(node),
+    ]),
+  )
+  if (!options?.requireWellFormedLayouts) {
+    return {
+      version,
+      layouts: migratedLayouts,
+      activePane: (res.data.activePane || {}) as Record<string, string>,
+      paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
+      paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
+    }
+  }
+
+  const sanitizedLayouts: Record<string, unknown> = {}
+  const droppedTabIds = new Set<string>()
+  for (const [tabId, node] of Object.entries(migratedLayouts)) {
+    if (isWellFormedPaneTree(node)) {
+      sanitizedLayouts[tabId] = node
+    } else {
+      droppedTabIds.add(tabId)
+    }
+  }
+
+  return {
+    version,
+    layouts: sanitizedLayouts,
+    activePane: Object.fromEntries(
+      Object.entries(res.data.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+    ) as Record<string, string>,
+    paneTitles: Object.fromEntries(
+      Object.entries(res.data.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+    ) as Record<string, Record<string, string>>,
+    paneTitleSetByUser: Object.fromEntries(
+      Object.entries(res.data.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+    ) as Record<string, Record<string, boolean>>,
+  }
+}
+
 export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null {
   let parsed: unknown
   try {
@@ -86,18 +146,5 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
     return null
   }
 
-  const res = zPersistedPanesPayload.safeParse(parsed)
-  if (!res.success) return null
-
-  let version = typeof res.data.version === 'number' ? res.data.version : 1
-  if (version < 1) version = 1
-  if (version > PANES_SCHEMA_VERSION) return null
-
-  return {
-    version,
-    layouts: (res.data.layouts || {}) as Record<string, unknown>,
-    activePane: (res.data.activePane || {}) as Record<string, string>,
-    paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
-    paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
-  }
+  return parsePersistedPanesPayload(parsed)
 }

@@ -1,0 +1,5 @@
+{"role":"_system_prompt","content":"hidden-system-token-kimi"}
+{"role":"user","content":"visible-user-token-kimi please investigate the routing bug"}
+{"role":"assistant","content":[{"type":"think","think":"hidden-think-token-kimi"},{"type":"text","text":"visible-assistant-token-kimi response"}]}
+{"role":"_usage","token_count":42}
+{"role":"_checkpoint","id":0}

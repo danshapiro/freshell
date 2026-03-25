@@ -12,8 +12,31 @@ import {
   resetBrowserPreferencesFlushListenersForTests,
 } from '../../../../src/store/browserPreferencesPersistence'
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
-import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '../../../../src/store/storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY, WORKSPACE_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
+
+function buildWorkspaceRaw(input: {
+  tabs: {
+    activeTabId: string | null
+    tabs: Array<Record<string, unknown>>
+  }
+  panes: {
+    layouts: Record<string, unknown>
+    activePane: Record<string, string>
+    paneTitles?: Record<string, Record<string, string>>
+    paneTitleSetByUser?: Record<string, Record<string, boolean>>
+  }
+}) {
+  return JSON.stringify({
+    version: 1,
+    tabs: input.tabs,
+    panes: {
+      paneTitles: {},
+      paneTitleSetByUser: {},
+      ...input.panes,
+    },
+  })
+}
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
@@ -108,6 +131,235 @@ describe('crossTabSync', () => {
 
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
+  })
+
+  it('hydrates an authoritative workspace snapshot while preserving local active selections', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [
+        { id: 'tab-1', title: 'T1', createdAt: 1 },
+        { id: 'tab-2', title: 'T2', createdAt: 2 },
+      ],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'split-local',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+            { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://example.com', devToolsOpen: false } },
+          ],
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-a' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = buildWorkspaceRaw({
+      tabs: {
+        activeTabId: 'tab-2',
+        tabs: [
+          { id: 'tab-1', title: 'T1', createdAt: 1, createRequestId: 'tab-1', status: 'creating', mode: 'shell', shell: 'system' },
+          { id: 'tab-2', title: 'T2', createdAt: 2, createRequestId: 'tab-2', status: 'creating', mode: 'shell', shell: 'system' },
+          { id: 'tab-3', title: 'T3', createdAt: 3, createRequestId: 'tab-3', status: 'creating', mode: 'shell', shell: 'system' },
+        ],
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-remote',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+              { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://example.com', devToolsOpen: false } },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-b' },
+      },
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: WORKSPACE_STORAGE_KEY, newValue: remoteRaw }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1', 'tab-2', 'tab-3'])
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
+  })
+
+  it('drops a stale local layout when an authoritative workspace snapshot removes it for an existing tab', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [
+        { id: 'tab-1', title: 'T1', createdAt: 1, createRequestId: 'tab-1', status: 'creating', mode: 'shell', shell: 'system' },
+      ] as any,
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-local',
+          content: {
+            kind: 'terminal',
+            mode: 'shell',
+            createRequestId: 'req-local',
+            status: 'running',
+            terminalId: 'term-local',
+            shell: 'system',
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-local' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = buildWorkspaceRaw({
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [
+          { id: 'tab-1', title: 'T1', createdAt: 1, createRequestId: 'tab-1', status: 'creating', mode: 'shell', shell: 'system' },
+        ],
+      },
+      panes: {
+        layouts: {},
+        activePane: {},
+      },
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: WORKSPACE_STORAGE_KEY, newValue: remoteRaw }))
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['tab-1'])
+    expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+    expect(store.getState().panes.activePane['tab-1']).toBeUndefined()
+  })
+
+  it('ignores split-key mirror events once the authoritative workspace key exists', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1 }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+
+    localStorage.setItem(WORKSPACE_STORAGE_KEY, buildWorkspaceRaw({
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'Authoritative', createdAt: 1, createRequestId: 'tab-1', status: 'creating', mode: 'shell', shell: 'system' }],
+      },
+      panes: {
+        layouts: {},
+        activePane: {},
+      },
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const splitTabsRaw = JSON.stringify({
+      tabs: {
+        activeTabId: 'tab-remote',
+        tabs: [{ id: 'tab-remote', title: 'Mirror Only', createdAt: 2 }],
+      },
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: TABS_STORAGE_KEY, newValue: splitTabsRaw }))
+
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['tab-1'])
+    expect(store.getState().tabs.activeTabId).toBe('tab-1')
+  })
+
+  it('hydrates remote panes but preserves local authoritative coding identity for the same createRequestId', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{ id: 'tab-1', title: 'T1', createdAt: 1, mode: 'codex' } as any],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+    }))
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-live',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-live',
+            status: 'running',
+            terminalId: 'term-live',
+            resumeSessionId: 'codex-local',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-local',
+              serverInstanceId: 'srv-local',
+            },
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-live' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 4,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-live',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-live',
+            status: 'creating',
+            resumeSessionId: 'codex-foreign',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-foreign',
+              serverInstanceId: 'srv-remote',
+            },
+          },
+        },
+      },
+      activePane: { 'tab-1': 'pane-live' },
+      paneTitles: {},
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: PANES_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout?.content?.terminalId).toBe('term-live')
+    expect(layout?.content?.resumeSessionId).toBe('codex-local')
+    expect(layout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-local',
+      serverInstanceId: 'srv-local',
+    })
   })
 
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {

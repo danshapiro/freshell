@@ -2,6 +2,56 @@ import fs from 'fs/promises'
 import path from 'path'
 import { test, expect } from '../helpers/fixtures.js'
 
+function buildBrokenWorkspacePayloads() {
+  const workspaceRaw = JSON.stringify({
+    version: 1,
+    tabs: {
+      activeTabId: 'broken-remote-tab',
+      tabs: [{
+        id: 'broken-remote-tab',
+        title: 'Broken Remote Tab',
+        createRequestId: 'req-broken-remote',
+        status: 'creating',
+        mode: 'codex',
+        shell: 'system',
+        resumeSessionId: 'remote-broken-session',
+        createdAt: 1,
+      }],
+    },
+    panes: {
+      layouts: {},
+      activePane: {},
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    },
+  })
+  const tabsRaw = JSON.stringify({
+    version: 1,
+    tabs: {
+      activeTabId: 'broken-remote-tab',
+      tabs: [{
+        id: 'broken-remote-tab',
+        title: 'Broken Remote Tab',
+        createRequestId: 'req-broken-remote',
+        status: 'creating',
+        mode: 'codex',
+        shell: 'system',
+        resumeSessionId: 'remote-broken-session',
+        createdAt: 1,
+      }],
+    },
+  })
+  const panesRaw = JSON.stringify({
+    version: 6,
+    layouts: {},
+    activePane: {},
+    paneTitles: {},
+    paneTitleSetByUser: {},
+  })
+
+  return { workspaceRaw, tabsRaw, panesRaw }
+}
+
 // Helper: wait for a page to be connected and ready
 async function waitForReady(page: any): Promise<void> {
   await page.waitForFunction(() => !!window.__FRESHELL_TEST_HARNESS__, { timeout: 15_000 })
@@ -124,6 +174,286 @@ test.describe('Multi-Client', () => {
     )
     expect(settingsAfter).toBe(sharedDefaultCwd)
     expect(settingsAfter).not.toBe(settingsBefore)
+
+    await context.close()
+  })
+
+  test('authoritative workspace sync surfaces missing-layout corruption in another client', async ({ browser, serverInfo }) => {
+    const context = await browser.newContext()
+    const page1 = await context.newPage()
+    const page2 = await context.newPage()
+
+    await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+
+    await waitForReady(page1)
+    await waitForReady(page2)
+
+    await page2.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.()
+    })
+
+    const payloads = buildBrokenWorkspacePayloads()
+    await page1.evaluate((seed) => {
+      window.localStorage.setItem('freshell.workspace.v1', seed.workspaceRaw)
+      window.localStorage.setItem('freshell.tabs.v2', seed.tabsRaw)
+      window.localStorage.setItem('freshell.panes.v2', seed.panesRaw)
+    }, payloads)
+
+    await page2.waitForFunction(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs?.some((tab: any) => tab?.id === 'broken-remote-tab')
+    ), { timeout: 15_000 })
+
+    await expect(
+      page2.locator('[data-context="tab"]').filter({ hasText: 'Broken Remote Tab' })
+    ).toBeVisible()
+    await expect(page2.getByTestId('missing-layout-error')).toBeVisible()
+
+    const createMessages = await page2.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+    ))
+    expect((createMessages as any[]).filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+    await context.close()
+  })
+
+  test('authoritative workspace sync drops an existing layout in another client when the snapshot removes it', async ({ browser, serverInfo }) => {
+    const context = await browser.newContext()
+    const page1 = await context.newPage()
+    const page2 = await context.newPage()
+
+    await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+
+    await waitForReady(page1)
+    await waitForReady(page2)
+
+    const existingTab = await page2.evaluate(() => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      const activeTabId = state?.tabs?.activeTabId
+      const tab = state?.tabs?.tabs?.find((entry: any) => entry?.id === activeTabId)
+      const hasLayout = !!(activeTabId && state?.panes?.layouts?.[activeTabId])
+      return {
+        activeTabId,
+        tab,
+        title: tab?.title ?? null,
+        hasLayout,
+      }
+    })
+
+    expect(existingTab.activeTabId).toBeTruthy()
+    expect(existingTab.title).toBeTruthy()
+    expect(existingTab.hasLayout).toBe(true)
+
+    await page2.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.()
+    })
+
+    const brokenWorkspaceRaw = await page1.evaluate((target) => {
+      const activeTabId = target.activeTabId
+      const activeTab = target.tab
+      if (!activeTabId || !activeTab) {
+        throw new Error('Expected an active tab with a layout before corrupting the workspace snapshot')
+      }
+
+      const brokenWorkspaceRaw = JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId,
+          tabs: [activeTab],
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+      })
+      const brokenTabsRaw = JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId,
+          tabs: [activeTab],
+        },
+      })
+      const brokenPanesRaw = JSON.stringify({
+        version: 6,
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      window.localStorage.setItem('freshell.workspace.v1', brokenWorkspaceRaw)
+      window.localStorage.setItem('freshell.tabs.v2', brokenTabsRaw)
+      window.localStorage.setItem('freshell.panes.v2', brokenPanesRaw)
+      return brokenWorkspaceRaw
+    }, { activeTabId: existingTab.activeTabId, tab: existingTab.tab })
+
+    await page2.evaluate((raw) => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'freshell.workspace.v1',
+        newValue: raw,
+      }))
+    }, brokenWorkspaceRaw)
+
+    await page2.waitForFunction((tabId) => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      return !state?.panes?.layouts?.[tabId as string]
+    }, existingTab.activeTabId, { timeout: 15_000 })
+
+    await expect(
+      page2.locator('[data-context="tab"]').filter({ hasText: existingTab.title as string })
+    ).toBeVisible()
+    await expect(page2.getByTestId('missing-layout-error')).toBeVisible()
+
+    const createMessages = await page2.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+    ))
+    expect((createMessages as any[]).filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+    await context.close()
+  })
+
+  test('a hidden corrupted tab only surfaces the missing-layout error when reselected in another client', async ({ browser, serverInfo }) => {
+    const context = await browser.newContext()
+    const page1 = await context.newPage()
+    const page2 = await context.newPage()
+
+    await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+
+    await waitForReady(page1)
+    await waitForReady(page2)
+
+    const tabState = await page2.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      const state = harness?.getState()
+      const originalTabId = state?.tabs?.activeTabId
+      const originalTab = state?.tabs?.tabs?.find((tab: any) => tab?.id === originalTabId)
+      const originalLayout = originalTabId ? state?.panes?.layouts?.[originalTabId] : null
+      if (!originalTabId || !originalTab || !originalLayout) {
+        throw new Error('Expected an existing active pane-backed tab before creating the hidden-tab scenario')
+      }
+
+      harness?.dispatch({
+        type: 'workspace/createPaneBackedTab',
+        payload: {
+          tab: {
+            id: 'healthy-secondary-tab',
+            title: 'Healthy Secondary Tab',
+            createRequestId: 'req-healthy-secondary',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 2,
+          },
+          content: {
+            kind: 'browser',
+            url: 'https://example.com/healthy-secondary',
+            devToolsOpen: false,
+            browserInstanceId: 'browser-healthy-secondary',
+          },
+        },
+      })
+
+      const nextState = harness?.getState()
+      const secondaryTab = nextState?.tabs?.tabs?.find((tab: any) => tab?.id === 'healthy-secondary-tab')
+      const secondaryLayout = nextState?.panes?.layouts?.['healthy-secondary-tab']
+      if (!secondaryTab || !secondaryLayout) {
+        throw new Error('Expected the healthy secondary tab to exist with a layout')
+      }
+
+      return {
+        originalTabId,
+        originalTab,
+        originalTitle: originalTab.title,
+        originalLayout,
+        secondaryTab,
+        secondaryLayout,
+      }
+    })
+
+    await expect(
+      page2.locator('[data-context="tab"]').filter({ hasText: 'Healthy Secondary Tab' })
+    ).toBeVisible()
+
+    await page2.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.clearSentWsMessages?.()
+    })
+
+    const brokenWorkspaceRaw = await page1.evaluate((stateForBreak) => {
+      const brokenWorkspaceRaw = JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId: stateForBreak.secondaryTab.id,
+          tabs: [stateForBreak.originalTab, stateForBreak.secondaryTab],
+        },
+        panes: {
+          layouts: {
+            [stateForBreak.secondaryTab.id]: stateForBreak.secondaryLayout,
+          },
+          activePane: {
+            [stateForBreak.secondaryTab.id]: stateForBreak.secondaryLayout.id,
+          },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+      })
+      const brokenTabsRaw = JSON.stringify({
+        version: 1,
+        tabs: {
+          activeTabId: stateForBreak.secondaryTab.id,
+          tabs: [stateForBreak.originalTab, stateForBreak.secondaryTab],
+        },
+      })
+      const brokenPanesRaw = JSON.stringify({
+        version: 6,
+        layouts: {
+          [stateForBreak.secondaryTab.id]: stateForBreak.secondaryLayout,
+        },
+        activePane: {
+          [stateForBreak.secondaryTab.id]: stateForBreak.secondaryLayout.id,
+        },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      window.localStorage.setItem('freshell.workspace.v1', brokenWorkspaceRaw)
+      window.localStorage.setItem('freshell.tabs.v2', brokenTabsRaw)
+      window.localStorage.setItem('freshell.panes.v2', brokenPanesRaw)
+      return brokenWorkspaceRaw
+    }, tabState)
+
+    await page2.evaluate((raw) => {
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'freshell.workspace.v1',
+        newValue: raw,
+      }))
+    }, brokenWorkspaceRaw)
+
+    await page2.waitForFunction((tabId) => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      return (
+        state?.tabs?.activeTabId === 'healthy-secondary-tab'
+        && !state?.panes?.layouts?.[tabId as string]
+        && !!state?.panes?.layouts?.['healthy-secondary-tab']
+      )
+    }, tabState.originalTabId, { timeout: 15_000 })
+
+    await expect(page2.getByTestId('missing-layout-error')).not.toBeVisible()
+
+    await page2
+      .locator('[data-context="tab"]')
+      .filter({ hasText: tabState.originalTitle as string })
+      .click()
+
+    await expect(page2.getByTestId('missing-layout-error')).toBeVisible()
+
+    const createMessages = await page2.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
+    ))
+    expect((createMessages as any[]).filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
 
     await context.close()
   })

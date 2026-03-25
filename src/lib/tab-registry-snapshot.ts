@@ -1,6 +1,7 @@
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
+import { buildExactSessionRef, sanitizeExactSessionRef } from '@/lib/exact-session-ref'
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000
 
@@ -14,14 +15,33 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
   switch (content.kind) {
     case 'terminal':
       {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId && content.mode !== 'shell'
-            ? {
-                provider: content.mode,
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
+        const sessionRef = sanitizeExactSessionRef(content.sessionRef)
+          || (
+            content.sessionRef && typeof content.sessionRef.provider === 'string' && typeof content.sessionRef.sessionId === 'string'
+              ? {
+                  provider: content.sessionRef.provider,
+                  sessionId: content.sessionRef.sessionId,
+                  ...(content.sessionRef.cwd ? { cwd: content.sessionRef.cwd } : {}),
+                  ...(content.sessionRef.serverInstanceId ? { serverInstanceId: content.sessionRef.serverInstanceId } : {}),
+                }
+              : undefined
+          )
+          || (
+            content.resumeSessionId && content.mode !== 'shell'
+              ? (
+                  buildExactSessionRef({
+                    provider: content.mode,
+                    sessionId: content.resumeSessionId,
+                    serverInstanceId,
+                  }) ?? (content.mode === 'kimi' ? {
+                    provider: content.mode,
+                    sessionId: content.resumeSessionId,
+                    cwd: content.initialCwd,
+                    serverInstanceId,
+                  } : undefined)
+                )
+              : undefined
+          )
         return {
           mode: content.mode,
           shell: content.shell,
@@ -44,14 +64,28 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
       }
     case 'agent-chat':
       {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId
-            ? {
-                provider: 'claude',
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
+        const sessionRef = sanitizeExactSessionRef(content.sessionRef)
+          || (
+            content.sessionRef && typeof content.sessionRef.provider === 'string' && typeof content.sessionRef.sessionId === 'string'
+              ? {
+                  provider: content.sessionRef.provider,
+                  sessionId: content.sessionRef.sessionId,
+                  ...(content.sessionRef.cwd ? { cwd: content.sessionRef.cwd } : {}),
+                  ...(content.sessionRef.serverInstanceId ? { serverInstanceId: content.sessionRef.serverInstanceId } : {}),
+                }
+              : undefined
+          )
+          || (
+            content.resumeSessionId
+              ? (
+                  buildExactSessionRef({
+                    provider: 'claude',
+                    sessionId: content.resumeSessionId,
+                    serverInstanceId,
+                  })
+                )
+              : undefined
+          )
         return {
           provider: content.provider,
           resumeSessionId: content.resumeSessionId,

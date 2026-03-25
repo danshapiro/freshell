@@ -136,6 +136,41 @@ function createDeferred<T>() {
   return { promise, resolve, reject }
 }
 
+function paneTreeContainsExactSessionRef(
+  node: any,
+  expected: { provider: string; sessionId: string; serverInstanceId?: string },
+): boolean {
+  if (!node || typeof node !== 'object') return false
+  if (node.type === 'leaf') {
+    const sessionRef = node.content?.sessionRef
+    return sessionRef?.provider === expected.provider
+      && sessionRef?.sessionId === expected.sessionId
+      && (
+        expected.serverInstanceId === undefined
+        || sessionRef?.serverInstanceId === expected.serverInstanceId
+      )
+  }
+  if (!Array.isArray(node.children)) return false
+  return node.children.some((child) => paneTreeContainsExactSessionRef(child, expected))
+}
+
+function layoutSyncContainsSessionIdentity(
+  message: any,
+  expected: { provider: string; sessionId: string; serverInstanceId?: string },
+): boolean {
+  if (message?.type !== 'ui.layout.sync') return false
+  if (Array.isArray(message.tabs) && message.tabs.some((tab: any) => (
+    tab?.fallbackSessionRef?.provider === expected.provider
+    && tab?.fallbackSessionRef?.sessionId === expected.sessionId
+  ))) {
+    return true
+  }
+
+  return Object.values(message.layouts ?? {}).some((layout) => (
+    paneTreeContainsExactSessionRef(layout, expected)
+  ))
+}
+
 function createStore(options?: {
   tabs?: Array<Record<string, unknown>>
   panes?: {
@@ -369,6 +404,176 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
 
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the indexed Kimi session exactly once for a restored Kimi tab after bootstrap', async () => {
+    const kimiSessionId = 'kimi-session-1'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/repo/root',
+          sessions: [{
+            provider: 'kimi',
+            sessionId: kimiSessionId,
+            projectPath: '/repo/root',
+            lastActivityAt: 10,
+            title: 'Pinned title from metadata',
+          }],
+        },
+        {
+          projectPath: '/repo/teammate',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'teammate-open',
+            projectPath: '/repo/teammate',
+            lastActivityAt: 9,
+            title: 'Teammate Session',
+          }],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 9,
+      oldestIncludedSessionId: 'codex:teammate-open',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-kimi',
+        title: 'Kimi Restored Tab',
+        mode: 'kimi',
+        resumeSessionId: kimiSessionId,
+      }],
+      panes: {
+        layouts: {
+          'tab-kimi': {
+            type: 'leaf',
+            id: 'pane-kimi',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              createRequestId: 'req-kimi',
+              status: 'running',
+              resumeSessionId: kimiSessionId,
+              sessionRef: {
+                provider: 'kimi',
+                sessionId: kimiSessionId,
+                serverInstanceId: 'srv-local',
+              },
+            },
+          },
+        },
+        activePane: {
+          'tab-kimi': 'pane-kimi',
+        },
+        paneTitles: {
+          'tab-kimi': {
+            'pane-kimi': 'Kimi Restored Tab',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Pinned title from metadata')).toHaveLength(1)
+      expect(screen.getAllByText('Teammate Session').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('root').length).toBeGreaterThan(0)
+    })
+
+    const kimiPane = (store.getState().panes.layouts['tab-kimi'] as any).content
+    expect(kimiPane.resumeSessionId).toBe(kimiSessionId)
+  })
+
+  it('keeps duplicate named Kimi sidebar rows distinct by cwd after bootstrap', async () => {
+    const kimiSessionId = 'shared-kimi-session'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/repo/root',
+          sessions: [
+            {
+              provider: 'kimi',
+              sessionId: kimiSessionId,
+              projectPath: '/repo/root',
+              cwd: '/repo/root/packages/app-a',
+              lastActivityAt: 10,
+              title: 'Kimi app A',
+            },
+            {
+              provider: 'kimi',
+              sessionId: kimiSessionId,
+              projectPath: '/repo/root',
+              cwd: '/repo/root/packages/app-b',
+              lastActivityAt: 9,
+              title: 'Kimi app B',
+            },
+          ],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 9,
+      oldestIncludedSessionId: 'kimi:shared-kimi-session',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-kimi',
+        title: 'Kimi app B tab',
+        mode: 'kimi',
+        initialCwd: '/repo/root/packages/app-b',
+        resumeSessionId: kimiSessionId,
+      }],
+      panes: {
+        layouts: {
+          'tab-kimi': {
+            type: 'leaf',
+            id: 'pane-kimi',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              createRequestId: 'req-kimi',
+              status: 'running',
+              initialCwd: '/repo/root/packages/app-b',
+              resumeSessionId: kimiSessionId,
+            },
+          },
+        },
+        activePane: {
+          'tab-kimi': 'pane-kimi',
+        },
+        paneTitles: {
+          'tab-kimi': {
+            'pane-kimi': 'Kimi app B tab',
+          },
+        },
+      },
+    })
+
+    const { container } = render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Kimi app A')).toHaveLength(1)
+      expect(screen.getAllByText('Kimi app B')).toHaveLength(1)
+    })
+
+    const appARow = Array.from(container.querySelectorAll('[data-context="sidebar-session"]'))
+      .find((element) => element.textContent?.includes('Kimi app A')) as HTMLElement | undefined
+    const appBRow = Array.from(container.querySelectorAll('[data-context="sidebar-session"]'))
+      .find((element) => element.textContent?.includes('Kimi app B')) as HTMLElement | undefined
+
+    expect(appARow?.getAttribute('data-has-tab')).toBe('false')
+    expect(appBRow?.getAttribute('data-has-tab')).toBe('true')
   })
 
   it('recovers CLI availability and sidebar filtering after transient pre-ready failures', async () => {
@@ -633,18 +838,22 @@ describe('open tab session sidebar visibility (e2e)', () => {
       await store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }) as any)
     })
 
+    const openedTabId = store.getState().tabs.activeTabId
+    const openedLayout = openedTabId ? (store.getState().panes.layouts[openedTabId] as any) : undefined
+    expect(openedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'older-open',
+      serverInstanceId: 'srv-local',
+    })
+
     await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'ui.layout.sync',
-        tabs: expect.arrayContaining([
-          expect.objectContaining({
-            fallbackSessionRef: {
-              provider: 'codex',
-              sessionId: 'older-open',
-            },
-          }),
-        ]),
-      }))
+      expect(wsMocks.send.mock.calls.some(([message]) => (
+        layoutSyncContainsSessionIdentity(message, {
+          provider: 'codex',
+          sessionId: 'older-open',
+          serverInstanceId: 'srv-local',
+        })
+      ))).toBe(true)
     }, { timeout: 2500 })
 
     // Snapshot the call count just before the invalidation event so the

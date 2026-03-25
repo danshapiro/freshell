@@ -4,7 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { updateTab } from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -492,6 +492,61 @@ describe('PaneContainer', () => {
         type: 'terminal.detach',
         terminalId: 'term-222',
       })
+    })
+
+    it('clears stale tab.resumeSessionId when closing the owning coding pane', () => {
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'pane-owner',
+            content: createTerminalContent({
+              mode: 'claude',
+              terminalId: 'term-owner',
+              createRequestId: 'req-owner',
+              resumeSessionId: '44444444-4444-4444-8444-444444444444',
+              status: 'running',
+            }),
+          },
+          {
+            type: 'leaf',
+            id: 'pane-shell',
+            content: createTerminalContent({
+              terminalId: 'term-shell',
+              createRequestId: 'req-shell',
+              status: 'running',
+            }),
+          },
+        ],
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': 'pane-owner' },
+      })
+      store.dispatch(updateTab({
+        id: 'tab-1',
+        updates: {
+          mode: 'claude',
+          codingCliProvider: 'claude',
+          terminalId: 'term-owner',
+          resumeSessionId: '44444444-4444-4444-8444-444444444444',
+        },
+      }))
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store,
+      )
+
+      const closeButtons = screen.getAllByTitle('Close pane')
+      fireEvent.click(closeButtons[0])
+
+      expect(store.getState().tabs.tabs[0].resumeSessionId).toBeUndefined()
     })
   })
 

@@ -1,5 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
+import { detectMissingLayoutCorruption } from '@/lib/tab-layout-integrity'
 
 const INITIAL_LAYOUT_SYNC_DEBOUNCE_MS = 1000
 const LAYOUT_SYNC_DEBOUNCE_MS = 200
@@ -8,11 +9,16 @@ function buildTabFallbackSessionRef(tab: {
   mode?: string
   codingCliProvider?: string
   resumeSessionId?: string
-}): { provider: string; sessionId: string } | undefined {
+  initialCwd?: string
+}): { provider: string; sessionId: string; cwd?: string } | undefined {
   const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
   const sessionId = tab.resumeSessionId
   if (!provider || !sessionId) return undefined
-  return { provider, sessionId }
+  return {
+    provider,
+    sessionId,
+    ...(typeof tab.initialCwd === 'string' ? { cwd: tab.initialCwd } : {}),
+  }
 }
 
 export const layoutMirrorMiddleware: Middleware = (store) => {
@@ -26,7 +32,12 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
     const payload = {
       type: 'ui.layout.sync',
       tabs: state.tabs.tabs.map((t: any) => {
-        const fallbackSessionRef = buildTabFallbackSessionRef(t)
+        const fallbackSessionRef = detectMissingLayoutCorruption({
+          tab: t,
+          layout: state.panes.layouts[t.id],
+        })
+          ? undefined
+          : buildTabFallbackSessionRef(t)
         return {
           id: t.id,
           title: t.title,

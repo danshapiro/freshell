@@ -41,6 +41,7 @@ export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
 export const SessionLocatorSchema = z.object({
   provider: CodingCliProviderSchema,
   sessionId: z.string().min(1),
+  cwd: z.string().min(1).optional(),
   serverInstanceId: z.string().min(1).optional(),
 })
 

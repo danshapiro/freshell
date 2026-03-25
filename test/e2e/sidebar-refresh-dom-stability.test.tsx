@@ -219,6 +219,7 @@ function createStore(options?: {
 describe('sidebar refresh DOM stability (e2e)', () => {
   beforeEach(() => {
     cleanup()
+    _resetSessionWindowThunkState()
     vi.clearAllMocks()
     wsHandlers.clear()
     wsMocks.isReady = false
@@ -310,7 +311,13 @@ describe('sidebar refresh DOM stability (e2e)', () => {
       </Provider>,
     )
 
-    act(() => {
+    // Use async act to fully flush the ready handler's async bootstrap chain
+    // (recoverMissingStartupState → loadPlatformDetails → ensureSidebarSessionsWindow
+    // → loadVersionInfo → ensureNetworkStatusLoaded). A synchronous act() only
+    // flushes the first microtask batch, leaving later continuations pending.
+    // Those pending continuations can interleave with the sessions.changed refresh
+    // below, causing extra re-renders that unmount and remount sidebar rows.
+    await act(async () => {
       wsMocks.isReady = true
       wsMocks.serverInstanceId = 'srv-local'
       broadcastWs({
@@ -325,9 +332,14 @@ describe('sidebar refresh DOM stability (e2e)', () => {
       expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(0)
     })
 
+    // Drain any remaining microtasks from the bootstrap async chain before
+    // capturing the DOM reference. Without this, fire-and-forget promises
+    // (e.g., void recoverMissingStartupState()) may still be settling.
+    await act(async () => {})
+
     const stableAButton = screen.getByRole('button', { name: /Stable A/i })
 
-    act(() => {
+    await act(async () => {
       broadcastWs({
         type: 'sessions.changed',
         revision: 7,

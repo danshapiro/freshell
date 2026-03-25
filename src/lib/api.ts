@@ -1,4 +1,5 @@
 import type { CodingCliProviderName } from './coding-cli-types'
+import { getCodingCliSessionKey, makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
@@ -206,6 +207,7 @@ export async function getAgentTimelinePage(
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
       ['limit', parsed.limit],
+      ['includeBodies', parsed.includeBodies ? 'true' : undefined],
     ])}`,
     options,
   )
@@ -274,6 +276,7 @@ export type VersionInfo = {
 export type SearchResult = {
   sessionId: string
   provider: CodingCliProviderName
+  sessionKey?: string
   projectPath: string
   title?: string
   summary?: string
@@ -328,6 +331,7 @@ function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
     sessions: sessions.map((item) => ({
       provider: item.provider,
       sessionId: item.sessionId,
+      sessionKey: item.sessionKey ?? makeCodingCliSessionKey(item.provider, item.sessionId, item.cwd),
       projectPath: item.projectPath,
       lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
@@ -347,8 +351,9 @@ export async function setSessionMetadata(
   provider: string,
   sessionId: string,
   sessionType: string,
+  cwd?: string,
 ): Promise<void> {
-  await api.post('/api/session-metadata', { provider, sessionId, sessionType })
+  await api.post('/api/session-metadata', { provider, sessionId, sessionType, cwd })
 }
 
 export async function fetchSidebarSessionsSnapshot(options: {
@@ -392,7 +397,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
     projects,
     totalSessions: page.items.length,
     oldestIncludedTimestamp: oldest?.lastActivityAt ?? 0,
-    oldestIncludedSessionId: oldest ? `${oldest.provider}:${oldest.sessionId}` : '',
+    oldestIncludedSessionId: oldest ? getCodingCliSessionKey(oldest) : '',
     hasMore: page.nextCursor !== null,
   }
 }
@@ -415,6 +420,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
     results: page.items.map((item) => ({
       sessionId: item.sessionId,
       provider: item.provider,
+      sessionKey: item.sessionKey ?? makeCodingCliSessionKey(item.provider, item.sessionId, item.cwd),
       projectPath: item.projectPath,
       title: item.title,
       summary: item.summary,

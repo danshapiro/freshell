@@ -20,24 +20,21 @@
 
 ## Features
 
-- **Tabs and panes** — Organize projects with multiple coding agents, shells, browsers, editors, and more on a tab - and as many tabs as you want.
+- **Tabs and panes** — Organize projects with multiple coding agents, shells, browsers, editors, and more on a tab - and as many tabs as you want. 
 - **Desktop, laptop, phone** — Run on your main machine, then work on your project anywhere via VPN or Tailscale.
 - **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
-- **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription. Rich chat UI with collapsible tool strips, token budget display, and full session persistence.
-- **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
+- **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
-- **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
-- **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 
 ## Quick Start
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.7.0 https://github.com/danshapiro/freshell.git
+git clone --branch v0.6.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
@@ -146,6 +143,12 @@ Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## Community Projects
+
+Projects built by the community around freshell.
+
+- [freshell-container](https://github.com/nkcx/freshell-container) — Docker container packaging freshell with all supported coding CLI providers for self-hosted, multi-device access
 
 ## License
 

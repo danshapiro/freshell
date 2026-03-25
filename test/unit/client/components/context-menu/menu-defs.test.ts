@@ -290,3 +290,117 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     expect(items[sessionIdx - 1]?.type).toBe('separator')
   })
 })
+
+function makeKimiSessionKey(cwd: string, sessionId = 'shared-kimi-session') {
+  return `kimi:cwd=${Buffer.from(cwd, 'utf8').toString('base64url')}:sid=${Buffer.from(sessionId, 'utf8').toString('base64url')}`
+}
+
+describe('buildMenuItems — duplicate Kimi session identity', () => {
+  it('uses sidebar target.sessionKey to read archived state for duplicate Kimi sessions', () => {
+    const actions = createMockActions()
+    const items = buildMenuItems(
+      {
+        kind: 'sidebar-session',
+        sessionId: 'shared-kimi-session',
+        provider: 'kimi',
+        sessionKey: makeKimiSessionKey('/repo/root/packages/app-b'),
+      },
+      {
+        ...createMockContext(actions),
+        sessions: [{
+          projectPath: '/repo/root',
+          sessions: [
+            {
+              provider: 'kimi',
+              sessionId: 'shared-kimi-session',
+              title: 'Kimi app A',
+              cwd: '/repo/root/packages/app-a',
+              projectPath: '/repo/root',
+              lastActivityAt: 2,
+              archived: true,
+            },
+            {
+              provider: 'kimi',
+              sessionId: 'shared-kimi-session',
+              title: 'Kimi app B',
+              cwd: '/repo/root/packages/app-b',
+              projectPath: '/repo/root',
+              lastActivityAt: 1,
+              archived: false,
+            },
+          ],
+        }],
+      },
+    )
+
+    const archiveItem = items.find((item) => item.type === 'item' && item.id === 'session-archive')
+    expect(archiveItem?.type).toBe('item')
+    expect(archiveItem?.type === 'item' ? archiveItem.label : null).toBe('Archive')
+  })
+
+  it('uses history target.sessionKey to read summary and open state for duplicate Kimi sessions', () => {
+    const actions = createMockActions()
+    const items = buildMenuItems(
+      {
+        kind: 'history-session',
+        sessionId: 'shared-kimi-session',
+        provider: 'kimi',
+        sessionKey: makeKimiSessionKey('/repo/root/packages/app-b'),
+      },
+      {
+        ...createMockContext(actions),
+        tabs: [{
+          id: 'tab-kimi-a',
+          createRequestId: 'tab-kimi-a',
+          title: 'Kimi app A',
+          status: 'running',
+          mode: 'kimi',
+          createdAt: 1,
+        }] as any,
+        paneLayouts: {
+          'tab-kimi-a': {
+            type: 'leaf',
+            id: 'pane-kimi-a',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              status: 'running',
+              resumeSessionId: 'shared-kimi-session',
+              initialCwd: '/repo/root/packages/app-a',
+            },
+          },
+        },
+        sessions: [{
+          projectPath: '/repo/root',
+          sessions: [
+            {
+              provider: 'kimi',
+              sessionId: 'shared-kimi-session',
+              title: 'Kimi app A',
+              cwd: '/repo/root/packages/app-a',
+              projectPath: '/repo/root',
+              lastActivityAt: 2,
+            },
+            {
+              provider: 'kimi',
+              sessionId: 'shared-kimi-session',
+              title: 'Kimi app B',
+              cwd: '/repo/root/packages/app-b',
+              projectPath: '/repo/root',
+              lastActivityAt: 1,
+              summary: 'Summary for Kimi app B',
+            },
+          ],
+        }],
+      },
+    )
+
+    const deleteItem = items.find((item) => item.type === 'item' && item.id === 'history-session-delete')
+    const copySummaryItem = items.find((item) => item.type === 'item' && item.id === 'history-session-copy-summary')
+
+    expect(deleteItem?.type).toBe('item')
+    expect(deleteItem?.type === 'item' ? deleteItem.disabled : true).toBe(false)
+    expect(copySummaryItem?.type).toBe('item')
+    expect(copySummaryItem?.type === 'item' ? copySummaryItem.disabled : true).toBe(false)
+  })
+})

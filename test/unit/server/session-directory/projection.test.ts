@@ -35,6 +35,7 @@ describe('session-directory projection', () => {
     })).toEqual({
       provider: 'codex',
       sessionId: 's1',
+      sessionKey: 'codex:s1',
       projectPath: '/repo',
       lastActivityAt: 100,
       createdAt: 50,
@@ -49,7 +50,7 @@ describe('session-directory projection', () => {
     })
   })
 
-  it('ignores invisible metadata and project color but still treats lastActivityAt as visible', () => {
+  it('ignores invisible metadata, project color, and timestamp-only changes', () => {
     const first: ProjectGroup[] = [{
       projectPath: '/repo',
       color: '#f00',
@@ -69,6 +70,30 @@ describe('session-directory projection', () => {
     expect(hasSessionDirectorySnapshotChange(
       [{ projectPath: '/repo', sessions: [{ ...baseSession, lastActivityAt: 100 }] }],
       lastActivityAtChanged,
-    )).toBe(true)
+    )).toBe(false)
+  })
+
+  it('returns false when only createdAt differs', () => {
+    const before: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{ ...baseSession, createdAt: 50 }],
+    }]
+    const after: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{ ...baseSession, createdAt: 99 }],
+    }]
+    expect(hasSessionDirectorySnapshotChange(before, after)).toBe(false)
+  })
+
+  it('returns true when a sidebar-relevant field changes alongside timestamps', () => {
+    const before: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{ ...baseSession, title: 'Deploy', lastActivityAt: 100, createdAt: 50 }],
+    }]
+    const after: ProjectGroup[] = [{
+      projectPath: '/repo',
+      sessions: [{ ...baseSession, title: 'Deploy v2', lastActivityAt: 200, createdAt: 50 }],
+    }]
+    expect(hasSessionDirectorySnapshotChange(before, after)).toBe(true)
   })
 })

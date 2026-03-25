@@ -4,6 +4,8 @@ import reducer, {
   setTabRegistrySnapshot,
   setTabRegistrySyncError,
   recordClosedTabSnapshot,
+  pushReopenEntry,
+  popReopenEntry,
 } from '../../../../src/store/tabRegistrySlice'
 import {
   BROWSER_PREFERENCES_STORAGE_KEY,
@@ -15,6 +17,8 @@ import {
   DEVICE_LABEL_STORAGE_KEY,
 } from '../../../../src/store/storage-keys'
 import type { RegistryTabRecord } from '../../../../src/store/tabRegistryTypes'
+import type { Tab } from '../../../../src/store/types'
+import type { PaneNode } from '../../../../src/store/paneTypes'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -97,5 +101,77 @@ describe('tabRegistrySlice', () => {
     const freshReducer = freshModule.default
 
     expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(365)
+  })
+})
+
+function makeTab(overrides: Partial<Tab> = {}): Tab {
+  return {
+    id: 'tab-1',
+    createRequestId: 'req-1',
+    title: 'Test Tab',
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
+    createdAt: 1000,
+    ...overrides,
+  }
+}
+
+function makeLeafLayout(id = 'pane-1'): PaneNode {
+  return {
+    type: 'leaf',
+    id,
+    content: {
+      kind: 'terminal',
+      terminalId: 'term-1',
+      createRequestId: 'crq-1',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+    },
+  }
+}
+
+describe('reopenStack', () => {
+  it('pushReopenEntry adds entry and popReopenEntry removes most recent', () => {
+    let state = reducer(undefined, pushReopenEntry({
+      tab: makeTab({ id: 'tab-a' }),
+      layout: makeLeafLayout(),
+      paneTitles: { 'pane-1': 'Shell' },
+      closedAt: 100,
+    }))
+    state = reducer(state, pushReopenEntry({
+      tab: makeTab({ id: 'tab-b' }),
+      layout: makeLeafLayout('pane-2'),
+      paneTitles: { 'pane-2': 'Shell 2' },
+      closedAt: 200,
+    }))
+
+    expect(state.reopenStack).toHaveLength(2)
+
+    state = reducer(state, popReopenEntry())
+    expect(state.reopenStack).toHaveLength(1)
+    expect(state.reopenStack[0].tab.id).toBe('tab-a')
+  })
+
+  it('popReopenEntry on empty stack is a no-op', () => {
+    const state = reducer(undefined, popReopenEntry())
+    expect(state.reopenStack).toHaveLength(0)
+  })
+
+  it('caps stack at 20 entries, evicting oldest', () => {
+    let state = reducer(undefined, { type: 'unknown' })
+    for (let i = 0; i < 25; i++) {
+      state = reducer(state, pushReopenEntry({
+        tab: makeTab({ id: `tab-${i}` }),
+        layout: makeLeafLayout(`pane-${i}`),
+        paneTitles: {},
+        closedAt: i,
+      }))
+    }
+    expect(state.reopenStack).toHaveLength(20)
+    // Oldest entries (0-4) should have been evicted
+    expect(state.reopenStack[0].tab.id).toBe('tab-5')
+    expect(state.reopenStack[19].tab.id).toBe('tab-24')
   })
 })

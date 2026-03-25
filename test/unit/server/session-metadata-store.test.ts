@@ -3,6 +3,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
 import { SessionMetadataStore } from '../../../server/session-metadata-store.js'
+import { makeSessionKey } from '../../../server/coding-cli/types.js'
 
 describe('SessionMetadataStore', () => {
   let tmpDir: string
@@ -54,6 +55,39 @@ describe('SessionMetadataStore', () => {
     const store2 = new SessionMetadataStore(tmpDir)
     const meta = await store2.get('claude', 'abc')
     expect(meta?.sessionType).toBe('freshclaude')
+  })
+
+  it('writes and reads Kimi metadata using the cwd-scoped composite key', async () => {
+    await store.set('kimi', 'team:alpha', { sessionType: 'agent' }, '/repo/worktrees/app')
+
+    expect(await store.get('kimi', 'team:alpha', '/repo/worktrees/app')).toEqual({
+      sessionType: 'agent',
+    })
+
+    const all = await store.getAll()
+    expect(all[makeSessionKey('kimi', 'team:alpha', '/repo/worktrees/app')]).toEqual({
+      sessionType: 'agent',
+    })
+  })
+
+  it('migrates legacy nested metadata files into flat composite keys', async () => {
+    await fsp.writeFile(path.join(tmpDir, 'session-metadata.json'), JSON.stringify({
+      version: 1,
+      sessions: {
+        claude: {
+          'session-1': { sessionType: 'freshclaude' },
+        },
+        kimi: {
+          'team:alpha': { sessionType: 'agent' },
+        },
+      },
+    }, null, 2), 'utf-8')
+
+    const migrated = new SessionMetadataStore(tmpDir)
+    const all = await migrated.getAll()
+
+    expect(all['claude:session-1']).toEqual({ sessionType: 'freshclaude' })
+    expect(all['kimi:team:alpha']).toEqual({ sessionType: 'agent' })
   })
 
   it('returns defensive copies from get and getAll', async () => {

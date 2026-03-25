@@ -140,6 +140,7 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
   const candidate = value as {
     provider?: unknown
     sessionId?: unknown
+    cwd?: unknown
     serverInstanceId?: unknown
   }
   const provider = CodingCliProviderSchema.safeParse(candidate.provider)
@@ -147,6 +148,9 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
   return {
     provider: provider.data,
     sessionId: candidate.sessionId,
+    ...(isNonEmptyString(candidate.cwd)
+      ? { cwd: candidate.cwd }
+      : {}),
     ...(isNonEmptyString(candidate.serverInstanceId)
       ? { serverInstanceId: candidate.serverInstanceId }
       : {}),
@@ -164,7 +168,11 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   const kind = content.kind
   if (kind === 'agent-chat') {
     if (isNonEmptyString(content.resumeSessionId)) {
-      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+      locators.push({
+        provider: 'claude',
+        sessionId: content.resumeSessionId,
+        ...(isNonEmptyString(content.initialCwd) ? { cwd: content.initialCwd } : {}),
+      })
     }
     return locators
   }
@@ -179,6 +187,7 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   locators.push({
     provider: mode.data,
     sessionId: content.resumeSessionId,
+    ...(isNonEmptyString(content.initialCwd) ? { cwd: content.initialCwd } : {}),
   })
   return locators
 }
@@ -302,6 +311,7 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
+  private loadSessionHistoryFn: (sessionId: string) => Promise<ChatMessage[] | null>
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
@@ -336,9 +346,11 @@ export class WsHandler {
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
     codexActivityListProvider?: () => CodexActivityRecord[],
+    loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>,
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
+    this.loadSessionHistoryFn = loadSessionHistoryFn ?? loadSessionHistory
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
@@ -1131,6 +1143,9 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         let effectiveResumeSessionId = m.resumeSessionId
+        if (!modeSupportsResume(m.mode as TerminalMode)) {
+          effectiveResumeSessionId = undefined
+        }
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
@@ -1211,15 +1226,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -1271,15 +1289,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -1367,7 +1388,7 @@ export class WsHandler {
                 requestId: m.requestId,
                 terminalId: record.terminalId,
                 createdAt: record.createdAt,
-                effectiveResumeSessionId,
+                effectiveResumeSessionId: record.resumeSessionId ?? effectiveResumeSessionId,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for
@@ -1693,7 +1714,7 @@ export class WsHandler {
           // becomes interactive, preventing user messages from being overwritten.
           if (m.resumeSessionId) {
             try {
-              const messages = await loadSessionHistory(m.resumeSessionId)
+              const messages = await this.loadSessionHistoryFn(m.resumeSessionId)
               this.send(ws, {
                 type: 'sdk.session.snapshot',
                 sessionId: session.sessionId,
@@ -1866,7 +1887,7 @@ export class WsHandler {
         if (!session) {
           if (isValidClaudeSessionId(m.sessionId)) {
             try {
-              const historicalMessages = await loadSessionHistory(m.sessionId)
+              const historicalMessages = await this.loadSessionHistoryFn(m.sessionId)
               if (historicalMessages !== null) {
                 this.send(ws, {
                   type: 'sdk.session.snapshot',
@@ -1916,7 +1937,7 @@ export class WsHandler {
         let historyMessages: ChatMessage[] = session.messages
         if (session.resumeSessionId) {
           try {
-            const jsonlMessages = await loadSessionHistory(session.resumeSessionId)
+            const jsonlMessages = await this.loadSessionHistoryFn(session.resumeSessionId)
             if (jsonlMessages && jsonlMessages.length > session.messages.length) {
               historyMessages = jsonlMessages
             }

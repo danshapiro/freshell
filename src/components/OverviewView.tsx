@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { setActiveTab, updateTab } from '@/store/tabsSlice'
+import { createTerminalPaneBackedTab } from '@/store/workspaceActions'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
@@ -11,6 +12,8 @@ type TerminalOverview = {
   terminalId: string
   title: string
   description?: string
+  mode?: string
+  resumeSessionId?: string
   createdAt: number
   lastActivityAt: number
   status: 'running' | 'exited'
@@ -41,6 +44,22 @@ function formatDuration(ms: number): string {
   return `${h}h ${m % 60}m`
 }
 
+const STORAGE_KEY = 'freshell:summaryActivityMap'
+
+function loadSummaryActivityMap(): Map<string, number> {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) return new Map(JSON.parse(raw))
+  } catch { /* ignore */ }
+  return new Map()
+}
+
+function saveSummaryActivityMap(map: Map<string, number>) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(Array.from(map.entries())))
+  } catch { /* ignore */ }
+}
+
 export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const tabs = useAppSelector((s) => s.tabs.tabs)
@@ -50,6 +69,8 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
   const [items, setItems] = useState<TerminalOverview[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [summaryActivityMap, setSummaryActivityMap] = useState(() => loadSummaryActivityMap())
+  const [refreshingAll, setRefreshingAll] = useState(false)
 
   async function refresh() {
     setLoading(true)
@@ -77,6 +98,76 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
     return () => unsub()
   }, [ws])
 
+  // Prune the activity map to only include IDs from the current terminal list
+  useEffect(() => {
+    if (items.length === 0) return
+    const currentIds = new Set(items.map((t) => t.terminalId))
+    const map = loadSummaryActivityMap()
+    let pruned = false
+    for (const id of map.keys()) {
+      if (!currentIds.has(id)) {
+        map.delete(id)
+        pruned = true
+      }
+    }
+    if (pruned) {
+      saveSummaryActivityMap(map)
+      setSummaryActivityMap(map)
+    }
+  }, [items])
+
+  const recordSummaryActivity = (terminalId: string, lastActivityAt: number) => {
+    setSummaryActivityMap((prev) => {
+      const nextMap = new Map(prev)
+      nextMap.set(terminalId, lastActivityAt)
+      saveSummaryActivityMap(nextMap)
+      return nextMap
+    })
+  }
+
+  const handleRefreshAll = async () => {
+    setRefreshingAll(true)
+    try {
+      const toRefresh = items.filter((t) => {
+        const lastGenAt = summaryActivityMap.get(t.terminalId)
+        return lastGenAt === undefined || t.lastActivityAt > lastGenAt
+      })
+
+      if (toRefresh.length === 0) {
+        return
+      }
+
+      const results = await Promise.allSettled(
+        toRefresh.map(async (t) => {
+          const res = await api.post(
+            `/api/ai/terminals/${encodeURIComponent(t.terminalId)}/summary`,
+            {},
+          )
+          if (res?.description) {
+            await api.patch(`/api/terminals/${encodeURIComponent(t.terminalId)}`, {
+              descriptionOverride: res.description,
+            })
+          }
+          return { terminalId: t.terminalId, lastActivityAt: t.lastActivityAt }
+        }),
+      )
+
+      setSummaryActivityMap((prev) => {
+        const nextMap = new Map(prev)
+        for (const result of results) {
+          if (result.status === 'fulfilled') {
+            nextMap.set(result.value.terminalId, result.value.lastActivityAt)
+          }
+        }
+        saveSummaryActivityMap(nextMap)
+        return nextMap
+      })
+      await refresh()
+    } finally {
+      setRefreshingAll(false)
+    }
+  }
+
   const runningTerminals = items.filter((t) => t.status === 'running')
   const exitedTerminals = items.filter((t) => t.status === 'exited')
 
@@ -91,17 +182,30 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
               {runningTerminals.length} running, {exitedTerminals.length} exited
             </p>
           </div>
-          <button
-            onClick={refresh}
-            disabled={loading}
-            aria-label={loading ? 'Loading...' : 'Refresh terminals'}
-            className={cn(
-              'p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors',
-              loading && 'animate-spin'
-            )}
-          >
-            <RefreshCw className="h-4 w-4" aria-hidden="true" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleRefreshAll}
+              disabled={refreshingAll || loading}
+              aria-label={refreshingAll ? 'Refreshing all summaries...' : 'Refresh all summaries'}
+              className={cn(
+                'p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors',
+                refreshingAll && 'animate-pulse'
+              )}
+            >
+              <Sparkles className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <button
+              onClick={refresh}
+              disabled={loading}
+              aria-label={loading ? 'Loading...' : 'Refresh terminals'}
+              className={cn(
+                'p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors',
+                loading && 'animate-spin'
+              )}
+            >
+              <RefreshCw className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -145,7 +249,15 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: 'shell' }))
+                        dispatch(createTerminalPaneBackedTab({
+                          tab: {
+                            title: t.title,
+                            terminalId: t.terminalId,
+                            status: 'running',
+                            mode: (t.mode as any) || 'shell',
+                            resumeSessionId: t.resumeSessionId,
+                          },
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
@@ -170,6 +282,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                             descriptionOverride: res.description,
                           })
                         }
+                        recordSummaryActivity(t.terminalId, t.lastActivityAt)
                         await refresh()
                       }}
                     />
@@ -200,7 +313,15 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'exited', mode: 'shell' }))
+                        dispatch(createTerminalPaneBackedTab({
+                          tab: {
+                            title: t.title,
+                            terminalId: t.terminalId,
+                            status: 'exited',
+                            mode: (t.mode as any) || 'shell',
+                            resumeSessionId: t.resumeSessionId,
+                          },
+                        }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
@@ -221,6 +342,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                             descriptionOverride: res.description,
                           })
                         }
+                        recordSummaryActivity(t.terminalId, t.lastActivityAt)
                         await refresh()
                       }}
                     />

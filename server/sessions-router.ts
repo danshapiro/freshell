@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
-import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import { makeSessionKey, parseSessionKey, sessionKeyRequiresCwdScope, type CodingCliProviderName } from './coding-cli/types.js'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
@@ -64,6 +64,44 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     })
   })
 
+  function resolveCompositeSessionKey(
+    rawId: string,
+    providerQuery: CodingCliProviderName | undefined,
+    cwdQuery: string | undefined,
+  ): { compositeKey?: string; error?: string } {
+    const parsedRaw = parseSessionKey(rawId)
+    const rawProviderIsKnown = validCliProviders.has(parsedRaw.provider)
+    const requestedProviderRequiresCwd = providerQuery ? sessionKeyRequiresCwdScope(providerQuery) : false
+    const rawLooksScopedComposite = rawProviderIsKnown
+      && sessionKeyRequiresCwdScope(parsedRaw.provider)
+      && rawId.startsWith(`${parsedRaw.provider}:cwd=`)
+      && rawId.includes(':sid=')
+    const rawLooksLegacyComposite = rawProviderIsKnown
+      && !sessionKeyRequiresCwdScope(parsedRaw.provider)
+      && rawId.startsWith(`${parsedRaw.provider}:`)
+      && (!requestedProviderRequiresCwd || providerQuery === parsedRaw.provider)
+
+    if (rawLooksScopedComposite || rawLooksLegacyComposite) {
+      if (providerQuery && providerQuery !== parsedRaw.provider) {
+        return { error: `Session key provider '${parsedRaw.provider}' does not match requested provider '${providerQuery}'` }
+      }
+      if (sessionKeyRequiresCwdScope(parsedRaw.provider) && !parsedRaw.cwd) {
+        return { error: `Opaque cwd-scoped session key required for provider '${parsedRaw.provider}'` }
+      }
+      return { compositeKey: rawId }
+    }
+
+    if (!providerQuery && rawProviderIsKnown && sessionKeyRequiresCwdScope(parsedRaw.provider)) {
+      return { error: `Opaque cwd-scoped session key required for provider '${parsedRaw.provider}'` }
+    }
+
+    const provider = providerQuery ?? 'claude'
+    if (sessionKeyRequiresCwdScope(provider) && !cwdQuery) {
+      return { error: `Opaque cwd-scoped session key required for provider '${provider}'` }
+    }
+    return { compositeKey: makeSessionKey(provider, rawId, cwdQuery) }
+  }
+
   router.get('/session-directory', async (req, res) => {
     const parsed = SessionDirectoryQuerySchema.safeParse({
       query: typeof req.query.query === 'string' ? req.query.query : undefined,
@@ -115,35 +153,40 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.patch('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
     const parsed = SessionPatchSchema.safeParse(req.body || {})
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
-    const next = await configStore.patchSessionOverride(compositeKey, {
-      titleOverride: cleanString(titleOverride),
-      ...(cleanString(titleOverride) ? { titleSource: 'user' as const } : {}),
-      summaryOverride: cleanString(summaryOverride),
-      deleted,
-      archived,
-      createdAtOverride,
-    })
+    const patch: Record<string, unknown> = {}
+    if (titleOverride !== undefined) {
+      patch.titleOverride = cleanString(titleOverride)
+      if (cleanString(titleOverride)) patch.titleSource = 'user' as const
+    }
+    if (summaryOverride !== undefined) patch.summaryOverride = cleanString(summaryOverride)
+    if (deleted !== undefined) patch.deleted = deleted
+    if (archived !== undefined) patch.archived = archived
+    if (createdAtOverride !== undefined) patch.createdAtOverride = createdAtOverride
+    const next = await configStore.patchSessionOverride(compositeKey, patch)
 
     // Cascade: if this session is running in a terminal, also rename the terminal
     const cleanTitle = cleanString(titleOverride)
     let cascadedTerminalId: string | undefined
     if (cleanTitle && deps.terminalMetadata) {
       try {
-        const parts = compositeKey.split(':')
-        const sessionProvider = (parts.length >= 2 ? parts[0] : provider) as CodingCliProviderName
-        const sessionId = parts.length >= 2 ? parts.slice(1).join(':') : rawId
+        const parsedKey = parseSessionKey(compositeKey)
         cascadedTerminalId = await cascadeSessionRenameToTerminal(
           deps.terminalMetadata.list(),
-          sessionProvider,
-          sessionId,
+          parsedKey.provider,
+          parsedKey.sessionId,
           cleanTitle,
+          parsedKey.cwd,
         )
         if (cascadedTerminalId) {
           deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)
@@ -160,8 +203,12 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.post('/sessions/:sessionId/generate-title', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
 
     const firstMessage = typeof req.body?.firstMessage === 'string' ? req.body.firstMessage : ''
     if (!firstMessage.trim()) {
@@ -205,8 +252,12 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
 
   router.delete('/sessions/:sessionId', async (req, res) => {
     const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    const provider = typeof req.query.provider === 'string' ? req.query.provider as CodingCliProviderName : undefined
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : undefined
+    const { compositeKey, error } = resolveCompositeSessionKey(rawId, provider, cwd)
+    if (!compositeKey) {
+      return res.status(400).json({ error })
+    }
     await configStore.deleteSession(compositeKey)
     await codingCliIndexer.refresh()
     res.json({ ok: true })
@@ -215,6 +266,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const SessionMetadataPostSchema = z.object({
     provider: sessionMetadataProviderSchema,
     sessionId: z.string().min(1),
+    cwd: z.string().min(1).optional(),
     sessionType: z.string().min(1),
   })
 
@@ -226,8 +278,11 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Missing required fields: provider, sessionId, sessionType', details: parsed.error.issues })
     }
-    const { provider, sessionId, sessionType } = parsed.data
-    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType })
+    const { provider, sessionId, cwd, sessionType } = parsed.data
+    if (sessionKeyRequiresCwdScope(provider) && !cwd) {
+      return res.status(400).json({ error: `Opaque cwd-scoped session key required for provider '${provider}'` })
+    }
+    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType }, cwd)
     await codingCliIndexer.refresh()
     res.json({ ok: true })
   })

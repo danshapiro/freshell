@@ -3,8 +3,8 @@ import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab } from '@/store/tabsSlice'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
+import { createTerminalPaneBackedTab } from '@/store/workspaceActions'
 
 type BackgroundTerminal = {
   terminalId: string
@@ -97,7 +97,15 @@ export default function BackgroundSessions() {
                     size="sm"
                     variant="outline"
                     onClick={() => {
-                      dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: (t.mode as any) || 'shell', resumeSessionId: t.resumeSessionId }))
+                      dispatch(createTerminalPaneBackedTab({
+                        tab: {
+                          title: t.title,
+                          terminalId: t.terminalId,
+                          status: 'running',
+                          mode: (t.mode as any) || 'shell',
+                          resumeSessionId: t.resumeSessionId,
+                        },
+                      }))
                     }}
                   >
                     Attach

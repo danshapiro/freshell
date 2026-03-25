@@ -489,6 +489,24 @@ function getLegacyOwnedPortProxyPorts(
     .filter((port) => !requiredPortSet.has(port) && existingRules.has(port))
 }
 
+function getStaleFirewallPorts(
+  requiredPorts: number[],
+  existingFirewallPorts: Set<number>,
+): number[] {
+  const requiredPortSet = new Set(requiredPorts)
+  return Array.from(existingFirewallPorts).filter((port) => !requiredPortSet.has(port))
+}
+
+function getStaleManagedPortProxyPorts(
+  requiredPorts: number[],
+  managedPorts: Set<number>,
+  existingRules: Map<number, PortProxyRule>,
+): number[] {
+  const requiredPortSet = new Set(requiredPorts)
+  return Array.from(managedPorts)
+    .filter((port) => !requiredPortSet.has(port) && existingRules.has(port))
+}
+
 function buildWslPortForwardingPlan(
   requiredPorts: number[],
   knownOwnedPorts: number[],
@@ -497,17 +515,21 @@ function buildWslPortForwardingPlan(
   existingFirewallPorts: Set<number>,
   managedPorts: Set<number>,
 ): WslPortForwardingPlan {
-  const requiredPortSet = new Set(requiredPorts)
-  const staleOwnedPorts = Array.from(new Set([...existingFirewallPorts, ...managedPorts]))
-    .filter((port) => !requiredPortSet.has(port))
+  const staleFirewallPorts = getStaleFirewallPorts(requiredPorts, existingFirewallPorts)
+  const staleManagedPortProxyPorts = getStaleManagedPortProxyPorts(
+    requiredPorts,
+    managedPorts,
+    existingRules,
+  )
   const staleOwnedPortProxyPorts = Array.from(new Set([
-    ...staleOwnedPorts.filter((port) => existingRules.has(port)),
+    ...staleFirewallPorts.filter((port) => existingRules.has(port)),
+    ...staleManagedPortProxyPorts,
     ...getLegacyOwnedPortProxyPorts(requiredPorts, knownOwnedPorts, existingRules),
   ]))
   const portsNeedUpdate = needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)
     || staleOwnedPortProxyPorts.length > 0
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
-    || staleOwnedPorts.length > 0
+    || staleFirewallPorts.length > 0
 
   if (!portsNeedUpdate && !firewallNeedsUpdate) {
     return {
@@ -519,8 +541,7 @@ function buildWslPortForwardingPlan(
   const scriptKind = portsNeedUpdate ? 'full' : 'firewall-only'
   const cleanupPorts = Array.from(new Set([
     ...requiredPorts,
-    ...managedPorts,
-    ...existingFirewallPorts,
+    ...staleFirewallPorts,
     ...staleOwnedPortProxyPorts,
   ]))
   const script = scriptKind === 'full'

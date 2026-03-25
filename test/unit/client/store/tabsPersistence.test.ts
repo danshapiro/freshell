@@ -15,6 +15,7 @@ const localStorageMock = (() => {
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
+import panesReducer from '@/store/panesSlice'
 import {
   persistMiddleware,
   resetPersistFlushListenersForTests,
@@ -22,7 +23,10 @@ import {
 
 function makeStore() {
   return configureStore({
-    reducer: { tabs: tabsReducer },
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+    },
     middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
     preloadedState: {
       tabs: {
@@ -36,6 +40,30 @@ function makeStore() {
           lastInputAt: 111,
         }],
         activeTabId: 'tab-1',
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'running',
+              mode: 'shell',
+              shell: 'system',
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+        },
+        paneTitles: {
+          'tab-1': {
+            'pane-1': 'Test',
+          },
+        },
+        paneTitleSetByUser: {},
       },
     },
   })
@@ -80,5 +108,6 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!)
     expect(parsed.tabs.tabs[0].lastInputAt).toBeUndefined()
+    expect(localStorage.getItem('freshell.workspace.v1')).not.toBeNull()
   })
 })

@@ -2,6 +2,7 @@ import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env ex
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
+import fsp from 'fs/promises'
 import http from 'http'
 import os from 'os'
 import path from 'path'
@@ -14,15 +15,14 @@ import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { AI_CONFIG } from './ai-prompts.js'
 import { getFreshellConfigDir } from './freshell-home.js'
-import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands } from './terminal-registry.js'
+import { buildCliCommandSpecsFromEntries } from './coding-cli/command-specs.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
-import { claudeProvider } from './coding-cli/providers/claude.js'
-import { codexProvider } from './coding-cli/providers/codex.js'
-import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { codingCliProviders } from './coding-cli/providers/index.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
@@ -48,6 +48,8 @@ import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
+import { DiscoveredSessionAssociation } from './discovered-session-association.js'
+import { splitAssociationProjectsForUpdate } from './session-association-routing.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
@@ -61,19 +63,12 @@ import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
+import { SessionContentCache } from './session-content-cache.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-
-function compileArgTemplate(
-  template: string[] | undefined,
-  placeholder: string,
-): ((value: string) => string[]) | undefined {
-  if (!template) return undefined
-  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
-}
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -169,7 +164,6 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -194,31 +188,7 @@ async function main() {
   const builtinExtDir = path.join(process.cwd(), 'extensions')
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
 
-  // Build CLI commands from extension manifests
-  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
-  for (const ext of extensionManager.getAll()) {
-    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
-    const cli = ext.manifest.cli
-    const spec: CodingCliCommandSpec = {
-      label: ext.manifest.label,
-      envVar: cli.envVar || '',
-      defaultCommand: cli.command,
-      args: cli.args,
-      env: cli.env,
-      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
-      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
-      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
-      permissionModeEnvVar: cli.permissionModeEnvVar,
-      permissionModeEnvValues: cli.permissionModeValues,
-    }
-    if (cli.resumeArgs) {
-      const template = cli.resumeArgs
-      spec.resumeArgs = (sessionId: string) =>
-        template.map(arg => arg.replace('{{sessionId}}', sessionId))
-    }
-    cliCommandsMap.set(ext.manifest.name, spec)
-  }
-  registerCodingCliCommands(cliCommandsMap)
+  registerCodingCliCommands(buildCliCommandSpecsFromEntries(extensionManager.getAll()))
 
   // Build CLI detection specs from extension manifests
   const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
@@ -265,6 +235,18 @@ async function main() {
     }
   }
 
+  // Shared parsed content cache for .jsonl session files.
+  // Used by both WsHandler (for sdk.create/attach history) and the
+  // agent-timeline service (for timeline page + turn body requests).
+  const sessionContentCache = new SessionContentCache()
+
+  /** Load session history using path resolution + content caching. */
+  const loadSessionHistoryWithCache = (sessionId: string) =>
+    loadSessionHistory(sessionId, undefined, {
+      resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
+      contentCache: sessionContentCache,
+    })
+
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
     server,
@@ -291,6 +273,7 @@ async function main() {
     layoutStore,
     extensionManager,
     () => codexActivity.tracker.list(),
+    loadSessionHistoryWithCache,
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
@@ -324,6 +307,7 @@ async function main() {
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+  const discoveredSessionAssociation = new DiscoveredSessionAssociation(registry)
 
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
@@ -436,7 +420,7 @@ async function main() {
 
   app.use('/api', createAgentTimelineRouter({
     service: createAgentTimelineService({
-      loadSessionHistory,
+      loadSessionHistory: loadSessionHistoryWithCache,
     }),
   }))
 
@@ -453,7 +437,20 @@ async function main() {
   }))
 
   // --- API: AI ---
-  app.use('/api/ai', createAiRouter({ registry, perfConfig }))
+  app.use('/api/ai', createAiRouter({
+    registry,
+    perfConfig,
+    readSessionContent: async (sessionId, provider, cwd) => {
+      const filePath = codingCliIndexer.getFilePathForSession(sessionId, provider as CodingCliProviderName, cwd)
+      if (!filePath) return null
+      try {
+        const content = await fsp.readFile(filePath, 'utf-8')
+        return content
+      } catch {
+        return null
+      }
+    },
+  }))
 
   // --- API: files (for editor pane) ---
   app.use('/api/files', createFilesRouter({ configStore, codingCliIndexer, registry }))
@@ -496,11 +493,46 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
-    const nonClaudeProjects = projects.map((project) => ({
-      ...project,
-      sessions: project.sessions.filter((session) => session.provider !== 'claude'),
-    }))
-    for (const session of associationCoordinator.collectNewOrAdvanced(nonClaudeProjects)) {
+    const pendingNamedClaudeResumeByCwd = new Map<string, boolean>()
+    const shouldIncludeClaudeUpdateSession = (session: CodingCliSession): boolean => {
+      if (session.provider !== 'claude' || !session.cwd) return false
+      const cached = pendingNamedClaudeResumeByCwd.get(session.cwd)
+      if (cached !== undefined) return cached
+      const hasPendingNamedResume = registry.findUnassociatedTerminals('claude', session.cwd)
+        .some((candidate) => typeof candidate.pendingResumeName === 'string' && candidate.pendingResumeName.trim().length > 0)
+      pendingNamedClaudeResumeByCwd.set(session.cwd, hasPendingNamedResume)
+      return hasPendingNamedResume
+    }
+    const { codexProjects, compatibilityProjects } = splitAssociationProjectsForUpdate(projects, {
+      includeClaudeSession: shouldIncludeClaudeUpdateSession,
+    })
+    for (const session of discoveredSessionAssociation.collectNewOrAdvanced(codexProjects)) {
+      const result = discoveredSessionAssociation.associateSingleSession(session)
+      if (!result.associated || !result.terminalId) continue
+      log.info({
+        event: 'session_bind_applied',
+        terminalId: result.terminalId,
+        sessionId: session.sessionId,
+        provider: session.provider,
+      }, 'session_bind_applied')
+      try {
+        wsHandler.broadcast({
+          type: 'terminal.session.associated' as const,
+          terminalId: result.terminalId,
+          sessionId: session.sessionId,
+        })
+        const metaUpsert = terminalMetadata.associateSession(
+          result.terminalId,
+          session.provider,
+          session.sessionId,
+        )
+        if (metaUpsert) associationMetaUpserts.push(metaUpsert)
+      } catch (err) {
+        log.warn({ err, terminalId: result.terminalId }, 'Failed to broadcast session association')
+      }
+    }
+
+    for (const session of associationCoordinator.collectNewOrAdvanced(compatibilityProjects)) {
       const result = associationCoordinator.associateSingleSession(session)
       if (!result.associated || !result.terminalId) continue
       log.info({

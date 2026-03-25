@@ -1,4 +1,5 @@
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import type { ChatSessionState } from '@/store/agentChatTypes'
@@ -39,14 +40,14 @@ function resolveAgentChatSessionKey(
 ): string | undefined {
   const explicit = content.sessionRef
   if (explicit?.provider && explicit.sessionId) {
-    return `${explicit.provider}:${explicit.sessionId}`
+    return makeCodingCliSessionKey(explicit.provider, explicit.sessionId, (explicit as { cwd?: string }).cwd ?? content.initialCwd)
   }
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
   const sessionId = session?.cliSessionId ?? content.resumeSessionId
   if (!provider || !sessionId) return undefined
 
-  return `${provider}:${sessionId}`
+  return makeCodingCliSessionKey(provider, sessionId, content.initialCwd)
 }
 
 function isAgentChatBusy(
@@ -73,7 +74,7 @@ function resolveTerminalSessionKey(
 ): string | undefined {
   const explicit = content.sessionRef
   if (explicit?.provider && explicit.sessionId) {
-    return `${explicit.provider}:${explicit.sessionId}`
+    return makeCodingCliSessionKey(explicit.provider, explicit.sessionId, (explicit as { cwd?: string }).cwd ?? content.initialCwd)
   }
 
   const provider = content.mode !== 'shell' ? content.mode : fallbackMode
@@ -82,7 +83,7 @@ function resolveTerminalSessionKey(
   const sessionId = content.resumeSessionId ?? fallbackSessionId
   if (!sessionId) return undefined
 
-  return `${provider}:${sessionId}`
+  return makeCodingCliSessionKey(provider, sessionId, content.initialCwd)
 }
 
 function buildSyntheticTerminalContent(tab: Tab): TerminalPaneContent | null {
@@ -98,6 +99,10 @@ function buildSyntheticTerminalContent(tab: Tab): TerminalPaneContent | null {
     resumeSessionId: tab.resumeSessionId,
     initialCwd: tab.initialCwd,
   }
+}
+
+function isNoLayoutCodingMirror(tab: Tab): boolean {
+  return Boolean(tab.codingCliProvider || (tab.mode && tab.mode !== 'shell'))
 }
 
 export function resolvePaneActivity(input: {
@@ -164,6 +169,8 @@ export function getBusyPaneIdsForTab(input: {
 }): string[] {
   const layout = input.paneLayouts[input.tab.id]
   if (!layout) {
+    if (isNoLayoutCodingMirror(input.tab)) return []
+
     const syntheticContent = buildSyntheticTerminalContent(input.tab)
     if (!syntheticContent) return []
 
@@ -208,6 +215,8 @@ export function collectBusySessionKeys(input: {
   for (const tab of input.tabs) {
     const layout = input.paneLayouts[tab.id]
     if (!layout) {
+      if (isNoLayoutCodingMirror(tab)) continue
+
       const syntheticContent = buildSyntheticTerminalContent(tab)
       if (!syntheticContent) continue
 

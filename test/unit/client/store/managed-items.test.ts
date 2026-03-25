@@ -50,6 +50,19 @@ const codexExt: ClientExtensionEntry = {
   },
 }
 
+const kimiExt: ClientExtensionEntry = {
+  name: 'kimi',
+  version: '1.0.0',
+  label: 'Kimi',
+  description: 'Kimi CLI agent',
+  category: 'cli',
+  cli: {
+    supportsModel: true,
+    supportsPermissionMode: true,
+    supportedPermissionModes: ['default', 'bypassPermissions'],
+  },
+}
+
 const serverExt: ClientExtensionEntry = {
   name: 'my-server',
   version: '2.0.0',
@@ -146,6 +159,18 @@ describe('selectManagedItems', () => {
     expect(sandboxConfig).toBeDefined()
     expect(sandboxConfig!.type).toBe('select')
     expect(sandboxConfig!.value).toBe('read-only')
+  })
+
+  it('filters Kimi permission options to the supported subset and coerces unsupported saved values back to default', () => {
+    const items = selectManagedItems(makeState({
+      entries: [kimiExt],
+      enabledProviders: ['kimi'],
+      providers: { kimi: { model: 'moonshot-k2', permissionMode: 'plan' } },
+    }))
+
+    const permission = items[0].config.find((field) => field.key === 'permissionMode')
+    expect(permission?.value).toBe('default')
+    expect(permission?.options?.map((option) => option.value)).toEqual(['default', 'bypassPermissions'])
   })
 
   it('always includes a starting directory field for CLI extensions', () => {

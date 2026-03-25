@@ -26,7 +26,7 @@ describe('layoutMirrorMiddleware', () => {
     vi.useRealTimers()
   })
 
-  it('includes fallbackSessionRef for no-layout local session tabs', () => {
+  it('does not include fallbackSessionRef for corrupted no-layout local session tabs', () => {
     mockSend.mockClear()
     vi.useFakeTimers()
     const store = configureStore({
@@ -49,10 +49,6 @@ describe('layoutMirrorMiddleware', () => {
         {
           id: 'tab-1',
           title: 'alpha',
-          fallbackSessionRef: {
-            provider: 'codex',
-            sessionId: 'older-open',
-          },
         },
       ],
       activeTabId: 'tab-1',
@@ -62,6 +58,37 @@ describe('layoutMirrorMiddleware', () => {
       paneTitleSetByUser: {},
       timestamp: expect.any(Number),
     })
+
+    vi.useRealTimers()
+  })
+
+  it('does not include fallbackSessionRef for corrupted no-layout Kimi tabs', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+
+    store.dispatch(addTab({
+      id: 'tab-kimi',
+      title: 'kimi tab',
+      mode: 'kimi',
+      resumeSessionId: 'team:alpha',
+      initialCwd: '/repo/worktrees/app',
+    }))
+
+    vi.runOnlyPendingTimers()
+
+    expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ui.layout.sync',
+      tabs: [
+        {
+          id: 'tab-kimi',
+          title: 'kimi tab',
+        },
+      ],
+    }))
 
     vi.useRealTimers()
   })
