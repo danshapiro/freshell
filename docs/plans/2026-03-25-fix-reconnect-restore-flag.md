@@ -195,49 +195,118 @@ a server restart."
 ### Task 2: Add e2e-browser test -- multi-pane recovery after server restart
 
 **Files:**
+- Modify: `test/e2e-browser/helpers/test-server.ts` (add `port` and `token` options to `TestServerOptions`)
 - Create: `test/e2e-browser/specs/server-restart-recovery.spec.ts`
 
 This test verifies the end-to-end behavior: multiple panes exist, server restarts (losing all terminal state), and all panes recover without hitting the rate limit.
 
-- [ ] **Step 1: Write the failing e2e test**
+**Why TestServer needs `port` and `token` options:** The current `TestServer.start()` always picks a random ephemeral port via `findFreePort()` and generates a random auth token via `randomUUID()`. A server-restart e2e test needs the replacement server on the **same port** (so the client's WS auto-reconnect reaches it) with the **same auth token** (so the WS handshake succeeds). Without these options, the client would either connect to the wrong port or fail authentication, making it impossible to test the INVALID_TERMINAL_ID reconnection flow.
 
-Create a new e2e-browser spec that:
-1. Creates 3+ terminal panes (via tab creation and/or splits)
-2. Waits for all terminals to be running and functional
-3. Stops the TestServer and starts a new one on the same port
-4. Waits for all panes to reconnect and become functional
-5. Verifies no "[Error]" messages appear in any terminal output
+- [ ] **Step 1: Extend TestServerOptions with `port` and `token`**
+
+In `test/e2e-browser/helpers/test-server.ts`, add two optional fields to the `TestServerOptions` interface:
 
 ```typescript
-import { test, expect } from '../helpers/fixtures.js'
+export interface TestServerOptions {
+  /** Extra environment variables to pass to the server process */
+  env?: Record<string, string>
+  /** Optional setup hook for populating the isolated HOME before the server starts */
+  setupHome?: (homeDir: string) => Promise<void>
+  /** Preserve the isolated HOME after stop for audit collection */
+  preserveHomeOnStop?: boolean
+  /** Timeout in ms to wait for the server to become healthy (default: 30000) */
+  startTimeoutMs?: number
+  /** Whether to pipe server stdout/stderr to the test console (default: false) */
+  verbose?: boolean
+  authStrategy?: 'explicit-env' | 'bootstrap'
+  runtimeRootMode?: 'project' | 'isolated'
+  /** Use a specific port instead of finding a free ephemeral port */
+  port?: number
+  /** Use a specific auth token instead of generating a random one (only with explicit-env auth) */
+  token?: string
+}
+```
+
+Then in the `start()` method, use the provided values when available:
+
+```typescript
+// Change:
+//   const explicitToken = randomUUID()
+//   const port = await findFreePort()
+// To:
+const explicitToken = this.options.token ?? randomUUID()
+const port = this.options.port ?? await findFreePort()
+```
+
+Both changes are in the `start()` method at lines 258-259. The rest of `start()` already uses `port` and `explicitToken` as local variables, so no other changes are needed.
+
+- [ ] **Step 2: Add a unit test for the new TestServer options**
+
+The existing `test/e2e-browser/helpers/test-server.test.ts` tests `TestServer` behavior. Add a test verifying the `port` and `token` options are respected. However, since spinning up a full TestServer is expensive and these are thin pass-through options, it is acceptable to verify via the existing e2e test in Step 3 rather than adding a dedicated unit test. The e2e test exercises both options end-to-end.
+
+- [ ] **Step 3: Write the e2e test**
+
+Create a new e2e-browser spec. The test manages its own `TestServer` instances (not the worker-scoped fixture) because it needs to stop and restart the server mid-test.
+
+**Important design notes:**
+- The second server must use the same `port` and `token` as the first, so the client's WS auto-reconnect reaches the new server with valid credentials.
+- New tabs show a `PanePicker` (shell selection UI) rather than immediately creating a terminal. The test must select a shell for each new tab. Use the `selectShellFromPicker` helper pattern from `fixtures.ts`, or click the shell button directly.
+- The test checks Redux state via `window.__FRESHELL_TEST_HARNESS__` to verify terminal recovery without relying on fragile DOM assertions.
+
+```typescript
+import { test as base, expect } from '../helpers/fixtures.js'
 import { TestServer } from '../helpers/test-server.js'
+import { TestHarness } from '../helpers/test-harness.js'
+
+// Override the worker-scoped testServer so this spec manages its own lifecycle.
+const test = base.extend({
+  testServer: [async ({}, use) => {
+    // Provide a dummy -- the test creates its own servers.
+    const server = new TestServer()
+    await server.start()
+    await use(server)
+    await server.stop()
+  }, { scope: 'worker' }],
+})
 
 test.describe('Server Restart Recovery', () => {
-  // This test needs its own server lifecycle, so we override the worker-scoped server.
-  test('all panes recover after server restart without rate limit errors', async ({ page, browser }) => {
-    const server = new TestServer()
-    const info = await server.start()
+  test('all panes recover after server restart without rate limit errors', async ({ page }) => {
+    const server1 = new TestServer()
+    const info1 = await server1.start()
 
     try {
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      await page.goto(`${info1.baseUrl}/?token=${info1.token}&e2e=1`)
 
-      // Wait for initial connection
-      await expect(async () => {
-        const status = await page.evaluate(() =>
-          window.__FRESHELL_TEST_HARNESS__?.getConnectionStatus()
-        )
-        expect(status).toBe('ready')
-      }).toPass({ timeout: 15_000 })
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
 
-      // Wait for the first terminal to be ready
-      await expect(page.locator('.xterm')).toBeVisible({ timeout: 15_000 })
+      // Wait for the first terminal to be ready (PanePicker auto-selects on
+      // some platforms, so wait for .xterm to appear)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
-      // Create 2 more tabs (total 3 panes)
+      // Create 2 more tabs (total 3 panes).
+      // Each new tab may show a PanePicker; select a shell for each.
       const addButton = page.locator('[data-context="tab-add"]')
-      await addButton.click()
-      await page.waitForTimeout(1000)
-      await addButton.click()
-      await page.waitForTimeout(1000)
+
+      for (let i = 0; i < 2; i++) {
+        await addButton.click()
+        // Wait for the new tab to become active, then select a shell if needed.
+        // The PanePicker shows shell buttons (Shell, WSL, CMD, etc.).
+        // Try clicking a visible shell button; if .xterm already appeared, skip.
+        await page.waitForTimeout(500)
+        const xtermVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
+        if (!xtermVisible) {
+          const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
+          for (const name of shellNames) {
+            try {
+              await page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') }).click({ timeout: 3000 })
+              await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 15_000 })
+              break
+            } catch { continue }
+          }
+        }
+      }
 
       // Verify 3 tabs exist
       await expect(async () => {
@@ -247,7 +316,7 @@ test.describe('Server Restart Recovery', () => {
         expect(tabCount).toBe(3)
       }).toPass({ timeout: 10_000 })
 
-      // Wait for all terminals to have terminalIds
+      // Wait for all terminals to have terminalIds (fully created)
       await expect(async () => {
         const state = await page.evaluate(() =>
           window.__FRESHELL_TEST_HARNESS__?.getState()
@@ -258,15 +327,22 @@ test.describe('Server Restart Recovery', () => {
         }
       }).toPass({ timeout: 20_000 })
 
-      // Stop the server (all PTYs and terminal state are lost)
-      await server.stop()
+      // Stop server1 (all PTYs and terminal state are lost)
+      await server1.stop()
 
-      // Start a fresh server on the same port -- simulates server restart
-      const server2 = new TestServer({ port: info.port })
-      const info2 = await server2.start()
+      // Start a fresh server on the SAME port with the SAME token.
+      // This simulates a server restart. The client's WS auto-reconnect
+      // will reach server2, authenticate with the original token, and
+      // try to attach to terminals that no longer exist, triggering
+      // INVALID_TERMINAL_ID -> recreate for each pane.
+      const server2 = new TestServer({
+        port: info1.port,
+        token: info1.token,
+      })
+      await server2.start()
 
       try {
-        // Wait for WS to reconnect and all terminals to recover
+        // Wait for WS to reconnect and reach 'ready' state
         await expect(async () => {
           const status = await page.evaluate(() =>
             window.__FRESHELL_TEST_HARNESS__?.getConnectionStatus()
@@ -274,8 +350,8 @@ test.describe('Server Restart Recovery', () => {
           expect(status).toBe('ready')
         }).toPass({ timeout: 30_000 })
 
-        // Wait for all panes to get new terminalIds (server restart means
-        // INVALID_TERMINAL_ID -> recreate flow for each pane)
+        // Wait for all panes to get new terminalIds (INVALID_TERMINAL_ID ->
+        // recreate with restore:true flow for each pane)
         await expect(async () => {
           const state = await page.evaluate(() =>
             window.__FRESHELL_TEST_HARNESS__?.getState()
@@ -284,7 +360,7 @@ test.describe('Server Restart Recovery', () => {
             const layout = state!.panes.layouts[tab.id] as any
             // Terminal should be running or creating -- NOT error
             expect(layout?.content?.status).not.toBe('error')
-            // Eventually should have a new terminalId
+            // Must have a new terminalId (proof that recreation succeeded)
             expect(layout?.content?.terminalId).toBeTruthy()
           }
         }).toPass({ timeout: 30_000 })
@@ -295,10 +371,8 @@ test.describe('Server Restart Recovery', () => {
           window.__FRESHELL_TEST_HARNESS__?.getState()
         )
         for (const tab of state!.tabs.tabs) {
-          // Click on each tab to make it active
           await page.locator(`[data-context="tab"][data-tab-id="${tab.id}"]`).click()
           await page.waitForTimeout(500)
-          // Check that no error messages are in the terminal
           const xtermContent = await page.locator('.xterm').first().textContent()
           expect(xtermContent).not.toContain('[Error]')
         }
@@ -306,45 +380,43 @@ test.describe('Server Restart Recovery', () => {
         await server2.stop()
       }
     } finally {
-      // Safety net: stop original server if still running
-      await server.stop().catch(() => {})
+      await server1.stop().catch(() => {})
     }
   })
 })
 ```
 
-**Note:** The `TestServer` constructor may need a `port` option to start the new server on the same port. Check the existing `TestServer` API -- it already accepts options including `port` in `TestServerOptions`. The test also needs its own server lifecycle rather than using the shared worker-scoped server, so it creates and manages `TestServer` instances directly (following the pattern in `settings-persistence-split.spec.ts`).
+- [ ] **Step 4: Run the test to confirm it reflects the fix**
 
-- [ ] **Step 2: Run the test to confirm it reflects the fix**
+Run: `cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag && npx playwright test test/e2e-browser/specs/server-restart-recovery.spec.ts --project=chromium`
 
-Run: `cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag && npx playwright test test/e2e-browser/specs/server-restart-recovery.spec.ts`
+With the production fix from Task 1 in place, this test should PASS. The test validates the end-to-end behavior: server restart triggers INVALID_TERMINAL_ID for all panes, all recreations are marked `restore: true`, and the rate limiter allows them through.
 
-If the production fix from Task 1 is in place, this test should PASS. If the fix is not in place (revert temporarily to verify), it should FAIL with rate limit errors.
-
-**Important:** This e2e test is designed to pass with the fix from Task 1. It validates the end-to-end behavior rather than catching the bug in isolation. Run it after the fix is applied.
-
-- [ ] **Step 3: Refactor and verify**
+- [ ] **Step 5: Refactor and verify**
 
 Review the test for:
 - Proper cleanup: both servers are stopped in `finally` blocks
 - Adequate timeouts: server restart takes time, 30s is reasonable
 - No flakiness: use `.toPass()` polling patterns, not fixed waits
-- Tab selector robustness: verify the `data-tab-id` attribute exists in the codebase
+- Tab selector robustness: `data-context="tab"` and `data-tab-id` attributes are confirmed in `TabItem.tsx:134-135`
+- Shell selection: new tabs may show PanePicker; the test handles this
 
 Run the full existing e2e-browser reconnection suite to ensure no regressions:
-Run: `cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag && npx playwright test test/e2e-browser/specs/reconnection.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts`
+Run: `cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag && npx playwright test test/e2e-browser/specs/reconnection.spec.ts test/e2e-browser/specs/server-restart-recovery.spec.ts --project=chromium`
 Expected: all PASS
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag
-git add test/e2e-browser/specs/server-restart-recovery.spec.ts
+git add test/e2e-browser/helpers/test-server.ts test/e2e-browser/specs/server-restart-recovery.spec.ts
 git commit -m "test: add e2e-browser test for multi-pane recovery after server restart
 
-Verifies that all panes recover their terminals without rate limit errors
-when the server restarts and all terminals are simultaneously recreated
-via INVALID_TERMINAL_ID -> restore flow."
+Extends TestServerOptions with optional port and token fields so tests
+can start a replacement server on the same endpoint. Uses this to verify
+that all panes recover their terminals without rate limit errors when the
+server restarts and all terminals are simultaneously recreated via
+INVALID_TERMINAL_ID -> restore flow."
 ```
 
 ---
@@ -375,4 +447,5 @@ Run: `cd /home/user/code/freshell/.worktrees/fix-reconnect-restore-flag && git d
 Expected changed files:
 - `src/components/TerminalView.tsx` -- 1 line change (remove `if (wasRestore)` guard)
 - `test/unit/client/components/TerminalView.lifecycle.test.tsx` -- new test case
+- `test/e2e-browser/helpers/test-server.ts` -- add `port` and `token` options
 - `test/e2e-browser/specs/server-restart-recovery.spec.ts` -- new e2e test file
