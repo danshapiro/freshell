@@ -530,6 +530,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
                   <span class="picker-label">Shell</span>
                   <span class="picker-shortcut">S</span>
                 </button>
+                <button class="picker-option">
+                  <i data-lucide="message-circle" class="picker-lucide"></i>
+                  <span class="picker-label">Freshclaude</span>
+                  <span class="picker-shortcut">F</span>
+                </button>
               </div>
             </div>
           </div>
@@ -774,7 +779,7 @@ const content = {
   welcome: [
     { typed: true, prompt: P, command: 'freshell', delay: 700 },
     { html: '' },
-    { html: '  🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.4.1</span>', delay: 60 },
+    { html: '  🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.7.0</span>', delay: 60 },
     { html: '  <span class="t-dim">Self-hosted browser terminal multiplexer</span>', delay: 60 },
     { html: '', delay: 200 },
     { html: '  <span class="t-success">✓</span> Multi-tab terminal management', delay: 50 },
@@ -785,6 +790,12 @@ const content = {
     { html: '  <span class="t-success">✓</span> Session history &amp; AI summaries', delay: 50 },
     { html: '  <span class="t-success">✓</span> Remote tab copies keep layout and reconnect safely on this machine', delay: 50 },
     { html: '  <span class="t-success">✓</span> Remote access with setup wizard &amp; QR code', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Extension system for custom pane types', delay: 50 },
+    { html: '  <span class="t-success">✓</span> AI-powered session titles', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Progressive sidebar search', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Keyboard shortcuts dialog (Alt+T, Alt+W)', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Personalized sidebar per device', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Freshclaude rich chat UI', delay: 50 },
     { html: '', delay: 300 },
     { html: '  <span class="t-dim">Your coding CLIs, organized in the browser.</span>', delay: 80 },
     { html: '  <span class="t-dim">GitHub:</span> <a href="https://github.com/danshapiro/freshell" target="_blank" class="t-blue">https://github.com/danshapiro/freshell</a>', delay: 80 },
@@ -876,7 +887,7 @@ const content = {
     { html: '<span class="t-dim"># Start the server</span>', delay: 100 },
     { typed: true, prompt: P, command: 'freshell --port 3000', delay: 600 },
     { html: '', delay: 400 },
-    { html: '🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.4.1</span>', delay: 60 },
+    { html: '🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.7.0</span>', delay: 60 },
     { html: '', delay: 200 },
     { html: '<span class="t-dim">Open your browser to connect.</span>', delay: 80 },
     { html: '<span class="t-dim">Run</span> <span class="t-cyan">freshell --help</span> <span class="t-dim">for more options.</span>', delay: 100 },
