@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import fs from 'fs'
-import path from 'path'
 import {
-  buildCodingCliCommandSpec,
   ExtensionManifestSchema,
   type ExtensionManifest,
   type ExtensionCategory,
@@ -82,7 +79,6 @@ describe('ExtensionManifestSchema', () => {
       ...validCliManifest,
       cli: {
         command: 'opencode',
-        launchArgs: ['--session-id', '{{sessionId}}'],
         resumeArgs: ['--session', '{{sessionId}}'],
         modelArgs: ['--model', '{{model}}'],
         sandboxArgs: ['--sandbox', '{{sandbox}}'],
@@ -97,37 +93,6 @@ describe('ExtensionManifestSchema', () => {
       },
     })
     expect(result.success).toBe(true)
-  })
-
-  it('accepts value-specific permission args for CLI manifests', () => {
-    const result = ExtensionManifestSchema.safeParse({
-      ...validCliManifest,
-      cli: {
-        command: 'kimi',
-        resumeArgs: ['--session', '{{sessionId}}'],
-        modelArgs: ['--model', '{{model}}'],
-        permissionModeArgsByValue: {
-          bypassPermissions: ['--yolo'],
-        },
-        supportsPermissionMode: true,
-        supportsModel: true,
-      },
-    })
-    expect(result.success).toBe(true)
-  })
-
-  it('compiles the bundled Claude CLI manifest with fresh-session launch args intact', () => {
-    const manifestPath = path.resolve(process.cwd(), 'extensions/claude-code/freshell.json')
-    const manifest = ExtensionManifestSchema.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf8')))
-    if (!manifest.cli) throw new Error('expected CLI manifest')
-
-    const spec = buildCodingCliCommandSpec({
-      label: manifest.label,
-      cli: manifest.cli,
-    })
-
-    expect(spec.launchArgs?.('session-123')).toEqual(['--session-id', 'session-123'])
-    expect(spec.resumeArgs?.('session-123')).toEqual(['--resume', 'session-123'])
   })
 
   it('rejects missing required fields', () => {

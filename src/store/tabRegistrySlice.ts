@@ -1,7 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
-import type { Tab } from './types'
-import type { PaneNode } from './paneTypes'
 import { getSearchRangeDaysPreference } from '@/lib/browser-preferences'
 import {
   DEVICE_ALIASES_STORAGE_KEY,
@@ -212,15 +210,6 @@ export function dismissDeviceIds(deviceIds: string[]): string[] {
   return next
 }
 
-export interface ClosedTabEntry {
-  tab: Tab
-  layout: PaneNode
-  paneTitles: Record<string, string>
-  closedAt: number
-}
-
-const REOPEN_STACK_MAX = 20
-
 export interface TabRegistryState {
   deviceId: string
   deviceLabel: string
@@ -231,7 +220,6 @@ export interface TabRegistryState {
   closed: RegistryTabRecord[]
   localClosed: Record<string, RegistryTabRecord>
   searchRangeDays: number
-  reopenStack: ClosedTabEntry[]
   loading: boolean
   syncError?: string
   lastSnapshotAt?: number
@@ -251,7 +239,6 @@ const initialState: TabRegistryState = {
   remoteOpen: [],
   closed: [],
   localClosed: {},
-  reopenStack: [],
   searchRangeDays: initialSearchRangeDays,
   loading: false,
 }
@@ -306,15 +293,6 @@ export const tabRegistrySlice = createSlice({
     clearClosedTabSnapshot: (state, action: PayloadAction<string>) => {
       delete state.localClosed[action.payload]
     },
-    pushReopenEntry: (state, action: PayloadAction<ClosedTabEntry>) => {
-      state.reopenStack.push(action.payload)
-      if (state.reopenStack.length > REOPEN_STACK_MAX) {
-        state.reopenStack = state.reopenStack.slice(state.reopenStack.length - REOPEN_STACK_MAX)
-      }
-    },
-    popReopenEntry: (state) => {
-      state.reopenStack.pop()
-    },
   },
 })
 
@@ -329,8 +307,6 @@ export const {
   setTabRegistrySyncError,
   recordClosedTabSnapshot,
   clearClosedTabSnapshot,
-  pushReopenEntry,
-  popReopenEntry,
 } = tabRegistrySlice.actions
 
 export default tabRegistrySlice.reducer

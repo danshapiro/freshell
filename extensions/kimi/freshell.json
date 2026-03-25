@@ -6,14 +6,7 @@
   "category": "cli",
   "cli": {
     "command": "kimi",
-    "envVar": "KIMI_CMD",
-    "resumeArgs": ["--session", "{{sessionId}}"],
-    "modelArgs": ["--model", "{{model}}"],
-    "permissionModeArgsByValue": {
-      "bypassPermissions": ["--yolo"]
-    },
-    "supportsPermissionMode": true,
-    "supportsModel": true
+    "envVar": "KIMI_CMD"
   },
   "picker": {
     "group": "agents"

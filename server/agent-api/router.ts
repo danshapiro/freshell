@@ -67,7 +67,7 @@ export function createAgentApiRouter({
   registry: any
   wsHandler?: any
   configStore?: any
-  terminalMetadata?: { list: () => Array<{ terminalId: string; provider?: string; sessionId?: string; cwd?: string }> }
+  terminalMetadata?: { list: () => Array<{ terminalId: string; provider?: string; sessionId?: string }> }
   codingCliIndexer?: { refresh: () => Promise<void> }
   codexActivityTracker?: CodexPromptBlocker
 }) {
@@ -155,15 +155,9 @@ export function createAgentApiRouter({
       terminalId ? registry.get?.(terminalId)?.mode : undefined,
       typeof meta?.provider === 'string' ? meta.provider : undefined,
     ]
-    const cwdCandidates = [
-      typeof meta?.cwd === 'string' ? meta.cwd : undefined,
-      typeof paneContent?.initialCwd === 'string' ? paneContent.initialCwd : undefined,
-      terminalId ? registry.get?.(terminalId)?.cwd : undefined,
-    ]
     const mode = modeCandidates.find((candidate) => (
       typeof candidate === 'string' && SYNCABLE_TERMINAL_MODES.has(candidate)
     ))
-    const cwd = cwdCandidates.find((candidate) => typeof candidate === 'string' && candidate.trim().length > 0)
 
     if (!terminalId || !mode || !SYNCABLE_TERMINAL_MODES.has(mode) || !configStore) {
       return
@@ -177,7 +171,7 @@ export function createAgentApiRouter({
       const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
       if (sessionProvider && sessionId) {
         try {
-          await configStore.patchSessionOverride?.(makeSessionKey(sessionProvider as any, sessionId, cwd), {
+          await configStore.patchSessionOverride?.(makeSessionKey(sessionProvider as any, sessionId), {
             titleOverride: title,
           })
           await codingCliIndexer?.refresh?.()

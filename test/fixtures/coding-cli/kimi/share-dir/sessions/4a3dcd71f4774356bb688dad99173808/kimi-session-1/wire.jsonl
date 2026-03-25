@@ -1,4 +1,0 @@
-{"type":"metadata","protocol_version":"1.2"}
-{"timestamp":1710000000.0,"message":{"type":"TurnBegin","payload":{"user_input":"Wire title that should be ignored by metadata"}}}
-{"timestamp":1710000001.0,"message":{"type":"ContentPart","payload":{"type":"text","text":"This is not the title"}}}
-{"timestamp":1710000002.0,"message":{"type":"TurnEnd","payload":{}}}

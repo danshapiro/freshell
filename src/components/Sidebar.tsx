@@ -6,12 +6,10 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
 import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, setActivePane, updatePaneContent } from '@/store/panesSlice'
+import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
-import { findFirstPickerPane } from '@/lib/pane-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -21,7 +19,6 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
-import { buildExactSessionRef } from '@/lib/exact-session-ref'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -192,7 +189,7 @@ export default function Sidebar({
     if (!tabId) return null
     const ref = getActiveSessionRefForTab(s, tabId)
     if (!ref) return null
-    return getCodingCliSessionKey(ref)
+    return `${ref.provider}:${ref.sessionId}`
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
@@ -278,7 +275,7 @@ export default function Sidebar({
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(
       state,
-      { provider, sessionId: item.sessionId, cwd: item.cwd },
+      { provider, sessionId: item.sessionId },
       localServerInstanceId,
     )
     if (existing) {
@@ -316,63 +313,35 @@ export default function Sidebar({
       return
     }
 
-    // Build the content to place in the target pane (picker fill or new split)
-    const resumeContent = buildResumeContent({
-      sessionType,
-      sessionId: item.sessionId,
-      cwd: item.cwd,
-      terminalId: runningTerminalId,
-      sessionRef: buildExactSessionRef({
-        provider,
-        sessionId: item.sessionId,
-        serverInstanceId: localServerInstanceId,
-      }),
-      agentChatProviderSettings: providerSettings,
-    })
-
-    // Track session metadata on the active tab so tab headers show session info
-    const syncSessionMetadata = () => {
-      const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
-      const sessionMetadataByKey = mergeSessionMetadataByKey(
-        activeTab?.sessionMetadataByKey,
-        provider,
-        item.sessionId,
-        {
-          sessionType,
-          firstUserMessage: item.firstUserMessage,
-          isSubagent: item.isSubagent,
-          isNonInteractive: item.isNonInteractive,
-        },
-        item.cwd,
-      )
-      if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
-        dispatch(updateTab({
-          id: currentActiveTabId,
-          updates: { sessionMetadataByKey },
-        }))
-      }
-    }
-
-    // 2.5. Picker: if the active tab has a picker pane, fill it instead of splitting
-    const pickerPaneId = findFirstPickerPane(activeLayout)
-    if (pickerPaneId) {
-      dispatch(updatePaneContent({
-        tabId: currentActiveTabId,
-        paneId: pickerPaneId,
-        content: resumeContent,
-      }))
-      dispatch(setActivePane({ tabId: currentActiveTabId, paneId: pickerPaneId }))
-      syncSessionMetadata()
-      onNavigate('terminal')
-      return
-    }
-
     // 3. Normal: split a new pane in the current tab
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent: resumeContent,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: item.sessionId,
+        cwd: item.cwd,
+        terminalId: runningTerminalId,
+        agentChatProviderSettings: providerSettings,
+      }),
     }))
-    syncSessionMetadata()
+    const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
+    const sessionMetadataByKey = mergeSessionMetadataByKey(
+      activeTab?.sessionMetadataByKey,
+      provider,
+      item.sessionId,
+      {
+        sessionType,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+      },
+    )
+    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+      dispatch(updateTab({
+        id: currentActiveTabId,
+        updates: { sessionMetadataByKey },
+      }))
+    }
     onNavigate('terminal')
   }, [dispatch, onNavigate, store])
 
@@ -697,7 +666,7 @@ export default function Sidebar({
             >
               <div ref={listContentRef}>
                 {sortedItems.map((item) => {
-                  const sessionKey = item.sessionKey
+                  const sessionKey = `${item.provider}:${item.sessionId}`
                   const isActive = computeIsActive({
                     isRunning: item.isRunning,
                     runningTerminalId: item.runningTerminalId,
@@ -785,7 +754,6 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           )}
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
-          data-session-key={item.sessionKey}
           data-provider={item.provider}
           data-session-type={item.sessionType}
           data-running-terminal-id={item.runningTerminalId}

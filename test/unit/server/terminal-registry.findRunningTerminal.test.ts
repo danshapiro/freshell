@@ -124,18 +124,4 @@ describe('TerminalRegistry.findRunningTerminalBySession', () => {
     expect(registry.get(canonical.terminalId)?.resumeSessionId).toBe(sessionId)
     expect(registry.get(duplicate.terminalId)?.resumeSessionId).toBeUndefined()
   })
-
-  it('findRunningTerminalBySession returns the canonical owner after repair clears duplicates', () => {
-    const sessionId = 'codex-session-repaired-find'
-    const canonical = registry.create({ mode: 'codex', resumeSessionId: sessionId })
-    const duplicate = registry.create({ mode: 'codex' })
-    const dupRecord = registry.get(duplicate.terminalId)
-    if (!dupRecord) throw new Error('Expected duplicate record')
-    dupRecord.resumeSessionId = sessionId
-
-    registry.repairLegacySessionOwners('codex', sessionId)
-
-    const found = registry.findRunningTerminalBySession('codex', sessionId)
-    expect(found?.terminalId).toBe(canonical.terminalId)
-  })
 })

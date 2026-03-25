@@ -934,9 +934,10 @@ describe('claude provider cross-platform tests', () => {
 })
 
 describe('parseSessionContent() - non-interactive detection', () => {
-  it('sets isNonInteractive when content contains entrypoint sdk-cli', () => {
+  it('sets isNonInteractive when content contains a queue-operation event', () => {
     const content = [
-      JSON.stringify({ entrypoint: 'sdk-cli', cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Do something' } }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Do something' } }),
     ].join('\n')
 
     const meta = parseSessionContent(content)
@@ -964,10 +965,11 @@ describe('parseSessionContent() - non-interactive detection', () => {
     expect(meta.isNonInteractive).toBeFalsy()
   })
 
-  it('sets isNonInteractive even when entrypoint sdk-cli is not the first line', () => {
+  it('sets isNonInteractive even when queue-operation is not the first line', () => {
     const content = [
       JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
-      JSON.stringify({ entrypoint: 'sdk-cli', cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Run tests' } }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-2' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Run tests' } }),
     ].join('\n')
 
     const meta = parseSessionContent(content)

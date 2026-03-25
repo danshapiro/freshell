@@ -18,8 +18,6 @@ export type AgentTimelinePage = {
   items: AgentTimelineItem[]
   nextCursor: string | null
   revision: number
-  /** When includeBodies is requested, maps turnId to full turn body. */
-  bodies?: Record<string, AgentTimelineTurn>
 }
 
 export type AgentTimelineTurn = {

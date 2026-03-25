@@ -16,15 +16,9 @@ interface PaneLayoutProps {
   tabId: string
   defaultContent: PaneContentInput
   hidden?: boolean
-  allowAutoInit?: boolean
 }
 
-export default function PaneLayout({
-  tabId,
-  defaultContent,
-  hidden,
-  allowAutoInit = true,
-}: PaneLayoutProps) {
+export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayoutProps) {
   const dispatch = useAppDispatch()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
@@ -34,11 +28,11 @@ export default function PaneLayout({
 
   // Initialize layout if not exists
   useEffect(() => {
-    if (allowAutoInit && !layout) {
+    if (!layout) {
       dispatch(initLayout({ tabId, content: defaultContent }))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allowAutoInit, dispatch, tabId, layout])
+  }, [dispatch, tabId, layout])
 
   const buildNewPaneContent = useCallback((): PaneContentInput => {
     const defaultNewPane = settings.panes?.defaultNewPane || 'ask'

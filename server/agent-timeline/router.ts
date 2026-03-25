@@ -30,7 +30,6 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
-      includeBodies: typeof req.query.includeBodies === 'string' ? req.query.includeBodies : undefined,
     })
 
     if (!params.success || !query.success) {

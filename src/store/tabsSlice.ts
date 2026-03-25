@@ -1,5 +1,4 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
-import { getCodingCliSessionKey, makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, removeLayout, updatePaneContent } from './panesSlice'
@@ -9,7 +8,7 @@ import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
-import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry, clearClosedTabSnapshot } from './tabRegistrySlice'
+import { recordClosedTabSnapshot } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
   buildClosedTabRegistryRecord,
@@ -18,15 +17,9 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
+import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
-import { buildExactSessionRef } from '@/lib/exact-session-ref'
-import {
-  createPaneBackedTab,
-  hydrateWorkspaceSnapshot,
-  restorePaneBackedTab,
-} from './workspaceActions'
-import { loadPersistedTabs } from './workspacePersistence'
 
 
 const log = createLogger('TabsSlice')
@@ -39,79 +32,48 @@ export interface TabsState {
   renameRequestTabId: string | null
 }
 
-function createDefaultTabsState(): TabsState {
-  return {
+// Load persisted tabs state directly at module initialization time
+// This ensures the initial state includes persisted data BEFORE the store is created
+function loadInitialTabsState(): TabsState {
+  const defaultState: TabsState = {
     tabs: [],
     activeTabId: null,
     renameRequestTabId: null,
   }
-}
-
-type TabInput = AddTabPayload & Partial<Pick<Tab, 'createdAt' | 'lastInputAt'>>
-
-function normalizeTabInput(payload: TabInput | undefined, fallbackTitle: string): Tab {
-  const input = payload || {}
-  const id = input.id || nanoid()
-  const legacyClaudeSessionId = input.claudeSessionId
-  const codingCliSessionId = input.codingCliSessionId || legacyClaudeSessionId
-  const codingCliProvider =
-    input.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
-
-  return {
-    id,
-    createRequestId: input.createRequestId || id,
-    title: input.title || fallbackTitle,
-    description: input.description,
-    terminalId: input.terminalId,
-    codingCliSessionId,
-    codingCliProvider,
-    claudeSessionId: input.claudeSessionId,
-    status: input.status || 'creating',
-    mode: input.mode || 'shell',
-    shell: input.shell || 'system',
-    initialCwd: input.initialCwd,
-    resumeSessionId: input.resumeSessionId,
-    sessionMetadataByKey: input.sessionMetadataByKey,
-    createdAt: input.createdAt || Date.now(),
-    titleSetByUser: input.titleSetByUser,
-    lastInputAt: input.lastInputAt,
-  }
-}
-
-function applyHydratedTabsState(state: TabsState, incoming: TabsState) {
-  state.tabs = (incoming.tabs || []).map((tab, index) =>
-    normalizeTabInput(tab, tab.title || `Tab ${index + 1}`),
-  )
-  const desired = incoming.activeTabId
-  const has = desired && state.tabs.some((tab) => tab.id === desired)
-  state.activeTabId = has ? desired! : (state.tabs[0]?.id ?? null)
-  state.renameRequestTabId = null
-}
-
-function appendTab(state: TabsState, payload: TabInput | undefined) {
-  const tab = normalizeTabInput(payload, payload?.title || `Tab ${state.tabs.length + 1}`)
-  state.tabs.push(tab)
-  state.activeTabId = tab.id
-}
-
-// Load persisted tabs state directly at module initialization time
-// This ensures the initial state includes persisted data BEFORE the store is created
-function loadInitialTabsState(): TabsState {
-  const defaultState = createDefaultTabsState()
 
   try {
-    const persisted = loadPersistedTabs()
-    const tabsState = persisted?.tabs as Partial<TabsState> | undefined
+    const raw = localStorage.getItem(TABS_STORAGE_KEY)
+    if (!raw) return defaultState
+    const parsed = JSON.parse(raw)
+    // The persisted format is { tabs: TabsState }
+    const tabsState = parsed?.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
     log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
-    const loadedState = createDefaultTabsState()
-    applyHydratedTabsState(loadedState, {
-      tabs: tabsState.tabs as Tab[],
-      activeTabId: tabsState.activeTabId ?? null,
-      renameRequestTabId: null,
+
+    // Apply same transformations as hydrateTabs to ensure consistency
+    const mappedTabs = tabsState.tabs.map((t: Tab) => {
+      const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+      return {
+        ...t,
+        codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
+        codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+        createdAt: t.createdAt || Date.now(),
+        createRequestId: (t as any).createRequestId || t.id,
+        status: t.status || 'creating',
+        mode: t.mode || 'shell',
+        shell: t.shell || 'system',
+        lastInputAt: t.lastInputAt,
+      }
     })
-    return loadedState
+    const desired = tabsState.activeTabId
+    const has = desired && mappedTabs.some((t) => t.id === desired)
+
+    return {
+      tabs: mappedTabs,
+      activeTabId: has ? desired! : (mappedTabs[0]?.id ?? null),
+      renameRequestTabId: null,
+    }
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
     return defaultState
@@ -123,7 +85,6 @@ const initialState: TabsState = loadInitialTabsState()
 type AddTabPayload = {
   id?: string
   title?: string
-  titleSetByUser?: boolean
   description?: string
   terminalId?: string
   codingCliSessionId?: string
@@ -145,7 +106,33 @@ export const tabsSlice = createSlice({
   reducers: {
     addTab: (state, action: PayloadAction<AddTabPayload | undefined>) => {
       // Dedupe by session is handled in openSessionTab using pane state.
-      appendTab(state, action.payload)
+      const payload = action.payload || {}
+
+      const id = payload.id || nanoid()
+      const legacyClaudeSessionId = payload.claudeSessionId
+      const codingCliSessionId = payload.codingCliSessionId || legacyClaudeSessionId
+      const codingCliProvider =
+        payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
+      const tab: Tab = {
+        id,
+        createRequestId: payload.createRequestId || id,
+        title: payload.title || `Tab ${state.tabs.length + 1}`,
+        description: payload.description,
+        terminalId: payload.terminalId,
+        codingCliSessionId,
+        codingCliProvider,
+        claudeSessionId: payload.claudeSessionId,
+        status: payload.status || 'creating',
+        mode: payload.mode || 'shell',
+        shell: payload.shell || 'system',
+        initialCwd: payload.initialCwd,
+        resumeSessionId: payload.resumeSessionId,
+        sessionMetadataByKey: payload.sessionMetadataByKey,
+        createdAt: Date.now(),
+        lastInputAt: undefined,
+      }
+      state.tabs.push(tab)
+      state.activeTabId = id
     },
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload
@@ -178,7 +165,24 @@ export const tabsSlice = createSlice({
       }
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
-      applyHydratedTabsState(state, action.payload)
+      // Basic sanity: ensure dates exist, status defaults.
+      state.tabs = (action.payload.tabs || []).map((t) => {
+        const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+        return {
+          ...t,
+          codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
+          codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+          createdAt: t.createdAt || Date.now(),
+          createRequestId: (t as any).createRequestId || t.id,
+          status: t.status || 'creating',
+          mode: t.mode || 'shell',
+          shell: t.shell || 'system',
+        }
+      })
+      const desired = action.payload.activeTabId
+      const has = desired && state.tabs.some((t) => t.id === desired)
+      state.activeTabId = has ? desired! : (state.tabs[0]?.id ?? null)
+      state.renameRequestTabId = null
     },
     reorderTabs: (
       state,
@@ -201,18 +205,6 @@ export const tabsSlice = createSlice({
       const prevIndex = (currentIndex - 1 + state.tabs.length) % state.tabs.length
       state.activeTabId = state.tabs[prevIndex].id
     },
-  },
-  extraReducers: (builder) => {
-    builder
-      .addCase(createPaneBackedTab, (state, action) => {
-        appendTab(state, action.payload.tab)
-      })
-      .addCase(restorePaneBackedTab, (state, action) => {
-        appendTab(state, action.payload.tab)
-      })
-      .addCase(hydrateWorkspaceSnapshot, (state, action) => {
-        applyHydratedTabsState(state, action.payload.tabs)
-      })
   },
 })
 
@@ -288,16 +280,6 @@ export const closeTab = createAsyncThunk(
       }
     }
 
-    // Always push to reopen stack (Alt+H should reopen any closed tab)
-    if (tab && layout) {
-      dispatch(pushReopenEntry({
-        tab: { ...tab },
-        layout: JSON.parse(JSON.stringify(layout)),
-        paneTitles: { ...(stateBeforeClose.panes.paneTitles[tabId] || {}) },
-        closedAt: Date.now(),
-      }))
-    }
-
     // Collect all pane IDs before removing the layout
     const currentLayout = (getState() as RootState).panes.layouts[tabId]
     const paneIds = collectPaneIds(currentLayout)
@@ -311,41 +293,6 @@ export const closeTab = createAsyncThunk(
       dispatch(clearPaneAttention({ paneId }))
       clearDraft(paneId)
     }
-  }
-)
-
-export const reopenClosedTab = createAsyncThunk(
-  'tabs/reopenClosedTab',
-  async (_, { dispatch, getState }) => {
-    const state = getState() as RootState
-    const stack = state.tabRegistry.reopenStack
-    if (stack.length === 0) return
-
-    const entry = stack[stack.length - 1]
-    dispatch(popReopenEntry())
-
-    // Remove from localClosed registry if present (prevents stale "recently closed" entry)
-    const deviceId = state.tabRegistry.deviceId
-    const closedTabKey = `${deviceId}:${entry.tab.id}`
-    dispatch(clearClosedTabSnapshot(closedTabKey))
-
-    const newTabId = nanoid()
-    dispatch(restorePaneBackedTab({
-      tab: {
-        id: newTabId,
-        title: entry.tab.title,
-        titleSetByUser: entry.tab.titleSetByUser,
-        mode: entry.tab.mode,
-        shell: entry.tab.shell,
-        initialCwd: entry.tab.initialCwd,
-        codingCliSessionId: entry.tab.codingCliSessionId,
-        codingCliProvider: entry.tab.codingCliProvider,
-        resumeSessionId: entry.tab.resumeSessionId,
-        sessionMetadataByKey: entry.tab.sessionMetadataByKey,
-      },
-      layout: entry.layout,
-      paneTitles: entry.paneTitles,
-    }))
   }
 )
 
@@ -375,11 +322,6 @@ export const openSessionTab = createAsyncThunk(
     const providerSettings = agentConfig
       ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
       : undefined
-    const exactSessionRef = buildExactSessionRef({
-      provider: resolvedProvider,
-      sessionId,
-      serverInstanceId: localServerInstanceId,
-    })
     const sessionMetadataInput = {
       sessionType: resolvedSessionType,
       firstUserMessage,
@@ -388,21 +330,13 @@ export const openSessionTab = createAsyncThunk(
     }
 
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
-      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput, cwd)
+      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
 
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
-      sessionRef: exactSessionRef,
       agentChatProviderSettings: providerSettings,
-    })
-    const desiredRunningResumeContent = buildResumeContent({
-      sessionType: resolvedProvider,
-      sessionId,
-      cwd,
-      terminalId,
-      sessionRef: exactSessionRef,
     })
 
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
@@ -415,44 +349,30 @@ export const openSessionTab = createAsyncThunk(
       }))
     }
 
-    const repairExistingTabLayout = (tab: Tab | undefined, desiredContent = desiredResumeContent) => {
+    const repairExistingTabLayout = (tab: Tab | undefined) => {
       if (!tab) return
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
 
-      const targetSessionKey = makeCodingCliSessionKey(resolvedProvider, sessionId, cwd)
       const matchingLeaves: Array<{ id: string; content: any }> = []
       const visit = (node: PaneNode) => {
         if (node.type === 'leaf') {
           const content = node.content
-          const contentInitialCwd =
-            content.kind === 'terminal' || content.kind === 'agent-chat'
-              ? content.initialCwd
-              : undefined
-          const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown; cwd?: unknown } }).sessionRef
-          const explicitSessionKey =
-            typeof sessionRef?.provider === 'string' && typeof sessionRef?.sessionId === 'string'
-              ? getCodingCliSessionKey({
-                provider: sessionRef.provider,
-                sessionId: sessionRef.sessionId,
-                cwd: typeof sessionRef.cwd === 'string' ? sessionRef.cwd : contentInitialCwd,
-              })
-              : undefined
+          const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
           const matchesExplicitSessionRef =
-            explicitSessionKey === targetSessionKey
-          const implicitProvider = content.kind === 'terminal'
-            ? content.mode
-            : resolvedProvider === 'claude'
-              ? 'claude'
-              : undefined
-          const implicitSessionId = content.kind === 'terminal' || content.kind === 'agent-chat'
-            ? content.resumeSessionId
-            : undefined
-          const matchesImplicitSessionRef =
-            typeof implicitProvider === 'string'
-            && implicitProvider !== 'shell'
-            && typeof implicitSessionId === 'string'
-            && makeCodingCliSessionKey(implicitProvider, implicitSessionId, contentInitialCwd) === targetSessionKey
+            typeof sessionRef?.provider === 'string'
+            && typeof sessionRef?.sessionId === 'string'
+            && sessionRef.provider === resolvedProvider
+            && sessionRef.sessionId === sessionId
+          const matchesImplicitSessionRef = (
+            content.kind === 'terminal'
+            && content.mode === resolvedProvider
+            && content.resumeSessionId === sessionId
+          ) || (
+            content.kind === 'agent-chat'
+            && resolvedProvider === 'claude'
+            && content.resumeSessionId === sessionId
+          )
           if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
             matchingLeaves.push({ id: node.id, content })
           }
@@ -466,32 +386,18 @@ export const openSessionTab = createAsyncThunk(
 
       if (matchingLeaves.length !== 1) return
       const [{ id: paneId, content }] = matchingLeaves
-      const sessionRefMatches = (
-        ('sessionRef' in content ? content.sessionRef : undefined)?.provider
-          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.provider
-        && ('sessionRef' in content ? content.sessionRef : undefined)?.sessionId
-          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.sessionId
-        && ('sessionRef' in content ? content.sessionRef : undefined)?.serverInstanceId
-          === ('sessionRef' in desiredContent ? desiredContent.sessionRef : undefined)?.serverInstanceId
-      )
+      if (content.kind === 'terminal' && content.terminalId) return
 
-      const needsRepair = desiredContent.kind === 'agent-chat'
-        ? content.kind !== 'agent-chat'
-          || content.provider !== desiredContent.provider
-          || content.resumeSessionId !== desiredContent.resumeSessionId
-          || !sessionRefMatches
-        : content.kind !== 'terminal'
-          || content.mode !== desiredContent.mode
-          || content.terminalId !== desiredContent.terminalId
-          || content.resumeSessionId !== desiredContent.resumeSessionId
-          || !sessionRefMatches
+      const needsRepair = desiredResumeContent.kind === 'agent-chat'
+        ? content.kind !== 'agent-chat' || content.provider !== desiredResumeContent.provider
+        : content.kind !== 'terminal' || content.mode !== desiredResumeContent.mode
 
       if (!needsRepair) return
 
       dispatch(updatePaneContent({
         tabId: tab.id,
         paneId,
-        content: desiredContent,
+        content: desiredResumeContent,
       }))
     }
 
@@ -500,28 +406,20 @@ export const openSessionTab = createAsyncThunk(
         const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
-          if (state.panes.layouts[existingTab.id]) {
-            repairExistingTabLayout(existingTab, desiredRunningResumeContent)
-          }
           dispatch(setActiveTab(existingTab.id))
           return
         }
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
-      const tabId = nanoid()
-      dispatch(createPaneBackedTab({
-        tab: {
-          id: tabId,
-          title: title || getProviderLabel(resolvedProvider, extensions),
-          terminalId,
-          status: 'running',
-          mode: resolvedProvider,
-          codingCliProvider: resolvedProvider,
-          initialCwd: cwd,
-          resumeSessionId: sessionId,
-          sessionMetadataByKey: buildSessionMetadataByKey(),
-        },
-        content: desiredRunningResumeContent,
+      dispatch(addTab({
+        title: title || getProviderLabel(resolvedProvider, extensions),
+        terminalId,
+        status: 'running',
+        mode: resolvedProvider,
+        codingCliProvider: resolvedProvider,
+        initialCwd: cwd,
+        resumeSessionId: sessionId,
+        sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       return
     }
@@ -529,7 +427,7 @@ export const openSessionTab = createAsyncThunk(
     if (!forceNew) {
       const existingTabId = findTabIdForSession(
         state,
-        { provider: resolvedProvider, sessionId, cwd },
+        { provider: resolvedProvider, sessionId },
         localServerInstanceId,
       )
       if (existingTabId) {
@@ -545,33 +443,29 @@ export const openSessionTab = createAsyncThunk(
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
     if (isAgentChatProviderName(resolvedSessionType)) {
       const tabId = nanoid()
-      dispatch(createPaneBackedTab({
-        tab: {
-          id: tabId,
-          title: title || getAgentChatProviderLabel(resolvedSessionType),
-          mode: resolvedProvider,
-          codingCliProvider: resolvedProvider,
-          initialCwd: cwd,
-          resumeSessionId: sessionId,
-          sessionMetadataByKey: buildSessionMetadataByKey(),
-        },
-        content: desiredResumeContent,
-      }))
-      return
-    }
-
-    const tabId = nanoid()
-    dispatch(createPaneBackedTab({
-      tab: {
+      dispatch(addTab({
         id: tabId,
-        title: title || getProviderLabel(resolvedProvider, extensions),
+        title: title || getAgentChatProviderLabel(resolvedSessionType),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
         resumeSessionId: sessionId,
         sessionMetadataByKey: buildSessionMetadataByKey(),
-      },
-      content: desiredResumeContent,
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: desiredResumeContent,
+      }))
+      return
+    }
+
+    dispatch(addTab({
+      title: title || getProviderLabel(resolvedProvider, extensions),
+      mode: resolvedProvider,
+      codingCliProvider: resolvedProvider,
+      initialCwd: cwd,
+      resumeSessionId: sessionId,
+      sessionMetadataByKey: buildSessionMetadataByKey(),
     }))
   }
 )

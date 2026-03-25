@@ -9,15 +9,9 @@ export function findTerminalForSession(
   allMeta: TerminalMeta[],
   provider: CodingCliProviderName,
   sessionId: string,
-  cwd?: string,
 ): TerminalMeta | undefined {
-  const targetKey = makeSessionKey(provider, sessionId, cwd)
   return allMeta.find(
-    (m) => (
-      m.provider === provider
-      && typeof m.sessionId === 'string'
-      && makeSessionKey(m.provider as CodingCliProviderName, m.sessionId, m.cwd) === targetKey
-    ),
+    (m) => m.provider === provider && m.sessionId === sessionId,
   )
 }
 
@@ -31,7 +25,7 @@ export async function cascadeTerminalRenameToSession(
 ): Promise<void> {
   if (!meta?.provider || !meta.sessionId) return
 
-  const compositeKey = makeSessionKey(meta.provider as CodingCliProviderName, meta.sessionId, meta.cwd)
+  const compositeKey = makeSessionKey(meta.provider as CodingCliProviderName, meta.sessionId)
   await configStore.patchSessionOverride(compositeKey, { titleOverride })
 }
 
@@ -45,9 +39,8 @@ export async function cascadeSessionRenameToTerminal(
   provider: CodingCliProviderName,
   sessionId: string,
   titleOverride: string,
-  cwd?: string,
 ): Promise<string | undefined> {
-  const match = findTerminalForSession(allMeta, provider, sessionId, cwd)
+  const match = findTerminalForSession(allMeta, provider, sessionId)
   if (!match) return undefined
 
   await configStore.patchTerminalOverride(match.terminalId, { titleOverride })

@@ -6,8 +6,6 @@
  * to reject unknown keys (catches typos in manifest files).
  */
 import { z } from 'zod'
-import { CLAUDE_PERMISSION_MODE_VALUES, type ClaudePermissionMode } from '../shared/settings.js'
-import type { CodingCliCommandSpec } from './terminal-registry.js'
 
 // ──────────────────────────────────────────────────────────────
 // Content schema field — describes a dynamic field for extension props
@@ -44,33 +42,17 @@ const ServerConfigSchema = z.strictObject({
   singleton: z.boolean().optional().default(true),
 })
 
-const PermissionModeValuesSchema = z.strictObject({
-  default: z.string().optional(),
-  plan: z.string().optional(),
-  acceptEdits: z.string().optional(),
-  bypassPermissions: z.string().optional(),
-})
-
-const PermissionModeArgsByValueSchema = z.strictObject({
-  default: z.array(z.string()).optional(),
-  plan: z.array(z.string()).optional(),
-  acceptEdits: z.array(z.string()).optional(),
-  bypassPermissions: z.array(z.string()).optional(),
-}) satisfies z.ZodType<Partial<Record<ClaudePermissionMode, string[]>>>
-
 const CliConfigSchema = z.strictObject({
   command: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
   env: z.record(z.string(), z.string()).optional(),
   envVar: z.string().optional(),              // env var to override command (e.g., 'CLAUDE_CMD')
-  launchArgs: z.array(z.string()).optional(), // template with {{sessionId}} placeholder for fresh exact launch
   resumeArgs: z.array(z.string()).optional(), // template with {{sessionId}} placeholder
   modelArgs: z.array(z.string()).optional(),  // template with {{model}} placeholder
   sandboxArgs: z.array(z.string()).optional(), // template with {{sandbox}} placeholder
   permissionModeArgs: z.array(z.string()).optional(), // template with {{permissionMode}} placeholder
   permissionModeEnvVar: z.string().optional(),
-  permissionModeValues: PermissionModeValuesSchema.optional(),
-  permissionModeArgsByValue: PermissionModeArgsByValueSchema.optional(),
+  permissionModeValues: z.record(z.string(), z.string()).optional(),
   supportsPermissionMode: z.boolean().optional(),
   supportsModel: z.boolean().optional(),      // shows model field in SettingsView
   supportsSandbox: z.boolean().optional(),    // shows sandbox selector in SettingsView
@@ -120,32 +102,3 @@ export const ExtensionManifestSchema = z.strictObject({
 export type ExtensionManifest = z.infer<typeof ExtensionManifestSchema>
 export type ExtensionCategory = ExtensionManifest['category']
 export type ContentSchemaField = z.infer<typeof ContentSchemaFieldSchema>
-export type CliConfig = z.infer<typeof CliConfigSchema>
-
-function compileArgTemplate(
-  template: string[] | undefined,
-  placeholder: string,
-): ((value: string) => string[]) | undefined {
-  if (!template) return undefined
-  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
-}
-
-export function buildCodingCliCommandSpec(input: {
-  label: string
-  cli: CliConfig
-}): CodingCliCommandSpec {
-  return {
-    label: input.label,
-    envVar: input.cli.envVar || '',
-    defaultCommand: input.cli.command,
-    args: input.cli.args,
-    env: input.cli.env,
-    launchArgs: compileArgTemplate(input.cli.launchArgs, '{{sessionId}}'),
-    resumeArgs: compileArgTemplate(input.cli.resumeArgs, '{{sessionId}}'),
-    modelArgs: compileArgTemplate(input.cli.modelArgs, '{{model}}'),
-    sandboxArgs: compileArgTemplate(input.cli.sandboxArgs, '{{sandbox}}'),
-    permissionModeArgs: compileArgTemplate(input.cli.permissionModeArgs, '{{permissionMode}}'),
-    permissionModeEnvVar: input.cli.permissionModeEnvVar,
-    permissionModeEnvValues: input.cli.permissionModeValues,
-  }
-}

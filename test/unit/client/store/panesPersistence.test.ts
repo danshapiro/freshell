@@ -583,20 +583,6 @@ describe('loadInitialPanesState consistency', () => {
   it('initial pane state matches loadPersistedPanes output for migrated data', async () => {
     // Simulate v1 data (no lifecycle fields) that needs migration
     localStorageMock.clear()
-    localStorage.setItem('freshell.tabs.v2', JSON.stringify({
-      tabs: {
-        activeTabId: 'tab-1',
-        tabs: [{
-          id: 'tab-1',
-          title: 'Migrated Tab',
-          createRequestId: 'req-tab-1',
-          status: 'creating',
-          mode: 'shell',
-          shell: 'system',
-          createdAt: 1,
-        }],
-      },
-    }))
     localStorage.setItem('freshell.panes.v2', JSON.stringify({
       layouts: {
         'tab-1': {
@@ -748,42 +734,6 @@ describe('version 5 migration (drop claude-chat panes)', () => {
 
     const result = loadPersistedPanes()
     expect(result!.layouts.tab1.content.kind).toBe('terminal')
-  })
-
-  it('memoizes migrated coding panes while preserving explicit exact sessionRef', () => {
-    localStorage.setItem('freshell.panes.v2', JSON.stringify({
-      version: PANES_SCHEMA_VERSION,
-      layouts: {
-        'tab-1': {
-          type: 'leaf',
-          id: 'pane-1',
-          content: {
-            kind: 'terminal',
-            mode: 'codex',
-            resumeSessionId: 'codex-session-123',
-            sessionRef: {
-              provider: 'codex',
-              sessionId: 'codex-session-123',
-              serverInstanceId: 'srv-local',
-            },
-          },
-        },
-      },
-      activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
-      paneTitleSetByUser: {},
-    }))
-
-    const first = loadPersistedPanes() as any
-    const second = loadPersistedPanes() as any
-
-    expect(first.layouts['tab-1'].content.createRequestId).toBeDefined()
-    expect(second.layouts['tab-1'].content.createRequestId).toBe(first.layouts['tab-1'].content.createRequestId)
-    expect(first.layouts['tab-1'].content.sessionRef).toEqual({
-      provider: 'codex',
-      sessionId: 'codex-session-123',
-      serverInstanceId: 'srv-local',
-    })
   })
 })
 

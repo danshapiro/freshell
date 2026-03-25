@@ -3,7 +3,7 @@ import http from 'http'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
-import { DiscoveredSessionAssociation } from '../../../server/discovered-session-association'
+import { SessionAssociationCoordinator } from '../../../server/session-association-coordinator'
 import type { CodingCliSession, ProjectGroup } from '../../../server/coding-cli/types'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
 
@@ -87,7 +87,7 @@ describe('codex session rebind regression', () => {
   let server: http.Server
   let wsHandler: WsHandler
   let registry: TerminalRegistry
-  let association: DiscoveredSessionAssociation
+  let coordinator: SessionAssociationCoordinator
   let port: number
 
   beforeAll(async () => {
@@ -100,7 +100,7 @@ describe('codex session rebind regression', () => {
       res.end()
     })
     registry = new TerminalRegistry()
-    association = new DiscoveredSessionAssociation(registry)
+    coordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
     wsHandler = new WsHandler(server, registry)
     port = await listen(server)
 
@@ -117,22 +117,16 @@ describe('codex session rebind regression', () => {
   })
 
   const applyIndexerUpdate = (lastActivityAtBase: number) => {
-    const terminalIds = registry.list().map((record) => record.terminalId)
     const sessions: CodingCliSession[] = CODEX_SESSION_IDS.map((sessionId, index) => ({
       provider: 'codex',
       sessionId,
       projectPath: CODEX_CWD,
       lastActivityAt: lastActivityAtBase + index,
       cwd: CODEX_CWD,
-      launchOrigin: {
-        terminalId: terminalIds[index]!,
-        tabId: `tab-${index + 1}`,
-        paneId: `pane-${index + 1}`,
-      },
     }))
     const projects: ProjectGroup[] = [{ projectPath: CODEX_CWD, sessions }]
-    for (const session of association.collectNewOrAdvanced(projects)) {
-      association.associateSingleSession(session)
+    for (const session of coordinator.collectNewOrAdvanced(projects)) {
+      coordinator.associateSingleSession(session)
     }
   }
 

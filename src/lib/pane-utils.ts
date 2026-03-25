@@ -27,19 +27,6 @@ export function getFirstTerminalCwd(
   return getFirstTerminalCwd(node.children[1], cwdMap)
 }
 
-/**
- * Find the first picker pane in a pane tree using left-to-right depth-first traversal.
- * This traversal order produces "leftmost then uppermost" tiebreaking:
- * left children appear before right children at each split level.
- * Returns the pane ID if found, undefined otherwise.
- */
-export function findFirstPickerPane(node: PaneNode): string | undefined {
-  if (node.type === 'leaf') {
-    return node.content.kind === 'picker' ? node.id : undefined
-  }
-  return findFirstPickerPane(node.children[0]) ?? findFirstPickerPane(node.children[1])
-}
-
 export function collectTerminalIds(node: PaneNode): string[] {
   if (node.type === 'leaf') {
     if (node.content.kind === 'terminal' && node.content.terminalId) {

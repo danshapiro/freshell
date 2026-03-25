@@ -1,3 +1,0 @@
-{"type":"metadata","protocol_version":"1.2"}
-{"timestamp":1710000200.0,"message":{"type":"TurnBegin","payload":{"user_input":"Automated print mode task"}}}
-{"timestamp":1710000201.0,"message":{"type":"TurnEnd","payload":{}}}

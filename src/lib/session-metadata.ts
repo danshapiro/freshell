@@ -1,5 +1,4 @@
 import type { CodingCliProviderName, SessionListMetadata, Tab } from '@/store/types'
-import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 
 type SessionMetadataInput = {
   sessionType?: string
@@ -8,12 +7,8 @@ type SessionMetadataInput = {
   isNonInteractive?: boolean
 }
 
-export function sessionMetadataKey(
-  provider: CodingCliProviderName,
-  sessionId: string,
-  cwd?: string,
-): string {
-  return getCodingCliSessionKey({ provider, sessionId, cwd })
+export function sessionMetadataKey(provider: CodingCliProviderName, sessionId: string): string {
+  return `${provider}:${sessionId}`
 }
 
 export function buildSessionListMetadata(input: SessionMetadataInput): SessionListMetadata | undefined {
@@ -40,12 +35,11 @@ export function mergeSessionMetadataByKey(
   provider: CodingCliProviderName,
   sessionId: string,
   input: SessionMetadataInput,
-  cwd?: string,
 ): Record<string, SessionListMetadata> | undefined {
   const nextMetadata = buildSessionListMetadata(input)
   if (!nextMetadata) return existing
 
-  const key = sessionMetadataKey(provider, sessionId, cwd)
+  const key = sessionMetadataKey(provider, sessionId)
   const previous = existing?.[key]
   return {
     ...(existing ?? {}),
@@ -60,16 +54,13 @@ export function getSessionMetadata(
   source: { sessionMetadataByKey?: Record<string, SessionListMetadata> } | undefined,
   provider: CodingCliProviderName,
   sessionId: string,
-  cwd?: string,
 ): SessionListMetadata | undefined {
-  return source?.sessionMetadataByKey?.[sessionMetadataKey(provider, sessionId, cwd)]
+  return source?.sessionMetadataByKey?.[sessionMetadataKey(provider, sessionId)]
 }
 
-export function getTabResumeSessionType(
-  tab: Pick<Tab, 'mode' | 'codingCliProvider' | 'resumeSessionId' | 'sessionMetadataByKey' | 'initialCwd'>,
-): string | undefined {
+export function getTabResumeSessionType(tab: Pick<Tab, 'mode' | 'codingCliProvider' | 'resumeSessionId' | 'sessionMetadataByKey'>): string | undefined {
   const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
   const sessionId = tab.resumeSessionId
   if (!provider || !sessionId) return undefined
-  return getSessionMetadata(tab, provider, sessionId, tab.initialCwd)?.sessionType ?? provider
+  return getSessionMetadata(tab, provider, sessionId)?.sessionType ?? provider
 }

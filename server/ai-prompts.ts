@@ -57,19 +57,4 @@ export const PROMPTS = {
       ].join('\n')
     },
   },
-  codingCliSummary: {
-    model: AI_CONFIG.model,
-    maxOutputTokens: 120,
-    build: (userMessages: string) => {
-      return [
-        'This is a coding agent session with only the user messages; the assistant replies are removed.',
-        'Summarize it in under 250 characters.',
-        'If multiple things happen, bias towards recency (the end of the messages).',
-        'No markdown. No quotes.',
-        '',
-        'User messages:',
-        userMessages,
-      ].join('\n')
-    },
-  },
 } as const

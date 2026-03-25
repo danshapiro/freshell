@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
-import { createTerminalPaneBackedTab } from '@/store/workspaceActions'
+import { addTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
 import {
   fetchFirewallConfig,
   type ConfigureFirewallResult,
@@ -319,14 +320,8 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
     if (result.method === 'terminal') {
       const tabId = nanoid()
-      dispatch(createTerminalPaneBackedTab({
-        tab: {
-          id: tabId,
-          title: 'Firewall Setup',
-          mode: 'shell',
-          shell: 'system',
-        },
-      }))
+      dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
       onFirewallTerminal?.({ tabId, command: result.command })
       // Dismiss the wizard overlay so the user can interact with the
       // terminal pane (type the sudo password).

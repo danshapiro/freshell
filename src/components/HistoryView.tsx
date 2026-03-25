@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import { toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
@@ -49,7 +48,6 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
-  const wasSearchingRef = useRef(false)
 
   useEffect(() => {
     if (historyWindow || topLevelSessionCount > 0) return
@@ -60,45 +58,35 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     }) as any)
   }, [dispatch, historyWindow, topLevelSessionCount])
 
-  useEffect(() => {
-    const query = filter.trim()
-    if (!query) {
-      if (wasSearchingRef.current) {
-        wasSearchingRef.current = false
-        void dispatch(fetchSessionWindow({
-          surface: 'history',
-          priority: 'visible',
-        }) as any)
-      }
-      return
-    }
-
-    const timeoutId = setTimeout(() => {
-      wasSearchingRef.current = true
-      void dispatch(fetchSessionWindow({
-        surface: 'history',
-        priority: 'visible',
-        query,
-        searchTier: 'fullText',
-      }) as any)
-    }, 300)
-
-    return () => {
-      clearTimeout(timeoutId)
-    }
-  }, [dispatch, filter])
+  const filtered = useMemo(() => {
+    const q = filter.trim().toLowerCase()
+    if (!q) return projects ?? []
+    return (projects ?? [])
+      .map((p) => ({
+        ...p,
+        sessions: p.sessions.filter((s) => {
+          const title = (s.title || s.sessionId).toLowerCase()
+          const sum = (s.summary || '').toLowerCase()
+          const cwd = (s.cwd || '').toLowerCase()
+          const provider = getProviderLabel(s.provider).toLowerCase()
+          return (
+            title.includes(q) ||
+            sum.includes(q) ||
+            p.projectPath.toLowerCase().includes(q) ||
+            cwd.includes(q) ||
+            provider.includes(q)
+          )
+        }),
+      }))
+      .filter((p) => p.sessions.length > 0)
+  }, [projects, filter])
 
   async function refresh() {
     setLoading(true)
     try {
-      const query = filter.trim()
       await dispatch(fetchSessionWindow({
         surface: 'history',
         priority: 'visible',
-        ...(query ? {
-          query,
-          searchTier: 'fullText' as const,
-        } : {}),
       }) as any)
     } finally {
       setLoading(false)
@@ -110,8 +98,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function renameSession(session: CodingCliSession, titleOverride?: string, summaryOverride?: string) {
-    const compositeKey = getCodingCliSessionKey(session)
+  async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
+    // Use composite key format: provider:sessionId
+    const compositeKey = `${provider || 'claude'}:${sessionId}`
     const result = await api.patch<{ cascadedTerminalId?: string }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     if (result.cascadedTerminalId && titleOverride) {
       dispatch(syncPaneTitleByTerminalId({ terminalId: result.cascadedTerminalId, title: titleOverride }))
@@ -119,8 +108,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function deleteSession(session: CodingCliSession) {
-    const compositeKey = getCodingCliSessionKey(session)
+  async function deleteSession(provider: CodingCliProviderName | undefined, sessionId: string) {
+    // Use composite key format: provider:sessionId
+    const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
     await refresh()
   }
@@ -189,7 +179,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
         <div className="space-y-2 px-3 py-4 md:px-6">
-          {(projects ?? []).length === 0 ? (
+          {filtered.length === 0 ? (
             <div className="py-12 text-center">
               <p className="text-muted-foreground">No sessions found</p>
               {filter && (
@@ -202,7 +192,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
               )}
             </div>
           ) : (
-            (projects ?? []).map((project) => (
+            filtered.map((project) => (
               <ProjectCard
                 key={project.projectPath}
                 project={project}
@@ -211,8 +201,8 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
                 onToggle={() => dispatch(toggleProjectExpanded(project.projectPath))}
                 onColorChange={(color) => setProjectColor(project.projectPath, color)}
                 onOpenSession={(session) => openSession(session)}
-                onRenameSession={(session, title, summary) => renameSession(session, title, summary)}
-                onDeleteSession={(session) => deleteSession(session)}
+                onRenameSession={(provider, sessionId, title, summary) => renameSession(provider, sessionId, title, summary)}
+                onDeleteSession={(provider, sessionId) => deleteSession(provider, sessionId)}
                 onShowSessionDetails={(sheetState) => setMobileSessionSheet(sheetState)}
               />
             ))
@@ -255,8 +245,8 @@ function ProjectCard({
   onToggle: () => void
   onColorChange: (color: string) => void
   onOpenSession: (session: CodingCliSession) => void
-  onRenameSession: (session: CodingCliSession, title?: string, summary?: string) => void
-  onDeleteSession: (session: CodingCliSession) => void
+  onRenameSession: (provider: CodingCliProviderName | undefined, sessionId: string, title?: string, summary?: string) => void
+  onDeleteSession: (provider: CodingCliProviderName | undefined, sessionId: string) => void
   onShowSessionDetails: (sheetState: MobileSessionSheetState) => void
 }) {
   const color = project.color || '#6b7280'
@@ -326,17 +316,17 @@ function ProjectCard({
               .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
               .map((session) => (
                 <SessionRow
-                  key={getCodingCliSessionKey(session)}
+                  key={session.sessionId}
                   isMobile={isMobile}
                   session={session}
                   onOpen={() => onOpenSession(session)}
-                  onRename={(title, summary) => onRenameSession(session, title, summary)}
-                  onDelete={() => onDeleteSession(session)}
+                  onRename={(title, summary) => onRenameSession(session.provider, session.sessionId, title, summary)}
+                  onDelete={() => onDeleteSession(session.provider, session.sessionId)}
                   onShowDetails={() => onShowSessionDetails({
                     session,
                     onOpen: () => onOpenSession(session),
-                    onRename: (title, summary) => onRenameSession(session, title, summary),
-                    onDelete: () => onDeleteSession(session),
+                    onRename: (title, summary) => onRenameSession(session.provider, session.sessionId, title, summary),
+                    onDelete: () => onDeleteSession(session.provider, session.sessionId),
                   })}
                 />
               ))}
@@ -413,7 +403,6 @@ function SessionRow({
       className="group w-full px-4 py-3 hover:bg-muted/30 transition-colors rounded-md"
       data-context={ContextIds.HistorySession}
       data-session-id={session.sessionId}
-      data-session-key={getCodingCliSessionKey(session)}
       data-provider={session.provider}
     >
       <div className="flex items-start gap-3">

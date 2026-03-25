@@ -41,9 +41,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 - Never use broad kill patterns (for example `pkill -f "tsx watch server/index.ts"`, `pkill -f vite`, `pkill node`).
 - Start manual worktree servers on a unique port and record their PID, then stop only that PID.
-- Dev mode example (source + Vite): `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
-- Production mode example (built dist): `PORT=3344 npm start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
-  - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
+- Example start: `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
 

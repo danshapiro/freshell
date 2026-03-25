@@ -1,3 +1,0 @@
-{"type":"metadata","protocol_version":"1.2"}
-{"timestamp":1710000050.0,"message":{"type":"TurnBegin","payload":{"user_input":[{"type":"text","text":"Fix the left sidebar refresh bug"}]}}}
-{"timestamp":1710000051.0,"message":{"type":"TurnEnd","payload":{}}}

@@ -68,19 +68,6 @@ const codexExt: ClientExtensionEntry = {
   },
 }
 
-const kimiExt: ClientExtensionEntry = {
-  name: 'kimi',
-  version: '1.0.0',
-  label: 'Kimi',
-  description: 'Kimi CLI agent',
-  category: 'cli',
-  cli: {
-    supportsModel: true,
-    supportsPermissionMode: true,
-    supportedPermissionModes: ['default', 'bypassPermissions'],
-  },
-}
-
 const serverExt: ClientExtensionEntry = {
   name: 'my-server',
   version: '2.0.0',
@@ -254,55 +241,6 @@ describe('ExtensionsView', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         codingCli: { providers: { codex: { sandbox: 'workspace-write' } } },
-      })
-    })
-
-    it('shows Kimi-specific fields, filters permission choices, and patches Kimi model and bypass mode', async () => {
-      renderExtensionsView({
-        extensions: [kimiExt],
-        settings: {
-          codingCli: {
-            enabledProviders: ['kimi'],
-            providers: {
-              kimi: {
-                model: 'moonshot-v1',
-                permissionMode: 'plan',
-              },
-            },
-          },
-        },
-      })
-
-      fireEvent.click(screen.getByLabelText('Show Kimi configuration'))
-
-      expect(screen.getByText('Kimi starting directory')).toBeInTheDocument()
-      const modelInput = screen.getByLabelText('Kimi model')
-      expect(modelInput).toHaveAttribute('placeholder', 'e.g. moonshot-k2')
-
-      const permissionSelect = screen.getByLabelText('Kimi permission mode')
-      const options = within(permissionSelect).getAllByRole('option')
-      expect(options.map((option) => option.getAttribute('value'))).toEqual([
-        'default',
-        'bypassPermissions',
-      ])
-      expect(permissionSelect).toHaveValue('default')
-
-      fireEvent.change(permissionSelect, { target: { value: 'bypassPermissions' } })
-
-      await act(async () => { await Promise.resolve() })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { kimi: { permissionMode: 'bypassPermissions' } } },
-      })
-
-      fireEvent.change(modelInput, { target: { value: 'moonshot-k2' } })
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { kimi: { model: 'moonshot-k2' } } },
       })
     })
   })

@@ -1,8 +1,7 @@
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
-import { createDefaultPaneBackedTab } from '@/store/workspaceActions'
+import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
@@ -469,7 +468,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           className="flex-shrink-0 ml-1 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
           title="New shell tab"
           aria-label="New shell tab"
-          onClick={() => dispatch(createDefaultPaneBackedTab())}
+          onClick={() => dispatch(addTab({ mode: 'shell' }))}
           data-context={ContextIds.TabAdd}
         >
           <Plus className="h-3.5 w-3.5" />

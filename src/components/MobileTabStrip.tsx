@@ -1,7 +1,6 @@
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { createDefaultPaneBackedTab } from '@/store/workspaceActions'
+import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
@@ -53,7 +52,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const handleRightAction = () => {
     triggerHapticFeedback()
     if (isLast) {
-      dispatch(createDefaultPaneBackedTab())
+      dispatch(addTab({ mode: 'shell' }))
       return
     }
     dispatch(switchToNextTab())

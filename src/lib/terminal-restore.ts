@@ -1,4 +1,4 @@
-import { loadPersistedWorkspaceSnapshot } from '@/store/workspacePersistence'
+import { loadPersistedPanes } from '@/store/persistMiddleware'
 
 type PaneNode = {
   type: 'leaf' | 'split'
@@ -23,9 +23,9 @@ function collectCreateRequestIds(node: PaneNode | null | undefined): void {
   }
 }
 
-const persistedWorkspace = loadPersistedWorkspaceSnapshot()
-if (persistedWorkspace?.panes.layouts && typeof persistedWorkspace.panes.layouts === 'object') {
-  for (const node of Object.values(persistedWorkspace.panes.layouts)) {
+const persisted = loadPersistedPanes()
+if (persisted?.layouts && typeof persisted.layouts === 'object') {
+  for (const node of Object.values(persisted.layouts)) {
     collectCreateRequestIds(node as PaneNode)
   }
 }
@@ -34,10 +34,6 @@ export function consumeTerminalRestoreRequestId(requestId: string): boolean {
   if (!restoredCreateRequestIds.has(requestId)) return false
   restoredCreateRequestIds.delete(requestId)
   return true
-}
-
-export function hasTerminalRestoreRequestId(requestId: string): boolean {
-  return restoredCreateRequestIds.has(requestId)
 }
 
 export function addTerminalRestoreRequestId(requestId: string): void {
