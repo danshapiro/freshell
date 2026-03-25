@@ -37,6 +37,10 @@ export interface TestServerOptions {
   verbose?: boolean
   authStrategy?: 'explicit-env' | 'bootstrap'
   runtimeRootMode?: 'project' | 'isolated'
+  /** Use a specific port instead of finding a free ephemeral port */
+  port?: number
+  /** Use a specific auth token instead of generating a random one (only with explicit-env auth) */
+  token?: string
 }
 
 function isWindowsStylePath(filePath: string): boolean {
@@ -255,8 +259,8 @@ export class TestServer {
     if (this.process) throw new Error('TestServer already started')
 
     try {
-      const explicitToken = randomUUID()
-      const port = await findFreePort()
+      const explicitToken = this.options.token ?? randomUUID()
+      const port = this.options.port ?? await findFreePort()
       this.configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-'))
       const homeDir = this.configDir
 
