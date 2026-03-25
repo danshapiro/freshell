@@ -1791,6 +1791,117 @@ describe('TerminalView lifecycle updates', () => {
     expect(createCalls).toHaveLength(1)
   })
 
+  it('always marks INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {
+    // consumeTerminalRestoreRequestId returns false by default (non-restore terminal)
+    // This is the common case: terminals created fresh, not from localStorage restore
+    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
+    const tabId = 'tab-reconnect-restore'
+    const paneId = 'pane-reconnect-restore'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-reconnect-restore',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId: 'term-reconnect-restore',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell',
+            status: 'running',
+            title: 'Shell',
+            titleSetByUser: false,
+            terminalId: 'term-reconnect-restore',
+            createRequestId: 'req-reconnect-restore',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    restoreMocks.addTerminalRestoreRequestId.mockClear()
+
+    // Wire the mocks together: when addTerminalRestoreRequestId is called,
+    // subsequent consumeTerminalRestoreRequestId calls for that ID return true.
+    const addedRestoreIds = new Set<string>()
+    restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
+      addedRestoreIds.add(id)
+    })
+    restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
+      if (addedRestoreIds.has(id)) {
+        addedRestoreIds.delete(id)
+        return true
+      }
+      return false
+    })
+
+    messageHandler!({
+      type: 'error',
+      code: 'INVALID_TERMINAL_ID',
+      message: 'Unknown terminalId',
+      terminalId: 'term-reconnect-restore',
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.createRequestId).not.toBe('req-reconnect-restore')
+    })
+
+    // The key assertion: addTerminalRestoreRequestId MUST be called even when
+    // the original terminal was NOT a restore (wasRestore=false).
+    expect(restoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledTimes(1)
+    const newRequestId = (store.getState().panes.layouts[tabId] as any).content.createRequestId
+    expect(restoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(newRequestId)
+
+    // Rerender with new content to trigger sendCreate
+    const newPaneContent = (store.getState().panes.layouts[tabId] as any).content as TerminalPaneContent
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={newPaneContent} />
+      </Provider>
+    )
+
+    // Verify the terminal.create message includes restore: true
+    await waitFor(() => {
+      const createCalls = wsMocks.send.mock.calls.filter(([msg]) =>
+        msg?.type === 'terminal.create' && msg.requestId === newRequestId
+      )
+      expect(createCalls.length).toBeGreaterThanOrEqual(1)
+      expect(createCalls[0][0].restore).toBe(true)
+    })
+  })
+
   it('marks restored terminal.create requests', async () => {
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
     const tabId = 'tab-restore'

@@ -1833,13 +1833,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               newRequestId,
               resumeSessionId: current?.resumeSessionId,
             })
-            // Preserve the restore flag so the re-creation bypasses rate limiting.
-            // The original createRequestId's flag was never consumed (we went
-            // through attach, not sendCreate), so check the old ID first.
-            const wasRestore = consumeTerminalRestoreRequestId(requestIdRef.current)
-            if (wasRestore) {
-              addTerminalRestoreRequestId(newRequestId)
-            }
+            // Any INVALID_TERMINAL_ID reconnect is restoring a terminal that existed
+            // before the server lost state. Always mark it as restore so the
+            // subsequent terminal.create bypasses the server's rate limit.
+            // Consume the old ID's flag (if any) to clean up the set, but mark the
+            // new request regardless — non-restore terminals also need rate-limit
+            // bypass when burst-reconnecting after a server restart.
+            consumeTerminalRestoreRequestId(requestIdRef.current)
+            addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
             clearTerminalCursor(currentTerminalId)
             forgetSentViewport(currentTerminalId)
