@@ -218,6 +218,38 @@ describe('SessionContentCache', () => {
     expect(result).not.toBeNull()
   })
 
+  it('rejects invalid FRESHELL_SESSION_CACHE_MAX_MB values', () => {
+    const origEnv = process.env.FRESHELL_SESSION_CACHE_MAX_MB
+    try {
+      process.env.FRESHELL_SESSION_CACHE_MAX_MB = 'not-a-number'
+      expect(() => new SessionContentCache()).toThrow('Invalid FRESHELL_SESSION_CACHE_MAX_MB')
+
+      process.env.FRESHELL_SESSION_CACHE_MAX_MB = '-5'
+      expect(() => new SessionContentCache()).toThrow('must be a positive number')
+
+      process.env.FRESHELL_SESSION_CACHE_MAX_MB = '0'
+      expect(() => new SessionContentCache()).toThrow('must be a positive number')
+
+      process.env.FRESHELL_SESSION_CACHE_MAX_MB = 'Infinity'
+      expect(() => new SessionContentCache()).toThrow('Invalid FRESHELL_SESSION_CACHE_MAX_MB')
+    } finally {
+      if (origEnv === undefined) delete process.env.FRESHELL_SESSION_CACHE_MAX_MB
+      else process.env.FRESHELL_SESSION_CACHE_MAX_MB = origEnv
+    }
+  })
+
+  it('accepts valid FRESHELL_SESSION_CACHE_MAX_MB', () => {
+    const origEnv = process.env.FRESHELL_SESSION_CACHE_MAX_MB
+    try {
+      process.env.FRESHELL_SESSION_CACHE_MAX_MB = '50'
+      const c = new SessionContentCache()
+      expect(c.stats().maxBytes).toBe(50 * 1024 * 1024)
+    } finally {
+      if (origEnv === undefined) delete process.env.FRESHELL_SESSION_CACHE_MAX_MB
+      else process.env.FRESHELL_SESSION_CACHE_MAX_MB = origEnv
+    }
+  })
+
   it('malformed JSONL caches partial result', async () => {
     const filePath = path.join(tmpDir, 'malformed.jsonl')
     const content = [

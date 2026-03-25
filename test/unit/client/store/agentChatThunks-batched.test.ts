@@ -72,11 +72,16 @@ describe('agentChatThunks batched bodies', () => {
     // getAgentTurnBody should NOT have been called since bodies were inlined
     expect(getAgentTurnBody).not.toHaveBeenCalled()
 
-    // The turn body should be in the store from the inlined data
+    // ALL turn bodies should be in the store from the inlined data
     const session = store.getState().agentChat.sessions['sess-1']
     expect(session.timelineBodies['turn-2']).toEqual(
       expect.objectContaining({
         content: [{ type: 'text', text: 'Inlined body content' }],
+      }),
+    )
+    expect(session.timelineBodies['turn-1']).toEqual(
+      expect.objectContaining({
+        content: [{ type: 'text', text: 'Inlined user content' }],
       }),
     )
   })

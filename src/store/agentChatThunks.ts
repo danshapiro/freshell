@@ -85,29 +85,33 @@ export const loadAgentTimelineWindow = createAsyncThunk<
         replace: !cursor,
       }))
 
-      const newestTurn = page.items[0]
-      if (!newestTurn) return
-
-      // Use inlined bodies when available (avoids separate HTTP request per turn)
-      const inlinedBody = page.bodies?.[newestTurn.turnId]
-      if (inlinedBody) {
-        dispatch(turnBodyReceived({
-          sessionId,
-          turnId: newestTurn.turnId,
-          message: inlinedBody.message,
-        }))
+      // Hydrate all inlined bodies (avoids separate HTTP request per turn)
+      if (page.bodies) {
+        for (const item of page.items) {
+          const body = page.bodies[item.turnId]
+          if (body) {
+            dispatch(turnBodyReceived({
+              sessionId,
+              turnId: item.turnId,
+              message: body.message,
+            }))
+          }
+        }
       } else {
-        // Fall back to separate request (backward compatibility with older servers)
-        const turn = await getAgentTurnBody(
-          timelineSessionId ?? sessionId,
-          newestTurn.turnId,
-          { signal: controller.signal },
-        )
-        dispatch(turnBodyReceived({
-          sessionId,
-          turnId: newestTurn.turnId,
-          message: turn.message,
-        }))
+        // Fall back to fetching newest turn body (backward compat with older servers)
+        const newestTurn = page.items[0]
+        if (newestTurn) {
+          const turn = await getAgentTurnBody(
+            timelineSessionId ?? sessionId,
+            newestTurn.turnId,
+            { signal: controller.signal },
+          )
+          dispatch(turnBodyReceived({
+            sessionId,
+            turnId: newestTurn.turnId,
+            message: turn.message,
+          }))
+        }
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {

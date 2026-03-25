@@ -43,7 +43,16 @@ export class SessionContentCache {
 
   constructor(options?: SessionContentCacheOptions) {
     const envMaxMb = process.env.FRESHELL_SESSION_CACHE_MAX_MB
-    const envBytes = envMaxMb ? Number(envMaxMb) * 1024 * 1024 : undefined
+    let envBytes: number | undefined
+    if (envMaxMb) {
+      const parsed = Number(envMaxMb)
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(
+          `Invalid FRESHELL_SESSION_CACHE_MAX_MB: "${envMaxMb}" (must be a positive number)`,
+        )
+      }
+      envBytes = parsed * 1024 * 1024
+    }
     this.maxBytes = options?.maxBytes ?? envBytes ?? DEFAULT_MAX_BYTES
   }
 

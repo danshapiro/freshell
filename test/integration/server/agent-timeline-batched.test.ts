@@ -104,8 +104,9 @@ describe('GET /api/agent-sessions/:sessionId/timeline with includeBodies', () =>
     )
   })
 
-  it('includeBodies reduces request count for full page render', async () => {
-    // With includeBodies=true, a single request serves all data
+  it('includeBodies=true returns all bodies in a single HTTP response, eliminating per-turn requests', async () => {
+    // With includeBodies=true, one HTTP response carries all turn bodies.
+    // Without it, the client would need 10 separate getTurnBody requests.
     const items = Array.from({ length: 10 }, (_, i) => ({
       turnId: `turn-${9 - i}`,
       sessionId: 's1',
@@ -134,9 +135,14 @@ describe('GET /api/agent-sessions/:sessionId/timeline with includeBodies', () =>
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
-    // A single request gives us all 10 bodies
+    // A single response carries all 10 bodies
     expect(Object.keys(res.body.bodies)).toHaveLength(10)
-    // No separate getTurnBody calls needed
+    // Every turn has a body with correct content
+    for (const item of items) {
+      expect(res.body.bodies[item.turnId]).toBeDefined()
+      expect(res.body.bodies[item.turnId].message.content[0].text).toBe(`Body ${item.turnId}`)
+    }
+    // No separate getTurnBody calls were made on the server
     expect(getTurnBody).not.toHaveBeenCalled()
   })
 
