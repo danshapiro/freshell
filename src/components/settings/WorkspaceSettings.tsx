@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react'
 import { KEYBOARD_SHORTCUTS } from '@/lib/keyboard-shortcuts'
 import type {
   SidebarSortMode,
+  SessionOpenMode,
   TabAttentionStyle,
   AttentionDismiss,
 } from '@/store/types'
@@ -139,6 +140,22 @@ export default function WorkspaceSettings({
       </SettingsSection>
 
       <SettingsSection title="Panes" description="Pane layout and behavior">
+        <SettingsRow
+          label="Open sidebar session in"
+          description="Where to open a coding agent session when clicked in the sidebar."
+        >
+          <SegmentedControl
+            value={settings.panes?.sessionOpenMode ?? 'tab'}
+            options={[
+              { value: 'tab', label: 'New tab' },
+              { value: 'split', label: 'Split pane' },
+            ]}
+            onChange={(v: string) => {
+              applyLocalSetting({ panes: { sessionOpenMode: v as SessionOpenMode } })
+            }}
+          />
+        </SettingsRow>
+
         <SettingsRow label="Default new pane">
           <select
             aria-label="Default new pane"

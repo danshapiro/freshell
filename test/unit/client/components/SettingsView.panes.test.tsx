@@ -171,6 +171,41 @@ describe('SettingsView Panes section', () => {
     expect(api.patch).not.toHaveBeenCalled()
   })
 
+  it('renders sidebar session open mode segmented control with default "New tab"', () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Workspace')
+
+    expect(screen.getByText('Open sidebar session in')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /new tab/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /split pane/i })).toBeInTheDocument()
+  })
+
+  it('switches sidebar session open mode to split pane locally', async () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Workspace')
+
+    const splitButton = screen.getByRole('button', { name: /split pane/i })
+    fireEvent.click(splitButton)
+
+    expect(store.getState().settings.settings.panes.sessionOpenMode).toBe('split')
+
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+
   it('toggles icons on tabs locally without calling /api/settings', async () => {
     const store = createTestStore('ask', { panes: { iconsOnTabs: true } })
     render(
