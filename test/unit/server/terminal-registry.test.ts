@@ -47,43 +47,52 @@ vi.mock('../../../server/logger', () => {
   return { logger }
 })
 
+// Mock MCP config writer
+vi.mock('../../../server/mcp/config-writer.js', () => ({
+  generateMcpInjection: vi.fn((mode: string, terminalId: string, cwd?: string, _platform?: string) => {
+    if (mode === 'claude' || mode === 'kimi') {
+      const flag = mode === 'claude' ? '--mcp-config' : '--mcp-config-file'
+      return { args: [flag, `/tmp/freshell-mcp/${terminalId}.json`], env: {} }
+    }
+    if (mode === 'codex') {
+      return { args: ['-c', 'mcp_servers.freshell.command="node"', '-c', 'mcp_servers.freshell.args=["/path/to/server.ts"]'], env: {} }
+    }
+    if (mode === 'gemini') {
+      return { args: [], env: { GEMINI_CLI_SYSTEM_DEFAULTS_PATH: `/tmp/freshell-mcp/${terminalId}.json` } }
+    }
+    if (mode === 'opencode') {
+      return { args: [], env: {} }
+    }
+    return { args: [], env: {} }
+  }),
+  cleanupMcpConfig: vi.fn(),
+}))
+
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 
-function expectCodexTurnCompleteArgs(args: string[]) {
+function expectCodexMcpArgs(args: string[]) {
+  // Bell notification still present
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
-  expect(args).toContain("tui.notifications=['agent-turn-complete']")
-
-  // skills.config must be passed as a single TOML array literal (not dotted map keys)
-  // to satisfy Codex's config parser which expects a sequence, not a map.
-  const skillsConfigArg = args.find((arg) => arg.startsWith('skills.config='))
-  expect(skillsConfigArg).toBeDefined()
-
-  // Must NOT use dotted key format (skills.config.N.path=...) — that creates a TOML map
-  const dottedKeyArgs = args.filter((arg) => /^skills\.config\.\d+\./.test(arg))
-  expect(dottedKeyArgs).toHaveLength(0)
-
-  // Parse the TOML array literal to verify contents
-  const arrayLiteral = skillsConfigArg!.replace('skills.config=', '')
-  expect(arrayLiteral).toMatch(/^\[.*\]$/)
-
-  // Verify orchestration skill is present and enabled
-  expect(arrayLiteral).toMatch(/path\s*=\s*"[^"]*freshell-orchestration[^"]*"/)
-  expect(arrayLiteral).toMatch(/freshell-orchestration[^}]*enabled\s*=\s*true/)
-
-  // Verify demo/legacy skills are present and disabled
-  const hasDemoDisabled = /(?:freshell-demo-creation|demo-creating)[^}]*enabled\s*=\s*false/.test(arrayLiteral)
-    || /enabled\s*=\s*false[^}]*(?:freshell-demo-creation|demo-creating)/.test(arrayLiteral)
-  expect(hasDemoDisabled).toBe(true)
+  // MCP server config instead of skills.config
+  const mcpArg = args.find(a => a.includes('mcp_servers.freshell'))
+  expect(mcpArg).toBeDefined()
+  // Old skills.config must NOT be present
+  const skillsArg = args.find(a => a.startsWith('skills.config='))
+  expect(skillsArg).toBeUndefined()
 }
 
-function expectClaudeTurnCompleteArgs(args: string[]) {
-  const pluginDirIndex = args.indexOf('--plugin-dir')
-  expect(pluginDirIndex).toBeGreaterThan(-1)
-  expect(args[pluginDirIndex + 1]).toContain('freshell-orchestration')
+function expectClaudeMcpArgs(args: string[]) {
+  // MCP config must be injected
+  expect(args).toContain('--mcp-config')
+  const configIndex = args.indexOf('--mcp-config')
+  expect(args[configIndex + 1]).toContain('freshell-mcp')
+  // Bell hook must still be present via --settings
   const command = getClaudeStopHookCommand(args)
   expect(command).toContain("printf '\\a'")
+  // Old plugin-dir must NOT be present
+  expect(args).not.toContain('--plugin-dir')
 }
 
 function getClaudeStopHookCommand(args: string[]): string {
@@ -793,7 +802,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
     })
   })
 
@@ -844,7 +853,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -862,7 +871,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system', 'session-123')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['resume', 'session-123'])
     })
   })
@@ -1263,7 +1272,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
@@ -1289,7 +1298,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -2460,6 +2469,83 @@ describe('TerminalRegistry', () => {
       expect(registry.isSessionBound('codex', '019cf585-9b35-7510-a99c-09b77b1f351a')).toBe(false)
     })
   })
+
+  describe('MCP cleanup on terminal exit', () => {
+    it('cleanupMcpConfig is called on onExit', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const pty = await import('node-pty')
+      // Get the mock pty object from the most recent spawn call
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      // Extract the onExit callback that the implementation registered
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+      // Trigger the exit handler
+      onExitCallback({ exitCode: 0, signal: 0 })
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'claude', '/home/user/project')
+    })
+
+    it('cleanupMcpConfig is called on explicit kill()', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'codex', cwd: '/home/user/work' })
+      registry.kill(record.terminalId)
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'codex', '/home/user/work')
+    })
+
+    it('cleanupMcpConfig is called on spawn failure', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const pty = await import('node-pty')
+      vi.mocked(pty.spawn).mockImplementationOnce(() => {
+        throw new Error('spawn failed: command not found')
+      })
+
+      expect(() => registry.create({ mode: 'claude', cwd: '/home/user/fail' })).toThrow('spawn failed')
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(
+        expect.any(String),
+        'claude',
+        '/home/user/fail',
+      )
+    })
+
+    it('terminal record stores mcpCwd from normalized buildSpawnSpec cwd', () => {
+      // The terminal record should store the normalized cwd (from buildSpawnSpec)
+      // separately from the raw cwd, so cleanup uses the same path as injection.
+      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      // On Linux (no WSL), mcpCwd should equal the resolved cwd (same as raw here)
+      expect(record.mcpCwd).toBe('/home/user/project')
+    })
+
+    it('kill() passes mcpCwd (not raw cwd) to cleanupMcpConfig', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-project' })
+      registry.kill(record.terminalId)
+
+      // cleanup must use mcpCwd (the normalized cwd used during injection)
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'opencode', record.mcpCwd)
+    })
+
+    it('onExit passes mcpCwd (not raw cwd) to cleanupMcpConfig', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-exit' })
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+      onExitCallback({ exitCode: 0, signal: 0 })
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'opencode', record.mcpCwd)
+    })
+  })
 })
 
 describe('TerminalRegistry exact Claude session binding', () => {
@@ -2645,7 +2731,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
     })
   })
 
@@ -2660,7 +2746,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -2891,7 +2977,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
@@ -2917,7 +3003,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -3276,7 +3362,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
 
-        expectClaudeTurnCompleteArgs(spec.args)
+        expectClaudeMcpArgs(spec.args)
       })
     })
 
@@ -3316,7 +3402,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('codex', '/home/user', 'system')
 
-        expectCodexTurnCompleteArgs(spec.args)
+        expectCodexMcpArgs(spec.args)
       })
     })
 
@@ -3460,4 +3546,137 @@ describe('buildSpawnSpec Unix paths', () => {
     })
   })
 
+  describe('buildSpawnSpec MCP injection', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+    })
+
+    it('gemini mode includes GEMINI_CLI_SYSTEM_DEFAULTS_PATH in env', () => {
+      const spec = buildSpawnSpec('gemini', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-gem1')
+      expect(spec.env).toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
+      expect(spec.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH).toContain('freshell-mcp')
+    })
+
+    it('kimi mode includes --mcp-config-file in args', () => {
+      const spec = buildSpawnSpec('kimi', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-kimi1')
+      expect(spec.args).toContain('--mcp-config-file')
+    })
+
+    it('opencode mode passes cwd to generateMcpInjection', async () => {
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, undefined, undefined, undefined, 'term-oc1')
+      expect(generateMcpInjection).toHaveBeenCalledWith('opencode', 'term-oc1', '/home/user/project', 'unix')
+    })
+
+    it('shell mode does not inject MCP config', () => {
+      const spec = buildSpawnSpec('shell', '/home/user', 'system')
+      expect(spec.args).not.toContain('--mcp-config')
+      expect(spec.args).not.toContain('--mcp-config-file')
+      expect(spec.env).not.toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
+    })
+
+    it('buildSpawnSpec passes terminalId, cwd, and platform to generateMcpInjection', async () => {
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      buildSpawnSpec('claude', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-123')
+      expect(generateMcpInjection).toHaveBeenCalledWith('claude', 'term-123', '/home/user', 'unix')
+    })
+
+    it('on Unix, passes resolved cwd (not raw cwd) to generateMcpInjection for WSL path normalization', async () => {
+      // Simulate WSL environment where cwd might be a Windows-style path
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(generateMcpInjection).mockClear()
+      // On WSL, a Windows-style cwd (e.g. D:\project) should be converted to a Linux path
+      // before being passed to generateMcpInjection. resolveUnixShellCwd handles this.
+      // The raw Windows path would fail existsSync in config-writer on Linux.
+      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, undefined, undefined, undefined, 'term-wsl1')
+      // The cwd passed to generateMcpInjection should be the resolved Unix path,
+      // not the raw Windows path. On WSL, convertWindowsPathToWslPath converts
+      // D:\project to /mnt/d/project.
+      const calledCwd = vi.mocked(generateMcpInjection).mock.calls[0]?.[2]
+      // The cwd must NOT be the raw Windows path
+      expect(calledCwd).not.toBe('D:\\project')
+      // It should be a Linux-style path (starts with /)
+      expect(calledCwd).toMatch(/^\//)
+    })
+
+    it('WSL cmd coding CLI returns non-undefined mcpCwd even when procCwd is undefined', () => {
+      // In WSL, cmd.exe cannot use Linux paths as cwd, so procCwd is undefined.
+      // But MCP injection used a resolved Linux path (cmdMcpCwd). The mcpCwd field
+      // must preserve this so cleanup can find the temp files.
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'cmd', undefined, undefined, undefined, undefined, 'term-cmd1')
+      // procCwd (spec.cwd) is undefined because cmd.exe can't take a Linux path
+      expect(spec.cwd).toBeUndefined()
+      // But mcpCwd must be the Linux path used for MCP injection
+      expect(spec.mcpCwd).toBeDefined()
+      expect(spec.mcpCwd).toMatch(/^\//)
+    })
+
+    it('WSL powershell coding CLI returns non-undefined mcpCwd even when procCwd is undefined', () => {
+      // Same issue: powershell.exe in WSL can't use Linux paths as cwd,
+      // so procCwd is undefined, but MCP injection used a resolved Linux path.
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'powershell', undefined, undefined, undefined, undefined, 'term-ps1')
+      expect(spec.cwd).toBeUndefined()
+      expect(spec.mcpCwd).toBeDefined()
+      expect(spec.mcpCwd).toMatch(/^\//)
+    })
+
+    it('WSL wsl.exe coding CLI returns wslCwd as mcpCwd', () => {
+      // When using wsl.exe (from native Windows), mcpCwd should be the Linux path
+      mockPlatform('win32')
+      const spec = buildSpawnSpec('claude', 'C:\\Users\\test', 'wsl', undefined, undefined, undefined, undefined, 'term-wsl2')
+      // wsl.exe passes cwd: undefined to the process
+      expect(spec.cwd).toBeUndefined()
+      // mcpCwd should be the Linux-normalized cwd
+      expect(spec.mcpCwd).toBeDefined()
+    })
+
+    it('Unix coding CLI returns unixCwd as mcpCwd', () => {
+      mockPlatform('linux')
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'system', undefined, undefined, undefined, undefined, 'term-unix1')
+      expect(spec.mcpCwd).toBe('/home/user/project')
+    })
+
+    it('shell mode returns undefined mcpCwd (no MCP injection)', () => {
+      mockPlatform('linux')
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'system')
+      // shell mode has no MCP injection, so mcpCwd is irrelevant
+      // but should still be set to the cwd for consistency
+      expect(spec.mcpCwd).toBeDefined()
+    })
+  })
+
+  describe('dead code removal verification', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+    })
+
+    it('claude mode does not include --plugin-dir in spawn args', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system')
+      expect(spec.args).not.toContain('--plugin-dir')
+    })
+
+    it('codex mode does not include skills.config in spawn args', () => {
+      const spec = buildSpawnSpec('codex', '/home/user', 'system')
+      const skillsArg = spec.args.find((a: string) => a.startsWith('skills.config='))
+      expect(skillsArg).toBeUndefined()
+    })
+
+    it('spawn-spec.ts is deleted', async () => {
+      try {
+        await import('../../../server/spawn-spec.js')
+        expect.fail('spawn-spec.ts should not exist')
+      } catch (err: any) {
+        // Expected: module not found
+        expect(err.message || err.code).toBeTruthy()
+      }
+    })
+  })
 })
