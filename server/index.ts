@@ -294,7 +294,8 @@ async function main() {
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
-  const isDev = process.env.NODE_ENV !== 'production'
+  const isCompiledBuild = __dirname.includes(path.join('dist', 'server'))
+  const isDev = !isCompiledBuild && process.env.NODE_ENV !== 'production'
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
@@ -486,7 +487,7 @@ async function main() {
   const clientDir = path.join(distRoot, 'client')
   const indexHtml = path.join(clientDir, 'index.html')
 
-  if (process.env.NODE_ENV === 'production') {
+  if (!isDev) {
     app.use(express.static(clientDir, { index: false }))
     app.get('*', (_req, res) => res.sendFile(indexHtml))
   }
@@ -672,7 +673,7 @@ async function main() {
 
     void (async () => {
       const token = process.env.AUTH_TOKEN
-      const visitPort = resolveVisitPort(port, process.env)
+      const visitPort = resolveVisitPort(port, isDev, process.env)
       const hideToken = process.env.HIDE_STARTUP_TOKEN?.toLowerCase() === 'true'
       const localUrl = hideToken
         ? `http://localhost:${visitPort}/`
