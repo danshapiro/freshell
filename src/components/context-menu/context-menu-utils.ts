@@ -66,7 +66,6 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
             kind: 'sidebar-session',
             sessionId: data.sessionId,
             provider: data.provider,
-            sessionKey: data.sessionKey,
             sessionType: data.sessionType,
             runningTerminalId: data.runningTerminalId,
             hasTab: data.hasTab === 'true' ? true : data.hasTab === 'false' ? false : undefined,
@@ -75,7 +74,7 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
     case ContextIds.HistoryProject:
       return data.projectPath ? { kind: 'history-project', projectPath: data.projectPath } : null
     case ContextIds.HistorySession:
-      return data.sessionId ? { kind: 'history-session', sessionId: data.sessionId, provider: data.provider, sessionKey: data.sessionKey } : null
+      return data.sessionId ? { kind: 'history-session', sessionId: data.sessionId, provider: data.provider } : null
     case ContextIds.OverviewTerminal:
       return data.terminalId ? { kind: 'overview-terminal', terminalId: data.terminalId } : null
     case ContextIds.ClaudeMessage:

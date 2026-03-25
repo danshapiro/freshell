@@ -426,37 +426,11 @@ describe('ExtensionManager', () => {
       const entry = mgr.toClientRegistry()[0]
       expect(entry.cli).toEqual({
         supportsPermissionMode: true,
-        supportedPermissionModes: ['default', 'plan'],
         supportsModel: true,
         supportsSandbox: undefined,
         supportsResume: true,
         resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'],
       })
-    })
-
-    it('derives supported permission modes for client registry entries', async () => {
-      await writeExtension(extDir1, 'cli', cliManifest({
-        name: 'kimi',
-        label: 'Kimi',
-        cli: {
-          command: 'kimi',
-          modelArgs: ['--model', '{{model}}'],
-          permissionModeArgsByValue: {
-            bypassPermissions: ['--yolo'],
-          },
-          supportsPermissionMode: true,
-          supportsModel: true,
-        },
-      }))
-
-      const mgr = new ExtensionManager()
-      mgr.scan([extDir1])
-
-      expect(mgr.toClientRegistry()[0].cli).toEqual(expect.objectContaining({
-        supportsModel: true,
-        supportsPermissionMode: true,
-        supportedPermissionModes: ['default', 'bypassPermissions'],
-      }))
     })
   })
 })

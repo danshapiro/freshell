@@ -418,7 +418,7 @@ export class WsClient {
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null
       if (!this.intentionalClose) {
-        this.connect().catch((err) => log.warn('reconnect failed', err))
+        this.connect().catch((err) => log.error('reconnect failed', err))
       }
     }, delay)
 

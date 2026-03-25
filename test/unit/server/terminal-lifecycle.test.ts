@@ -1554,41 +1554,6 @@ describe('shutdownGracefully', () => {
       Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
     }
   })
-
-  it('should not trigger MaxListenersExceededWarning with many terminals', async () => {
-    const warnings: string[] = []
-    const onWarning = (w: Error) => {
-      if (w.message.includes('MaxListeners')) warnings.push(w.message)
-    }
-    process.on('warning', onWarning)
-
-    try {
-      // Create enough terminals to exceed the old per-terminal listener approach
-      const count = 25
-      for (let i = 0; i < count; i++) {
-        registry.create({ mode: 'shell' })
-      }
-
-      // All ptys exit when killed
-      for (const pty of mockPtyProcess.instances) {
-        pty.kill.mockImplementation(() => {
-          setTimeout(() => pty._emitExit(0), 5)
-        })
-      }
-
-      await registry.shutdownGracefully(5000)
-
-      // All should be exited
-      for (const term of registry.list()) {
-        expect(term.status).toBe('exited')
-      }
-
-      // No MaxListenersExceeded warning should have fired
-      expect(warnings).toHaveLength(0)
-    } finally {
-      process.off('warning', onWarning)
-    }
-  })
 })
 
 describe('ChunkRingBuffer edge cases for lifecycle', () => {

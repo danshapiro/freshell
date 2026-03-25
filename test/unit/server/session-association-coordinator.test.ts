@@ -4,7 +4,7 @@ import type { CodingCliSession } from '../../../server/coding-cli/types'
 
 function createSession(overrides: Partial<CodingCliSession> = {}): CodingCliSession {
   return {
-    provider: 'claude',
+    provider: 'codex',
     sessionId: 'session-main',
     projectPath: '/repo/project',
     lastActivityAt: 2_000,
@@ -23,9 +23,9 @@ describe('SessionAssociationCoordinator', () => {
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
     const sessions = [
-      createSession({ provider: 'opencode', sessionId: 'session-main', lastActivityAt: 1 }),
-      createSession({ provider: 'opencode', sessionId: 'session-subagent', lastActivityAt: 2, isSubagent: true }),
-      createSession({ provider: 'opencode', sessionId: 'session-exec', lastActivityAt: 3, isNonInteractive: true }),
+      createSession({ sessionId: 'session-main', lastActivityAt: 1 }),
+      createSession({ sessionId: 'session-subagent', lastActivityAt: 2, isSubagent: true }),
+      createSession({ sessionId: 'session-exec', lastActivityAt: 3, isNonInteractive: true }),
     ]
 
     const candidates = coordinator.collectNewOrAdvanced([
@@ -63,7 +63,7 @@ describe('SessionAssociationCoordinator', () => {
 
   it('associates regular sessions with matching unassociated terminals', () => {
     const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
       isSessionBound: vi.fn(() => false),
     }
@@ -72,8 +72,8 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
-    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'claude', 'session-main', 'association')
+    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('codex', '/repo/project')
+    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'codex', 'session-main', 'association')
   })
 
   it('skips association when session is already bound to another terminal', () => {
@@ -84,20 +84,17 @@ describe('SessionAssociationCoordinator', () => {
     }
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
-    const result = coordinator.associateSingleSession(createSession({
-      provider: 'opencode',
-      sessionId: 'opencode-session-bound',
-    }))
+    const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: false })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('opencode', 'opencode-session-bound', '/repo/project')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
     expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
     expect(registry.bindSession).not.toHaveBeenCalled()
   })
 
   it('does not skip association when isSessionBound returns false', () => {
     const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
       isSessionBound: vi.fn(() => false),
     }
@@ -106,79 +103,7 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('claude', 'session-main', '/repo/project')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
     expect(registry.bindSession).toHaveBeenCalled()
-  })
-
-  it('skips codex sessions because exact launch provenance should bind them elsewhere', () => {
-    const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'codex-session' })),
-      isSessionBound: vi.fn(() => false),
-    }
-    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
-
-    const result = coordinator.associateSingleSession(createSession({
-      provider: 'codex',
-      sessionId: 'codex-session',
-    }))
-
-    expect(result).toEqual({ associated: false })
-    expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
-    expect(registry.bindSession).not.toHaveBeenCalled()
-  })
-
-  it('keeps named claude resumes eligible on the compatibility path', () => {
-    const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000, pendingResumeName: '137 tour' }]),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: '550e8400-e29b-41d4-a716-446655440000' })),
-      isSessionBound: vi.fn(() => false),
-    }
-    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
-
-    const result = coordinator.associateSingleSession(createSession({
-      provider: 'claude',
-      sessionId: '550e8400-e29b-41d4-a716-446655440000',
-    }))
-
-    expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
-  })
-
-  it('collectNewOrAdvanced excludes plain claude sessions unless a named resume terminal is waiting', () => {
-    const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: '550e8400-e29b-41d4-a716-446655440000' })),
-      isSessionBound: vi.fn(() => false),
-    }
-    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
-
-    const candidates = coordinator.collectNewOrAdvanced([{
-      projectPath: '/repo/project',
-      sessions: [createSession({
-        provider: 'claude',
-        sessionId: '550e8400-e29b-41d4-a716-446655440000',
-      })],
-    }])
-
-    expect(candidates).toEqual([])
-    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
-  })
-
-  it('keeps opencode on the compatibility path', () => {
-    const registry = {
-      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-2', createdAt: 1_000 }]),
-      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'opencode-session-1' })),
-      isSessionBound: vi.fn(() => false),
-    }
-    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
-
-    const result = coordinator.associateSingleSession(createSession({
-      provider: 'opencode',
-      sessionId: 'opencode-session-1',
-    }))
-
-    expect(result).toEqual({ associated: true, terminalId: 'term-2' })
-    expect(registry.bindSession).toHaveBeenCalledWith('term-2', 'opencode', 'opencode-session-1', 'association')
   })
 })

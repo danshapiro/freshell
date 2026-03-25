@@ -196,7 +196,6 @@ describe('SessionsSyncService', () => {
         sourceFile: '/tmp/other.jsonl',
       }, '#0f0'),
     ])
-    // Only lastActivityAt changed -- should NOT broadcast
     svc.publish([
       createDetailedProject('/repo', {
         provider: 'codex',
@@ -206,7 +205,6 @@ describe('SessionsSyncService', () => {
         title: 'Deploy',
       }, '#0f0'),
     ])
-    // Title changed -- SHOULD broadcast
     svc.publish([
       createDetailedProject('/repo', {
         provider: 'codex',
@@ -220,47 +218,7 @@ describe('SessionsSyncService', () => {
     expect(ws.broadcastSessionsChanged.mock.calls).toEqual([
       [1],
       [2],
+      [3],
     ])
-  })
-
-  it('suppresses broadcast when only timestamps change on an existing session', () => {
-    const ws = createWsMocks()
-    const svc = new SessionsSyncService(ws as any, { coalesceMs: 0 })
-
-    svc.publish([
-      createDetailedProject('/repo', {
-        provider: 'codex',
-        sessionId: 's1',
-        projectPath: '/repo',
-        lastActivityAt: 100,
-        createdAt: 50,
-        title: 'Deploy',
-      }),
-    ])
-    svc.publish([
-      createDetailedProject('/repo', {
-        provider: 'codex',
-        sessionId: 's1',
-        projectPath: '/repo',
-        lastActivityAt: 200,
-        createdAt: 50,
-        title: 'Deploy',
-      }),
-    ])
-    svc.publish([
-      createDetailedProject('/repo', {
-        provider: 'codex',
-        sessionId: 's1',
-        projectPath: '/repo',
-        lastActivityAt: 300,
-        createdAt: 50,
-        title: 'Deploy',
-      }),
-    ])
-
-    // Only the first publish should have broadcast (initial state)
-    // Subsequent publishes with only lastActivityAt changes should be suppressed
-    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
-    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
   })
 })

@@ -207,44 +207,6 @@ describe('replace pane (e2e)', () => {
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
     })
 
-    it('clears stale tab.resumeSessionId when replacing the owning coding pane', () => {
-      const layout: PaneNode = {
-        type: 'leaf',
-        id: 'pane-1',
-        content: {
-          kind: 'terminal',
-          createRequestId: 'req-1',
-          status: 'running',
-          mode: 'claude',
-          shell: 'system',
-          terminalId: 'term-1',
-          resumeSessionId: '55555555-5555-4555-8555-555555555555',
-        },
-      }
-      const store = createStore(layout, { tabTerminalId: 'term-1' })
-      store.dispatch(updateTab({
-        id: 'tab-1',
-        updates: {
-          mode: 'claude',
-          codingCliProvider: 'claude',
-          resumeSessionId: '55555555-5555-4555-8555-555555555555',
-        },
-      }))
-
-      const content = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
-      if (content?.kind === 'terminal' && content.terminalId) {
-        wsMocks.send({ type: 'terminal.detach', terminalId: content.terminalId })
-        const tab = store.getState().tabs.tabs.find((t) => t.id === 'tab-1')
-        if (tab?.terminalId === content.terminalId) {
-          store.dispatch(updateTab({ id: 'tab-1', updates: { terminalId: undefined } }))
-        }
-        store.dispatch(updateTab({ id: 'tab-1', updates: { resumeSessionId: undefined } }))
-      }
-      store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'pane-1' }))
-
-      expect(store.getState().tabs.tabs[0].resumeSessionId).toBeUndefined()
-    })
-
     it('does not clear tab.terminalId when pane terminal does not match', () => {
       const layout: PaneNode = {
         type: 'leaf',

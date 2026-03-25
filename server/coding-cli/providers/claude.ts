@@ -356,7 +356,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       lastActivityAt = clock.lastActivityAt
     }
 
-    if (obj.entrypoint === 'sdk-cli') isNonInteractive = true
+    if (obj.type === 'queue-operation') isNonInteractive = true
 
     if (!sessionId) {
       const candidates = [

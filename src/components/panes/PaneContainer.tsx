@@ -1,5 +1,5 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
-import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
+import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -23,7 +23,6 @@ import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
-import { collectSessionRefsFromContent, collectSessionRefsFromNode } from '@/lib/session-utils'
 import {
   formatPaneRuntimeLabel,
   formatPaneRuntimeTooltip,
@@ -161,7 +160,6 @@ function resolveFreshClaudeRuntimeMeta(
 
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
-  const store = useAppStore()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
@@ -272,31 +270,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     }
   }, [])
 
-  const clearStaleTabResumeSessionId = useCallback((removedContent: PaneContent) => {
-    const removedSession = collectSessionRefsFromContent(removedContent)[0]
-    if (!removedSession) return
-
-    const state = store.getState()
-    const currentTab = state.tabs.tabs.find((candidate) => candidate.id === tabId)
-    if (!currentTab?.resumeSessionId) return
-
-    const currentProvider = currentTab.codingCliProvider || (currentTab.mode !== 'shell' ? currentTab.mode : undefined)
-    if (currentProvider !== removedSession.provider || currentTab.resumeSessionId !== removedSession.sessionId) {
-      return
-    }
-
-    const survivingLayout = state.panes.layouts[tabId]
-    const stillOwnsSession = survivingLayout
-      ? collectSessionRefsFromNode(survivingLayout).some((sessionRef) => (
-        sessionRef.provider === removedSession.provider
-        && sessionRef.sessionId === removedSession.sessionId
-      ))
-      : false
-    if (stillOwnsSession) return
-
-    dispatch(updateTab({ id: tabId, updates: { resumeSessionId: undefined } }))
-  }, [dispatch, store, tabId])
-
   const handleClose = useCallback((paneId: string, content: PaneContent) => {
     // Clean up terminal process if this pane has one
     if (content.kind === 'terminal' && content.terminalId) {
@@ -332,8 +305,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-    clearStaleTabResumeSessionId(content)
-  }, [clearStaleTabResumeSessionId, dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
+  }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
   const handleFocus = useCallback((paneId: string) => {
     if (attentionDismiss === 'click' && attentionByPane[paneId]) {

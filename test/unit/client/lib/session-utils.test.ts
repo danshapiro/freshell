@@ -169,7 +169,7 @@ describe('getSessionsForHello', () => {
 })
 
 describe('collectSessionLocatorsFromTabs', () => {
-  it('preserves exact local and foreign locators while ignoring no-layout coding tab mirrors', () => {
+  it('preserves exact local and foreign locators, intrinsic local fallbacks, and tab-level fallbacks', () => {
     const tabs = [
       { id: 'tab-local' },
       { id: 'tab-local-duplicate' },
@@ -218,12 +218,14 @@ describe('collectSessionLocatorsFromTabs', () => {
       { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
       { provider: 'claude', sessionId: VALID_SESSION_ID, serverInstanceId: 'srv-local' },
       { provider: 'claude', sessionId: VALID_SESSION_ID },
+      { provider: 'codex', sessionId: 'tab-only' },
       { provider: 'claude', sessionId: 'not-a-uuid' },
     ])
 
     expect(collectSessionRefsFromTabs(tabs, panes)).toEqual([
       { provider: 'codex', sessionId: 'shared' },
       { provider: 'claude', sessionId: VALID_SESSION_ID },
+      { provider: 'codex', sessionId: 'tab-only' },
       { provider: 'claude', sessionId: 'not-a-uuid' },
     ])
   })
@@ -263,11 +265,13 @@ describe('collectSessionLocatorsFromTabs', () => {
     expect(collectSessionLocatorsFromTabs(tabs, panes)).toEqual([
       { provider: 'codex', sessionId: 'resume-valid' },
       { provider: 'codex', sessionId: 'explicit-valid' },
+      { provider: 'codex', sessionId: 'tab-valid' },
     ])
 
     expect(collectSessionRefsFromTabs(tabs, panes)).toEqual([
       { provider: 'codex', sessionId: 'resume-valid' },
       { provider: 'codex', sessionId: 'explicit-valid' },
+      { provider: 'codex', sessionId: 'tab-valid' },
     ])
   })
 })
@@ -309,43 +313,6 @@ describe('findTabIdForSession', () => {
     )).toBe('tab-local')
   })
 
-  it('ignores mirrored fallback ownership on a foreign exact copy when choosing a local tab', () => {
-    const state = {
-      tabs: {
-        activeTabId: 'tab-foreign-copy',
-        tabs: [{ id: 'tab-foreign-copy' }, { id: 'tab-local' }],
-      },
-      panes: {
-        layouts: {
-          'tab-foreign-copy': leaf('pane-foreign-copy', {
-            kind: 'terminal',
-            mode: 'codex',
-            status: 'running',
-            createRequestId: 'req-foreign-copy',
-            resumeSessionId: 'shared',
-            sessionRef: {
-              provider: 'codex',
-              sessionId: 'shared',
-              serverInstanceId: 'srv-remote',
-            },
-          }),
-          'tab-local': leaf('pane-local', terminalContent('codex', 'shared', {
-            provider: 'codex',
-            sessionId: 'shared',
-            serverInstanceId: 'srv-local',
-          })),
-        },
-        activePane: {},
-      },
-    } as unknown as RootState
-
-    expect(findTabIdForSession(
-      state,
-      { provider: 'codex', sessionId: 'shared' },
-      'srv-local',
-    )).toBe('tab-local')
-  })
-
   it('ignores a foreign copied tab when it is the only match for a local target', () => {
     const state = {
       tabs: {
@@ -359,7 +326,6 @@ describe('findTabIdForSession', () => {
             mode: 'codex',
             status: 'running',
             createRequestId: 'req-remote',
-            resumeSessionId: 'shared',
             sessionRef: {
               provider: 'codex',
               sessionId: 'shared',
@@ -414,7 +380,7 @@ describe('findTabIdForSession', () => {
     )).toBe('tab-local')
   })
 
-  it('ignores no-layout coding tab mirrors before websocket ready', () => {
+  it('still finds tab-level local fallbacks before websocket ready', () => {
     const state = {
       tabs: {
         activeTabId: 'tab-remote',
@@ -445,10 +411,10 @@ describe('findTabIdForSession', () => {
       state,
       { provider: 'codex', sessionId: 'shared' },
       undefined
-    )).toBeUndefined()
+    )).toBe('tab-local-fallback')
   })
 
-  it('ignores a tab-only coding mirror when layout is missing', () => {
+  it('falls back to tab resumeSessionId when layout is missing', () => {
     const state = {
       tabs: {
         activeTabId: 'tab-1',
@@ -464,31 +430,7 @@ describe('findTabIdForSession', () => {
       state,
       { provider: 'claude', sessionId: VALID_SESSION_ID },
       undefined
-    )).toBeUndefined()
-  })
-
-  it('prefers the layout-backed owner over a no-layout coding mirror with matching metadata', () => {
-    const state = {
-      tabs: {
-        activeTabId: 'tab-mirror',
-        tabs: [
-          { id: 'tab-mirror', mode: 'claude', resumeSessionId: VALID_SESSION_ID },
-          { id: 'tab-real' },
-        ],
-      },
-      panes: {
-        layouts: {
-          'tab-real': leaf('pane-real', terminalContent('claude', VALID_SESSION_ID)),
-        },
-        activePane: { 'tab-real': 'pane-real' },
-      },
-    } as unknown as RootState
-
-    expect(findTabIdForSession(
-      state,
-      { provider: 'claude', sessionId: VALID_SESSION_ID },
-      undefined,
-    )).toBe('tab-real')
+    )).toBe('tab-1')
   })
 })
 
@@ -529,46 +471,6 @@ describe('findPaneForSession', () => {
     )).toEqual({
       tabId: 'tab-remote',
       paneId: 'pane-remote',
-    })
-  })
-
-  it('ignores mirrored fallback ownership on a foreign exact copy when choosing a local pane', () => {
-    const state = {
-      tabs: {
-        activeTabId: 'tab-foreign-copy',
-        tabs: [{ id: 'tab-foreign-copy' }, { id: 'tab-local' }],
-      },
-      panes: {
-        layouts: {
-          'tab-foreign-copy': leaf('pane-foreign-copy', {
-            kind: 'terminal',
-            mode: 'codex',
-            status: 'running',
-            createRequestId: 'req-foreign-copy',
-            resumeSessionId: 'shared',
-            sessionRef: {
-              provider: 'codex',
-              sessionId: 'shared',
-              serverInstanceId: 'srv-remote',
-            },
-          }),
-          'tab-local': leaf('pane-local', terminalContent('codex', 'shared', {
-            provider: 'codex',
-            sessionId: 'shared',
-            serverInstanceId: 'srv-local',
-          })),
-        },
-        activePane: {},
-      },
-    } as unknown as RootState
-
-    expect(findPaneForSession(
-      state,
-      { provider: 'codex', sessionId: 'shared' },
-      'srv-local',
-    )).toEqual({
-      tabId: 'tab-local',
-      paneId: 'pane-local',
     })
   })
 
@@ -694,7 +596,7 @@ describe('findPaneForSession', () => {
     )).toBeUndefined()
   })
 
-  it('ignores a tab-only coding mirror when there is no layout-backed pane', () => {
+  it('falls back to tab-level match when tab has resumeSessionId but no layout', () => {
     const state = {
       tabs: {
         activeTabId: 'tab-1',
@@ -706,69 +608,14 @@ describe('findPaneForSession', () => {
       },
     } as unknown as RootState
 
+    // Returns tabId but no paneId since there's no pane tree yet
     expect(findPaneForSession(
       state,
       { provider: 'claude', sessionId: VALID_SESSION_ID },
       undefined
-    )).toBeUndefined()
-  })
-
-  it('ignores a foreign exact pane with mirrored compatibility metadata when it is the only candidate for a local target', () => {
-    const state = {
-      tabs: {
-        activeTabId: 'tab-remote',
-        tabs: [{ id: 'tab-remote' }],
-      },
-      panes: {
-        layouts: {
-          'tab-remote': leaf('pane-remote', {
-            kind: 'terminal',
-            mode: 'codex',
-            status: 'running',
-            createRequestId: 'req-remote',
-            resumeSessionId: 'shared',
-            sessionRef: {
-              provider: 'codex',
-              sessionId: 'shared',
-              serverInstanceId: 'srv-remote',
-            },
-          }),
-        },
-        activePane: {},
-      },
-    } as unknown as RootState
-
-    expect(findPaneForSession(
-      state,
-      { provider: 'codex', sessionId: 'shared' },
-      'srv-local',
-    )).toBeUndefined()
-  })
-
-  it('prefers the layout-backed pane over a no-layout coding mirror with matching metadata', () => {
-    const state = {
-      tabs: {
-        activeTabId: 'tab-mirror',
-        tabs: [
-          { id: 'tab-mirror', mode: 'claude', resumeSessionId: VALID_SESSION_ID },
-          { id: 'tab-real' },
-        ],
-      },
-      panes: {
-        layouts: {
-          'tab-real': leaf('pane-real', terminalContent('claude', VALID_SESSION_ID)),
-        },
-        activePane: { 'tab-real': 'pane-real' },
-      },
-    } as unknown as RootState
-
-    expect(findPaneForSession(
-      state,
-      { provider: 'claude', sessionId: VALID_SESSION_ID },
-      undefined,
     )).toEqual({
-      tabId: 'tab-real',
-      paneId: 'pane-real',
+      tabId: 'tab-1',
+      paneId: undefined,
     })
   })
 })

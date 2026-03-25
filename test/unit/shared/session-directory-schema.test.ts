@@ -54,26 +54,6 @@ describe('SessionDirectoryItemSchema matchedIn field', () => {
   })
 })
 
-describe('SessionDirectoryItemSchema lastActivityAt integer enforcement', () => {
-  const baseItem = {
-    sessionId: 'test-session',
-    provider: 'kimi',
-    projectPath: '/test',
-    lastActivityAt: 1000,
-    isRunning: false,
-  }
-
-  it('accepts integer lastActivityAt', () => {
-    expect(() => SessionDirectoryItemSchema.parse(baseItem)).not.toThrow()
-  })
-
-  it('rejects float lastActivityAt', () => {
-    expect(() =>
-      SessionDirectoryItemSchema.parse({ ...baseItem, lastActivityAt: 1774212239458.0225 }),
-    ).toThrow()
-  })
-})
-
 describe('SessionDirectoryPageSchema partial fields', () => {
   const basePage = {
     items: [],

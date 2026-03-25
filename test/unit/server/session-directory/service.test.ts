@@ -8,23 +8,6 @@ import type { TerminalMeta } from '../../../../server/terminal-metadata-service.
 import { querySessionDirectory } from '../../../../server/session-directory/service.js'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude.js'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex.js'
-import { KimiProvider } from '../../../../server/coding-cli/providers/kimi.js'
-
-const kimiFixtureShareDir = path.join(
-  process.cwd(),
-  'test',
-  'fixtures',
-  'coding-cli',
-  'kimi',
-  'share-dir',
-)
-const kimiFixtureSessionFile = path.join(
-  kimiFixtureShareDir,
-  'sessions',
-  '4a3dcd71f4774356bb688dad99173808',
-  'kimi-session-1',
-  'context.jsonl',
-)
 
 function makeSession(overrides: Partial<CodingCliSession> & Pick<CodingCliSession, 'sessionId' | 'projectPath' | 'lastActivityAt'>): CodingCliSession {
   return {
@@ -127,63 +110,6 @@ describe('querySessionDirectory', () => {
       runningTerminalId: 'term-1',
     })
     expect(page.revision).toBe(1_500)
-  })
-
-  it('joins Kimi running state by cwd when duplicate named session ids exist', async () => {
-    const kimiProjects = [
-      makeProject('/repo/root', [
-        makeSession({
-          provider: 'kimi',
-          sessionId: 'shared-kimi-session',
-          projectPath: '/repo/root',
-          lastActivityAt: 1_100,
-          cwd: '/repo/root/packages/app-a',
-          title: 'Kimi app A',
-        }),
-        makeSession({
-          provider: 'kimi',
-          sessionId: 'shared-kimi-session',
-          projectPath: '/repo/root',
-          lastActivityAt: 1_000,
-          cwd: '/repo/root/packages/app-b',
-          title: 'Kimi app B',
-        }),
-      ]),
-    ]
-
-    const kimiTerminalMeta = [
-      makeTerminalMeta({
-        terminalId: 'term-kimi-a',
-        updatedAt: 1_600,
-        provider: 'kimi',
-        sessionId: 'shared-kimi-session',
-        cwd: '/repo/root/packages/app-a',
-      }),
-    ]
-
-    const page = await querySessionDirectory({
-      projects: kimiProjects,
-      terminalMeta: kimiTerminalMeta,
-      query: {
-        priority: 'visible',
-      },
-    })
-
-    expect(page.items).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        provider: 'kimi',
-        sessionId: 'shared-kimi-session',
-        cwd: '/repo/root/packages/app-a',
-        isRunning: true,
-        runningTerminalId: 'term-kimi-a',
-      }),
-      expect.objectContaining({
-        provider: 'kimi',
-        sessionId: 'shared-kimi-session',
-        cwd: '/repo/root/packages/app-b',
-        isRunning: false,
-      }),
-    ]))
   })
 
   it('searches titles and snippets on the server and bounds snippet length', async () => {
@@ -370,102 +296,6 @@ describe('querySessionDirectory file-based search', () => {
 
     expect(page.items).toHaveLength(1)
     expect(page.items[0].matchedIn).toBe('assistantMessage')
-  })
-
-  it('searches Kimi visible transcript text and honors metadata title/archive state', async () => {
-    const projects = [makeProject('/repo/root', [
-      makeSession({
-        provider: 'kimi',
-        sessionId: 'kimi-session-1',
-        projectPath: '/repo/root',
-        lastActivityAt: 1000,
-        title: 'Pinned title from metadata',
-        archived: true,
-        sourceFile: kimiFixtureSessionFile,
-      }),
-    ])]
-    const kimiProvider = new KimiProvider(kimiFixtureShareDir)
-
-    const userPage = await querySessionDirectory({
-      projects,
-      terminalMeta: [],
-      providers: [kimiProvider],
-      query: { priority: 'visible', query: 'visible-user-token-kimi', tier: 'userMessages' },
-    })
-    expect(userPage.items).toHaveLength(1)
-    expect(userPage.items[0]).toMatchObject({
-      sessionId: 'kimi-session-1',
-      title: 'Pinned title from metadata',
-      archived: true,
-      matchedIn: 'userMessage',
-    })
-
-    const assistantPage = await querySessionDirectory({
-      projects,
-      terminalMeta: [],
-      providers: [kimiProvider],
-      query: { priority: 'visible', query: 'visible-assistant-token-kimi', tier: 'fullText' },
-    })
-    expect(assistantPage.items).toHaveLength(1)
-    expect(assistantPage.items[0].matchedIn).toBe('assistantMessage')
-
-    const hiddenPage = await querySessionDirectory({
-      projects,
-      terminalMeta: [],
-      providers: [kimiProvider],
-      query: { priority: 'visible', query: 'hidden-think-token-kimi', tier: 'fullText' },
-    })
-    expect(hiddenPage.items).toHaveLength(0)
-  })
-
-  it('keeps duplicate Kimi session ids in different cwd values distinct during file search', async () => {
-    const appASessionFile = path.join(tempDir, 'kimi-app-a-context.jsonl')
-    const appBSessionFile = path.join(tempDir, 'kimi-app-b-context.jsonl')
-    await fsp.writeFile(appASessionFile, [
-      '{"role":"user","content":"shared-kimi-token-app-a"}',
-      '{"role":"assistant","content":[{"type":"text","text":"response-a"}]}',
-    ].join('\n'))
-    await fsp.writeFile(appBSessionFile, [
-      '{"role":"user","content":"shared-kimi-token-app-b"}',
-      '{"role":"assistant","content":[{"type":"text","text":"response-b"}]}',
-    ].join('\n'))
-
-    const projects = [makeProject('/repo/root', [
-      makeSession({
-        provider: 'kimi',
-        sessionId: 'shared-kimi-session',
-        projectPath: '/repo/root',
-        lastActivityAt: 1_000,
-        cwd: '/repo/root/packages/app-a',
-        title: 'Kimi app A',
-        sourceFile: appASessionFile,
-      }),
-      makeSession({
-        provider: 'kimi',
-        sessionId: 'shared-kimi-session',
-        projectPath: '/repo/root',
-        lastActivityAt: 900,
-        cwd: '/repo/root/packages/app-b',
-        title: 'Kimi app B',
-        sourceFile: appBSessionFile,
-      }),
-    ])]
-    const kimiProvider = new KimiProvider(kimiFixtureShareDir)
-
-    const page = await querySessionDirectory({
-      projects,
-      terminalMeta: [],
-      providers: [kimiProvider],
-      query: { priority: 'visible', query: 'shared-kimi-token-app-a', tier: 'userMessages' },
-    })
-
-    expect(page.items).toHaveLength(1)
-    expect(page.items[0]).toMatchObject({
-      provider: 'kimi',
-      sessionId: 'shared-kimi-session',
-      cwd: '/repo/root/packages/app-a',
-      matchedIn: 'userMessage',
-    })
   })
 
   it('title tier still works without file I/O (does not require providers)', async () => {

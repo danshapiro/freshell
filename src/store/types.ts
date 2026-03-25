@@ -56,7 +56,7 @@ export interface Tab {
   mode: TabMode
   shell?: ShellType
   initialCwd?: string
-  resumeSessionId?: string     // Compatibility mirror of the last associated coding session; not authoritative ownership
+  resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
   titleSetByUser?: boolean     // If true, don't auto-update title
@@ -79,7 +79,6 @@ export interface CodingCliSession {
   provider: CodingCliProviderName
   sessionType?: string
   sessionId: string
-  sessionKey?: string
   projectPath: string
   createdAt?: number
   lastActivityAt: number

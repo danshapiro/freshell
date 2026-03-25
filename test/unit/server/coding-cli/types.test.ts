@@ -1,24 +1,20 @@
-import { describe, expect, it } from 'vitest'
-import {
-  makeSessionKey,
-  normalizeSessionCwdForKey,
-  parseSessionKey,
-} from '../../../../server/coding-cli/types.js'
-import {
-  SESSION_KEY_NORMALIZATION_CASES,
-  makeExpectedScopedSessionKey,
-} from '@test/shared/coding-cli-session-key-corpus'
+import { describe, it, expect } from 'vitest'
+import { FIRST_USER_MESSAGE_MAX_CHARS, normalizeFirstUserMessage } from '../../../../server/coding-cli/types'
 
-describe('server coding-cli session keys', () => {
-  it.each(SESSION_KEY_NORMALIZATION_CASES)('normalizes $name cwd values consistently', ({ rawCwd, normalizedCwd }) => {
-    expect(normalizeSessionCwdForKey(rawCwd)).toBe(normalizedCwd)
+describe('normalizeFirstUserMessage', () => {
+  it('returns undefined for blank content', () => {
+    expect(normalizeFirstUserMessage('   \n\t  ')).toBeUndefined()
+  })
 
-    const compositeKey = makeSessionKey('kimi', 'team:alpha', rawCwd)
-    expect(compositeKey).toBe(makeExpectedScopedSessionKey('kimi', 'team:alpha', normalizedCwd))
-    expect(parseSessionKey(compositeKey)).toEqual({
-      provider: 'kimi',
-      sessionId: 'team:alpha',
-      cwd: normalizedCwd,
-    })
+  it('trims leading and trailing whitespace', () => {
+    expect(normalizeFirstUserMessage('  hello world  ')).toBe('hello world')
+  })
+
+  it('truncates to the configured max characters', () => {
+    const input = `  ${'x'.repeat(FIRST_USER_MESSAGE_MAX_CHARS + 25)}  `
+    const normalized = normalizeFirstUserMessage(input)
+
+    expect(normalized).toBeDefined()
+    expect(normalized?.length).toBe(FIRST_USER_MESSAGE_MAX_CHARS)
   })
 })

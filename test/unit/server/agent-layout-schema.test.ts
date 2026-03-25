@@ -9,9 +9,8 @@ describe('UiLayoutSyncSchema', () => {
         id: 'tab_a',
         title: 'alpha',
         fallbackSessionRef: {
-          provider: 'kimi',
-          sessionId: 'team:alpha',
-          cwd: '/repo/worktrees/app',
+          provider: 'codex',
+          sessionId: 'older-open',
         },
       }],
       activeTabId: 'tab_a',
@@ -24,9 +23,8 @@ describe('UiLayoutSyncSchema', () => {
     expect(parsed.success).toBe(true)
     if (!parsed.success) return
     expect(parsed.data.tabs[0]?.fallbackSessionRef).toEqual({
-      provider: 'kimi',
-      sessionId: 'team:alpha',
-      cwd: '/repo/worktrees/app',
+      provider: 'codex',
+      sessionId: 'older-open',
     })
   })
 })

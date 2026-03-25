@@ -45,15 +45,12 @@ function buildCliConfig(
   const cli = ext.cli
 
   if (cli?.supportsPermissionMode) {
-    const supportedPermissionModes = cli.supportedPermissionModes ?? [...CLAUDE_PERMISSION_MODE_VALUES]
-    const allowedPermissionModes = new Set(supportedPermissionModes)
-    const storedPermissionMode = (providerSettings.permissionMode as string) || 'default'
     config.push({
       key: 'permissionMode',
       label: `${ext.label} permission mode`,
       type: 'select',
-      value: allowedPermissionModes.has(storedPermissionMode) ? storedPermissionMode : 'default',
-      options: supportedPermissionModes.map((v) => ({
+      value: (providerSettings.permissionMode as string) || 'default',
+      options: CLAUDE_PERMISSION_MODE_VALUES.map((v) => ({
         label: v === 'default' ? 'Default'
           : v === 'plan' ? 'Plan'
           : v === 'acceptEdits' ? 'Accept edits'

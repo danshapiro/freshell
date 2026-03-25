@@ -4,7 +4,6 @@ import {
   type SearchOptions,
   type SearchResult,
 } from '@/lib/api'
-import { getCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
 import {
@@ -67,7 +66,6 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
     existing.sessions.push({
       provider: result.provider,
       sessionId: result.sessionId,
-      sessionKey: result.sessionKey,
       projectPath: result.projectPath,
       lastActivityAt: result.lastActivityAt,
       createdAt: result.createdAt,
@@ -87,13 +85,13 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
   return Array.from(grouped.values())
 }
 
-function sessionKey(session: { provider?: string; sessionId: string; cwd?: string; sessionKey?: string }) {
-  return getCodingCliSessionKey(session)
+function sessionKey(session: { provider?: string; sessionId: string }) {
+  return `${session.provider || 'claude'}:${session.sessionId}`
 }
 
 /**
  * Merge Phase 1 (title) and Phase 2 (deep) search results.
- * Deep results overwrite title results for the same session key.
+ * Deep results overwrite title results for the same session key (provider:sessionId).
  * Title-only results that were not found by the deep search are preserved.
  */
 export function mergeSearchResults(titleResults: SearchResult[], deepResults: SearchResult[]): SearchResult[] {
@@ -151,7 +149,7 @@ function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): Proj
   return Array.from(projectMap.values())
 }
 
-export function getLoadingKind(args: {
+function getLoadingKind(args: {
   priority: 'visible' | 'background'
   append: boolean
   trimmedQuery: string
@@ -167,7 +165,7 @@ export function getLoadingKind(args: {
 
   const queryChanged = args.trimmedQuery !== args.previousQuery
   const tierChanged = args.nextTier !== args.previousTier
-  if (args.trimmedQuery && (queryChanged || tierChanged)) {
+  if (queryChanged || tierChanged) {
     return 'search'
   }
 
@@ -194,7 +192,7 @@ function buildSearchPayload(
     projects: searchResultsToProjects(results),
     totalSessions: results.length,
     oldestLoadedTimestamp: last?.lastActivityAt ?? 0,
-    oldestLoadedSessionId: last ? getCodingCliSessionKey(last) : '',
+    oldestLoadedSessionId: last ? `${last.provider}:${last.sessionId}` : '',
     hasMore: false,
     query,
     searchTier,

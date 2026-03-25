@@ -40,7 +40,6 @@ export const SessionDirectoryQuerySchema = z.object({
 export const SessionDirectoryItemSchema = z.object({
   sessionId: z.string().min(1),
   provider: z.string().min(1),
-  sessionKey: z.string().min(1).optional(),
   projectPath: z.string().min(1),
   title: z.string().optional(),
   summary: z.string().optional(),
@@ -77,10 +76,6 @@ export const AgentTimelinePageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
   limit: z.number().int().positive().max(MAX_AGENT_TIMELINE_ITEMS).optional(),
-  includeBodies: z.union([
-    z.boolean(),
-    z.enum(['true', 'false']).transform((v) => v === 'true'),
-  ]).optional(),
 })
 
 export const TerminalScrollbackQuerySchema = z.object({

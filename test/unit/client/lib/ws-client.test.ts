@@ -338,7 +338,6 @@ describe('WsClient.connect', () => {
     c.setHelloExtensionProvider(() => ({
       sidebarOpenSessions: [
         { provider: 'foo', sessionId: '' } as any,
-        { provider: 'kimi', sessionId: 'team:alpha', cwd: '/repo/worktrees/app' } as any,
         { provider: 'codex', sessionId: 'older-open', serverInstanceId: '' } as any,
       ],
     }))
@@ -349,7 +348,6 @@ describe('WsClient.connect', () => {
 
     const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
     expect(hello.sidebarOpenSessions).toEqual([
-      { provider: 'kimi', sessionId: 'team:alpha', cwd: '/repo/worktrees/app' },
       { provider: 'codex', sessionId: 'older-open' },
     ])
 

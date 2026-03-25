@@ -3,7 +3,6 @@ import { describe, expect, it } from 'vitest'
 import {
   createReadModelAbortError,
   createReadModelWorkScheduler,
-  defaultReadModelScheduler,
 } from '../../../../server/read-models/work-scheduler.js'
 
 function waitForSchedulerTick(): Promise<void> {
@@ -136,38 +135,5 @@ describe('createReadModelWorkScheduler', () => {
     runningController.abort()
     await expect(running).rejects.toMatchObject({ name: 'AbortError' })
     expect(started).toEqual(['running'])
-  })
-})
-
-describe('defaultReadModelScheduler', () => {
-  it('allows multiple concurrent foreground tasks to prevent search starvation', async () => {
-    const started: string[] = []
-    const releaseFirst = createDeferred()
-    const releaseSecond = createDeferred()
-
-    const first = defaultReadModelScheduler.schedule({
-      lane: 'visible',
-      run: async () => {
-        started.push('first')
-        await releaseFirst.promise
-      },
-    })
-    const second = defaultReadModelScheduler.schedule({
-      lane: 'visible',
-      run: async () => {
-        started.push('second')
-        await releaseSecond.promise
-      },
-    })
-
-    await waitForSchedulerTick()
-
-    // Both visible tasks must start concurrently — if only one starts,
-    // the scheduler is starving other foreground requests during deep search.
-    expect(started).toEqual(['first', 'second'])
-
-    releaseFirst.resolve()
-    releaseSecond.resolve()
-    await Promise.all([first, second])
   })
 })

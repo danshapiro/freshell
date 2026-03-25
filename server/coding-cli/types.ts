@@ -1,42 +1,26 @@
 import type { CodingCliProviderName } from '../../shared/ws-protocol.js'
-import {
-  makeCodingCliSessionKey,
-  normalizeSessionCwdForKey as normalizeSharedSessionCwdForKey,
-  parseCodingCliSessionKey,
-  sessionKeyRequiresCwdScope as sharedSessionKeyRequiresCwdScope,
-} from '../../shared/coding-cli-session-key.js'
 export type { CodingCliProviderName }
 
 /**
- * Session keys are provider-scoped, with optional cwd scoping for providers
- * whose upstream contract treats session IDs as workdir-local rather than
- * globally unique.
+ * Sessions are uniquely identified by provider + sessionId.
+ * This prevents collisions across providers (e.g., both Claude and Codex
+ * could theoretically have the same UUID).
  */
-export type SessionCompositeKey = string
+export type SessionCompositeKey = `${CodingCliProviderName}:${string}`
 
-export function sessionKeyRequiresCwdScope(provider: CodingCliProviderName): boolean {
-  return sharedSessionKeyRequiresCwdScope(provider)
+export function makeSessionKey(provider: CodingCliProviderName, sessionId: string): SessionCompositeKey {
+  return `${provider}:${sessionId}`
 }
 
-export function normalizeSessionCwdForKey(cwd?: string): string | undefined {
-  return normalizeSharedSessionCwdForKey(cwd)
-}
-
-export function makeSessionKey(
-  provider: CodingCliProviderName,
-  sessionId: string,
-  cwd?: string,
-): SessionCompositeKey {
-  return makeCodingCliSessionKey(provider, sessionId, cwd)
-}
-
-export function parseSessionKey(key: SessionCompositeKey): { provider: CodingCliProviderName; sessionId: string; cwd?: string } {
-  const parsed = parseCodingCliSessionKey(key)
-  return {
-    provider: parsed.provider as CodingCliProviderName,
-    sessionId: parsed.sessionId,
-    cwd: parsed.cwd,
+export function parseSessionKey(key: SessionCompositeKey): { provider: CodingCliProviderName; sessionId: string } {
+  const colonIdx = key.indexOf(':')
+  if (colonIdx === -1) {
+    // Fallback for legacy keys without provider prefix
+    return { provider: 'claude', sessionId: key }
   }
+  const provider = key.slice(0, colonIdx) as CodingCliProviderName
+  const sessionId = key.slice(colonIdx + 1)
+  return { provider, sessionId }
 }
 
 export type NormalizedEventType =
@@ -134,12 +118,6 @@ export interface CodexTaskEventSnapshot {
   latestTurnAbortedAt?: number
 }
 
-export interface SessionLaunchOrigin {
-  terminalId: string
-  tabId?: string
-  paneId?: string
-}
-
 export interface ErrorPayload {
   message: string
   code?: string
@@ -155,7 +133,6 @@ export interface ApprovalPayload {
 
 export interface ParsedSessionMeta {
   sessionId?: string
-  launchOrigin?: SessionLaunchOrigin
   cwd?: string
   createdAt?: number
   lastActivityAt?: number
@@ -188,7 +165,6 @@ export interface CodingCliSessionInfo {
 export interface CodingCliSession {
   provider: CodingCliProviderName
   sessionId: string
-  launchOrigin?: SessionLaunchOrigin
   projectPath: string
   lastActivityAt: number
   createdAt?: number

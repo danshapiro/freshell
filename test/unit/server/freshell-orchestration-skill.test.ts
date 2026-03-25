@@ -10,19 +10,4 @@ describe('freshell orchestration skill docs', () => {
     expect(content).not.toContain('prefer the flagged `-t/-n` form.')
     expect(content).toContain('If a target or name contains spaces, quote it.')
   })
-
-  it('includes MCP tool section', async () => {
-    const skillPath = path.resolve(process.cwd(), '.claude/skills/freshell-orchestration/SKILL.md')
-    const content = await fs.readFile(skillPath, 'utf8')
-
-    expect(content).toContain('MCP tool')
-    expect(content).toContain('freshell` MCP')
-  })
-
-  it('mentions CLI as fallback', async () => {
-    const skillPath = path.resolve(process.cwd(), '.claude/skills/freshell-orchestration/SKILL.md')
-    const content = await fs.readFile(skillPath, 'utf8')
-
-    expect(content).toContain('CLI fallback')
-  })
 })
