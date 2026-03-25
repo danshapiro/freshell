@@ -46,6 +46,13 @@ describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
     const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible' })
     expect(result.includeBodies).toBeUndefined()
   })
+
+  it('rejects invalid string values for includeBodies', () => {
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible' })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible' })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible' })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible' })).toThrow()
+  })
 })
 
 describe('agent timeline includeBodies', () => {
