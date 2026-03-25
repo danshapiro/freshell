@@ -92,7 +92,6 @@ describe('Settings API Integration', () => {
     expect(res.body.sidebar).toEqual({
       excludeFirstChatSubstrings: [],
       excludeFirstChatMustStart: false,
-      autoGenerateTitles: true,
     })
   })
 

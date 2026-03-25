@@ -854,30 +854,4 @@ describe('terminal.create session repair wait', () => {
       await closeWebSocket(ws)
     }
   })
-
-  it('passes exact codex resumeSessionId through without entering session repair wait', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-
-    try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      await waitForReady(ws)
-
-      const requestId = 'codex-resume-no-repair-1'
-      const createdPromise = waitForCreated(ws, requestId)
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'codex',
-        resumeSessionId: 'codex-session-exact-1',
-      }))
-
-      const created = await createdPromise
-
-      expect(registry.lastCreateOpts?.resumeSessionId).toBe('codex-session-exact-1')
-      expect(created.effectiveResumeSessionId).toBe('codex-session-exact-1')
-      expect(sessionRepairService.waitForSessionCalls).toEqual([])
-    } finally {
-      await closeWebSocket(ws)
-    }
-  })
 })

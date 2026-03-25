@@ -1,11 +1,8 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
-import { createPaneBackedTab } from '@/store/workspaceActions'
+import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
-import { buildExactSessionRef } from '@/lib/exact-session-ref'
-import type { PaneContentInput } from '@/store/paneTypes'
 
 type DispatchFn = (action: any) => any
 
@@ -20,26 +17,6 @@ function resolveRuntime(input: UiCommandRuntime | DispatchFn): UiCommandRuntime 
     return { dispatch: input }
   }
   return input
-}
-
-function hydrateUiCommandPaneContent(
-  content: PaneContentInput | undefined,
-  localServerInstanceId?: string,
-): PaneContentInput | undefined {
-  if (!content) return content
-  if (content.kind === 'terminal' && content.mode !== 'shell' && content.resumeSessionId) {
-    const sessionRef = content.sessionRef
-      ?? buildExactSessionRef({
-        provider: content.mode,
-        sessionId: content.resumeSessionId,
-        serverInstanceId: localServerInstanceId,
-      })
-    return {
-      ...content,
-      ...(sessionRef ? { sessionRef } : {}),
-    }
-  }
-  return content
 }
 
 async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Promise<void> {
@@ -92,7 +69,6 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
   if (msg?.type !== 'ui.command') return
   const runtime = resolveRuntime(runtimeOrDispatch)
   const dispatch = runtime.dispatch
-  const localServerInstanceId = runtime.getState?.().connection?.serverInstanceId
 
   if (msg.command === 'screenshot.capture') {
     void handleScreenshotCapture(msg, runtime)
@@ -101,25 +77,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
 
   switch (msg.command) {
     case 'tab.create':
-      if (msg.payload.paneContent) {
-        return dispatch(createPaneBackedTab({
-          tab: {
-            id: msg.payload.id,
-            title: msg.payload.title,
-            mode: msg.payload.mode,
-            shell: msg.payload.shell,
-            terminalId: msg.payload.terminalId,
-            initialCwd: msg.payload.initialCwd,
-            resumeSessionId: msg.payload.resumeSessionId,
-            status: msg.payload.status,
-            createRequestId: msg.payload.createRequestId
-              || msg.payload.paneContent?.createRequestId,
-          },
-          paneId: msg.payload.paneId,
-          content: hydrateUiCommandPaneContent(msg.payload.paneContent, localServerInstanceId)!,
-        }))
-      }
-      return dispatch(addTab({
+      dispatch(addTab({
         id: msg.payload.id,
         title: msg.payload.title,
         mode: msg.payload.mode,
@@ -128,8 +86,11 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         initialCwd: msg.payload.initialCwd,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
-        createRequestId: msg.payload.createRequestId,
       }))
+      if (msg.payload.paneId && msg.payload.paneContent) {
+        return dispatch(initLayout({ tabId: msg.payload.id, paneId: msg.payload.paneId, content: msg.payload.paneContent }))
+      }
+      return
     case 'tab.select':
       return dispatch(setActiveTab(msg.payload.id))
     case 'tab.rename':
@@ -155,11 +116,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         title: msg.payload.title,
       }))
     case 'pane.attach':
-      return dispatch(updatePaneContent({
-        tabId: msg.payload.tabId,
-        paneId: msg.payload.paneId,
-        content: hydrateUiCommandPaneContent(msg.payload.content, localServerInstanceId)!,
-      }))
+      return dispatch(updatePaneContent({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, content: msg.payload.content }))
     case 'pane.resize':
       return dispatch(resizePanes({ tabId: msg.payload.tabId, splitId: msg.payload.splitId, sizes: msg.payload.sizes }))
     case 'pane.swap':

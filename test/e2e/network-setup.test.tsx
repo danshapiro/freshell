@@ -293,9 +293,6 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    // Remote access toggle is in the Safety tab
-    fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
-
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
   })
 
@@ -308,9 +305,6 @@ describe('Settings network section (e2e)', () => {
         <SettingsView onNavigate={vi.fn()} />
       </Provider>,
     )
-
-    // Remote access toggle is in the Safety tab
-    fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
 
     const toggle = screen.getByRole('switch', { name: /remote access/i })
     fireEvent.click(toggle)
@@ -350,9 +344,6 @@ describe('Settings network section (e2e)', () => {
         <SettingsView onNavigate={vi.fn()} />
       </Provider>,
     )
-
-    // Fix firewall button is in the Safety tab
-    fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 

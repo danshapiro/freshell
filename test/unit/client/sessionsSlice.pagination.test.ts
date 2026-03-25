@@ -130,39 +130,6 @@ describe('sessionsSlice pagination', () => {
       expect(state.projects[0].sessions).toHaveLength(2)
     })
 
-    it('keeps duplicate Kimi session ids with different cwd values when appending', () => {
-      const existing = [
-        makeProject('/repo/root', [{
-          provider: 'kimi',
-          sessionId: 'shared-kimi-session',
-          projectPath: '/repo/root',
-          cwd: '/repo/root/packages/app-a',
-          lastActivityAt: 200,
-          title: 'Kimi app A',
-        } as any]),
-      ]
-      let state = stateWith(existing)
-
-      const page = [
-        makeProject('/repo/root', [{
-          provider: 'kimi',
-          sessionId: 'shared-kimi-session',
-          projectPath: '/repo/root',
-          cwd: '/repo/root/packages/app-b',
-          lastActivityAt: 100,
-          title: 'Kimi app B',
-        } as any]),
-      ]
-      state = sessionsReducer(state, appendSessionsPage(page))
-
-      expect(state.projects).toHaveLength(1)
-      expect(state.projects[0].sessions).toHaveLength(2)
-      expect(state.projects[0].sessions).toEqual(expect.arrayContaining([
-        expect.objectContaining({ provider: 'kimi', sessionId: 'shared-kimi-session', cwd: '/repo/root/packages/app-a' }),
-        expect.objectContaining({ provider: 'kimi', sessionId: 'shared-kimi-session', cwd: '/repo/root/packages/app-b' }),
-      ]))
-    })
-
     it('preserves unique coverage when a personalized first page overlaps with the natural next page', () => {
       let state = stateWith([
         makeProject('/a', [

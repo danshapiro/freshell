@@ -24,17 +24,10 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     picker: { shortcut: 'X' },
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
   },
-  {
-    name: 'kimi', version: '1.0.0', label: 'Kimi', description: '', category: 'cli',
-    picker: { shortcut: 'K' },
-    cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['kimi', '--session', '{{sessionId}}'] },
-  },
 ]
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 import Pane from '@/components/panes/Pane'
-import { api } from '@/lib/api'
-import { makeCodingCliSessionKey } from '@/lib/coding-cli-session-key'
 
 const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
@@ -147,13 +140,12 @@ function renderWithProvider(ui: React.ReactNode, options?: { platform?: string |
   return { store, ...utils }
 }
 
-function createStoreWithSession(options?: { serverInstanceId?: string }) {
+function createStoreWithSession() {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
-      connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
     },
@@ -217,11 +209,6 @@ function createStoreWithSession(options?: { serverInstanceId?: string }) {
       },
       extensions: {
         entries: defaultCliExtensions,
-      },
-      connection: {
-        status: 'ready',
-        platform: null,
-        serverInstanceId: options?.serverInstanceId,
       },
     },
   })
@@ -472,106 +459,6 @@ function createStoreWithOverlappingSessionWindows() {
   })
 }
 
-function kimiSessionKey(cwd: string): string {
-  return `kimi:cwd=${Buffer.from(cwd, 'utf8').toString('base64url')}:sid=${Buffer.from('shared-kimi-session', 'utf8').toString('base64url')}`
-}
-
-function createStoreWithDuplicateKimiSessionWindows() {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      sessions: sessionsReducer,
-      connection: connectionReducer,
-      settings: settingsReducer,
-      extensions: extensionsReducer,
-    },
-    middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({ serializableCheck: false }),
-    preloadedState: {
-      tabs: {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'Shell',
-            status: 'running',
-            mode: 'shell',
-            shell: 'system',
-            createdAt: 1,
-          },
-        ],
-        activeTabId: 'tab-1',
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'shell',
-              status: 'running',
-              terminalId: 'term-1',
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-      sessions: {
-        projects: [],
-        activeSurface: 'sidebar',
-        windows: {
-          sidebar: {
-            projects: [
-              {
-                projectPath: '/repo/root',
-                sessions: [
-                  {
-                    sessionId: 'shared-kimi-session',
-                    provider: 'kimi',
-                    title: 'Kimi app A',
-                    cwd: '/repo/root/packages/app-a',
-                    sessionKey: kimiSessionKey('/repo/root/packages/app-a'),
-                    createdAt: 1000,
-                    updatedAt: 2000,
-                  },
-                  {
-                    sessionId: 'shared-kimi-session',
-                    provider: 'kimi',
-                    title: 'Kimi app B',
-                    cwd: '/repo/root/packages/app-b',
-                    sessionKey: kimiSessionKey('/repo/root/packages/app-b'),
-                    createdAt: 1100,
-                    updatedAt: 2100,
-                    firstUserMessage: 'generate a title for app b',
-                  },
-                ],
-              },
-            ],
-            lastLoadedAt: 1,
-          },
-        },
-        expandedProjects: new Set<string>(),
-      },
-      extensions: {
-        entries: defaultCliExtensions,
-      },
-      connection: {
-        status: 'ready',
-        platform: null,
-      },
-    },
-  })
-}
-
 function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
   return configureStore({
     reducer: {
@@ -680,70 +567,6 @@ function createStoreWithTerminalPane() {
         },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-      },
-      sessions: {
-        projects: [],
-        expandedProjects: new Set<string>(),
-      },
-      extensions: {
-        entries: defaultCliExtensions,
-      },
-      connection: {
-        status: 'ready',
-        platform: 'linux',
-      },
-    },
-  })
-}
-
-function createStoreWithCodingTerminalPane() {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      sessions: sessionsReducer,
-      connection: connectionReducer,
-      settings: settingsReducer,
-      extensions: extensionsReducer,
-    },
-    middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({ serializableCheck: false }),
-    preloadedState: {
-      tabs: {
-        tabs: [
-          {
-            id: 'tab-1',
-            createRequestId: 'tab-1',
-            title: 'Claude',
-            status: 'running',
-            mode: 'claude',
-            shell: 'system',
-            createdAt: 1,
-            terminalId: 'term-1',
-            codingCliProvider: 'claude',
-            resumeSessionId: VALID_SESSION_ID,
-          },
-        ],
-        activeTabId: 'tab-1',
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: 'pane-1',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              status: 'running',
-              createRequestId: 'req-1',
-              terminalId: 'term-1',
-              resumeSessionId: VALID_SESSION_ID,
-            },
-          },
-        },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Claude' } },
       },
       sessions: {
         projects: [],
@@ -1014,55 +837,6 @@ describe('ContextMenuProvider', () => {
     }
   })
 
-  it('open in this tab preserves exact local identity for a running sidebar session target', async () => {
-    const user = userEvent.setup()
-    const store = createStoreWithSession({ serverInstanceId: 'srv-local' })
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="history"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id={VALID_SESSION_ID}
-            data-provider="claude"
-            data-running-terminal-id="term-running"
-          >
-            Test Session
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Test Session'), keys: '[MouseRight]' })
-    await user.click(screen.getByText('Open in this tab'))
-
-    const newLayout = store.getState().panes.layouts['tab-1']
-    expect(newLayout?.type).toBe('split')
-    if (newLayout?.type === 'split') {
-      const newPane = newLayout.children.find(
-        (child) => child.type === 'leaf' && child.id !== 'pane-1',
-      )
-      expect(newPane).toBeDefined()
-      if (newPane?.type === 'leaf' && newPane.content.kind === 'terminal') {
-        expect(newPane.content).toMatchObject({
-          mode: 'claude',
-          terminalId: 'term-running',
-          status: 'running',
-          resumeSessionId: VALID_SESSION_ID,
-          sessionRef: {
-            provider: 'claude',
-            sessionId: VALID_SESSION_ID,
-            serverInstanceId: 'srv-local',
-          },
-        })
-      }
-    }
-  })
-
   it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSidebarWindowAgentSession()
@@ -1143,97 +917,7 @@ describe('ContextMenuProvider', () => {
       initialCwd: '/shared/project/history',
       resumeSessionId: VALID_SESSION_ID,
     })
-    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
-      },
-    })
-  })
-
-  it('renames the targeted duplicate Kimi sidebar session using its opaque cwd-scoped key', async () => {
-    const user = userEvent.setup()
-    const promptSpy = vi.spyOn(window, 'prompt')
-      .mockReturnValueOnce('Renamed Kimi app B')
-    const store = createStoreWithDuplicateKimiSessionWindows()
-
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id="shared-kimi-session"
-            data-provider="kimi"
-            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
-          >
-            Duplicate Kimi Sidebar Session
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Duplicate Kimi Sidebar Session'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
-
-    expect(promptSpy).toHaveBeenCalledWith('Rename session', 'Kimi app B')
-    expect(vi.mocked(api.patch)).toHaveBeenCalledWith(
-      `/api/sessions/${encodeURIComponent(kimiSessionKey('/repo/root/packages/app-b'))}`,
-      { titleOverride: 'Renamed Kimi app B', summaryOverride: undefined },
-    )
-  })
-
-  it('keeps duplicate Kimi session metadata separate when opening both into the same tab', async () => {
-    const user = userEvent.setup()
-    const store = createStoreWithDuplicateKimiSessionWindows()
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id="shared-kimi-session"
-            data-provider="kimi"
-            data-session-key={kimiSessionKey('/repo/root/packages/app-a')}
-          >
-            Duplicate Kimi App A
-          </div>
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id="shared-kimi-session"
-            data-provider="kimi"
-            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
-          >
-            Duplicate Kimi App B
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Duplicate Kimi App A'), keys: '[MouseRight]' })
-    await user.click(screen.getByText('Open in this tab'))
-    await user.pointer({ target: screen.getByText('Duplicate Kimi App B'), keys: '[MouseRight]' })
-    await user.click(screen.getByText('Open in this tab'))
-
-    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
-      [makeCodingCliSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-a')]: {
-        sessionType: 'kimi',
-      },
-      [makeCodingCliSessionKey('kimi', 'shared-kimi-session', '/repo/root/packages/app-b')]: {
-        sessionType: 'kimi',
-        firstUserMessage: 'generate a title for app b',
-      },
-    })
+    expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
   })
 
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
@@ -1295,119 +979,6 @@ describe('ContextMenuProvider', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
-  })
-
-  it('copies cwd-scoped Kimi resume command from sidebar session context menu', async () => {
-    const user = userEvent.setup()
-    const store = createStoreWithDuplicateKimiSessionWindows()
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div
-            data-context={ContextIds.SidebarSession}
-            data-session-id="shared-kimi-session"
-            data-provider="kimi"
-            data-session-key={kimiSessionKey('/repo/root/packages/app-b')}
-          >
-            Kimi Sidebar Session
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Kimi Sidebar Session'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
-
-    expect(clipboardMocks.copyText).toHaveBeenCalledWith('cd /repo/root/packages/app-b && kimi --session shared-kimi-session')
-  })
-
-  it('copies a PowerShell-safe Kimi resume command for Windows Kimi panes', async () => {
-    const user = userEvent.setup()
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        sessions: sessionsReducer,
-        connection: connectionReducer,
-        settings: settingsReducer,
-        extensions: extensionsReducer,
-      },
-      middleware: (getDefaultMiddleware) =>
-        getDefaultMiddleware({ serializableCheck: false }),
-      preloadedState: {
-        tabs: {
-          tabs: [
-            {
-              id: 'tab-1',
-              createRequestId: 'tab-1',
-              title: 'Kimi PowerShell',
-              status: 'running',
-              mode: 'kimi',
-              shell: 'powershell',
-              createdAt: 1,
-            },
-          ],
-          activeTabId: 'tab-1',
-          renameRequestTabId: null,
-        },
-        extensions: {
-          entries: defaultCliExtensions,
-        },
-        panes: {
-          layouts: {
-            'tab-1': {
-              type: 'leaf',
-              id: 'pane-1',
-              content: {
-                kind: 'terminal',
-                mode: 'kimi',
-                shell: 'powershell',
-                status: 'running',
-                resumeSessionId: "team:alpha's session",
-                initialCwd: "C:\\repo root\\team's app",
-              },
-            },
-          },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: {},
-        },
-        sessions: {
-          projects: [],
-          expandedProjects: new Set<string>(),
-        },
-        connection: {
-          status: 'ready',
-          platform: 'win32',
-        },
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
-            Kimi PowerShell Pane
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Kimi PowerShell Pane'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
-
-    expect(clipboardMocks.copyText).toHaveBeenCalledWith(
-      `Set-Location -LiteralPath 'C:\\repo root\\team''s app'; & 'kimi' '--session' 'team:alpha''s session'`,
-    )
   })
 
   it('copies resume command from terminal pane context menu for codex pane', async () => {
@@ -1791,83 +1362,6 @@ describe('ContextMenuProvider', () => {
       expect(screen.getByText('New Browser tab')).toBeInTheDocument()
       expect(screen.getByText('New Editor tab')).toBeInTheDocument()
     })
-
-    it('creates a pane-backed browser tab from the tab-add context menu', async () => {
-      const user = userEvent.setup()
-      const store = createStoreWithTerminalPane()
-
-      render(
-        <Provider store={store}>
-          <ContextMenuProvider
-            view="terminal"
-            onViewChange={() => {}}
-            onToggleSidebar={() => {}}
-            sidebarCollapsed={false}
-          >
-            <div data-context={ContextIds.TabAdd}>Add Tab</div>
-          </ContextMenuProvider>
-        </Provider>
-      )
-
-      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
-      await user.click(screen.getByText('New Browser tab'))
-
-      const createdTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
-      expect(createdTab).toMatchObject({
-        title: 'Tab 2',
-        mode: 'shell',
-        shell: 'system',
-      })
-      expect(store.getState().tabs.activeTabId).toBe(createdTab?.id)
-      expect(store.getState().panes.layouts[createdTab!.id]).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'browser',
-          url: '',
-          devToolsOpen: false,
-        },
-      })
-    })
-  })
-
-  it('opens an overview terminal into a new pane-backed tab', async () => {
-    const user = userEvent.setup()
-    const store = createStoreWithTerminalPane()
-
-    render(
-      <Provider store={store}>
-        <ContextMenuProvider
-          view="terminal"
-          onViewChange={() => {}}
-          onToggleSidebar={() => {}}
-          sidebarCollapsed={false}
-        >
-          <div data-context={ContextIds.OverviewTerminal} data-terminal-id="term-remote-2">
-            Remote Terminal
-          </div>
-        </ContextMenuProvider>
-      </Provider>
-    )
-
-    await user.pointer({ target: screen.getByText('Remote Terminal'), keys: '[MouseRight]' })
-    await user.click(screen.getByRole('menuitem', { name: 'Open/focus terminal' }))
-
-    const createdTab = store.getState().tabs.tabs.find((tab) => tab.terminalId === 'term-remote-2')
-    expect(createdTab).toMatchObject({
-      status: 'running',
-      mode: 'shell',
-      terminalId: 'term-remote-2',
-    })
-    expect(store.getState().tabs.activeTabId).toBe(createdTab?.id)
-    expect(store.getState().panes.layouts[createdTab!.id]).toMatchObject({
-      type: 'leaf',
-      content: {
-        kind: 'terminal',
-        terminalId: 'term-remote-2',
-        status: 'running',
-        mode: 'shell',
-      },
-    })
   })
 
   it('renders Copy, Paste, and Select all as the first terminal menu section with icons', async () => {
@@ -1945,33 +1439,6 @@ describe('ContextMenuProvider', () => {
 
       // Verify stale tab.terminalId is cleared
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
-    })
-
-    it('clears stale tab.resumeSessionId when replacing the owning coding pane', async () => {
-      const user = userEvent.setup()
-      wsMocks.send.mockClear()
-
-      const store = createStoreWithCodingTerminalPane()
-
-      render(
-        <Provider store={store}>
-          <ContextMenuProvider
-            view="terminal"
-            onViewChange={() => {}}
-            onToggleSidebar={() => {}}
-            sidebarCollapsed={false}
-          >
-            <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
-              Coding Terminal
-            </div>
-          </ContextMenuProvider>
-        </Provider>
-      )
-
-      await user.pointer({ target: screen.getByText('Coding Terminal'), keys: '[MouseRight]' })
-      await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
-
-      expect(store.getState().tabs.tabs[0].resumeSessionId).toBeUndefined()
     })
 
   })

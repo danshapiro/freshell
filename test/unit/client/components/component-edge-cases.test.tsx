@@ -744,7 +744,7 @@ describe('Component Edge Cases', () => {
 
         // Initial load triggers loading state
         await waitFor(() => {
-          const refreshButton = screen.getByLabelText('Loading...')
+          const refreshButton = screen.getByRole('button')
           expect(refreshButton.className).toContain('animate-spin')
         })
 
@@ -767,7 +767,7 @@ describe('Component Edge Cases', () => {
           await vi.runAllTimersAsync()
         })
 
-        const refreshButton = screen.getByLabelText('Refresh terminals')
+        const refreshButton = screen.getByRole('button')
         expect(refreshButton.className).not.toContain('animate-spin')
       })
     })
@@ -778,9 +778,6 @@ describe('Component Edge Cases', () => {
 
         const store = createTestStore()
         renderWithStore(<SettingsView />, store)
-
-        // defaultCwd input is in the Safety tab
-        fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
 
         const defaultCwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
         let finalPath = ''
@@ -852,7 +849,7 @@ describe('Component Edge Cases', () => {
         // Second call succeeds
         mockApiTyped.get.mockResolvedValueOnce([])
 
-        const refreshButton = screen.getByLabelText('Refresh terminals')
+        const refreshButton = screen.getByRole('button')
         fireEvent.click(refreshButton)
 
         await act(async () => {
@@ -888,9 +885,6 @@ describe('Component Edge Cases', () => {
         const store = createTestStore()
 
         renderWithStore(<SettingsView />, store)
-
-        // defaultCwd input is in the Safety tab
-        fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
 
         fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {
           target: { value: '/tmp/save-failure' },
@@ -1065,9 +1059,6 @@ describe('Component Edge Cases', () => {
       it('cleans up pending save on unmount', async () => {
         const store = createTestStore()
         const { unmount } = renderWithStore(<SettingsView />, store)
-
-        // defaultCwd input is in the Safety tab
-        fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
 
         // Trigger a save
         fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { collectBusySessionKeys, getBusyPaneIdsForTab, resolvePaneActivity } from '@/lib/pane-activity'
+import { collectBusySessionKeys, resolvePaneActivity } from '@/lib/pane-activity'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 
@@ -141,76 +141,5 @@ describe('pane activity', () => {
       `claude:${claudeSessionId}`,
       `claude:${freshSessionId}`,
     ])
-  })
-
-  it('ignores no-layout coding tab mirrors for busy ownership', () => {
-    const claudeSessionId = '33333333-3333-4333-8333-333333333333'
-
-    const tabs: Tab[] = [
-      {
-        id: 'tab-mirror',
-        title: 'Mirror',
-        createRequestId: 'req-mirror',
-        status: 'running',
-        mode: 'codex',
-        shell: 'system',
-        createdAt: 1,
-        terminalId: 'term-mirror',
-        resumeSessionId: 'codex-session-mirror',
-      },
-      {
-        id: 'tab-claude',
-        title: 'Claude',
-        createRequestId: 'req-claude',
-        status: 'running',
-        mode: 'claude',
-        shell: 'system',
-        createdAt: 1,
-        terminalId: 'term-claude',
-        resumeSessionId: claudeSessionId,
-      },
-    ]
-
-    const paneLayouts: Record<string, PaneNode> = {
-      'tab-claude': {
-        type: 'leaf',
-        id: 'pane-claude',
-        content: {
-          kind: 'terminal',
-          createRequestId: 'req-claude',
-          status: 'running',
-          mode: 'claude',
-          shell: 'system',
-          terminalId: 'term-claude',
-          resumeSessionId: claudeSessionId,
-        },
-      },
-    }
-
-    expect(getBusyPaneIdsForTab({
-      tab: tabs[0],
-      paneLayouts,
-      codexActivityByTerminalId: {
-        'term-mirror': { terminalId: 'term-mirror', phase: 'busy', updatedAt: 10 },
-      },
-      paneRuntimeActivityByPaneId: {},
-      agentChatSessions: {},
-    })).toEqual([])
-
-    expect(collectBusySessionKeys({
-      tabs,
-      paneLayouts,
-      codexActivityByTerminalId: {
-        'term-mirror': { terminalId: 'term-mirror', phase: 'busy', updatedAt: 10 },
-      },
-      paneRuntimeActivityByPaneId: {
-        'pane-claude': {
-          source: 'terminal',
-          phase: 'working',
-          updatedAt: 1,
-        },
-      },
-      agentChatSessions: {},
-    })).toEqual([`claude:${claudeSessionId}`])
   })
 })

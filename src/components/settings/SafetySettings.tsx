@@ -13,7 +13,8 @@ import {
 import { api, type ApiError } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
-import { createTerminalPaneBackedTab } from '@/store/workspaceActions'
+import { addTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
 import {
   fetchFirewallConfig,
   type ConfigureFirewallResult,
@@ -326,14 +327,8 @@ export default function SafetySettings({
 
     if (result.method === 'terminal') {
       const tabId = nanoid()
-      dispatch(createTerminalPaneBackedTab({
-        tab: {
-          id: tabId,
-          title: 'Firewall Setup',
-          mode: 'shell',
-          shell: 'system',
-        },
-      }))
+      dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
       onFirewallTerminal?.({ tabId, command: result.command })
       onNavigate?.('terminal')
       return

@@ -3,7 +3,6 @@ import { makeSessionKey, type CodingCliProviderName, type SessionCompositeKey } 
 export type BindInput = {
   provider: CodingCliProviderName
   sessionId: string
-  cwd?: string
   terminalId: string
 }
 
@@ -21,7 +20,7 @@ export class SessionBindingAuthority {
   private byTerminal = new Map<string, SessionCompositeKey>()
 
   bind(input: BindInput): BindResult {
-    const key = makeSessionKey(input.provider, input.sessionId, input.cwd)
+    const key = makeSessionKey(input.provider, input.sessionId)
     const owner = this.bySession.get(key)
     if (owner && owner !== input.terminalId) {
       return { ok: false, reason: 'session_already_owned', owner }
@@ -37,8 +36,8 @@ export class SessionBindingAuthority {
     return { ok: true, key }
   }
 
-  ownerForSession(provider: CodingCliProviderName, sessionId: string, cwd?: string): string | undefined {
-    return this.bySession.get(makeSessionKey(provider, sessionId, cwd))
+  ownerForSession(provider: CodingCliProviderName, sessionId: string): string | undefined {
+    return this.bySession.get(makeSessionKey(provider, sessionId))
   }
 
   sessionForTerminal(terminalId: string): SessionCompositeKey | undefined {
@@ -56,8 +55,8 @@ export class SessionBindingAuthority {
     return { ok: true, key }
   }
 
-  clearSessionOwner(provider: CodingCliProviderName, sessionId: string, cwd?: string): void {
-    const key = makeSessionKey(provider, sessionId, cwd)
+  clearSessionOwner(provider: CodingCliProviderName, sessionId: string): void {
+    const key = makeSessionKey(provider, sessionId)
     const ownerTerminalId = this.bySession.get(key)
     if (!ownerTerminalId) return
     this.bySession.delete(key)

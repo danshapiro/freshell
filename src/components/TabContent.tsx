@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react'
 import { PaneLayout } from './panes'
-import MissingLayoutError from './panes/MissingLayoutError'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
@@ -8,8 +7,6 @@ import type { PaneContentInput } from '@/store/paneTypes'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getTabResumeSessionType } from '@/lib/session-metadata'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import { detectMissingLayoutCorruption } from '@/lib/tab-layout-integrity'
 
 interface TabContentProps {
   tabId: string
@@ -18,7 +15,6 @@ interface TabContentProps {
 
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
-  const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
   const previousHiddenRef = useRef(hidden)
 
@@ -31,26 +27,14 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   if (!tab) return null
 
-  const missingLayoutCorruption = detectMissingLayoutCorruption({ tab, layout })
-  const resumeSessionType = tab ? getTabResumeSessionType(tab) : undefined
-
   // For coding CLI session views with no terminal, use SessionView
   if (tab.codingCliSessionId && !tab.terminalId) {
     return <SessionView sessionId={tab.codingCliSessionId} hidden={hidden} />
   }
 
-  if (missingLayoutCorruption) {
-    return (
-      <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
-        <ErrorBoundary key={tabId} label="Tab">
-          <MissingLayoutError tabTitle={tab.title} />
-        </ErrorBoundary>
-      </div>
-    )
-  }
-
   // Build default content based on setting
   let defaultContent: PaneContentInput
+  const resumeSessionType = getTabResumeSessionType(tab)
 
   if (tab.terminalId) {
     defaultContent = {
@@ -105,7 +89,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   return (
     <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
       <ErrorBoundary key={tabId} label="Tab">
-        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} allowAutoInit={false} />
+        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
       </ErrorBoundary>
     </div>
   )

@@ -7,7 +7,6 @@ import path from 'path'
 import os from 'os'
 import { SessionMetadataStore } from '../../../server/session-metadata-store.js'
 import { createSessionsRouter } from '../../../server/sessions-router.js'
-import { makeSessionKey } from '../../../server/coding-cli/types.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
@@ -67,41 +66,6 @@ describe('POST /api/session-metadata', () => {
 
     // Verify the indexer was refreshed so sessions API reflects the change
     expect(mockRefresh).toHaveBeenCalled()
-  })
-
-  it('stores Kimi metadata under the cwd-scoped session key', async () => {
-    const res = await request(app)
-      .post('/api/session-metadata')
-      .set('x-auth-token', TEST_AUTH_TOKEN)
-      .send({
-        provider: 'kimi',
-        sessionId: 'team:alpha',
-        cwd: '/repo/worktrees/app',
-        sessionType: 'agent',
-      })
-
-    expect(res.status).toBe(200)
-    expect(res.body).toEqual({ ok: true })
-
-    const stored = await sessionMetadataStore.get('kimi', 'team:alpha', '/repo/worktrees/app')
-    expect(stored).toEqual({ sessionType: 'agent' })
-
-    const all = await sessionMetadataStore.getAll()
-    expect(all[makeSessionKey('kimi', 'team:alpha', '/repo/worktrees/app')]).toEqual({
-      sessionType: 'agent',
-    })
-    expect(mockRefresh).toHaveBeenCalled()
-  })
-
-  it('rejects Kimi session metadata writes without cwd', async () => {
-    const res = await request(app)
-      .post('/api/session-metadata')
-      .set('x-auth-token', TEST_AUTH_TOKEN)
-      .send({ provider: 'kimi', sessionId: 'team:alpha', sessionType: 'agent' })
-
-    expect(res.status).toBe(400)
-    expect(res.body.error).toMatch(/cwd-scoped session key required/i)
-    expect(mockRefresh).not.toHaveBeenCalled()
   })
 
   it('returns 400 when provider is missing', async () => {

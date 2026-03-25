@@ -1,6 +1,5 @@
 import type { CodingCliProvider } from '../coding-cli/provider.js'
 import type { ProjectGroup } from '../coding-cli/types.js'
-import { makeSessionKey, type CodingCliProviderName } from '../coding-cli/types.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet, searchSessionFile } from '../session-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
@@ -33,8 +32,8 @@ type CursorPayload = {
   key: string
 }
 
-function buildSessionKey(item: { provider: string; sessionId: string; cwd?: string }): string {
-  return makeSessionKey(item.provider as CodingCliProviderName, item.sessionId, item.cwd)
+function buildSessionKey(item: { provider: string; sessionId: string }): string {
+  return `${item.provider}:${item.sessionId}`
 }
 
 function encodeCursor(payload: CursorPayload): string {
@@ -84,12 +83,7 @@ function applySearch(item: SessionDirectoryItem, queryText: string): SessionDire
 function joinRunningState(item: SessionDirectoryItem, terminalMeta: TerminalMeta[]): SessionDirectoryItem {
   const match = terminalMeta.find((meta) => (
     meta.provider === item.provider &&
-    meta.sessionId === item.sessionId &&
-    buildSessionKey({
-      provider: meta.provider,
-      sessionId: meta.sessionId,
-      cwd: meta.cwd,
-    }) === buildSessionKey(item)
+    meta.sessionId === item.sessionId
   ))
 
   if (!match) {
@@ -132,7 +126,7 @@ async function applyFileSearch(
   for (const project of input.projects) {
     for (const session of project.sessions) {
       if (session.sourceFile) {
-        sourceFiles.set(buildSessionKey({ provider: session.provider, sessionId: session.sessionId, cwd: session.cwd }), session.sourceFile)
+        sourceFiles.set(buildSessionKey({ provider: session.provider, sessionId: session.sessionId }), session.sourceFile)
       }
     }
   }

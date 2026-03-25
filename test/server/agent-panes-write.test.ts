@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
-import { makeSessionKey } from '../../server/coding-cli/types.js'
 
 it('splits a pane horizontally', async () => {
   const app = express()
@@ -348,90 +347,6 @@ it('falls back to pane resumeSessionId when terminal metadata is not ready yet',
   expect(patchSessionOverride).toHaveBeenCalledWith('codex:session-1', { titleOverride: 'Agent' })
   expect(refresh).toHaveBeenCalledOnce()
   expect(broadcastTerminalsChanged).toHaveBeenCalledOnce()
-})
-
-it('persists Kimi pane renames through cwd-scoped session overrides', async () => {
-  const app = express()
-  app.use(express.json())
-  const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-  const patchTerminalOverride = vi.fn().mockResolvedValue({})
-  const patchSessionOverride = vi.fn().mockResolvedValue({})
-  const updateTitle = vi.fn()
-  const refresh = vi.fn().mockResolvedValue(undefined)
-  const broadcastTerminalsChanged = vi.fn()
-  const cwd = '/repo/root/packages/app-b'
-  app.use('/api', createAgentApiRouter({
-    layoutStore: {
-      renamePane,
-      listPanes: () => [{ id: 'pane_1' }, { id: 'pane_2' }],
-      getPaneSnapshot: () => ({
-        tabId: 'tab_1',
-        paneId: 'pane_1',
-        paneContent: { kind: 'terminal', mode: 'kimi', terminalId: 'term_1' },
-      }),
-    } as any,
-    registry: { updateTitle } as any,
-    wsHandler: { broadcastUiCommand: vi.fn(), broadcastTerminalsChanged },
-    configStore: { patchTerminalOverride, patchSessionOverride } as any,
-    terminalMetadata: {
-      list: () => [{ terminalId: 'term_1', provider: 'kimi', sessionId: 'shared-kimi-session', cwd }],
-    } as any,
-    codingCliIndexer: { refresh } as any,
-  }))
-
-  const res = await request(app).patch('/api/panes/pane_1').send({ name: 'Kimi agent' })
-
-  expect(res.status).toBe(200)
-  expect(patchSessionOverride).toHaveBeenCalledWith(
-    makeSessionKey('kimi', 'shared-kimi-session', cwd),
-    { titleOverride: 'Kimi agent' },
-  )
-  expect(refresh).toHaveBeenCalledOnce()
-})
-
-it('falls back to pane initial cwd when Kimi terminal metadata is not ready yet', async () => {
-  const app = express()
-  app.use(express.json())
-  const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-  const patchTerminalOverride = vi.fn().mockResolvedValue({})
-  const patchSessionOverride = vi.fn().mockResolvedValue({})
-  const updateTitle = vi.fn()
-  const refresh = vi.fn().mockResolvedValue(undefined)
-  const broadcastTerminalsChanged = vi.fn()
-  const cwd = '/repo/root/packages/app-b'
-  app.use('/api', createAgentApiRouter({
-    layoutStore: {
-      renamePane,
-      listPanes: () => [{ id: 'pane_1' }, { id: 'pane_2' }],
-      getPaneSnapshot: () => ({
-        tabId: 'tab_1',
-        paneId: 'pane_1',
-        paneContent: {
-          kind: 'terminal',
-          mode: 'kimi',
-          terminalId: 'term_1',
-          resumeSessionId: 'shared-kimi-session',
-          initialCwd: cwd,
-        },
-      }),
-    } as any,
-    registry: { updateTitle } as any,
-    wsHandler: { broadcastUiCommand: vi.fn(), broadcastTerminalsChanged },
-    configStore: { patchTerminalOverride, patchSessionOverride } as any,
-    terminalMetadata: {
-      list: () => [],
-    } as any,
-    codingCliIndexer: { refresh } as any,
-  }))
-
-  const res = await request(app).patch('/api/panes/pane_1').send({ name: 'Recovered Kimi agent' })
-
-  expect(res.status).toBe(200)
-  expect(patchSessionOverride).toHaveBeenCalledWith(
-    makeSessionKey('kimi', 'shared-kimi-session', cwd),
-    { titleOverride: 'Recovered Kimi agent' },
-  )
-  expect(refresh).toHaveBeenCalledOnce()
 })
 
 it('falls back to terminal metadata when pane snapshot mode is stale during pane rename persistence', async () => {

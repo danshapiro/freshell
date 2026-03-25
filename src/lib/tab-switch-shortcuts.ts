@@ -1,6 +1,6 @@
 export type TabSwitchShortcutDirection = 'prev' | 'next'
 
-export type TabLifecycleAction = 'new' | 'close' | 'reopen'
+export type TabLifecycleAction = 'new' | 'close'
 
 type TabShortcutEvent = Pick<
   KeyboardEvent,
@@ -22,6 +22,5 @@ export function getTabLifecycleAction(
   if (!event.altKey || event.ctrlKey || event.shiftKey || event.metaKey) return null
   if (event.code === 'KeyT') return 'new'
   if (event.code === 'KeyW') return 'close'
-  if (event.code === 'KeyH') return 'reopen'
   return null
 }

@@ -1,14 +1,13 @@
-import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import type { CodingCliProviderName } from './coding-cli/types.js'
 
 export type SidebarSessionLocator = {
   provider: CodingCliProviderName
   sessionId: string
-  cwd?: string
   serverInstanceId?: string
 }
 
-function sessionKey(locator: Pick<SidebarSessionLocator, 'provider' | 'sessionId' | 'cwd'>): string {
-  return makeSessionKey(locator.provider, locator.sessionId, locator.cwd)
+function sessionKey(locator: Pick<SidebarSessionLocator, 'provider' | 'sessionId'>): string {
+  return `${locator.provider}:${locator.sessionId}`
 }
 
 function locatorPriority(locator: SidebarSessionLocator, serverInstanceId: string): number {

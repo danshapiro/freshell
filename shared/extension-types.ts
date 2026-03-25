@@ -33,7 +33,6 @@ export interface ClientExtensionEntry {
   serverPort?: number
   cli?: {
     supportsPermissionMode?: boolean
-    supportedPermissionModes?: string[]
     supportsModel?: boolean
     supportsSandbox?: boolean
     supportsResume?: boolean

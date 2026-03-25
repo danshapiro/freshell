@@ -187,4 +187,4 @@ export function createReadModelWorkScheduler(options: SchedulerOptions = {}): Re
   }
 }
 
-export const defaultReadModelScheduler = createReadModelWorkScheduler({ foregroundConcurrency: 3 })
+export const defaultReadModelScheduler = createReadModelWorkScheduler()

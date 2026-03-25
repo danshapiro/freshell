@@ -44,27 +44,6 @@ describe('resolveStartupBanner', () => {
     expect(banner.noteLines).toContain('Remote access is active but needs firewall/port-forward repair.')
   })
 
-  it('shows the healthy remote banner without repair copy when WSL access is active and healthy', () => {
-    const banner = resolveStartupBanner({
-      localUrl: 'http://localhost:3001/?token=test',
-      advertisedUrl: 'http://192.168.1.100:3001/?token=test',
-      status: {
-        remoteAccessEnabled: true,
-        remoteAccessRequested: true,
-        remoteAccessNeedsRepair: false,
-        accessUrl: 'http://192.168.1.100:3001/?token=test',
-        firewall: {
-          platform: 'wsl2',
-          portOpen: true,
-        },
-      },
-    })
-
-    expect(banner.kind).toBe('remote')
-    expect(banner.url).toBe('http://192.168.1.100:3001/?token=test')
-    expect(banner.noteLines).toEqual([])
-  })
-
   it('falls back to the local banner when WSL remote access needs repair and no LAN URL is available', () => {
     const banner = resolveStartupBanner({
       localUrl: 'http://localhost:3001/?token=test',
