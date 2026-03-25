@@ -5,6 +5,19 @@ import { createPortal } from 'react-dom'
 import { OVERLAY_Z } from '@/components/ui/overlay'
 import { KEYBOARD_SHORTCUTS, SHORTCUT_CATEGORIES } from '@/lib/keyboard-shortcuts'
 
+function KeyCombo({ keys }: { keys: string[] }) {
+  return (
+    <>
+      {keys.map((key, i) => (
+        <span key={i}>
+          {i > 0 && <span className="text-muted-foreground/40 mx-0.5">+</span>}
+          <kbd className="px-1.5 py-0.5 text-2xs bg-muted rounded font-mono">{key}</kbd>
+        </span>
+      ))}
+    </>
+  )
+}
+
 type KeyboardShortcutsDialogProps = {
   open: boolean
   onClose: () => void
@@ -73,12 +86,13 @@ export function KeyboardShortcutsDialog({ open, onClose }: KeyboardShortcutsDial
                   <div key={entry.description} className="flex items-center justify-between">
                     <span className="text-muted-foreground">{entry.description}</span>
                     <div className="flex items-center gap-1">
-                      {entry.keys.map((key, i) => (
-                        <span key={i}>
-                          {i > 0 && <span className="text-muted-foreground/40 mx-0.5">+</span>}
-                          <kbd className="px-1.5 py-0.5 text-2xs bg-muted rounded font-mono">{key}</kbd>
-                        </span>
-                      ))}
+                      <KeyCombo keys={entry.keys} />
+                      {entry.alternateKeys && (
+                        <>
+                          <span className="text-muted-foreground/40 mx-1">/</span>
+                          <KeyCombo keys={entry.alternateKeys} />
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}

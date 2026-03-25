@@ -10,7 +10,10 @@ type TabShortcutEvent = Pick<
 export function getTabSwitchShortcutDirection(
   event: TabShortcutEvent,
 ): TabSwitchShortcutDirection | null {
-  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return null
+  if (event.metaKey) return null
+  const ctrlShift = event.ctrlKey && event.shiftKey && !event.altKey
+  const altOnly = event.altKey && !event.ctrlKey && !event.shiftKey
+  if (!ctrlShift && !altOnly) return null
   if (event.code === 'BracketLeft') return 'prev'
   if (event.code === 'BracketRight') return 'next'
   return null
