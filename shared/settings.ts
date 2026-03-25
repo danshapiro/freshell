@@ -19,6 +19,7 @@ const TERMINAL_RENDERER_VALUES = ['auto', 'webgl', 'canvas'] as const
 const DEFAULT_NEW_PANE_VALUES = ['ask', 'shell', 'browser', 'editor'] as const
 const TAB_ATTENTION_STYLE_VALUES = ['highlight', 'pulse', 'darken', 'none'] as const
 const ATTENTION_DISMISS_VALUES = ['click', 'type'] as const
+const SESSION_OPEN_MODE_VALUES = ['tab', 'split'] as const
 const SIDEBAR_SORT_MODE_VALUES = ['recency', 'recency-pinned', 'activity', 'project'] as const
 export const CODEX_SANDBOX_VALUES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'] as const
@@ -46,7 +47,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'showProjectBadges',
@@ -65,6 +66,7 @@ export type TerminalRendererMode = (typeof TERMINAL_RENDERER_VALUES)[number]
 export type DefaultNewPane = (typeof DEFAULT_NEW_PANE_VALUES)[number]
 export type TabAttentionStyle = (typeof TAB_ATTENTION_STYLE_VALUES)[number]
 export type AttentionDismiss = (typeof ATTENTION_DISMISS_VALUES)[number]
+export type SessionOpenMode = (typeof SESSION_OPEN_MODE_VALUES)[number]
 export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number]
 export type CodexSandboxMode = (typeof CODEX_SANDBOX_VALUES)[number]
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODE_VALUES)[number]
@@ -161,6 +163,7 @@ export type LocalSettings = {
     iconsOnTabs: boolean
     tabAttentionStyle: TabAttentionStyle
     attentionDismiss: AttentionDismiss
+    sessionOpenMode: SessionOpenMode
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -209,6 +212,7 @@ const TerminalRendererSchema = z.enum(TERMINAL_RENDERER_VALUES)
 const DefaultNewPaneSchema = z.enum(DEFAULT_NEW_PANE_VALUES)
 const TabAttentionStyleSchema = z.enum(TAB_ATTENTION_STYLE_VALUES)
 const AttentionDismissSchema = z.enum(ATTENTION_DISMISS_VALUES)
+const SessionOpenModeSchema = z.enum(SESSION_OPEN_MODE_VALUES)
 const ExternalEditorSchema = z.enum(EXTERNAL_EDITOR_VALUES)
 const NetworkHostSchema = z.enum(NETWORK_HOST_VALUES)
 const AgentChatEffortSchema = z.enum(AGENT_CHAT_EFFORT_VALUES)
@@ -404,6 +408,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
     if (AttentionDismissSchema.safeParse(patch.panes.attentionDismiss).success) {
       panes.attentionDismiss = patch.panes.attentionDismiss as AttentionDismiss
+    }
+    if (SessionOpenModeSchema.safeParse(patch.panes.sessionOpenMode).success) {
+      panes.sessionOpenMode = patch.panes.sessionOpenMode as SessionOpenMode
     }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
@@ -660,6 +667,7 @@ export const defaultLocalSettings: LocalSettings = {
     iconsOnTabs: true,
     tabAttentionStyle: 'highlight',
     attentionDismiss: 'click',
+    sessionOpenMode: 'tab',
   },
   sidebar: {
     sortMode: 'activity',

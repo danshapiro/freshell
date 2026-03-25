@@ -313,7 +313,24 @@ export default function Sidebar({
       return
     }
 
-    // 3. Normal: split a new pane in the current tab
+    // 3. Normal: open in new tab or split, based on user preference
+    const sessionOpenMode = state.settings.settings.panes?.sessionOpenMode ?? 'tab'
+    if (sessionOpenMode === 'tab') {
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
+        title: item.title,
+        cwd: item.cwd,
+        provider,
+        sessionType,
+        terminalId: runningTerminalId,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+      }))
+      onNavigate('terminal')
+      return
+    }
+
     dispatch(addPane({
       tabId: currentActiveTabId,
       newContent: buildResumeContent({
