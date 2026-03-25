@@ -26,7 +26,6 @@ interface SessionContentCacheEntry {
   size: number
   messages: ChatMessage[]
   byteSize: number
-  cachedAt: number
 }
 
 export interface SessionContentCacheOptions {
@@ -151,7 +150,6 @@ export class SessionContentCache {
       size: stat.size,
       messages,
       byteSize,
-      cachedAt: Date.now(),
     }
     this.cache.set(filePath, entry)
     this.totalBytes += byteSize
