@@ -292,9 +292,11 @@ describe('Files API Integration', () => {
       }
     })
 
-    // This test requires WSL path translation (path.win32.resolve -> /mnt/d/...)
-    // which only works on actual Linux/WSL, not on native Windows
-    it.skipIf(process.platform === 'win32')('supports Windows drive prefixes when running in WSL', async () => {
+    // WSL path translation relies on getWslMountPrefix() extracting the mount root
+    // from WSL_WINDOWS_SYS32 via a regex that matches the first single-letter path
+    // component. This only works reliably on Linux where temp paths lack single-letter
+    // components (macOS /var/folders/.../T/ confuses the regex).
+    it.skipIf(process.platform !== 'linux')('supports Windows drive prefixes when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
       const originalPlatform = process.platform
@@ -383,8 +385,8 @@ describe('Files API Integration', () => {
       expect(res.body.error).toContain('path')
     })
 
-    // This test requires WSL path translation which only works on actual Linux/WSL
-    it.skipIf(process.platform === 'win32')('validates Windows drive paths when running in WSL', async () => {
+    // WSL path simulation only works on Linux; macOS temp paths confuse the mount prefix regex
+    it.skipIf(process.platform !== 'linux')('validates Windows drive paths when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
       const originalPlatform = process.platform

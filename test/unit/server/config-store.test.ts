@@ -213,8 +213,13 @@ describe('ConfigStore', () => {
           scrollback: 9000,
         },
         sidebar: {
+          autoGenerateTitles: true,
           excludeFirstChatSubstrings: ['build'],
           excludeFirstChatMustStart: true,
+        },
+        codingCli: {
+          ...defaultSettings.codingCli,
+          knownProviders: undefined,
         },
         agentChat: {
           ...defaultSettings.agentChat,
