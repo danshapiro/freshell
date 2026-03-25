@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest'
+import { AgentTimelinePageQuerySchema } from '../../../shared/read-models.js'
 import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
 
 const mockMessages = [
@@ -19,6 +20,33 @@ const mockMessages = [
     content: [{ type: 'text' as const, text: 'latest user turn' }],
   },
 ]
+
+describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
+  it('accepts boolean true from client code', () => {
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible' })
+    expect(result.includeBodies).toBe(true)
+  })
+
+  it('accepts boolean false from client code', () => {
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible' })
+    expect(result.includeBodies).toBe(false)
+  })
+
+  it('accepts string "true" from query parameters', () => {
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible' })
+    expect(result.includeBodies).toBe(true)
+  })
+
+  it('accepts string "false" from query parameters and parses to false', () => {
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible' })
+    expect(result.includeBodies).toBe(false)
+  })
+
+  it('treats omitted includeBodies as undefined', () => {
+    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible' })
+    expect(result.includeBodies).toBeUndefined()
+  })
+})
 
 describe('agent timeline includeBodies', () => {
   it('includeBodies=false (default): no bodies field in response', async () => {

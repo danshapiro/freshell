@@ -77,7 +77,10 @@ export const AgentTimelinePageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
   limit: z.number().int().positive().max(MAX_AGENT_TIMELINE_ITEMS).optional(),
-  includeBodies: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  includeBodies: z.preprocess(
+    (v) => (typeof v === 'string' ? v === 'true' : v),
+    z.boolean().optional(),
+  ),
 })
 
 export const TerminalScrollbackQuerySchema = z.object({
