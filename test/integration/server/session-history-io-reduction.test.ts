@@ -141,7 +141,7 @@ describe('session history I/O reduction', () => {
     expect(scanTime / resolverTime).toBeGreaterThanOrEqual(5)
   })
 
-  it('stat budget: resolving 100 sessions costs < 50ms total', async () => {
+  it('stat budget: resolving 100 sessions costs < 500ms total', async () => {
     const sessionDir = path.join(tmpDir, 'sessions')
     await fsp.mkdir(sessionDir, { recursive: true })
 

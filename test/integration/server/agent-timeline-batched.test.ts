@@ -146,6 +146,29 @@ describe('GET /api/agent-sessions/:sessionId/timeline with includeBodies', () =>
     expect(getTurnBody).not.toHaveBeenCalled()
   })
 
+  it('GET /timeline?includeBodies=false does not return bodies', async () => {
+    getTimelinePage.mockResolvedValue({
+      sessionId: 's1',
+      items: [{ turnId: 'turn-0', sessionId: 's1', role: 'user', summary: 'Hello' }],
+      nextCursor: null,
+      revision: 123,
+    })
+
+    const res = await request(app)
+      .get('/api/agent-sessions/s1/timeline?priority=visible&includeBodies=false')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.bodies).toBeUndefined()
+
+    // Service should have been called with includeBodies=false
+    expect(getTimelinePage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        includeBodies: false,
+      }),
+    )
+  })
+
   it('includeBodies=true with empty session: empty items and no bodies', async () => {
     getTimelinePage.mockResolvedValue({
       sessionId: 's1',
