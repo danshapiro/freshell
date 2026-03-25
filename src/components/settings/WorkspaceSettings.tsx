@@ -141,7 +141,7 @@ export default function WorkspaceSettings({
 
       <SettingsSection title="Panes" description="Pane layout and behavior">
         <SettingsRow
-          label="Open sidebar agent in"
+          label="Open sidebar session in"
           description="Where to open a coding agent session when clicked in the sidebar."
         >
           <SegmentedControl

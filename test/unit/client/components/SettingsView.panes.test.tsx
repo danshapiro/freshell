@@ -171,7 +171,7 @@ describe('SettingsView Panes section', () => {
     expect(api.patch).not.toHaveBeenCalled()
   })
 
-  it('renders sidebar agent open mode segmented control with default "New tab"', () => {
+  it('renders sidebar session open mode segmented control with default "New tab"', () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
@@ -180,12 +180,12 @@ describe('SettingsView Panes section', () => {
     )
     switchSettingsTab('Workspace')
 
-    expect(screen.getByText('Open sidebar agent in')).toBeInTheDocument()
+    expect(screen.getByText('Open sidebar session in')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /new tab/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /split pane/i })).toBeInTheDocument()
   })
 
-  it('switches sidebar agent open mode to split pane locally', async () => {
+  it('switches sidebar session open mode to split pane locally', async () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
