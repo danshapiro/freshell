@@ -20,6 +20,24 @@ describe('getTabSwitchShortcutDirection', () => {
     })).toBe('next')
   })
 
+  it('maps Alt+[ and Alt+] to tab directions', () => {
+    expect(getTabSwitchShortcutDirection({
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: true,
+      metaKey: false,
+      code: 'BracketLeft',
+    })).toBe('prev')
+
+    expect(getTabSwitchShortcutDirection({
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: true,
+      metaKey: false,
+      code: 'BracketRight',
+    })).toBe('next')
+  })
+
   it('ignores other modifier combinations', () => {
     expect(getTabSwitchShortcutDirection({
       ctrlKey: true,
@@ -43,6 +61,22 @@ describe('getTabSwitchShortcutDirection', () => {
       altKey: false,
       metaKey: true,
       code: 'BracketLeft',
+    })).toBeNull()
+
+    expect(getTabSwitchShortcutDirection({
+      altKey: true,
+      ctrlKey: true,
+      shiftKey: false,
+      metaKey: false,
+      code: 'BracketLeft',
+    })).toBeNull()
+
+    expect(getTabSwitchShortcutDirection({
+      altKey: true,
+      ctrlKey: false,
+      shiftKey: false,
+      metaKey: true,
+      code: 'BracketRight',
     })).toBeNull()
   })
 })
