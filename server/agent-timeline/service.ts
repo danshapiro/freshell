@@ -111,12 +111,26 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       const nextOffset = offset + pageItems.length
       const fullMessages = timeline.map((record) => record.message).reverse()
 
-      return {
+      const result: AgentTimelinePage = {
         sessionId: query.sessionId,
         items: pageItems.map(toTimelineItem),
         nextCursor: nextOffset < timeline.length ? encodeCursor({ offset: nextOffset }) : null,
         revision: toRevision(fullMessages),
       }
+
+      if (query.includeBodies) {
+        const bodies: Record<string, AgentTimelineTurn> = {}
+        for (const record of pageItems) {
+          bodies[record.turnId] = {
+            sessionId: query.sessionId,
+            turnId: record.turnId,
+            message: record.message,
+          }
+        }
+        result.bodies = bodies
+      }
+
+      return result
     },
 
     async getTurnBody({ sessionId, turnId }) {
