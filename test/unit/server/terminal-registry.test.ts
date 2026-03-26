@@ -47,43 +47,46 @@ vi.mock('../../../server/logger', () => {
   return { logger }
 })
 
+// Mock MCP config writer
+vi.mock('../../../server/mcp/config-writer.js', () => ({
+  generateMcpInjection: vi.fn((mode: string, terminalId: string, cwd?: string, _platform?: string) => {
+    if (mode === 'claude' || mode === 'kimi') {
+      const flag = mode === 'claude' ? '--mcp-config' : '--mcp-config-file'
+      return { args: [flag, `/tmp/freshell-mcp/${terminalId}.json`], env: {} }
+    }
+    if (mode === 'codex') {
+      return { args: ['-c', 'mcp_servers.freshell.command="node"', '-c', 'mcp_servers.freshell.args=["/path/to/server.ts"]'], env: {} }
+    }
+    if (mode === 'gemini') {
+      return { args: [], env: { GEMINI_CLI_SYSTEM_DEFAULTS_PATH: `/tmp/freshell-mcp/${terminalId}.json` } }
+    }
+    if (mode === 'opencode') {
+      return { args: [], env: {} }
+    }
+    return { args: [], env: {} }
+  }),
+  cleanupMcpConfig: vi.fn(),
+}))
+
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 
-function expectCodexTurnCompleteArgs(args: string[]) {
+function expectCodexMcpArgs(args: string[]) {
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
-  expect(args).toContain("tui.notifications=['agent-turn-complete']")
-
-  // skills.config must be passed as a single TOML array literal (not dotted map keys)
-  // to satisfy Codex's config parser which expects a sequence, not a map.
-  const skillsConfigArg = args.find((arg) => arg.startsWith('skills.config='))
-  expect(skillsConfigArg).toBeDefined()
-
-  // Must NOT use dotted key format (skills.config.N.path=...) — that creates a TOML map
-  const dottedKeyArgs = args.filter((arg) => /^skills\.config\.\d+\./.test(arg))
-  expect(dottedKeyArgs).toHaveLength(0)
-
-  // Parse the TOML array literal to verify contents
-  const arrayLiteral = skillsConfigArg!.replace('skills.config=', '')
-  expect(arrayLiteral).toMatch(/^\[.*\]$/)
-
-  // Verify orchestration skill is present and enabled
-  expect(arrayLiteral).toMatch(/path\s*=\s*"[^"]*freshell-orchestration[^"]*"/)
-  expect(arrayLiteral).toMatch(/freshell-orchestration[^}]*enabled\s*=\s*true/)
-
-  // Verify demo/legacy skills are present and disabled
-  const hasDemoDisabled = /(?:freshell-demo-creation|demo-creating)[^}]*enabled\s*=\s*false/.test(arrayLiteral)
-    || /enabled\s*=\s*false[^}]*(?:freshell-demo-creation|demo-creating)/.test(arrayLiteral)
-  expect(hasDemoDisabled).toBe(true)
+  const mcpArg = args.find(a => a.includes('mcp_servers.freshell'))
+  expect(mcpArg).toBeDefined()
+  const skillsArg = args.find(a => a.startsWith('skills.config='))
+  expect(skillsArg).toBeUndefined()
 }
 
-function expectClaudeTurnCompleteArgs(args: string[]) {
-  const pluginDirIndex = args.indexOf('--plugin-dir')
-  expect(pluginDirIndex).toBeGreaterThan(-1)
-  expect(args[pluginDirIndex + 1]).toContain('freshell-orchestration')
+function expectClaudeMcpArgs(args: string[]) {
+  expect(args).toContain('--mcp-config')
+  const configIndex = args.indexOf('--mcp-config')
+  expect(args[configIndex + 1]).toContain('freshell-mcp')
   const command = getClaudeStopHookCommand(args)
   expect(command).toContain("printf '\\a'")
+  expect(args).not.toContain('--plugin-dir')
 }
 
 function getClaudeStopHookCommand(args: string[]): string {
@@ -793,7 +796,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
     })
   })
 
@@ -844,7 +847,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -862,7 +865,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system', 'session-123')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['resume', 'session-123'])
     })
   })
@@ -1239,7 +1242,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
@@ -1265,7 +1268,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -2569,7 +2572,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
     })
   })
 
@@ -2584,7 +2587,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -2815,7 +2818,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expectClaudeTurnCompleteArgs(spec.args)
+      expectClaudeMcpArgs(spec.args)
       expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
@@ -2841,7 +2844,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expectCodexTurnCompleteArgs(spec.args)
+      expectCodexMcpArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -3200,7 +3203,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
 
-        expectClaudeTurnCompleteArgs(spec.args)
+        expectClaudeMcpArgs(spec.args)
       })
     })
 
@@ -3240,7 +3243,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('codex', '/home/user', 'system')
 
-        expectCodexTurnCompleteArgs(spec.args)
+        expectCodexMcpArgs(spec.args)
       })
     })
 
