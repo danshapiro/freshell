@@ -1,0 +1,14 @@
+{
+  "name": "synth",
+  "version": "0.1.0",
+  "label": "Synth",
+  "description": "Web Audio synthesizer with keyboard, sequencer, and effects",
+  "category": "client",
+  "client": {
+    "entry": "dist/index.html"
+  },
+  "picker": {
+    "shortcut": "Y",
+    "group": "tools"
+  }
+}

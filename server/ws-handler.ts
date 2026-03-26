@@ -302,6 +302,7 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
+  private loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
@@ -336,6 +337,7 @@ export class WsHandler {
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
     codexActivityListProvider?: () => CodexActivityRecord[],
+    loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>,
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
@@ -346,6 +348,7 @@ export class WsHandler {
     this.tabsRegistryStore = tabsRegistryStore
     this.layoutStore = layoutStore
     this.extensionManager = extensionManager
+    this.loadSessionHistoryFn = loadSessionHistoryFn
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
@@ -1693,7 +1696,8 @@ export class WsHandler {
           // becomes interactive, preventing user messages from being overwritten.
           if (m.resumeSessionId) {
             try {
-              const messages = await loadSessionHistory(m.resumeSessionId)
+              const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
+              const messages = await loadFn(m.resumeSessionId)
               this.send(ws, {
                 type: 'sdk.session.snapshot',
                 sessionId: session.sessionId,
@@ -1866,7 +1870,8 @@ export class WsHandler {
         if (!session) {
           if (isValidClaudeSessionId(m.sessionId)) {
             try {
-              const historicalMessages = await loadSessionHistory(m.sessionId)
+              const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
+              const historicalMessages = await loadFn(m.sessionId)
               if (historicalMessages !== null) {
                 this.send(ws, {
                   type: 'sdk.session.snapshot',
@@ -1916,7 +1921,8 @@ export class WsHandler {
         let historyMessages: ChatMessage[] = session.messages
         if (session.resumeSessionId) {
           try {
-            const jsonlMessages = await loadSessionHistory(session.resumeSessionId)
+            const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
+            const jsonlMessages = await loadFn(session.resumeSessionId)
             if (jsonlMessages && jsonlMessages.length > session.messages.length) {
               historyMessages = jsonlMessages
             }

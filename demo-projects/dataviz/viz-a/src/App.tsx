@@ -206,7 +206,7 @@ export default function App() {
 
   // ─── Load data ───
   useEffect(() => {
-    fetch('/exoplanets.csv')
+    fetch('./exoplanets.csv')
       .then((r) => r.text())
       .then((text) => {
         const parsed = parseCSV(text)

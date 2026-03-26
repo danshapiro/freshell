@@ -1,0 +1,14 @@
+{
+  "name": "exoplanet-clusters",
+  "version": "0.1.0",
+  "label": "Exoplanet Clusters",
+  "description": "Force-directed bubble chart grouping exoplanets by size, temperature, method, and more",
+  "category": "client",
+  "client": {
+    "entry": "dist/index.html"
+  },
+  "picker": {
+    "shortcut": "U",
+    "group": "tools"
+  }
+}
