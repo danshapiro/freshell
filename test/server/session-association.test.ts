@@ -15,6 +15,11 @@ vi.mock('node-pty', () => ({
   })),
 }))
 
+vi.mock('../../server/mcp/config-writer.js', () => ({
+  generateMcpInjection: vi.fn(() => ({ args: [], env: {} })),
+  cleanupMcpConfig: vi.fn(),
+}))
+
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
 const SESSION_ID_TWO = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 const SESSION_ID_THREE = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'

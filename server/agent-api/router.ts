@@ -12,6 +12,26 @@ import { resolveScreenshotOutputPath } from './screenshot-path.js'
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 
+/**
+ * Resolve provider settings for a terminal spawn. Explicit API params override
+ * the user's configured defaults from settings.
+ */
+async function resolveProviderSettings(
+  mode: string,
+  configStore: any,
+  overrides: { permissionMode?: string; model?: string; sandbox?: string },
+): Promise<{ permissionMode?: string; model?: string; sandbox?: string } | undefined> {
+  if (mode === 'shell') return undefined
+  const defaults = configStore
+    ? (await configStore.getSettings())?.codingCli?.providers?.[mode] ?? {}
+    : {}
+  return {
+    permissionMode: overrides.permissionMode ?? defaults.permissionMode,
+    model: overrides.model ?? defaults.model,
+    sandbox: overrides.sandbox ?? defaults.sandbox,
+  }
+}
+
 type ResizeLayoutStore = {
   getSplitSizes?: (tabId: string | undefined, splitId: string) => [number, number] | undefined
   resolveTarget?: (target: string) => { tabId?: string; paneId?: string; message?: string }
@@ -187,8 +207,8 @@ export function createAgentApiRouter({
     }
   }
 
-  router.post('/tabs', (req, res) => {
-    const { name, mode, shell, cwd, browser, editor, resumeSessionId } = req.body || {}
+  router.post('/tabs', async (req, res) => {
+    const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
 
@@ -203,11 +223,14 @@ export function createAgentApiRouter({
       } else if (wantsEditor) {
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
+        const effectiveMode = mode || 'shell'
+        const providerSettings = await resolveProviderSettings(effectiveMode, configStore, { permissionMode, model, sandbox })
         const terminal = registry.create({
-          mode: mode || 'shell',
+          mode: effectiveMode,
           shell,
           cwd,
           resumeSessionId,
+          providerSettings,
           envContext: { tabId, paneId },
         })
         terminalId = terminal.terminalId
@@ -528,7 +551,8 @@ export function createAgentApiRouter({
     const created = layoutStore.createTab?.({ title })
     const tabId = created?.tabId || nanoid()
     const paneId = created?.paneId || nanoid()
-    const terminal = registry.create({ mode, shell, cwd, envContext: { tabId, paneId } })
+    const providerSettings = await resolveProviderSettings(mode, configStore, {})
+    const terminal = registry.create({ mode, shell, cwd, providerSettings, envContext: { tabId, paneId } })
     layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
     wsHandler?.broadcastUiCommand({
       command: 'tab.create',
@@ -557,7 +581,7 @@ export function createAgentApiRouter({
     return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
   })
 
-  router.post('/panes/:id/split', (req, res) => {
+  router.post('/panes/:id/split', async (req, res) => {
     const rawPaneId = req.params.id
     const resolved = resolvePaneTarget(rawPaneId)
     if (rejectPaneTargetError(res, resolved)) return
@@ -588,10 +612,13 @@ export function createAgentApiRouter({
     } else if (wantsEditor) {
       content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
     } else {
+      const splitMode = req.body?.mode || 'shell'
+      const splitProviderSettings = await resolveProviderSettings(splitMode, configStore, {})
       const terminal = registry.create({
-        mode: req.body?.mode || 'shell',
+        mode: splitMode,
         shell: req.body?.shell,
         cwd: req.body?.cwd,
+        providerSettings: splitProviderSettings,
         envContext: { tabId, paneId: newPaneId },
       })
       terminalId = terminal.terminalId
@@ -765,14 +792,16 @@ export function createAgentApiRouter({
     res.json(ok(result, message))
   })
 
-  router.post('/panes/:id/respawn', (req, res) => {
+  router.post('/panes/:id/respawn', async (req, res) => {
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
     const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
-    const terminal = registry.create({ mode: req.body?.mode || 'shell', shell: req.body?.shell, cwd: req.body?.cwd, envContext: { tabId, paneId } })
+    const effectiveMode = req.body?.mode || 'shell'
+    const providerSettings = await resolveProviderSettings(effectiveMode, configStore, {})
+    const terminal = registry.create({ mode: effectiveMode, shell: req.body?.shell, cwd: req.body?.cwd, providerSettings, envContext: { tabId, paneId } })
     const content = { kind: 'terminal', terminalId: terminal.terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system', createRequestId: nanoid() }
     layoutStore.attachPaneContent(tabId, paneId, content)
     wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })

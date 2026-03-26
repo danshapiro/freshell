@@ -19,6 +19,7 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network?.status ?? null)
   const configuring = useAppSelector((s) => s.network?.configuring ?? false)
+  const mcpServerEnabled = useAppSelector((s) => s.settings?.settings?.codingCli?.mcpServer ?? true)
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const remoteAccessRequested = networkStatus?.remoteAccessRequested ?? remoteAccessEnabled
   const remoteAccessActive = remoteAccessEnabled || remoteAccessRequested
@@ -218,6 +219,20 @@ export default function NetworkQuickAccess({ onSharePanel }: NetworkQuickAccessP
               )}
             </>
           )}
+
+          {/* MCP server status */}
+          <div className="flex items-center justify-between text-xs border-t border-border/40 pt-2">
+            <div className="flex items-center gap-2">
+              <div className={cn(
+                'w-2 h-2 rounded-full',
+                mcpServerEnabled ? 'bg-emerald-500' : 'bg-zinc-500',
+              )} />
+              <span className="text-muted-foreground">Agent MCP server</span>
+            </div>
+            <span className="text-muted-foreground">
+              {mcpServerEnabled ? 'On' : 'Off'}
+            </span>
+          </div>
         </div>
       )}
     </div>
