@@ -51,6 +51,19 @@ export default function AdvancedSettings({
         />
       </SettingsRow>
 
+      <SettingsRow
+        label="Agent MCP server"
+        description="Expose Freshell as an MCP tool to coding agents. Agents can create tabs, send keys, take screenshots, and more."
+      >
+        <Toggle
+          checked={settings.codingCli?.mcpServer ?? true}
+          onChange={(checked) => {
+            applyServerSetting({ codingCli: { mcpServer: checked } })
+          }}
+          aria-label="Agent MCP server"
+        />
+      </SettingsRow>
+
       <div className="pt-1 border-t border-border/40">
         <button
           type="button"

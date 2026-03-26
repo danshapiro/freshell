@@ -92,6 +92,7 @@ export type CodingCliSettings = {
   enabledProviders: string[]
   knownProviders?: string[]
   providers: Partial<Record<string, CodingCliProviderConfig>>
+  mcpServer: boolean
 }
 
 export type AgentChatProviderDefaults = {
@@ -536,6 +537,7 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       enabledProviders: z.array(CliProviderNameSchema),
       knownProviders: z.array(CliProviderNameSchema).optional(),
       providers: z.record(CliProviderNameSchema, createCodingCliProviderConfigSchema()),
+      mcpServer: z.boolean(),
     }).strict(),
     editor: z.object({
       externalEditor: ExternalEditorSchema,
@@ -579,6 +581,7 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
       enabledProviders: z.array(CliProviderNameSchema).optional(),
       knownProviders: z.array(CliProviderNameSchema).optional(),
       providers: z.record(CliProviderNameSchema, createCodingCliProviderConfigPatchSchema()).optional(),
+      mcpServer: z.coerce.boolean().optional(),
     }).strict().optional(),
     editor: z.object({
       externalEditor: ExternalEditorSchema.optional(),
@@ -631,6 +634,7 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
         },
         codex: {},
       },
+      mcpServer: true,
     },
     editor: {
       externalEditor: 'auto',

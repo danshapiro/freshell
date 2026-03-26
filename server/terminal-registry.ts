@@ -125,8 +125,11 @@ function providerNotificationArgs(
   target: ProviderTarget,
   terminalId: string,
   cwd?: string,
+  mcpEnabled: boolean = true,
 ): { args: string[]; env: Record<string, string> } {
-  const mcpInjection = generateMcpInjection(mode, terminalId, cwd, target)
+  const mcpInjection = mcpEnabled
+    ? generateMcpInjection(mode, terminalId, cwd, target)
+    : { args: [] as string[], env: {} as Record<string, string> }
 
   if (mode === 'codex') {
     return {
@@ -172,12 +175,12 @@ type ProviderSettings = {
   sandbox?: string
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings, terminalId?: string, cwd?: string) {
+function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings, terminalId?: string, cwd?: string, mcpEnabled: boolean = true) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
   if (!spec) return null
   const command = (spec.envVar && process.env[spec.envVar]) || spec.defaultCommand
-  const notification = providerNotificationArgs(mode, target, terminalId || '', cwd)
+  const notification = providerNotificationArgs(mode, target, terminalId || '', cwd, mcpEnabled)
   const providerArgs = notification.args
   const baseArgs = spec.args || []
   const commandEnv: Record<string, string> = { ...(spec.env || {}), ...notification.env }
@@ -651,6 +654,7 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
   terminalId?: string,
+  mcpEnabled: boolean = true,
 ) {
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
@@ -731,7 +735,7 @@ export function buildSpawnSpec(
         return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslCwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslCwd, mcpEnabled)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
@@ -768,7 +772,7 @@ export function buildSpawnSpec(
         }
         return { file, args: ['/K'], cwd: procCwd, mcpCwd: cmdMcpCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd, mcpEnabled)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
@@ -799,7 +803,7 @@ export function buildSpawnSpec(
       return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: psMcpCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd, mcpEnabled)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -820,7 +824,7 @@ export function buildSpawnSpec(
     return { file: systemShell, args: ['-l'], cwd: unixCwd, mcpCwd: unixCwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd)
+  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd, mcpEnabled)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
@@ -1030,6 +1034,8 @@ export class TerminalRegistry extends EventEmitter {
       ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
     }
 
+    const mcpEnabled = this.settings?.codingCli?.mcpServer ?? true
+
     const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
       cwd,
@@ -1038,6 +1044,7 @@ export class TerminalRegistry extends EventEmitter {
       opts.providerSettings,
       baseEnv,
       terminalId,
+      mcpEnabled,
     )
 
     const endSpawnTimer = startPerfTimer(
