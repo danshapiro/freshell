@@ -260,7 +260,7 @@ export default function WorkspaceSettings({
       <SettingsSection title="Keyboard shortcuts" description="Navigation and terminal">
         <div className="space-y-2 text-sm">
           {KEYBOARD_SHORTCUTS.map((entry) => (
-            <ShortcutRow key={entry.description} keys={entry.keys} description={entry.description} />
+            <ShortcutRow key={entry.description} keys={entry.keys} alternateKeys={entry.alternateKeys} description={entry.description} />
           ))}
         </div>
       </SettingsSection>

@@ -79,8 +79,8 @@ The audit writes one JSON artifact to `artifacts/perf/visible-first-audit.json` 
 |----------|--------|
 | `Alt+T` | New tab |
 | `Alt+W` | Close tab |
-| `Ctrl+Shift+[` | Previous tab |
-| `Ctrl+Shift+]` | Next tab |
+| `Ctrl+Shift+[` / `Alt+[` | Previous tab |
+| `Ctrl+Shift+]` / `Alt+]` | Next tab |
 | `Ctrl+Shift+ArrowLeft` | Move tab left |
 | `Ctrl+Shift+ArrowRight` | Move tab right |
 | `Ctrl+Shift+C` | Copy selection (in terminal) |
