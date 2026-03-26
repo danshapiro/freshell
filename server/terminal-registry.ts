@@ -765,7 +765,7 @@ export function buildSpawnSpec(
         procCwd,
         file,
       }, 'buildSpawnSpec: cmd.exe cwd resolution')
-      const cmdMcpCwd = resolveUnixShellCwd(cwd)
+      const cmdMcpCwd = resolveUnixShellCwd(cwd) || os.homedir()
       if (mode === 'shell') {
         if (inWsl && winCwd) {
           return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: cmdMcpCwd, env }
@@ -795,7 +795,7 @@ export function buildSpawnSpec(
       procCwd,
       file,
     }, 'buildSpawnSpec: powershell.exe cwd resolution')
-    const psMcpCwd = resolveUnixShellCwd(cwd)
+    const psMcpCwd = resolveUnixShellCwd(cwd) || os.homedir()
     if (mode === 'shell') {
       if (inWsl && winCwd) {
         return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: psMcpCwd, env }

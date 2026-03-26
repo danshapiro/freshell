@@ -818,6 +818,9 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
         codingCli.providers = providers
       }
     }
+    if (hasOwn(candidate.codingCli, 'mcpServer')) {
+      codingCli.mcpServer = !!candidate.codingCli.mcpServer
+    }
     if (Object.keys(codingCli).length > 0) {
       sanitized.codingCli = codingCli
     }
