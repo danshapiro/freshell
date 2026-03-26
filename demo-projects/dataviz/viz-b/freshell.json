@@ -8,7 +8,7 @@
     "entry": "dist/index.html"
   },
   "picker": {
-    "shortcut": "X",
+    "shortcut": "U",
     "group": "tools"
   }
 }
