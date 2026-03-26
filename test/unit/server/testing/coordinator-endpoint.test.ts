@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import fsp from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -12,7 +13,7 @@ import {
 let tempDir: string
 
 beforeEach(async () => {
-  tempDir = await fsp.mkdtemp(path.join('/tmp', 'fce-'))
+  tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fce-'))
 })
 
 afterEach(async () => {
@@ -38,8 +39,8 @@ async function createDirectoryWithByteLength(parentDir: string, byteLength: numb
 describe('buildCoordinatorEndpoint()', () => {
   it('prefers XDG_RUNTIME_DIR over shared temp directories when it fits the socket-length cap', () => {
     const commonDir = path.join(tempDir, 'repo', '.git')
-    const shortDir = path.join(tempDir, 'tmp')
-    const xdgDir = path.join(tempDir, 'very', 'long', 'runtime', 'directory')
+    const shortDir = path.join(tempDir, 's')
+    const xdgDir = path.join(tempDir, 'xdg')
     fsSetup(shortDir, xdgDir)
 
     const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [xdgDir, shortDir])

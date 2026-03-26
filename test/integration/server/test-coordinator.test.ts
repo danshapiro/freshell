@@ -4,6 +4,7 @@ import { once } from 'node:events'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import { createRequire } from 'node:module'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -219,7 +220,7 @@ async function readCaptureLines(captureFile: string) {
 
 async function createRepoFixture(options: { linkedWorktree?: boolean; dirty?: boolean } = {}): Promise<RepoFixture> {
   const linkedWorktree = options.linkedWorktree ?? true
-  const baseDir = fs.realpathSync(await fsp.mkdtemp(path.join('/tmp', 'fcf-')))
+  const baseDir = fs.realpathSync(await fsp.mkdtemp(path.join(os.tmpdir(), 'fcf-')))
   activeFixtureDirs.push(baseDir)
 
   const repoRoot = path.join(baseDir, 'repo')
