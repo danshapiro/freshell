@@ -90,6 +90,7 @@ describe('Settings API Integration', () => {
     expect(res.body).not.toHaveProperty('notifications')
     expect(res.body.terminal).toEqual({ scrollback: defaultSettings.terminal.scrollback })
     expect(res.body.sidebar).toEqual({
+      autoGenerateTitles: true,
       excludeFirstChatSubstrings: [],
       excludeFirstChatMustStart: false,
     })

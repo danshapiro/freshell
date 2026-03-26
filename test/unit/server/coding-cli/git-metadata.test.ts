@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import path from 'path'
 import os from 'os'
+import fs from 'fs'
 import fsp from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
@@ -42,7 +43,7 @@ async function createLinkedWorktreeFixture(baseDir: string) {
 }
 
 beforeEach(async () => {
-  tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-git-meta-'))
+  tempDir = fs.realpathSync(await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-git-meta-')))
   clearRepoRootCache()
 })
 

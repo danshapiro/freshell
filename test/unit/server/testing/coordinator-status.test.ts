@@ -23,7 +23,7 @@ import {
 let tempDir: string
 
 beforeEach(async () => {
-  tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coordinator-status-'))
+  tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fcs-'))
 })
 
 afterEach(async () => {
