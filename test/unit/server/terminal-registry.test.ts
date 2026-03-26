@@ -2404,6 +2404,43 @@ describe('TerminalRegistry', () => {
     })
   })
 
+  describe('gracefulShutdown MaxListeners', () => {
+    it('does not add more than one terminal.exit listener even with 20+ terminals', async () => {
+      const reg = new TerminalRegistry(undefined, 50)
+      const warningHandler = vi.fn()
+      process.on('warning', warningHandler)
+
+      // Create 25 terminals
+      const terminals = []
+      for (let i = 0; i < 25; i++) {
+        terminals.push(reg.create({ mode: 'shell' }))
+      }
+
+      // Start graceful shutdown (non-blocking — don't await yet)
+      const shutdownPromise = reg.shutdownGracefully(100)
+
+      // Count terminal.exit listeners — should be at most 1 (the shared handler)
+      const exitListenerCount = reg.listenerCount('terminal.exit')
+      expect(exitListenerCount).toBeLessThanOrEqual(1)
+
+      // Simulate all terminals exiting
+      for (const term of terminals) {
+        reg.emit('terminal.exit', { terminalId: term.terminalId, exitCode: 0 })
+      }
+
+      await shutdownPromise
+
+      // No MaxListenersExceeded warnings should have been emitted
+      const maxListenerWarnings = warningHandler.mock.calls.filter(
+        ([w]: [Error]) => w?.name === 'MaxListenersExceededWarning'
+      )
+      expect(maxListenerWarnings).toHaveLength(0)
+
+      process.off('warning', warningHandler)
+      reg.shutdown()
+    })
+  })
+
   describe('isSessionBound', () => {
     it('returns true when session is already bound to a terminal', () => {
       const term = registry.create({ mode: 'codex', resumeSessionId: '019cf585-9b35-7510-a99c-09b77b1f351a' })
