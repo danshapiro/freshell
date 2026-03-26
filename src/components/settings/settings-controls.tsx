@@ -117,25 +117,41 @@ export function Toggle({
   )
 }
 
+function KeyCombo({ keys }: { keys: string[] }) {
+  return (
+    <>
+      {keys.map((key, i) => (
+        <span key={i}>
+          {i > 0 && <span className="text-muted-foreground/40 mx-0.5">+</span>}
+          <kbd className="px-1.5 py-0.5 text-2xs bg-muted rounded font-mono">
+            {key}
+          </kbd>
+        </span>
+      ))}
+    </>
+  )
+}
+
 export function ShortcutRow({
   keys,
+  alternateKeys,
   description,
 }: {
   keys: string[]
+  alternateKeys?: string[]
   description: string
 }) {
   return (
     <div className="flex items-center justify-between">
       <span className="text-muted-foreground">{description}</span>
       <div className="flex items-center gap-1">
-        {keys.map((key, i) => (
-          <span key={i}>
-            {i > 0 && <span className="text-muted-foreground/40 mx-0.5">+</span>}
-            <kbd className="px-1.5 py-0.5 text-2xs bg-muted rounded font-mono">
-              {key}
-            </kbd>
-          </span>
-        ))}
+        <KeyCombo keys={keys} />
+        {alternateKeys && (
+          <>
+            <span className="text-muted-foreground/40 mx-1">/</span>
+            <KeyCombo keys={alternateKeys} />
+          </>
+        )}
       </div>
     </div>
   )

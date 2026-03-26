@@ -4,6 +4,7 @@ export type ShortcutCategory = 'tabs' | 'terminal'
 
 export type ShortcutEntry = {
   keys: string[]
+  alternateKeys?: string[]
   description: string
   category: ShortcutCategory
 }
@@ -11,8 +12,8 @@ export type ShortcutEntry = {
 export const KEYBOARD_SHORTCUTS: ShortcutEntry[] = [
   { keys: ['Alt', 'T'], description: 'New tab', category: 'tabs' },
   { keys: ['Alt', 'W'], description: 'Close tab', category: 'tabs' },
-  { keys: ['Ctrl', 'Shift', '['], description: 'Previous tab', category: 'tabs' },
-  { keys: ['Ctrl', 'Shift', ']'], description: 'Next tab', category: 'tabs' },
+  { keys: ['Ctrl', 'Shift', '['], alternateKeys: ['Alt', '['], description: 'Previous tab', category: 'tabs' },
+  { keys: ['Ctrl', 'Shift', ']'], alternateKeys: ['Alt', ']'], description: 'Next tab', category: 'tabs' },
   { keys: ['Ctrl', 'Shift', '\u2190'], description: 'Move tab left', category: 'tabs' },
   { keys: ['Ctrl', 'Shift', '\u2192'], description: 'Move tab right', category: 'tabs' },
   { keys: ['Ctrl', 'Shift', 'C'], description: 'Copy selection', category: 'terminal' },
