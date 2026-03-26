@@ -160,7 +160,7 @@ function parseCSVLine(line: string): string[] {
 }
 
 async function loadData(): Promise<PlanetNode[]> {
-  const resp = await fetch('/data/exoplanets-clean.csv')
+  const resp = await fetch('./data/exoplanets-clean.csv')
   const text = await resp.text()
   const lines = text.split('\n')
   const headers = parseCSVLine(lines[0])
