@@ -22,7 +22,10 @@ export function getTabSwitchShortcutDirection(
 export function getTabLifecycleAction(
   event: TabShortcutEvent,
 ): TabLifecycleAction | null {
-  if (!event.altKey || event.ctrlKey || event.shiftKey || event.metaKey) return null
+  if (event.metaKey || event.ctrlKey || !event.altKey) return null
+  // Alt+Shift+T is an alternate binding for reopen (mirrors browser Ctrl+Shift+T)
+  if (event.shiftKey && event.code === 'KeyT') return 'reopen'
+  if (event.shiftKey) return null
   if (event.code === 'KeyT') return 'new'
   if (event.code === 'KeyW') return 'close'
   if (event.code === 'KeyH') return 'reopen'
