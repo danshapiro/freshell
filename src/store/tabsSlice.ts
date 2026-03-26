@@ -8,7 +8,7 @@ import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
-import { recordClosedTabSnapshot } from './tabRegistrySlice'
+import { recordClosedTabSnapshot, pushReopenEntry } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
   buildClosedTabRegistryRecord,
@@ -278,6 +278,16 @@ export const closeTab = createAsyncThunk(
           updatedAt: Date.now(),
         })))
       }
+    }
+
+    // Push to the reopen stack so Alt+H can restore this tab
+    if (tab && layout) {
+      dispatch(pushReopenEntry({
+        tab: { ...tab },
+        layout,
+        paneTitles: stateBeforeClose.panes.paneTitles[tabId] || {},
+        closedAt: Date.now(),
+      }))
     }
 
     // Collect all pane IDs before removing the layout
