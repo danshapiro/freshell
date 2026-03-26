@@ -16,6 +16,13 @@ export interface ChatMessage {
   model?: string
 }
 
+export interface LoadSessionHistoryDeps {
+  /** O(1) path resolver from session indexer. Returns file path or undefined. */
+  resolveFilePath?: (sessionId: string) => string | undefined
+  /** Parsed content cache. When provided, avoids re-reading unchanged files. */
+  contentCache?: { get(filePath: string): Promise<ChatMessage[] | null> }
+}
+
 /**
  * Parse JSONL content from a Claude Code session file and extract chat messages
  * in the normalized shape used by visible-first restore flows.
@@ -60,15 +67,51 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
   return messages
 }
 
+/** Read a file and parse its JSONL content into ChatMessages. */
+async function readAndParse(filePath: string): Promise<ChatMessage[] | null> {
+  try {
+    const content = await fsp.readFile(filePath, 'utf-8')
+    return extractChatMessagesFromJsonl(content)
+  } catch {
+    return null
+  }
+}
+
 /**
  * Find and load chat messages from a Claude Code session .jsonl file.
- * Searches all project directories under `<claudeHome>/projects/` for the session file.
- * Returns parsed ChatMessage[] or null if the session file is not found.
+ *
+ * When `deps.resolveFilePath` is provided and returns a path, reads that file
+ * directly (O(1) lookup). Falls back to the brute-force directory scan when:
+ *   - No resolver is provided
+ *   - The resolver returns undefined
+ *   - The resolved file cannot be read
+ *
+ * When `deps.contentCache` is provided, delegates file reading to the cache
+ * (which handles mtime+size stat invalidation and request coalescing).
  */
 export async function loadSessionHistory(
   sessionId: string,
   claudeHome?: string,
+  deps?: LoadSessionHistoryDeps,
 ): Promise<ChatMessage[] | null> {
+  // Prevent path traversal: only allow the basename (no slashes or ..)
+  const safeName = path.basename(sessionId)
+  if (!safeName || safeName !== sessionId) return null
+
+  // Layer 1: resolve via index
+  const resolvedPath = deps?.resolveFilePath?.(sessionId)
+  if (resolvedPath) {
+    // Layer 2: check content cache
+    if (deps?.contentCache) {
+      const cached = await deps.contentCache.get(resolvedPath)
+      if (cached !== null) return cached
+    } else {
+      const result = await readAndParse(resolvedPath)
+      if (result !== null) return result
+    }
+  }
+
+  // Brute-force directory scan (original behavior)
   const home = claudeHome ?? getClaudeHome()
   const projectsDir = path.join(home, 'projects')
 
@@ -82,19 +125,17 @@ export async function loadSessionHistory(
     return null
   }
 
-  // Prevent path traversal: only allow the basename (no slashes or ..)
-  const safeName = path.basename(sessionId)
-  if (!safeName || safeName !== sessionId) return null
   const filename = `${safeName}.jsonl`
 
   for (const dir of projectDirs) {
     // Check directly under the project dir (standard Claude Code layout)
     const directPath = path.join(dir, filename)
-    try {
-      const content = await fsp.readFile(directPath, 'utf-8')
-      return extractChatMessagesFromJsonl(content)
-    } catch {
-      // Not found directly, check one level of subdirectories
+    if (deps?.contentCache) {
+      const cached = await deps.contentCache.get(directPath)
+      if (cached !== null) return cached
+    } else {
+      const result = await readAndParse(directPath)
+      if (result !== null) return result
     }
 
     // Check subdirectories (e.g. sessions/, or session-id dirs with subagents)
@@ -103,11 +144,12 @@ export async function loadSessionHistory(
       for (const entry of entries) {
         if (!entry.isDirectory()) continue
         const nestedPath = path.join(dir, entry.name, filename)
-        try {
-          const content = await fsp.readFile(nestedPath, 'utf-8')
-          return extractChatMessagesFromJsonl(content)
-        } catch {
-          // Not found in this subdirectory
+        if (deps?.contentCache) {
+          const cached = await deps.contentCache.get(nestedPath)
+          if (cached !== null) return cached
+        } else {
+          const result = await readAndParse(nestedPath)
+          if (result !== null) return result
         }
       }
     } catch {
