@@ -82,7 +82,7 @@ describe('getTabSwitchShortcutDirection', () => {
 })
 
 describe('getTabLifecycleAction', () => {
-  it('maps Alt+T to new and Alt+W to close', () => {
+  it('maps Alt+T to new, Alt+W to close, and Alt+H to reopen', () => {
     expect(getTabLifecycleAction({
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
       code: 'KeyT',
@@ -92,6 +92,11 @@ describe('getTabLifecycleAction', () => {
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
       code: 'KeyW',
     })).toBe('close')
+
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyH',
+    })).toBe('reopen')
   })
 
   it('ignores other modifier combinations', () => {
