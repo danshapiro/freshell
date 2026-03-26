@@ -484,6 +484,53 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
   return incoming
 }
 
+/**
+ * Strip stale runtime IDs from pane content so restored panes get fresh ones.
+ */
+function stripStaleIds(content: PaneContent): PaneContentInput {
+  if (content.kind === 'terminal') {
+    const { terminalId: _terminalId, createRequestId: _createRequestId, status: _status, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'browser') {
+    const { browserInstanceId: _browserInstanceId, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'agent-chat') {
+    const { sessionId: _sessionId, createRequestId: _createRequestId, status: _status, ...rest } = content
+    return rest
+  }
+  return content
+}
+
+/**
+ * Walk a PaneNode tree, normalizing each leaf's content with fresh IDs.
+ */
+function normalizeRestoredTree(node: PaneNode): PaneNode {
+  if (node.type === 'leaf') {
+    return {
+      type: 'leaf',
+      id: node.id,
+      content: normalizePaneContent(stripStaleIds(node.content)),
+    }
+  }
+  return {
+    type: 'split',
+    id: node.id,
+    direction: node.direction,
+    sizes: node.sizes,
+    children: [
+      normalizeRestoredTree(node.children[0]),
+      normalizeRestoredTree(node.children[1]),
+    ],
+  }
+}
+
+function findFirstLeafId(node: PaneNode): string {
+  if (node.type === 'leaf') return node.id
+  return findFirstLeafId(node.children[0])
+}
+
 export const panesSlice = createSlice({
   name: 'panes',
   initialState,
@@ -505,6 +552,23 @@ export const panesSlice = createSlice({
       }
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
+    restoreLayout: (
+      state,
+      action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string>; paneTitleSetByUser?: Record<string, boolean> }>
+    ) => {
+      const { tabId, layout, paneTitles, paneTitleSetByUser } = action.payload
+      if (state.layouts[tabId]) return
+
+      const normalizedLayout = normalizeRestoredTree(layout)
+      state.layouts[tabId] = normalizedLayout
+      state.activePane[tabId] = findFirstLeafId(normalizedLayout)
+      state.paneTitles[tabId] = paneTitles
+      if (paneTitleSetByUser && Object.keys(paneTitleSetByUser).length > 0) {
+        state.paneTitleSetByUser[tabId] = paneTitleSetByUser
+      }
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -1204,6 +1268,7 @@ export const panesSlice = createSlice({
 
 export const {
   initLayout,
+  restoreLayout,
   resetLayout,
   splitPane,
   addPane,

@@ -82,7 +82,7 @@ describe('getTabSwitchShortcutDirection', () => {
 })
 
 describe('getTabLifecycleAction', () => {
-  it('maps Alt+T to new and Alt+W to close', () => {
+  it('maps Alt+T to new, Alt+W to close, and Alt+H to reopen', () => {
     expect(getTabLifecycleAction({
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
       code: 'KeyT',
@@ -92,17 +92,36 @@ describe('getTabLifecycleAction', () => {
       altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
       code: 'KeyW',
     })).toBe('close')
+
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: false, metaKey: false,
+      code: 'KeyH',
+    })).toBe('reopen')
+  })
+
+  it('maps Alt+Shift+T to reopen as alternate binding', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
+      code: 'KeyT',
+    })).toBe('reopen')
+  })
+
+  it('Alt+Shift does not affect non-reopen keys', () => {
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
+      code: 'KeyW',
+    })).toBeNull()
+
+    expect(getTabLifecycleAction({
+      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
+      code: 'KeyH',
+    })).toBeNull()
   })
 
   it('ignores other modifier combinations', () => {
     expect(getTabLifecycleAction({
       altKey: true, ctrlKey: true, shiftKey: false, metaKey: false,
       code: 'KeyT',
-    })).toBeNull()
-
-    expect(getTabLifecycleAction({
-      altKey: true, ctrlKey: false, shiftKey: true, metaKey: false,
-      code: 'KeyW',
     })).toBeNull()
 
     expect(getTabLifecycleAction({

@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KeyboardShortcutsDialog } from '@/components/KeyboardShortcutsDialog'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
+import { addTab, closeTab, reopenClosedTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
 import {
   addPane,
   initLayout,
@@ -264,6 +264,10 @@ export function ContextMenuProvider({
     }
     dispatch(closeTab(tabId))
   }, [dispatch, panes, ws])
+
+  const reopenClosedTabAction = useCallback(() => {
+    dispatch(reopenClosedTab())
+  }, [dispatch])
 
   const closeOtherTabs = useCallback((tabId: string) => {
     setConfirmState({
@@ -905,6 +909,7 @@ export function ContextMenuProvider({
         refreshTab: refreshTabAction,
         renameTab,
         closeTab: closeTabById,
+        reopenClosedTab: reopenClosedTabAction,
         closeOtherTabs,
         closeTabsToRight,
         moveTab,
@@ -980,6 +985,7 @@ export function ContextMenuProvider({
     refreshTabAction,
     renameTab,
     closeTabById,
+    reopenClosedTabAction,
     closeOtherTabs,
     closeTabsToRight,
     moveTab,

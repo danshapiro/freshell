@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import panesReducer, {
   initLayout,
+  restoreLayout,
   splitPane,
   swapPanes,
   addPane,
@@ -3239,6 +3240,128 @@ describe('panesSlice', () => {
       const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'Title' }))
 
       expect(result.paneTitles['tab-1']).toBeUndefined()
+    })
+  })
+
+  describe('restoreLayout', () => {
+    it('restores a leaf layout with normalized content', () => {
+      const layout: PaneNode = {
+        type: 'leaf',
+        id: 'old-pane',
+        content: {
+          kind: 'terminal',
+          terminalId: 'stale-term-id',
+          createRequestId: 'stale-cr',
+          status: 'running',
+          mode: 'shell',
+        },
+      }
+      const paneTitles = { 'old-pane': 'My Shell' }
+
+      const result = panesReducer(
+        initialState,
+        restoreLayout({ tabId: 'tab-1', layout, paneTitles }),
+      )
+
+      const restoredLayout = result.layouts['tab-1']
+      expect(restoredLayout).toBeDefined()
+      expect(restoredLayout.type).toBe('leaf')
+      if (restoredLayout.type === 'leaf') {
+        // Stale terminalId should be cleared
+        expect((restoredLayout.content as TerminalPaneContent).terminalId).toBeUndefined()
+        // Fresh createRequestId should be generated
+        expect((restoredLayout.content as TerminalPaneContent).createRequestId).not.toBe('stale-cr')
+        // Status should be reset to creating
+        expect((restoredLayout.content as TerminalPaneContent).status).toBe('creating')
+        // Mode preserved
+        expect((restoredLayout.content as TerminalPaneContent).mode).toBe('shell')
+      }
+      expect(result.paneTitles['tab-1']).toEqual(paneTitles)
+      expect(result.activePane['tab-1']).toBe('old-pane')
+    })
+
+    it('restores a split layout with multiple leaves', () => {
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'terminal',
+              terminalId: 'stale-a',
+              createRequestId: 'stale-cr-a',
+              status: 'running',
+              mode: 'claude',
+            },
+          },
+          {
+            type: 'leaf',
+            id: 'pane-b',
+            content: {
+              kind: 'browser',
+              browserInstanceId: 'stale-browser',
+              url: 'https://example.com',
+              devToolsOpen: false,
+            },
+          },
+        ],
+      }
+      const paneTitles = { 'pane-a': 'Claude', 'pane-b': 'Browser' }
+
+      const result = panesReducer(
+        initialState,
+        restoreLayout({ tabId: 'tab-2', layout, paneTitles }),
+      )
+
+      const restored = result.layouts['tab-2']
+      expect(restored.type).toBe('split')
+      if (restored.type === 'split') {
+        const left = restored.children[0]
+        const right = restored.children[1]
+        expect(left.type).toBe('leaf')
+        expect(right.type).toBe('leaf')
+        if (left.type === 'leaf') {
+          expect((left.content as TerminalPaneContent).terminalId).toBeUndefined()
+          expect((left.content as TerminalPaneContent).status).toBe('creating')
+        }
+        if (right.type === 'leaf') {
+          // Browser pane should get fresh browserInstanceId
+          expect((right.content as BrowserPaneContent).browserInstanceId).not.toBe('stale-browser')
+          expect((right.content as BrowserPaneContent).url).toBe('https://example.com')
+        }
+      }
+      expect(result.activePane['tab-2']).toBe('pane-a')
+    })
+
+    it('does not overwrite an existing layout', () => {
+      const existingLayout: PaneNode = {
+        type: 'leaf',
+        id: 'existing',
+        content: { kind: 'terminal', createRequestId: 'existing-cr', status: 'running', mode: 'shell' },
+      }
+      const stateWithLayout: PanesState = {
+        ...initialState,
+        layouts: { 'tab-1': existingLayout },
+        activePane: { 'tab-1': 'existing' },
+        paneTitles: { 'tab-1': { existing: 'Existing' } },
+      }
+
+      const newLayout: PaneNode = {
+        type: 'leaf',
+        id: 'new-pane',
+        content: { kind: 'terminal', createRequestId: 'new-cr', status: 'creating', mode: 'shell' },
+      }
+      const result = panesReducer(
+        stateWithLayout,
+        restoreLayout({ tabId: 'tab-1', layout: newLayout, paneTitles: { 'new-pane': 'New' } }),
+      )
+
+      // Should still be the existing layout
+      expect(result.layouts['tab-1'].id).toBe('existing')
     })
   })
 })
