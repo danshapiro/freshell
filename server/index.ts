@@ -294,7 +294,7 @@ async function main() {
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
-  const isCompiledBuild = __dirname.includes(path.join('dist', 'server'))
+  const isCompiledBuild = __dirname.endsWith(path.join('dist', 'server'))
   const isDev = !isCompiledBuild && process.env.NODE_ENV !== 'production'
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
