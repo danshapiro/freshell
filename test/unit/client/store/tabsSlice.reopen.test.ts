@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, closeTab, reopenClosedTab } from '../../../../src/store/tabsSlice'
-import panesReducer, { initLayout, splitPane } from '../../../../src/store/panesSlice'
+import panesReducer, { initLayout, splitPane, updatePaneTitle } from '../../../../src/store/panesSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 import type { TerminalPaneContent, BrowserPaneContent } from '../../../../src/store/paneTypes'
 
@@ -144,5 +144,30 @@ describe('reopenClosedTab', () => {
 
     await store.dispatch(reopenClosedTab() as any)
     expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('preserves paneTitleSetByUser across close and reopen', async () => {
+    const store = createStore()
+
+    store.dispatch(addTab({ title: 'Anchor' }))
+    const anchorId = store.getState().tabs.tabs[0]!.id
+    store.dispatch(initLayout({ tabId: anchorId, content: { kind: 'terminal', mode: 'shell' } }))
+
+    store.dispatch(addTab({ title: 'Renamed Panes' }))
+    const tabId = store.getState().tabs.tabs[1]!.id
+    store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+
+    const paneId = store.getState().panes.activePane[tabId]
+    store.dispatch(updatePaneTitle({ tabId, paneId, title: 'User Title', setByUser: true }))
+
+    expect(store.getState().panes.paneTitleSetByUser[tabId]?.[paneId]).toBe(true)
+
+    await store.dispatch(closeTab(tabId) as any)
+    await store.dispatch(reopenClosedTab() as any)
+
+    const reopenedTabId = store.getState().tabs.activeTabId!
+    const reopenedPaneId = store.getState().panes.activePane[reopenedTabId]
+    expect(store.getState().panes.paneTitleSetByUser[reopenedTabId]?.[reopenedPaneId]).toBe(true)
+    expect(store.getState().panes.paneTitles[reopenedTabId]?.[reopenedPaneId]).toBe('User Title')
   })
 })

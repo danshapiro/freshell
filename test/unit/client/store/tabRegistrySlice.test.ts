@@ -101,6 +101,7 @@ describe('tabRegistrySlice', () => {
         },
         layout: { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'cr-1', status: 'running', mode: 'shell' } },
         paneTitles: { 'pane-1': 'Shell' },
+        paneTitleSetByUser: {},
         closedAt: Date.now(),
         ...overrides,
       }

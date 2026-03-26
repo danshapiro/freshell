@@ -557,15 +557,18 @@ export const panesSlice = createSlice({
 
     restoreLayout: (
       state,
-      action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string> }>
+      action: PayloadAction<{ tabId: string; layout: PaneNode; paneTitles: Record<string, string>; paneTitleSetByUser?: Record<string, boolean> }>
     ) => {
-      const { tabId, layout, paneTitles } = action.payload
+      const { tabId, layout, paneTitles, paneTitleSetByUser } = action.payload
       if (state.layouts[tabId]) return
 
       const normalizedLayout = normalizeRestoredTree(layout)
       state.layouts[tabId] = normalizedLayout
       state.activePane[tabId] = findFirstLeafId(normalizedLayout)
       state.paneTitles[tabId] = paneTitles
+      if (paneTitleSetByUser && Object.keys(paneTitleSetByUser).length > 0) {
+        state.paneTitleSetByUser[tabId] = paneTitleSetByUser
+      }
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
