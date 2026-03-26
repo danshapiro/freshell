@@ -95,47 +95,94 @@ These were good fixes but they're patches on the symptom. The architectural root
 
 ## Research Spikes
 
-### Spike 1: Measure the Reconnect Experience
-**Goal:** Quantify the actual problem. How long is the gap between "ready" and "all panes live"? How often does INVALID_TERMINAL_ID trigger?
+### What We Learned From Chrome Tooling Recon (2026-03-26)
+
+Before defining spikes, we tested what Chrome automation can actually observe. Key findings:
+
+**Capabilities confirmed:**
+- Can access full Redux store (all 17 slices) via React fiber tree in dev mode
+- Can install dispatch interceptors to log all actions with timestamps
+- Can read localStorage, capture console messages, take screenshots
+- Can observe HTTP API calls (bootstrap, session-directory, terminals)
+
+**Limitations discovered:**
+- Cannot capture WebSocket frames directly (only HTTP). Must infer WS traffic from Redux actions.
+- All injected instrumentation is lost on page reload — so reconnect-after-server-restart scenarios wipe our observers at the worst possible moment.
+- Production build has no fiber access, no readable console messages. Must use dev mode.
+
+**Real findings from ad-hoc testing:**
+1. **Every Redux action fires twice** — the cross-tab sync mechanism re-dispatches. 5 persistence mechanisms doing double work.
+2. **Server restart reconnect took 35+ seconds** and then didn't fully recover. Connection status stayed `disconnected` despite terminal re-creation activity. The `INVALID_TERMINAL_ID reconnecting` log appeared, a new terminalId was assigned, but the connection never went back to `ready`.
+3. **"Recovering terminal output..." appears even on fresh terminal creation**, not just reconnects. Contributes to the flaky feel in normal usage.
+4. **Dev vs production mode may have different failure characteristics** due to Vite proxy layer.
+
+**Implication for spikes:** Runtime injection alone can't measure the reconnect cascade reliably — the page reload wipes our hooks. We need to add lightweight instrumentation to the actual source code (removable after investigation), and we need to test in production mode separately from dev mode.
+
+See: `docs/lab-notes/2026-03-26-chrome-tooling-capabilities.md`
+
+---
+
+### Spike 1: Instrument and Measure the Reconnect Cascade (Source-Level)
+
+**Goal:** Add temporary timing instrumentation to the source code so it survives page reloads and captures the full reconnect timeline. Measure in both dev and production mode.
 
 **Approach:**
-- Add timing instrumentation to ws-client.ts (reconnect milestones) and TerminalView.tsx (per-pane attach timing)
-- Trigger reconnects in three scenarios: normal, server restart, long disconnect
-- Record actual timings
+- Add a `ReconnectTracer` utility that logs timestamped events to a `window.__reconnectTrace` array
+- Wire it into ws-client.ts (disconnect detected, reconnect attempt, ready received, each attempt's latency)
+- Wire it into TerminalView.tsx (attach sent, INVALID_TERMINAL_ID received, create sent, terminal.created received, attach.ready received, first output rendered)
+- Wire it into App.tsx (state.snapshot if we add one, sessions.changed, terminals.changed)
+- Test three scenarios:
+  1. **Normal reconnect** (WS drop, server still running, terminals alive) — production mode
+  2. **Server restart** (kill server, restart, terminals gone) — production mode
+  3. **Page refresh** (F5 with terminals running) — production mode
+- Record actual timings for each scenario
 - Remove instrumentation after
 
-**Output:** Lab note with measurements. This tells us if the problem is 100ms (not worth fixing architecturally) or 2-5s (worth it).
+**Output:** Lab note with per-scenario timelines. Answers: How long is the user staring at broken state? Where is time spent?
 
-### Spike 2: Server Snapshot Feasibility
-**Goal:** Can the server cheaply assemble a complete state snapshot?
+### Spike 2: Observe Normal Usage Degradation (Chrome Runtime)
 
-**Approach:**
-- Write a prototype `assembleStateSnapshot()` in ws-handler.ts that collects terminal inventory + metadata
-- Measure assembly time and JSON size with varying terminal counts
-- Test sending it in the handshake flow (don't process on client, just log receipt)
+**Goal:** Use Chrome automation to observe what happens during normal usage that contributes to the "flaky feel" — without server crashes or disconnects.
 
-**Output:** Lab note with size/timing data. Go/no-go on the snapshot approach.
+**Approach (all via Chrome runtime injection, no source changes):**
+- Install Redux dispatch interceptor
+- Open Freshell, create 3-5 terminals across tabs
+- Switch between tabs, observe action storms
+- Open sidebar, expand projects, observe API call patterns
+- Let it sit idle for 5-10 minutes, check for background activity/state drift
+- Record localStorage state, then compare to Redux state — look for divergence
 
-### Spike 3: Layout Mirror Gap Analysis
-**Goal:** What's in the layout mirror vs. what the client needs?
+**Questions to answer:**
+- How many Redux actions fire per tab switch? Per sidebar interaction?
+- Does the "every action fires twice" cross-tab sync cause visible performance issues?
+- Does idle state drift (session timestamps, terminal metadata going stale)?
+- Is localStorage ever inconsistent with Redux state?
 
-**Approach:**
-- Read layoutMirrorMiddleware.ts to see what's sent
-- Read the server's ui.layout.sync handler to see what's stored
-- Compare to the full persisted pane tree from panesSlice
-- Document the gap
+**Output:** Lab note with action counts, timing data, and any divergence found.
 
-**Output:** Lab note answering: can the server return the client's layout, or is too much missing?
+### Spike 3: State Consolidation Map (Code Review)
 
-### Spike 4: State Consolidation Map
-**Goal:** Catalog all 17 slices and their persistence, identify what can be cut.
+**Goal:** Catalog all 17 slices and their persistence, identify what can be cut. This is a code review, not a running-server test.
 
 **Approach:**
 - For each slice: what it stores, how it's persisted, is it server-derived or client-generated
 - Group into: server-authoritative, client-local, redundant, ephemeral
+- Map which slices are involved in the reconnect cascade (informed by Spike 1 findings)
 - Sketch a simplified state tree
 
 **Output:** Lab note with the catalog and a proposed consolidation.
+
+### Spike 4: Server Snapshot Feasibility (After Spikes 1-3)
+
+**Goal:** Informed by actual measurements and the state map, prototype a `state.snapshot` message.
+
+**Approach:**
+- Write `assembleStateSnapshot()` in ws-handler.ts — terminal inventory + metadata + session summary
+- Measure assembly time and JSON size with realistic terminal counts
+- Send it after `ready` in the handshake, log receipt on client
+- Compare snapshot content to what the client currently discovers piecemeal
+
+**Output:** Lab note with size/timing data and a go/no-go on the snapshot approach.
 
 ---
 
