@@ -1,0 +1,14 @@
+{
+  "name": "exoplanet-nightsky",
+  "version": "0.1.0",
+  "label": "Exoplanet Nightsky",
+  "description": "Interactive sky map of discovered exoplanets with Hammer-Aitoff projection",
+  "category": "client",
+  "client": {
+    "entry": "dist/index.html"
+  },
+  "picker": {
+    "shortcut": "I",
+    "group": "tools"
+  }
+}
