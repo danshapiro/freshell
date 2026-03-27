@@ -796,7 +796,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
     expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
   })
 
-  it('keeps loaded search results visible and shows no search chrome during websocket revalidation', async () => {
+  it('keeps stale applied search results visible and revalidates them silently during websocket refresh after clearing search', async () => {
     const searchProjects = [{
       projectPath: '/search',
       sessions: [{
@@ -807,7 +807,9 @@ describe('open tab session sidebar visibility (e2e)', () => {
         title: 'Search Result',
       }],
     }]
+    const browseDeferred = createDeferred<any>()
     const deferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseDeferred.promise)
     searchSessions.mockReturnValueOnce(deferred.promise)
 
     const store = createStore({
@@ -838,6 +840,15 @@ describe('open tab session sidebar visibility (e2e)', () => {
     await waitFor(() => {
       expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
     })
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: '' } })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+
+    expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
 
     act(() => {
       broadcastWs({
@@ -871,6 +882,17 @@ describe('open tab session sidebar visibility (e2e)', () => {
         tier: 'title',
         query: 'search',
         totalScanned: 1,
+      })
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      browseDeferred.resolve({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
       })
       await Promise.resolve()
     })
@@ -938,7 +960,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
   })
 
-  it('keeps direct active-query refreshes silent and only shows searching for actual query changes', async () => {
+  it('keeps direct refreshes on the visible applied search silent and only shows searching for actual query changes', async () => {
     const searchProjects = [{
       projectPath: '/search',
       sessions: [{
@@ -949,8 +971,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
         title: 'Search Result',
       }],
     }]
+    const browseDeferred = createDeferred<any>()
     const refreshDeferred = createDeferred<any>()
     const queryChangeDeferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseDeferred.promise)
     searchSessions
       .mockReturnValueOnce(refreshDeferred.promise)
       .mockReturnValueOnce(queryChangeDeferred.promise)
@@ -984,6 +1008,12 @@ describe('open tab session sidebar visibility (e2e)', () => {
       expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
     })
 
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: '' } })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+
     const refreshRequest = store.dispatch((sessionsThunks as any).refreshActiveSessionWindow())
 
     await waitFor(() => {
@@ -1013,6 +1043,17 @@ describe('open tab session sidebar visibility (e2e)', () => {
         totalScanned: 1,
       })
       await refreshRequest
+    })
+
+    await act(async () => {
+      browseDeferred.resolve({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+      await Promise.resolve()
     })
 
     fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search plus' } })

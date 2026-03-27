@@ -379,6 +379,128 @@ describe('sessionsThunks', () => {
     }
   })
 
+  it('preserves the previous applied search context when a replacement request errors before new data lands', async () => {
+    searchSessions.mockRejectedValueOnce(new Error('Search failed'))
+
+    const appliedProjects = [{
+      projectPath: '/tmp/project-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        lastActivityAt: 1_000,
+        title: 'Alpha result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: appliedProjects,
+      lastLoadedAt: 1_000,
+      windows: {
+        sidebar: {
+          projects: appliedProjects,
+          lastLoadedAt: 1_000,
+          query: 'alpha',
+          searchTier: 'title',
+          appliedQuery: 'alpha',
+          appliedSearchTier: 'title',
+        },
+      },
+    })
+
+    await expect(store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'beta',
+      searchTier: 'fullText',
+    }) as any)).rejects.toThrow('Search failed')
+
+    expect((store.getState().sessions.windows.sidebar as any).query).toBe('beta')
+    expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('fullText')
+    expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('alpha')
+    expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+    expect((store.getState().sessions.windows.sidebar as any).error).toBe('Search failed')
+  })
+
+  it('preserves the previous applied search context when a replacement request is aborted before new data lands', async () => {
+    const replacementSearch = createDeferred<any>()
+    const browseReload = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(replacementSearch.promise)
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseReload.promise)
+
+    const appliedProjects = [{
+      projectPath: '/tmp/project-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        lastActivityAt: 1_000,
+        title: 'Alpha result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: appliedProjects,
+      lastLoadedAt: 1_000,
+      windows: {
+        sidebar: {
+          projects: appliedProjects,
+          lastLoadedAt: 1_000,
+          query: 'alpha',
+          searchTier: 'title',
+          appliedQuery: 'alpha',
+          appliedSearchTier: 'title',
+        },
+      },
+    })
+
+    const replacementRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'beta',
+      searchTier: 'title',
+    }) as any)
+    const replacementSignal = searchSessions.mock.calls[0]?.[0]?.signal as AbortSignal
+
+    const browseRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: '',
+      searchTier: 'title',
+    }) as any)
+
+    expect(replacementSignal.aborted).toBe(true)
+    expect((store.getState().sessions.windows.sidebar as any).query).toBe('')
+    expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('title')
+    expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('alpha')
+    expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+
+    browseReload.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+    replacementSearch.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-beta',
+        projectPath: '/tmp/project-beta',
+        title: 'Beta result',
+        lastActivityAt: 2_000,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'beta',
+      totalScanned: 1,
+    })
+
+    await Promise.allSettled([replacementRequest, browseRequest])
+  })
+
   it('appends a later page into the same surface window', async () => {
     fetchSidebarSessionsSnapshot
       .mockResolvedValueOnce({
@@ -517,37 +639,36 @@ describe('sessionsThunks', () => {
     expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
   })
 
-  it('refreshes the active active-query window silently while reusing its query context', async () => {
-    searchSessions.mockResolvedValue({
-      results: [
-        {
-          provider: 'claude',
-          sessionId: 'session-search',
-          projectPath: '/tmp/search-project',
-          title: 'Search result',
-          lastActivityAt: 3_000,
-          archived: false,
-        },
-      ],
-      tier: 'fullText',
-      query: 'needle',
-      totalScanned: 1,
-    })
-
-    const store = createStore()
-    store.dispatch(setActiveSessionSurface('sidebar'))
-
-    await store.dispatch(fetchSessionWindow({
-      surface: 'sidebar',
-      priority: 'visible',
-      query: 'needle',
-      searchTier: 'fullText',
-    }) as any)
-
-    searchSessions.mockClear()
-
+  it('refreshes the visible applied-query window silently while reusing its search context during search-to-browse drift', async () => {
     const deferred = createDeferred<any>()
     searchSessions.mockReturnValueOnce(deferred.promise)
+
+    const searchProjects = [{
+      projectPath: '/tmp/search-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        lastActivityAt: 3_000,
+        title: 'Search result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: searchProjects,
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: searchProjects,
+          lastLoadedAt: 3_000,
+          query: '',
+          searchTier: 'title',
+          appliedQuery: 'needle',
+          appliedSearchTier: 'fullText',
+        },
+      },
+    })
 
     const request = store.dispatch(refreshActiveSessionWindow() as any)
 
@@ -580,7 +701,7 @@ describe('sessionsThunks', () => {
     })
   })
 
-  it('marks websocket revalidation as background for both default lists and active queries', async () => {
+  it('marks websocket revalidation as background for both default lists and the visible applied query', async () => {
     const defaultRefresh = createDeferred<any>()
     const searchRefresh = createDeferred<any>()
     fetchSidebarSessionsSnapshot.mockReturnValueOnce(defaultRefresh.promise)
@@ -634,8 +755,10 @@ describe('sessionsThunks', () => {
         sidebar: {
           projects: searchProjects,
           lastLoadedAt: 3_000,
-          query: 'needle',
+          query: '',
           searchTier: 'title',
+          appliedQuery: 'needle',
+          appliedSearchTier: 'title',
         },
       },
     })
@@ -660,6 +783,12 @@ describe('sessionsThunks', () => {
 
       await searchRequest
     }
+
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
   })
 
   it('treats websocket recovery without committed sidebar data as an initial blocking load', async () => {
@@ -693,6 +822,93 @@ describe('sessionsThunks', () => {
 
       await request
     }
+  })
+
+  it('silently refreshes the visible applied search during an in-flight search-to-browse transition without overwriting the requested browse state', async () => {
+    const searchProjects = [{
+      projectPath: '/tmp/search-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        lastActivityAt: 3_000,
+        title: 'Search result',
+      }],
+    }]
+    const browseDeferred = createDeferred<any>()
+    const invalidationDeferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseDeferred.promise)
+    searchSessions.mockReturnValueOnce(invalidationDeferred.promise)
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: searchProjects,
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: searchProjects,
+          lastLoadedAt: 3_000,
+          query: 'needle',
+          searchTier: 'title',
+          appliedQuery: 'needle',
+          appliedSearchTier: 'title',
+        },
+      },
+    })
+
+    const browseRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: '',
+      searchTier: 'title',
+    }) as any)
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+
+    const invalidationRequest = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
+
+    invalidationDeferred.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        title: 'Search result',
+        lastActivityAt: 3_100,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'needle',
+      totalScanned: 1,
+    })
+
+    await invalidationRequest
+
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.searchTier).toBe('title')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
+    expect(store.getState().sessions.windows.sidebar.loading).toBe(true)
+
+    browseDeferred.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await browseRequest
+
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
   })
 
   it('coalesces repeated invalidations into one in-flight fetch plus one trailing refresh', async () => {
