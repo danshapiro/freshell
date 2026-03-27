@@ -18,14 +18,6 @@ const __dirname = path.dirname(__filename)
 const REPO_ROOT = path.resolve(__dirname, '../../..')
 const require = createRequire(import.meta.url)
 let TSX_CLI: string | undefined
-const HAS_TSX_CLI = (() => {
-  try {
-    require.resolve('tsx/cli')
-    return true
-  } catch {
-    return false
-  }
-})()
 const DEFAULT_TEST_TIMEOUT_MS = 120_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
@@ -129,7 +121,7 @@ async function startDistLoggerProcess(env: NodeJS.ProcessEnv) {
 }
 
 describe('debug log separation', () => {
-  it.skipIf(!HAS_TSX_CLI)(
+  it(
     'dist and source launches choose different mode-specific filenames',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
@@ -160,7 +152,7 @@ describe('debug log separation', () => {
     },
   )
 
-  it.skipIf(!HAS_TSX_CLI)(
+  it(
     'concurrent launches with the same mode keep separate files',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
@@ -191,7 +183,7 @@ describe('debug log separation', () => {
     },
   )
 
-  it.skipIf(!HAS_TSX_CLI)(
+  it(
     'explicit instance settings are respected across launch modes',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
@@ -220,7 +212,7 @@ describe('debug log separation', () => {
     },
   )
 
-  it.skipIf(!HAS_TSX_CLI)(
+  it(
     'startup logs include resolved debug destination details',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
