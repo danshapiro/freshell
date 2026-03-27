@@ -164,10 +164,8 @@ test.describe('Tab Management', () => {
     expect(sent.filter((msg: any) => msg?.type === 'terminal.resize')).toHaveLength(0)
   })
 
-  test.skip('keyboard shortcut creates new tab', async ({ freshellPage, page, harness }) => {
-    // Ctrl+T is intercepted by Chromium in headed mode and cannot be tested.
-    // The app's keyboard shortcut handling is covered by unit tests.
-    await page.keyboard.press('Control+t')
+  test('keyboard shortcut creates new tab', async ({ freshellPage, page, harness }) => {
+    await page.keyboard.press('Alt+T')
     await harness.waitForTabCount(2)
   })
 
