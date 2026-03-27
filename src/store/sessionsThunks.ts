@@ -218,12 +218,16 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const previousTier = windowState?.searchTier ?? 'title'
     const hasCommittedWindow = typeof windowState?.lastLoadedAt === 'number'
     const hasCommittedItems = (windowState?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
+    const previousVisibleQuery = windowState?.appliedQuery?.trim()
+      ?? (hasCommittedWindow ? previousQuery : '')
+    const previousVisibleTier = windowState?.appliedSearchTier
+      ?? (hasCommittedWindow ? previousTier : 'title')
     const loadingKind = getLoadingKind({
       priority: args.priority,
       append,
       trimmedQuery,
-      previousQuery,
-      previousTier,
+      previousQuery: previousVisibleQuery,
+      previousTier: previousVisibleTier,
       nextTier: searchTier,
       hasCommittedWindow,
       hasCommittedItems,

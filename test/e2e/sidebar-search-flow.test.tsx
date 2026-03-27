@@ -224,6 +224,43 @@ describe('sidebar search flow (e2e)', () => {
     expect(screen.getByText('Deploy Pipeline')).toBeInTheDocument()
   })
 
+  it('renders preloaded requested search controls from sidebar state without local typing', async () => {
+    const store = createStore({
+      sessions: {
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [{
+              projectPath: '/proj',
+              sessions: [{
+                provider: 'claude',
+                sessionId: 'session-prefilled',
+                projectPath: '/proj',
+                lastActivityAt: 2_000,
+                title: 'Prefilled Result',
+              }],
+            }],
+            lastLoadedAt: 1_700_000_000_000,
+            query: 'prefilled',
+            searchTier: 'fullText',
+            appliedQuery: 'prefilled',
+            appliedSearchTier: 'fullText',
+            deepSearchPending: true,
+            loading: false,
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(() => vi.advanceTimersByTime(100))
+
+    expect(screen.getByPlaceholderText('Search...')).toHaveValue('prefilled')
+    expect(screen.getByRole('combobox', { name: /search tier/i })).toHaveValue('fullText')
+    expect(screen.getByLabelText('Clear search')).toBeInTheDocument()
+    expect(screen.getByText('Scanning files...')).toBeInTheDocument()
+  })
+
   it('matches subdirectory leaves and only shows matching open-tab fallbacks without pinning them above newer server results', async () => {
     const matchingFallbackSessionId = 'fallback-trycycle'
     vi.mocked(mockSearchSessions)
