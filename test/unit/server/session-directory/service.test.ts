@@ -133,6 +133,139 @@ describe('querySessionDirectory', () => {
     expect(page.items[2]?.snippet?.toLowerCase()).toContain('deploy')
   })
 
+  it('matches a title-tier query against the indexed project-path leaf and rejects ancestor-only path text', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/home/user/code/trycycle', [
+          makeSession({
+            sessionId: 'session-leaf',
+            projectPath: '/home/user/code/trycycle',
+            cwd: '/home/user/code/trycycle/server',
+            lastActivityAt: 900,
+            title: 'Routine work',
+            summary: 'Metadata without the query',
+            firstUserMessage: 'Still no query here',
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: {
+        priority: 'visible',
+        query: 'trycycle',
+        tier: 'title',
+      },
+    })
+
+    expect(page.items).toHaveLength(1)
+    expect(page.items[0]).toMatchObject({
+      sessionId: 'session-leaf',
+      matchedIn: 'title',
+      snippet: 'trycycle',
+    })
+
+    const ancestorOnlyPage = await querySessionDirectory({
+      projects: [
+        makeProject('/home/user/code/trycycle', [
+          makeSession({
+            sessionId: 'session-leaf',
+            projectPath: '/home/user/code/trycycle',
+            cwd: '/home/user/code/trycycle/server',
+            lastActivityAt: 900,
+            title: 'Routine work',
+            summary: 'Metadata without the query',
+            firstUserMessage: 'Still no query here',
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: {
+        priority: 'visible',
+        query: 'code',
+        tier: 'title',
+      },
+    })
+
+    expect(ancestorOnlyPage.items).toHaveLength(0)
+  })
+
+  it('keeps ordering and focused snippets for title-tier metadata and directory matches without providers', async () => {
+    const page = await querySessionDirectory({
+      projects: [
+        makeProject('/repo/title', [
+          makeSession({
+            sessionId: 'session-title',
+            projectPath: '/repo/title',
+            lastActivityAt: 1_300,
+            title: 'Trycycle rollout notes',
+          }),
+        ]),
+        makeProject('/repo/team/trycycle', [
+          makeSession({
+            sessionId: 'session-leaf',
+            projectPath: '/repo/team/trycycle',
+            cwd: '/repo/team/trycycle/server',
+            lastActivityAt: 1_250,
+            title: 'Routine work',
+          }),
+        ]),
+        makeProject('/repo/summary', [
+          makeSession({
+            sessionId: 'session-summary',
+            projectPath: '/repo/summary',
+            lastActivityAt: 1_100,
+            title: 'Routine work',
+            summary: 'This summary explains how the trycycle migration should roll out in production without surprises.',
+          }),
+        ]),
+        makeProject('/repo/first-user', [
+          makeSession({
+            sessionId: 'session-first-user',
+            projectPath: '/repo/first-user',
+            lastActivityAt: 1_000,
+            title: 'Routine work',
+            firstUserMessage: 'Please double-check the trycycle migration before shipping.',
+          }),
+        ]),
+        makeProject('/repo/archive/trycycle', [
+          makeSession({
+            sessionId: 'session-archived',
+            projectPath: '/repo/archive/trycycle',
+            lastActivityAt: 1_400,
+            archived: true,
+            title: 'Archived notes',
+          }),
+        ]),
+      ],
+      terminalMeta: [],
+      query: {
+        priority: 'visible',
+        query: 'trycycle',
+        tier: 'title',
+      },
+    })
+
+    expect(page.items.map((item) => item.sessionId)).toEqual([
+      'session-title',
+      'session-leaf',
+      'session-summary',
+      'session-first-user',
+      'session-archived',
+    ])
+    expect(page.items.map((item) => item.matchedIn)).toEqual([
+      'title',
+      'title',
+      'summary',
+      'firstUserMessage',
+      'title',
+    ])
+    expect(page.items.every((item) => (item.snippet?.length ?? 0) <= 140)).toBe(true)
+    expect(page.items[0]?.snippet?.toLowerCase()).toContain('trycycle')
+    expect(page.items[1]?.snippet).toBe('trycycle')
+    expect(page.items[2]?.snippet?.toLowerCase()).toContain('trycycle')
+    expect(page.items[3]?.snippet?.toLowerCase()).toContain('trycycle')
+    expect(page.items[4]?.snippet).toBe('trycycle')
+  })
+
   it('bounds page size and provides a deterministic cursor window', async () => {
     const firstPage = await querySessionDirectory({
       projects,

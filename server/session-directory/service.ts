@@ -3,6 +3,7 @@ import type { ProjectGroup } from '../coding-cli/types.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet, searchSessionFile } from '../session-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
+import { matchTitleTierMetadata } from '../../shared/session-title-search.js'
 import {
   buildSessionDirectoryComparableSnapshot,
   compareSessionDirectoryComparableItems,
@@ -63,20 +64,13 @@ function compareItems(a: SessionDirectoryItem, b: SessionDirectoryItem): number 
 }
 
 function applySearch(item: SessionDirectoryItem, queryText: string): SessionDirectoryItem | null {
-  const normalizedQuery = queryText.toLowerCase()
-  const searchable: Array<[SessionDirectoryItem['matchedIn'], string | undefined]> = [
-    ['title', item.title],
-    ['summary', item.summary],
-    ['firstUserMessage', item.firstUserMessage],
-  ]
-
-  const match = searchable.find(([, value]) => typeof value === 'string' && value.toLowerCase().includes(normalizedQuery))
-  if (!match || !match[1]) return null
+  const match = matchTitleTierMetadata(item, queryText)
+  if (!match) return null
 
   return {
     ...item,
-    matchedIn: match[0],
-    snippet: extractSnippet(match[1], queryText, 40).slice(0, 140),
+    matchedIn: match.matchedIn,
+    snippet: extractSnippet(match.matchedValue, queryText, 40).slice(0, 140),
   }
 }
 
