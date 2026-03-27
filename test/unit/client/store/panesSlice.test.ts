@@ -21,6 +21,7 @@ import panesReducer, {
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
+  clearDeadTerminals,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -2251,6 +2252,77 @@ describe('panesSlice', () => {
       expect(next.activePane['tab-1']).toBe('pane-1')
       expect(next.paneTitles['tab-1']).toEqual({ 'pane-1': 'Local title' })
       expect(next.paneTitleSetByUser['tab-1']).toEqual({ 'pane-1': true })
+    })
+  })
+
+  describe('clearDeadTerminals', () => {
+    it('clears terminal IDs not in the live list', () => {
+      const state: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running', terminalId: 'alive-1' },
+          } as any,
+          'tab-2': {
+            type: 'leaf',
+            id: 'p2',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r2', status: 'running', terminalId: 'dead-1' },
+          } as any,
+          'tab-3': {
+            type: 'leaf',
+            id: 'p3',
+            content: { kind: 'browser', url: 'https://example.com' },
+          } as any,
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: ['alive-1'] }))
+
+      // alive-1 should be preserved
+      const leaf1 = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf1.content as TerminalPaneContent).terminalId).toBe('alive-1')
+      expect((leaf1.content as TerminalPaneContent).status).toBe('running')
+
+      // dead-1 should be cleared
+      const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
+
+      // browser pane should be untouched
+      const leaf3 = next.layouts['tab-3'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf3.content.kind).toBe('browser')
+    })
+
+    it('handles server restart with empty live list', () => {
+      const state: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running', terminalId: 'old-1' },
+          } as any,
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: [] }))
+      const leaf = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf.content as TerminalPaneContent).status).toBe('creating')
     })
   })
 

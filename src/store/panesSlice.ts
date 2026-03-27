@@ -1270,6 +1270,37 @@ export const panesSlice = createSlice({
         }
       }
     },
+
+    clearDeadTerminals: (state, action: PayloadAction<{ liveTerminalIds: string[] }>) => {
+      const liveSet = new Set(action.payload.liveTerminalIds)
+
+      function clearDeadInNode(node: PaneNode): boolean {
+        if (node.type === 'leaf') {
+          if (
+            node.content?.kind === 'terminal' &&
+            node.content.terminalId &&
+            !liveSet.has(node.content.terminalId)
+          ) {
+            node.content.terminalId = undefined
+            node.content.status = 'creating'
+            return true
+          }
+          return false
+        }
+        if (node.type === 'split' && Array.isArray(node.children)) {
+          let changed = false
+          for (const child of node.children) {
+            if (clearDeadInNode(child)) changed = true
+          }
+          return changed
+        }
+        return false
+      }
+
+      for (const layout of Object.values(state.layouts)) {
+        clearDeadInNode(layout)
+      }
+    },
   },
 })
 
@@ -1299,6 +1330,7 @@ export const {
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
+  clearDeadTerminals,
 } = panesSlice.actions
 
 export default panesSlice.reducer

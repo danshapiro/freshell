@@ -55,6 +55,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { clearDeadTerminals } from '@/store/panesSlice'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -771,6 +772,7 @@ export default function App() {
             .map((t: any) => t.terminalId as string)
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
+          dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
           if (terminalMeta.length > 0) {
             dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta }))
           }
