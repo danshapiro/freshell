@@ -9,7 +9,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import type { ProjectGroup } from '@/store/types'
+import type { BackgroundTerminal, ProjectGroup } from '@/store/types'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -81,6 +81,7 @@ function createStore(options: {
     layouts: Record<string, any>
     activePane: Record<string, string>
     paneTitles?: Record<string, Record<string, string>>
+    paneTitleSetByUser?: Record<string, Record<string, boolean>>
   }
   terminals?: BackgroundTerminal[]
   excludeFirstChatSubstrings?: string[]
@@ -88,6 +89,7 @@ function createStore(options: {
   showSubagents?: boolean
   ignoreCodexSubagents?: boolean
   showNoninteractiveSessions?: boolean
+  sessionOpenMode?: 'tab' | 'split'
 }) {
   const serverSettings = mergeServerSettings(
     createDefaultServerSettings({
@@ -101,6 +103,9 @@ function createStore(options: {
     } satisfies ServerSettingsPatch,
   )
   const localSettings = resolveLocalSettings({
+    panes: {
+      sessionOpenMode: options.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
+    },
     sidebar: {
       sortMode: 'activity',
       showProjectBadges: true,
@@ -178,6 +183,7 @@ function createStore(options: {
         layouts: inferredLayouts,
         activePane: inferredActivePane,
         paneTitles: {},
+        paneTitleSetByUser: {},
       },
       sessions: {
         projects,
@@ -328,6 +334,7 @@ describe('sidebar click opens pane (e2e)', () => {
         { id: 'tab-1', mode: 'shell' },
       ],
       activeTabId: 'tab-1',
+      sessionOpenMode: 'split',
     })
 
     renderSidebar(store)

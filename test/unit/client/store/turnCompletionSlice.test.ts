@@ -149,6 +149,7 @@ describe('turnCompletionSlice', () => {
             layouts: { 'tab-1': layout },
             activePane: { 'tab-1': 'pane-1' },
             paneTitles: {},
+            paneTitleSetByUser: {},
           },
           settings: { settings: defaultSettings, loaded: true },
           turnCompletion: {

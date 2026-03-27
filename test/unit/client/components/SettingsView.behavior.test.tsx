@@ -414,7 +414,7 @@ describe('SettingsView behavior sections', () => {
       renderSettingsView(store)
       switchSettingsTab('Workspace')
 
-      expect(screen.getByText('New tab')).toBeInTheDocument()
+      expect(screen.getAllByText('New tab').length).toBeGreaterThan(0)
       expect(screen.getByText('Close tab')).toBeInTheDocument()
       expect(screen.getByText('Previous tab')).toBeInTheDocument()
       expect(screen.getByText('Next tab')).toBeInTheDocument()
@@ -429,8 +429,8 @@ describe('SettingsView behavior sections', () => {
       expect(screen.getAllByText('Alt').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Ctrl').length).toBeGreaterThan(0)
       expect(screen.getAllByText('Shift').length).toBeGreaterThan(0)
-      expect(screen.getByText('[')).toBeInTheDocument()
-      expect(screen.getByText(']')).toBeInTheDocument()
+      expect(screen.getAllByText('[').length).toBeGreaterThan(0)
+      expect(screen.getAllByText(']').length).toBeGreaterThan(0)
     })
   })
 
