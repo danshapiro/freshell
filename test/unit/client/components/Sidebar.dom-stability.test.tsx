@@ -7,7 +7,10 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer, { setSessionWindowData } from '@/store/sessionsSlice'
+import sessionsReducer, {
+  commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
+} from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
@@ -128,7 +131,7 @@ describe('Sidebar DOM stability', () => {
     const store = createSidebarStore()
 
     act(() => {
-      store.dispatch(setSessionWindowData({
+      store.dispatch(commitSessionWindowReplacement({
         surface: 'sidebar',
         projects: [
           {
@@ -152,7 +155,7 @@ describe('Sidebar DOM stability', () => {
     const stableBButton = screen.getByRole('button', { name: /Stable B/i })
 
     act(() => {
-      store.dispatch(setSessionWindowData({
+      store.dispatch(commitSessionWindowVisibleRefresh({
         surface: 'sidebar',
         projects: [
           {

@@ -1014,6 +1014,9 @@ describe('open tab session sidebar visibility (e2e)', () => {
       expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     })
 
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('search')
+
     const refreshRequest = store.dispatch((sessionsThunks as any).refreshActiveSessionWindow())
 
     await waitFor(() => {
@@ -1027,6 +1030,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
 
     expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
     expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
 
     await act(async () => {
       refreshDeferred.resolve({
@@ -1054,6 +1058,12 @@ describe('open tab session sidebar visibility (e2e)', () => {
         hasMore: false,
       })
       await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('')
+      expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
+      expect(screen.queryByText('Search Result')).not.toBeInTheDocument()
     })
 
     fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search plus' } })
