@@ -4,7 +4,7 @@
 
 **Goal:** Make sidebar title-tier search match a session's leaf subdirectory name and make active search show open-tab fallback sessions only when they truly match, without pinning them above other search results or corrupting in-flight browse/search replacement state.
 
-**Architecture:** Treat the `"title"` tier as metadata search, not literal title-only search. Add one shared pure matcher for title-tier metadata and use it in both the server query path and the client fallback-row gate. Keep sidebar search state split into requested context (`query/searchTier`) and visible applied context (`appliedQuery/appliedSearchTier`), then split session-window orchestration into two explicit flows: replacement requests that own requested state and visible refreshes that revalidate what is currently on screen without rewriting requested state or aborting the pending replacement request.
+**Architecture:** Treat the `"title"` tier as metadata search, not literal title-only search. Add one shared pure matcher for title-tier metadata and use it in both the server query path and the client fallback-row gate. Keep sidebar search state split into requested context (`query/searchTier`) and visible applied context (`appliedQuery/appliedSearchTier`), then split session-window orchestration into two explicit flows: replacement requests that own requested state for explicit browse/search changes and visible refreshes that revalidate the committed result set using applied-result identity (applied query/tier plus a committed-window version/token) without consulting requested state, rewriting requested state, or aborting a pending replacement request.
 
 **Tech Stack:** React 18, Redux Toolkit, Express, shared TypeScript utilities, Vitest, Testing Library
 
@@ -23,7 +23,8 @@
   `appliedQuery/appliedSearchTier` describe the result set currently stored in `projects` and must remain stable until replacement data commits.
 - Typing and in-flight query replacement must not locally re-filter the last committed result set. Selector search inputs must come from `appliedQuery/appliedSearchTier`, not the raw input box text or the just-requested query.
 - Clearing the search box starts a browse replacement request immediately, but the visible list remains the old applied search result set until browse data commits.
-- Visible refreshes are a separate contract from replacement requests. While requested and applied contexts differ, both `refreshActiveSessionWindow()` and queued invalidations must refresh the currently visible applied result set only. They must not rewrite `query/searchTier`, must not abort the pending replacement request, and must not discard that pending replacement when the refresh data commits.
+- Visible refreshes are a separate contract from replacement requests. `refreshActiveSessionWindow()` and queued invalidations revalidate the currently visible applied result set, not the next requested browse/search state. They must not rewrite `query/searchTier`, must not abort a pending browse/search replacement request, and must not discard that pending replacement when the refresh data commits.
+- Visible-refresh commit eligibility is based only on the visible applied result-set identity captured at refresh start. Capture the applied query/tier plus the committed window version/token (for example `lastLoadedAt` or an equivalent monotonic commit token). Requested state may drift again while the refresh is in flight; that alone must not block a valid visible-refresh commit. Only the visible result set changing out from under the refresh should invalidate it.
 - Once replacement data commits, `appliedQuery/appliedSearchTier` advance to the new result set, and subsequent refreshes follow that newly visible context.
 - Blocking first-load behavior stays unchanged: if there is no applied result set yet and search is loading, fallback rows remain hidden.
 
@@ -36,7 +37,7 @@
 - Modify: `src/store/sessionsSlice.ts`
   Responsibility: keep requested and applied sidebar search state separate at the reducer boundary so the visible result set has an explicit contract.
 - Modify: `src/store/sessionsThunks.ts`
-  Responsibility: split replacement requests from visible refreshes so refreshes during requested/applied drift cannot rewrite requested state or abort pending browse/search replacement.
+  Responsibility: split replacement requests from visible refreshes so refreshes revalidate the applied result set by visible-result identity, without rewriting requested state or aborting pending browse/search replacement.
 - Modify: `src/store/selectors/sidebarSelectors.ts`
   Responsibility: gate fallback rows from applied search context and disable tab pinning whenever an applied search is active.
 - Modify: `src/components/Sidebar.tsx`
@@ -65,6 +66,8 @@
 - Do refactor thunk/control-flow now. The blocker is not just reducer state; the request pipeline must distinguish replacement requests from visible refreshes.
 - Do not keep routing visible refreshes through the generic `fetchSessionWindow()` replacement path when requested and applied contexts differ.
 - Do not let the visible-refresh path own or replace the surface abort controller for a pending browse/search replacement request.
+- Do not make visible-refresh commit eligibility depend on requested `query/searchTier`. Requested state is future intent, not the authority for whether a visible refresh may commit.
+- Do not key visible-refresh safety to query/tier alone when the same applied context can be refreshed multiple times. Capture a visible-result version/token so an older refresh cannot overwrite a newer committed window that happens to share the same applied query/tier.
 - Do not let a visible-refresh commit rewrite requested `query/searchTier`, clear a pending browse/search replacement, or prematurely advance the applied context to browse mode.
 - Do not solve selector behavior by passing raw search-box text into `makeSelectSortedSessionItems()`. The selector must read applied search context from `sessions.windows.sidebar`.
 - Do not prefer `cwd` over `projectPath` for indexed sessions. Indexed rows should keep the project-path leaf as the canonical searchable subtitle; `cwd` is the fallback-only or secondary signal.
@@ -310,6 +313,8 @@ In `test/unit/client/store/sessionsThunks.test.ts`, add or tighten coverage that
 - clearing search starts a browse replacement request immediately, but the applied search context remains on the visible search results until browse data commits
 - while that search-to-browse drift exists, `queueActiveSessionWindowRefresh()` refreshes the visible applied search results silently, does not rewrite requested browse state, does not abort the pending browse request, and leaves the pending browse replacement alive to commit later
 - while that same drift exists, direct `refreshActiveSessionWindow()` follows the same visible-refresh contract instead of routing through the generic replacement path
+- while a visible refresh for query A is in flight, requested state may drift again to browse or query B and the refresh still commits if A is still the visible applied result set, leaving requested state untouched
+- if a newer commit replaces the visible result set before an older visible refresh resolves, the stale refresh is discarded instead of overwriting the newer committed window
 - once the browse replacement commits, `appliedQuery/appliedSearchTier` advance to browse mode and later refreshes follow browse state instead of the stale search
 
 Make the direct-refresh drift test assert the missing invariant explicitly:
@@ -344,14 +349,15 @@ In `src/store/sessionsThunks.ts`:
 
 - keep `fetchSessionWindow()` as the replacement-request path for explicit browse/search changes and pagination
 - add or refine a dedicated visible-refresh path that:
+  - captures the visible result-set identity at refresh start (applied query/tier plus the committed window version/token)
   - fetches using the currently applied visible context
-  - commits only if the requested context and visible context still match the expectations captured at refresh start
+  - commits only if that same visible result set is still on screen when the refresh resolves
+  - never consults requested context to decide commit eligibility
   - updates visible results without rewriting requested state
   - never aborts or replaces the controller for an in-flight browse/search replacement request
 - update `refreshActiveSessionWindow()` so:
-  - when requested and applied contexts already match, it can keep the existing direct-refresh semantics
-  - when requested and applied contexts differ, it uses the visible-refresh path instead of the replacement path
-- keep `queueActiveSessionWindowRefresh()` queue-based, but make its drift behavior use the same visible-refresh contract as direct refresh
+  - it uses the visible-refresh path for revalidating what is already on screen, rather than calling the replacement-request path
+- keep `queueActiveSessionWindowRefresh()` queue-based, but make it use the same visible-refresh helper as direct refresh; it may preserve existing loading chrome when a replacement request is already in flight, but it must not own or replace that replacement controller
 - preserve current two-phase deep-search behavior and current browse pagination behavior
 
 The key invariant is not optional: refreshing what is visible during drift must not mutate or cancel the pending replacement that will eventually replace it.
@@ -376,6 +382,7 @@ Refactor only after the targeted tests are green:
 
 - keep helper names aligned with the two contracts: replacement request vs visible refresh
 - remove any remaining path that infers "current visible query" from requested state during drift
+- verify visible-refresh commit guards are based on visible-result identity, not requested state, and that stale refreshes cannot overwrite a newer committed window with the same query/tier
 - verify silent refresh, abort behavior, and replacement commits remain consistent
 
 Run:

@@ -7,11 +7,11 @@ No new harnesses are required. The implementation plan stays within existing loc
 - **Sidebar search flow harness**: `test/e2e/sidebar-search-flow.test.tsx`. Real `Sidebar` + Redux store + mocked `searchSessions` and `fetchSidebarSessionsSnapshot`, with fake timers for debounce and direct DOM actions for typing, tier changes, and clearing. Estimated complexity: low fixture expansion. Depends on test 1.
 - **Sidebar component harness**: `test/unit/client/components/Sidebar.test.tsx`. Rendered `Sidebar` with preloaded store state, tabs/panes fixtures, and scroll geometry helpers for append behavior. Estimated complexity: low fixture expansion. Depends on tests 2-6.
 - **Open-tab App harness**: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`. Full `App` with mocked WebSocket invalidation and API calls. Estimated complexity: none beyond reusing an existing regression gate. Depends on test 7.
-- **Store harnesses**: `test/unit/client/store/sessionsThunks.test.ts` and `test/unit/client/store/sessionsSlice.test.ts`. Redux store with deferred promises for in-flight request timing plus direct reducer action coverage. Estimated complexity: none. Depends on tests 8-9.
-- **Selector harness**: `test/unit/client/store/selectors/sidebarSelectors.test.ts`. Pure selector state fixtures spanning server rows, synthesized fallback rows, tabs, panes, sort modes, and requested/applied search drift. Estimated complexity: low fixture expansion. Depends on tests 10-11.
-- **HTTP router harness**: `test/integration/server/session-directory-router.test.ts`. Express router round-trip via `supertest`. Estimated complexity: low fixture expansion. Depends on test 12.
-- **Service harness**: `test/unit/server/session-directory/service.test.ts`. Direct `querySessionDirectory()` calls with provider and file fixtures. Estimated complexity: low fixture expansion. Depends on test 13.
-- **Shared matcher harness**: `test/unit/shared/session-title-search.test.ts`. New pure unit harness for cross-platform path leaf extraction and metadata precedence. Estimated complexity: low. Depends on test 14.
+- **Store harnesses**: `test/unit/client/store/sessionsThunks.test.ts` and `test/unit/client/store/sessionsSlice.test.ts`. Redux store with deferred promises for in-flight request timing plus direct reducer action coverage. Estimated complexity: none. Depends on tests 8-10.
+- **Selector harness**: `test/unit/client/store/selectors/sidebarSelectors.test.ts`. Pure selector state fixtures spanning server rows, synthesized fallback rows, tabs, panes, sort modes, and requested/applied search drift. Estimated complexity: low fixture expansion. Depends on tests 11-12.
+- **HTTP router harness**: `test/integration/server/session-directory-router.test.ts`. Express router round-trip via `supertest`. Estimated complexity: low fixture expansion. Depends on test 13.
+- **Service harness**: `test/unit/server/session-directory/service.test.ts`. Direct `querySessionDirectory()` calls with provider and file fixtures. Estimated complexity: low fixture expansion. Depends on test 14.
+- **Shared matcher harness**: `test/unit/shared/session-title-search.test.ts`. New pure unit harness for cross-platform path leaf extraction and metadata precedence. Estimated complexity: low. Depends on test 15.
 
 Minor reconciliation adjustment: in addition to the implementation plan's unit/service coverage, keep the existing `/api/session-directory` router round-trip as an explicit acceptance gate because that is the transport contract the sidebar actually consumes.
 
@@ -77,7 +77,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
    **Harness:** Open-tab App harness
    **Preconditions:** The full app is mounted with committed search results in the sidebar and a WebSocket-driven refresh is triggered for the active query.
    **Actions:** Broadcast the refresh/invalidation event and keep the refresh request in flight long enough to observe the UI before it resolves.
-   **Expected outcome:** Source of truth: current user-visible refresh behavior already covered by the existing suite, plus the implementation plan requirement that component logic reason from the result set currently on screen. The existing search result rows remain visible and no extra search chrome appears during the silent refresh.
+   **Expected outcome:** Source of truth: current user-visible refresh behavior already covered by the existing suite, plus the implementation plan requirement that component logic reason from the result set currently on screen. The existing search result rows remain visible and no extra search chrome appears during the silent refresh. This scenario remains the broad UI regression gate; the store-level commit-authority invariants live in tests 8-9.
    **Interactions:** App-level WebSocket invalidation, `refreshActiveSessionWindow`, active-query reuse, and sidebar rendering under background work.
 
 8. **Name:** In-flight replacement requests move requested search state immediately but keep applied search state on the visible results until commit
@@ -89,7 +89,16 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
    **Expected outcome:** Source of truth: implementation plan Behavior Contract bullets for requested vs applied search state. `query/searchTier` change as soon as loading starts; `appliedQuery/appliedSearchTier` keep describing query A until query B data commits; clearing search starts a browse request but leaves the applied search context intact until browse data commits.
    **Interactions:** Thunk control flow, reducer commit boundary, abort handling, loading-kind classification, and browse/search request routing.
 
-9. **Name:** The reducer only advances applied search fields when new window data commits
+9. **Name:** Visible refresh commits against the same visible result set even if requested state drifts again, and stale refreshes cannot overwrite a newer committed window
+   **Type:** integration
+   **Disposition:** extend
+   **Harness:** Store harnesses (`sessionsThunks.test.ts`)
+   **Preconditions:** A store with committed sidebar search results for query A plus deferred promises for a visible refresh of A, a replacement request whose requested state moves to browse or query B, and a later replacement or refresh that can commit a newer visible window before the older refresh resolves.
+   **Actions:** Start a visible refresh for query A, then change requested state with a replacement request while leaving A visible; resolve the older visible refresh and inspect state. In a second phase, let a newer commit replace the visible window before the older visible refresh resolves, then resolve the stale refresh.
+   **Expected outcome:** Source of truth: implementation plan Behavior Contract bullets for visible-refresh authority. Requested-state drift alone does not invalidate the visible refresh: if query A is still the visible applied result set and the captured visible-window version/token is unchanged, the refresh may commit without rewriting requested state or cancelling the pending replacement. If a newer commit has already replaced the visible window, the stale refresh is discarded instead of overwriting newer data that happens to share the same query/tier.
+   **Interactions:** Visible-refresh commit guard, applied result-set identity token, replacement sequencing, stale response suppression, and requested-vs-applied drift.
+
+10. **Name:** The reducer only advances applied search fields when new window data commits
    **Type:** unit
    **Disposition:** extend
    **Harness:** Store harnesses (`sessionsSlice.test.ts`)
@@ -98,7 +107,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
    **Expected outcome:** Source of truth: implementation plan Strategy Gate and Behavior Contract sections describing `setSessionWindowLoading()` as a requested-state update and `setSessionWindowData()` as the commit point for the visible result set. Loading updates only `query/searchTier`; data commit updates both requested and applied fields to the newly committed values.
    **Interactions:** Pure reducer boundary for the visible-result-set contract.
 
-10. **Name:** Applied title search uses the shared metadata rules for fallback gating and rejects ancestor-only matches
+11. **Name:** Applied title search uses the shared metadata rules for fallback gating and rejects ancestor-only matches
     **Type:** invariant
     **Disposition:** extend
     **Harness:** Selector harness
@@ -107,7 +116,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
     **Expected outcome:** Source of truth: user transcript plus implementation plan Behavior Contract bullets on leaf-only directory matching, project-path precedence for indexed rows, fallback `cwd` matching, and no fallback injection for deep tiers. Indexed rows match on their leaf subtitle metadata, cwd-only fallback rows match on their leaf, ancestor-only `code` does not match, and deep tiers drop fallback rows entirely.
     **Interactions:** Shared metadata matcher contract, selector state inputs, fallback-row synthesis, and applied tier handling.
 
-11. **Name:** Applied search disables tab pinning in `activity` and `recency-pinned` modes while preserving archived-last ordering and ignoring requested-state drift
+12. **Name:** Applied search disables tab pinning in `activity` and `recency-pinned` modes while preserving archived-last ordering and ignoring requested-state drift
     **Type:** invariant
     **Disposition:** extend
     **Harness:** Selector harness
@@ -116,7 +125,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
     **Expected outcome:** Source of truth: implementation plan Behavior Contract bullets that search disables `hasTab` pinning regardless of sort mode, archived-last remains intact, and selector search behavior must come from applied fields rather than requested ones. During applied search, the older fallback row is not promoted above the newer non-tab row in either sort mode, archived rows remain last, and requested-state drift does not re-enable pinning or re-filter the visible set early. Without applied search, the existing pinning behavior stays unchanged.
     **Interactions:** Sort comparator behavior, archived grouping, requested vs applied state, and synthesized fallback rows.
 
-12. **Name:** `/api/session-directory` title-tier search matches the subdirectory leaf through the real HTTP contract and keeps the existing schema
+13. **Name:** `/api/session-directory` title-tier search matches the subdirectory leaf through the real HTTP contract and keeps the existing schema
     **Type:** integration
     **Disposition:** extend
     **Harness:** HTTP router harness
@@ -125,7 +134,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
     **Expected outcome:** Source of truth: user transcript, implementation plan Behavior Contract, and the unchanged `SessionDirectoryPage` schema in `shared/read-models.ts`. The `trycycle` query returns the matching session through the real endpoint; the `code` query does not return it on ancestor-only path text; the response shape stays in the current read-model contract, including existing `matchedIn` semantics and no new transport fields.
     **Interactions:** Router query parsing, service invocation, read-model schema validation, and title-tier provider-free search path.
 
-13. **Name:** Service-level title-tier search keeps ordering, snippet behavior, provider-free execution, and the existing low-risk performance guard after directory matching is added
+14. **Name:** Service-level title-tier search keeps ordering, snippet behavior, provider-free execution, and the existing low-risk performance guard after directory matching is added
     **Type:** integration
     **Disposition:** extend
     **Harness:** Service harness
@@ -134,7 +143,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
     **Expected outcome:** Source of truth: implementation plan Behavior Contract and Strategy Gate, especially the rules to keep title-tier metadata search provider-free and keep snippet extraction in the service. Directory matches preserve the canonical ordering and archived handling, metadata snippets stay bounded and query-focused, title-tier search still works without file providers, ancestor-only queries do not match, and the generous timing guard still catches catastrophic regressions without turning this task into performance work.
     **Interactions:** Projection ordering, server-side snippet extraction, provider lookup bypass for title tier, and metadata-only search cost.
 
-14. **Name:** Shared title-tier metadata matching extracts leaf directory names cross-platform and honors the required precedence
+15. **Name:** Shared title-tier metadata matching extracts leaf directory names cross-platform and honors the required precedence
     **Type:** unit
     **Disposition:** new
     **Harness:** Shared matcher harness
@@ -145,7 +154,7 @@ Minor reconciliation adjustment: in addition to the implementation plan's unit/s
 
 ## Coverage summary
 
-- **Covered action space:** typing into the sidebar search input; changing the search tier dropdown; clicking the clear-search button; triggering near-bottom scroll and underfilled-viewport append logic; rendering committed search results while replacement work is in flight; active-query refresh via app-level invalidation; selector merging of server rows with synthesized fallback rows from tabs/panes; HTTP `GET /api/session-directory` title-tier queries; service-level metadata search; shared path-leaf extraction.
+- **Covered action space:** typing into the sidebar search input; changing the search tier dropdown; clicking the clear-search button; triggering near-bottom scroll and underfilled-viewport append logic; rendering committed search results while replacement work is in flight; active-query refresh via app-level invalidation; visible-refresh commit ordering under requested-state drift; selector merging of server rows with synthesized fallback rows from tabs/panes; HTTP `GET /api/session-directory` title-tier queries; service-level metadata search; shared path-leaf extraction.
 - **Covered unchanged behaviors kept as regression gates:** first-load blocking search hides fallback tabs; active-query background refresh remains silent; title-tier search remains provider-free; archived-last ordering remains intact; existing read-model transport shape does not change.
 - **Explicitly excluded:** deep file-content matching correctness beyond fallback suppression, click-to-open session behavior, and terminal-directory/busy-indicator behavior. Those surfaces are unchanged by this task and already have dedicated coverage elsewhere.
 - **Risk carried by the exclusions:** if unrelated deep-search file scanning, session-open behavior, or terminal-state rendering regress at the same time, this plan will detect only the parts that overlap with applied search state and fallback gating, not every independent failure in those adjacent features.
