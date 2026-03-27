@@ -22,6 +22,7 @@
   `query/searchTier` track the current request and can change as soon as loading starts.
   `appliedQuery/appliedSearchTier` describe the result set currently stored in `projects` and must remain stable until `setSessionWindowData()` commits replacement data.
 - Typing and in-flight query replacement must not locally re-filter the last committed result set. Selector search inputs must come from `appliedQuery/appliedSearchTier`, not the raw input box text or the just-requested query.
+- Component logic that needs to know what result set is currently on screen must also use the applied fields. In particular, browse pagination must stay disabled while stale search results remain visible during a search-to-browse transition.
 - Blocking first-load behavior stays unchanged: if there is no applied result set yet and search is loading, fallback rows remain hidden.
 
 ## File Structure
@@ -34,6 +35,8 @@
   Responsibility: track both requested search state and applied search state per surface so selectors can reason about the visible result set without guessing from loading flags.
 - Modify: `src/store/selectors/sidebarSelectors.ts`
   Responsibility: mark fallback rows explicitly, gate fallback rows during applied search using the shared matcher against existing item metadata, and disable `hasTab` pinning while applied search is active without changing the selector's public signature.
+- Modify: `src/components/Sidebar.tsx`
+  Responsibility: keep search UI chrome driven by requested state, but use applied search state for visible-result-set decisions such as suppressing browse pagination while stale search results are still on screen.
 - Create: `test/unit/shared/session-title-search.test.ts`
   Responsibility: direct coverage for cross-platform leaf-directory extraction plus project-path-vs-cwd match precedence.
 - Modify: `test/unit/server/session-directory/service.test.ts`
@@ -57,6 +60,7 @@
 - Do not prefer `cwd` over `projectPath` for indexed sessions. The sidebar's indexed "subdirectory" comes from `projectPath`; `cwd` is only a secondary signal and the fallback-only path source.
 - Do not move snippet extraction into the shared helper. The shared matcher should answer "what matched?" while `server/session-directory/service.ts` keeps the existing `extractSnippet(...).slice(0, 140)` behavior.
 - Do not change the public call shape of `makeSelectSortedSessionItems()`. Read applied search context from `sessions.windows.sidebar` inside the selector so existing callers and tests do not need a new argument contract.
+- Do not leave `Sidebar.tsx`'s "committed search" checks on requested `query/searchTier`. Clearing the search box starts a browse request immediately, but the visible list is still the old applied search result set until replacement browse data lands.
 - Do not widen the read-model schema with a new `matchedIn` enum for directory matches. The `"title"` tier is already shorthand for metadata-only search, no current client flow distinguishes directory matches, and the clean steady state is to keep the existing transport contract stable.
 - Do not keep pinning "mostly on" during applied search. The user explicitly asked for search to stop pinning open tabs. The clean rule is: pinning is a browse-mode concern, not a search-mode concern.
 - Do not use raw full-path substring matching for the new behavior. Restrict matching to the leaf directory name so common ancestors like `code`, `src`, and home-directory segments do not produce noisy false positives.
@@ -295,6 +299,7 @@ git commit -m "refactor: track applied sidebar search state"
 
 **Files:**
 - Modify: `src/store/selectors/sidebarSelectors.ts`
+- Modify: `src/components/Sidebar.tsx`
 - Modify: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
 - Modify: `test/unit/client/components/Sidebar.test.tsx`
 - Modify: `test/e2e/sidebar-search-flow.test.tsx`
@@ -329,6 +334,7 @@ In `test/unit/client/components/Sidebar.test.tsx`, add component regressions for
 - a loaded title search plus a fallback open tab whose `cwd` leaf matches the query: both rows are visible, but the fallback row is not pinned above the newer server result
 - a loaded deep search: fallback tab rows stay hidden even if their title or directory would have matched locally
 - starting a replacement search while an older applied query is still displayed does not locally re-filter the old committed result set before the new server response arrives
+- clearing the search box while older applied search results are still visible does not release browse append pagination until browse data replaces that visible result set
 - existing blocking-load tests still hold: if there is no applied result set yet, fallback rows do not appear underneath the search spinner
 
 In `test/e2e/sidebar-search-flow.test.tsx`, add a user-visible flow that proves both halves of the requested behavior:
@@ -350,7 +356,7 @@ FRESHELL_TEST_SUMMARY="task3 sidebar search fallback gating" \
   test/e2e/sidebar-search-flow.test.tsx
 ```
 
-Expected: FAIL because the selector currently ignores applied search context, keeps fallback rows during search regardless of match status, and still pins `hasTab` rows in search mode.
+Expected: FAIL because the selector currently ignores applied search context, keeps fallback rows during search regardless of match status, still pins `hasTab` rows in search mode, and the sidebar component still treats requested `query` as the visible-result-set contract for append suppression.
 
 - [ ] **Step 3: Implement applied-search fallback gating and search-time unpinned sorting**
 
@@ -385,6 +391,12 @@ Behavior requirements:
 - project-mode ordering stays unchanged
 - update any loaded-search test fixtures to seed both requested and applied search fields when they represent already-visible results
 
+In `src/components/Sidebar.tsx`:
+
+- keep the input control, loading chrome, and tier dropdown driven by requested `query/searchTier`
+- switch "the list currently on screen is a search result set" decisions to `appliedQuery/appliedSearchTier`
+- specifically, keep browse append pagination disabled while `appliedQuery` is non-empty, even if the local input has already been cleared and a browse request is in flight
+
 - [ ] **Step 4: Re-run the targeted tests to verify they pass**
 
 Run:
@@ -405,7 +417,7 @@ Expected: PASS.
 Refactor only after the targeted tests are green:
 
 - remove any duplicated leaf-directory extraction logic introduced during the task
-- keep helper boundaries clear: shared metadata matching in `shared/`, applied-search state in `sessionsSlice`, selector policy in `sidebarSelectors`
+- keep helper boundaries clear: shared metadata matching in `shared/`, applied-search state in `sessionsSlice`, selector policy in `sidebarSelectors`, and visible-result-set policy in `Sidebar.tsx`
 - verify there is no regression in silent refresh, blocking-load, or deep-search pending behavior
 
 Run:
@@ -424,6 +436,7 @@ Expected: PASS.
 cd /home/user/code/freshell/.worktrees/trycycle-title-search-subdir-tabs
 git add \
   src/store/selectors/sidebarSelectors.ts \
+  src/components/Sidebar.tsx \
   test/unit/client/store/selectors/sidebarSelectors.test.ts \
   test/unit/client/components/Sidebar.test.tsx \
   test/e2e/sidebar-search-flow.test.tsx
