@@ -72,6 +72,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.projectColor !== bi.projectColor ||
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
+      ai.isFallback !== bi.isFallback ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -123,6 +124,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
+    a.isFallback === b.isFallback &&
     a.ratchetedActivity === b.ratchetedActivity &&
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
@@ -373,10 +375,14 @@ export default function Sidebar({
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
   const activeTerminalId = activeTab?.terminalId
-  const activeSearchTier = sidebarWindow?.searchTier ?? searchTier
+  const requestedSearchTier = sidebarWindow?.searchTier ?? searchTier
+  const appliedQuery = (sidebarWindow?.appliedQuery ?? '').trim()
+  const appliedSearchTier = sidebarWindow?.appliedSearchTier ?? 'title'
   const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
   const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
-  const activeQuery = (sidebarWindow?.query ?? filter).trim()
+  const requestedQuery = (sidebarWindow?.query ?? filter).trim()
+  const visibleQuery = appliedQuery || requestedQuery
+  const visibleSearchTier = appliedQuery ? appliedSearchTier : requestedSearchTier
   const loadingKind = sidebarWindow?.loadingKind
   const showBlockingLoad = !!sidebarWindow?.loading
     && loadingKind === 'initial'
@@ -388,8 +394,7 @@ export default function Sidebar({
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
   const localQuery = filter.trim()
-  const committedQuery = (sidebarWindow?.query ?? '').trim()
-  const hasActiveQuery = localQuery.length > 0 || committedQuery.length > 0
+  const hasActiveQuery = localQuery.length > 0 || appliedQuery.length > 0
 
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -652,11 +657,11 @@ export default function Sidebar({
           {showBlockingLoad ? (
             <div
               className="flex items-center justify-center py-8"
-              data-testid={activeQuery ? 'search-loading' : undefined}
+              data-testid={requestedQuery ? 'search-loading' : undefined}
             >
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               <span className="ml-2 text-sm text-muted-foreground">
-                {activeQuery ? 'Searching...' : 'Loading sessions...'}
+                {requestedQuery ? 'Searching...' : 'Loading sessions...'}
               </span>
             </div>
           ) : sortedItems.length === 0 ? (
@@ -667,9 +672,9 @@ export default function Sidebar({
             </div>
           ) : (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {activeQuery && activeSearchTier !== 'title'
+            {visibleQuery && visibleSearchTier !== 'title'
               ? 'No results found'
-              : activeQuery
+              : visibleQuery
               ? 'No matching sessions'
               : 'No sessions yet'}
           </div>
@@ -750,7 +755,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
-    a.projectPath === b.projectPath
+    a.projectPath === b.projectPath &&
+    a.isFallback === b.isFallback
   )
 }
 

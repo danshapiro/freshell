@@ -49,6 +49,8 @@ function createDeferred<T>() {
 function createStore(options?: {
   projects?: ProjectGroup[]
   sessions?: Record<string, unknown>
+  tabs?: any[]
+  panes?: any
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -90,10 +92,10 @@ function createStore(options?: {
         lastSavedAt: undefined,
       },
       tabs: {
-        tabs: [],
+        tabs: options?.tabs ?? [],
         activeTabId: null,
       },
-      panes: {
+      panes: options?.panes ?? {
         layouts: {},
         activePane: {},
         paneTitles: {},
@@ -139,6 +141,13 @@ function renderSidebar(store: ReturnType<typeof createStore>) {
     </Provider>,
   )
   return { ...result, onNavigate }
+}
+
+function getSidebarSessionOrder(labels: string[]): string[] {
+  const list = screen.getByTestId('sidebar-session-list')
+  return Array.from(list.querySelectorAll('button'))
+    .map((button) => labels.find((label) => button.textContent?.includes(label)))
+    .filter((label): label is string => Boolean(label))
 }
 
 describe('sidebar search flow (e2e)', () => {
@@ -213,6 +222,120 @@ describe('sidebar search flow (e2e)', () => {
 
     // Search results rendered
     expect(screen.getByText('Deploy Pipeline')).toBeInTheDocument()
+  })
+
+  it('matches subdirectory leaves and only shows matching open-tab fallbacks without pinning them above newer server results', async () => {
+    const matchingFallbackSessionId = 'fallback-trycycle'
+    vi.mocked(mockSearchSessions)
+      .mockResolvedValueOnce({
+        results: [
+          {
+            sessionId: 'server-newer',
+            provider: 'codex',
+            projectPath: '/proj/server',
+            title: 'Newer Server Result',
+            matchedIn: 'title',
+            lastActivityAt: 3_000,
+            archived: false,
+          },
+          {
+            sessionId: 'server-leaf',
+            provider: 'codex',
+            projectPath: '/proj/code/trycycle',
+            cwd: '/proj/code/trycycle/server',
+            title: 'Routine work',
+            matchedIn: 'title',
+            lastActivityAt: 2_500,
+            archived: false,
+          },
+        ],
+        tier: 'title',
+        query: 'trycycle',
+        totalScanned: 8,
+      } as any)
+      .mockResolvedValueOnce({
+        results: [],
+        tier: 'title',
+        query: 'code',
+        totalScanned: 8,
+      } as any)
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-fallback',
+        title: 'Open Trycycle Tab',
+        mode: 'codex',
+        resumeSessionId: matchingFallbackSessionId,
+        createdAt: 1_000,
+      }],
+      panes: {
+        layouts: {
+          'tab-fallback': {
+            type: 'leaf',
+            id: 'pane-fallback',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              status: 'running',
+              createRequestId: 'req-fallback',
+              resumeSessionId: matchingFallbackSessionId,
+              initialCwd: '/tmp/code/trycycle',
+            },
+          },
+        },
+        activePane: {
+          'tab-fallback': 'pane-fallback',
+        },
+        paneTitles: {
+          'tab-fallback': {
+            'pane-fallback': 'Open Trycycle Tab',
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(() => vi.advanceTimersByTime(100))
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'trycycle' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'trycycle',
+      tier: 'title',
+    }))
+    expect(screen.getByText('Routine work')).toBeInTheDocument()
+    expect(screen.getByText('Newer Server Result')).toBeInTheDocument()
+    expect(screen.getByText('Open Trycycle Tab')).toBeInTheDocument()
+    expect(getSidebarSessionOrder([
+      'Newer Server Result',
+      'Routine work',
+      'Open Trycycle Tab',
+    ])).toEqual([
+      'Newer Server Result',
+      'Routine work',
+      'Open Trycycle Tab',
+    ])
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'code' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(mockSearchSessions).toHaveBeenLastCalledWith(expect.objectContaining({
+      query: 'code',
+      tier: 'title',
+    }))
+    expect(screen.queryByText('Routine work')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open Trycycle Tab')).not.toBeInTheDocument()
   })
 
   it('deep-tier search shows title results first, then merged results after Phase 2', async () => {

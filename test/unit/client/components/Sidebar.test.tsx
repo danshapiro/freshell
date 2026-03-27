@@ -8,7 +8,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { setSessionWindowData } from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
@@ -63,6 +63,16 @@ const sessionId = (label: string) => {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
 function createTestStore(options?: {
   projects?: ProjectGroup[]
   sessions?: Record<string, unknown>
@@ -85,6 +95,7 @@ function createTestStore(options?: {
   serverInstanceId?: string
   sortMode?: 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
+  sessionOpenMode?: 'tab' | 'split'
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
   sessionOpenMode?: 'tab' | 'split'
@@ -150,6 +161,10 @@ function createTestStore(options?: {
             sortMode: options?.sortMode ?? 'activity',
             showProjectBadges: options?.showProjectBadges ?? true,
             hideEmptySessions: false,
+          },
+          panes: {
+            ...defaultSettings.panes,
+            sessionOpenMode: options?.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
           },
         },
         loaded: true,
@@ -253,10 +268,18 @@ function triggerNearBottomScroll(
   fireEvent.scroll(node)
 }
 
+function getSidebarSessionOrder(labels: string[]): string[] {
+  const list = screen.getByTestId('sidebar-session-list')
+  return Array.from(list.querySelectorAll('button'))
+    .map((button) => labels.find((label) => button.textContent?.includes(label)))
+    .filter((label): label is string => Boolean(label))
+}
+
 describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    vi.mocked(mockSearchSessions).mockReset()
     mockFetchSidebarSessionsSnapshot.mockReset()
     mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
     mockGetTerminalDirectoryPage.mockReset()
@@ -1364,14 +1387,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.activeTabId).toBe('existing-tab-id')
     })
 
-    // Note: Tests for running sessions require complex WebSocket mocking that is currently
-    // broken in the test setup. The implementation is verified to be correct through:
-    // 1. Code review - handleItemClick checks for existing tab before creating new one
-    // 2. The non-running session test passes, which uses the same pattern
-    // 3. Manual testing
-    //
-    // TODO: Fix WebSocket mock to properly simulate terminal.list responses with fake timers
-    it.skip('switches to existing tab when clicking running session that has a tab', async () => {
+    it('switches to existing tab when clicking running session that has a tab', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -1407,20 +1423,44 @@ describe('Sidebar Component - Session-Centric Display', () => {
           id: 'existing-tab-for-terminal',
           terminalId: 'running-terminal-id',
           mode: 'claude' as const,
+          resumeSessionId: sessionId('session-running'),
         },
       ]
 
-      const store = createTestStore({ projects, tabs: existingTabs, activeTabId: null, sortMode: 'activity' })
+      const panes = {
+        layouts: {
+          'existing-tab-for-terminal': {
+            type: 'leaf',
+            id: 'pane-running',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-running',
+              status: 'running',
+              terminalId: 'running-terminal-id',
+              resumeSessionId: sessionId('session-running'),
+            },
+          },
+        },
+        activePane: {
+          'existing-tab-for-terminal': 'pane-running',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({
+        projects,
+        tabs: existingTabs,
+        panes,
+        activeTabId: null,
+        sortMode: 'activity',
+      })
       const { onNavigate } = renderSidebar(store, terminals)
 
       // Advance timers to process the mock response and wait for state update
       await act(async () => {
         vi.advanceTimersByTime(100)
       })
-
-      // Verify the "Running" section appears (confirms terminals are loaded)
-      const runningSection = screen.queryByText('Running')
-      expect(runningSection).not.toBeNull()
 
       const sessionButton = screen.getByText('Running session').closest('button')
       fireEvent.click(sessionButton!)
@@ -2302,6 +2342,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               loading: false,
               query: 'search',
               searchTier: 'title',
+              appliedQuery: 'search',
+              appliedSearchTier: 'title',
             },
           },
         },
@@ -2612,7 +2654,26 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
 
-      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1', sessionOpenMode: 'split' })
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({ projects, tabs, panes, activeTabId: 'tab-1', sessionOpenMode: 'split' })
       const { onNavigate } = renderSidebar(store, [])
 
       await act(async () => {
@@ -3011,6 +3072,452 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(statusElement).toBeInTheDocument()
       expect(statusElement.getAttribute('aria-live')).toBe('polite')
       expect(statusElement.textContent).toContain('Scanning files...')
+    })
+  })
+
+  describe('applied search fallback behavior', () => {
+    it('shows only matching title-search fallback tabs and keeps them unpinned below newer server results', async () => {
+      const matchingFallbackSessionId = sessionId('matching-fallback')
+      const unrelatedFallbackSessionId = sessionId('unrelated-fallback')
+      const searchProjects: ProjectGroup[] = [
+        {
+          projectPath: '/work/server',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'server-newer',
+              projectPath: '/work/server',
+              lastActivityAt: 3_000,
+              title: 'Newer Server Result',
+            },
+          ],
+        },
+        {
+          projectPath: '/work/repos/trycycle',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'server-leaf',
+              projectPath: '/work/repos/trycycle',
+              cwd: '/work/repos/trycycle/server',
+              lastActivityAt: 2_500,
+              title: 'Routine work',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects: searchProjects,
+        tabs: [
+          {
+            id: 'tab-match',
+            title: 'Matching Fallback',
+            mode: 'codex',
+            resumeSessionId: matchingFallbackSessionId,
+            createdAt: 1_000,
+          },
+          {
+            id: 'tab-unrelated',
+            title: 'Unrelated Fallback',
+            mode: 'codex',
+            resumeSessionId: unrelatedFallbackSessionId,
+            createdAt: 900,
+          },
+        ],
+        panes: {
+          layouts: {
+            'tab-match': {
+              type: 'leaf',
+              id: 'pane-match',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-match',
+                status: 'running',
+                resumeSessionId: matchingFallbackSessionId,
+                initialCwd: '/tmp/local/trycycle',
+              },
+            },
+            'tab-unrelated': {
+              type: 'leaf',
+              id: 'pane-unrelated',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-unrelated',
+                status: 'running',
+                resumeSessionId: unrelatedFallbackSessionId,
+                initialCwd: '/tmp/local/elsewhere',
+              },
+            },
+          },
+          activePane: {
+            'tab-match': 'pane-match',
+            'tab-unrelated': 'pane-unrelated',
+          },
+          paneTitles: {
+            'tab-match': {
+              'pane-match': 'Matching Fallback',
+            },
+            'tab-unrelated': {
+              'pane-unrelated': 'Unrelated Fallback',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: searchProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: searchProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              query: 'trycycle',
+              searchTier: 'title',
+              appliedQuery: 'trycycle',
+              appliedSearchTier: 'title',
+              loading: false,
+            },
+          },
+        },
+        sortMode: 'activity',
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Newer Server Result')).toBeInTheDocument()
+      expect(screen.getByText('Routine work')).toBeInTheDocument()
+      expect(screen.getByText('Matching Fallback')).toBeInTheDocument()
+      expect(screen.queryByText('Unrelated Fallback')).not.toBeInTheDocument()
+      expect(getSidebarSessionOrder([
+        'Newer Server Result',
+        'Routine work',
+        'Matching Fallback',
+      ])).toEqual([
+        'Newer Server Result',
+        'Routine work',
+        'Matching Fallback',
+      ])
+    })
+
+    it('hides fallback tabs entirely while a deep-search result set is on screen', async () => {
+      const deepFallbackSessionId = sessionId('deep-fallback')
+      const deepProjects: ProjectGroup[] = [
+        {
+          projectPath: '/work/deep',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId: 'deep-server',
+              projectPath: '/work/deep',
+              lastActivityAt: 3_000,
+              title: 'Deep Search Result',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects: deepProjects,
+        tabs: [{
+          id: 'tab-deep',
+          title: 'Deep Matching Fallback',
+          mode: 'codex',
+          resumeSessionId: deepFallbackSessionId,
+          createdAt: 1_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-deep': {
+              type: 'leaf',
+              id: 'pane-deep',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-deep',
+                status: 'running',
+                resumeSessionId: deepFallbackSessionId,
+                initialCwd: '/tmp/local/trycycle',
+              },
+            },
+          },
+          activePane: {
+            'tab-deep': 'pane-deep',
+          },
+          paneTitles: {
+            'tab-deep': {
+              'pane-deep': 'Deep Matching Fallback',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: deepProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: deepProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              query: 'trycycle',
+              searchTier: 'fullText',
+              appliedQuery: 'trycycle',
+              appliedSearchTier: 'fullText',
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Deep Search Result')).toBeInTheDocument()
+      expect(screen.queryByText('Deep Matching Fallback')).not.toBeInTheDocument()
+    })
+
+    it('keeps the previous applied title-search result set visible while a replacement search is loading', async () => {
+      const replacementSearch = createDeferred<any>()
+      const alphaFallbackSessionId = sessionId('alpha-fallback')
+      const betaFallbackSessionId = sessionId('beta-fallback')
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(replacementSearch.promise)
+
+      const alphaProjects: ProjectGroup[] = [
+        {
+          projectPath: '/work/alpha',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'alpha-server',
+              projectPath: '/work/alpha',
+              lastActivityAt: 3_000,
+              title: 'Alpha Server Result',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects: alphaProjects,
+        tabs: [
+          {
+            id: 'tab-alpha-fallback',
+            title: 'Alpha Fallback',
+            mode: 'codex',
+            resumeSessionId: alphaFallbackSessionId,
+            createdAt: 1_000,
+          },
+          {
+            id: 'tab-beta-fallback',
+            title: 'Beta Fallback',
+            mode: 'codex',
+            resumeSessionId: betaFallbackSessionId,
+            createdAt: 900,
+          },
+        ],
+        panes: {
+          layouts: {
+            'tab-alpha-fallback': {
+              type: 'leaf',
+              id: 'pane-alpha-fallback',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-alpha-fallback',
+                status: 'running',
+                resumeSessionId: alphaFallbackSessionId,
+                initialCwd: '/tmp/local/alpha',
+              },
+            },
+            'tab-beta-fallback': {
+              type: 'leaf',
+              id: 'pane-beta-fallback',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-beta-fallback',
+                status: 'running',
+                resumeSessionId: betaFallbackSessionId,
+                initialCwd: '/tmp/local/beta',
+              },
+            },
+          },
+          activePane: {
+            'tab-alpha-fallback': 'pane-alpha-fallback',
+            'tab-beta-fallback': 'pane-beta-fallback',
+          },
+          paneTitles: {
+            'tab-alpha-fallback': {
+              'pane-alpha-fallback': 'Alpha Fallback',
+            },
+            'tab-beta-fallback': {
+              'pane-beta-fallback': 'Beta Fallback',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: alphaProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: alphaProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              query: 'alpha',
+              searchTier: 'title',
+              appliedQuery: 'alpha',
+              appliedSearchTier: 'title',
+              loading: false,
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      try {
+        fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'beta' } })
+
+        await act(async () => {
+          vi.advanceTimersByTime(350)
+          await Promise.resolve()
+        })
+
+        expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+        expect(screen.getByText('Alpha Server Result')).toBeInTheDocument()
+        expect(screen.getByText('Alpha Fallback')).toBeInTheDocument()
+        expect(screen.queryByText('Beta Fallback')).not.toBeInTheDocument()
+      } finally {
+        replacementSearch.resolve({
+          results: [],
+          tier: 'title',
+          query: 'beta',
+          totalScanned: 0,
+        })
+
+        await act(async () => {
+          await Promise.resolve()
+          await Promise.resolve()
+        })
+      }
+    })
+
+    it('keeps browse append disabled until browse data replaces stale applied search results', async () => {
+      vi.useRealTimers()
+
+      const browseProjects: ProjectGroup[] = [{
+        projectPath: '/browse',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'browse-session',
+          projectPath: '/browse',
+          lastActivityAt: 20,
+          title: 'Browse Session',
+        }],
+      }]
+
+      mockFetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-session',
+            projectPath: '/older',
+            lastActivityAt: 10,
+            title: 'Older Session',
+          }],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 10,
+        oldestIncludedSessionId: 'codex:older-session',
+        hasMore: false,
+      })
+
+      const store = createTestStore({
+        projects: [{
+          projectPath: '/search',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'search-session',
+            projectPath: '/search',
+            lastActivityAt: 30,
+            title: 'Search Result',
+          }],
+        }],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [{
+            projectPath: '/search',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'search-session',
+              projectPath: '/search',
+              lastActivityAt: 30,
+              title: 'Search Result',
+            }],
+          }],
+          lastLoadedAt: 1_700_000_000_000,
+          hasMore: true,
+          oldestLoadedTimestamp: 30,
+          oldestLoadedSessionId: 'codex:search-session',
+          windows: {
+            sidebar: {
+              projects: [{
+                projectPath: '/search',
+                sessions: [{
+                  provider: 'codex',
+                  sessionId: 'search-session',
+                  projectPath: '/search',
+                  lastActivityAt: 30,
+                  title: 'Search Result',
+                }],
+              }],
+              lastLoadedAt: 1_700_000_000_000,
+              hasMore: true,
+              oldestLoadedTimestamp: 30,
+              oldestLoadedSessionId: 'codex:search-session',
+              loading: true,
+              loadingKind: 'search',
+              query: '',
+              searchTier: 'title',
+              appliedQuery: 'search',
+              appliedSearchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+      const list = screen.getByTestId('sidebar-session-list')
+
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+
+      await act(async () => {
+        store.dispatch(setSessionWindowData({
+          surface: 'sidebar',
+          projects: browseProjects,
+          totalSessions: 1,
+          hasMore: true,
+          oldestLoadedTimestamp: 20,
+          oldestLoadedSessionId: 'codex:browse-session',
+          query: '',
+          searchTier: 'title',
+        }))
+      })
+
+      triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
+
+      await waitFor(() => {
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+          limit: 50,
+          before: 20,
+          beforeId: 'codex:browse-session',
+          signal: expect.any(AbortSignal),
+        }))
+      })
+      await waitFor(() => {
+        expect(screen.getByText('Older Session')).toBeInTheDocument()
+      })
     })
   })
 })

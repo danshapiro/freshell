@@ -114,6 +114,9 @@ function createStore(options: {
       showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
       hideEmptySessions: false,
     },
+    panes: {
+      sessionOpenMode: options.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
+    },
   })
 
   const projects = options.projects.map((project) => ({
