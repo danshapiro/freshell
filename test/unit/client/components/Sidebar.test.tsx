@@ -2046,6 +2046,48 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(searchInput).toHaveClass('pr-36')
     })
 
+    it('hides search chrome when clearing to browse while stale search results remain visible', async () => {
+      const searchProjects: ProjectGroup[] = [{
+        projectPath: '/work/search',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/work/search',
+          lastActivityAt: 1_700_000_000_000,
+          title: 'Search Result',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: searchProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: searchProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: searchProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              loadingKind: 'search',
+              query: '',
+              searchTier: 'title',
+              appliedQuery: 'search',
+              appliedSearchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      const searchInput = getByPlaceholderText('Search...')
+
+      expect(searchInput).toHaveValue('')
+      expect(screen.getByText('Search Result')).toBeInTheDocument()
+      expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+      expect(screen.queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
+    })
+
     it('keeps a loaded empty-state message visible during refresh', async () => {
       const store = createTestStore({
         projects: [],
