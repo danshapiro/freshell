@@ -3,13 +3,6 @@ import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ToolStrip from '@/components/agent-chat/ToolStrip'
 import type { ToolPair } from '@/components/agent-chat/ToolStrip'
-import {
-  BROWSER_PREFERENCES_STORAGE_KEY,
-  getToolStripExpandedPreference,
-  loadBrowserPreferencesRecord,
-} from '@/lib/browser-preferences'
-
-const LEGACY_TOOL_STRIP_STORAGE_KEY = 'freshell:toolStripExpanded'
 
 function makePair(
   name: string,
@@ -29,79 +22,103 @@ function makePair(
 
 describe('ToolStrip', () => {
   beforeEach(() => {
-    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
-    localStorage.removeItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
+    localStorage.clear()
   })
   afterEach(cleanup)
 
-  it('renders collapsed by default showing the latest tool preview', () => {
+  it('starts expanded when showTools is true', () => {
     const pairs = [
       makePair('Bash', { command: 'echo hello' }, 'hello'),
       makePair('Read', { file_path: '/path/file.ts' }, 'content'),
     ]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
-    // Collapsed: shows "2 tools used"
-    expect(screen.getByText('2 tools used')).toBeInTheDocument()
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
   })
 
-  it('always shows chevron button', () => {
+  it('always shows chevron button when showTools is true', () => {
     const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
     expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
   })
 
-  it('uses compact spacing in collapsed mode', () => {
+  it('uses compact spacing in expanded mode', () => {
     const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
-    const { container } = render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    const { container } = render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
     const strip = screen.getByRole('region', { name: /tool strip/i })
     expect(strip.className).toContain('my-0.5')
-
-    const collapsedRow = container.querySelector('[aria-label="Tool strip"] > div') as HTMLElement
-    expect(collapsedRow.className).toContain('py-0.5')
   })
 
-  it('expands on chevron click and persists to browser preferences', async () => {
-    const user = userEvent.setup()
+  it('starts collapsed when showTools is false', () => {
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
     ]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+  })
+
+  it('strip toggle is session-only (not persisted to localStorage)', async () => {
+    const user = userEvent.setup()
+    const pairs = [makePair('Bash', { command: 'ls' }, 'file1\nfile2')]
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
 
     const toggle = screen.getByRole('button', { name: /toggle tool details/i })
     await user.click(toggle)
 
-    // Expanded: should show individual ToolBlock
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-    // Persisted
-    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(true)
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    expect(localStorage.getItem('freshell:browser-preferences')).toBeNull()
   })
 
-  it('starts expanded when browser preferences have a stored preference', () => {
-    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
-      toolStrip: { expanded: true },
-    }))
-    const pairs = [
-      makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
-    ]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
-    // Should show individual ToolBlock
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-  })
-
-  it('collapses on second chevron click and stores false in browser preferences', async () => {
-    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
-      toolStrip: { expanded: true },
-    }))
+  it('collapses on second chevron click', async () => {
     const user = userEvent.setup()
     const pairs = [makePair('Bash', { command: 'ls' }, 'file1')]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
 
     const toggle = screen.getByRole('button', { name: /toggle tool details/i })
     await user.click(toggle)
-
-    // Should be collapsed again
     expect(screen.getByText('1 tool used')).toBeInTheDocument()
-    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(false)
+  })
+
+  it('ToolBlocks start expanded when showTools is true', () => {
+    const pairs = [
+      makePair('Bash', { command: 'ls' }, 'output'),
+    ]
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+
+    const toolButton = screen.getByRole('button', { name: /Bash tool call/i })
+    expect(toolButton).toBeInTheDocument()
+    expect(toolButton).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('ToolBlocks are not visible when showTools is false', () => {
+    const pairs = [
+      makePair('Bash', { command: 'ls' }, 'output'),
+    ]
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
+
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+  })
+
+  it('individual ToolBlock toggles work independently', async () => {
+    const user = userEvent.setup()
+    const pairs = [
+      makePair('Bash', { command: 'ls' }, 'output1'),
+      makePair('Read', { file_path: 'f.ts' }, 'output2'),
+    ]
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+
+    const toolButtons = screen.getAllByRole('button', { name: /tool call/i })
+    expect(toolButtons).toHaveLength(2)
+    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'true')
+    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
+
+    await user.click(toolButtons[0])
+    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'false')
+    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
   })
 
   it('shows streaming tool activity when isStreaming is true', () => {
@@ -109,28 +126,28 @@ describe('ToolStrip', () => {
       makePair('Bash', { command: 'echo hello' }, 'hello'),
       makePair('Read', { file_path: '/path/to/file.ts' }),
     ]
-    render(<ToolStrip pairs={pairs} isStreaming={true} />)
-    // Should show the currently running tool's info
-    expect(screen.getByText('Read')).toBeInTheDocument()
+    render(<ToolStrip pairs={pairs} isStreaming={true} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
   })
 
-  it('shows "N tools used" when all tools are complete and not streaming', () => {
+  it('shows all tools when complete', () => {
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'output'),
       makePair('Read', { file_path: 'f.ts' }, 'content'),
       makePair('Grep', { pattern: 'foo' }, 'bar'),
     ]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
-    expect(screen.getByText('3 tools used')).toBeInTheDocument()
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Grep tool call/i })).toBeInTheDocument()
   })
 
   it('renders with error indication when any tool has isError', () => {
     const pairs = [
       makePair('Bash', { command: 'false' }, 'error output', true),
     ]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
-    // The strip should still render; error styling is at the ToolBlock level in expanded view
-    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('shows hasErrors indicator in collapsed mode when a tool errored', () => {
@@ -138,63 +155,51 @@ describe('ToolStrip', () => {
       makePair('Bash', { command: 'false' }, 'error output', true),
       makePair('Read', { file_path: 'f.ts' }, 'content'),
     ]
-    const { container } = render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    const { container } = render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
     const strip = screen.getByRole('region', { name: /tool strip/i })
     expect(strip).toBeInTheDocument()
-    // Collapsed row should have the error border color instead of the normal tool color
     const collapsedRow = container.querySelector('.border-l-\\[hsl\\(var\\(--claude-error\\)\\)\\]')
     expect(collapsedRow).toBeInTheDocument()
   })
 
   it('renders accessible region with aria-label', () => {
     const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
-    render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
     expect(screen.getByRole('region', { name: /tool strip/i })).toBeInTheDocument()
   })
 
-  it('always shows collapsed view when showTools is false, even if localStorage says expanded', () => {
-    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
-      toolStrip: { expanded: true },
-    }))
+  it('always shows collapsed view when showTools is false', () => {
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
       makePair('Read', { file_path: '/path/file.ts' }, 'content'),
     ]
     render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
-    // Should show collapsed summary text
     expect(screen.getByText('2 tools used')).toBeInTheDocument()
-    // Chevron toggle should NOT be rendered
     expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
-    // Individual ToolBlocks should NOT be rendered
     expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
   })
 
-  it('passes autoExpandAbove props through to ToolBlocks in expanded mode', async () => {
-    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
-      toolStrip: { expanded: true },
-    }))
-    const pairs = [
-      makePair('Bash', { command: 'echo 1' }, 'output1'),
-      makePair('Bash', { command: 'echo 2' }, 'output2'),
-      makePair('Bash', { command: 'echo 3' }, 'output3'),
-    ]
-    render(
-      <ToolStrip pairs={pairs} isStreaming={false} autoExpandAbove={1} completedToolOffset={0} />
-    )
+  it('resets to showTools default when component remounts', async () => {
+    const user = userEvent.setup()
+    const pairs = [makePair('Bash', { command: 'ls' }, 'file1')]
 
-    const toolButtons = screen.getAllByRole('button', { name: /Bash tool call/i })
-    expect(toolButtons).toHaveLength(3)
-    // Tool at index 0 (globalIndex=0) should be collapsed (below autoExpandAbove=1)
-    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'false')
-    // Tools at indices 1,2 (globalIndex=1,2) should be expanded (>= autoExpandAbove=1)
-    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
-    expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
+    const { unmount } = render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    unmount()
+
+    cleanup()
+
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
-  it('migrates the legacy tool-strip key through the browser preferences helper', () => {
-    localStorage.setItem(LEGACY_TOOL_STRIP_STORAGE_KEY, 'true')
-
-    expect(getToolStripExpandedPreference()).toBe(true)
-    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(true)
+  it('defaults to showTools=true when not specified', () => {
+    const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
+    render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 })

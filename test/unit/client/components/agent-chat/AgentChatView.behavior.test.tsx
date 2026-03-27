@@ -292,15 +292,12 @@ describe('AgentChatView turn-pairing edge cases', () => {
   })
 })
 
-describe('AgentChatView auto-expand', () => {
+describe('AgentChatView tool blocks expanded by default', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
   })
 
-  it('auto-expands the most recent tool blocks', () => {
-    // Tool strips are collapsed by default; set expanded to test auto-expand behavior
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+  it('all tool blocks start expanded when showTools is true', () => {
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     // Create a turn with 5 completed tools
@@ -312,16 +309,13 @@ describe('AgentChatView auto-expand', () => {
       </Provider>,
     )
 
-    // With RECENT_TOOLS_EXPANDED=3, the last 3 tools should be expanded
-    // and the first 2 collapsed. Check for expanded tool blocks via aria-expanded.
+    // With showTools=true (default), all tools should start expanded
     const toolButtons = screen.getAllByRole('button', { name: /tool call/i })
     expect(toolButtons).toHaveLength(5)
 
-    // First 2 should be collapsed (aria-expanded=false)
-    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'false')
-    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'false')
-
-    // Last 3 should be expanded (aria-expanded=true)
+    // All tools should be expanded (aria-expanded=true)
+    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'true')
+    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[3]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[4]).toHaveAttribute('aria-expanded', 'true')
