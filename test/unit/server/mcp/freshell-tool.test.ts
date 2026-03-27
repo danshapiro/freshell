@@ -1,7 +1,4 @@
-// Tests for the Freshell MCP tool action router.
-// Validates action dispatch, target resolution, and error handling.
-
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const mockClient = vi.hoisted(() => ({
   get: vi.fn(),
@@ -33,9 +30,30 @@ describe('TOOL_DESCRIPTION and INSTRUCTIONS', () => {
     expect(TOOL_DESCRIPTION).toContain('screenshot')
   })
 
-  it('INSTRUCTIONS is a non-empty string mentioning Freshell', () => {
+  it('INSTRUCTIONS contains mental model, pane kinds, picker warning, targets, and gotchas', () => {
     expect(INSTRUCTIONS).toBeTruthy()
     expect(INSTRUCTIONS.toLowerCase()).toContain('freshell')
+    // Mental model section
+    expect(INSTRUCTIONS).toContain('Mental model')
+    expect(INSTRUCTIONS).toContain('terminal')
+    expect(INSTRUCTIONS).toContain('editor')
+    expect(INSTRUCTIONS).toContain('browser')
+    expect(INSTRUCTIONS).toContain('agent-chat')
+    expect(INSTRUCTIONS).toContain('picker')
+    // Picker warning
+    expect(INSTRUCTIONS).toContain('Picker panes are ephemeral')
+    // Targets section
+    expect(INSTRUCTIONS).toContain('Targets')
+    expect(INSTRUCTIONS).toContain('tab ID or exact tab title')
+    expect(INSTRUCTIONS).toContain('pane ID')
+    // Key gotchas
+    expect(INSTRUCTIONS).toContain('literal mode')
+    expect(INSTRUCTIONS).toContain('wait-for')
+    expect(INSTRUCTIONS).toContain('stable')
+    expect(INSTRUCTIONS).toContain('50 PTY limit')
+    // tmux compatibility
+    expect(INSTRUCTIONS).toContain('tmux')
+    expect(INSTRUCTIONS).toContain('new-window')
   })
 
   it('INPUT_SCHEMA has action and params fields', () => {
@@ -117,19 +135,25 @@ describe('executeAction -- pane actions', () => {
   })
 
   it('list-panes with tab target calls GET /api/panes?tabId=...', async () => {
+    // First call: GET /api/tabs to resolve target 't1' (matched by ID)
     mockClient.get
       .mockResolvedValueOnce({ data: { tabs: [{ id: 't1', title: 'Tab1' }], activeTabId: 't1' } })
+      // Second call: GET /api/panes?tabId=t1
       .mockResolvedValueOnce({ panes: [] })
     await executeAction('list-panes', { target: 't1' })
     expect(mockClient.get).toHaveBeenCalledWith(expect.stringMatching(/\/api\/panes\?tabId=t1/))
   })
 
   it('list-panes resolves tab title to tabId via resolveTabTarget', async () => {
+    // First call: GET /api/tabs to resolve "Work" -> "t1"
     mockClient.get
       .mockResolvedValueOnce({ data: { tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' } })
+      // Second call: GET /api/panes?tabId=t1
       .mockResolvedValueOnce({ data: { panes: [{ id: 'p1', index: 0 }] } })
-    await executeAction('list-panes', { target: 'Work' })
+    const result = await executeAction('list-panes', { target: 'Work' })
+    // The panes call must use the resolved tab ID, not the raw title
     expect(mockClient.get).toHaveBeenCalledWith(expect.stringMatching(/\/api\/panes\?tabId=t1/))
+    // Must NOT have called with the raw title as tabId
     expect(mockClient.get).not.toHaveBeenCalledWith(expect.stringMatching(/\/api\/panes\?tabId=Work/))
   })
 
@@ -180,7 +204,25 @@ describe('executeAction -- pane actions', () => {
 })
 
 describe('executeAction -- terminal I/O', () => {
+  // send-keys, capture-pane, wait-for all resolve pane targets via resolvePaneTarget,
+  // which fetches tabs and panes from the API. Set up mock that resolves 'p1' by ID.
+  function setupPaneResolution() {
+    const prevGet = mockClient.get.getMockImplementation()
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes') && !path.includes('/capture') && !path.includes('/wait-for')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      }
+      // For capture-pane and wait-for, call through to specific mocks or return default
+      if (prevGet) return prevGet(path)
+      return Promise.resolve({})
+    })
+  }
+
   it('send-keys in token mode translates key tokens via translateKeys()', async () => {
+    setupPaneResolution()
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('send-keys', { target: 'p1', keys: ['ls', 'ENTER'] })
     expect(mockClient.post).toHaveBeenCalledWith(
@@ -190,6 +232,7 @@ describe('executeAction -- terminal I/O', () => {
   })
 
   it('send-keys in literal mode sends raw string without translation', async () => {
+    setupPaneResolution()
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('send-keys', { target: 'p1', keys: 'echo hello world\n', literal: true })
     expect(mockClient.post).toHaveBeenCalledWith(
@@ -199,6 +242,7 @@ describe('executeAction -- terminal I/O', () => {
   })
 
   it('send-keys with string keys and no literal flag treats as single token', async () => {
+    setupPaneResolution()
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('send-keys', { target: 'p1', keys: 'ENTER' })
     expect(mockClient.post).toHaveBeenCalledWith(
@@ -207,23 +251,64 @@ describe('executeAction -- terminal I/O', () => {
     )
   })
 
+  it('send-keys without target resolves to caller pane', async () => {
+    setupPaneResolution()
+    mockClient.post.mockResolvedValue({ ok: true })
+    await executeAction('send-keys', { keys: ['ls', 'ENTER'] })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/panes/p1/send-keys',
+      expect.objectContaining({ data: 'ls\r' }),
+    )
+  })
+
   it('capture-pane calls GET /api/panes/:id/capture and returns plain text', async () => {
-    mockClient.get.mockResolvedValue('terminal output')
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes') && !path.includes('/capture')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      }
+      if (path.includes('/api/panes/p1/capture')) {
+        return Promise.resolve('terminal output')
+      }
+      return Promise.resolve({})
+    })
     const result = await executeAction('capture-pane', { target: 'p1' })
     expect(mockClient.get).toHaveBeenCalledWith(expect.stringContaining('/api/panes/p1/capture'))
     expect(result).toContain('terminal output')
   })
 
   it('capture-pane URL-encodes the S selector parameter', async () => {
-    mockClient.get.mockResolvedValue('output')
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes') && !path.includes('/capture')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      }
+      return Promise.resolve('output')
+    })
     await executeAction('capture-pane', { target: 'p1', S: 'foo&bar=baz' })
-    const url = mockClient.get.mock.calls[0][0] as string
+    // Find the capture call specifically
+    const captureCall = mockClient.get.mock.calls.find((c: string[]) => (c[0] as string).includes('/capture'))
+    expect(captureCall).toBeTruthy()
+    const url = captureCall![0] as string
+    // The S value must be encoded so & and = don't corrupt query parsing
     expect(url).toContain(`S=${encodeURIComponent('foo&bar=baz')}`)
     expect(url).not.toContain('S=foo&bar=baz')
   })
 
   it('wait-for calls GET /api/panes/:id/wait-for with pattern', async () => {
-    mockClient.get.mockResolvedValue({ matched: true })
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes') && !path.includes('/wait-for')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      }
+      return Promise.resolve({ matched: true })
+    })
     await executeAction('wait-for', { target: 'p1', pattern: '\\$' })
     expect(mockClient.get).toHaveBeenCalledWith(expect.stringMatching(/\/api\/panes\/p1\/wait-for/))
   })
@@ -365,6 +450,7 @@ describe('executeAction -- screenshot', () => {
     expect(result).toHaveProperty('error')
     expect((result as { error: string }).error).toContain("'nonexistent-tab'")
     expect((result as { error: string }).error).toContain('not found')
+    // Should NOT have called post (no fallback to raw target)
     expect(mockClient.post).not.toHaveBeenCalled()
   })
 })
@@ -392,14 +478,31 @@ describe('executeAction -- meta', () => {
     expect(mockClient.get).toHaveBeenCalledWith('/api/health')
   })
 
-  it('help returns full command reference text', async () => {
+  it('help returns full reference with commands, playbooks, gotchas, and tmux aliases', async () => {
     const result = await executeAction('help')
     expect(result).toBeTruthy()
     expect(typeof result === 'string' || typeof result === 'object').toBe(true)
     const text = typeof result === 'string' ? result : JSON.stringify(result)
+    // Command reference
     expect(text).toContain('new-tab')
     expect(text).toContain('send-keys')
     expect(text).toContain('capture-pane')
+    expect(text).toContain('screenshot')
+    expect(text).toContain('wait-for')
+    // Playbooks
+    expect(text).toContain('Playbook')
+    expect(text).toContain('literal: true')
+    // Screenshot guidance
+    expect(text).toContain('Screenshot guidance')
+    expect(text).toContain('canary tab')
+    // Gotchas
+    expect(text).toContain('Gotchas')
+    expect(text).toContain('50 PTY limit')
+    expect(text).toContain('Picker panes')
+    // tmux aliases
+    expect(text).toContain('tmux aliases')
+    expect(text).toContain('new-window')
+    expect(text).toContain('split-window')
   })
 })
 
@@ -418,7 +521,9 @@ describe('executeAction -- tab target resolution', () => {
     mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' })
     mockClient.delete.mockResolvedValue({ ok: true })
     await executeAction('kill-tab', { target: 'Work' })
-    expect(mockClient.delete).toHaveBeenCalledWith(expect.stringContaining('/api/tabs/t1'))
+    expect(mockClient.delete).toHaveBeenCalledWith(
+      expect.stringContaining('/api/tabs/t1'),
+    )
   })
 
   it('rename-tab resolves tab title to tab ID', async () => {
@@ -440,7 +545,7 @@ describe('executeAction -- tab target resolution', () => {
 })
 
 describe('executeAction -- split-pane without target', () => {
-  it('split-pane without target resolves to active pane', async () => {
+  it('split-pane without target resolves to active pane when no caller identity', async () => {
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
       if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', terminalId: 'term-1' }] })
@@ -451,6 +556,122 @@ describe('executeAction -- split-pane without target', () => {
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/panes/p1/split'),
       expect.objectContaining({ direction: 'vertical' }),
+    )
+  })
+})
+
+describe('executeAction -- caller identity (FRESHELL_TAB_ID / FRESHELL_PANE_ID)', () => {
+  const origTabId = process.env.FRESHELL_TAB_ID
+  const origPaneId = process.env.FRESHELL_PANE_ID
+
+  afterEach(() => {
+    // Restore original env
+    if (origTabId !== undefined) process.env.FRESHELL_TAB_ID = origTabId
+    else delete process.env.FRESHELL_TAB_ID
+    if (origPaneId !== undefined) process.env.FRESHELL_PANE_ID = origPaneId
+    else delete process.env.FRESHELL_PANE_ID
+  })
+
+  function setupTwoTabs() {
+    // t-caller is the caller's tab; t-active is the user's active viewport tab.
+    // Active tab is t-active, but FRESHELL_TAB_ID points to t-caller.
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({
+          tabs: [
+            { id: 't-caller', title: 'Caller Tab', activePaneId: 'p-caller' },
+            { id: 't-active', title: 'Active Tab', activePaneId: 'p-active' },
+          ],
+          activeTabId: 't-active',
+        })
+      }
+      if (path.includes('tabId=t-caller')) {
+        return Promise.resolve({ panes: [{ id: 'p-caller', index: 0, kind: 'terminal', terminalId: 'term-caller' }] })
+      }
+      if (path.includes('tabId=t-active')) {
+        return Promise.resolve({ panes: [{ id: 'p-active', index: 0, kind: 'terminal', terminalId: 'term-active' }] })
+      }
+      // Unfiltered panes query
+      if (path === '/api/panes') {
+        return Promise.resolve({ panes: [
+          { id: 'p-caller', index: 0, kind: 'terminal', terminalId: 'term-caller' },
+          { id: 'p-active', index: 0, kind: 'terminal', terminalId: 'term-active' },
+        ] })
+      }
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ ok: true })
+  }
+
+  it('split-pane without target uses caller tab/pane when FRESHELL_TAB_ID is set', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    process.env.FRESHELL_PANE_ID = 'p-caller'
+    setupTwoTabs()
+
+    await executeAction('split-pane', { direction: 'horizontal' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p-caller/split'),
+      expect.objectContaining({ direction: 'horizontal' }),
+    )
+  })
+
+  it('split-pane without target falls back to active tab when FRESHELL_TAB_ID is NOT set', async () => {
+    delete process.env.FRESHELL_TAB_ID
+    delete process.env.FRESHELL_PANE_ID
+    setupTwoTabs()
+
+    await executeAction('split-pane', { direction: 'horizontal' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p-active/split'),
+      expect.objectContaining({ direction: 'horizontal' }),
+    )
+  })
+
+  it('screenshot scope=pane without target uses caller pane', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    process.env.FRESHELL_PANE_ID = 'p-caller'
+    setupTwoTabs()
+
+    await executeAction('screenshot', { scope: 'pane', name: 'test' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/screenshots',
+      expect.objectContaining({ scope: 'pane', paneId: 'p-caller', tabId: 't-caller' }),
+    )
+  })
+
+  it('screenshot scope=tab without target uses caller tab', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    setupTwoTabs()
+
+    await executeAction('screenshot', { scope: 'tab', name: 'test' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/screenshots',
+      expect.objectContaining({ scope: 'tab', tabId: 't-caller', name: 'test' }),
+    )
+  })
+
+  it('bare numeric pane index resolves within caller tab, not active tab', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    setupTwoTabs()
+
+    // summarize uses resolvePaneTarget which resolves bare indices
+    await executeAction('summarize', { target: '0' })
+    // Should resolve to p-caller (index 0 in t-caller), not p-active (index 0 in t-active)
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/ai/terminals/term-caller/summary'),
+      expect.anything(),
+    )
+  })
+
+  it('summarize without target uses caller pane', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    process.env.FRESHELL_PANE_ID = 'p-caller'
+    setupTwoTabs()
+
+    await executeAction('summarize')
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/ai/terminals/term-caller/summary'),
+      expect.anything(),
     )
   })
 })
@@ -481,8 +702,19 @@ describe('executeAction -- screenshot without target', () => {
   })
 })
 
-describe('executeAction -- pane index resolution scoped to active tab', () => {
-  it('bare numeric index resolves within the active tab only, not across all tabs', async () => {
+describe('executeAction -- pane index resolution scoped to caller/active tab', () => {
+  const origTabId = process.env.FRESHELL_TAB_ID
+  afterEach(() => {
+    if (origTabId !== undefined) process.env.FRESHELL_TAB_ID = origTabId
+    else delete process.env.FRESHELL_TAB_ID
+  })
+
+  it('bare numeric index resolves within the active tab when no caller identity', async () => {
+    // Clear caller identity so we test the active-tab fallback path
+    delete process.env.FRESHELL_TAB_ID
+    // Two tabs, each with a pane at index 0.
+    // Tab t1 is first in array but NOT active; Tab t2 is active.
+    // Bare index "0" should resolve to p2-a (active tab t2), NOT p1-a.
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -503,6 +735,7 @@ describe('executeAction -- pane index resolution scoped to active tab', () => {
     })
     mockClient.post.mockResolvedValue({ summary: 'test' })
     await executeAction('summarize', { target: '0' })
+    // Must resolve to p2-a's terminal (active tab t2), not p1-a's
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/ai/terminals/term-2a/summary'),
       expect.anything(),
@@ -510,6 +743,7 @@ describe('executeAction -- pane index resolution scoped to active tab', () => {
   })
 
   it('UUID-like pane ID resolves across all tabs', async () => {
+    // Pane p2-a is in tab t2 (not active). A UUID-like target should find it.
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -530,6 +764,7 @@ describe('executeAction -- pane index resolution scoped to active tab', () => {
     })
     mockClient.post.mockResolvedValue({ summary: 'test' })
     await executeAction('summarize', { target: 'p2-a' })
+    // Must resolve to p2-a's terminal (cross-tab by ID)
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/ai/terminals/term-2a/summary'),
       expect.anything(),
@@ -539,6 +774,7 @@ describe('executeAction -- pane index resolution scoped to active tab', () => {
 
 describe('executeAction -- screenshot target resolution through resolvePaneTarget', () => {
   it('screenshot with scope=pane resolves name/index targets through resolvePaneTarget', async () => {
+    // Bare index "0" should be resolved through resolvePaneTarget to a real pane ID
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -553,6 +789,7 @@ describe('executeAction -- screenshot target resolution through resolvePaneTarge
     })
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('screenshot', { scope: 'pane', target: '0', name: 'test' })
+    // The API requires a real pane ID, not a bare index
     expect(mockClient.post).toHaveBeenCalledWith(
       '/api/screenshots',
       expect.objectContaining({ scope: 'pane', paneId: 'p1', name: 'test' }),
@@ -562,6 +799,7 @@ describe('executeAction -- screenshot target resolution through resolvePaneTarge
 
 describe('executeAction -- pane title matching', () => {
   it('resolvePaneTarget matches pane by title when target is not numeric and not found by ID', async () => {
+    // Pane has title 'My Terminal'. Non-numeric, non-ID target should match by title.
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -581,6 +819,7 @@ describe('executeAction -- pane title matching', () => {
     })
     mockClient.post.mockResolvedValue({ summary: 'test' })
     await executeAction('summarize', { target: 'My Terminal' })
+    // Must resolve to p1's terminal (matched by title)
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/ai/terminals/term-1/summary'),
       expect.anything(),
@@ -608,6 +847,7 @@ describe('executeAction -- pane title matching', () => {
   })
 
   it('resolvePaneTarget matches pane title across multiple tabs', async () => {
+    // Pane with title 'Build' is in tab t2 (not active)
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -632,6 +872,7 @@ describe('executeAction -- pane title matching', () => {
     })
     mockClient.post.mockResolvedValue({ summary: 'test' })
     await executeAction('summarize', { target: 'Build' })
+    // Must resolve to p2's terminal (title match in tab t2)
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/ai/terminals/term-2/summary'),
       expect.anything(),
@@ -641,6 +882,8 @@ describe('executeAction -- pane title matching', () => {
 
 describe('executeAction -- new-tab with prompt sends keys', () => {
   it('new-tab with prompt sends keys to the newly created pane', async () => {
+    // The CLI (server/cli/index.ts:318) sends the prompt via send-keys after tab creation.
+    // The MCP tool must replicate this behavior.
     mockClient.post.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({ status: 'ok', data: { id: 't1', paneId: 'p-new' } })
@@ -648,7 +891,9 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
       return Promise.resolve({ ok: true })
     })
     await executeAction('new-tab', { name: 'Work', mode: 'claude', prompt: 'build the thing' })
+    // First call: create tab
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
+    // Second call: send keys with prompt + \r
     expect(mockClient.post).toHaveBeenCalledWith(
       '/api/panes/p-new/send-keys',
       expect.objectContaining({ data: 'build the thing\r' }),
@@ -658,11 +903,13 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
   it('new-tab without prompt does not send keys', async () => {
     mockClient.post.mockResolvedValue({ status: 'ok', data: { id: 't1', paneId: 'p-new' } })
     await executeAction('new-tab', { name: 'Work', mode: 'claude' })
+    // Only one call -- no send-keys
     expect(mockClient.post).toHaveBeenCalledTimes(1)
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
   })
 
   it('new-tab with prompt but no paneId in response does not send keys', async () => {
+    // If the response doesn't include a paneId (unexpected but defensive), don't crash
     mockClient.post.mockResolvedValue({ status: 'ok', data: { id: 't1' } })
     await executeAction('new-tab', { name: 'Work', prompt: 'hello' })
     expect(mockClient.post).toHaveBeenCalledTimes(1)
@@ -671,6 +918,9 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
 
 describe('executeAction -- ambiguous pane title error', () => {
   it('resolvePaneTarget returns error when multiple panes share the same title and suggests using pane ID', async () => {
+    // CLI returns an explicit ambiguity error (server/cli/targets.ts:68).
+    // MCP tool must do the same, not silently pick the first match.
+    // Review fix: error message must suggest using the pane ID directly, NOT tab.pane syntax.
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -694,13 +944,16 @@ describe('executeAction -- ambiguous pane title error', () => {
       return Promise.resolve({ panes: [] })
     })
     const result = await executeAction('summarize', { target: 'Build' })
+    // Must return an error, not silently pick the first match
     expect(result).toHaveProperty('error')
     expect(result.error).toContain('ambiguous')
+    // Review fix: error must suggest using pane ID directly, NOT tab.pane syntax
     expect(result.error).toContain('pane ID')
     expect(result.error).not.toContain('tab.pane')
   })
 
   it('resolvePaneTarget succeeds when pane title is unique across all tabs', async () => {
+    // Single match should work fine
     mockClient.get.mockImplementation((path: string) => {
       if (path === '/api/tabs') {
         return Promise.resolve({
@@ -725,10 +978,141 @@ describe('executeAction -- ambiguous pane title error', () => {
     })
     mockClient.post.mockResolvedValue({ summary: 'test' })
     await executeAction('summarize', { target: 'Build' })
+    // Must resolve to p2's terminal (unique title match)
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/ai/terminals/term-2/summary'),
       expect.anything(),
     )
+  })
+})
+
+describe('executeAction -- tmux aliases', () => {
+  it('new-window routes to new-tab', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    await executeAction('new-window', { name: 'Work', mode: 'claude' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
+  })
+
+  it('new-session routes to new-tab', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    await executeAction('new-session', { name: 'Work' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work' }))
+  })
+
+  it('list-windows routes to list-tabs', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [] })
+    await executeAction('list-windows')
+    expect(mockClient.get).toHaveBeenCalledWith('/api/tabs')
+  })
+
+  it('select-window routes to select-tab', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' })
+    mockClient.post.mockResolvedValue({ ok: true })
+    await executeAction('select-window', { target: 'Work' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs/t1/select', {})
+  })
+
+  it('kill-window routes to kill-tab', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' })
+    mockClient.delete.mockResolvedValue({ ok: true })
+    await executeAction('kill-window', { target: 'Work' })
+    expect(mockClient.delete).toHaveBeenCalledWith('/api/tabs/t1')
+  })
+
+  it('rename-window routes to rename-tab', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Old' }], activeTabId: 't1' })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-window', { target: 'Old', name: 'New' })
+    expect(mockClient.patch).toHaveBeenCalledWith('/api/tabs/t1', { name: 'New' })
+  })
+
+  it('next-window routes to next-tab', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+    await executeAction('next-window')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs/next', {})
+  })
+
+  it('previous-window routes to prev-tab', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+    await executeAction('previous-window')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs/prev', {})
+  })
+
+  it('prev-window routes to prev-tab', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+    await executeAction('prev-window')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs/prev', {})
+  })
+
+  it('split-window routes to split-pane', async () => {
+    mockClient.get.mockResolvedValue({
+      tabs: [{ id: 't1', title: 'Tab', activePaneId: 'p1' }],
+      activeTabId: 't1',
+    })
+    // fetchPanes for the active tab
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0 }] })
+      }
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ paneId: 'p2' })
+    await executeAction('split-window', { direction: 'horizontal' })
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/split'),
+      expect.objectContaining({ direction: 'horizontal' }),
+    )
+  })
+
+  it('display-message routes to display', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', title: 'Work', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      }
+      return Promise.resolve({})
+    })
+    const result = await executeAction('display-message', { format: '#S' })
+    expect(result).toBe('Work')
+  })
+
+  it('screenshot-pane routes to screenshot with scope=pane', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      }
+      if (path.includes('/api/panes')) {
+        return Promise.resolve({ panes: [{ id: 'p1', index: 0 }] })
+      }
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ path: '/tmp/screenshot.png' })
+    await executeAction('screenshot-pane', { target: 'p1', name: 'test' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/screenshots', expect.objectContaining({ scope: 'pane', name: 'test', paneId: 'p1' }))
+  })
+
+  it('screenshot-tab routes to screenshot with scope=tab', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' })
+    mockClient.post.mockResolvedValue({ path: '/tmp/screenshot.png' })
+    await executeAction('screenshot-tab', { target: 'Work', name: 'test' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/screenshots', expect.objectContaining({ scope: 'tab', name: 'test', tabId: 't1' }))
+  })
+
+  it('screenshot-view routes to screenshot with scope=view', async () => {
+    mockClient.post.mockResolvedValue({ path: '/tmp/screenshot.png' })
+    await executeAction('screenshot-view', { name: 'test' })
+    expect(mockClient.post).toHaveBeenCalledWith('/api/screenshots', expect.objectContaining({ scope: 'view', name: 'test' }))
+  })
+
+  it('truly unknown action still returns error', async () => {
+    const result = await executeAction('totally-fake-action')
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain("Unknown action 'totally-fake-action'")
   })
 })
 

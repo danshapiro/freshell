@@ -1,7 +1,9 @@
-// MCP server entry point for Freshell orchestration.
-// Registers a single "freshell" tool and connects via stdio JSON-RPC transport.
-
 /**
+ * MCP server entry point for Freshell orchestration.
+ *
+ * Registers a single "freshell" tool with action dispatch and connects
+ * via stdio JSON-RPC transport. Spawned as a child process by each agent.
+ *
  * CRITICAL: No console.log() -- it corrupts the stdio JSON-RPC channel.
  * Use console.error() for debug output only.
  */
@@ -40,6 +42,8 @@ server.tool(
   INPUT_SCHEMA,
   async ({ action, params }) => {
     const result = await executeAction(action, params as Record<string, unknown> | undefined)
+    // Guard against undefined results (e.g. from API envelopes with no data).
+    // JSON.stringify(undefined) produces the literal "undefined", not valid JSON.
     const text = result !== undefined ? JSON.stringify(result, null, 2) : '{}'
     return {
       content: [{ type: 'text' as const, text }],
