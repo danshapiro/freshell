@@ -122,67 +122,30 @@ See: `docs/lab-notes/2026-03-26-chrome-tooling-capabilities.md`
 
 ---
 
-### Spike 1: Instrument and Measure the Reconnect Cascade (Source-Level)
+**Full spike details:** See `docs/lab-notes/2026-03-27-investigation-plan.md`
 
-**Goal:** Add temporary timing instrumentation to the source code so it survives page reloads and captures the full reconnect timeline. Measure in both dev and production mode.
+### Spike 1: Reconnect Cascade Measurement (Source-Level Instrumentation)
+Add a `ReconnectTracer` module that logs timestamped events to `window.__reconnectTrace`. Hooks into ws-client.ts, TerminalView.tsx, and App.tsx. Test 4 scenarios in production mode: WS drop, server restart, page refresh, long idle. Measure time-to-recovery per pane.
 
-**Approach:**
-- Add a `ReconnectTracer` utility that logs timestamped events to a `window.__reconnectTrace` array
-- Wire it into ws-client.ts (disconnect detected, reconnect attempt, ready received, each attempt's latency)
-- Wire it into TerminalView.tsx (attach sent, INVALID_TERMINAL_ID received, create sent, terminal.created received, attach.ready received, first output rendered)
-- Wire it into App.tsx (state.snapshot if we add one, sessions.changed, terminals.changed)
-- Test three scenarios:
-  1. **Normal reconnect** (WS drop, server still running, terminals alive) — production mode
-  2. **Server restart** (kill server, restart, terminals gone) — production mode
-  3. **Page refresh** (F5 with terminals running) — production mode
-- Record actual timings for each scenario
-- Remove instrumentation after
+### Spike 2: Normal Usage Action Storms (Chrome Runtime)
+Use Chrome dispatch interceptor to measure Redux action counts during tab switches, sidebar interactions, terminal output bursts, and 10-minute idle periods. Check for cross-tab sync overhead and localStorage/Redux divergence.
 
-**Output:** Lab note with per-scenario timelines. Answers: How long is the user staring at broken state? Where is time spent?
+### Spike 3: Terminal Rendering Investigation (Chrome + Code Review)
+Trace why "Recovering terminal output..." appears on fresh terminal creation. Observe xterm.js rendering during heavy output and tab switches. Determine if the rendering layer contributes to the flaky feel.
 
-### Spike 2: Observe Normal Usage Degradation (Chrome Runtime)
+### Spike 4: Server-Side Performance Audit (Logs + Timing)
+Runs alongside Spike 1. Read server logs during reconnect cascade. Time bootstrap/indexing, API endpoints, and terminal operations. Check for server-side bottlenecks.
 
-**Goal:** Use Chrome automation to observe what happens during normal usage that contributes to the "flaky feel" — without server crashes or disconnects.
+### Spike 5: State Consolidation Map (Code Review)
+Catalog all 17 Redux slices and 5 persistence mechanisms. Classify each as server-authoritative, client-local, ephemeral, or derived. Propose simplified state tree.
 
-**Approach (all via Chrome runtime injection, no source changes):**
-- Install Redux dispatch interceptor
-- Open Freshell, create 3-5 terminals across tabs
-- Switch between tabs, observe action storms
-- Open sidebar, expand projects, observe API call patterns
-- Let it sit idle for 5-10 minutes, check for background activity/state drift
-- Record localStorage state, then compare to Redux state — look for divergence
+### Spike 6: Server Snapshot Prototype (After 1-5)
+Write `assembleStateSnapshot()` in ws-handler.ts. Measure size and assembly time. Send after `ready`, log on client. Go/no-go assessment.
 
-**Questions to answer:**
-- How many Redux actions fire per tab switch? Per sidebar interaction?
-- Does the "every action fires twice" cross-tab sync cause visible performance issues?
-- Does idle state drift (session timestamps, terminal metadata going stale)?
-- Is localStorage ever inconsistent with Redux state?
-
-**Output:** Lab note with action counts, timing data, and any divergence found.
-
-### Spike 3: State Consolidation Map (Code Review)
-
-**Goal:** Catalog all 17 slices and their persistence, identify what can be cut. This is a code review, not a running-server test.
-
-**Approach:**
-- For each slice: what it stores, how it's persisted, is it server-derived or client-generated
-- Group into: server-authoritative, client-local, redundant, ephemeral
-- Map which slices are involved in the reconnect cascade (informed by Spike 1 findings)
-- Sketch a simplified state tree
-
-**Output:** Lab note with the catalog and a proposed consolidation.
-
-### Spike 4: Server Snapshot Feasibility (After Spikes 1-3)
-
-**Goal:** Informed by actual measurements and the state map, prototype a `state.snapshot` message.
-
-**Approach:**
-- Write `assembleStateSnapshot()` in ws-handler.ts — terminal inventory + metadata + session summary
-- Measure assembly time and JSON size with realistic terminal counts
-- Send it after `ready` in the handshake, log receipt on client
-- Compare snapshot content to what the client currently discovers piecemeal
-
-**Output:** Lab note with size/timing data and a go/no-go on the snapshot approach.
+### Execution order
+```
+Spike 1 + 4 (together)  → Spike 2 + 3 (parallel) → Spike 5 → Spike 6
+```
 
 ---
 
