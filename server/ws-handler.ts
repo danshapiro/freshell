@@ -974,6 +974,16 @@ export class WsHandler {
       if (snapshot.configFallback) {
         this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
       }
+
+      // Send terminal inventory so the client knows what's alive
+      const terminals = this.registry.list()
+      const terminalMeta = this.terminalMetaListProvider?.() ?? []
+      this.safeSend(ws, {
+        type: 'terminal.inventory',
+        bootId: this.bootId,
+        terminals,
+        terminalMeta,
+      })
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }

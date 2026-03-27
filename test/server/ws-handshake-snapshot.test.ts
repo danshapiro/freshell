@@ -43,6 +43,9 @@ class FakeRegistry {
   detach() {
     return true
   }
+  list() {
+    return []
+  }
 }
 
 function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 2000): Promise<any> {
@@ -311,6 +314,25 @@ describe('ws handshake snapshot', () => {
     } finally {
       await closeWs(ws1)
       await closeWs(ws2)
+    }
+  })
+
+  it('sends terminal inventory in handshake snapshot', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const inventoryPromise = waitForMessage(ws, (m) => m.type === 'terminal.inventory', 10_000)
+      await waitForReady(ws, 10_000)
+
+      const inventory = await inventoryPromise
+      expect(inventory).toHaveProperty('type', 'terminal.inventory')
+      expect(inventory).toHaveProperty('bootId')
+      expect(Array.isArray(inventory.terminals)).toBe(true)
+      expect(Array.isArray(inventory.terminalMeta)).toBe(true)
+    } finally {
+      await closeWs(ws)
     }
   })
 

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
@@ -54,7 +54,7 @@ import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
-import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -719,6 +719,14 @@ export default function App() {
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
+          const newBootId = ready.success ? ready.data.bootId : undefined
+          const previousBootId = appStore.getState().connection.bootId
+          const serverRestarted = !!previousBootId && previousBootId !== newBootId
+          dispatch(setBootId(newBootId))
+          dispatch(setServerRestarted(serverRestarted))
+          if (serverRestarted) {
+            dispatch(setLiveTerminalIds([]))
+          }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
@@ -753,6 +761,18 @@ export default function App() {
           const remove = Array.isArray(msg.remove) ? msg.remove : []
           for (const terminalId of remove) {
             dispatch(removeTerminalMeta(terminalId))
+          }
+        }
+        if (msg.type === 'terminal.inventory') {
+          const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
+          const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
+          const liveIds = terminals
+            .filter((t: any) => t.status === 'running')
+            .map((t: any) => t.terminalId as string)
+          dispatch(setLiveTerminalIds(liveIds))
+          dispatch(setServerRestarted(false))
+          if (terminalMeta.length > 0) {
+            dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta }))
           }
         }
         if (msg.type === 'codex.activity.list.response') {
