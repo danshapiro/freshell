@@ -62,15 +62,6 @@ npm run dev     # Development with hot reload
 npm run serve   # Production build and run
 ```
 
-### Visible-First Audit
-
-```bash
-npm run perf:audit:visible-first
-npm run perf:audit:compare -- --base artifacts/perf/visible-first-audit.json --candidate other-audit.json
-```
-
-The audit writes one JSON artifact to `artifacts/perf/visible-first-audit.json` by default. It captures one desktop sample and one bandwidth-restricted mobile sample per scenario so the later visible-first transport work can be compared against the same workload with a single machine-readable file.
-
 ## Keyboard Shortcuts
 
 <!-- Canonical source: src/lib/keyboard-shortcuts.ts -->
