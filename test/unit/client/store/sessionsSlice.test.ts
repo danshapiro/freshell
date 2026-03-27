@@ -663,4 +663,108 @@ describe('sessionsSlice', () => {
       expect(state.windows.sidebar.deepSearchPending).toBe(false)
     })
   })
+
+  describe('requested vs applied search state', () => {
+    it('setSessionWindowLoading updates the requested query and tier without changing the applied search context', () => {
+      const stateWithAppliedSearch: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [mockProjects[0]],
+            query: 'alpha',
+            searchTier: 'title',
+            appliedQuery: 'alpha',
+            appliedSearchTier: 'title',
+          } as any,
+        },
+      }
+
+      const state = sessionsReducer(stateWithAppliedSearch, setSessionWindowLoading({
+        surface: 'sidebar',
+        loading: true,
+        loadingKind: 'search',
+        query: 'beta',
+        searchTier: 'fullText',
+      }))
+
+      expect(state.windows.sidebar.query).toBe('beta')
+      expect(state.windows.sidebar.searchTier).toBe('fullText')
+      expect((state.windows.sidebar as any).appliedQuery).toBe('alpha')
+      expect((state.windows.sidebar as any).appliedSearchTier).toBe('title')
+    })
+
+    it('setSessionWindowData commits requested and applied search fields together with the visible result set', () => {
+      const stateWithAppliedSearch: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [mockProjects[0]],
+            query: 'alpha',
+            searchTier: 'title',
+            appliedQuery: 'alpha',
+            appliedSearchTier: 'title',
+          } as any,
+        },
+      }
+
+      const state = sessionsReducer(stateWithAppliedSearch, setSessionWindowData({
+        surface: 'sidebar',
+        projects: [mockProjects[1]],
+        totalSessions: 1,
+        hasMore: false,
+        query: 'beta',
+        searchTier: 'fullText',
+      }))
+
+      expect(state.windows.sidebar.projects).toEqual([mockProjects[1]])
+      expect(state.windows.sidebar.query).toBe('beta')
+      expect(state.windows.sidebar.searchTier).toBe('fullText')
+      expect((state.windows.sidebar as any).appliedQuery).toBe('beta')
+      expect((state.windows.sidebar as any).appliedSearchTier).toBe('fullText')
+      expect(state.projects).toEqual([mockProjects[1]])
+    })
+
+    it('keeps the previous applied search context during a search-to-browse transition until browse data commits', () => {
+      const stateWithAppliedSearch: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [mockProjects[0]],
+            query: 'alpha',
+            searchTier: 'title',
+            appliedQuery: 'alpha',
+            appliedSearchTier: 'title',
+          } as any,
+        },
+      }
+
+      const loadingState = sessionsReducer(stateWithAppliedSearch, setSessionWindowLoading({
+        surface: 'sidebar',
+        loading: true,
+        loadingKind: 'search',
+        query: '',
+        searchTier: 'title',
+      }))
+
+      expect(loadingState.windows.sidebar.query).toBe('')
+      expect(loadingState.windows.sidebar.searchTier).toBe('title')
+      expect((loadingState.windows.sidebar as any).appliedQuery).toBe('alpha')
+      expect((loadingState.windows.sidebar as any).appliedSearchTier).toBe('title')
+
+      const committedState = sessionsReducer(loadingState, setSessionWindowData({
+        surface: 'sidebar',
+        projects: mockProjects,
+        totalSessions: mockProjects.length,
+        hasMore: true,
+        query: '',
+        searchTier: 'title',
+      }))
+
+      expect((committedState.windows.sidebar as any).appliedQuery).toBe('')
+      expect((committedState.windows.sidebar as any).appliedSearchTier).toBe('title')
+    })
+  })
 })

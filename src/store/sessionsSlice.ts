@@ -15,6 +15,8 @@ export interface SessionWindowState {
   error?: string
   query?: string
   searchTier?: 'title' | 'userMessages' | 'fullText'
+  appliedQuery?: string
+  appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
   partialReason?: 'budget' | 'io_error'
@@ -219,8 +221,14 @@ export const sessionsSlice = createSlice({
       window.deepSearchPending = action.payload.deepSearchPending ?? false
       window.partial = action.payload.partial
       window.partialReason = action.payload.partialReason
-      if (action.payload.query !== undefined) window.query = action.payload.query
-      if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
+      if (action.payload.query !== undefined) {
+        window.query = action.payload.query
+        window.appliedQuery = action.payload.query
+      }
+      if (action.payload.searchTier !== undefined) {
+        window.searchTier = action.payload.searchTier
+        window.appliedSearchTier = action.payload.searchTier
+      }
       if (!state.activeSurface || state.activeSurface === action.payload.surface) {
         syncTopLevelFromWindow(state, action.payload.surface)
       }
