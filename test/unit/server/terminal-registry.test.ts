@@ -3424,4 +3424,137 @@ describe('buildSpawnSpec Unix paths', () => {
     })
   })
 
+  describe('buildSpawnSpec MCP injection', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+    })
+
+    it('gemini mode includes GEMINI_CLI_SYSTEM_DEFAULTS_PATH in env', () => {
+      const spec = buildSpawnSpec('gemini', '/home/user', 'system', undefined, undefined, undefined, 'term-gem1')
+      expect(spec.env).toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
+      expect(spec.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH).toContain('freshell-mcp')
+    })
+
+    it('kimi mode includes --mcp-config-file in args', () => {
+      const spec = buildSpawnSpec('kimi', '/home/user', 'system', undefined, undefined, undefined, 'term-kimi1')
+      expect(spec.args).toContain('--mcp-config-file')
+    })
+
+    it('opencode mode passes cwd to generateMcpInjection', async () => {
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, undefined, undefined, 'term-oc1')
+      expect(generateMcpInjection).toHaveBeenCalledWith('opencode', 'term-oc1', '/home/user/project', 'unix')
+    })
+
+    it('shell mode does not inject MCP config', () => {
+      const spec = buildSpawnSpec('shell', '/home/user', 'system')
+      expect(spec.args).not.toContain('--mcp-config')
+      expect(spec.args).not.toContain('--mcp-config-file')
+      expect(spec.env).not.toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
+    })
+
+    it('buildSpawnSpec passes terminalId, cwd, and platform to generateMcpInjection', async () => {
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      buildSpawnSpec('claude', '/home/user', 'system', undefined, undefined, undefined, 'term-123')
+      expect(generateMcpInjection).toHaveBeenCalledWith('claude', 'term-123', '/home/user', 'unix')
+    })
+
+    it('on Unix, passes resolved cwd (not raw cwd) to generateMcpInjection for WSL path normalization', async () => {
+      // Simulate WSL environment where cwd might be a Windows-style path
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(generateMcpInjection).mockClear()
+      // On WSL, a Windows-style cwd (e.g. D:\project) should be converted to a Linux path
+      // before being passed to generateMcpInjection. resolveUnixShellCwd handles this.
+      // The raw Windows path would fail existsSync in config-writer on Linux.
+      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, undefined, undefined, 'term-wsl1')
+      // The cwd passed to generateMcpInjection should be the resolved Unix path,
+      // not the raw Windows path. On WSL, convertWindowsPathToWslPath converts
+      // D:\project to /mnt/d/project.
+      const calledCwd = vi.mocked(generateMcpInjection).mock.calls[0]?.[2]
+      // The cwd must NOT be the raw Windows path
+      expect(calledCwd).not.toBe('D:\\project')
+      // It should be a Linux-style path (starts with /)
+      expect(calledCwd).toMatch(/^\//)
+    })
+
+    it('WSL cmd coding CLI returns non-undefined mcpCwd even when procCwd is undefined', () => {
+      // In WSL, cmd.exe cannot use Linux paths as cwd, so procCwd is undefined.
+      // But MCP injection used a resolved Linux path (cmdMcpCwd). The mcpCwd field
+      // must preserve this so cleanup can find the temp files.
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'cmd', undefined, undefined, undefined, 'term-cmd1')
+      // procCwd (spec.cwd) is undefined because cmd.exe can't take a Linux path
+      expect(spec.cwd).toBeUndefined()
+      // But mcpCwd must be the Linux path used for MCP injection
+      expect(spec.mcpCwd).toBeDefined()
+      expect(spec.mcpCwd).toMatch(/^\//)
+    })
+
+    it('WSL powershell coding CLI returns non-undefined mcpCwd even when procCwd is undefined', () => {
+      // Same issue: powershell.exe in WSL can't use Linux paths as cwd,
+      // so procCwd is undefined, but MCP injection used a resolved Linux path.
+      mockPlatform('linux')
+      process.env.WSL_DISTRO_NAME = 'Ubuntu'
+      process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'powershell', undefined, undefined, undefined, 'term-ps1')
+      expect(spec.cwd).toBeUndefined()
+      expect(spec.mcpCwd).toBeDefined()
+      expect(spec.mcpCwd).toMatch(/^\//)
+    })
+
+    it('WSL wsl.exe coding CLI returns wslCwd as mcpCwd', () => {
+      // When using wsl.exe (from native Windows), mcpCwd should be the Linux path
+      mockPlatform('win32')
+      const spec = buildSpawnSpec('claude', 'C:\\Users\\test', 'wsl', undefined, undefined, undefined, 'term-wsl2')
+      // wsl.exe passes cwd: undefined to the process
+      expect(spec.cwd).toBeUndefined()
+      // mcpCwd should be the Linux-normalized cwd
+      expect(spec.mcpCwd).toBeDefined()
+    })
+
+    it('Unix coding CLI returns unixCwd as mcpCwd', () => {
+      mockPlatform('linux')
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'system', undefined, undefined, undefined, 'term-unix1')
+      expect(spec.mcpCwd).toBe('/home/user/project')
+    })
+
+    it('shell mode returns undefined mcpCwd (no MCP injection)', () => {
+      mockPlatform('linux')
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'system')
+      // shell mode has no MCP injection, so mcpCwd is irrelevant
+      // but should still be set to the cwd for consistency
+      expect(spec.mcpCwd).toBeDefined()
+    })
+  })
+
+  describe('dead code removal verification', () => {
+    beforeEach(() => {
+      mockPlatform('linux')
+    })
+
+    it('claude mode does not include --plugin-dir in spawn args', () => {
+      const spec = buildSpawnSpec('claude', '/home/user', 'system')
+      expect(spec.args).not.toContain('--plugin-dir')
+    })
+
+    it('codex mode does not include skills.config in spawn args', () => {
+      const spec = buildSpawnSpec('codex', '/home/user', 'system')
+      const skillsArg = spec.args.find((a: string) => a.startsWith('skills.config='))
+      expect(skillsArg).toBeUndefined()
+    })
+
+    it('spawn-spec.ts is deleted', async () => {
+      try {
+        await import('../../../server/spawn-spec.js')
+        expect.fail('spawn-spec.ts should not exist')
+      } catch (err: any) {
+        // Expected: module not found
+        expect(err.message || err.code).toBeTruthy()
+      }
+    })
+  })
 })

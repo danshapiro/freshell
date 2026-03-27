@@ -4,11 +4,13 @@
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { createRequire } from 'module'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { execFileSync } from 'child_process'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
 
 function findRepoRoot(): string {
   let dir = __dirname
@@ -52,18 +54,39 @@ function convertToWindowsPath(linuxPath: string): string {
   }
 }
 
+function resolveDependencyPath(specifier: string): string {
+  try {
+    return require.resolve(specifier)
+  } catch (error) {
+    const detail = error instanceof Error && error.message ? ` ${error.message}` : ''
+    throw new Error(`Unable to resolve MCP dependency "${specifier}". Ensure project dependencies are installed.${detail}`)
+  }
+}
+
+/**
+ * Build the MCP server command + args for the given environment.
+ * In production: node <repoRoot>/dist/server/mcp/server.js
+ * In development: node --import <repoRoot>/node_modules/tsx/dist/esm/index.mjs <repoRoot>/server/mcp/server.ts
+ *
+ * When platform is 'windows' and running on WSL, paths are converted to
+ * Windows UNC format so Windows-native agent processes can resolve them.
+ */
 function buildMcpServerCommandArgs(platform?: 'unix' | 'windows'): string[] {
   const repoRoot = findRepoRoot()
   const needsWinPaths = platform === 'windows' && isWslEnvironment()
-  const resolvePath = (p: string) => needsWinPaths ? convertToWindowsPath(resolve(repoRoot, p)) : resolve(repoRoot, p)
+  const resolveRepoPath = (p: string) => needsWinPaths ? convertToWindowsPath(resolve(repoRoot, p)) : resolve(repoRoot, p)
+  const resolveDependencyForPlatform = (specifier: string) => {
+    const resolved = resolveDependencyPath(specifier)
+    return needsWinPaths ? convertToWindowsPath(resolved) : resolved
+  }
 
   if (process.env.NODE_ENV === 'production') {
-    return [resolvePath('dist/server/mcp/server.js')]
+    return [resolveRepoPath('dist/server/mcp/server.js')]
   }
   return [
     '--import',
-    resolvePath('node_modules/tsx/dist/esm/index.mjs'),
-    resolvePath('server/mcp/server.ts'),
+    resolveDependencyForPlatform('tsx'),
+    resolveRepoPath('server/mcp/server.ts'),
   ]
 }
 

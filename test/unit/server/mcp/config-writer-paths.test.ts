@@ -51,9 +51,9 @@ describe.skipIf(
 
       const args = config.mcpServers.freshell.args as string[]
       expect(args).toContain('--import')
-      const tsxPath = args.find((a: string) => a.includes('tsx/dist/esm/index.mjs'))
-      expect(tsxPath).toBeDefined()
-      expect(fs.existsSync(tsxPath!)).toBe(true)
+      const loaderPath = args[args.indexOf('--import') + 1]
+      expect(loaderPath).toContain('tsx')
+      expect(fs.existsSync(loaderPath)).toBe(true)
 
       const serverPath = args.find((a: string) => a.includes('server/mcp/server.ts'))
       expect(serverPath).toBeDefined()
