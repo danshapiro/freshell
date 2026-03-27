@@ -174,7 +174,7 @@ function MessageBubble({
   return (
     <div
       className={cn(
-        'max-w-prose pl-2.5 py-0.5 text-sm',
+        'w-full pl-2.5 py-0.5 text-sm',
         resolvedSpeaker === 'user'
           ? 'border-l-[3px] border-l-[hsl(var(--claude-user))]'
           : 'border-l-2 border-l-[hsl(var(--claude-assistant))]'

@@ -15,7 +15,7 @@ function ThinkingIndicator() {
 
   return (
     <div
-      className="max-w-prose border-l-2 border-l-[hsl(var(--claude-assistant))] pl-2.5 py-0.5"
+      className="w-full border-l-2 border-l-[hsl(var(--claude-assistant))] pl-2.5 py-0.5"
       role="status"
       aria-label="Claude is thinking"
     >

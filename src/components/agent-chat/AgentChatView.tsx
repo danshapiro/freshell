@@ -569,7 +569,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto overflow-x-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
         {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav).
              Falls back to welcome screen after timeout (e.g. server restarted, session lost). */}
         {isRestoring && !restoreTimedOut && (
