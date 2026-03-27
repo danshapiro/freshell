@@ -643,9 +643,12 @@ describe('sessionsThunks', () => {
     expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
   })
 
-  it('refreshes the visible applied-query window silently while reusing its search context during search-to-browse drift', async () => {
-    const deferred = createDeferred<any>()
-    searchSessions.mockReturnValueOnce(deferred.promise)
+  it('refreshes the visible applied-query window with a two-phase deep search while requested state drifts to browse', async () => {
+    const phase1Deferred = createDeferred<any>()
+    const phase2Deferred = createDeferred<any>()
+    searchSessions
+      .mockReturnValueOnce(phase1Deferred.promise)
+      .mockReturnValueOnce(phase2Deferred.promise)
 
     const searchProjects = [{
       projectPath: '/tmp/search-project',
@@ -676,33 +679,68 @@ describe('sessionsThunks', () => {
 
     const request = store.dispatch(refreshActiveSessionWindow() as any)
 
-    try {
-      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('background')
-    } finally {
-      deferred.resolve({
-        results: [
-          {
-            provider: 'claude',
-            sessionId: 'session-search',
-            projectPath: '/tmp/search-project',
-            title: 'Search result',
-            lastActivityAt: 3_000,
-            archived: false,
-          },
-        ],
-        tier: 'fullText',
-        query: 'needle',
-        totalScanned: 1,
-      })
+    expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('background')
+    expect(searchSessions).toHaveBeenNthCalledWith(1, {
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
 
-      await request
-    }
+    phase1Deferred.resolve({
+      results: [
+        {
+          provider: 'claude',
+          sessionId: 'session-search',
+          projectPath: '/tmp/search-project',
+          title: 'Search result',
+          matchedIn: 'title',
+          lastActivityAt: 3_000,
+          archived: false,
+        },
+      ],
+      tier: 'title',
+      query: 'needle',
+      totalScanned: 1,
+    })
 
-    expect(searchSessions).toHaveBeenCalledWith({
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(searchSessions).toHaveBeenNthCalledWith(2, {
       query: 'needle',
       tier: 'fullText',
       signal: expect.any(AbortSignal),
     })
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.searchTier).toBe('title')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('fullText')
+    expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(true)
+
+    phase2Deferred.resolve({
+      results: [
+        {
+          provider: 'claude',
+          sessionId: 'session-search',
+          projectPath: '/tmp/search-project',
+          title: 'Search result',
+          matchedIn: 'userMessage',
+          lastActivityAt: 3_000,
+          archived: false,
+        },
+      ],
+      tier: 'fullText',
+      query: 'needle',
+      totalScanned: 4,
+    })
+
+    await request
+
+    expect(searchSessions).toHaveBeenCalledTimes(2)
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.searchTier).toBe('title')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('fullText')
+    expect(store.getState().sessions.windows.sidebar.deepSearchPending).toBe(false)
   })
 
   it('refreshActiveSessionWindow keeps a pending browse replacement alive during search-to-browse drift and lets it commit afterward', async () => {
@@ -953,8 +991,11 @@ describe('sessionsThunks', () => {
       query: '',
       searchTier: 'title',
     }) as any)
+    const browseSignal = fetchSidebarSessionsSnapshot.mock.calls[0]?.[0]?.signal as AbortSignal
 
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    expect(browseSignal).toBeDefined()
+    expect(browseSignal.aborted).toBe(false)
     expect(store.getState().sessions.windows.sidebar.query).toBe('')
     expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
 
@@ -982,6 +1023,8 @@ describe('sessionsThunks', () => {
 
     await invalidationRequest
 
+    expect(browseSignal.aborted).toBe(false)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     expect(store.getState().sessions.windows.sidebar.query).toBe('')
     expect(store.getState().sessions.windows.sidebar.searchTier).toBe('title')
     expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
@@ -998,6 +1041,7 @@ describe('sessionsThunks', () => {
 
     await browseRequest
 
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('')
     expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
   })
