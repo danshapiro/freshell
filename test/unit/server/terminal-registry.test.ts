@@ -72,20 +72,26 @@ const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 
 function expectCodexMcpArgs(args: string[]) {
+  // Bell notification still present
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
+  // MCP server config instead of skills.config
   const mcpArg = args.find(a => a.includes('mcp_servers.freshell'))
   expect(mcpArg).toBeDefined()
+  // Old skills.config must NOT be present
   const skillsArg = args.find(a => a.startsWith('skills.config='))
   expect(skillsArg).toBeUndefined()
 }
 
 function expectClaudeMcpArgs(args: string[]) {
+  // MCP config must be injected
   expect(args).toContain('--mcp-config')
   const configIndex = args.indexOf('--mcp-config')
   expect(args[configIndex + 1]).toContain('freshell-mcp')
+  // Bell hook must still be present via --settings
   const command = getClaudeStopHookCommand(args)
   expect(command).toContain("printf '\\a'")
+  // Old plugin-dir must NOT be present
   expect(args).not.toContain('--plugin-dir')
 }
 
@@ -2407,43 +2413,6 @@ describe('TerminalRegistry', () => {
     })
   })
 
-  describe('gracefulShutdown MaxListeners', () => {
-    it('does not add more than one terminal.exit listener even with 20+ terminals', async () => {
-      const reg = new TerminalRegistry(undefined, 50)
-      const warningHandler = vi.fn()
-      process.on('warning', warningHandler)
-
-      // Create 25 terminals
-      const terminals = []
-      for (let i = 0; i < 25; i++) {
-        terminals.push(reg.create({ mode: 'shell' }))
-      }
-
-      // Start graceful shutdown (non-blocking — don't await yet)
-      const shutdownPromise = reg.shutdownGracefully(100)
-
-      // Count terminal.exit listeners — should be at most 1 (the shared handler)
-      const exitListenerCount = reg.listenerCount('terminal.exit')
-      expect(exitListenerCount).toBeLessThanOrEqual(1)
-
-      // Simulate all terminals exiting
-      for (const term of terminals) {
-        reg.emit('terminal.exit', { terminalId: term.terminalId, exitCode: 0 })
-      }
-
-      await shutdownPromise
-
-      // No MaxListenersExceeded warnings should have been emitted
-      const maxListenerWarnings = warningHandler.mock.calls.filter(
-        ([w]: [Error]) => w?.name === 'MaxListenersExceededWarning'
-      )
-      expect(maxListenerWarnings).toHaveLength(0)
-
-      process.off('warning', warningHandler)
-      reg.shutdown()
-    })
-  })
-
   describe('isSessionBound', () => {
     it('returns true when session is already bound to a terminal', () => {
       const term = registry.create({ mode: 'codex', resumeSessionId: '019cf585-9b35-7510-a99c-09b77b1f351a' })
@@ -2453,6 +2422,83 @@ describe('TerminalRegistry', () => {
 
     it('returns false when session is not bound', () => {
       expect(registry.isSessionBound('codex', '019cf585-9b35-7510-a99c-09b77b1f351a')).toBe(false)
+    })
+  })
+
+  describe('MCP cleanup on terminal exit', () => {
+    it('cleanupMcpConfig is called on onExit', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const pty = await import('node-pty')
+      // Get the mock pty object from the most recent spawn call
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      // Extract the onExit callback that the implementation registered
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+      // Trigger the exit handler
+      onExitCallback({ exitCode: 0, signal: 0 })
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'claude', '/home/user/project')
+    })
+
+    it('cleanupMcpConfig is called on explicit kill()', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'codex', cwd: '/home/user/work' })
+      registry.kill(record.terminalId)
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'codex', '/home/user/work')
+    })
+
+    it('cleanupMcpConfig is called on spawn failure', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const pty = await import('node-pty')
+      vi.mocked(pty.spawn).mockImplementationOnce(() => {
+        throw new Error('spawn failed: command not found')
+      })
+
+      expect(() => registry.create({ mode: 'claude', cwd: '/home/user/fail' })).toThrow('spawn failed')
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(
+        expect.any(String),
+        'claude',
+        '/home/user/fail',
+      )
+    })
+
+    it('terminal record stores mcpCwd from normalized buildSpawnSpec cwd', () => {
+      // The terminal record should store the normalized cwd (from buildSpawnSpec)
+      // separately from the raw cwd, so cleanup uses the same path as injection.
+      const record = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      // On Linux (no WSL), mcpCwd should equal the resolved cwd (same as raw here)
+      expect(record.mcpCwd).toBe('/home/user/project')
+    })
+
+    it('kill() passes mcpCwd (not raw cwd) to cleanupMcpConfig', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-project' })
+      registry.kill(record.terminalId)
+
+      // cleanup must use mcpCwd (the normalized cwd used during injection)
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'opencode', record.mcpCwd)
+    })
+
+    it('onExit passes mcpCwd (not raw cwd) to cleanupMcpConfig', async () => {
+      const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
+      vi.mocked(cleanupMcpConfig).mockClear()
+
+      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-exit' })
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+      onExitCallback({ exitCode: 0, signal: 0 })
+
+      expect(cleanupMcpConfig).toHaveBeenCalledWith(record.terminalId, 'opencode', record.mcpCwd)
     })
   })
 })

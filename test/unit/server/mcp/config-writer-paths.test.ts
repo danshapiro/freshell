@@ -1,18 +1,20 @@
-// Path resolution tests for config-writer.ts.
-// Uses the REAL filesystem to verify generated MCP config paths point to files that exist.
-
+/**
+ * Path resolution tests for config-writer.ts.
+ *
+ * Uses the REAL filesystem (no fs mocking) to verify that generated MCP
+ * config paths point to files that actually exist on disk.
+ */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
 
+// Only mock os.tmpdir to use a test-safe temp directory
 const testTmpDir = path.join(os.tmpdir(), 'freshell-mcp-test-' + process.pid)
 
-describe.skipIf(
-  // In git worktrees, node_modules may not be present locally — skip path verification
-  !fs.existsSync(path.join(path.resolve(import.meta.dirname || '.', '../../../..'), 'node_modules', 'tsx')),
-)('config-writer path verification', () => {
+describe('config-writer path verification', () => {
   afterEach(() => {
+    // Clean up test temp files
     try {
       fs.rmSync(testTmpDir, { recursive: true, force: true })
     } catch { /* ignore */ }
@@ -22,6 +24,7 @@ describe.skipIf(
 
   for (const mode of modes) {
     it(`${mode} mode: MCP server command is "node" and paths exist`, async () => {
+      // Import with real fs but mocked tmpdir
       vi.resetModules()
       vi.doMock('os', () => ({
         ...os,
@@ -33,6 +36,7 @@ describe.skipIf(
       const { generateMcpInjection } = await import('../../../../server/mcp/config-writer.js')
       const result = generateMcpInjection(mode, `test-${mode}`)
 
+      // For claude/kimi, config is in args; for gemini, config is in env
       let configPath: string
       if (mode === 'claude') {
         const idx = result.args.indexOf('--mcp-config')
@@ -47,8 +51,10 @@ describe.skipIf(
       expect(fs.existsSync(configPath)).toBe(true)
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
 
+      // Command is bare "node"
       expect(config.mcpServers.freshell.command).toBe('node')
 
+      // Dev mode: args should include --import and paths should exist
       const args = config.mcpServers.freshell.args as string[]
       expect(args).toContain('--import')
       const loaderPath = args[args.indexOf('--import') + 1]
@@ -59,6 +65,7 @@ describe.skipIf(
       expect(serverPath).toBeDefined()
       expect(fs.existsSync(serverPath!)).toBe(true)
 
+      // Clean up
       try { fs.unlinkSync(configPath) } catch { /* ignore */ }
     })
   }
@@ -68,11 +75,13 @@ describe.skipIf(
     const { generateMcpInjection } = await import('../../../../server/mcp/config-writer.js')
     const result = generateMcpInjection('codex', 'test-codex')
 
+    // Codex uses -c flags, no temp file
     const commandArg = result.args.find((a: string) => a.includes('mcp_servers.freshell.command'))
     expect(commandArg).toContain('"node"')
 
     const argsArg = result.args.find((a: string) => a.includes('mcp_servers.freshell.args'))
     expect(argsArg).toBeDefined()
+    // Extract paths from TOML array
     const pathMatches = argsArg!.match(/"([^"]+)"/g)
     expect(pathMatches).toBeTruthy()
     for (const quoted of pathMatches!) {
@@ -103,6 +112,7 @@ describe.skipIf(
     expect(config.mcp.freshell).toBeDefined()
     expect(config.mcp.freshell.type).toBe('local')
 
+    // Clean up
     cleanupMcpConfig('test-opencode', 'opencode', testCwd)
   })
 })
