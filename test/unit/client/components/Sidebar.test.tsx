@@ -2356,7 +2356,33 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     })
 
-    it('does not append while the user has typed an uncommitted sidebar search query', () => {
+    it('continues append pagination while the user has only typed an uncommitted sidebar search query', async () => {
+      vi.useRealTimers()
+
+      mockSearchSessions.mockResolvedValue({
+        results: [],
+        tier: 'title',
+        query: 'search',
+        totalScanned: 0,
+      } as any)
+
+      mockFetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-session',
+            projectPath: '/older',
+            lastActivityAt: 10,
+            title: 'Older Session',
+          }],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 10,
+        oldestIncludedSessionId: 'codex:older-session',
+        hasMore: false,
+      })
+
       const store = createTestStore({
         sessions: {
           activeSurface: 'sidebar',
@@ -2390,7 +2416,18 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const list = screen.getByTestId('sidebar-session-list')
       triggerNearBottomScroll(list, { clientHeight: 560, scrollHeight: 1120 })
 
-      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+      await waitFor(() => {
+        expect(mockFetchSidebarSessionsSnapshot).toHaveBeenCalledWith(expect.objectContaining({
+          limit: 50,
+          before: 20,
+          beforeId: 'codex:recent-session',
+          signal: expect.any(AbortSignal),
+        }))
+      })
+      await waitFor(() => {
+        expect(screen.getByText('Older Session')).toBeInTheDocument()
+      })
+      expect(screen.getByText('Recent Session')).toBeInTheDocument()
     })
 
     it('releases the sidebar append guard even when another session surface is active', async () => {

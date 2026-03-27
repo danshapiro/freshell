@@ -393,15 +393,14 @@ export default function Sidebar({
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
-  const localQuery = filter.trim()
-  const hasActiveQuery = localQuery.length > 0 || appliedQuery.length > 0
+  const hasAppliedQuery = appliedQuery.length > 0
 
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const requestSidebarAppend = useCallback(() => {
     if (!sidebarHasMore || sidebarWindow?.loading || loadMoreInFlightRef.current) return
     if (sidebarOldestLoadedTimestamp == null || sidebarOldestLoadedSessionId == null) return
-    if (hasActiveQuery) return
+    if (hasAppliedQuery) return
 
     loadMoreInFlightRef.current = true
     void dispatch(fetchSessionWindow({
@@ -415,7 +414,7 @@ export default function Sidebar({
     }, 15_000)
   }, [
     dispatch,
-    hasActiveQuery,
+    hasAppliedQuery,
     sidebarHasMore,
     sidebarOldestLoadedSessionId,
     sidebarOldestLoadedTimestamp,
