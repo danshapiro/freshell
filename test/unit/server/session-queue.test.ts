@@ -5,7 +5,7 @@ import os from 'os'
 import { SessionRepairQueue, Priority } from '../../../server/session-scanner/queue.js'
 import { createSessionScanner } from '../../../server/session-scanner/scanner.js'
 import { SessionCache } from '../../../server/session-scanner/cache.js'
-import type { SessionScanResult, SessionRepairResult } from '../../../server/session-scanner/types.js'
+import type { SessionScanResult, SessionRepairResult, SessionRepairOptions } from '../../../server/session-scanner/types.js'
 
 const FIXTURES_DIR = path.join(__dirname, '../../fixtures/sessions')
 
@@ -345,6 +345,182 @@ describe('SessionRepairQueue', () => {
 
       expect(result.status).toBe('healthy')
       expect(scanner.scan).not.toHaveBeenCalled()
+
+      await localQueue.stop()
+    })
+
+    it('does not repair healthy sessions with resume issues during disk scans', async () => {
+      const scanResult: SessionScanResult = {
+        sessionId: 'resume-issue',
+        filePath: '/tmp/resume-issue.jsonl',
+        status: 'healthy',
+        chainDepth: 5,
+        orphanCount: 0,
+        fileSize: 500,
+        messageCount: 5,
+        resumeIssue: 'inline_stop_hook_progress',
+      }
+
+      const scanner = {
+        scan: vi.fn().mockResolvedValue(scanResult),
+        repair: vi.fn(),
+        scanBatch: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache-disk.json'))
+      const localQueue = new SessionRepairQueue(scanner as any, localCache)
+
+      localQueue.enqueue([
+        { sessionId: 'resume-issue', filePath: '/tmp/resume-issue.jsonl', priority: 'disk' },
+      ])
+
+      localQueue.start()
+      const result = await localQueue.waitFor('resume-issue', 5000)
+
+      expect(result.status).toBe('healthy')
+      expect(result.resumeIssue).toBe('inline_stop_hook_progress')
+      expect(scanner.repair).not.toHaveBeenCalled()
+
+      await localQueue.stop()
+    })
+
+    it('repairs healthy sessions with resume issues during active scans', async () => {
+      const scanResult: SessionScanResult = {
+        sessionId: 'resume-issue',
+        filePath: '/tmp/resume-issue.jsonl',
+        status: 'healthy',
+        chainDepth: 5,
+        orphanCount: 0,
+        fileSize: 500,
+        messageCount: 5,
+        resumeIssue: 'inline_stop_hook_progress',
+      }
+
+      const repairedScanResult: SessionScanResult = {
+        ...scanResult,
+        resumeIssue: undefined,
+      }
+
+      const scanner = {
+        scan: vi.fn()
+          .mockResolvedValueOnce(scanResult)
+          .mockResolvedValueOnce(repairedScanResult),
+        repair: vi.fn().mockResolvedValue({
+          sessionId: 'resume-issue',
+          status: 'repaired',
+          orphansFixed: 0,
+          resumeIssuesFixed: 1,
+          newChainDepth: 5,
+        }),
+        scanBatch: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache-active.json'))
+      const localQueue = new SessionRepairQueue(scanner as any, localCache)
+
+      localQueue.enqueue([
+        { sessionId: 'resume-issue', filePath: '/tmp/resume-issue.jsonl', priority: 'active' },
+      ])
+
+      localQueue.start()
+      const result = await localQueue.waitFor('resume-issue', 5000)
+
+      expect(result.status).toBe('healthy')
+      expect(result.resumeIssue).toBeUndefined()
+      expect(scanner.repair).toHaveBeenCalledWith('/tmp/resume-issue.jsonl', { includeResumeIssues: true })
+
+      await localQueue.stop()
+    })
+
+    it('bypasses cache for active priority when cached result has resume issue', async () => {
+      const cachedResult: SessionScanResult = {
+        sessionId: 'cached-resume-issue',
+        filePath: path.join(tempDir, 'cached-resume.jsonl'),
+        status: 'healthy',
+        chainDepth: 5,
+        orphanCount: 0,
+        fileSize: 500,
+        messageCount: 5,
+        resumeIssue: 'inline_stop_hook_progress',
+      }
+
+      // Create a real file so cache.set stat() works
+      await fs.writeFile(path.join(tempDir, 'cached-resume.jsonl'), '{}')
+
+      const repairedScanResult: SessionScanResult = {
+        ...cachedResult,
+        resumeIssue: undefined,
+      }
+
+      const scanner = {
+        scan: vi.fn()
+          .mockResolvedValueOnce(cachedResult)
+          .mockResolvedValueOnce(repairedScanResult),
+        repair: vi.fn().mockResolvedValue({
+          sessionId: 'cached-resume-issue',
+          status: 'repaired',
+          orphansFixed: 0,
+          resumeIssuesFixed: 1,
+          newChainDepth: 5,
+        }),
+        scanBatch: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache-bypass.json'))
+      // Seed cache with the resume-issue result
+      await localCache.set(path.join(tempDir, 'cached-resume.jsonl'), cachedResult)
+
+      const localQueue = new SessionRepairQueue(scanner as any, localCache)
+      localQueue.enqueue([
+        { sessionId: 'cached-resume-issue', filePath: path.join(tempDir, 'cached-resume.jsonl'), priority: 'active' },
+      ])
+
+      localQueue.start()
+      const result = await localQueue.waitFor('cached-resume-issue', 5000)
+
+      expect(result.resumeIssue).toBeUndefined()
+      expect(scanner.repair).toHaveBeenCalledWith(
+        path.join(tempDir, 'cached-resume.jsonl'),
+        { includeResumeIssues: true },
+      )
+
+      await localQueue.stop()
+    })
+
+    it('uses cached resume-issue result for disk priority without repair', async () => {
+      const cachedResult: SessionScanResult = {
+        sessionId: 'cached-disk-resume',
+        filePath: path.join(tempDir, 'cached-disk.jsonl'),
+        status: 'healthy',
+        chainDepth: 5,
+        orphanCount: 0,
+        fileSize: 500,
+        messageCount: 5,
+        resumeIssue: 'inline_stop_hook_progress',
+      }
+
+      await fs.writeFile(path.join(tempDir, 'cached-disk.jsonl'), '{}')
+
+      const scanner = {
+        scan: vi.fn(),
+        repair: vi.fn(),
+        scanBatch: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache-disk-reuse.json'))
+      await localCache.set(path.join(tempDir, 'cached-disk.jsonl'), cachedResult)
+
+      const localQueue = new SessionRepairQueue(scanner as any, localCache)
+      localQueue.enqueue([
+        { sessionId: 'cached-disk-resume', filePath: path.join(tempDir, 'cached-disk.jsonl'), priority: 'disk' },
+      ])
+
+      localQueue.start()
+      const result = await localQueue.waitFor('cached-disk-resume', 5000)
+
+      expect(result.resumeIssue).toBe('inline_stop_hook_progress')
+      expect(scanner.scan).not.toHaveBeenCalled()
+      expect(scanner.repair).not.toHaveBeenCalled()
 
       await localQueue.stop()
     })
