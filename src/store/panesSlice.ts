@@ -460,6 +460,12 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
       }
     }
 
+    // Guard cross-kind overwrites: if local and incoming have different content
+    // kinds, preserve local to prevent pane corruption during cross-tab sync
+    if (incoming.content?.kind !== local.content?.kind) {
+      return local
+    }
+
     return incoming
   }
 
@@ -1154,10 +1160,11 @@ export const panesSlice = createSlice({
         const mergedNode = localNode
           ? mergeTerminalState(incomingNode as PaneNode, localNode)
           : (incomingHasShape ? incomingNode as PaneNode : null)
+        const mergeUsedIncoming = mergedNode !== localNode
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
         if (normalizedNode) {
           mergedLayouts[tabId] = normalizedNode
-          if (incomingHasShape && normalizedNode !== localNode) {
+          if (incomingHasShape && mergeUsedIncoming) {
             incomingLayoutTabIds.add(tabId)
           }
         }
