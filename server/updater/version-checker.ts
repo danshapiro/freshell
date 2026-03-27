@@ -73,6 +73,31 @@ export function isMinorOrMajorNewer(current: string, remote: string): boolean {
   return remoteMinor > currentMinor
 }
 
+type UpdateChecker = (currentVersion: string) => Promise<UpdateCheckResult>
+
+const DEFAULT_CACHE_TTL_MS = 10 * 60 * 1000 // 10 minutes
+
+export function createCachedUpdateChecker(
+  checker: UpdateChecker,
+  ttlMs: number = DEFAULT_CACHE_TTL_MS
+): UpdateChecker {
+  let cached: { result: UpdateCheckResult; expiresAt: number } | null = null
+
+  return async (currentVersion: string) => {
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.result
+    }
+
+    const result = await checker(currentVersion)
+
+    if (!result.error) {
+      cached = { result, expiresAt: Date.now() + ttlMs }
+    }
+
+    return result
+  }
+}
+
 export async function checkForUpdate(currentVersion: string): Promise<UpdateCheckResult> {
   try {
     const response = await fetch(GITHUB_RELEASES_URL, {

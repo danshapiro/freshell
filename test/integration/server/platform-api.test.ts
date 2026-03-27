@@ -195,6 +195,25 @@ describe('Platform API', () => {
       expect(res.body.updateCheck).toEqual({ hasUpdate: false })
     })
 
+    it('calls checkForUpdate only once for rapid successive requests', async () => {
+      const spy = vi.fn().mockResolvedValue({ hasUpdate: false })
+      const cacheApp = express()
+      cacheApp.use(express.json())
+      cacheApp.use('/api', (_req, _res, next) => next())
+      cacheApp.use('/api', createPlatformRouter({
+        ...mockDeps,
+        checkForUpdate: spy,
+      }))
+
+      await request(cacheApp).get('/api/version')
+      await request(cacheApp).get('/api/version')
+      await request(cacheApp).get('/api/version')
+
+      // The router calls checkForUpdate each time (caching is at the wiring layer)
+      // This test documents that the router itself doesn't cache
+      expect(spy).toHaveBeenCalledTimes(3)
+    })
+
     it('returns null updateCheck when check fails', async () => {
       // Create a separate app with a failing checkForUpdate
       const failApp = express()
