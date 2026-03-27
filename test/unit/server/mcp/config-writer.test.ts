@@ -250,7 +250,7 @@ describe('generateMcpInjection -- dev/production detection', () => {
     const parsed = JSON.parse(writeCall![1])
     const args = parsed.mcpServers.freshell.args as string[]
     expect(args).toContain('--import')
-    expect(args.some((a: string) => a.includes('tsx/dist/esm/index.mjs'))).toBe(true)
+    expect(args[args.indexOf('--import') + 1]).toContain('tsx')
     expect(args.some((a: string) => a.includes('server/mcp/server.ts'))).toBe(true)
   })
 })

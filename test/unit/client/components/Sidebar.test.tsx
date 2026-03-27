@@ -79,6 +79,7 @@ function createTestStore(options?: {
     layouts: Record<string, PaneNode>
     activePane: Record<string, string>
     paneTitles?: Record<string, Record<string, string>>
+    paneTitleSetByUser?: Record<string, Record<string, boolean>>
   }
   activeTabId?: string
   serverInstanceId?: string
@@ -86,6 +87,7 @@ function createTestStore(options?: {
   showProjectBadges?: boolean
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
+  sessionOpenMode?: 'tab' | 'split'
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -139,6 +141,10 @@ function createTestStore(options?: {
       settings: {
         settings: {
           ...defaultSettings,
+          panes: {
+            ...defaultSettings.panes,
+            sessionOpenMode: options?.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
+          },
           sidebar: {
             ...defaultSettings.sidebar,
             sortMode: options?.sortMode ?? 'activity',
@@ -157,6 +163,7 @@ function createTestStore(options?: {
         layouts: inferredLayouts,
         activePane: inferredActivePane,
         paneTitles: {},
+        paneTitleSetByUser: {},
       },
       sessions: {
         projects,
@@ -2605,7 +2612,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
 
-      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1', sessionOpenMode: 'split' })
       const { onNavigate } = renderSidebar(store, [])
 
       await act(async () => {
@@ -2762,6 +2769,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         panes,
         activeTabId: 'tab-foreign',
         serverInstanceId: 'srv-local',
+        sessionOpenMode: 'split',
       })
       const { onNavigate } = renderSidebar(store, [])
 

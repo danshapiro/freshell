@@ -68,14 +68,26 @@ function createStore(networkStatus: NetworkStatusResponse | null = unconfiguredS
         lastSavedAt: undefined,
       },
       tabs: { tabs: [], activeTabId: null },
-      panes: { layouts: {}, activePane: {}, paneTitles: {} },
+      panes: { layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
     },
   })
 }
 
+function resetNetworkMocks() {
+  mockPost.mockReset()
+  mockGet.mockReset()
+  mockFetchFirewallConfig.mockReset()
+  mockCancelFirewallConfirmation.mockReset()
+  mockCancelFirewallConfirmation.mockResolvedValue(undefined)
+}
+
+function openSafetyTab() {
+  fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
+}
+
 describe('Network Setup Wizard (e2e)', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    resetNetworkMocks()
     mockPost.mockResolvedValue(configuredRemoteStatus)
   })
 
@@ -278,7 +290,7 @@ describe('Share button routing logic', () => {
 
 describe('Settings network section (e2e)', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    resetNetworkMocks()
   })
 
   afterEach(() => {
@@ -293,6 +305,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
+    openSafetyTab()
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
   })
 
@@ -306,6 +319,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
+    openSafetyTab()
     const toggle = screen.getByRole('switch', { name: /remote access/i })
     fireEvent.click(toggle)
 
@@ -345,6 +359,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
+    openSafetyTab()
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
 
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })

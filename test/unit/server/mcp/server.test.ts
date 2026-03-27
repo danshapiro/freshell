@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { createRequire } from 'module'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
+
+const require = createRequire(import.meta.url)
+
+function resolveTsxLoaderPath(): string {
+  return require.resolve('tsx')
+}
 
 const { mockConnect, mockRegisterTool, mockMcpServer, mockStdioTransport, mockExecuteAction } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined)
@@ -138,7 +145,7 @@ describe('MCP server process-level smoke test', () => {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const repoRoot = resolve(__dirname, '..', '..', '..', '..')
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
-    const tsxLoaderPath = resolve(repoRoot, 'node_modules/tsx/dist/esm/index.mjs')
+    const tsxLoaderPath = resolveTsxLoaderPath()
 
     const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
       env: {
@@ -223,7 +230,7 @@ describe('MCP server process-level smoke test', () => {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const repoRoot = resolve(__dirname, '..', '..', '..', '..')
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
-    const tsxLoaderPath = resolve(repoRoot, 'node_modules/tsx/dist/esm/index.mjs')
+    const tsxLoaderPath = resolveTsxLoaderPath()
 
     const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
       env: {

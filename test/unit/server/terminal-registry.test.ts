@@ -3476,19 +3476,19 @@ describe('buildSpawnSpec Unix paths', () => {
     })
 
     it('gemini mode includes GEMINI_CLI_SYSTEM_DEFAULTS_PATH in env', () => {
-      const spec = buildSpawnSpec('gemini', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-gem1')
+      const spec = buildSpawnSpec('gemini', '/home/user', 'system', undefined, undefined, undefined, 'term-gem1')
       expect(spec.env).toHaveProperty('GEMINI_CLI_SYSTEM_DEFAULTS_PATH')
       expect(spec.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH).toContain('freshell-mcp')
     })
 
     it('kimi mode includes --mcp-config-file in args', () => {
-      const spec = buildSpawnSpec('kimi', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-kimi1')
+      const spec = buildSpawnSpec('kimi', '/home/user', 'system', undefined, undefined, undefined, 'term-kimi1')
       expect(spec.args).toContain('--mcp-config-file')
     })
 
     it('opencode mode passes cwd to generateMcpInjection', async () => {
       const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
-      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, undefined, undefined, undefined, 'term-oc1')
+      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, undefined, undefined, 'term-oc1')
       expect(generateMcpInjection).toHaveBeenCalledWith('opencode', 'term-oc1', '/home/user/project', 'unix')
     })
 
@@ -3501,7 +3501,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
     it('buildSpawnSpec passes terminalId, cwd, and platform to generateMcpInjection', async () => {
       const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
-      buildSpawnSpec('claude', '/home/user', 'system', undefined, undefined, undefined, undefined, 'term-123')
+      buildSpawnSpec('claude', '/home/user', 'system', undefined, undefined, undefined, 'term-123')
       expect(generateMcpInjection).toHaveBeenCalledWith('claude', 'term-123', '/home/user', 'unix')
     })
 
@@ -3514,7 +3514,7 @@ describe('buildSpawnSpec Unix paths', () => {
       // On WSL, a Windows-style cwd (e.g. D:\project) should be converted to a Linux path
       // before being passed to generateMcpInjection. resolveUnixShellCwd handles this.
       // The raw Windows path would fail existsSync in config-writer on Linux.
-      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, undefined, undefined, undefined, 'term-wsl1')
+      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, undefined, undefined, 'term-wsl1')
       // The cwd passed to generateMcpInjection should be the resolved Unix path,
       // not the raw Windows path. On WSL, convertWindowsPathToWslPath converts
       // D:\project to /mnt/d/project.
@@ -3532,7 +3532,7 @@ describe('buildSpawnSpec Unix paths', () => {
       mockPlatform('linux')
       process.env.WSL_DISTRO_NAME = 'Ubuntu'
       process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
-      const spec = buildSpawnSpec('claude', '/home/user/project', 'cmd', undefined, undefined, undefined, undefined, 'term-cmd1')
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'cmd', undefined, undefined, undefined, 'term-cmd1')
       // procCwd (spec.cwd) is undefined because cmd.exe can't take a Linux path
       expect(spec.cwd).toBeUndefined()
       // But mcpCwd must be the Linux path used for MCP injection
@@ -3546,7 +3546,7 @@ describe('buildSpawnSpec Unix paths', () => {
       mockPlatform('linux')
       process.env.WSL_DISTRO_NAME = 'Ubuntu'
       process.env.WSL_WINDOWS_SYS32 = '/mnt/c/WINDOWS/system32'
-      const spec = buildSpawnSpec('claude', '/home/user/project', 'powershell', undefined, undefined, undefined, undefined, 'term-ps1')
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'powershell', undefined, undefined, undefined, 'term-ps1')
       expect(spec.cwd).toBeUndefined()
       expect(spec.mcpCwd).toBeDefined()
       expect(spec.mcpCwd).toMatch(/^\//)
@@ -3555,7 +3555,7 @@ describe('buildSpawnSpec Unix paths', () => {
     it('WSL wsl.exe coding CLI returns wslCwd as mcpCwd', () => {
       // When using wsl.exe (from native Windows), mcpCwd should be the Linux path
       mockPlatform('win32')
-      const spec = buildSpawnSpec('claude', 'C:\\Users\\test', 'wsl', undefined, undefined, undefined, undefined, 'term-wsl2')
+      const spec = buildSpawnSpec('claude', 'C:\\Users\\test', 'wsl', undefined, undefined, undefined, 'term-wsl2')
       // wsl.exe passes cwd: undefined to the process
       expect(spec.cwd).toBeUndefined()
       // mcpCwd should be the Linux-normalized cwd
@@ -3564,7 +3564,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
     it('Unix coding CLI returns unixCwd as mcpCwd', () => {
       mockPlatform('linux')
-      const spec = buildSpawnSpec('claude', '/home/user/project', 'system', undefined, undefined, undefined, undefined, 'term-unix1')
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'system', undefined, undefined, undefined, 'term-unix1')
       expect(spec.mcpCwd).toBe('/home/user/project')
     })
 
