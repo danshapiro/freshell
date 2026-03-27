@@ -2381,6 +2381,85 @@ describe('TerminalView lifecycle updates', () => {
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
     })
 
+    it('does not show recovering banner on fresh terminal creation', async () => {
+      const tabId = 'tab-fresh'
+      const paneId = 'pane-fresh'
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-fresh',
+        status: 'creating',
+        mode: 'shell',
+        shell: 'system',
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+          turnCompletion: turnCompletionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'shell',
+              status: 'creating',
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: 'req-fresh',
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: {
+            status: 'ready',
+            error: null,
+          },
+          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        },
+      })
+
+      // Use TerminalViewFromStore so paneContent updates from Redux reach the component
+      const { queryByText } = render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      // Wait for create request to be sent
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.create',
+          requestId: 'req-fresh',
+        }))
+      })
+
+      // Simulate server responding with terminal.created
+      // This triggers: updateContent({ status: 'running' }) then attachTerminal(viewport_hydrate)
+      act(() => {
+        messageHandler!({ type: 'terminal.created', requestId: 'req-fresh', terminalId: 'term-fresh-1', createdAt: Date.now() })
+      })
+
+      // After terminal.created, status is 'running' and isAttaching is true
+      // but the banner should NOT show because this is a fresh terminal
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId: 'term-fresh-1',
+        }))
+      })
+
+      expect(queryByText('Recovering terminal output...')).toBeNull()
+    })
+
     it('shows inline offline status while disconnected without blocking overlay', async () => {
       const { tabId, paneId, paneContent, store } = setupNonBlockingTerminal('disconnected')
 

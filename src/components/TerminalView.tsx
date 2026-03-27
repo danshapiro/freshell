@@ -218,6 +218,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const suppressNetworkEffects = typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
+  const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -1277,6 +1278,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [isTerminal, dispatch, tabId])
 
   const markAttachComplete = useCallback(() => {
+    wasCreatedFreshRef.current = false
     deferredAttachStateRef.current = {
       mode: 'live',
       pendingIntent: null,
@@ -1992,7 +1994,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
   const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
-  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating'
+  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
   const inlineStatusMessage = showInlineOfflineStatus
     ? 'Offline: input will queue until reconnected.'
     : (showInlineRecoveringStatus ? 'Recovering terminal output...' : null)
