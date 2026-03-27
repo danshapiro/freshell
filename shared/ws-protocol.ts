@@ -402,6 +402,7 @@ export type ReadyMessage = {
   type: 'ready'
   timestamp: string
   serverInstanceId?: string
+  bootId?: string
 }
 
 export type PongMessage = {

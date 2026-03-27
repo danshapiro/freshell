@@ -136,6 +136,7 @@ const ReadyMessageSchema = z.object({
   type: z.literal('ready'),
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
+  bootId: z.string().min(1).optional(),
 })
 
 export default function App() {

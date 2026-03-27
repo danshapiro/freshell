@@ -275,6 +275,45 @@ describe('ws handshake snapshot', () => {
     }
   })
 
+  it('includes a bootId in the ready message that differs from serverInstanceId', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const readyMsg = await waitForReady(ws, 10_000)
+      expect(readyMsg).toHaveProperty('bootId')
+      expect(typeof readyMsg.bootId).toBe('string')
+      expect(readyMsg.bootId.length).toBeGreaterThan(0)
+      // bootId should be different from serverInstanceId (boot is ephemeral, instance is persistent)
+      expect(readyMsg.bootId).not.toBe(readyMsg.serverInstanceId)
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
+  it('sends the same bootId to multiple clients within the same process', async () => {
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await Promise.all([
+        new Promise<void>((resolve) => ws1.on('open', () => resolve())),
+        new Promise<void>((resolve) => ws2.on('open', () => resolve())),
+      ])
+
+      const [ready1, ready2] = await Promise.all([
+        waitForReady(ws1, 10_000),
+        waitForReady(ws2, 10_000),
+      ])
+
+      expect(ready1.bootId).toBe(ready2.bootId)
+    } finally {
+      await closeWs(ws1)
+      await closeWs(ws2)
+    }
+  })
+
   it('still omits websocket sessions payloads when no projects exist', async () => {
     snapshot = {
       ...snapshot,
