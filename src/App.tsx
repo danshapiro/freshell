@@ -446,6 +446,7 @@ export default function App() {
     let startupRecoveryRerunRequested = false
     let platformCapabilitiesLoaded = false
     let lastReadyServerInstanceId: string | undefined
+    let lastSessionsRevision = -1
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
@@ -722,10 +723,15 @@ export default function App() {
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
+          lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
         if (msg.type === 'sessions.changed') {
-          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+          const rev = typeof msg.revision === 'number' ? msg.revision : -1
+          if (rev > lastSessionsRevision) {
+            lastSessionsRevision = rev
+            void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+          }
         }
         if (msg.type === 'settings.updated') {
           dispatch(setServerSettings(msg.settings as ServerSettings))
