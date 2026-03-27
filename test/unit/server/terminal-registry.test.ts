@@ -1067,6 +1067,18 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.env.COLORTERM).toBe('24bit')
     })
 
+    it('includes LANG environment variable for UTF-8 encoding', () => {
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.LANG).toBe('en_US.UTF-8')
+    })
+
+    it('includes LC_ALL environment variable for UTF-8 encoding', () => {
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.LC_ALL).toBe('en_US.UTF-8')
+    })
+
     it('passes through other environment variables', () => {
       process.env.MY_CUSTOM_VAR = 'test-value'
 
@@ -2718,6 +2730,18 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('shell', '/Users/john', 'system')
 
       expect(spec.env.COLORTERM).toBe('24bit')
+    })
+
+    it('includes LANG environment variable for UTF-8 encoding', () => {
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.LANG).toBe('en_US.UTF-8')
+    })
+
+    it('includes LC_ALL environment variable for UTF-8 encoding', () => {
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.LC_ALL).toBe('en_US.UTF-8')
     })
 
     it('passes through other environment variables', () => {

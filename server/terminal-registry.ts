@@ -687,6 +687,8 @@ export function buildSpawnSpec(
     ...parentEnv,
     TERM: process.env.TERM || 'xterm-256color',
     COLORTERM: process.env.COLORTERM || 'truecolor',
+    LANG: 'en_US.UTF-8',
+    LC_ALL: 'en_US.UTF-8',
     ...envOverrides,
   }
 
