@@ -50,12 +50,12 @@ describe('MessageBubble', () => {
     expect(article.className).toContain('border-l-2')
   })
 
-  it('constrains content width with max-w-prose', () => {
+  it('fills available width with w-full (matches CLI behavior)', () => {
     const { container } = render(
       <MessageBubble role="assistant" content={[{ type: 'text', text: 'Hello' }]} />
     )
     const article = container.querySelector('[role="article"]')!
-    expect(article.className).toContain('max-w-prose')
+    expect(article.className).toContain('w-full')
   })
 
   it('uses compact vertical padding for denser FreshClaude messages', () => {
