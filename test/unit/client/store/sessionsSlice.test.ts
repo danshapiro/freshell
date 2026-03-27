@@ -12,7 +12,8 @@ import sessionsReducer, {
   expandAll,
   SessionsState,
   setActiveSessionSurface,
-  setSessionWindowData,
+  commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
   setSessionWindowError,
   setSessionWindowLoading,
 } from '@/store/sessionsSlice'
@@ -180,7 +181,7 @@ describe('sessionsSlice', () => {
     it('stores per-surface window data without overwriting another surface', () => {
       let state: SessionsState = sessionsReducer(undefined, setProjects(mockProjects))
       state = sessionsReducer(state, setActiveSessionSurface('sidebar'))
-      state = sessionsReducer(state, setSessionWindowData({
+      state = sessionsReducer(state, commitSessionWindowReplacement({
         surface: 'history',
         projects: [mockProjects[1]],
         totalSessions: 1,
@@ -190,6 +191,157 @@ describe('sessionsSlice', () => {
       expect(state.windows.sidebar.projects).toEqual(mockProjects)
       expect(state.windows.history.projects).toEqual([mockProjects[1]])
       expect(state.projects).toEqual(mockProjects)
+    })
+  })
+
+  describe('explicit sidebar window commits', () => {
+    function createCommittedSidebarState(): SessionsState {
+      return {
+        ...initialState,
+        activeSurface: 'sidebar',
+        projects: [mockProjects[0]],
+        lastLoadedAt: 1700000000000,
+        totalSessions: 2,
+        oldestLoadedTimestamp: 1699999999000,
+        oldestLoadedSessionId: 'claude:session-2',
+        hasMore: false,
+        windows: {
+          sidebar: {
+            projects: [mockProjects[0]],
+            lastLoadedAt: 1700000000000,
+            totalSessions: 2,
+            oldestLoadedTimestamp: 1699999999000,
+            oldestLoadedSessionId: 'claude:session-2',
+            hasMore: false,
+            query: 'alpha',
+            searchTier: 'title',
+            appliedQuery: 'alpha',
+            appliedSearchTier: 'title',
+            resultVersion: 7,
+          },
+        },
+      }
+    }
+
+    it('updates requested replacement state immediately without changing the committed visible result version', () => {
+      const state = sessionsReducer(
+        createCommittedSidebarState(),
+        setSessionWindowLoading({
+          surface: 'sidebar',
+          loading: true,
+          loadingKind: 'search',
+          query: 'beta',
+          searchTier: 'fullText',
+        }),
+      )
+
+      expect(state.windows.sidebar.query).toBe('beta')
+      expect(state.windows.sidebar.searchTier).toBe('fullText')
+      expect(state.windows.sidebar.appliedQuery).toBe('alpha')
+      expect(state.windows.sidebar.appliedSearchTier).toBe('title')
+      expect(state.windows.sidebar.loading).toBe(true)
+      expect(state.windows.sidebar.loadingKind).toBe('search')
+      expect(state.windows.sidebar.resultVersion).toBe(7)
+      expect(state.query).toBeUndefined()
+      expect(state.projects).toEqual([mockProjects[0]])
+    })
+
+    it('commits a replacement by updating requested and applied state together and bumping resultVersion', () => {
+      const replacementProjects = [mockProjects[1]]
+
+      const state = sessionsReducer(
+        createCommittedSidebarState(),
+        commitSessionWindowReplacement({
+          surface: 'sidebar',
+          projects: replacementProjects,
+          totalSessions: 1,
+          oldestLoadedTimestamp: 1700000000500,
+          oldestLoadedSessionId: 'claude:session-3',
+          hasMore: false,
+          query: 'beta',
+          searchTier: 'fullText',
+          deepSearchPending: false,
+        }),
+      )
+
+      expect(state.windows.sidebar.projects).toEqual(replacementProjects)
+      expect(state.windows.sidebar.query).toBe('beta')
+      expect(state.windows.sidebar.searchTier).toBe('fullText')
+      expect(state.windows.sidebar.appliedQuery).toBe('beta')
+      expect(state.windows.sidebar.appliedSearchTier).toBe('fullText')
+      expect(state.windows.sidebar.loading).toBe(false)
+      expect(state.windows.sidebar.loadingKind).toBeUndefined()
+      expect(state.windows.sidebar.resultVersion).toBe(8)
+      expect(state.projects).toEqual(replacementProjects)
+      expect(state.totalSessions).toBe(1)
+    })
+
+    it('commits a visible refresh without rewriting requested state and can preserve an in-flight replacement load', () => {
+      const replacementLoadingState = sessionsReducer(
+        createCommittedSidebarState(),
+        setSessionWindowLoading({
+          surface: 'sidebar',
+          loading: true,
+          loadingKind: 'search',
+          query: '',
+          searchTier: 'title',
+        }),
+      )
+      const refreshedProjects = [mockProjects[2]]
+
+      const state = sessionsReducer(
+        replacementLoadingState,
+        commitSessionWindowVisibleRefresh({
+          surface: 'sidebar',
+          projects: refreshedProjects,
+          totalSessions: 1,
+          oldestLoadedTimestamp: 1700000001000,
+          oldestLoadedSessionId: 'claude:session-4',
+          hasMore: false,
+          query: 'alpha',
+          searchTier: 'title',
+          preserveLoading: true,
+        }),
+      )
+
+      expect(state.windows.sidebar.projects).toEqual(refreshedProjects)
+      expect(state.windows.sidebar.query).toBe('')
+      expect(state.windows.sidebar.searchTier).toBe('title')
+      expect(state.windows.sidebar.appliedQuery).toBe('alpha')
+      expect(state.windows.sidebar.appliedSearchTier).toBe('title')
+      expect(state.windows.sidebar.loading).toBe(true)
+      expect(state.windows.sidebar.loadingKind).toBe('search')
+      expect(state.windows.sidebar.resultVersion).toBe(8)
+      expect(state.projects).toEqual(refreshedProjects)
+    })
+
+    it('preserves the last applied context and resultVersion when a replacement fails', () => {
+      const loadingState = sessionsReducer(
+        createCommittedSidebarState(),
+        setSessionWindowLoading({
+          surface: 'sidebar',
+          loading: true,
+          loadingKind: 'search',
+          query: 'beta',
+          searchTier: 'fullText',
+        }),
+      )
+
+      const state = sessionsReducer(
+        loadingState,
+        setSessionWindowError({
+          surface: 'sidebar',
+          error: 'Search failed',
+        }),
+      )
+
+      expect(state.windows.sidebar.query).toBe('beta')
+      expect(state.windows.sidebar.searchTier).toBe('fullText')
+      expect(state.windows.sidebar.appliedQuery).toBe('alpha')
+      expect(state.windows.sidebar.appliedSearchTier).toBe('title')
+      expect(state.windows.sidebar.resultVersion).toBe(7)
+      expect(state.windows.sidebar.error).toBe('Search failed')
+      expect(state.projects).toEqual([mockProjects[0]])
     })
   })
 
@@ -620,7 +772,7 @@ describe('sessionsSlice', () => {
   })
 
   describe('deepSearchPending', () => {
-    it('defaults deepSearchPending to false when setSessionWindowData omits it', () => {
+    it('defaults deepSearchPending to false when commitSessionWindowReplacement omits it', () => {
       // Start with a sidebar window that has deepSearchPending: true
       const stateWithPending: SessionsState = {
         ...initialState,
@@ -633,7 +785,7 @@ describe('sessionsSlice', () => {
         },
       }
 
-      const state = sessionsReducer(stateWithPending, setSessionWindowData({
+      const state = sessionsReducer(stateWithPending, commitSessionWindowReplacement({
         surface: 'sidebar',
         projects: mockProjects,
         totalSessions: 3,
@@ -695,7 +847,7 @@ describe('sessionsSlice', () => {
       expect((state.windows.sidebar as any).appliedSearchTier).toBe('title')
     })
 
-    it('setSessionWindowData commits requested and applied search fields together with the visible result set', () => {
+    it('commitSessionWindowReplacement commits requested and applied search fields together with the visible result set', () => {
       const stateWithAppliedSearch: SessionsState = {
         ...initialState,
         activeSurface: 'sidebar',
@@ -710,7 +862,7 @@ describe('sessionsSlice', () => {
         },
       }
 
-      const state = sessionsReducer(stateWithAppliedSearch, setSessionWindowData({
+      const state = sessionsReducer(stateWithAppliedSearch, commitSessionWindowReplacement({
         surface: 'sidebar',
         projects: [mockProjects[1]],
         totalSessions: 1,
@@ -755,7 +907,7 @@ describe('sessionsSlice', () => {
       expect((loadingState.windows.sidebar as any).appliedQuery).toBe('alpha')
       expect((loadingState.windows.sidebar as any).appliedSearchTier).toBe('title')
 
-      const committedState = sessionsReducer(loadingState, setSessionWindowData({
+      const committedState = sessionsReducer(loadingState, commitSessionWindowReplacement({
         surface: 'sidebar',
         projects: mockProjects,
         totalSessions: mockProjects.length,
@@ -815,14 +967,13 @@ describe('sessionsSlice', () => {
         },
       }
 
-      const state = sessionsReducer(stateWithPendingBrowseRequest, setSessionWindowData({
+      const state = sessionsReducer(stateWithPendingBrowseRequest, commitSessionWindowVisibleRefresh({
         surface: 'sidebar',
         projects: [mockProjects[1]],
         totalSessions: 1,
         hasMore: false,
         query: 'alpha',
         searchTier: 'title',
-        preserveRequestedSearch: true,
         preserveLoading: true,
       }))
 
