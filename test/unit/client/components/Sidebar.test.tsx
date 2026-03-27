@@ -8,7 +8,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer, { setSessionWindowData } from '@/store/sessionsSlice'
+import sessionsReducer, { setSessionWindowData, setSessionWindowLoading } from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
@@ -1636,6 +1636,34 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('Search clear button', () => {
+    it('renders and clears a preloaded requested search from sidebar state', async () => {
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [],
+              lastLoadedAt: 1_700_000_000_000,
+              query: 'preloaded search',
+              searchTier: 'fullText',
+            },
+          },
+        },
+      })
+      const { getByPlaceholderText, getByRole, queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const input = getByPlaceholderText('Search...')
+      expect(input).toHaveValue('preloaded search')
+      expect(getByRole('combobox', { name: /search tier/i })).toHaveValue('fullText')
+
+      fireEvent.click(getByRole('button', { name: /clear search/i }))
+
+      expect(input).toHaveValue('')
+      expect(queryByRole('button', { name: /clear search/i })).not.toBeInTheDocument()
+      expect(queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
+    })
+
     it('shows clear button when search has text', async () => {
       const store = createTestStore()
       const { getByPlaceholderText, getByRole, queryByRole } = renderSidebar(store, [])
@@ -1673,6 +1701,25 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('Search tier toggle', () => {
+    it('follows requested search updates from Redux after mount', async () => {
+      const store = createTestStore()
+      const { getByPlaceholderText, getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      act(() => {
+        store.dispatch(setSessionWindowLoading({
+          surface: 'sidebar',
+          loading: false,
+          query: 'store-driven query',
+          searchTier: 'userMessages',
+        }))
+      })
+
+      expect(getByPlaceholderText('Search...')).toHaveValue('store-driven query')
+      expect(getByRole('combobox', { name: /search tier/i })).toHaveValue('userMessages')
+      expect(getByRole('button', { name: /clear search/i })).toBeInTheDocument()
+    })
+
     it('renders tier selector when searching', async () => {
       const store = createTestStore()
       const { getByPlaceholderText, getByRole } = renderSidebar(store, [])
