@@ -224,41 +224,47 @@ describe('sidebar search flow (e2e)', () => {
     expect(screen.getByText('Deploy Pipeline')).toBeInTheDocument()
   })
 
-  it('renders preloaded requested search controls from sidebar state without local typing', async () => {
+  it('renders a preloaded requested search and dispatches it on mount without local typing', async () => {
+    const searchRequest = createDeferred<any>()
+    vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
     const store = createStore({
       sessions: {
         activeSurface: 'sidebar',
         windows: {
           sidebar: {
-            projects: [{
-              projectPath: '/proj',
-              sessions: [{
-                provider: 'claude',
-                sessionId: 'session-prefilled',
-                projectPath: '/proj',
-                lastActivityAt: 2_000,
-                title: 'Prefilled Result',
-              }],
-            }],
-            lastLoadedAt: 1_700_000_000_000,
             query: 'prefilled',
-            searchTier: 'fullText',
-            appliedQuery: 'prefilled',
-            appliedSearchTier: 'fullText',
-            deepSearchPending: true,
-            loading: false,
+            searchTier: 'title',
+            projects: [],
           },
         },
       },
     })
 
     renderSidebar(store)
-    await act(() => vi.advanceTimersByTime(100))
+    await act(async () => {
+      vi.advanceTimersByTime(300)
+      await Promise.resolve()
+    })
 
     expect(screen.getByPlaceholderText('Search...')).toHaveValue('prefilled')
-    expect(screen.getByRole('combobox', { name: /search tier/i })).toHaveValue('fullText')
+    expect(screen.getByRole('combobox', { name: /search tier/i })).toHaveValue('title')
     expect(screen.getByLabelText('Clear search')).toBeInTheDocument()
-    expect(screen.getByText('Scanning files...')).toBeInTheDocument()
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'prefilled',
+      tier: 'title',
+    }))
+    expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+
+    await act(async () => {
+      searchRequest.resolve({
+        results: [],
+        tier: 'title',
+        query: 'prefilled',
+        totalScanned: 0,
+      })
+      await Promise.resolve()
+    })
   })
 
   it('matches subdirectory leaves and only shows matching open-tab fallbacks without pinning them above newer server results', async () => {

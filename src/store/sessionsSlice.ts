@@ -192,37 +192,6 @@ export const sessionsSlice = createSlice({
         }
       }
     },
-    setSessionWindowRequestedSearch: (
-      state,
-      action: PayloadAction<{
-        surface: string
-        query?: string
-        searchTier?: 'title' | 'userMessages' | 'fullText'
-      }>,
-    ) => {
-      if (!state.windows) {
-        state.windows = {}
-      }
-      if (
-        !state.windows?.[action.payload.surface] &&
-        !state.activeSurface &&
-        (state.projects.length > 0 || state.lastLoadedAt !== undefined)
-      ) {
-        state.windows[action.payload.surface] = {
-          projects: state.projects,
-          lastLoadedAt: state.lastLoadedAt,
-          totalSessions: state.totalSessions,
-          oldestLoadedTimestamp: state.oldestLoadedTimestamp,
-          oldestLoadedSessionId: state.oldestLoadedSessionId,
-          hasMore: state.hasMore,
-          loading: state.loadingMore,
-          loadingKind: state.loadingKind,
-        }
-      }
-      const window = ensureWindow(state, action.payload.surface)
-      if (action.payload.query !== undefined) window.query = action.payload.query
-      if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
-    },
     setSessionWindowData: (
       state,
       action: PayloadAction<{
@@ -424,7 +393,6 @@ export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
   setSessionWindowError,
-  setSessionWindowRequestedSearch,
   setSessionWindowData,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,

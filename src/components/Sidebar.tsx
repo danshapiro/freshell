@@ -17,7 +17,6 @@ import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
-import { setSessionWindowRequestedSearch } from '@/store/sessionsSlice'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
 import type { ChatSessionState } from '@/store/agentChatTypes'
@@ -212,6 +211,10 @@ export default function Sidebar({
   const requestedSearchTier = sidebarWindow?.searchTier ?? 'title'
   const appliedQuery = (sidebarWindow?.appliedQuery ?? '').trim()
   const appliedSearchTier = sidebarWindow?.appliedSearchTier ?? 'title'
+  const [filter, setFilter] = useState(requestedQueryValue)
+  const [searchTier, setSearchTier] = useState<typeof requestedSearchTier>(requestedSearchTier)
+  const localQuery = filter.trim()
+  const localMatchesRequestedSearch = filter === requestedQueryValue && searchTier === requestedSearchTier
 
   // Tick counter that increments every 15s to keep relative timestamps fresh.
   // The custom comparator on SidebarItem ensures only the timestamp text node
@@ -223,13 +226,36 @@ export default function Sidebar({
   }, [])
 
   useEffect(() => {
+    setFilter(requestedQueryValue)
+  }, [requestedQueryValue])
+
+  useEffect(() => {
+    setSearchTier(requestedSearchTier)
+  }, [requestedSearchTier])
+
+  useEffect(() => {
+    const shouldDispatchInitialRequestedSearch = !hasInitializedSearchEffectRef.current
+      && localMatchesRequestedSearch
+      && requestedQuery.length > 0
+      && (
+        requestedQuery !== appliedQuery
+        || requestedSearchTier !== appliedSearchTier
+        || typeof sidebarWindow?.lastLoadedAt !== 'number'
+      )
+
     if (!hasInitializedSearchEffectRef.current) {
       hasInitializedSearchEffectRef.current = true
       wasSearchingRef.current = requestedQuery.length > 0 || appliedQuery.length > 0
+      if (!shouldDispatchInitialRequestedSearch) {
+        return
+      }
+    }
+
+    if (localMatchesRequestedSearch && !shouldDispatchInitialRequestedSearch) {
       return
     }
 
-    if (!requestedQuery) {
+    if (!localQuery) {
       if (wasSearchingRef.current) {
         wasSearchingRef.current = false
         lastMarkedSearchQueryRef.current = null
@@ -246,15 +272,25 @@ export default function Sidebar({
       void dispatch(fetchSessionWindow({
         surface: 'sidebar',
         priority: 'visible',
-        query: requestedQuery,
-        searchTier: requestedSearchTier,
+        query: localQuery,
+        searchTier,
       }) as any)
     }, 300) // Debounce 300ms
 
     return () => {
       clearTimeout(timeoutId)
     }
-  }, [dispatch, requestedQuery, requestedSearchTier])
+  }, [
+    appliedQuery,
+    appliedSearchTier,
+    dispatch,
+    localMatchesRequestedSearch,
+    localQuery,
+    requestedQuery,
+    requestedSearchTier,
+    searchTier,
+    sidebarWindow?.lastLoadedAt,
+  ])
 
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
   const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
@@ -582,13 +618,8 @@ export default function Sidebar({
           <input
             type="text"
             placeholder="Search..."
-            value={requestedQueryValue}
-            onChange={(e) => {
-              dispatch(setSessionWindowRequestedSearch({
-                surface: 'sidebar',
-                query: e.target.value,
-              }))
-            }}
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
             aria-busy={showSearchLoading}
             className="w-full h-8 pl-8 pr-36 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
           />
@@ -603,15 +634,10 @@ export default function Sidebar({
                 <span>Searching...</span>
               </span>
             ) : null}
-            {requestedQueryValue ? (
+            {filter ? (
               <button
                 aria-label="Clear search"
-                onClick={() => {
-                  dispatch(setSessionWindowRequestedSearch({
-                    surface: 'sidebar',
-                    query: '',
-                  }))
-                }}
+                onClick={() => setFilter('')}
                 className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3.5 w-3.5" />
@@ -619,17 +645,12 @@ export default function Sidebar({
             ) : null}
           </div>
         </div>
-        {requestedQuery && (
+        {localQuery && (
           <div className="mt-2">
             <select
               aria-label="Search tier"
-              value={requestedSearchTier}
-              onChange={(e) => {
-                dispatch(setSessionWindowRequestedSearch({
-                  surface: 'sidebar',
-                  searchTier: e.target.value as typeof requestedSearchTier,
-                }))
-              }}
+              value={searchTier}
+              onChange={(e) => setSearchTier(e.target.value as typeof requestedSearchTier)}
               className="w-full h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
             >
               <option value="title">Title</option>
@@ -677,11 +698,11 @@ export default function Sidebar({
           {showBlockingLoad ? (
             <div
               className="flex items-center justify-center py-8"
-              data-testid={requestedQuery ? 'search-loading' : undefined}
+              data-testid={localQuery ? 'search-loading' : undefined}
             >
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               <span className="ml-2 text-sm text-muted-foreground">
-                {requestedQuery ? 'Searching...' : 'Loading sessions...'}
+                {localQuery ? 'Searching...' : 'Loading sessions...'}
               </span>
             </div>
           ) : sortedItems.length === 0 ? (
