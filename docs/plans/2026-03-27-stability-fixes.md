@@ -8,16 +8,18 @@
 
 ## How to Use This Plan
 
-Each issue below is a self-contained work item. An agent should:
-1. Read the issue description and context files
-2. Work in a dedicated worktree (branch off `data-model-review`)
-3. Implement with TDD — write a failing test, make it pass, refactor
-4. Build and run a server on a unique port to verify the fix works in a real browser
-5. Use Chrome automation to confirm the user-visible behavior is fixed
-6. Write findings/decisions in the lab note if anything surprising comes up
-7. Commit frequently, with clear messages
+**Work model:** One agent, one branch, serial execution. Work through the issues in order, committing frequently. Each fix builds on the previous ones. The ordering is designed so later fixes benefit from earlier ones (e.g., boot ID enables the handshake snapshot which enables proactive recovery).
 
-Issues are ordered by independence (can be done without touching other fixes) and impact. Early issues are safe to parallelize. Later issues depend on earlier ones or touch overlapping code.
+**Suggested PR breakpoints:** After Issue 3 (quick wins), after Issue 7 (handshake snapshot — the biggest architectural change), and after Issue 9 (the full set). This gives 3 reviewable PRs that can merge sequentially.
+
+**For each issue, the agent should:**
+1. Read the issue description and the referenced context files (spike lab notes)
+2. Implement with TDD — write a failing test, make it pass, refactor
+3. Build and run a server on a unique port to verify the fix works in a real browser
+4. Use Chrome automation to confirm the user-visible behavior is fixed
+5. Write findings/decisions in a lab note if anything surprising comes up
+6. Commit with a clear message, then move to the next issue
+7. Run the full test suite periodically (at least at each PR breakpoint) to catch regressions
 
 ---
 
@@ -186,27 +188,31 @@ Issues are ordered by independence (can be done without touching other fixes) an
 
 ---
 
-## Dependencies and Ordering
+## Serial Order and PR Breakpoints
+
+The issues are ordered so each builds on the last:
 
 ```
-Independent (can parallelize):
-  Issue 1: /api/version cache
-  Issue 2: "Recovering" banner fix
-  Issue 3: Session-directory polling
-  Issue 5: Cross-kind merge guard
+PR 1 — Quick Wins (Issues 1-3)
+  1. /api/version cache              — trivial, immediate page load improvement
+  2. "Recovering" banner fix         — cosmetic, builds confidence
+  3. Session-directory over-polling   — biggest steady-state fix
 
-Sequential chain:
-  Issue 4: Boot ID → Issue 7: Handshake snapshot → Issue 9: Proactive hidden-tab recovery
+PR 2 — Architectural Core (Issues 4-7)
+  4. Per-process boot ID             — enables server restart detection
+  5. Cross-kind merge guard          — prevents pane corruption
+  6. Atomic cross-tab hydration      — prevents cross-tab breakage
+  7. Handshake terminal snapshot     — the big one: eliminates INVALID cascade
 
-Independent but benefits from context:
-  Issue 6: Atomic cross-tab hydration (can be done anytime, doesn't depend on others)
-  Issue 8: Backoff tuning (can be done anytime, synergizes with Issue 7)
+PR 3 — Recovery Polish (Issues 8-9)
+  8. Reconnect backoff tuning        — faster reconnect after restart
+  9. Proactive hidden-tab recovery   — no more replay-on-switch
 ```
 
-## Verification Checklist (For Each Issue)
+## Verification Checklist (At Each PR Breakpoint)
 
-- [ ] Tests pass (both new tests and existing suite)
+- [ ] Full test suite passes (`npm test`)
 - [ ] Server builds and runs in production mode
-- [ ] Behavior verified in Chrome with real terminals
-- [ ] No regression in other scenarios (reconnect, page refresh, cross-tab sync)
-- [ ] Commit with clear message explaining what and why
+- [ ] All fixed behaviors verified in Chrome with real terminals
+- [ ] No regression in: reconnect, page refresh, cross-tab sync, terminal output
+- [ ] Each commit has a clear message explaining what and why
