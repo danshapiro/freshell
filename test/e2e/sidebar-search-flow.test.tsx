@@ -263,7 +263,7 @@ describe('sidebar search flow (e2e)', () => {
     const store = createStore({
       tabs: [{
         id: 'tab-fallback',
-        title: 'Open Trycycle Tab',
+        title: 'Open Matching Tab',
         mode: 'codex',
         resumeSessionId: matchingFallbackSessionId,
         createdAt: 1_000,
@@ -288,7 +288,7 @@ describe('sidebar search flow (e2e)', () => {
         },
         paneTitles: {
           'tab-fallback': {
-            'pane-fallback': 'Open Trycycle Tab',
+            'pane-fallback': 'Open Matching Tab',
           },
         },
       },
@@ -311,15 +311,15 @@ describe('sidebar search flow (e2e)', () => {
     }))
     expect(screen.getByText('Routine work')).toBeInTheDocument()
     expect(screen.getByText('Newer Server Result')).toBeInTheDocument()
-    expect(screen.getByText('Open Trycycle Tab')).toBeInTheDocument()
+    expect(screen.getByText('Open Matching Tab')).toBeInTheDocument()
     expect(getSidebarSessionOrder([
       'Newer Server Result',
       'Routine work',
-      'Open Trycycle Tab',
+      'Open Matching Tab',
     ])).toEqual([
       'Newer Server Result',
       'Routine work',
-      'Open Trycycle Tab',
+      'Open Matching Tab',
     ])
 
     fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'code' } })
@@ -335,7 +335,7 @@ describe('sidebar search flow (e2e)', () => {
       tier: 'title',
     }))
     expect(screen.queryByText('Routine work')).not.toBeInTheDocument()
-    expect(screen.queryByText('Open Trycycle Tab')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open Matching Tab')).not.toBeInTheDocument()
   })
 
   it('deep-tier search shows title results first, then merged results after Phase 2', async () => {
