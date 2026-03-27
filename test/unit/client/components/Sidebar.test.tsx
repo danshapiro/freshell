@@ -1664,6 +1664,53 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
     })
 
+    it('does not write search request state to Redux until the debounced request starts', async () => {
+      const searchRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [],
+            },
+          },
+        },
+      })
+      const { getByPlaceholderText, getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'draft query' } })
+      fireEvent.change(getByRole('combobox', { name: /search tier/i }), { target: { value: 'fullText' } })
+
+      expect((store.getState().sessions.windows.sidebar as any).query).toBeUndefined()
+      expect((store.getState().sessions.windows.sidebar as any).searchTier).toBeUndefined()
+
+      await act(() => vi.advanceTimersByTime(299))
+
+      expect((store.getState().sessions.windows.sidebar as any).query).toBeUndefined()
+      expect((store.getState().sessions.windows.sidebar as any).searchTier).toBeUndefined()
+
+      await act(async () => {
+        vi.advanceTimersByTime(1)
+        await Promise.resolve()
+      })
+
+      expect((store.getState().sessions.windows.sidebar as any).query).toBe('draft query')
+      expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('fullText')
+
+      await act(async () => {
+        searchRequest.resolve({
+          results: [],
+          tier: 'title',
+          query: 'draft query',
+          totalScanned: 0,
+        })
+        await Promise.resolve()
+      })
+    })
+
     it('shows clear button when search has text', async () => {
       const store = createTestStore()
       const { getByPlaceholderText, getByRole, queryByRole } = renderSidebar(store, [])
@@ -1718,6 +1765,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(getByPlaceholderText('Search...')).toHaveValue('store-driven query')
       expect(getByRole('combobox', { name: /search tier/i })).toHaveValue('userMessages')
       expect(getByRole('button', { name: /clear search/i })).toBeInTheDocument()
+    })
+
+    it('dispatches a preloaded requested search on mount when no applied result set is committed', async () => {
+      const searchRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [],
+              query: 'prefilled request',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(300)
+        await Promise.resolve()
+      })
+
+      expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+        query: 'prefilled request',
+        tier: 'title',
+      }))
+
+      await act(async () => {
+        searchRequest.resolve({
+          results: [],
+          tier: 'title',
+          query: 'prefilled request',
+          totalScanned: 0,
+        })
+        await Promise.resolve()
+      })
     })
 
     it('renders tier selector when searching', async () => {
@@ -3009,6 +3096,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastLoadedAt: Date.now(),
               query: 'test',
               searchTier: 'fullText',
+              appliedQuery: 'test',
+              appliedSearchTier: 'fullText',
               deepSearchPending: true,
               loading: false,
             },
@@ -3017,10 +3106,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       renderSidebar(store, [])
-
-      // Need to type in the search box so the filter.trim() conditional shows the tier dropdown
-      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
-      await act(() => vi.advanceTimersByTime(0))
 
       expect(screen.getByText('Scanning files...')).toBeInTheDocument()
       expect(screen.getByText('Scanning files...').closest('[role="status"]')).toBeInTheDocument()
@@ -3043,6 +3128,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastLoadedAt: Date.now(),
               query: 'test',
               searchTier: 'fullText',
+              appliedQuery: 'test',
+              appliedSearchTier: 'fullText',
               deepSearchPending: false,
               loading: false,
             },
@@ -3051,9 +3138,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       renderSidebar(store, [])
-
-      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
-      await act(() => vi.advanceTimersByTime(0))
 
       expect(screen.queryByText('Scanning files...')).not.toBeInTheDocument()
     })
@@ -3070,6 +3154,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastLoadedAt: Date.now(),
               query: 'test',
               searchTier: 'fullText',
+              appliedQuery: 'test',
+              appliedSearchTier: 'fullText',
               deepSearchPending: true,
               loading: false,
             },
@@ -3078,9 +3164,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       renderSidebar(store, [])
-
-      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
-      await act(() => vi.advanceTimersByTime(0))
 
       expect(screen.getByText('Scanning files...')).toBeInTheDocument()
       expect(screen.queryByText('No results found')).not.toBeInTheDocument()
@@ -3103,6 +3186,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastLoadedAt: Date.now(),
               query: 'test',
               searchTier: 'fullText',
+              appliedQuery: 'test',
+              appliedSearchTier: 'fullText',
               deepSearchPending: true,
               loading: false,
             },
@@ -3111,9 +3196,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       renderSidebar(store, [])
-
-      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
-      await act(() => vi.advanceTimersByTime(0))
       expect(screen.getByText('Scanning files...')).toBeInTheDocument()
 
       // Clear the search
@@ -3140,6 +3222,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
               lastLoadedAt: Date.now(),
               query: 'test',
               searchTier: 'fullText',
+              appliedQuery: 'test',
+              appliedSearchTier: 'fullText',
               deepSearchPending: true,
               loading: false,
             },
@@ -3148,9 +3232,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       renderSidebar(store, [])
-
-      fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'test' } })
-      await act(() => vi.advanceTimersByTime(0))
 
       const statusElement = screen.getByRole('status')
       expect(statusElement).toBeInTheDocument()
