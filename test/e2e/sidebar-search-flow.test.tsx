@@ -563,6 +563,7 @@ describe('sidebar search flow (e2e)', () => {
   it('clearing search returns to browse mode', async () => {
     const phase1Deferred = createDeferred<any>()
     const phase2Deferred = createDeferred<any>()
+    const browseDeferred = createDeferred<any>()
     vi.mocked(mockSearchSessions)
       .mockReturnValueOnce(phase1Deferred.promise) // Phase 1
       .mockReturnValueOnce(phase2Deferred.promise) // Phase 2 (will hang)
@@ -578,15 +579,38 @@ describe('sidebar search flow (e2e)', () => {
       }],
     }]
 
-    vi.mocked(mockFetchSnapshot).mockResolvedValue({
+    vi.mocked(mockFetchSnapshot).mockReturnValue(browseDeferred.promise)
+
+    const store = createStore({
+      projects: browseProjects,
+      sessions: {
+        activeSurface: 'sidebar',
+        projects: browseProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: browseProjects,
+            lastLoadedAt: 1_000,
+            query: '',
+            searchTier: 'title',
+            appliedQuery: '',
+            appliedSearchTier: 'title',
+            loading: false,
+            hasMore: false,
+            oldestLoadedTimestamp: 1_000,
+            oldestLoadedSessionId: 'claude:session-browse',
+          },
+        },
+      },
+    })
+
+    browseDeferred.resolve({
       projects: browseProjects,
       totalSessions: 1,
       oldestIncludedTimestamp: 1_000,
       oldestIncludedSessionId: 'claude:session-browse',
       hasMore: false,
     })
-
-    const store = createStore({ projects: browseProjects })
 
     renderSidebar(store)
     await act(() => vi.advanceTimersByTime(100))
@@ -627,9 +651,23 @@ describe('sidebar search flow (e2e)', () => {
     const clearButton = screen.getByLabelText('Clear search')
     fireEvent.click(clearButton)
 
-    // Wait for browse re-fetch
+    // Wait for browse re-fetch to start while leaving it unresolved.
     await act(async () => {
       vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
+
+    await act(async () => {
+      browseDeferred.resolve({
+        projects: browseProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-browse',
+        hasMore: false,
+      })
       await Promise.resolve()
       await Promise.resolve()
     })

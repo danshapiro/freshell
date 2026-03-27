@@ -427,11 +427,14 @@ export default function Sidebar({
   const visibleQuery = appliedQuery || requestedQuery
   const visibleSearchTier = appliedQuery ? appliedSearchTier : requestedSearchTier
   const loadingKind = sidebarWindow?.loadingKind
+  const hasRequestedQuery = requestedQuery.length > 0
   const showBlockingLoad = !!sidebarWindow?.loading
     && loadingKind === 'initial'
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
-  const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
+  const showSearchLoading = !!sidebarWindow?.loading
+    && loadingKind === 'search'
+    && hasRequestedQuery
   const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
@@ -698,11 +701,11 @@ export default function Sidebar({
           {showBlockingLoad ? (
             <div
               className="flex items-center justify-center py-8"
-              data-testid={localQuery ? 'search-loading' : undefined}
+              data-testid={hasRequestedQuery ? 'search-loading' : undefined}
             >
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               <span className="ml-2 text-sm text-muted-foreground">
-                {localQuery ? 'Searching...' : 'Loading sessions...'}
+                {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
               </span>
             </div>
           ) : sortedItems.length === 0 ? (
