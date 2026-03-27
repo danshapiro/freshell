@@ -1,6 +1,3 @@
-// Tests for the MCP server entry point.
-// Validates McpServer creation, tool registration, and stdio transport.
-
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
@@ -42,6 +39,7 @@ describe('MCP server initialization', () => {
     mockStdioTransport.mockClear()
     mockExecuteAction.mockClear()
 
+    // Re-mock after resetModules
     mockMcpServer.mockReturnValue({
       tool: mockRegisterTool,
       connect: mockConnect,
@@ -49,6 +47,7 @@ describe('MCP server initialization', () => {
   })
 
   async function importServer() {
+    // Re-register mocks after resetModules
     vi.doMock('@modelcontextprotocol/sdk/server/mcp.js', () => ({
       McpServer: mockMcpServer,
     }))
@@ -89,12 +88,14 @@ describe('MCP server initialization', () => {
 
   it('tool registration includes correct description', async () => {
     await importServer()
+    // server.tool(name, description, inputSchema, handler)
     const [, description] = mockRegisterTool.mock.calls[0]
     expect(description).toBe('Test tool description')
   })
 
   it('tool registration includes inputSchema with action and params', async () => {
     await importServer()
+    // server.tool(name, description, inputSchema, handler)
     const [,, inputSchema] = mockRegisterTool.mock.calls[0]
     expect(inputSchema).toHaveProperty('action')
     expect(inputSchema).toHaveProperty('params')
@@ -102,6 +103,7 @@ describe('MCP server initialization', () => {
 
   it('tool handler calls executeAction and wraps result in MCP content format', async () => {
     await importServer()
+    // server.tool(name, description, inputSchema, handler)
     const handler = mockRegisterTool.mock.calls[0][3]
     mockExecuteAction.mockResolvedValue({ ok: true })
     const result = await handler({ action: 'health', params: {} })
@@ -116,8 +118,10 @@ describe('MCP server initialization', () => {
     const handler = mockRegisterTool.mock.calls[0][3]
     mockExecuteAction.mockResolvedValue(undefined)
     const result = await handler({ action: 'navigate', params: { target: 'p1', url: 'https://example.com' } })
+    // Must produce valid JSON, not the literal string "undefined"
     expect(result.content[0].type).toBe('text')
     const text = result.content[0].text
+    // Text must be valid JSON (JSON.parse should not throw)
     expect(() => JSON.parse(text)).not.toThrow()
   })
 
@@ -134,8 +138,9 @@ describe('MCP server process-level smoke test', () => {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const repoRoot = resolve(__dirname, '..', '..', '..', '..')
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
+    const tsxLoaderPath = resolve(repoRoot, 'node_modules/tsx/dist/esm/index.mjs')
 
-    const child = spawn('npx', ['tsx', serverPath], {
+    const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
       env: {
         ...process.env,
         FRESHELL_URL: 'http://localhost:3001',
@@ -160,7 +165,7 @@ describe('MCP server process-level smoke test', () => {
         },
       })
 
-      // MCP SDK v1.28+ uses newline-delimited JSON (one JSON object per line)
+      // Write the JSON-RPC request (MCP stdio transport uses Content-Length framing like LSP)
       child.stdin!.write(initRequest + '\n')
 
       const response = await new Promise<string>((resolve, reject) => {
@@ -168,17 +173,34 @@ describe('MCP server process-level smoke test', () => {
         const timeout = setTimeout(() => reject(new Error('Timeout waiting for MCP response')), 10000)
         child.stdout!.on('data', (data: Buffer) => {
           buffer += data.toString()
-          const lines = buffer.split('\n')
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (!trimmed) continue
+          // Try to find a complete JSON-RPC response in the buffer.
+          // The SDK may or may not use Content-Length framing on stdout.
+          // Try both: raw JSON line, and Content-Length framed.
+          try {
+            // Try raw JSON first (the line may contain just the JSON object)
+            const lines = buffer.split('\n').filter(l => l.trim())
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (trimmed.startsWith('{')) {
+                JSON.parse(trimmed)
+                clearTimeout(timeout)
+                resolve(trimmed)
+                return
+              }
+            }
+          } catch {
+            // Not complete JSON yet
+          }
+          // Also try Content-Length framed
+          const headerEnd = buffer.indexOf('\r\n\r\n')
+          if (headerEnd !== -1) {
+            const body = buffer.slice(headerEnd + 4)
             try {
-              JSON.parse(trimmed)
+              JSON.parse(body)
               clearTimeout(timeout)
-              resolve(trimmed)
-              return
+              resolve(body)
             } catch {
-              // Incomplete JSON, keep buffering
+              // Not complete yet
             }
           }
         })
@@ -201,8 +223,9 @@ describe('MCP server process-level smoke test', () => {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const repoRoot = resolve(__dirname, '..', '..', '..', '..')
     const serverPath = resolve(repoRoot, 'server/mcp/server.ts')
+    const tsxLoaderPath = resolve(repoRoot, 'node_modules/tsx/dist/esm/index.mjs')
 
-    const child = spawn('npx', ['tsx', serverPath], {
+    const child = spawn('node', ['--import', tsxLoaderPath, serverPath], {
       env: {
         ...process.env,
         FRESHELL_URL: 'http://localhost:3001',
@@ -212,6 +235,8 @@ describe('MCP server process-level smoke test', () => {
     })
 
     try {
+      // Wait briefly, then check that no output was written to stdout
+      // (only JSON-RPC frames should appear after initialization)
       await new Promise((resolve) => setTimeout(resolve, 1000))
 
       let stdoutData = ''
@@ -219,9 +244,12 @@ describe('MCP server process-level smoke test', () => {
         stdoutData += data.toString()
       })
 
+      // Give it a moment to flush
       await new Promise((resolve) => setTimeout(resolve, 500))
 
+      // If there is any output, it should only be valid JSON-RPC frames
       if (stdoutData) {
+        // Each frame starts with Content-Length header
         const lines = stdoutData.split('\r\n')
         for (const line of lines) {
           if (line.trim() && !line.startsWith('Content-Length:') && !line.startsWith('{')) {

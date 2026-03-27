@@ -1,5 +1,10 @@
-// Minimal HTTP client for the Freshell REST API, used by the MCP server.
-// Reads FRESHELL_URL and FRESHELL_TOKEN from the environment.
+/**
+ * Minimal HTTP client for the Freshell REST API, used by the MCP server.
+ *
+ * Reads FRESHELL_URL and FRESHELL_TOKEN from the environment (injected by
+ * Freshell into every spawned terminal). Does NOT read config files -- the
+ * MCP server always runs in a terminal that already has env vars set.
+ */
 
 export type ApiClientConfig = {
   url: string
@@ -33,10 +38,15 @@ async function parseResponse(res: Response) {
   if (type.includes('application/json')) {
     try {
       const parsed = JSON.parse(text)
+      // Handle agent API envelope: { status, data, message }
+      // Preserve status/message alongside data so callers can distinguish
+      // normal vs approximate/degraded outcomes.
       if (parsed && typeof parsed === 'object' && 'data' in parsed) {
         if (parsed.data != null) {
+          // Return the full envelope so callers can inspect status/message
           return parsed
         }
+        // data is null/undefined -- return message-only envelope or empty object
         if (parsed.message) return { message: parsed.message }
         return {}
       }

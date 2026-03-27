@@ -1,6 +1,3 @@
-// Tests for the Freshell MCP HTTP client.
-// Validates env config resolution, request methods, auth headers, and envelope handling.
-
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 describe('resolveConfig', () => {
@@ -39,6 +36,7 @@ describe('resolveConfig', () => {
 
 describe('createApiClient', () => {
   let mockFetch: ReturnType<typeof vi.fn>
+  const originalFetch = globalThis.fetch
 
   beforeEach(() => {
     mockFetch = vi.fn()
@@ -140,7 +138,7 @@ describe('createApiClient', () => {
     expect(init.method).toBe('DELETE')
   })
 
-  it('correctly joins base URL and path (trailing slash on base)', async () => {
+  it('correctly joins base URL and path', async () => {
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -152,7 +150,7 @@ describe('createApiClient', () => {
     expect(url).toBe('http://localhost:3001/api/health')
   })
 
-  it('preserves full envelope when response has data field', async () => {
+  it('get() unwraps agent API envelope when response has data field', async () => {
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ status: 'ok', data: { tabs: [] } }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -160,12 +158,15 @@ describe('createApiClient', () => {
     const { createApiClient } = await import('../../../../server/mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/tabs')
+    // data should be unwrapped, but status should be preserved for callers
+    // that need to distinguish normal vs approximate/degraded outcomes
     expect(result).toHaveProperty('data')
     expect(result.data).toEqual({ tabs: [] })
     expect(result).toHaveProperty('status', 'ok')
   })
 
-  it('preserves status and message alongside data in envelope responses', async () => {
+  it('get() preserves status and message alongside data in envelope responses', async () => {
+    // approx() responses carry meaningful status that MCP callers need
     mockFetch.mockResolvedValue(new Response(JSON.stringify({
       status: 'approximate',
       data: { results: [1, 2] },
@@ -183,7 +184,7 @@ describe('createApiClient', () => {
     expect(result.data).toEqual({ results: [1, 2] })
   })
 
-  it('returns full response when no data field present', async () => {
+  it('get() returns full response when no data field present', async () => {
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -194,7 +195,7 @@ describe('createApiClient', () => {
     expect(result).toEqual({ ok: true })
   })
 
-  it('returns text for text/plain responses', async () => {
+  it('get() returns text for text/plain responses', async () => {
     mockFetch.mockResolvedValue(new Response('terminal output', {
       status: 200,
       headers: { 'Content-Type': 'text/plain' },
@@ -205,7 +206,11 @@ describe('createApiClient', () => {
     expect(result).toBe('terminal output')
   })
 
-  it('returns message when envelope has null data', async () => {
+  it('get() returns message when envelope has undefined data', async () => {
+    // Server responds with ok(undefined, "navigate requested") -> { status: "ok", data: undefined, message: "navigate requested" }
+    // Since JSON.stringify strips undefined values, the wire format is { status: "ok", message: "navigate requested" }
+    // but if the server explicitly sets data to null, we get { status: "ok", data: null, message: "navigate requested" }
+    // Either way, parseResponse should NOT return undefined/null -- it should fall back to a meaningful value.
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ status: 'ok', data: null, message: 'navigate requested' }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -213,12 +218,14 @@ describe('createApiClient', () => {
     const { createApiClient } = await import('../../../../server/mcp/http-client.js')
     const client = createApiClient({ url: 'http://localhost:3001', token: '' })
     const result = await client.get('/api/panes/p1/navigate')
+    // Must not be null/undefined -- should return the message or an empty object
     expect(result).not.toBeNull()
     expect(result).not.toBeUndefined()
+    // Should contain the message as useful feedback
     expect(result).toHaveProperty('message', 'navigate requested')
   })
 
-  it('returns empty object when envelope has null data and no message', async () => {
+  it('get() returns empty object when envelope has undefined data and no message', async () => {
     mockFetch.mockResolvedValue(new Response(JSON.stringify({ status: 'ok', data: null }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },

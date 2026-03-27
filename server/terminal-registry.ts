@@ -119,17 +119,13 @@ export function modeSupportsResume(mode: TerminalMode): boolean {
 
 type ProviderTarget = 'unix' | 'windows'
 
-
 function providerNotificationArgs(
   mode: TerminalMode,
   target: ProviderTarget,
   terminalId: string,
   cwd?: string,
-  mcpEnabled: boolean = true,
 ): { args: string[]; env: Record<string, string> } {
-  const mcpInjection = mcpEnabled
-    ? generateMcpInjection(mode, terminalId, cwd, target)
-    : { args: [] as string[], env: {} as Record<string, string> }
+  const mcpInjection = generateMcpInjection(mode, terminalId, cwd, target)
 
   if (mode === 'codex') {
     return {
@@ -175,12 +171,19 @@ type ProviderSettings = {
   sandbox?: string
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings, terminalId?: string, cwd?: string, mcpEnabled: boolean = true) {
+function resolveCodingCliCommand(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+  target: ProviderTarget = 'unix',
+  providerSettings?: ProviderSettings,
+  terminalId?: string,
+  cwd?: string,
+) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
   if (!spec) return null
   const command = (spec.envVar && process.env[spec.envVar]) || spec.defaultCommand
-  const notification = providerNotificationArgs(mode, target, terminalId || '', cwd, mcpEnabled)
+  const notification = providerNotificationArgs(mode, target, terminalId || '', cwd)
   const providerArgs = notification.args
   const baseArgs = spec.args || []
   const commandEnv: Record<string, string> = { ...(spec.env || {}), ...notification.env }
@@ -252,6 +255,11 @@ function normalizeResumeForBinding(mode: TerminalMode, resumeSessionId?: string)
   if (mode !== 'claude') return resumeSessionId
   if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
   return undefined
+}
+
+function matchesScopedSession(mode: TerminalMode, term: TerminalRecord, sessionId: string, _cwd?: string): boolean {
+  return term.mode === mode
+    && term.resumeSessionId === sessionId
 }
 
 function getModeLabel(mode: TerminalMode): string {
@@ -654,7 +662,6 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
   terminalId?: string,
-  mcpEnabled: boolean = true,
 ) {
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
@@ -723,19 +730,21 @@ export function buildSpawnSpec(
       const args: string[] = []
       if (distro) args.push('-d', distro)
 
-      if (cwd) {
-        // cwd must be a Linux path inside WSL.
-        const wslCwd = isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd)
+      // cwd must be a Linux path inside WSL for both the --cd arg and MCP injection.
+      const wslCwd = cwd
+        ? (isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd))
+        : undefined
+      if (wslCwd) {
         args.push('--cd', wslCwd)
       }
 
-      const wslCwd = cwd ? (isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd)) : undefined
       if (mode === 'shell') {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslCwd, mcpEnabled)
+      // Pass wslCwd (Linux-normalized) so MCP injection receives a valid POSIX path
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslCwd)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, mcpCwd: wslCwd, env }
@@ -765,14 +774,16 @@ export function buildSpawnSpec(
         procCwd,
         file,
       }, 'buildSpawnSpec: cmd.exe cwd resolution')
-      const cmdMcpCwd = resolveUnixShellCwd(cwd) || os.homedir()
       if (mode === 'shell') {
         if (inWsl && winCwd) {
-          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: cmdMcpCwd, env }
+          // Use /K with cd command to change to Windows directory
+          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
         }
-        return { file, args: ['/K'], cwd: procCwd, mcpCwd: cmdMcpCwd, env }
+        return { file, args: ['/K'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd, mcpEnabled)
+      // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
+      const cmdMcpCwd = resolveUnixShellCwd(cwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
@@ -795,15 +806,17 @@ export function buildSpawnSpec(
       procCwd,
       file,
     }, 'buildSpawnSpec: powershell.exe cwd resolution')
-    const psMcpCwd = resolveUnixShellCwd(cwd) || os.homedir()
     if (mode === 'shell') {
       if (inWsl && winCwd) {
-        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: psMcpCwd, env }
+        // Use Set-Location to change to Windows directory
+        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
       }
-      return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: psMcpCwd, env }
+      return { file, args: ['-NoLogo'], cwd: procCwd, mcpCwd: resolveUnixShellCwd(cwd), env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd, mcpEnabled)
+    // Pass Linux-resolved cwd for MCP injection (server writes config to Linux filesystem)
+    const psMcpCwd = resolveUnixShellCwd(cwd)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -824,7 +837,11 @@ export function buildSpawnSpec(
     return { file: systemShell, args: ['-l'], cwd: unixCwd, mcpCwd: unixCwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd, mcpEnabled)
+  // Pass the resolved unixCwd (not raw cwd) so that MCP config injection
+  // (via providerNotificationArgs → generateMcpInjection) receives a valid
+  // Linux path. On WSL, raw cwd could be a Windows-style path (e.g. D:\project)
+  // which would fail existsSync checks in config-writer.ts.
+  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
@@ -846,8 +863,8 @@ export class TerminalRegistry extends EventEmitter {
 
   constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
-    // 5 permanent terminal.exit listeners (index, ws-handler, broker, codex-wiring,
-    // terminal-view) plus transient per-terminal listeners during shutdown.
+    // Permanent terminal.exit listeners: index, ws-handler, broker, codex-wiring,
+    // terminal-view. Shutdown uses a single shared listener (no per-terminal scaling).
     this.setMaxListeners(20)
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
@@ -1023,7 +1040,6 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
-
     const port = Number(process.env.PORT || 3001)
     const baseEnv = {
       FRESHELL: '1',
@@ -1034,8 +1050,6 @@ export class TerminalRegistry extends EventEmitter {
       ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
     }
 
-    const mcpEnabled = this.settings?.codingCli?.mcpServer ?? true
-
     const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
       cwd,
@@ -1044,7 +1058,6 @@ export class TerminalRegistry extends EventEmitter {
       opts.providerSettings,
       baseEnv,
       terminalId,
-      mcpEnabled,
     )
 
     const endSpawnTimer = startPerfTimer(
@@ -1055,7 +1068,7 @@ export class TerminalRegistry extends EventEmitter {
 
     logger.info({ terminalId, file, args, cwd: procCwd, mode: opts.mode, shell: opts.shell || 'system' }, 'Spawning terminal')
 
-    let ptyProc: pty.IPty
+    let ptyProc: ReturnType<typeof pty.spawn>
     try {
       ptyProc = pty.spawn(file, args, {
         name: 'xterm-256color',
@@ -1065,6 +1078,9 @@ export class TerminalRegistry extends EventEmitter {
         env: env as any,
       })
     } catch (err) {
+      // Clean up MCP config temp files that were created before the spawn attempt.
+      // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
+      // (which may be undefined for WSL cmd/powershell paths).
       cleanupMcpConfig(terminalId, opts.mode, mcpCwd)
       throw err
     }
@@ -1199,11 +1215,17 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
-    if (modeSupportsResume(opts.mode) && resumeForBinding) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, resumeForBinding, 'resume')
+    const exactSessionId = resumeForBinding
+    if (modeSupportsResume(opts.mode) && exactSessionId) {
+      const bound = this.bindSession(
+        terminalId,
+        opts.mode as CodingCliProviderName,
+        exactSessionId,
+        'resume',
+      )
       if (!bound.ok) {
         logger.warn(
-          { terminalId, mode: opts.mode, sessionId: resumeForBinding, reason: bound.reason },
+          { terminalId, mode: opts.mode, sessionId: exactSessionId, reason: bound.reason },
           'Failed to bind resume session during terminal create',
         )
       }
@@ -1373,7 +1395,7 @@ export class TerminalRegistry extends EventEmitter {
   private releaseBinding(
     terminalId: string,
     reason: SessionUnbindReason,
-    explicit?: { provider?: CodingCliProviderName; sessionId?: string },
+    explicit?: { provider?: CodingCliProviderName; sessionId?: string; cwd?: string },
   ): void {
     const rec = this.terminals.get(terminalId)
     const existingBinding = this.bindingAuthority.sessionForTerminal(terminalId)
@@ -1384,7 +1406,6 @@ export class TerminalRegistry extends EventEmitter {
     const sessionId = explicit?.sessionId
       ?? existing?.sessionId
       ?? rec?.resumeSessionId
-
     this.bindingAuthority.unbindTerminal(terminalId)
     if (rec) rec.resumeSessionId = undefined
     if (!provider || !sessionId) return
@@ -1578,13 +1599,13 @@ export class TerminalRegistry extends EventEmitter {
 
   /**
    * Find provider-mode terminals that match a session by exact resumeSessionId.
-   * The cwd parameter is kept for API compatibility but ignored.
+   * Providers with cwd-scoped session IDs (such as Kimi) also filter by cwd
+   * when one is supplied.
    */
-  findTerminalsBySession(mode: TerminalMode, sessionId: string, _cwd?: string): TerminalRecord[] {
+  findTerminalsBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord[] {
     const results: TerminalRecord[] = []
     for (const term of this.terminals.values()) {
-      if (term.mode !== mode) continue
-      if (term.resumeSessionId === sessionId) {
+      if (matchesScopedSession(mode, term, sessionId, cwd)) {
         results.push(term)
       }
     }
@@ -1594,51 +1615,47 @@ export class TerminalRegistry extends EventEmitter {
   /**
    * Find a running terminal of the given mode that already owns the given sessionId.
    */
-  findRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+  findRunningTerminalBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord | undefined {
     if (modeSupportsResume(mode)) {
       const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
       if (owner) {
         const rec = this.terminals.get(owner)
-        if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+        if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
           return rec
         }
-        this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
+        this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
       }
     }
-    for (const term of this.terminals.values()) {
-      if (term.mode !== mode) continue
-      if (term.status !== 'running') continue
-      if (term.resumeSessionId === sessionId) return term
-    }
-    return undefined
+    const matches = Array.from(this.terminals.values())
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
+    return matches[0]
   }
 
-  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord | undefined {
     if (!modeSupportsResume(mode)) return undefined
 
     const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
     if (owner) {
       const rec = this.terminals.get(owner)
-      if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+      if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
         return rec
       }
-      this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
+      this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
     }
 
     const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
 
     return matches[0]
   }
 
-  repairLegacySessionOwners(mode: TerminalMode, sessionId: string): RepairLegacySessionOwnersResult {
+  repairLegacySessionOwners(mode: TerminalMode, sessionId: string, cwd?: string): RepairLegacySessionOwnersResult {
     if (!modeSupportsResume(mode)) {
       return { repaired: false, clearedTerminalIds: [] }
     }
-
     const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .filter((term) => term.status === 'running' && matchesScopedSession(mode, term, sessionId, cwd))
       .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
     if (matches.length === 0) {
       return { repaired: false, clearedTerminalIds: [] }
@@ -1655,7 +1672,7 @@ export class TerminalRegistry extends EventEmitter {
 
     if (owner && owner !== canonical.terminalId) {
       const ownerIsDuplicate = matches.some((term) => term.terminalId === owner)
-      this.releaseBinding(owner, ownerIsDuplicate ? 'repair_duplicate' : 'stale_owner', { provider, sessionId })
+      this.releaseBinding(owner, ownerIsDuplicate ? 'repair_duplicate' : 'stale_owner', { provider, sessionId, cwd })
       if (ownerIsDuplicate) {
         clearedTerminalIds.push(owner)
         clearedTerminals.add(owner)
@@ -1685,7 +1702,7 @@ export class TerminalRegistry extends EventEmitter {
 
     for (const duplicate of matches.slice(1)) {
       if (clearedTerminals.has(duplicate.terminalId)) continue
-      this.releaseBinding(duplicate.terminalId, 'repair_duplicate', { provider, sessionId })
+      this.releaseBinding(duplicate.terminalId, 'repair_duplicate', { provider, sessionId, cwd })
       clearedTerminalIds.push(duplicate.terminalId)
     }
 
@@ -1825,6 +1842,23 @@ export class TerminalRegistry extends EventEmitter {
     return { ok: true, terminalId, sessionId: normalized }
   }
 
+  rebindSession(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    reason: SessionBindingReason = 'association',
+  ): BindSessionResult {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return { ok: false, reason: 'invalid_session_id' }
+
+    const owner = this.bindingAuthority.ownerForSession(provider, normalized)
+    if (owner && owner !== terminalId) {
+      this.releaseBinding(owner, 'rebind', { provider, sessionId: normalized })
+    }
+
+    return this.bindSession(terminalId, provider, normalized, reason)
+  }
+
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
@@ -1835,10 +1869,16 @@ export class TerminalRegistry extends EventEmitter {
   /**
    * Check whether a session is already bound to any terminal.
    */
-  isSessionBound(provider: CodingCliProviderName, sessionId: string): boolean {
+  isSessionBound(provider: CodingCliProviderName, sessionId: string, cwd?: string): boolean {
     const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return false
     return this.bindingAuthority.ownerForSession(provider, normalized) !== undefined
+  }
+
+  getSessionOwner(provider: CodingCliProviderName, sessionId: string): string | undefined {
+    const normalized = normalizeResumeForBinding(provider, sessionId)
+    if (!normalized) return undefined
+    return this.bindingAuthority.ownerForSession(provider, normalized)
   }
 
   /**
