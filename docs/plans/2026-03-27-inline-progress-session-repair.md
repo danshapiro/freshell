@@ -41,9 +41,9 @@ The existing `SessionRepairResult` already has `orphansFixed: number` and `statu
 - Modify: `server/session-scanner/scanner.ts`
   - Extend `parseMessage()` to extract four additional fields. Add `detectInlineStopHookProgress()` function. Wire classification into `scan()` and targeted pointer rewrite into `repair()`.
 - Modify: `server/session-scanner/queue.ts`
-  - Add cache-bypass logic for `resumeIssue` results at `active` priority. Pass `includeResumeIssues` to `repair()` when appropriate.
+  - Add cache-bypass logic for `resumeIssue` results at `active` priority. Pass `includeResumeIssues` to `repair()` when appropriate. Add `clearProcessed(sessionId)` method to allow the service to remove stale processed entries before re-enqueueing.
 - Modify: `server/session-scanner/service.ts`
-  - Prevent `waitForSession()` from returning cached results with `resumeIssue` directly; force re-enqueue at `active` priority.
+  - Prevent `waitForSession()` from returning cached results with `resumeIssue` directly; call `clearProcessed` then re-enqueue at `active` priority.
 - Create: `test/fixtures/sessions/inline-stop-hook-progress.jsonl`
   - Healthy session whose active chain has the exact inline-progress shape: `user -> assistant -> progress(hook_progress/Stop) -> stop_hook_summary -> turn_duration`.
 - Create: `test/fixtures/sessions/sibling-stop-hook-progress.jsonl`
@@ -513,7 +513,24 @@ In `server/session-scanner/scanner.ts`, modify the `repair()` function:
 async function repair(filePath: string, options?: SessionRepairOptions): Promise<SessionRepairResult> {
 ```
 
-2. After building `messages`, `uuidToMessage`, and `lineToObj` but before the orphan check, detect the inline-progress match when enabled:
+2. **Critical:** Update the inline `ParsedMessage` construction inside `repair()` to include the new fields. The existing code (around line 182) builds ParsedMessage with only `uuid`, `parentUuid`, `type`, `lineNumber`. The `detectInlineStopHookProgress` function needs `subtype`, `toolUseID`, `dataType`, and `dataHookEvent`. Update the inline construction:
+
+```typescript
+const msg: ParsedMessage = {
+  uuid: obj.uuid,
+  parentUuid: obj.parentUuid,
+  type: obj.type,
+  lineNumber: i,
+  subtype: obj.subtype,
+  toolUseID: obj.toolUseID,
+  dataType: obj.data?.type,
+  dataHookEvent: obj.data?.hookEvent,
+}
+```
+
+Without this change, `detectInlineStopHookProgress` will always return `undefined` inside `repair()` because the ParsedMessage objects will lack the fields it checks. Note: `repair()` does NOT call `parseMessage()` -- it builds ParsedMessage inline because it also needs `lineToObj`. Both code paths must extract the same fields.
+
+3. After building `messages`, `uuidToMessage`, and `lineToObj` but before the orphan check, detect the inline-progress match when enabled:
 
 ```typescript
 const inlineMatch = options?.includeResumeIssues
@@ -524,7 +541,7 @@ const inlineMatch = options?.includeResumeIssues
   : undefined
 ```
 
-3. Update the early-return condition to check both orphans and inline match:
+4. Update the early-return condition to check both orphans and inline match:
 
 ```typescript
 if (orphans.length === 0 && !inlineMatch) {
@@ -539,7 +556,7 @@ if (orphans.length === 0 && !inlineMatch) {
 }
 ```
 
-4. After the orphan-fix loop, add the inline-progress fix:
+5. After the orphan-fix loop, add the inline-progress fix:
 
 ```typescript
 let resumeIssuesFixed = 0
@@ -553,9 +570,9 @@ if (inlineMatch) {
 }
 ```
 
-5. Include `resumeIssuesFixed` in all return paths of the function.
+6. Include `resumeIssuesFixed` in all return paths of the function.
 
-6. Ensure backup creation still happens before the write -- the existing backup code already runs before writing `fixedLines`, which is correct. The backup condition should be: create backup if `orphans.length > 0 || inlineMatch`.
+7. Ensure backup creation still happens before the write -- the existing backup code already runs before writing `fixedLines`, which is correct. The backup condition should be: create backup if `orphans.length > 0 || inlineMatch`.
 
 Important implementation note: the existing backup code is already positioned before `fixedLines` is written. If the orphan section was the only thing creating backups, verify that the backup creation also fires for inline-only repairs. The cleanest approach is: move the backup creation to after all fixes are determined but before writing, and gate it on `orphans.length > 0 || resumeIssuesFixed > 0`.
 
@@ -862,6 +879,20 @@ if (needsRepair) {
 
 Note: The import needs `SessionRepairOptions` from `./types.js`. Add it to the existing import.
 
+3. **Add `clearProcessed(sessionId)` method.** The service layer (Task 4) needs to clear a stale processed result before re-enqueueing a session for active repair. Without this, `queue.waitFor()` would immediately return the stale result from `this.processed` before the re-enqueued item is processed. Add:
+
+```typescript
+/**
+ * Remove a processed result so the session can be re-enqueued and re-awaited.
+ * Used by the service layer to force active-priority re-processing.
+ */
+clearProcessed(sessionId: string): void {
+  this.processed.delete(sessionId)
+}
+```
+
+This is a one-line method but it solves a critical race: `waitFor()` checks `this.processed` first and returns immediately if found. If the service calls `enqueue()` then `waitFor()` without clearing the stale processed entry, `waitFor()` returns the old (resume-issue) result immediately.
+
 - [ ] **Step 4: Run the queue tests to verify they pass**
 
 Run:
@@ -1048,6 +1079,8 @@ The first thing `waitForSession()` does is check `queue.getResult(sessionId)`. I
 
 Replace the early return at the top of `waitForSession()`:
 
+**Critical:** Before calling `this.queue.waitFor()`, you MUST call `this.queue.clearProcessed(sessionId)` to remove the stale processed entry. Without this, `waitFor()` checks `this.processed` first and returns the stale result immediately, before the re-enqueued item is processed. The sequence must be: `clearProcessed` -> `enqueue` -> `waitFor`.
+
 ```typescript
 async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanResult> {
   // Check if already processed
@@ -1055,6 +1088,7 @@ async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanR
   if (existing) {
     // If the processed result has a resume issue, force active-priority repair
     if (existing.resumeIssue) {
+      this.queue.clearProcessed(sessionId)
       this.queue.enqueue([{ sessionId, filePath: existing.filePath, priority: 'active' }])
       return this.queue.waitFor(sessionId, timeoutMs)
     }
@@ -1071,6 +1105,7 @@ const legacyResult = this.queue.getResult(fileSessionId)
 if (legacyResult) {
   // If the legacy result has a resume issue, force active-priority repair
   if (legacyResult.resumeIssue) {
+    this.queue.clearProcessed(fileSessionId)
     this.queue.enqueue([{ sessionId: fileSessionId, filePath, priority: 'active' }])
     const result = await this.queue.waitFor(fileSessionId, timeoutMs)
     const normalized = result.sessionId === sessionId
@@ -1102,6 +1137,7 @@ if (cached) {
   }
   // If cached result has a resume issue, force active-priority repair
   if (cached.resumeIssue) {
+    this.queue.clearProcessed(sessionId)
     this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
     return this.queue.waitFor(sessionId, timeoutMs)
   }
