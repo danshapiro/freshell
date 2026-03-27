@@ -7,8 +7,9 @@ import {
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
 import {
+  commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
   setActiveSessionSurface,
-  setSessionWindowData,
   setSessionWindowError,
   setSessionWindowLoading,
   type SessionWindowLoadingKind,
@@ -115,6 +116,10 @@ type SessionWindowSearchContext = {
   searchTier: SearchOptions['tier']
 }
 
+type VisibleResultIdentity = SessionWindowSearchContext & {
+  resultVersion: number
+}
+
 function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): ProjectGroup[] {
   const projectMap = new Map<string, ProjectGroup>()
   const seenKeys = new Map<string, Set<string>>()
@@ -216,11 +221,38 @@ function getVisibleWindowSearchContext(windowState?: {
   return getRequestedWindowSearchContext(windowState)
 }
 
+function getVisibleResultIdentity(windowState?: {
+  query?: string
+  searchTier?: SearchOptions['tier']
+  appliedQuery?: string
+  appliedSearchTier?: SearchOptions['tier']
+  resultVersion?: number
+}): VisibleResultIdentity {
+  const visibleContext = getVisibleWindowSearchContext(windowState)
+  return {
+    ...visibleContext,
+    resultVersion: windowState?.resultVersion ?? 0,
+  }
+}
+
 function searchContextsEqual(
   left: SessionWindowSearchContext,
   right: SessionWindowSearchContext,
 ) {
   return left.query === right.query && left.searchTier === right.searchTier
+}
+
+function visibleResultIdentitiesEqual(
+  left: VisibleResultIdentity,
+  right: VisibleResultIdentity,
+) {
+  return searchContextsEqual(left, right) && left.resultVersion === right.resultVersion
+}
+
+function hasCommittedWindowData(windowState?: {
+  lastLoadedAt?: number
+}) {
+  return typeof windowState?.lastLoadedAt === 'number'
 }
 
 export function activateSessionSurface(surface: SessionSurface) {
@@ -266,13 +298,11 @@ function canCommitVisibleRefresh(args: {
   generation: number
   getState: () => RootState
   surface: SessionSurface
-  requestedContext: SessionWindowSearchContext
-  visibleContext: SessionWindowSearchContext
+  identity: VisibleResultIdentity
 }) {
   if (args.generation !== sessionWindowThunkGeneration) return false
   const windowState = args.getState().sessions.windows?.[args.surface]
-  return searchContextsEqual(getRequestedWindowSearchContext(windowState), args.requestedContext)
-    && searchContextsEqual(getVisibleWindowSearchContext(windowState), args.visibleContext)
+  return visibleResultIdentitiesEqual(getVisibleResultIdentity(windowState), args.identity)
 }
 
 async function refreshVisibleSessionWindowSilently(args: {
@@ -280,8 +310,7 @@ async function refreshVisibleSessionWindowSilently(args: {
   getState: () => RootState
   surface: SessionSurface
   generation: number
-  requestedContext: SessionWindowSearchContext
-  visibleContext: SessionWindowSearchContext
+  identity: VisibleResultIdentity
   preserveLoadingState: boolean
 }) {
   const {
@@ -289,18 +318,16 @@ async function refreshVisibleSessionWindowSilently(args: {
     getState,
     surface,
     generation,
-    requestedContext,
-    visibleContext,
     preserveLoadingState,
   } = args
+  let identity = args.identity
   const visibilityOpts = getSidebarVisibilityOptions(getState())
   const controller = new AbortController()
   const canCommit = () => canCommitVisibleRefresh({
     generation,
     getState,
     surface,
-    requestedContext,
-    visibleContext,
+    identity,
   })
   const commitData = (payload: ReturnType<typeof buildSearchPayload> | {
     surface: SessionSurface
@@ -313,11 +340,11 @@ async function refreshVisibleSessionWindowSilently(args: {
     searchTier?: SearchOptions['tier']
   }) => {
     if (!canCommit()) return false
-    dispatch(setSessionWindowData({
+    dispatch(commitSessionWindowVisibleRefresh({
       ...payload,
-      preserveRequestedSearch: true,
       preserveLoading: preserveLoadingState,
     }))
+    identity = getVisibleResultIdentity(getState().sessions.windows?.[surface])
     return true
   }
 
@@ -330,43 +357,43 @@ async function refreshVisibleSessionWindowSilently(args: {
   }
 
   try {
-    if (visibleContext.query) {
-      if (visibleContext.searchTier !== 'title') {
+    if (identity.query) {
+      if (identity.searchTier !== 'title') {
         const titleResponse = await searchSessions({
-          query: visibleContext.query,
+          query: identity.query,
           tier: 'title',
           signal: controller.signal,
           ...visibilityOpts,
         })
-        if (!commitData(buildSearchPayload(surface, titleResponse.results, visibleContext.query, visibleContext.searchTier, true))) {
+        if (!commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, true))) {
           return
         }
 
         try {
           const deepResponse = await searchSessions({
-            query: visibleContext.query,
-            tier: visibleContext.searchTier,
+            query: identity.query,
+            tier: identity.searchTier,
             signal: controller.signal,
             ...visibilityOpts,
           })
           const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-          commitData(buildSearchPayload(surface, merged, visibleContext.query, visibleContext.searchTier, false, {
+          commitData(buildSearchPayload(surface, merged, identity.query, identity.searchTier, false, {
             partial: deepResponse.partial,
             partialReason: deepResponse.partialReason,
           }))
         } catch {
-          commitData(buildSearchPayload(surface, titleResponse.results, visibleContext.query, visibleContext.searchTier, false))
+          commitData(buildSearchPayload(surface, titleResponse.results, identity.query, identity.searchTier, false))
         }
         return
       }
 
       const response = await searchSessions({
-        query: visibleContext.query,
-        tier: visibleContext.searchTier,
+        query: identity.query,
+        tier: identity.searchTier,
         signal: controller.signal,
         ...visibilityOpts,
       })
-      commitData(buildSearchPayload(surface, response.results, visibleContext.query, visibleContext.searchTier, false, {
+      commitData(buildSearchPayload(surface, response.results, identity.query, identity.searchTier, false, {
         partial: response.partial,
         partialReason: response.partialReason,
       }))
@@ -386,8 +413,8 @@ async function refreshVisibleSessionWindowSilently(args: {
       oldestLoadedTimestamp: response?.oldestIncludedTimestamp,
       oldestLoadedSessionId: response?.oldestIncludedSessionId,
       hasMore: response?.hasMore,
-      query: visibleContext.query,
-      searchTier: visibleContext.searchTier,
+      query: identity.query,
+      searchTier: identity.searchTier,
     })
   } catch {
     if (!preserveLoadingState && canCommit()) {
@@ -408,7 +435,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const visibilityOpts = getSidebarVisibilityOptions(state)
     const previousQuery = (windowState?.query ?? '').trim()
     const previousTier = windowState?.searchTier ?? 'title'
-    const hasCommittedWindow = typeof windowState?.lastLoadedAt === 'number'
+    const hasCommittedWindow = hasCommittedWindowData(windowState)
     const hasCommittedItems = (windowState?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
     const previousVisibleQuery = windowState?.appliedQuery?.trim()
       ?? (hasCommittedWindow ? previousQuery : '')
@@ -452,7 +479,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(setSessionWindowData(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true)))
+            dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, true)))
 
             // Phase 2: file-based search
             try {
@@ -465,7 +492,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               if (controller.signal.aborted) return
 
               const merged = mergeSearchResults(titleResponse.results, deepResponse.results)
-              dispatch(setSessionWindowData(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
+              dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, merged, trimmedQuery, searchTier, false, {
                 partial: deepResponse.partial,
                 partialReason: deepResponse.partialReason,
               })))
@@ -473,7 +500,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
               if (controller.signal.aborted) return
               // Phase 2 failed but Phase 1 data is already displayed.
               // Clear the pending indicator and report the error.
-              dispatch(setSessionWindowData(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false)))
+              dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, titleResponse.results, trimmedQuery, searchTier, false)))
               dispatch(setSessionWindowError({
                 surface,
                 error: phase2Error instanceof Error ? phase2Error.message : 'Deep search failed',
@@ -489,7 +516,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             })
             if (controller.signal.aborted) return
 
-            dispatch(setSessionWindowData(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
+            dispatch(commitSessionWindowReplacement(buildSearchPayload(surface, response.results, trimmedQuery, searchTier, false, {
               partial: response.partial,
               partialReason: response.partialReason,
             })))
@@ -513,7 +540,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
           ? mergeProjects(windowState?.projects ?? [], nextProjects)
           : nextProjects
 
-        dispatch(setSessionWindowData({
+        dispatch(commitSessionWindowReplacement({
           surface,
           projects,
           totalSessions: response?.totalSessions,
@@ -556,13 +583,25 @@ export function refreshActiveSessionWindow() {
     const surface = getState().sessions.activeSurface as SessionSurface | undefined
     if (!surface) return
     const windowState = getState().sessions.windows[surface]
-    const visibleSearchContext = getVisibleWindowSearchContext(windowState)
-    await dispatch(fetchSessionWindow({
+    if (!hasCommittedWindowData(windowState)) {
+      const requestedSearchContext = getRequestedWindowSearchContext(windowState)
+      await dispatch(fetchSessionWindow({
+        surface,
+        priority: 'background',
+        query: requestedSearchContext.query,
+        searchTier: requestedSearchContext.searchTier,
+      }) as any)
+      return
+    }
+
+    await refreshVisibleSessionWindowSilently({
+      dispatch,
+      getState,
       surface,
-      priority: 'visible',
-      query: visibleSearchContext.query,
-      searchTier: visibleSearchContext.searchTier,
-    }) as any)
+      generation: sessionWindowThunkGeneration,
+      identity: getVisibleResultIdentity(windowState),
+      preserveLoadingState: inFlightRequests.get(surface) !== null && inFlightRequests.get(surface) !== undefined,
+    })
   }
 }
 
@@ -589,6 +628,29 @@ export function queueActiveSessionWindowRefresh() {
         while (generation === sessionWindowThunkGeneration) {
           const activeRequest = inFlightRequests.get(activeSurface) ?? null
           const windowState = getState().sessions.windows[activeSurface]
+          const hasCommittedWindow = hasCommittedWindowData(windowState)
+
+          if (!hasCommittedWindow) {
+            if (activeRequest) {
+              try {
+                await activeRequest
+              } catch {
+                // A queued invalidation should still retry after an aborted/failed direct fetch.
+              }
+              continue
+            }
+            if (!state.queued) break
+            state.queued = false
+            const requestedSearchContext = getRequestedWindowSearchContext(windowState)
+            await dispatch(fetchSessionWindow({
+              surface: activeSurface,
+              priority: 'background',
+              query: requestedSearchContext.query,
+              searchTier: requestedSearchContext.searchTier,
+            }) as any)
+            continue
+          }
+
           const requestedSearchContext = getRequestedWindowSearchContext(windowState)
           const visibleSearchContext = getVisibleWindowSearchContext(windowState)
           const hasRequestedAppliedDrift = !searchContextsEqual(
@@ -603,8 +665,7 @@ export function queueActiveSessionWindowRefresh() {
               getState,
               surface: activeSurface,
               generation,
-              requestedContext: requestedSearchContext,
-              visibleContext: visibleSearchContext,
+              identity: getVisibleResultIdentity(windowState),
               preserveLoadingState: activeRequest !== null,
             })
             continue
@@ -619,12 +680,14 @@ export function queueActiveSessionWindowRefresh() {
           }
           if (!state.queued) break
           state.queued = false
-          await dispatch(fetchSessionWindow({
+          await refreshVisibleSessionWindowSilently({
+            dispatch,
+            getState,
             surface: activeSurface,
-            priority: 'background',
-            query: visibleSearchContext.query,
-            searchTier: visibleSearchContext.searchTier,
-          }) as any)
+            generation,
+            identity: getVisibleResultIdentity(windowState),
+            preserveLoadingState: false,
+          })
         }
       } finally {
         if (invalidationRefreshState.get(activeSurface) === state) {

@@ -8,7 +8,10 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer, { setSessionWindowData, setSessionWindowLoading } from '@/store/sessionsSlice'
+import sessionsReducer, {
+  commitSessionWindowReplacement,
+  setSessionWindowLoading,
+} from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
@@ -3700,7 +3703,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
 
       await act(async () => {
-        store.dispatch(setSessionWindowData({
+        store.dispatch(commitSessionWindowReplacement({
           surface: 'sidebar',
           projects: browseProjects,
           totalSessions: 1,

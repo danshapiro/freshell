@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import { enableMapSet } from 'immer'
-import sessionsReducer, { setActiveSessionSurface } from '@/store/sessionsSlice'
+import sessionsReducer, {
+  commitSessionWindowVisibleRefresh,
+  setActiveSessionSurface,
+  setSessionWindowLoading,
+} from '@/store/sessionsSlice'
 import * as sessionsThunks from '@/store/sessionsThunks'
 
 const {
@@ -701,6 +705,93 @@ describe('sessionsThunks', () => {
     })
   })
 
+  it('refreshActiveSessionWindow keeps a pending browse replacement alive during search-to-browse drift and lets it commit afterward', async () => {
+    const searchProjects = [{
+      projectPath: '/tmp/search-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        lastActivityAt: 3_000,
+        title: 'Search result',
+      }],
+    }]
+    const browseDeferred = createDeferred<any>()
+    const refreshDeferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseDeferred.promise)
+    searchSessions.mockReturnValueOnce(refreshDeferred.promise)
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: searchProjects,
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: searchProjects,
+          lastLoadedAt: 3_000,
+          query: 'needle',
+          searchTier: 'title',
+          appliedQuery: 'needle',
+          appliedSearchTier: 'title',
+          resultVersion: 4,
+        },
+      },
+    })
+
+    const browseRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: '',
+      searchTier: 'title',
+    }) as any)
+    const browseSignal = fetchSidebarSessionsSnapshot.mock.calls[0]?.[0]?.signal as AbortSignal
+
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+
+    const refreshRequest = store.dispatch(refreshActiveSessionWindow() as any)
+
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
+    expect(browseSignal.aborted).toBe(false)
+
+    refreshDeferred.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        title: 'Search result',
+        lastActivityAt: 3_100,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'needle',
+      totalScanned: 1,
+    })
+
+    await refreshRequest
+
+    expect(browseSignal.aborted).toBe(false)
+    expect(store.getState().sessions.windows.sidebar.query).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+
+    browseDeferred.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await browseRequest
+
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
+  })
+
   it('marks websocket revalidation as background for both default lists and the visible applied query', async () => {
     const defaultRefresh = createDeferred<any>()
     const searchRefresh = createDeferred<any>()
@@ -909,6 +1000,155 @@ describe('sessionsThunks', () => {
 
     expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('')
     expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
+  })
+
+  it('keeps a visible refresh committable when requested state drifts again but the visible result set identity is unchanged', async () => {
+    const refreshDeferred = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(refreshDeferred.promise)
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: [{
+        projectPath: '/tmp/search-project',
+        sessions: [{
+          provider: 'claude',
+          sessionId: 'session-search',
+          projectPath: '/tmp/search-project',
+          lastActivityAt: 3_000,
+          title: 'Search result',
+        }],
+      }],
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: [{
+            projectPath: '/tmp/search-project',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'session-search',
+              projectPath: '/tmp/search-project',
+              lastActivityAt: 3_000,
+              title: 'Search result',
+            }],
+          }],
+          lastLoadedAt: 3_000,
+          query: 'beta',
+          searchTier: 'title',
+          appliedQuery: 'alpha',
+          appliedSearchTier: 'title',
+          loading: true,
+          loadingKind: 'search',
+          resultVersion: 11,
+        },
+      },
+    })
+
+    const refreshRequest = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    store.dispatch(setSessionWindowLoading({
+      surface: 'sidebar',
+      loading: true,
+      loadingKind: 'search',
+      query: '',
+      searchTier: 'title',
+    }))
+
+    refreshDeferred.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        title: 'Search result refreshed',
+        lastActivityAt: 3_500,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'alpha',
+      totalScanned: 1,
+    })
+
+    await refreshRequest
+
+    const windowState = store.getState().sessions.windows.sidebar
+    expect(windowState.query).toBe('')
+    expect(windowState.appliedQuery).toBe('alpha')
+    expect(windowState.projects[0]?.sessions[0]?.title).toBe('Search result refreshed')
+    expect(windowState.resultVersion).toBe(12)
+  })
+
+  it('drops a stale visible refresh once a newer committed resultVersion replaces the visible set', async () => {
+    const staleRefresh = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(staleRefresh.promise)
+
+    const initialProjects = [{
+      projectPath: '/tmp/search-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        lastActivityAt: 3_000,
+        title: 'Initial search result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: initialProjects,
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: initialProjects,
+          lastLoadedAt: 3_000,
+          query: 'alpha',
+          searchTier: 'title',
+          appliedQuery: 'alpha',
+          appliedSearchTier: 'title',
+          resultVersion: 2,
+        },
+      },
+    })
+
+    const refreshRequest = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    store.dispatch(commitSessionWindowVisibleRefresh({
+      surface: 'sidebar',
+      projects: [{
+        projectPath: '/tmp/search-project',
+        sessions: [{
+          provider: 'claude',
+          sessionId: 'session-newer',
+          projectPath: '/tmp/search-project',
+          lastActivityAt: 4_000,
+          title: 'Newer committed result',
+        }],
+      }],
+      totalSessions: 1,
+      oldestLoadedTimestamp: 4_000,
+      oldestLoadedSessionId: 'claude:session-newer',
+      hasMore: false,
+      query: 'alpha',
+      searchTier: 'title',
+    }))
+
+    staleRefresh.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-stale',
+        projectPath: '/tmp/search-project',
+        title: 'Stale refresh result',
+        lastActivityAt: 3_100,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'alpha',
+      totalScanned: 1,
+    })
+
+    await refreshRequest
+
+    const windowState = store.getState().sessions.windows.sidebar
+    expect(windowState.projects[0]?.sessions[0]?.title).toBe('Newer committed result')
+    expect(windowState.resultVersion).toBe(3)
   })
 
   it('coalesces repeated invalidations into one in-flight fetch plus one trailing refresh', async () => {
