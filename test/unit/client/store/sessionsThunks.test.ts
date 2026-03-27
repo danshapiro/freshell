@@ -270,6 +270,115 @@ describe('sessionsThunks', () => {
     expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
   })
 
+  it('moves requested search state immediately but keeps applied search state on the visible results until each replacement commits', async () => {
+    const replacementSearch = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(replacementSearch.promise)
+
+    const appliedProjects = [{
+      projectPath: '/tmp/project-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        lastActivityAt: 1_000,
+        title: 'Alpha result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: appliedProjects,
+      lastLoadedAt: 1_000,
+      windows: {
+        sidebar: {
+          projects: appliedProjects,
+          lastLoadedAt: 1_000,
+          query: 'alpha',
+          searchTier: 'title',
+          appliedQuery: 'alpha',
+          appliedSearchTier: 'title',
+        },
+      },
+    })
+
+    const replacementRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'beta',
+      searchTier: 'title',
+    }) as any)
+
+    let replacementResolved = false
+
+    try {
+      expect((store.getState().sessions.windows.sidebar as any).query).toBe('beta')
+      expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('title')
+      expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('alpha')
+      expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+
+      replacementSearch.resolve({
+        results: [{
+          provider: 'claude',
+          sessionId: 'session-beta',
+          projectPath: '/tmp/project-beta',
+          title: 'Beta result',
+          matchedIn: 'title',
+          lastActivityAt: 2_000,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'beta',
+        totalScanned: 1,
+      })
+      replacementResolved = true
+
+      await replacementRequest
+
+      expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('beta')
+      expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+
+      const browseReload = createDeferred<any>()
+      fetchSidebarSessionsSnapshot.mockReturnValueOnce(browseReload.promise)
+
+      const browseRequest = store.dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query: '',
+        searchTier: 'title',
+      }) as any)
+
+      try {
+        expect((store.getState().sessions.windows.sidebar as any).query).toBe('')
+        expect((store.getState().sessions.windows.sidebar as any).searchTier).toBe('title')
+        expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('beta')
+        expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+      } finally {
+        browseReload.resolve({
+          projects: [],
+          totalSessions: 0,
+          oldestIncludedTimestamp: 0,
+          oldestIncludedSessionId: '',
+          hasMore: false,
+        })
+
+        await browseRequest
+      }
+
+      expect((store.getState().sessions.windows.sidebar as any).appliedQuery).toBe('')
+      expect((store.getState().sessions.windows.sidebar as any).appliedSearchTier).toBe('title')
+    } finally {
+      if (!replacementResolved) {
+        replacementSearch.resolve({
+          results: [],
+          tier: 'title',
+          query: 'beta',
+          totalScanned: 0,
+        })
+        await replacementRequest
+      }
+    }
+  })
+
   it('appends a later page into the same surface window', async () => {
     fetchSidebarSessionsSnapshot
       .mockResolvedValueOnce({
