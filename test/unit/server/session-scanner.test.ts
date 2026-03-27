@@ -101,6 +101,29 @@ describe('SessionScanner', () => {
       const stat = await fs.stat(path.join(FIXTURES_DIR, 'healthy.jsonl'))
       expect(result.fileSize).toBe(stat.size)
     })
+
+    it('flags inline stop-hook progress on the active chain as a resume issue', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'inline-stop-hook-progress.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.orphanCount).toBe(0)
+      expect(result.resumeIssue).toBe('inline_stop_hook_progress')
+    })
+
+    it('does not flag sibling stop-hook progress that is off the active chain', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'sibling-stop-hook-progress.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.orphanCount).toBe(0)
+      expect(result.resumeIssue).toBeUndefined()
+    })
+
+    it('does not flag resume issue for files without stop-hook progress', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'healthy.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.resumeIssue).toBeUndefined()
+    })
   })
 
   describe('repair()', () => {
