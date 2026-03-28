@@ -2291,18 +2291,18 @@ describe('panesSlice', () => {
       expect((leaf1.content as TerminalPaneContent).terminalId).toBe('alive-1')
       expect((leaf1.content as TerminalPaneContent).status).toBe('running')
 
-      // dead-1 should be cleared but preserve createRequestId for restore bypass
+      // dead-1 should be cleared with a new createRequestId to trigger re-creation
       const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
       expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
       expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
-      expect((leaf2.content as TerminalPaneContent).createRequestId).toBe('r2')
+      expect((leaf2.content as TerminalPaneContent).createRequestId).not.toBe('r2')
 
       // browser pane should be untouched
       const leaf3 = next.layouts['tab-3'] as Extract<PaneNode, { type: 'leaf' }>
       expect(leaf3.content.kind).toBe('browser')
     })
 
-    it('preserves createRequestId so terminal-restore can match it', () => {
+    it('generates new createRequestIds to trigger TerminalView effect re-run', () => {
       const state: PanesState = {
         layouts: {
           'tab-1': {
@@ -2328,12 +2328,12 @@ describe('panesSlice', () => {
       const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: [] }))
 
       const leaf1 = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      expect((leaf1.content as TerminalPaneContent).createRequestId).toBe('original-req-1')
+      expect((leaf1.content as TerminalPaneContent).createRequestId).not.toBe('original-req-1')
       expect((leaf1.content as TerminalPaneContent).terminalId).toBeUndefined()
       expect((leaf1.content as TerminalPaneContent).status).toBe('creating')
 
       const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
-      expect((leaf2.content as TerminalPaneContent).createRequestId).toBe('original-req-2')
+      expect((leaf2.content as TerminalPaneContent).createRequestId).not.toBe('original-req-2')
       expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
       expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
     })
