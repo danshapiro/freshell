@@ -101,7 +101,6 @@ function createTestStore(options?: {
   sessionOpenMode?: 'tab' | 'split'
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
-  sessionOpenMode?: 'tab' | 'split'
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -155,10 +154,6 @@ function createTestStore(options?: {
       settings: {
         settings: {
           ...defaultSettings,
-          panes: {
-            ...defaultSettings.panes,
-            sessionOpenMode: options?.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
-          },
           sidebar: {
             ...defaultSettings.sidebar,
             sortMode: options?.sortMode ?? 'activity',

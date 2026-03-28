@@ -103,9 +103,6 @@ function createStore(options: {
     } satisfies ServerSettingsPatch,
   )
   const localSettings = resolveLocalSettings({
-    panes: {
-      sessionOpenMode: options.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
-    },
     sidebar: {
       sortMode: 'activity',
       showProjectBadges: true,
