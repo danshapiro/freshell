@@ -231,6 +231,74 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Parameter validation: known params per action
+// ---------------------------------------------------------------------------
+
+const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'prompt'] },
+  'list-tabs':       { required: [],                          optional: [] },
+  'select-tab':      { required: ['target'],                  optional: [] },
+  'kill-tab':        { required: ['target'],                  optional: [] },
+  'rename-tab':      { required: ['target', 'name'],          optional: [] },
+  'has-tab':         { required: ['target'],                  optional: [] },
+  'next-tab':        { required: [],                          optional: [] },
+  'prev-tab':        { required: [],                          optional: [] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor'] },
+  'list-panes':      { required: [],                          optional: ['target'] },
+  'select-pane':     { required: ['target'],                  optional: [] },
+  'rename-pane':     { required: ['target', 'name'],          optional: [] },
+  'kill-pane':       { required: ['target'],                  optional: [] },
+  'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
+  'swap-pane':       { required: ['target', 'with'],          optional: [] },
+  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd'] },
+  'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
+  'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
+  'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
+  'run':             { required: ['command'],                 optional: ['capture', 'detached', 'timeout', 'name', 'cwd'] },
+  'summarize':       { required: [],                          optional: ['target'] },
+  'display':         { required: [],                          optional: ['target', 'format'] },
+  'list-terminals':  { required: [],                          optional: [] },
+  'attach':          { required: ['target', 'terminalId'],    optional: [] },
+  'open-browser':    { required: ['url'],                     optional: ['name'] },
+  'navigate':        { required: ['target', 'url'],           optional: [] },
+  'screenshot':      { required: ['scope'],                   optional: ['target', 'name'] },
+  'list-sessions':   { required: [],                          optional: [] },
+  'search-sessions': { required: ['query'],                   optional: [] },
+  'lan-info':        { required: [],                          optional: [] },
+  'health':          { required: [],                          optional: [] },
+  'help':            { required: [],                          optional: [] },
+}
+
+const COMMON_CONFUSIONS: Record<string, Record<string, string>> = {
+  'new-tab': {
+    url: "Unknown parameter 'url' for action 'new-tab'. Did you mean to use 'open-browser' to open a URL? Or pass the URL as 'browser' to create a browser pane in a new tab.",
+  },
+}
+
+function validateParams(action: string, params: Record<string, unknown> | undefined): { error: string; hint: string } | null {
+  const schema = ACTION_PARAMS[action]
+  if (!schema) return null
+
+  const allValid = [...schema.required, ...schema.optional]
+  const givenKeys = Object.keys(params || {})
+  const unknownKeys = givenKeys.filter(k => !allValid.includes(k))
+
+  if (unknownKeys.length === 0) return null
+
+  const specificHint = COMMON_CONFUSIONS[action]
+  for (const key of unknownKeys) {
+    if (specificHint?.[key]) {
+      return { error: specificHint[key], hint: `Valid params for '${action}': ${allValid.join(', ') || '(none)'}` }
+    }
+  }
+
+  return {
+    error: `Unknown parameter${unknownKeys.length > 1 ? 's' : ''} '${unknownKeys.join("', '")}' for action '${action}'.`,
+    hint: `Valid params: ${allValid.join(', ') || '(none)'}`,
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Action router
 // ---------------------------------------------------------------------------
 
@@ -239,9 +307,10 @@ const HELP_TEXT = `Freshell MCP tool -- full reference
 ## Command reference
 
 Tab commands:
-  new-tab         Create a tab. Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, prompt?
+  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, prompt?
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
+                  To open a URL in a browser pane, use 'open-browser' instead.
   list-tabs       List all tabs. Returns { tabs: [...], activeTabId }.
   select-tab      Activate a tab. Params: target (tab ID or title)
   kill-tab        Close a tab. Params: target
@@ -279,8 +348,9 @@ Terminal I/O:
   attach          Attach a terminal to a pane. Params: target (pane ID), terminalId
 
 Browser/navigation:
-  open-browser    Open a URL in a new browser tab. Params: url, name?
-  navigate        Navigate a browser pane to a URL. Params: target (pane ID), url
+  open-browser    Open a URL in a new browser tab to display web pages or images.
+                  Params: url (required), name? (optional)
+  navigate        Navigate an existing browser pane to a URL. Params: target (pane ID), url
 
 Screenshot:
   screenshot      Take a screenshot. Params: scope (pane|tab|view), target?, name? (defaults to "screenshot")
@@ -339,6 +409,15 @@ Meta:
   // Or split an existing pane
   freshell({ action: "split-pane", params: { editor: "/absolute/path/to/file.ts" } })
 
+## Playbook: open a URL in a browser pane
+
+  // Open a URL in a new browser tab (correct way)
+  freshell({ action: "open-browser", params: { url: "https://example.com", name: "My Page" } })
+
+  // Navigate an existing browser pane to a different URL
+  freshell({ action: "navigate", params: { target: paneId, url: "https://other.com" } })
+
+
 ## Screenshot guidance
 
 - Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
@@ -386,6 +465,8 @@ export async function executeAction(
   params?: Record<string, unknown>,
 ): Promise<any> {
   try {
+    const paramError = validateParams(action, params)
+    if (paramError) return paramError
     return await routeAction(action, params)
   } catch (err: any) {
     if (err instanceof MissingParamError) {
