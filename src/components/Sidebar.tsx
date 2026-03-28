@@ -234,18 +234,24 @@ export default function Sidebar({
   }, [requestedSearchTier])
 
   useEffect(() => {
-    const shouldDispatchInitialRequestedSearch = !hasInitializedSearchEffectRef.current
-      && localMatchesRequestedSearch
-      && requestedQuery.length > 0
-      && (
-        requestedQuery !== appliedQuery
-        || requestedSearchTier !== appliedSearchTier
-        || typeof sidebarWindow?.lastLoadedAt !== 'number'
-      )
+    let shouldDispatchInitialRequestedSearch = false
 
     if (!hasInitializedSearchEffectRef.current) {
+      const currentSidebarWindow = store.getState().sessions.windows?.sidebar
+      const currentRequestedQuery = (currentSidebarWindow?.query ?? '').trim()
+      const currentRequestedSearchTier = currentSidebarWindow?.searchTier ?? 'title'
+      const currentAppliedQuery = (currentSidebarWindow?.appliedQuery ?? '').trim()
+      const currentAppliedSearchTier = currentSidebarWindow?.appliedSearchTier ?? 'title'
+      shouldDispatchInitialRequestedSearch = localMatchesRequestedSearch
+        && currentRequestedQuery.length > 0
+        && (
+          currentRequestedQuery !== currentAppliedQuery
+          || currentRequestedSearchTier !== currentAppliedSearchTier
+          || typeof currentSidebarWindow?.lastLoadedAt !== 'number'
+        )
+
       hasInitializedSearchEffectRef.current = true
-      wasSearchingRef.current = requestedQuery.length > 0 || appliedQuery.length > 0
+      wasSearchingRef.current = currentRequestedQuery.length > 0 || currentAppliedQuery.length > 0
       if (!shouldDispatchInitialRequestedSearch) {
         return
       }
@@ -281,15 +287,11 @@ export default function Sidebar({
       clearTimeout(timeoutId)
     }
   }, [
-    appliedQuery,
-    appliedSearchTier,
     dispatch,
     localMatchesRequestedSearch,
     localQuery,
-    requestedQuery,
-    requestedSearchTier,
     searchTier,
-    sidebarWindow?.lastLoadedAt,
+    store,
   ])
 
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))

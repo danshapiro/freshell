@@ -1709,6 +1709,77 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
     })
 
+    it('does not restart a newer debounced search when older results commit', async () => {
+      const alphaRequest = createDeferred<any>()
+      const betaRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions)
+        .mockReturnValueOnce(alphaRequest.promise)
+        .mockReturnValueOnce(betaRequest.promise)
+
+      const store = createTestStore({
+        sessions: {
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [],
+              lastLoadedAt: 1_700_000_000_000,
+            },
+          },
+        },
+      })
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const input = getByPlaceholderText('Search...')
+      fireEvent.change(input, { target: { value: 'alpha' } })
+
+      await act(async () => {
+        vi.advanceTimersByTime(300)
+        await Promise.resolve()
+      })
+
+      expect(mockSearchSessions).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        query: 'alpha',
+        tier: 'title',
+      }))
+
+      fireEvent.change(input, { target: { value: 'beta' } })
+
+      await act(() => vi.advanceTimersByTime(250))
+      expect(mockSearchSessions).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        alphaRequest.resolve({
+          results: [],
+          tier: 'title',
+          query: 'alpha',
+          totalScanned: 0,
+        })
+        await Promise.resolve()
+      })
+
+      await act(async () => {
+        vi.advanceTimersByTime(50)
+        await Promise.resolve()
+      })
+
+      expect(mockSearchSessions).toHaveBeenCalledTimes(2)
+      expect(mockSearchSessions).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        query: 'beta',
+        tier: 'title',
+      }))
+
+      await act(async () => {
+        betaRequest.resolve({
+          results: [],
+          tier: 'title',
+          query: 'beta',
+          totalScanned: 0,
+        })
+        await Promise.resolve()
+      })
+    })
+
     it('shows clear button when search has text', async () => {
       const store = createTestStore()
       const { getByPlaceholderText, getByRole, queryByRole } = renderSidebar(store, [])
