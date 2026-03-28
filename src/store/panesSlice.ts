@@ -460,6 +460,12 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
       }
     }
 
+    // Guard cross-kind overwrites: if local and incoming have different content
+    // kinds, preserve local to prevent pane corruption during cross-tab sync
+    if (incoming.content?.kind !== local.content?.kind) {
+      return local
+    }
+
     return incoming
   }
 
@@ -1154,10 +1160,11 @@ export const panesSlice = createSlice({
         const mergedNode = localNode
           ? mergeTerminalState(incomingNode as PaneNode, localNode)
           : (incomingHasShape ? incomingNode as PaneNode : null)
+        const mergeUsedIncoming = mergedNode !== localNode
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
         if (normalizedNode) {
           mergedLayouts[tabId] = normalizedNode
-          if (incomingHasShape && normalizedNode !== localNode) {
+          if (incomingHasShape && mergeUsedIncoming) {
             incomingLayoutTabIds.add(tabId)
           }
         }
@@ -1263,6 +1270,38 @@ export const panesSlice = createSlice({
         }
       }
     },
+
+    clearDeadTerminals: (state, action: PayloadAction<{ liveTerminalIds: string[] }>) => {
+      const liveSet = new Set(action.payload.liveTerminalIds)
+
+      function clearDeadInNode(node: PaneNode): boolean {
+        if (node.type === 'leaf') {
+          if (
+            node.content?.kind === 'terminal' &&
+            node.content.terminalId &&
+            !liveSet.has(node.content.terminalId)
+          ) {
+            node.content.terminalId = undefined
+            node.content.status = 'creating'
+            node.content.createRequestId = nanoid()
+            return true
+          }
+          return false
+        }
+        if (node.type === 'split' && Array.isArray(node.children)) {
+          let changed = false
+          for (const child of node.children) {
+            if (clearDeadInNode(child)) changed = true
+          }
+          return changed
+        }
+        return false
+      }
+
+      for (const layout of Object.values(state.layouts)) {
+        clearDeadInNode(layout)
+      }
+    },
   },
 })
 
@@ -1292,6 +1331,7 @@ export const {
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
+  clearDeadTerminals,
 } = panesSlice.actions
 
 export default panesSlice.reducer

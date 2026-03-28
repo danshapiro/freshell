@@ -402,6 +402,7 @@ export type ReadyMessage = {
   type: 'ready'
   timestamp: string
   serverInstanceId?: string
+  bootId?: string
 }
 
 export type PongMessage = {
@@ -664,6 +665,23 @@ export type ExtensionServerStoppedMessage = {
   name: string
 }
 
+export type TerminalInventoryMessage = {
+  type: 'terminal.inventory'
+  bootId: string
+  terminals: Array<{
+    terminalId: string
+    title: string
+    description?: string
+    mode: string
+    resumeSessionId?: string
+    createdAt: number
+    lastActivityAt: number
+    status: 'running' | 'exited'
+    cwd?: string
+  }>
+  terminalMeta: TerminalMetaRecord[]
+}
+
 // ── Server message discriminated union ──
 
 export type ServerMessage =
@@ -681,6 +699,7 @@ export type ServerMessage =
   | TerminalsChangedMessage
   | TerminalRuntimeUpdatedMessage
   | TerminalMetaUpdatedMessage
+  | TerminalInventoryMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage
   | SessionsChangedMessage

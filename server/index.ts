@@ -46,7 +46,7 @@ import { getNetworkHost } from './get-network-host.js'
 import { PortForwardManager } from './port-forward.js'
 import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
-import { checkForUpdate } from './updater/version-checker.js'
+import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
@@ -427,7 +427,7 @@ async function main() {
     detectPlatform,
     detectAvailableClis: () => detectAvailableClis(cliDetectionSpecs),
     detectHostName,
-    checkForUpdate,
+    checkForUpdate: createCachedUpdateChecker(checkForUpdate),
     appVersion: APP_VERSION,
   }))
 

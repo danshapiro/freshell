@@ -21,6 +21,7 @@ import panesReducer, {
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
+  clearDeadTerminals,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -2245,10 +2246,84 @@ describe('panesSlice', () => {
 
       const next = panesReducer(localState, hydratePanes(incoming))
 
-      expect(next.layouts['tab-1']).toEqual(localState.layouts['tab-1'])
+      const leaf = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('terminal')
+      expect((leaf.content as TerminalPaneContent).terminalId).toBe('local-terminal-1')
       expect(next.activePane['tab-1']).toBe('pane-1')
       expect(next.paneTitles['tab-1']).toEqual({ 'pane-1': 'Local title' })
       expect(next.paneTitleSetByUser['tab-1']).toEqual({ 'pane-1': true })
+    })
+  })
+
+  describe('clearDeadTerminals', () => {
+    it('clears terminal IDs not in the live list', () => {
+      const state: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running', terminalId: 'alive-1' },
+          } as any,
+          'tab-2': {
+            type: 'leaf',
+            id: 'p2',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r2', status: 'running', terminalId: 'dead-1' },
+          } as any,
+          'tab-3': {
+            type: 'leaf',
+            id: 'p3',
+            content: { kind: 'browser', url: 'https://example.com' },
+          } as any,
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: ['alive-1'] }))
+
+      // alive-1 should be preserved
+      const leaf1 = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf1.content as TerminalPaneContent).terminalId).toBe('alive-1')
+      expect((leaf1.content as TerminalPaneContent).status).toBe('running')
+
+      // dead-1 should be cleared with a new createRequestId to trigger re-creation
+      const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
+      expect((leaf2.content as TerminalPaneContent).createRequestId).not.toBe('r2')
+
+      // browser pane should be untouched
+      const leaf3 = next.layouts['tab-3'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf3.content.kind).toBe('browser')
+    })
+
+    it('handles server restart with empty live list', () => {
+      const state: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running', terminalId: 'old-1' },
+          } as any,
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: [] }))
+      const leaf = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf.content as TerminalPaneContent).status).toBe('creating')
     })
   })
 
@@ -2406,6 +2481,89 @@ describe('panesSlice', () => {
         extensionName: 'my-widget',
         props: { theme: 'dark' },
       })
+    })
+
+    it('preserves local terminal pane when incoming is browser kind', () => {
+      const terminalContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'running',
+        mode: 'shell',
+        terminalId: 'term-live',
+      }
+      const browserContent: PaneContent = {
+        kind: 'browser',
+        url: 'https://example.com',
+      }
+
+      const localState = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-xk', content: terminalContent })
+      )
+
+      const paneId = (localState.layouts['tab-xk'] as any).id
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-xk': {
+            type: 'leaf',
+            id: paneId,
+            content: browserContent,
+          },
+        },
+        activePane: localState.activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const merged = panesReducer(localState, hydratePanes(incoming))
+      const leaf = merged.layouts['tab-xk'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('terminal')
+      expect((leaf.content as TerminalPaneContent).terminalId).toBe('term-live')
+    })
+
+    it('preserves local browser pane when incoming is terminal kind', () => {
+      const browserContent: PaneContent = {
+        kind: 'browser',
+        url: 'https://example.com',
+      }
+      const terminalContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-2',
+        status: 'running',
+        mode: 'shell',
+        terminalId: 'term-other',
+      }
+
+      const localState = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-xk2', content: browserContent })
+      )
+
+      const paneId = (localState.layouts['tab-xk2'] as any).id
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-xk2': {
+            type: 'leaf',
+            id: paneId,
+            content: terminalContent,
+          },
+        },
+        activePane: localState.activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const merged = panesReducer(localState, hydratePanes(incoming))
+      const leaf = merged.layouts['tab-xk2'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.kind).toBe('browser')
     })
 
     it('survives mergeTerminalState when extension pane exists locally and remotely', () => {

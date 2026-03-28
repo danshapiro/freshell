@@ -229,6 +229,93 @@ describe('version-checker', () => {
     })
   })
 
+  describe('createCachedUpdateChecker', () => {
+    it('calls the underlying checker on first invocation', async () => {
+      const { createCachedUpdateChecker } = await import('../../../../server/updater/version-checker.js')
+      const inner = vi.fn().mockResolvedValue({
+        updateAvailable: false,
+        currentVersion: '1.0.0',
+        latestVersion: '1.0.0',
+        releaseUrl: null,
+        error: null,
+      })
+
+      const cached = createCachedUpdateChecker(inner, 60_000)
+      const result = await cached('1.0.0')
+
+      expect(inner).toHaveBeenCalledTimes(1)
+      expect(result.currentVersion).toBe('1.0.0')
+    })
+
+    it('returns cached result on second call within TTL', async () => {
+      const { createCachedUpdateChecker } = await import('../../../../server/updater/version-checker.js')
+      const inner = vi.fn().mockResolvedValue({
+        updateAvailable: true,
+        currentVersion: '1.0.0',
+        latestVersion: '2.0.0',
+        releaseUrl: 'https://example.com',
+        error: null,
+      })
+
+      const cached = createCachedUpdateChecker(inner, 60_000)
+      await cached('1.0.0')
+      const result = await cached('1.0.0')
+
+      expect(inner).toHaveBeenCalledTimes(1)
+      expect(result.updateAvailable).toBe(true)
+    })
+
+    it('re-fetches after TTL expires', async () => {
+      const { createCachedUpdateChecker } = await import('../../../../server/updater/version-checker.js')
+      vi.useFakeTimers()
+
+      const inner = vi.fn().mockResolvedValue({
+        updateAvailable: false,
+        currentVersion: '1.0.0',
+        latestVersion: '1.0.0',
+        releaseUrl: null,
+        error: null,
+      })
+
+      const cached = createCachedUpdateChecker(inner, 5_000)
+      await cached('1.0.0')
+      expect(inner).toHaveBeenCalledTimes(1)
+
+      vi.advanceTimersByTime(6_000)
+      await cached('1.0.0')
+      expect(inner).toHaveBeenCalledTimes(2)
+
+      vi.useRealTimers()
+    })
+
+    it('does not cache error responses', async () => {
+      const { createCachedUpdateChecker } = await import('../../../../server/updater/version-checker.js')
+      const inner = vi.fn()
+        .mockResolvedValueOnce({
+          updateAvailable: false,
+          currentVersion: '1.0.0',
+          latestVersion: null,
+          releaseUrl: null,
+          error: 'GitHub API returned 500',
+        })
+        .mockResolvedValueOnce({
+          updateAvailable: false,
+          currentVersion: '1.0.0',
+          latestVersion: '1.0.0',
+          releaseUrl: null,
+          error: null,
+        })
+
+      const cached = createCachedUpdateChecker(inner, 60_000)
+      const first = await cached('1.0.0')
+      expect(first.error).toBe('GitHub API returned 500')
+
+      const second = await cached('1.0.0')
+      expect(inner).toHaveBeenCalledTimes(2)
+      expect(second.error).toBeNull()
+    })
+  })
+
   describe('GitHubReleaseSchema', () => {
     it('validates a correct release object', () => {
       const validRelease = {

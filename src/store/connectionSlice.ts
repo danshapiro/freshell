@@ -8,6 +8,9 @@ export interface ConnectionState {
   lastErrorCode?: number
   lastReadyAt?: number
   serverInstanceId?: string
+  bootId?: string
+  serverRestarted?: boolean
+  liveTerminalIds?: string[]
   platform: string | null
   availableClis: Record<string, boolean>
   featureFlags: Record<string, boolean>
@@ -47,6 +50,15 @@ export const connectionSlice = createSlice({
     setServerInstanceId: (state, action: PayloadAction<string | undefined>) => {
       state.serverInstanceId = action.payload
     },
+    setBootId: (state, action: PayloadAction<string | undefined>) => {
+      state.bootId = action.payload
+    },
+    setServerRestarted: (state, action: PayloadAction<boolean>) => {
+      state.serverRestarted = action.payload
+    },
+    setLiveTerminalIds: (state, action: PayloadAction<string[] | undefined>) => {
+      state.liveTerminalIds = action.payload
+    },
     setPlatform: (state, action: PayloadAction<string>) => {
       state.platform = action.payload
     },
@@ -59,5 +71,5 @@ export const connectionSlice = createSlice({
   },
 })
 
-export const { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } = connectionSlice.actions
+export const { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } = connectionSlice.actions
 export default connectionSlice.reducer

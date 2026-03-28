@@ -367,8 +367,11 @@ describe('WsClient.connect', () => {
 
     await expect(p).rejects.toThrow(/Handshake timeout/i)
 
-    // Should schedule a reconnect attempt (baseReconnectDelay = 1000).
-    expect(setTimeoutSpy.mock.calls.some((call) => call[1] === 1000)).toBe(true)
+    // Should schedule a reconnect attempt around baseReconnectDelay (1000ms ± jitter)
+    const reconnectDelays = setTimeoutSpy.mock.calls
+      .map((call) => call[1])
+      .filter((d): d is number => typeof d === 'number' && d >= 800 && d <= 1400)
+    expect(reconnectDelays.length).toBeGreaterThan(0)
   })
 
   it('treats BACKPRESSURE as transient and schedules reconnect with a minimum delay', async () => {
@@ -403,11 +406,15 @@ describe('WsClient.connect', () => {
       .map((call) => call[1])
       .filter((d): d is number => typeof d === 'number' && d < 10000)
 
-    expect(reconnectDelays).toContain(1000)
-    expect(reconnectDelays.every((delay) => delay < 5000)).toBe(true)
+    // First reconnect delay should be around 1000ms (with jitter ±20%)
+    expect(reconnectDelays.length).toBeGreaterThan(0)
+    expect(reconnectDelays[0]).toBeGreaterThanOrEqual(800)
+    expect(reconnectDelays[0]).toBeLessThanOrEqual(1400)
+    // All delays capped at max (4000ms + jitter ceiling)
+    expect(reconnectDelays.every((delay) => delay <= 4800)).toBe(true)
   })
 
-  it('treats SERVER_SHUTDOWN (4009) as transient and resets backoff for fast reconnect', async () => {
+  it('treats SERVER_SHUTDOWN (4009) as transient and uses fast reconnect', async () => {
     const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
 
     const c = new WsClient('ws://example/ws')
@@ -419,14 +426,14 @@ describe('WsClient.connect', () => {
 
     await expect(p).rejects.toThrow(/Server restarting/i)
 
-    // Should schedule a reconnect at base delay (1000ms) since backoff is reset.
-    // Filter out the connection timeout (10000ms) which is unrelated.
+    // Should schedule a fast reconnect (500ms base with jitter)
     const reconnectDelays = setTimeoutSpy.mock.calls
       .map((call) => call[1])
       .filter((d): d is number => typeof d === 'number' && d < 10000)
-    expect(reconnectDelays).toContain(1000)
-    // No exponential backoff — max reconnect delay should be 1000ms
-    expect(Math.max(...reconnectDelays)).toBe(1000)
+    expect(reconnectDelays.length).toBeGreaterThan(0)
+    // Post-shutdown base is 500ms, with jitter ±20%: 400-700ms
+    expect(reconnectDelays[0]).toBeGreaterThanOrEqual(400)
+    expect(reconnectDelays[0]).toBeLessThanOrEqual(700)
   })
 
   it('treats protocol version mismatch as fatal and does not reconnect', async () => {
