@@ -830,6 +830,69 @@ describe('sessionsThunks', () => {
     expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
   })
 
+  it('refreshActiveSessionWindow uses the visible applied query without drift and stays background/silent', async () => {
+    const refreshDeferred = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(refreshDeferred.promise)
+
+    const searchProjects = [{
+      projectPath: '/tmp/search-project',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        lastActivityAt: 3_000,
+        title: 'Search result',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: searchProjects,
+      lastLoadedAt: 3_000,
+      windows: {
+        sidebar: {
+          projects: searchProjects,
+          lastLoadedAt: 3_000,
+          query: 'needle',
+          searchTier: 'title',
+          appliedQuery: 'needle',
+          appliedSearchTier: 'title',
+        },
+      },
+    })
+
+    const request = store.dispatch(refreshActiveSessionWindow() as any)
+
+    expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('background')
+    expect(searchSessions).toHaveBeenCalledWith({
+      query: 'needle',
+      tier: 'title',
+      signal: expect.any(AbortSignal),
+    })
+
+    refreshDeferred.resolve({
+      results: [{
+        provider: 'claude',
+        sessionId: 'session-search',
+        projectPath: '/tmp/search-project',
+        title: 'Search result',
+        lastActivityAt: 3_100,
+        archived: false,
+      }],
+      tier: 'title',
+      query: 'needle',
+      totalScanned: 1,
+    })
+
+    await request
+
+    expect(store.getState().sessions.windows.sidebar.loadingKind).toBeUndefined()
+    expect(store.getState().sessions.windows.sidebar.query).toBe('needle')
+    expect(store.getState().sessions.windows.sidebar.searchTier).toBe('title')
+    expect(store.getState().sessions.windows.sidebar.appliedQuery).toBe('needle')
+    expect(store.getState().sessions.windows.sidebar.appliedSearchTier).toBe('title')
+  })
+
   it('marks websocket revalidation as background for both default lists and the visible applied query', async () => {
     const defaultRefresh = createDeferred<any>()
     const searchRefresh = createDeferred<any>()
