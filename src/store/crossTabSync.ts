@@ -208,6 +208,10 @@ export function installCrossTabSync(store: StoreLike): () => void {
     }
   }
 
+  // tryDedupeAndMark is passed into handleIncomingRaw so that when a tabs event
+  // triggers a paired panes read from localStorage (or vice versa), the paired
+  // key also goes through dedup. This prevents the later StorageEvent for the
+  // paired key from re-hydrating what we already processed eagerly.
   const tryDedupeAndMark = (key: string, raw: string): boolean => {
     if (lastProcessedRawByKey.get(key) === raw) return false
     lastProcessedRawByKey.set(key, raw)
