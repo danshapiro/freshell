@@ -81,17 +81,17 @@ export function createCachedUpdateChecker(
   checker: UpdateChecker,
   ttlMs: number = DEFAULT_CACHE_TTL_MS
 ): UpdateChecker {
-  let cached: { result: UpdateCheckResult; expiresAt: number } | null = null
+  let cached: { result: UpdateCheckResult; expiresAt: number; version: string } | null = null
 
   return async (currentVersion: string) => {
-    if (cached && Date.now() < cached.expiresAt) {
+    if (cached && cached.version === currentVersion && Date.now() < cached.expiresAt) {
       return cached.result
     }
 
     const result = await checker(currentVersion)
 
     if (!result.error) {
-      cached = { result, expiresAt: Date.now() + ttlMs }
+      cached = { result, expiresAt: Date.now() + ttlMs, version: currentVersion }
     }
 
     return result

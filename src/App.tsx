@@ -773,9 +773,7 @@ export default function App() {
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
           dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
-          if (terminalMeta.length > 0) {
-            dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta }))
-          }
+          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: Date.now() }))
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
