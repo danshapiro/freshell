@@ -182,7 +182,8 @@ describe('MessageBubble display toggles', () => {
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
   })
 
-  it('shows collapsed tool strip when showTools is false', () => {
+  it('shows collapsed tool strip when showTools is false, chevron still works', async () => {
+    const user = userEvent.setup()
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -191,7 +192,12 @@ describe('MessageBubble display toggles', () => {
       />
     )
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
-    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('shows collapsed tool strip for tool_result when showTools is false', () => {
@@ -402,7 +408,8 @@ describe('MessageBubble tool strip grouping', () => {
     expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
-  it('shows collapsed strips when showTools is false', () => {
+  it('shows collapsed strips when showTools is false, chevron works', async () => {
+    const user = userEvent.setup()
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -415,8 +422,13 @@ describe('MessageBubble tool strip grouping', () => {
       />
     )
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
-    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
     expect(screen.getByText('Hello')).toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('includes running tool_use without result in the strip', () => {
@@ -475,7 +487,8 @@ describe('MessageBubble tool strip grouping', () => {
 describe('MessageBubble tool strip visual behavior', () => {
   afterEach(cleanup)
 
-  it('renders collapsed strip with summary text when showTools is false', () => {
+  it('renders collapsed strip with summary text when showTools is false, chevron works', async () => {
+    const user = userEvent.setup()
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -499,10 +512,16 @@ describe('MessageBubble tool strip visual behavior', () => {
     const strips = container.querySelectorAll('[aria-label="Tool strip"]')
     expect(strips).toHaveLength(1)
     expect(screen.getByText('3 tools used')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Read tool call/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Grep tool call/i })).not.toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Grep tool call/i })).toBeInTheDocument()
   })
 
   it('renders expanded strip with tool blocks when showTools is true', () => {

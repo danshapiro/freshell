@@ -1,0 +1,12 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "freshell": {
+      "type": "local",
+      "command": [
+        "node",
+        "/home/user/code/freshell/dist/server/mcp/server.js"
+      ]
+    }
+  }
+}

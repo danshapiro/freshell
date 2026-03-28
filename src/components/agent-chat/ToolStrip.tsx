@@ -57,16 +57,14 @@ function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
               : 'border-l-[hsl(var(--claude-tool))]',
           )}
         >
-          {showTools && (
-            <button
-              type="button"
-              onClick={handleToggle}
-              className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
-              aria-label="Toggle tool details"
-            >
-              <ChevronRight className="h-3 w-3" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={handleToggle}
+            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
+            aria-label="Toggle tool details"
+          >
+            <ChevronRight className="h-3 w-3" />
+          </button>
           <SlotReel
             toolName={isSettled ? null : (currentTool?.name ?? null)}
             previewText={

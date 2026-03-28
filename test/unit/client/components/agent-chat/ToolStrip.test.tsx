@@ -49,13 +49,19 @@ describe('ToolStrip', () => {
     expect(strip.className).toContain('my-0.5')
   })
 
-  it('starts collapsed when showTools is false', () => {
+  it('starts collapsed when showTools is false, chevron still works', async () => {
+    const user = userEvent.setup()
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
     ]
     render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
     expect(screen.getByText('1 tool used')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('strip toggle is session-only (not persisted to localStorage)', async () => {
@@ -168,15 +174,20 @@ describe('ToolStrip', () => {
     expect(screen.getByRole('region', { name: /tool strip/i })).toBeInTheDocument()
   })
 
-  it('always shows collapsed view when showTools is false', () => {
+  it('shows collapsed view by default when showTools is false, chevron still works', async () => {
+    const user = userEvent.setup()
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
       makePair('Read', { file_path: '/path/file.ts' }, 'content'),
     ]
     render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
     expect(screen.getByText('2 tools used')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+
+    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+    await user.click(toggle)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('resets to showTools default when component remounts', async () => {
