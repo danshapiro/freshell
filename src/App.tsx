@@ -56,6 +56,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearDeadTerminals } from '@/store/panesSlice'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -773,6 +774,24 @@ export default function App() {
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
           dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
+          // Register new createRequestIds with the restore set so the
+          // subsequent terminal.create messages include restore: true
+          // and bypass the server's rate limiter.
+          const layouts = appStore.getState().panes.layouts
+          for (const layout of Object.values(layouts)) {
+            ;(function walk(node: any) {
+              if (!node) return
+              if (node.type === 'leaf') {
+                if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
+                  addTerminalRestoreRequestId(node.content.createRequestId)
+                }
+                return
+              }
+              if (node.type === 'split' && Array.isArray(node.children)) {
+                for (const child of node.children) walk(child)
+              }
+            })(layout)
+          }
           dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: Date.now() }))
         }
         if (msg.type === 'codex.activity.list.response') {
