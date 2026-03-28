@@ -2030,7 +2030,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(layout.content.status).toBe('creating')
 
     await act(async () => {
-      vi.advanceTimersByTime(250)
+      vi.advanceTimersByTime(2000)
     })
 
     const createCallsAfter = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')

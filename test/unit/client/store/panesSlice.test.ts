@@ -2291,24 +2291,29 @@ describe('panesSlice', () => {
       expect((leaf1.content as TerminalPaneContent).terminalId).toBe('alive-1')
       expect((leaf1.content as TerminalPaneContent).status).toBe('running')
 
-      // dead-1 should be cleared with a new createRequestId to trigger re-creation
+      // dead-1 should be cleared but preserve createRequestId for restore bypass
       const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
       expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
       expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
-      expect((leaf2.content as TerminalPaneContent).createRequestId).not.toBe('r2')
+      expect((leaf2.content as TerminalPaneContent).createRequestId).toBe('r2')
 
       // browser pane should be untouched
       const leaf3 = next.layouts['tab-3'] as Extract<PaneNode, { type: 'leaf' }>
       expect(leaf3.content.kind).toBe('browser')
     })
 
-    it('handles server restart with empty live list', () => {
+    it('preserves createRequestId so terminal-restore can match it', () => {
       const state: PanesState = {
         layouts: {
           'tab-1': {
             type: 'leaf',
             id: 'p1',
-            content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running', terminalId: 'old-1' },
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'original-req-1', status: 'running', terminalId: 'dead-1' },
+          } as any,
+          'tab-2': {
+            type: 'leaf',
+            id: 'p2',
+            content: { kind: 'terminal', mode: 'claude', createRequestId: 'original-req-2', status: 'running', terminalId: 'dead-2' },
           } as any,
         },
         activePane: {},
@@ -2321,9 +2326,16 @@ describe('panesSlice', () => {
       }
 
       const next = panesReducer(state, clearDeadTerminals({ liveTerminalIds: [] }))
-      const leaf = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      expect((leaf.content as TerminalPaneContent).terminalId).toBeUndefined()
-      expect((leaf.content as TerminalPaneContent).status).toBe('creating')
+
+      const leaf1 = next.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf1.content as TerminalPaneContent).createRequestId).toBe('original-req-1')
+      expect((leaf1.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf1.content as TerminalPaneContent).status).toBe('creating')
+
+      const leaf2 = next.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
+      expect((leaf2.content as TerminalPaneContent).createRequestId).toBe('original-req-2')
+      expect((leaf2.content as TerminalPaneContent).terminalId).toBeUndefined()
+      expect((leaf2.content as TerminalPaneContent).status).toBe('creating')
     })
   })
 

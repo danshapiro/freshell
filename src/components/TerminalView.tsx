@@ -73,9 +73,9 @@ import { createLogger } from '@/lib/client-logger'
 const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
-const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 3
-const RATE_LIMIT_RETRY_BASE_MS = 250
-const RATE_LIMIT_RETRY_MAX_MS = 1000
+export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
+export const RATE_LIMIT_RETRY_BASE_MS = 2000
+export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
@@ -1524,7 +1524,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      term.writeln(`\r\n[Rate limited - retrying in ${delayMs}ms]\r\n`)
+      term.writeln(`\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
       return true
     }
 

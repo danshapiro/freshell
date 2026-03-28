@@ -1283,7 +1283,6 @@ export const panesSlice = createSlice({
           ) {
             node.content.terminalId = undefined
             node.content.status = 'creating'
-            node.content.createRequestId = nanoid()
             return true
           }
           return false
