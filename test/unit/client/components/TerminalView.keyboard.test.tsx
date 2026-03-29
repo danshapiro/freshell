@@ -37,7 +37,10 @@ vi.mock('lucide-react', () => ({
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
 let capturedOnData: ((data: string) => void) | null = null
 let capturedTerminal: { paste: ReturnType<typeof vi.fn> } | null = null
-let capturedLinkProvider: {
+let capturedLinkProviders: Array<{
+  provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
+}> = []
+let capturedFilePathProvider: {
   provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
 } | null = null
 
@@ -56,7 +59,7 @@ vi.mock('@xterm/xterm', () => {
     open = vi.fn()
     loadAddon = vi.fn()
     registerLinkProvider = vi.fn((provider: any) => {
-      capturedLinkProvider = provider
+      capturedLinkProviders.push(provider)
       return { dispose: vi.fn() }
     })
     write = vi.fn()
@@ -308,7 +311,8 @@ describe('TerminalView keyboard handling', () => {
     capturedKeyHandler = null
     capturedOnData = null
     capturedTerminal = null
-    capturedLinkProvider = null
+    capturedLinkProviders = []
+    capturedFilePathProvider = null
     wsMocks.send.mockClear()
     clipboardMocks.readText.mockClear()
     clipboardMocks.copyText.mockClear()
@@ -860,11 +864,12 @@ describe('TerminalView keyboard handling', () => {
       )
 
       await waitFor(() => {
-        expect(capturedLinkProvider).not.toBeNull()
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
       })
 
       let links: any[] | undefined
-      capturedLinkProvider!.provideLinks(1, (provided) => {
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
         links = provided
       })
 
@@ -930,11 +935,12 @@ describe('TerminalView keyboard handling', () => {
       )
 
       await waitFor(() => {
-        expect(capturedLinkProvider).not.toBeNull()
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
       })
 
       let links: any[] | undefined
-      capturedLinkProvider!.provideLinks(1, (provided) => {
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
         links = provided
       })
 
