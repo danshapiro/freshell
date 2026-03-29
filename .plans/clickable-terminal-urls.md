@@ -99,7 +99,7 @@ Note: The `leave` callback ignores all parameters. TypeScript allows fewer param
 
 3. The existing file path link provider's `ILink` objects do not need `hover`/`leave` callbacks. File paths are not URLs, and they already open in editor panes. Leave them unchanged -- do **not** add empty hover/leave stubs.
 
-4. Add a URL link provider via `registerLinkProvider` to detect plain-text URLs in terminal output (non-OSC-8). This ensures URLs that are visually styled but not wrapped in OSC 8 sequences are also clickable. **Register this BEFORE the file path provider** (currently at line 1044 in TerminalView.tsx) so file paths get higher priority (xterm.js: last registered = highest priority):
+4. Add a URL link provider via `registerLinkProvider` to detect plain-text URLs in terminal output (non-OSC-8). This ensures URLs that are visually styled but not wrapped in OSC 8 sequences are also clickable. **Register this AFTER the file path provider** (currently at line 1044 in TerminalView.tsx) so file paths get higher priority (xterm.js: first registered = highest priority, since `linkProviders.push()` gives lower indices to earlier registrations and `_checkLinkProviderResult` checks lower indices first):
 
 ```ts
 const urlLinkDisposable = typeof term.registerLinkProvider === 'function'
@@ -376,7 +376,7 @@ Update the assertions to check that `store.getState().panes.layouts['tab-1']` be
 
 **File: `test/unit/client/components/TerminalView.keyboard.test.tsx`**
 
-This file captures `registerLinkProvider` callbacks via `capturedLinkProvider`. Since we add a new URL link provider, `registerLinkProvider` will now be called twice (URL provider first, then file path provider). The mock at line 58-61 saves only the last provider registered. If any keyboard tests depend on the captured file path provider, verify they still capture the correct one. The URL provider registration means `registerLinkProvider.mock.calls` will have two entries. Adjust the `capturedLinkProvider` capture if needed (e.g., capture the last call or both calls).
+This file captures `registerLinkProvider` callbacks via `capturedLinkProvider`. Since we add a new URL link provider (registered AFTER the file path provider), `registerLinkProvider` will now be called twice (file path provider first, then URL provider). The mock at line 58-61 saves only the last provider registered, which will now be the URL provider instead of the file path provider. The keyboard tests that use `capturedLinkProvider` to test file path link behavior (e.g., lines 863-937) will need the mock updated to capture the FIRST call (the file path provider), not the last. Recommended approach: store all registered providers in an array and expose separate references, e.g., `capturedFilePathProvider = calls[0]`, `capturedUrlProvider = calls[1]`.
 
 ### Phase 4: New Tests
 
@@ -405,11 +405,9 @@ Test the left-click behavior:
 - Clicking a URL with warnExternalLinks=false directly dispatches splitPane with browser content
 - Verify the browser pane content has the correct URL
 
-**File: `test/unit/client/components/context-menu/menu-defs.test.ts`** (update existing -- this is the canonical test file using `@/` imports)
+**File: `test/unit/client/components/context-menu/menu-defs.test.ts`** (new -- no existing test file for menu-defs currently exists in the repo)
 
-Note: There is also a stale `test/unit/client/context-menu/menu-defs.test.ts` with outdated function names (`copyFreshclaude*` instead of `copyAgentChat*`). Use the `test/unit/client/components/context-menu/` version.
-
-**Important pre-existing issue:** The `createMockActions()` function in this test file is already missing 6 actions that exist in the current `MenuActions` type: `refreshTab`, `reopenClosedTab`, `refreshPane`, `replacePane`, `generateSessionTitle`, `showKeyboardShortcuts`. These were added after the test was written. When adding the 4 new URL actions (`openUrlInPane`, `openUrlInTab`, `openUrlInBrowser`, `copyUrl`), also add the 6 missing pre-existing actions to bring the mock fully in sync with the `MenuActions` type. The `createMockContext()` is also missing the `aiEnabled` field (should be `aiEnabled: false`).
+Create a new test file for `buildMenuItems`. The `createMockActions()` helper must include ALL actions from the current `MenuActions` type (67 actions as of now) plus the 4 new URL actions (`openUrlInPane`, `openUrlInTab`, `openUrlInBrowser`, `copyUrl`). The `createMockContext()` helper must include `aiEnabled: false` and all fields of `MenuBuildContext`.
 
 Add tests for the terminal context target with `hoveredUrl`:
 - When `hoveredUrl` is set, URL-specific menu items appear at the top
@@ -428,7 +426,7 @@ Test that `parseContextTarget` for Terminal correctly extracts `hoveredUrl` from
 
 3. **Multiple terminals**: Each terminal pane has its own paneId, so hover states are independent. The context menu reads from the correct pane's wrapper div.
 
-4. **OSC 8 vs custom link provider priority**: xterm.js checks OSC 8 links first, then registered link providers in reverse order (last registered = highest priority). Our custom URL link provider should be registered BEFORE the file path provider (currently at line 1044) so file paths get higher priority. However, the URL regex should not match file paths (no `http://` prefix), so overlap is unlikely. Concretely: insert the URL provider registration between `term.open(containerRef.current)` (line 1040) and the file path provider (line 1044).
+4. **OSC 8 vs custom link provider priority**: xterm.js checks OSC 8 links first, then registered link providers in order of registration (first registered = highest priority, since providers are pushed onto an array and iterated from index 0). Our custom URL link provider should be registered AFTER the file path provider (currently at line 1044) so file paths get higher priority if ranges ever overlap. However, the URL regex should not match file paths (no `http://` prefix), so overlap is unlikely. Concretely: insert the URL provider registration AFTER the existing file path provider block (after line 1076).
 
 5. **Data attribute cleanup on leave**: The `leave` callback must always clear the `data-hovered-url` attribute. If the user right-clicks while hovering a link and then moves the mouse away before the context menu renders, the attribute should already be set at the time of the `contextmenu` event because `leave` fires after the mouse moves off the link, not when the context menu opens.
 
@@ -452,17 +450,16 @@ After all tests pass, evaluate:
 - `test/unit/client/lib/url-utils.test.ts`
 - `test/unit/client/components/TerminalView.urlClick.test.tsx`
 - `test/unit/client/components/context-menu/context-menu-utils.test.ts`
+- `test/unit/client/components/context-menu/menu-defs.test.ts` -- New test file for URL menu items + buildMenuItems
 
 ### Modified Files
 - `src/components/TerminalView.tsx` -- linkHandler hover/leave, URL link provider, left-click behavior change, data attribute, wrapperRef
 - `src/components/context-menu/context-menu-types.ts` -- Add hoveredUrl to terminal target
-- `src/components/context-menu/context-menu-constants.ts` -- No changes needed (Terminal context ID already exists)
 - `src/components/context-menu/context-menu-utils.ts` -- Parse hoveredUrl from dataset
 - `src/components/context-menu/menu-defs.ts` -- URL menu items, new MenuActions (4 new action signatures)
 - `src/components/context-menu/ContextMenuProvider.tsx` -- New action implementations + useMemo dependency array update
 - `test/unit/client/components/TerminalView.linkWarning.test.tsx` -- Update assertions for splitPane instead of window.open
 - `test/unit/client/components/TerminalView.keyboard.test.tsx` -- Update registerLinkProvider mock to handle two providers
-- `test/unit/client/components/context-menu/menu-defs.test.ts` -- Add URL menu item tests + new mock actions
 
 ### Unchanged
 - `src/store/panesSlice.ts` -- Already has splitPane with browser content support
