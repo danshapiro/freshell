@@ -132,11 +132,11 @@ function createStore(settingsOverride?: Partial<AppSettings>) {
   })
 }
 
-function activateLinkHandler(uri: string) {
+function activateLinkHandler(uri: string, button = 0) {
   const term = terminalInstances[terminalInstances.length - 1]
   const handler = term.options.linkHandler as { activate: (event: MouseEvent, uri: string) => void }
   act(() => {
-    handler.activate(new MouseEvent('click'), uri)
+    handler.activate(new MouseEvent('click', { button }), uri)
   })
 }
 
@@ -266,5 +266,42 @@ describe('TerminalView link warning', () => {
     })
     expect(windowOpenSpy).not.toHaveBeenCalled()
     expect(screen.queryByText('Open external link?')).not.toBeInTheDocument()
+  })
+
+  it('does not activate link on right-click', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    activateLinkHandler('https://example.com', 2)
+
+    expect(screen.queryByText('Open external link?')).not.toBeInTheDocument()
+    expect(windowOpenSpy).not.toHaveBeenCalled()
+  })
+
+  it('does not activate link on middle-click', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    activateLinkHandler('https://example.com', 1)
+
+    expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 })
