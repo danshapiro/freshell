@@ -68,7 +68,7 @@ import { cn } from '@/lib/utils'
 import { Terminal } from '@xterm/xterm'
 import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
-import type { PaneContent, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
+import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
 import '@xterm/xterm/css/xterm.css'
 import { createLogger } from '@/lib/client-logger'
 
@@ -982,7 +982,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     event.stopPropagation()
   }, [])
 
-  const queuePaneSplit = useCallback((newContent: PaneContent) => {
+  const queuePaneSplit = useCallback((newContent: PaneContentInput) => {
     deferTerminalPointerMutation(() => {
       dispatch(splitPane({
         tabId,
