@@ -7,7 +7,7 @@ export type ContextTarget =
   | { kind: 'tab-add' }
   | { kind: 'pane'; tabId: string; paneId: string }
   | { kind: 'pane-divider'; tabId: string; splitId: string }
-  | { kind: 'terminal'; tabId: string; paneId: string }
+  | { kind: 'terminal'; tabId: string; paneId: string; hoveredUrl?: string }
   | { kind: 'browser'; tabId: string; paneId: string }
   | { kind: 'editor'; tabId: string; paneId: string }
   | { kind: 'pane-picker'; tabId: string; paneId: string }
