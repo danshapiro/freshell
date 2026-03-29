@@ -17,6 +17,42 @@
 - **Native file-picker exclusion:** Files opened via `window.showOpenFilePicker()` use a `FileSystemFileHandle` for saves. These handles are browser-local and cannot be resolved by the server. The `filePath` in those panes is only `handle.name` (a basename), not an absolute path. The polling guard checks `fileHandleRef.current` — if set, skip polling entirely. Auto-save via `createWritable()` does not produce a server mtime, so there is no mtime to track.
 - **What's out of scope:** Binary file detection, encoding handling, status bar, word wrap toggle, file tree, new-file action, save-as, keyboard shortcuts. This plan is strictly about sync awareness.
 
+## Fresheyes Errata
+
+Three rounds of independent review produced these fixes. The implementer MUST apply all of them; they are not optional suggestions — they are correctness requirements:
+
+### FE1: Cancel auto-save timer immediately on conflict detection
+
+When the poll detects an external change and the buffer is dirty, the pending auto-save timer MUST be canceled BEFORE setting `conflictState`. Without this, the 5s timer callback will fire, write the local buffer to disk, and overwrite the external change the user hasn't seen yet.
+
+### FE2: Silent-reload race guard — re-check buffer cleanliness after async read
+
+After the async `api.get('/read')` returns, the poller MUST re-check `pendingContent.current === lastSavedContent.current` before applying the disk content. If the user typed during the await, show the conflict banner instead. Snapshot `wasClean` before the read and check `stillClean` after.
+
+### FE3: All test mocks must `.text()` method
+
+`api.ts` (`src/lib/api.ts`) reads `res.text()` first then `JSON.parse(text)`. Every mock response in every test MUST include both `.text()` and `.json()`. Mocks that only have `.json()` will fail with `res.text is not a function`.
+
+### FE4: Seed `lastSavedContent` from initial `content` prop
+
+`lastKnownMtime` starts as `null`. For panes mounted with `filePath` and `content` (restored from localStorage), the the first stat poll sees `null → any mtime` and always detects a "change." Fix: initialize `lastSavedContent.current = content` on mount (already done via `useRef`), AND add a `lastKnownMtime.current = 'initial'` sentinel. The sentinel means "first poll should always proceed" — if the file hasn't changed, the read returns the same content and the sentinel gets replaced with the real mtime. If it has changed, the reload is correct (stale content was loaded).
+
+### FE5: `handleKeepLocal` must NOT update `lastSavedContent`
+
+`handleKeepLocal` only updates `lastKnownMtime` (not `lastSavedContent`). The buffer remains dirty — the user kept local edits that were NOT saved to disk. If `lastSavedContent` were updated to `pendingContent.current`, the subsequent external change would be treated as a clean buffer and silently overwritten. Both `handleReloadFromDisk` and `handleKeepLocal` MUST cancel `autoSaveTimer.current` (clear timeout + set ref to null) BEFORE updating refs, Timer cancellation must happen before ref updates to prevent the stale callback from running with new ref values.
+
+### FE6: Keep Mine must reschedule auto-save after dismissal
+
+After `handleKeepLocal` dismisses the banner, the user's dirty edits have no path to disk. The auto-save debounce should be re-triggered (call `scheduleAutoSave(pendingContent.current)`) so that the local edits eventually reach disk. Without this, edits sit dirty forever.
+
+### FE7: New tests must be inside existing `describe` block
+
+The new stat-polling tests in Task 3 reference `store` from the enclosing `describe('EditorPane auto-save', ...)` scope. Either: (a) add them inside that block, or (b) create the `store` inside the new block too. The plan should specify which.
+
+### FE8: Add a test for native file-picker exclusion
+
+Add a test that opens a file via `showOpenFilePicker()` (mocked), verifies `fileHandleRef.current` is the set, confirms no stat polling occurs.
+
 ## Guardrails
 
 - Do NOT modify the existing auto-save debounce timing (5s) or behavior.
