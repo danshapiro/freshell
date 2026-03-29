@@ -97,20 +97,7 @@ linkHandler: {
 
 Note: The `leave` callback ignores all parameters. TypeScript allows fewer params than the signature requires, so `() => void` is valid for `(event, text, range) => void`.
 
-3. Update the custom file path link provider's `ILink` objects to also set `hover`/`leave`:
-
-```ts
-callback(matches.map((m) => ({
-  range: { ... },
-  text: m.path,
-  activate: () => { ... },
-  hover: () => {
-    // File paths are not URLs -- do not set hoveredUrl.
-    // They already open in editor panes and don't need context menu URL items.
-  },
-  leave: () => {},
-})))
-```
+3. The existing file path link provider's `ILink` objects do not need `hover`/`leave` callbacks. File paths are not URLs, and they already open in editor panes. Leave them unchanged -- do **not** add empty hover/leave stubs.
 
 4. Add a URL link provider via `registerLinkProvider` to detect plain-text URLs in terminal output (non-OSC-8). This ensures URLs that are visually styled but not wrapped in OSC 8 sequences are also clickable. **Register this BEFORE the file path provider** (currently at line 1044 in TerminalView.tsx) so file paths get higher priority (xterm.js: last registered = highest priority):
 
@@ -222,6 +209,8 @@ const wrapperRef = useRef<HTMLDivElement | null>(null)
   data-tab-id={tabId}
 >
 ```
+
+**Timing note**: The hover/leave callbacks reference `wrapperRef.current`, but are defined inside the terminal creation `useEffect` (line 976, dependency `[isTerminal]`). This is safe because `wrapperRef.current` is set during the initial render (before any user interaction can trigger hover events), and the callbacks only execute when the user hovers a link.
 
 2. In the hover/leave callbacks (both in the `linkHandler` and in the URL link provider), also update the DOM attribute:
 
@@ -365,7 +354,9 @@ const copyUrlAction = useCallback(async (url: string) => {
 }, [])
 ```
 
-Wire these into the `actions` object in the `useMemo` for `menuItems` (at approx line 900 in ContextMenuProvider.tsx). Also add them to the `useMemo` dependency array (at approx line 965-1019). The new actions should also be added to the `MenuActions` type in `menu-defs.ts`.
+Define these as `useCallback` hooks alongside the existing action callbacks (before line 886). Then wire them into the `actions` object inside the `useMemo` at line 900 (add them after `copyAgentChatFilePath`). Also add them to the `useMemo` dependency array at lines 965-1019. The new action signatures should also be added to the `MenuActions` type in `menu-defs.ts`.
+
+Note: `copyText`, `nanoid`, `addTab`, `initLayout`, and `splitPaneAction` are all already imported in ContextMenuProvider.tsx -- no new imports needed for the action implementations.
 
 ### Phase 3: Update Existing Tests
 
@@ -405,6 +396,7 @@ Test `findUrls`:
 - Handles multiple URLs per line
 - Does not match non-URL text
 - Edge cases: URLs at end of line, URLs with query strings, URLs with fragments
+- Edge case: URLs with balanced parentheses (e.g., Wikipedia URLs like `https://en.wikipedia.org/wiki/Foo_(bar)`) -- the trailing punctuation stripper may over-trim. Decide whether to handle balanced parens or accept this limitation. A simple approach: only strip a trailing `)` if there is no matching `(` in the URL.
 
 **File: `test/unit/client/components/TerminalView.urlClick.test.tsx`** (new)
 
@@ -415,7 +407,9 @@ Test the left-click behavior:
 
 **File: `test/unit/client/components/context-menu/menu-defs.test.ts`** (update existing -- this is the canonical test file using `@/` imports)
 
-Note: There is also a stale `test/unit/client/context-menu/menu-defs.test.ts` with outdated function names (`copyFreshclaude*` instead of `copyAgentChat*`). Use the `test/unit/client/components/context-menu/` version. The mock `createMockActions()` function needs the 4 new actions added: `openUrlInPane`, `openUrlInTab`, `openUrlInBrowser`, `copyUrl`.
+Note: There is also a stale `test/unit/client/context-menu/menu-defs.test.ts` with outdated function names (`copyFreshclaude*` instead of `copyAgentChat*`). Use the `test/unit/client/components/context-menu/` version.
+
+**Important pre-existing issue:** The `createMockActions()` function in this test file is already missing 6 actions that exist in the current `MenuActions` type: `refreshTab`, `reopenClosedTab`, `refreshPane`, `replacePane`, `generateSessionTitle`, `showKeyboardShortcuts`. These were added after the test was written. When adding the 4 new URL actions (`openUrlInPane`, `openUrlInTab`, `openUrlInBrowser`, `copyUrl`), also add the 6 missing pre-existing actions to bring the mock fully in sync with the `MenuActions` type. The `createMockContext()` is also missing the `aiEnabled` field (should be `aiEnabled: false`).
 
 Add tests for the terminal context target with `hoveredUrl`:
 - When `hoveredUrl` is set, URL-specific menu items appear at the top
@@ -438,12 +432,14 @@ Test that `parseContextTarget` for Terminal correctly extracts `hoveredUrl` from
 
 5. **Data attribute cleanup on leave**: The `leave` callback must always clear the `data-hovered-url` attribute. If the user right-clicks while hovering a link and then moves the mouse away before the context menu renders, the attribute should already be set at the time of the `contextmenu` event because `leave` fires after the mouse moves off the link, not when the context menu opens.
 
-### Phase 6: Refactor
+### Phase 6: Refactor and Polish
 
 After all tests pass, evaluate:
 - Whether `terminal-hovered-url.ts` should be merged into `pane-action-registry.ts` or kept separate
 - Whether the URL link provider logic should be extracted into its own file (similar to how file path links use `findLocalFilePaths` from `path-utils.ts`)
 - Whether the `findUrls` utility belongs in `path-utils.ts` or its own file
+
+**Update `docs/index.html`**: Per repo rules, update the docs mock to reflect the new clickable URL feature (URL context menu items in terminal panes). This is a significant user-facing UX change.
 
 ---
 
