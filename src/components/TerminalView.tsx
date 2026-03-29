@@ -101,11 +101,7 @@ function deferTerminalPointerMutation(callback: () => void): void {
   // xterm link activation runs inside element-level mouse handlers while it may
   // still have document-level mouseup/move listeners in flight. Reparenting the
   // terminal synchronously can dispose the renderer before those listeners finish.
-  if (typeof queueMicrotask === 'function') {
-    queueMicrotask(callback)
-    return
-  }
-  void Promise.resolve().then(callback)
+  queueMicrotask(callback)
 }
 
 function createNoopRuntime(): TerminalRuntime {
@@ -2213,7 +2209,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         confirmLabel="Open link"
         onConfirm={() => {
           if (pendingLinkUri) {
-            queuePaneSplit({ kind: 'browser', url: pendingLinkUri, devToolsOpen: false })
+            dispatch(splitPane({
+              tabId,
+              paneId,
+              direction: 'horizontal',
+              newContent: { kind: 'browser', url: pendingLinkUri, devToolsOpen: false },
+            }))
           }
           setPendingLinkUri(null)
         }}
