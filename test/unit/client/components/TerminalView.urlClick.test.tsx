@@ -199,14 +199,18 @@ describe('TerminalView URL click behavior', () => {
       handler.activate(new MouseEvent('click'), 'https://example.com')
     })
 
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout.type).toBe('split')
-    if (layout.type === 'split') {
-      expect(layout.children[1]).toMatchObject({
-        type: 'leaf',
-        content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false },
-      })
-    }
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      if (layout.type === 'split') {
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false },
+        })
+      }
+    })
     expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 
@@ -331,14 +335,18 @@ describe('TerminalView URL click behavior', () => {
       links![0].activate(new MouseEvent('click'))
     })
 
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout.type).toBe('split')
-    if (layout.type === 'split') {
-      expect(layout.children[1]).toMatchObject({
-        type: 'leaf',
-        content: { kind: 'browser', url: 'https://detected.example.com', devToolsOpen: false },
-      })
-    }
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      if (layout.type === 'split') {
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: { kind: 'browser', url: 'https://detected.example.com', devToolsOpen: false },
+        })
+      }
+    })
   })
 
   it('URL link provider hover sets hovered URL in module and data attribute', async () => {
@@ -571,8 +579,12 @@ describe('TerminalView URL click behavior', () => {
       handler.activate(new MouseEvent('click'), 'https://safe.example.com')
     })
 
-    const layout = store.getState().panes.layouts['tab-1']
-    expect(layout.type).toBe('split')
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+    })
     expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 

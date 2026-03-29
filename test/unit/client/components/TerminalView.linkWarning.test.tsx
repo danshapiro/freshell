@@ -254,6 +254,8 @@ describe('TerminalView link warning', () => {
 
     activateLinkHandler('https://trusted.example.com')
 
+    expect(store.getState().panes.layouts['tab-1'].type).toBe('leaf')
+
     await waitFor(() => {
       const layout = store.getState().panes.layouts['tab-1']
       expect(layout.type).toBe('split')
