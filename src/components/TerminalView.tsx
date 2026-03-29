@@ -1264,13 +1264,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     })
     ro.observe(containerRef.current)
 
+    const wrapperEl = wrapperRef.current
     return () => {
       requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       urlLinkDisposable?.dispose()
       clearHoveredUrl(paneId)
-      if (wrapperRef.current) {
-        delete wrapperRef.current.dataset.hoveredUrl
+      if (wrapperEl) {
+        delete wrapperEl.dataset.hoveredUrl
       }
       ro.disconnect()
       unregisterActions()

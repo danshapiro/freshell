@@ -5,7 +5,7 @@ export type UrlMatch = {
 }
 
 export function findUrls(line: string): UrlMatch[] {
-  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`\[\]]+/g
+  const urlRegex = /https?:\/\/[^\s<>"{}|\\^`[\]]+/g
   const results: UrlMatch[] = []
   let match
   while ((match = urlRegex.exec(line)) !== null) {
