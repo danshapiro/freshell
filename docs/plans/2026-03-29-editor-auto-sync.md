@@ -190,6 +190,11 @@ vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
   if (urlStr.includes('/api/files/stat')) {
     return Promise.resolve({
       ok: true,
+      text: () => Promise.resolve(JSON.stringify({
+        exists: true,
+        size: 100,
+        modifiedAt: '2026-01-01T00:00:00.000Z',
+      })),
       json: () => Promise.resolve({
         exists: true,
         size: 100,
@@ -801,16 +806,18 @@ useEffect(() => {
       if (!statResult.exists || !statResult.modifiedAt) return
       if (statResult.modifiedAt === lastKnownMtime.current) return
 
-      if (pendingContent.current === lastSavedContent.current) {
-        const response = await api.get<{
-          content: string
-          language?: string
-          filePath?: string
-          modifiedAt?: string
-        }>(`/api/files/read?path=${encodeURIComponent(resolved)}`)
+      const wasClean = pendingContent.current === lastSavedContent.current
+      const response = await api.get<{
+        content: string
+        language?: string
+        filePath?: string
+        modifiedAt?: string
+      }>(`/api/files/read?path=${encodeURIComponent(resolved)}`)
 
-        if (!mountedRef.current) return
+      if (!mountedRef.current) return
 
+      const stillClean = pendingContent.current === lastSavedContent.current
+      if (wasClean && stillClean) {
         setEditorValue(response.content)
         pendingContent.current = response.content
         lastSavedContent.current = response.content
@@ -820,16 +827,9 @@ useEffect(() => {
           content: response.content,
         })
       } else {
-        const response = await api.get<{
-          content: string
-          modifiedAt?: string
-        }>(`/api/files/read?path=${encodeURIComponent(resolved)}`)
-
-        if (!mountedRef.current) return
-
         setConflictState({
           diskContent: response.content,
-          diskMtime: response.modifiedAt || statResult.modifiedAt,
+          diskMtime: response.modifiedAt || statResult.modifiedAt!
         })
       }
     } catch (err) {
@@ -876,6 +876,10 @@ const handleReloadFromDisk = useCallback(() => {
 
 const handleKeepLocal = useCallback(() => {
   if (!conflictState) return
+  if (autoSaveTimer.current) {
+    clearTimeout(autoSaveTimer.current)
+    autoSaveTimer.current = null
+  }
   lastKnownMtime.current = conflictState.diskMtime
   setConflictState(null)
 }, [conflictState])
