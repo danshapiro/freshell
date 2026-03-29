@@ -38,6 +38,8 @@ import {
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
+import { findUrls } from '@/lib/url-utils'
+import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
 import { getTabSwitchShortcutDirection, getTabLifecycleAction } from '@/lib/tab-switch-shortcuts'
 import {
   createTurnCompleteSignalParserState,
@@ -229,6 +231,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const mobileCtrlActiveRef = useRef(false)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
+  const wrapperRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const runtimeRef = useRef<TerminalRuntime | null>(null)
   const writeQueueRef = useRef<TerminalWriteQueue | null>(null)
@@ -403,7 +406,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   useEffect(() => {
     hiddenRef.current = hidden
-  }, [hidden])
+    if (hidden) {
+      clearHoveredUrl(paneId)
+      if (wrapperRef.current) {
+        delete wrapperRef.current.dataset.hoveredUrl
+      }
+    }
+  }, [hidden, paneId])
 
   useEffect(() => {
     warnExternalLinksRef.current = settings.terminal.warnExternalLinks
@@ -1002,7 +1011,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {
-            window.open(uri, '_blank', 'noopener,noreferrer')
+            dispatch(splitPane({
+              tabId,
+              paneId,
+              direction: 'horizontal',
+              newContent: { kind: 'browser', url: uri, devToolsOpen: false },
+            }))
+          }
+        },
+        hover: (_event: MouseEvent, text: string, _range: import('@xterm/xterm').IBufferRange) => {
+          setHoveredUrl(paneId, text)
+          if (wrapperRef.current) {
+            wrapperRef.current.dataset.hoveredUrl = text
+          }
+        },
+        leave: () => {
+          clearHoveredUrl(paneId)
+          if (wrapperRef.current) {
+            delete wrapperRef.current.dataset.hoveredUrl
           }
         },
       },
@@ -1069,6 +1095,50 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
                   viewMode: 'source',
                 },
               }))
+            },
+          })))
+        },
+      })
+      : { dispose: () => {} }
+
+    // Register custom link provider for clickable URLs in terminal output
+    const urlLinkDisposable = typeof term.registerLinkProvider === 'function'
+      ? term.registerLinkProvider({
+        provideLinks(bufferLineNumber: number, callback: (links: import('@xterm/xterm').ILink[] | undefined) => void) {
+          const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1)
+          if (!bufferLine) { callback(undefined); return }
+          const text = bufferLine.translateToString()
+          const urls = findUrls(text)
+          if (urls.length === 0) { callback(undefined); return }
+          callback(urls.map((m) => ({
+            range: {
+              start: { x: m.startIndex + 1, y: bufferLineNumber },
+              end: { x: m.endIndex, y: bufferLineNumber },
+            },
+            text: m.url,
+            activate: (_event: MouseEvent) => {
+              if (warnExternalLinksRef.current !== false) {
+                setPendingLinkUriRef.current(m.url)
+              } else {
+                dispatch(splitPane({
+                  tabId,
+                  paneId,
+                  direction: 'horizontal',
+                  newContent: { kind: 'browser', url: m.url, devToolsOpen: false },
+                }))
+              }
+            },
+            hover: () => {
+              setHoveredUrl(paneId, m.url)
+              if (wrapperRef.current) {
+                wrapperRef.current.dataset.hoveredUrl = m.url
+              }
+            },
+            leave: () => {
+              clearHoveredUrl(paneId)
+              if (wrapperRef.current) {
+                delete wrapperRef.current.dataset.hoveredUrl
+              }
             },
           })))
         },
@@ -1197,6 +1267,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return () => {
       requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
+      urlLinkDisposable?.dispose()
+      clearHoveredUrl(paneId)
+      if (wrapperRef.current) {
+        delete wrapperRef.current.dataset.hoveredUrl
+      }
       ro.disconnect()
       unregisterActions()
       unregisterCaptureHandler()
@@ -2001,6 +2076,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   return (
     <div
+      ref={wrapperRef}
       className={cn('h-full w-full', hidden ? 'tab-hidden' : 'tab-visible relative')}
       data-context={ContextIds.Terminal}
       data-pane-id={paneId}
@@ -2120,7 +2196,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         confirmLabel="Open link"
         onConfirm={() => {
           if (pendingLinkUri) {
-            window.open(pendingLinkUri, '_blank', 'noopener,noreferrer')
+            dispatch(splitPane({
+              tabId,
+              paneId,
+              direction: 'horizontal',
+              newContent: { kind: 'browser', url: pendingLinkUri, devToolsOpen: false },
+            }))
           }
           setPendingLinkUri(null)
         }}

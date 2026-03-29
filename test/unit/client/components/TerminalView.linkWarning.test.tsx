@@ -199,8 +199,16 @@ describe('TerminalView link warning', () => {
     fireEvent.click(screen.getByText('Open link'))
 
     await waitFor(() => {
-      expect(windowOpenSpy).toHaveBeenCalledWith('https://example.com/page', '_blank', 'noopener,noreferrer')
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      if (layout.type === 'split') {
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: { kind: 'browser', url: 'https://example.com/page', devToolsOpen: false },
+        })
+      }
     })
+    expect(windowOpenSpy).not.toHaveBeenCalled()
     expect(screen.queryByText('Open external link?')).not.toBeInTheDocument()
   })
 
@@ -247,8 +255,16 @@ describe('TerminalView link warning', () => {
     activateLinkHandler('https://trusted.example.com')
 
     await waitFor(() => {
-      expect(windowOpenSpy).toHaveBeenCalledWith('https://trusted.example.com', '_blank', 'noopener,noreferrer')
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      if (layout.type === 'split') {
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: { kind: 'browser', url: 'https://trusted.example.com', devToolsOpen: false },
+        })
+      }
     })
+    expect(windowOpenSpy).not.toHaveBeenCalled()
     expect(screen.queryByText('Open external link?')).not.toBeInTheDocument()
   })
 })
