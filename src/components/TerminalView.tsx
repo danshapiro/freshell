@@ -1008,6 +1008,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
       linkHandler: {
         activate: (_event: MouseEvent, uri: string) => {
+          // Only open http/https URLs in browser panes. Reject javascript:,
+          // data:, and other potentially dangerous schemes from OSC 8 links.
+          if (!/^https?:\/\//i.test(uri)) {
+            window.open(uri, '_blank', 'noopener,noreferrer')
+            return
+          }
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {

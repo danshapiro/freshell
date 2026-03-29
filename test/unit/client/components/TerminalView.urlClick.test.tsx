@@ -517,6 +517,65 @@ describe('TerminalView URL click behavior', () => {
     expect(getHoveredUrl('pane-1')).toBeUndefined()
   })
 
+  it('OSC 8 linkHandler.activate with non-http scheme does not open browser pane', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const handler = getLinkHandler()
+
+    // javascript: URI should NOT open a browser pane
+    act(() => {
+      handler.activate(new MouseEvent('click'), 'javascript:alert(1)')
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout.type).toBe('leaf')
+    expect(windowOpenSpy).toHaveBeenCalledWith('javascript:alert(1)', '_blank', 'noopener,noreferrer')
+
+    windowOpenSpy.mockClear()
+
+    // data: URI should NOT open a browser pane
+    act(() => {
+      handler.activate(new MouseEvent('click'), 'data:text/html,<h1>hi</h1>')
+    })
+
+    const layout2 = store.getState().panes.layouts['tab-1']
+    expect(layout2.type).toBe('leaf')
+    expect(windowOpenSpy).toHaveBeenCalledWith('data:text/html,<h1>hi</h1>', '_blank', 'noopener,noreferrer')
+  })
+
+  it('OSC 8 linkHandler.activate with https scheme opens browser pane normally', async () => {
+    const store = createStore({ terminal: { ...defaultSettings.terminal, warnExternalLinks: false } })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    const handler = getLinkHandler()
+    act(() => {
+      handler.activate(new MouseEvent('click'), 'https://safe.example.com')
+    })
+
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout.type).toBe('split')
+    expect(windowOpenSpy).not.toHaveBeenCalled()
+  })
+
   it('file path link provider is registered before URL link provider', async () => {
     const store = createStore()
 

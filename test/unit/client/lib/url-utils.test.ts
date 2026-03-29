@@ -120,4 +120,28 @@ describe('findUrls', () => {
     expect(results).toHaveLength(1)
     expect(results[0].url).toBe('https://example.com/path%20with%20spaces')
   })
+
+  it('preserves balanced parentheses in Wikipedia-style URLs', () => {
+    const results = findUrls('See https://en.wikipedia.org/wiki/Foo_(bar) for details')
+    expect(results).toHaveLength(1)
+    expect(results[0].url).toBe('https://en.wikipedia.org/wiki/Foo_(bar)')
+  })
+
+  it('preserves nested balanced parentheses', () => {
+    const results = findUrls('https://example.com/path_(a_(b))')
+    expect(results).toHaveLength(1)
+    expect(results[0].url).toBe('https://example.com/path_(a_(b))')
+  })
+
+  it('strips unbalanced trailing paren when URL has no open paren', () => {
+    const results = findUrls('(see https://example.com/page)')
+    expect(results).toHaveLength(1)
+    expect(results[0].url).toBe('https://example.com/page')
+  })
+
+  it('strips trailing punctuation after balanced parens', () => {
+    const results = findUrls('https://en.wikipedia.org/wiki/Foo_(bar).')
+    expect(results).toHaveLength(1)
+    expect(results[0].url).toBe('https://en.wikipedia.org/wiki/Foo_(bar)')
+  })
 })
