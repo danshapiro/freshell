@@ -969,5 +969,36 @@ describe('TerminalView keyboard handling', () => {
         },
       })
     })
+
+    it('does not activate file path link on right-click', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
+      })
+
+      let links: any[] | undefined
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
+        links = provided
+      })
+
+      expect(links).toBeDefined()
+      expect(links).toHaveLength(1)
+
+      const layoutBefore = store.getState().panes.layouts[tabId]
+      expect(layoutBefore.type).toBe('leaf')
+
+      links![0].activate(new MouseEvent('click', { button: 2 }))
+
+      const layoutAfter = store.getState().panes.layouts[tabId]
+      expect(layoutAfter.type).toBe('leaf')
+    })
   })
 })

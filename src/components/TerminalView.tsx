@@ -1007,7 +1007,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       theme: resolvedTheme,
       minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
       linkHandler: {
-        activate: (_event: MouseEvent, uri: string) => {
+        activate: (event: MouseEvent, uri: string) => {
+          if (event.button !== 0) return
           // Only open http/https URLs in browser panes. Reject javascript:,
           // data:, and other potentially dangerous schemes from OSC 8 links.
           if (!/^https?:\/\//i.test(uri)) {
@@ -1087,7 +1088,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               end: { x: m.endIndex, y: bufferLineNumber },
             },
             text: m.path,
-            activate: () => {
+            activate: (event: MouseEvent) => {
+              if (event && event.button !== 0) return
               dispatch(splitPane({
                 tabId,
                 paneId,
@@ -1122,7 +1124,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               end: { x: m.endIndex, y: bufferLineNumber },
             },
             text: m.url,
-            activate: (_event: MouseEvent) => {
+            activate: (event: MouseEvent) => {
+              if (event && event.button !== 0) return
               if (warnExternalLinksRef.current !== false) {
                 setPendingLinkUriRef.current(m.url)
               } else {
