@@ -25,9 +25,13 @@ Currently, the OSC 8 `linkHandler.activate` either shows a warning modal or call
 
 - **Hover state tracking via a module-level map** (not React state or Redux): The xterm.js `ILinkHandler.hover`/`leave` and `ILink.hover`/`leave` callbacks fire on raw DOM events, outside the React render cycle. We use a simple `Map<string, string>` keyed by paneId, storing the currently hovered URL. This avoids unnecessary re-renders and is synchronous to read at context-menu time.
 
+- **`ILinkHandler` vs `ILink` hover/leave signatures differ**: The `ILinkHandler` callbacks (OSC 8) receive `(event, text, range)` while `ILink` callbacks (custom link providers) receive `(event, text)`. Both are optional. Our implementations can safely ignore trailing params but should use the correct signature for each context to satisfy TypeScript.
+
 - **Context menu uses `dataset` attributes**: Following the existing pattern (e.g., `data-tab-id`, `data-pane-id`), we add `data-hovered-url` to the TerminalView wrapper div. The context menu system reads this from `dataset` when building menu items. This is the same pattern used by `data-context`, `data-tab-id`, etc.
 
 - **No new ContextTarget kind**: Rather than adding a new `terminal-url` kind, we enrich the existing `terminal` target with an optional `hoveredUrl` field. This is simpler and avoids splitting the terminal menu into two separate code paths. The `buildMenuItems` function checks for `hoveredUrl` in the dataset and conditionally prepends URL-specific items.
+
+- **New URL actions are separate from existing `splitPane` action in MenuActions**: The existing `actions.splitPane` in `ContextMenuProvider` always opens a picker pane (`{ kind: 'picker' }`). Our new `openUrlInPane` action dispatches `splitPaneAction` directly with browser content, bypassing the picker. This is intentional -- URL links should open directly in browser panes without a picker step.
 
 - **Left-click opens browser pane**: The `linkHandler.activate` callback dispatches `splitPane` with browser content, similar to how file path links dispatch `splitPane` with editor content. The warning modal is preserved as a setting but the default behavior changes from `window.open` to split-pane-browser.
 
@@ -80,14 +84,18 @@ linkHandler: {
       }))
     }
   },
-  hover: (_event: MouseEvent, text: string) => {
+  // ILinkHandler.hover signature: (event, text, range) -- range unused
+  hover: (_event: MouseEvent, text: string, _range: import('@xterm/xterm').IBufferRange) => {
     setHoveredUrl(paneId, text)
   },
+  // ILinkHandler.leave signature: (event, text, range) -- all unused
   leave: () => {
     clearHoveredUrl(paneId)
   },
 },
 ```
+
+Note: The `leave` callback ignores all parameters. TypeScript allows fewer params than the signature requires, so `() => void` is valid for `(event, text, range) => void`.
 
 3. Update the custom file path link provider's `ILink` objects to also set `hover`/`leave`:
 
@@ -104,7 +112,7 @@ callback(matches.map((m) => ({
 })))
 ```
 
-4. Add a URL link provider via `registerLinkProvider` to detect plain-text URLs in terminal output (non-OSC-8). This ensures URLs that are visually styled but not wrapped in OSC 8 sequences are also clickable:
+4. Add a URL link provider via `registerLinkProvider` to detect plain-text URLs in terminal output (non-OSC-8). This ensures URLs that are visually styled but not wrapped in OSC 8 sequences are also clickable. **Register this BEFORE the file path provider** (currently at line 1044 in TerminalView.tsx) so file paths get higher priority (xterm.js: last registered = highest priority):
 
 ```ts
 const urlLinkDisposable = typeof term.registerLinkProvider === 'function'
@@ -197,14 +205,29 @@ export function findUrls(line: string): UrlMatch[] {
 
 **File: `src/components/TerminalView.tsx`**
 
-Update the wrapper div to include the hovered URL in a data attribute. Since the hovered URL changes frequently (on mouse move) but we only need it at context-menu-open time, we use a ref-based approach to update a data attribute imperatively:
+Update the wrapper div to include the hovered URL in a data attribute. Since the hovered URL changes frequently (on mouse move) but we only need it at context-menu-open time, we use a ref-based approach to update a data attribute imperatively.
+
+1. Add a `wrapperRef` and attach it to the outer div (the one at approx line 2003 that currently has `data-context={ContextIds.Terminal}`, `data-pane-id={paneId}`, `data-tab-id={tabId}` but no ref):
 
 ```tsx
-// In the component body:
+// In the component body (near containerRef at line 231):
 const wrapperRef = useRef<HTMLDivElement | null>(null)
 
-// In the hover/leave callbacks, also update the DOM attribute:
-hover: (_event, text) => {
+// In the JSX, add ref to the outer div:
+<div
+  ref={wrapperRef}
+  className={cn('h-full w-full', hidden ? 'tab-hidden' : 'tab-visible relative')}
+  data-context={ContextIds.Terminal}
+  data-pane-id={paneId}
+  data-tab-id={tabId}
+>
+```
+
+2. In the hover/leave callbacks (both in the `linkHandler` and in the URL link provider), also update the DOM attribute:
+
+```tsx
+// For linkHandler hover/leave:
+hover: (_event, text, _range) => {
   setHoveredUrl(paneId, text)
   if (wrapperRef.current) {
     wrapperRef.current.dataset.hoveredUrl = text
@@ -216,9 +239,23 @@ leave: () => {
     delete wrapperRef.current.dataset.hoveredUrl
   }
 },
+
+// For URL link provider ILink hover/leave:
+hover: () => {
+  setHoveredUrl(paneId, m.url)
+  if (wrapperRef.current) {
+    wrapperRef.current.dataset.hoveredUrl = m.url
+  }
+},
+leave: () => {
+  clearHoveredUrl(paneId)
+  if (wrapperRef.current) {
+    delete wrapperRef.current.dataset.hoveredUrl
+  }
+},
 ```
 
-The wrapper div already has `data-context={ContextIds.Terminal}`, `data-pane-id`, `data-tab-id`. The `data-hovered-url` attribute will be picked up by the context menu system's `copyDataset` call.
+The `data-hovered-url` attribute will be picked up by the context menu system's `copyDataset` call, which copies all `dataset` properties from the nearest context element.
 
 **File: `src/components/context-menu/context-menu-types.ts`**
 
@@ -328,7 +365,7 @@ const copyUrlAction = useCallback(async (url: string) => {
 }, [])
 ```
 
-Wire these into the `actions` object in the `useMemo` for `menuItems`.
+Wire these into the `actions` object in the `useMemo` for `menuItems` (at approx line 900 in ContextMenuProvider.tsx). Also add them to the `useMemo` dependency array (at approx line 965-1019). The new actions should also be added to the `MenuActions` type in `menu-defs.ts`.
 
 ### Phase 3: Update Existing Tests
 
@@ -348,7 +385,7 @@ Update the assertions to check that `store.getState().panes.layouts['tab-1']` be
 
 **File: `test/unit/client/components/TerminalView.keyboard.test.tsx`**
 
-This file captures the `registerLinkProvider` callback. It may need updating if we change the link provider or add a new one.
+This file captures `registerLinkProvider` callbacks via `capturedLinkProvider`. Since we add a new URL link provider, `registerLinkProvider` will now be called twice (URL provider first, then file path provider). The mock at line 58-61 saves only the last provider registered. If any keyboard tests depend on the captured file path provider, verify they still capture the correct one. The URL provider registration means `registerLinkProvider.mock.calls` will have two entries. Adjust the `capturedLinkProvider` capture if needed (e.g., capture the last call or both calls).
 
 ### Phase 4: New Tests
 
@@ -376,26 +413,28 @@ Test the left-click behavior:
 - Clicking a URL with warnExternalLinks=false directly dispatches splitPane with browser content
 - Verify the browser pane content has the correct URL
 
-**File: `test/unit/client/context-menu/menu-defs.test.ts`** (update existing)
+**File: `test/unit/client/components/context-menu/menu-defs.test.ts`** (update existing -- this is the canonical test file using `@/` imports)
+
+Note: There is also a stale `test/unit/client/context-menu/menu-defs.test.ts` with outdated function names (`copyFreshclaude*` instead of `copyAgentChat*`). Use the `test/unit/client/components/context-menu/` version. The mock `createMockActions()` function needs the 4 new actions added: `openUrlInPane`, `openUrlInTab`, `openUrlInBrowser`, `copyUrl`.
 
 Add tests for the terminal context target with `hoveredUrl`:
 - When `hoveredUrl` is set, URL-specific menu items appear at the top
 - When `hoveredUrl` is not set, no URL items appear
 - Each URL menu item calls the correct action with the correct URL
 
-**File: `test/unit/client/components/context-menu/context-menu-utils.test.ts`** (update or create)
+**File: `test/unit/client/components/context-menu/context-menu-utils.test.ts`** (new -- no existing test for this util)
 
 Test that `parseContextTarget` for Terminal correctly extracts `hoveredUrl` from dataset.
 
 ### Phase 5: Hover State Cleanup and Edge Cases
 
-1. **Terminal dispose cleanup**: When the terminal is disposed (component unmount), `clearHoveredUrl(paneId)` must be called. Add this to the existing cleanup function in TerminalView.
+1. **Terminal dispose cleanup**: When the terminal is disposed (component unmount), `clearHoveredUrl(paneId)` must be called AND `delete wrapperRef.current.dataset.hoveredUrl` must be called. Add both to the existing cleanup function in TerminalView (approx line 1197, inside the `return () => { ... }` block). Also dispose the new URL link provider disposable.
 
-2. **Tab switch / hidden state**: When a terminal tab becomes hidden, the hover state should be cleared (the mouse is no longer over it). The existing `hidden` prop handling is a good place for this.
+2. **Tab switch / hidden state**: When a terminal tab becomes hidden, the hover state should be cleared (the mouse is no longer over it). The existing `hiddenRef.current = hidden` effect (line 404-406) is a good place to add `clearHoveredUrl(paneId)` when `hidden` becomes true.
 
 3. **Multiple terminals**: Each terminal pane has its own paneId, so hover states are independent. The context menu reads from the correct pane's wrapper div.
 
-4. **OSC 8 vs custom link provider priority**: xterm.js checks OSC 8 links first, then registered link providers in reverse order. Our custom URL link provider should be registered before the file path provider so file paths take priority. However, the URL regex should not match file paths (no `http://` prefix), so overlap is unlikely. Register the URL provider first (lower priority), then file paths (higher priority).
+4. **OSC 8 vs custom link provider priority**: xterm.js checks OSC 8 links first, then registered link providers in reverse order (last registered = highest priority). Our custom URL link provider should be registered BEFORE the file path provider (currently at line 1044) so file paths get higher priority. However, the URL regex should not match file paths (no `http://` prefix), so overlap is unlikely. Concretely: insert the URL provider registration between `term.open(containerRef.current)` (line 1040) and the file path provider (line 1044).
 
 5. **Data attribute cleanup on leave**: The `leave` callback must always clear the `data-hovered-url` attribute. If the user right-clicks while hovering a link and then moves the mouse away before the context menu renders, the attribute should already be set at the time of the `contextmenu` event because `leave` fires after the mouse moves off the link, not when the context menu opens.
 
@@ -416,17 +455,18 @@ After all tests pass, evaluate:
 - `test/unit/client/lib/terminal-hovered-url.test.ts`
 - `test/unit/client/lib/url-utils.test.ts`
 - `test/unit/client/components/TerminalView.urlClick.test.tsx`
+- `test/unit/client/components/context-menu/context-menu-utils.test.ts`
 
 ### Modified Files
-- `src/components/TerminalView.tsx` -- linkHandler hover/leave, URL link provider, left-click behavior change, data attribute
+- `src/components/TerminalView.tsx` -- linkHandler hover/leave, URL link provider, left-click behavior change, data attribute, wrapperRef
 - `src/components/context-menu/context-menu-types.ts` -- Add hoveredUrl to terminal target
 - `src/components/context-menu/context-menu-constants.ts` -- No changes needed (Terminal context ID already exists)
 - `src/components/context-menu/context-menu-utils.ts` -- Parse hoveredUrl from dataset
-- `src/components/context-menu/menu-defs.ts` -- URL menu items, new MenuActions
-- `src/components/context-menu/ContextMenuProvider.tsx` -- New action implementations
+- `src/components/context-menu/menu-defs.ts` -- URL menu items, new MenuActions (4 new action signatures)
+- `src/components/context-menu/ContextMenuProvider.tsx` -- New action implementations + useMemo dependency array update
 - `test/unit/client/components/TerminalView.linkWarning.test.tsx` -- Update assertions for splitPane instead of window.open
-- `test/unit/client/components/TerminalView.keyboard.test.tsx` -- May need link provider updates
-- `test/unit/client/context-menu/menu-defs.test.ts` -- Add URL menu item tests
+- `test/unit/client/components/TerminalView.keyboard.test.tsx` -- Update registerLinkProvider mock to handle two providers
+- `test/unit/client/components/context-menu/menu-defs.test.ts` -- Add URL menu item tests + new mock actions
 
 ### Unchanged
 - `src/store/panesSlice.ts` -- Already has splitPane with browser content support
