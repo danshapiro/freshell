@@ -887,6 +887,8 @@ const handleKeepLocal = useCallback(() => {
 
 Note: `handleKeepLocal` only updates `lastKnownMtime`, NOT `lastSavedContent`. The buffer remains dirty — the user chose to keep local edits that have not been saved to disk. If another external change occurs, the conflict banner will re-appear.
 
+Both handlers cancel the pending auto-save timer **before** updating any refs. JavaScript's `clearTimeout` is synchronous, so the timer callback is guaranteed to be removed from the macrotask queue before any state updates happen. This prevents a stale save from racing with the resolution.
+
 ### 3g. Add conflict banner UI
 
 In the JSX, after the `filePickerMessage` div and before the editor/preview container div, add:
