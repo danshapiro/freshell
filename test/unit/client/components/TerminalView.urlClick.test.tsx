@@ -486,6 +486,37 @@ describe('TerminalView URL click behavior', () => {
     expect(getHoveredUrl('pane-1')).toBeUndefined()
   })
 
+  it('hover state is cleared when terminal tab becomes hidden', async () => {
+    const store = createStore()
+
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(1)
+    })
+
+    // Set hovered URL via hover callback
+    const handler = getLinkHandler()
+    const mockRange = { start: { x: 1, y: 1 }, end: { x: 20, y: 1 } }
+    act(() => {
+      handler.hover!(new MouseEvent('mouseover'), 'https://hovered.example.com', mockRange)
+    })
+    expect(getHoveredUrl('pane-1')).toBe('https://hovered.example.com')
+
+    // Re-render with hidden=true
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={true} />
+      </Provider>
+    )
+
+    expect(getHoveredUrl('pane-1')).toBeUndefined()
+  })
+
   it('file path link provider is registered before URL link provider', async () => {
     const store = createStore()
 
