@@ -97,6 +97,13 @@ function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): numbe
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
 }
 
+function deferTerminalPointerMutation(callback: () => void): void {
+  // xterm link activation runs inside element-level mouse handlers while it may
+  // still have document-level mouseup/move listeners in flight. Reparenting the
+  // terminal synchronously can dispose the renderer before those listeners finish.
+  queueMicrotask(callback)
+}
+
 function createNoopRuntime(): TerminalRuntime {
   return {
     attachAddons: () => {},
@@ -975,6 +982,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     event.stopPropagation()
   }, [])
 
+  const queuePaneSplit = useCallback((newContent: PaneContent) => {
+    deferTerminalPointerMutation(() => {
+      dispatch(splitPane({
+        tabId,
+        paneId,
+        direction: 'horizontal',
+        newContent,
+      }))
+    })
+  }, [dispatch, paneId, tabId])
+
   useEffect(() => {
     return () => {
       clearMobileToolbarRepeat()
@@ -1018,12 +1036,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {
-            dispatch(splitPane({
-              tabId,
-              paneId,
-              direction: 'horizontal',
-              newContent: { kind: 'browser', url: uri, devToolsOpen: false },
-            }))
+            queuePaneSplit({ kind: 'browser', url: uri, devToolsOpen: false })
           }
         },
         hover: (_event: MouseEvent, text: string, _range: import('@xterm/xterm').IBufferRange) => {
@@ -1090,19 +1103,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             text: m.path,
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
-              dispatch(splitPane({
-                tabId,
-                paneId,
-                direction: 'horizontal',
-                newContent: {
-                  kind: 'editor',
-                  filePath: m.path,
-                  language: null,
-                  readOnly: false,
-                  content: '',
-                  viewMode: 'source',
-                },
-              }))
+              queuePaneSplit({
+                kind: 'editor',
+                filePath: m.path,
+                language: null,
+                readOnly: false,
+                content: '',
+                viewMode: 'source',
+              })
             },
           })))
         },
@@ -1129,12 +1137,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               if (warnExternalLinksRef.current !== false) {
                 setPendingLinkUriRef.current(m.url)
               } else {
-                dispatch(splitPane({
-                  tabId,
-                  paneId,
-                  direction: 'horizontal',
-                  newContent: { kind: 'browser', url: m.url, devToolsOpen: false },
-                }))
+                queuePaneSplit({ kind: 'browser', url: m.url, devToolsOpen: false })
               }
             },
             hover: () => {

@@ -879,27 +879,31 @@ describe('TerminalView keyboard handling', () => {
 
       links![0].activate()
 
-      const state = store.getState()
-      expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.activeTabId).toBe(tabId)
+      expect(store.getState().panes.layouts[tabId].type).toBe('leaf')
 
-      const layout = state.panes.layouts[tabId]
-      expect(layout.type).toBe('split')
-      if (layout.type !== 'split') {
-        throw new Error('expected split layout')
-      }
+      await waitFor(() => {
+        const state = store.getState()
+        expect(state.tabs.tabs).toHaveLength(1)
+        expect(state.tabs.activeTabId).toBe(tabId)
 
-      expect(layout.children[0]).toMatchObject({ type: 'leaf', id: paneId })
-      expect(layout.children[1]).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'editor',
-          filePath: '/tmp/example.txt',
-          language: null,
-          readOnly: false,
-          content: '',
-          viewMode: 'source',
-        },
+        const layout = state.panes.layouts[tabId]
+        expect(layout.type).toBe('split')
+        if (layout.type !== 'split') {
+          throw new Error('expected split layout')
+        }
+
+        expect(layout.children[0]).toMatchObject({ type: 'leaf', id: paneId })
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: {
+            kind: 'editor',
+            filePath: '/tmp/example.txt',
+            language: null,
+            readOnly: false,
+            content: '',
+            viewMode: 'source',
+          },
+        })
       })
     })
 
@@ -946,27 +950,31 @@ describe('TerminalView keyboard handling', () => {
 
       links![0].activate()
 
-      const root = store.getState().panes.layouts[tabId]
-      expect(root.type).toBe('split')
-      if (root.type !== 'split') {
-        throw new Error('expected root split layout')
-      }
+      expect(store.getState().panes.layouts[tabId]).toEqual(layout)
 
-      expect(root.children[0]).toMatchObject({ type: 'leaf', id: activePaneId })
+      await waitFor(() => {
+        const root = store.getState().panes.layouts[tabId]
+        expect(root.type).toBe('split')
+        if (root.type !== 'split') {
+          throw new Error('expected root split layout')
+        }
 
-      const clickedBranch = root.children[1]
-      expect(clickedBranch.type).toBe('split')
-      if (clickedBranch.type !== 'split') {
-        throw new Error('expected clicked branch split layout')
-      }
+        expect(root.children[0]).toMatchObject({ type: 'leaf', id: activePaneId })
 
-      expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: clickedPaneId })
-      expect(clickedBranch.children[1]).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'editor',
-          filePath: '/tmp/example.txt',
-        },
+        const clickedBranch = root.children[1]
+        expect(clickedBranch.type).toBe('split')
+        if (clickedBranch.type !== 'split') {
+          throw new Error('expected clicked branch split layout')
+        }
+
+        expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: clickedPaneId })
+        expect(clickedBranch.children[1]).toMatchObject({
+          type: 'leaf',
+          content: {
+            kind: 'editor',
+            filePath: '/tmp/example.txt',
+          },
+        })
       })
     })
 
