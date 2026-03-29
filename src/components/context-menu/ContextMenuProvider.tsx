@@ -883,6 +883,29 @@ export function ContextMenuProvider({
     return cleanup
   }, [view, closeMenu, menuState])
 
+  const openUrlInPane = useCallback((tabId: string, paneId: string, url: string) => {
+    dispatch(splitPaneAction({
+      tabId,
+      paneId,
+      direction: 'horizontal',
+      newContent: { kind: 'browser', url, devToolsOpen: false },
+    }))
+  }, [dispatch])
+
+  const openUrlInTab = useCallback((url: string) => {
+    const id = nanoid()
+    dispatch(addTab({ id, mode: 'shell' }))
+    dispatch(initLayout({ tabId: id, content: { kind: 'browser', url, devToolsOpen: false } }))
+  }, [dispatch])
+
+  const openUrlInBrowser = useCallback((url: string) => {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }, [])
+
+  const copyUrlAction = useCallback(async (url: string) => {
+    await copyText(url)
+  }, [])
+
   const menuItems = useMemo(() => {
     if (!menuState) return []
     return buildMenuItems(menuState.target, {
@@ -960,6 +983,10 @@ export function ContextMenuProvider({
         copyAgentChatDiffNew: copyAgentChatDiffNew,
         copyAgentChatDiffOld: copyAgentChatDiffOld,
         copyAgentChatFilePath: copyAgentChatFilePath,
+        openUrlInPane,
+        openUrlInTab,
+        openUrlInBrowser,
+        copyUrl: copyUrlAction,
       },
     })
   }, [
@@ -1016,6 +1043,10 @@ export function ContextMenuProvider({
     copyTerminalCwd,
     copyMessageText,
     copyMessageCode,
+    openUrlInPane,
+    openUrlInTab,
+    openUrlInBrowser,
+    copyUrlAction,
   ])
 
   return (

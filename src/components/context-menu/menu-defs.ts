@@ -64,6 +64,10 @@ export type MenuActions = {
   copyAgentChatDiffOld: (clickTarget: HTMLElement | null) => void
   copyAgentChatFilePath: (clickTarget: HTMLElement | null) => void
   showKeyboardShortcuts: () => void
+  openUrlInPane: (tabId: string, paneId: string, url: string) => void
+  openUrlInTab: (url: string) => void
+  openUrlInBrowser: (url: string) => void
+  copyUrl: (url: string) => void
 }
 
 export type MenuBuildContext = {
@@ -338,7 +342,37 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
+
+    const urlItems: MenuItem[] = target.hoveredUrl ? [
+      {
+        type: 'item',
+        id: 'url-open-pane',
+        label: 'Open URL in pane',
+        onSelect: () => actions.openUrlInPane(target.tabId, target.paneId, target.hoveredUrl!),
+      },
+      {
+        type: 'item',
+        id: 'url-open-tab',
+        label: 'Open URL in new tab',
+        onSelect: () => actions.openUrlInTab(target.hoveredUrl!),
+      },
+      {
+        type: 'item',
+        id: 'url-open-browser',
+        label: 'Open in external browser',
+        onSelect: () => actions.openUrlInBrowser(target.hoveredUrl!),
+      },
+      {
+        type: 'item',
+        id: 'url-copy',
+        label: 'Copy URL',
+        onSelect: () => actions.copyUrl(target.hoveredUrl!),
+      },
+      { type: 'separator', id: 'url-sep' },
+    ] : []
+
     return [
+      ...urlItems,
       ...buildTerminalClipboardItems(terminalActions, hasSelection),
       { type: 'separator', id: 'terminal-clipboard-sep' },
       {
