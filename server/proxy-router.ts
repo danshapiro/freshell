@@ -101,8 +101,8 @@ export function createProxyRouter(deps: ProxyRouterDeps): Router {
         headers,
       },
       (proxyRes) => {
-        const headers = stripIframeBlockingHeaders(proxyRes.headers)
-        res.writeHead(proxyRes.statusCode ?? 502, headers)
+        const strippedHeaders = stripIframeBlockingHeaders(proxyRes.headers)
+        res.writeHead(proxyRes.statusCode ?? 502, strippedHeaders)
         proxyRes.pipe(res)
       },
     )

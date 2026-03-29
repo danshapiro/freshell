@@ -56,6 +56,19 @@ describe('TOOL_DESCRIPTION and INSTRUCTIONS', () => {
     expect(INSTRUCTIONS).toContain('new-window')
   })
 
+  it('browser pane screenshot instructions reflect that proxied localhost URLs render actual content', () => {
+    // The instructions should clarify that proxied localhost URLs render actual
+    // content in iframe screenshots, and only truly cross-origin URLs fall back
+    // to a placeholder. This guards against regressions where the instructions
+    // incorrectly claim all browser pane screenshots show placeholders.
+    expect(INSTRUCTIONS).toContain('proxied localhost URLs render actual content')
+    expect(INSTRUCTIONS).toContain('cross-origin')
+    expect(INSTRUCTIONS).toContain('placeholder')
+    // Must NOT contain the old wording that claims all proxied screenshots are placeholders
+    expect(INSTRUCTIONS).not.toMatch(/browser pane screenshots.*always.*placeholder/i)
+    expect(INSTRUCTIONS).not.toMatch(/cross-origin iframe content renders a placeholder/i)
+  })
+
   it('INPUT_SCHEMA has action and params fields', () => {
     expect(INPUT_SCHEMA).toHaveProperty('action')
     expect(INPUT_SCHEMA).toHaveProperty('params')
