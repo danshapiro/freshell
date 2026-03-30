@@ -224,6 +224,10 @@ export const sessionsSlice = createSlice({
       if (!state.activeSurface || state.activeSurface === action.payload.surface) {
         syncTopLevelFromWindow(state, action.payload.surface)
       }
+      // A successful HTTP fetch establishes a valid baseline for WS patches.
+      if (!state.wsSnapshotReceived) {
+        state.wsSnapshotReceived = true
+      }
     },
     markWsSnapshotReceived: (state) => {
       state.wsSnapshotReceived = true

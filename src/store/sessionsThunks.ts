@@ -357,8 +357,8 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
 
 export function refreshActiveSessionWindow() {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
-    const surface = getState().sessions.activeSurface as SessionSurface | undefined
-    if (!surface) return
+    const active = getState().sessions.activeSurface as SessionSurface | undefined
+    const surface: SessionSurface = active ?? 'sidebar'
     const windowState = getState().sessions.windows[surface]
     await dispatch(fetchSessionWindow({
       surface,
@@ -372,9 +372,11 @@ export function refreshActiveSessionWindow() {
 export function queueActiveSessionWindowRefresh() {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
     const activeSurface = getState().sessions.activeSurface
-    if (!isSessionSurface(activeSurface)) return
+    // Default to 'sidebar' if activeSurface hasn't been initialized yet —
+    // sessions.changed can arrive before bootstrap sets the active surface.
+    const surface: SessionSurface = isSessionSurface(activeSurface) ? activeSurface : 'sidebar'
 
-    const existing = invalidationRefreshState.get(activeSurface)
+    const existing = invalidationRefreshState.get(surface)
     if (existing?.inFlight) {
       existing.queued = true
       return existing.inFlight
@@ -385,12 +387,12 @@ export function queueActiveSessionWindowRefresh() {
       inFlight: null as Promise<void> | null,
       queued: true,
     }
-    invalidationRefreshState.set(activeSurface, state)
+    invalidationRefreshState.set(surface, state)
 
     const run = (async () => {
       try {
         while (generation === sessionWindowThunkGeneration) {
-          const activeRequest = inFlightRequests.get(activeSurface) ?? null
+          const activeRequest = inFlightRequests.get(surface) ?? null
           if (activeRequest) {
             try {
               await activeRequest
@@ -401,17 +403,17 @@ export function queueActiveSessionWindowRefresh() {
           }
           if (!state.queued) break
           state.queued = false
-          const windowState = getState().sessions.windows[activeSurface]
+          const windowState = getState().sessions.windows[surface]
           await dispatch(fetchSessionWindow({
-            surface: activeSurface,
+            surface,
             priority: 'background',
             query: windowState?.query,
             searchTier: windowState?.searchTier,
           }) as any)
         }
       } finally {
-        if (invalidationRefreshState.get(activeSurface) === state) {
-          invalidationRefreshState.delete(activeSurface)
+        if (invalidationRefreshState.get(surface) === state) {
+          invalidationRefreshState.delete(surface)
         }
       }
     })()

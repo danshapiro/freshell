@@ -324,6 +324,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
     if (tabsDirty) {
       const tabsPayload = {
+        persistedAt: Date.now(),
         tabs: {
           // Persist only stable tab state. Keep ephemeral UI fields out of storage.
           activeTabId: state.tabs.activeTabId,

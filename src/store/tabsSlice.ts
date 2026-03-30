@@ -49,7 +49,13 @@ function loadInitialTabsState(): TabsState {
     const tabsState = parsed?.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
-    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
+    const persistedAt = typeof parsed.persistedAt === 'number' ? parsed.persistedAt : undefined
+    const ageMs = persistedAt ? Date.now() - persistedAt : undefined
+    const ageHours = ageMs ? Math.round(ageMs / 3600000) : undefined
+    if (ageHours !== undefined && ageHours > 24) {
+      log.warn(`Restoring tab state from ${ageHours}h ago — may be stale (persistedAt: ${new Date(persistedAt!).toISOString()})`)
+    }
+    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id), persistedAt ? `(${ageHours}h old)` : '(no timestamp)')
 
     // Apply same transformations as hydrateTabs to ensure consistency
     const mappedTabs = tabsState.tabs.map((t: Tab) => {
