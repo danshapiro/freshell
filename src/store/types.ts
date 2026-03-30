@@ -49,7 +49,6 @@ export interface Tab {
   createRequestId: string
   title: string
   description?: string
-  terminalId?: string          // For shell mode
   codingCliSessionId?: string  // For coding CLI session view
   codingCliProvider?: CodingCliProviderName
   claudeSessionId?: string     // Legacy field (migrated to codingCliSessionId)

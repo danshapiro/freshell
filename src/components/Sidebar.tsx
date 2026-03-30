@@ -19,6 +19,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
+import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -337,7 +338,6 @@ export default function Sidebar({
         sessionType,
         sessionId: item.sessionId,
         cwd: item.cwd,
-        terminalId: runningTerminalId,
         agentChatProviderSettings: providerSettings,
       }),
     }))
@@ -370,9 +370,8 @@ export default function Sidebar({
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 
-  const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
-  const activeTerminalId = activeTab?.terminalId
+  const activeTerminalId = useAppSelector((s) => activeTabId ? selectPrimaryTerminalIdForTab(s, activeTabId) : undefined)
   const activeSearchTier = sidebarWindow?.searchTier ?? searchTier
   const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
   const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)

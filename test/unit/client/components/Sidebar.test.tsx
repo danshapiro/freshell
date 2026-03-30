@@ -1478,12 +1478,17 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should navigate to terminal view
       expect(onNavigate).toHaveBeenCalledWith('terminal')
 
-      // Should create a new tab with the terminalId to attach
+      // Should create a new tab with the terminalId in pane content
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.tabs[0].terminalId).toBe('orphan-terminal-id')
       expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('session-running-no-tab'))
       expect(state.tabs.tabs[0].mode).toBe('claude')
+      // terminalId lives in pane content, not on the tab
+      const layout = state.panes.layouts[state.tabs.tabs[0].id]
+      expect(layout).toBeDefined()
+      if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
+        expect(layout.content.terminalId).toBe('orphan-terminal-id')
+      }
     })
   })
 

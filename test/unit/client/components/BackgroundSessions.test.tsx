@@ -5,6 +5,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import BackgroundSessions from '../../../../src/components/BackgroundSessions'
 import tabsReducer from '../../../../src/store/tabsSlice'
+import panesReducer from '../../../../src/store/panesSlice'
 import settingsReducer from '../../../../src/store/settingsSlice'
 import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
 
@@ -33,6 +34,7 @@ function makeStore() {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
+      panes: panesReducer,
       settings: settingsReducer,
       terminalDirectory: terminalDirectoryReducer,
     },
@@ -79,6 +81,15 @@ describe('BackgroundSessions', () => {
     expect(tabs).toHaveLength(1)
     expect(tabs[0].mode).toBe('codex')
     expect(tabs[0].resumeSessionId).toBe('codex-sess-abc')
-    expect(tabs[0].terminalId).toBe('term-codex-1')
+    // terminalId is in pane content, not on the tab
+    const layout = store.getState().panes.layouts[tabs[0].id]
+    expect(layout).toBeDefined()
+    expect(layout.type).toBe('leaf')
+    if (layout.type === 'leaf') {
+      expect(layout.content.kind).toBe('terminal')
+      if (layout.content.kind === 'terminal') {
+        expect(layout.content.terminalId).toBe('term-codex-1')
+      }
+    }
   })
 })

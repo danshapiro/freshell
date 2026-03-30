@@ -2257,7 +2257,6 @@ describe('TerminalView lifecycle updates', () => {
             status: 'running',
             title: 'Claude',
             titleSetByUser: false,
-            terminalId: 'term-clear',
             createRequestId: 'req-clear',
           }],
           activeTabId: tabId,
@@ -2290,10 +2289,10 @@ describe('TerminalView lifecycle updates', () => {
       terminalId: 'term-clear',
     })
 
-    // Wait for state update
+    // Wait for state update - pane content terminalId should be cleared
     await waitFor(() => {
-      const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-      expect(tab?.terminalId).toBeUndefined()
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.terminalId).toBeUndefined()
     })
 
     // Verify tab status was set to 'creating'

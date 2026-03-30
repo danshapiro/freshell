@@ -25,7 +25,6 @@ vi.mock('@/components/SessionView', () => ({
 interface TabConfig {
   id: string
   mode: string
-  terminalId?: string
   codingCliSessionId?: string
   resumeSessionId?: string
   sessionMetadataByKey?: Record<string, unknown>
@@ -56,7 +55,6 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           mode: t.mode as any,
           status: 'running' as const,
           title: 'Test',
-          terminalId: t.terminalId,
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
           sessionMetadataByKey: t.sessionMetadataByKey,
@@ -85,27 +83,8 @@ describe('TabContent', () => {
     cleanup()
   })
 
-  describe('terminalId passthrough', () => {
-    it('passes terminalId to PaneLayout defaultContent when tab has terminalId', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'existing-terminal-123' }])
-
-      render(
-        <Provider store={store}>
-          <TabContent tabId="tab-1" />
-        </Provider>
-      )
-
-      expect(mockPaneLayout).toHaveBeenCalledWith(
-        expect.objectContaining({
-          defaultContent: expect.objectContaining({
-            terminalId: 'existing-terminal-123',
-          }),
-        }),
-        expect.anything()
-      )
-    })
-
-    it('shows picker when tab has no terminalId and defaultNewPane is ask', () => {
+  describe('default content resolution', () => {
+    it('shows picker when defaultNewPane is ask', () => {
       const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'ask' })
 
       render(
@@ -124,7 +103,7 @@ describe('TabContent', () => {
       )
     })
 
-    it('passes undefined terminalId when tab has no terminalId and defaultNewPane is shell', () => {
+    it('passes terminal content when defaultNewPane is shell', () => {
       const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'shell' })
 
       render(
@@ -137,7 +116,7 @@ describe('TabContent', () => {
         expect.objectContaining({
           defaultContent: expect.objectContaining({
             kind: 'terminal',
-            terminalId: undefined,
+            mode: 'shell',
           }),
         }),
         expect.anything()
@@ -196,7 +175,7 @@ describe('TabContent', () => {
 
   describe('hidden prop propagation', () => {
     it('passes hidden=true to PaneLayout when hidden prop is true', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       render(
         <Provider store={store}>
@@ -211,7 +190,7 @@ describe('TabContent', () => {
     })
 
     it('passes hidden=false to PaneLayout when hidden prop is false', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       render(
         <Provider store={store}>
@@ -226,7 +205,7 @@ describe('TabContent', () => {
     })
 
     it('passes hidden=undefined to PaneLayout when hidden prop is not provided', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       render(
         <Provider store={store}>
@@ -243,7 +222,7 @@ describe('TabContent', () => {
 
   describe('visibility CSS classes', () => {
     it('applies tab-hidden class when hidden=true', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       const { container } = render(
         <Provider store={store}>
@@ -258,7 +237,7 @@ describe('TabContent', () => {
     })
 
     it('applies tab-visible class when hidden=false', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       const { container } = render(
         <Provider store={store}>
@@ -272,7 +251,7 @@ describe('TabContent', () => {
     })
 
     it('applies tab-visible class when hidden is undefined', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell', terminalId: 'term-1' }])
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
 
       const { container } = render(
         <Provider store={store}>

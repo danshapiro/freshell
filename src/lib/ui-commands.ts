@@ -82,13 +82,26 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         title: msg.payload.title,
         mode: msg.payload.mode,
         shell: msg.payload.shell,
-        terminalId: msg.payload.terminalId,
         initialCwd: msg.payload.initialCwd,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
       }))
       if (msg.payload.paneId && msg.payload.paneContent) {
         return dispatch(initLayout({ tabId: msg.payload.id, paneId: msg.payload.paneId, content: msg.payload.paneContent }))
+      }
+      if (msg.payload.terminalId) {
+        return dispatch(initLayout({
+          tabId: msg.payload.id,
+          content: {
+            kind: 'terminal',
+            mode: msg.payload.mode || 'shell',
+            terminalId: msg.payload.terminalId,
+            status: msg.payload.status || 'running',
+            shell: msg.payload.shell,
+            initialCwd: msg.payload.initialCwd,
+            resumeSessionId: msg.payload.resumeSessionId,
+          },
+        }))
       }
       return
     case 'tab.select':

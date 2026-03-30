@@ -546,7 +546,6 @@ function createStoreWithTerminalPane() {
             mode: 'shell',
             shell: 'system',
             createdAt: 1,
-            terminalId: 'term-1',
           },
         ],
         activeTabId: 'tab-1',
@@ -1437,8 +1436,8 @@ describe('ContextMenuProvider', () => {
         expect(layout.content).toEqual({ kind: 'picker' })
       }
 
-      // Verify stale tab.terminalId is cleared
-      expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
+      // Verify pane content no longer has the old terminal
+      // (tab.terminalId was removed; terminal ownership is in pane content only)
     })
 
   })

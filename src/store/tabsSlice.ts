@@ -17,6 +17,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
+import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
@@ -38,8 +39,10 @@ export interface TabsState {
 
 function migrateTabFields(t: Tab): Tab {
   const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+  // Strip legacy terminalId field from persisted data
+  const { terminalId: _legacyTerminalId, ...rest } = t as Tab & { terminalId?: unknown }
   return {
-    ...t,
+    ...rest,
     codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
     codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
     createdAt: t.createdAt || Date.now(),
@@ -92,7 +95,6 @@ type AddTabPayload = {
   id?: string
   title?: string
   description?: string
-  terminalId?: string
   codingCliSessionId?: string
   codingCliProvider?: CodingCliProviderName
   claudeSessionId?: string
@@ -125,7 +127,6 @@ export const tabsSlice = createSlice({
         createRequestId: payload.createRequestId || id,
         title: payload.title || `Tab ${state.tabs.length + 1}`,
         description: payload.description,
-        terminalId: payload.terminalId,
         codingCliSessionId,
         codingCliProvider,
         claudeSessionId: payload.claudeSessionId,
@@ -492,7 +493,10 @@ export const openSessionTab = createAsyncThunk(
 
     if (terminalId) {
       if (!forceNew) {
-        const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
+        const existingTabId = selectTabIdByTerminalId(state, terminalId)
+        const existingTab = existingTabId
+          ? state.tabs.tabs.find((t) => t.id === existingTabId)
+          : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
           dispatch(setActiveTab(existingTab.id))
@@ -500,15 +504,27 @@ export const openSessionTab = createAsyncThunk(
         }
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
+      const tabId = nanoid()
       dispatch(addTab({
+        id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
-        terminalId,
         status: 'running',
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
         resumeSessionId: sessionId,
         sessionMetadataByKey: buildSessionMetadataByKey(),
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: {
+          kind: 'terminal',
+          mode: resolvedProvider,
+          terminalId,
+          resumeSessionId: sessionId,
+          initialCwd: cwd,
+          status: 'running',
+        },
       }))
       return
     }
