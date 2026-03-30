@@ -81,6 +81,7 @@ export class TerminalStreamBroker {
     rows: number,
     sinceSeq: number | undefined,
     attachRequestId?: string,
+    maxReplayBytes?: number,
   ): Promise<'attached' | 'duplicate' | 'missing'> {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
     let result: 'attached' | 'duplicate' | 'missing' = 'attached'
@@ -127,12 +128,41 @@ export class TerminalStreamBroker {
       }
 
       const replay = terminalState.replayRing.replaySince(normalizedSinceSeq)
-      const replayFrames = replay.frames
+      let replayFrames = replay.frames
+      let effectiveMissedFromSeq = replay.missedFromSeq
       const headSeq = terminalState.replayRing.headSeq()
+
+      // Truncate replay to tail frames within byte budget
+      if (maxReplayBytes !== undefined && maxReplayBytes > 0 && replayFrames.length > 0) {
+        let budgetRemaining = maxReplayBytes
+        let keepFromIndex = replayFrames.length
+        for (let i = replayFrames.length - 1; i >= 0; i--) {
+          if (replayFrames[i].bytes > budgetRemaining) break
+          budgetRemaining -= replayFrames[i].bytes
+          keepFromIndex = i
+        }
+        if (keepFromIndex > 0) {
+          const truncatedFromSeq = replayFrames[0].seqStart
+          const truncatedToSeq = replayFrames[keepFromIndex - 1].seqEnd
+          effectiveMissedFromSeq = effectiveMissedFromSeq ?? truncatedFromSeq
+          replayFrames = replayFrames.slice(keepFromIndex)
+
+          this.perfEventLogger('terminal_stream_replay_truncated', {
+            terminalId,
+            connectionId: ws.connectionId,
+            maxReplayBytes,
+            droppedFrames: keepFromIndex,
+            droppedFromSeq: truncatedFromSeq,
+            droppedToSeq: truncatedToSeq,
+            keptFrames: replayFrames.length,
+          })
+        }
+      }
+
       const replayFromSeq = replayFrames.length > 0 ? replayFrames[0].seqStart : headSeq + 1
       const replayToSeq = replayFrames.length > 0 ? replayFrames[replayFrames.length - 1].seqEnd : headSeq
 
-      if (replayFrames.length > 0 && replay.missedFromSeq === undefined) {
+      if (replayFrames.length > 0 && effectiveMissedFromSeq === undefined) {
         this.perfEventLogger('terminal_stream_replay_hit', {
           terminalId,
           connectionId: ws.connectionId,
@@ -154,14 +184,14 @@ export class TerminalStreamBroker {
         return
       }
 
-      if (replay.missedFromSeq !== undefined) {
+      if (effectiveMissedFromSeq !== undefined) {
         const missedToSeq = replayFromSeq - 1
-        if (missedToSeq >= replay.missedFromSeq) {
+        if (missedToSeq >= effectiveMissedFromSeq) {
           this.perfEventLogger('terminal_stream_replay_miss', {
             terminalId,
             connectionId: ws.connectionId,
             sinceSeq: normalizedSinceSeq,
-            missedFromSeq: replay.missedFromSeq,
+            missedFromSeq: effectiveMissedFromSeq,
             missedToSeq,
             replayFromSeq,
             replayToSeq,
@@ -170,7 +200,7 @@ export class TerminalStreamBroker {
           this.perfEventLogger('terminal_stream_gap', {
             terminalId,
             connectionId: ws.connectionId,
-            fromSeq: replay.missedFromSeq,
+            fromSeq: effectiveMissedFromSeq,
             toSeq: missedToSeq,
             reason: 'replay_window_exceeded',
           }, 'warn')
@@ -178,7 +208,7 @@ export class TerminalStreamBroker {
           if (!this.safeSend(ws, {
             type: 'terminal.output.gap',
             terminalId,
-            fromSeq: replay.missedFromSeq,
+            fromSeq: effectiveMissedFromSeq,
             toSeq: missedToSeq,
             reason: 'replay_window_exceeded',
             ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),

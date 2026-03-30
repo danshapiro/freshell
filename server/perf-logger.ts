@@ -106,6 +106,7 @@ type PerfSeverity = 'debug' | 'info' | 'warn' | 'error'
 export type TerminalStreamPerfEvent =
   | 'terminal_stream_replay_hit'
   | 'terminal_stream_replay_miss'
+  | 'terminal_stream_replay_truncated'
   | 'terminal_stream_gap'
   | 'terminal_stream_queue_pressure'
   | 'terminal_stream_catastrophic_close'

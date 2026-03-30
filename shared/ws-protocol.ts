@@ -196,6 +196,7 @@ export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
   sinceSeq: z.number().int().nonnegative().optional(),
+  maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
   cols: z.number().int().min(2).max(1000),
   rows: z.number().int().min(2).max(500),
