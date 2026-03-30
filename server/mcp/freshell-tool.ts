@@ -63,7 +63,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - Use literal mode for natural-language prompts: { keys: "your prompt text", literal: true }. Token mode (default) translates special tokens like ENTER/C-C but mangles prose.
 - wait-for with stable (seconds of no output) is more reliable than pattern matching across different CLI providers.
 - Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
-- Browser pane screenshots: cross-origin iframe content renders a placeholder with the source URL instead of a blank region.
+- Browser pane screenshots: proxied localhost URLs render actual content in the iframe. Truly cross-origin URLs (e.g. https://example.com) render a placeholder with the source URL instead of a blank region.
 - Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Clean up with list-terminals and kill unneeded tabs/panes.
 
 ## tmux compatibility
@@ -422,7 +422,7 @@ Meta:
 
 - Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
 - Close temporary tabs/panes after verification unless user asked to keep them open.
-- Browser panes: cross-origin iframe content renders a placeholder message with the source URL instead of a blank region.
+- Browser panes: proxied localhost URLs render actual content in the iframe screenshot. Truly cross-origin URLs (e.g. https://example.com) render a placeholder message with the source URL instead of a blank region.
 - Editor panes show "Loading..." until visited. When screenshotting multiple tabs, visit each tab once first (select-tab), then loop back for screenshots.
 
 ## Gotchas
