@@ -371,6 +371,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let tabsDirty = false
   let panesDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+  const sessionPersistedAt = Date.now()
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
@@ -414,7 +415,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       const layoutPayload = {
-        persistedAt: Date.now(),
+        persistedAt: sessionPersistedAt,
         version: LAYOUT_SCHEMA_VERSION,
         tabs: {
           activeTabId: state.tabs.activeTabId,
