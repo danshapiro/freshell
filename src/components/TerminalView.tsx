@@ -92,6 +92,7 @@ const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
+const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
@@ -227,6 +228,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const suppressNetworkEffects = typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
+  const [truncatedHistoryGap, setTruncatedHistoryGap] = useState<{ fromSeq: number; toSeq: number } | null>(null)
   const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
@@ -1395,7 +1397,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean; skipPreAttachFit?: boolean },
+    opts?: {
+      clearViewportFirst?: boolean
+      suppressNextMatchingResize?: boolean
+      skipPreAttachFit?: boolean
+      maxReplayBytes?: number
+    },
   ) => {
     if (suppressNetworkEffects) return
     const term = termRef.current
@@ -1411,6 +1418,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
     setIsAttaching(true)
+    setTruncatedHistoryGap(null)
 
     const persistedSeq = loadTerminalCursor(tid)
     const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
@@ -1456,6 +1464,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       rows,
       sinceSeq,
       attachRequestId,
+      ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
@@ -1483,7 +1492,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       setIsAttaching(false)
     } else {
-      attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+      attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true, maxReplayBytes: TRUNCATED_REPLAY_BYTES })
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
@@ -1525,6 +1534,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
+          ...(deferred.pendingIntent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : {}),
         })
         return
       }
@@ -1705,13 +1715,23 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          const reason = msg.reason === 'replay_window_exceeded'
-            ? 'reconnect window exceeded'
-            : 'slow link backlog'
-          try {
-            term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
-          } catch {
-            // disposed
+          // If this gap is from a truncated replay (maxReplayBytes), store it
+          // for the "load more history" UI instead of printing a gap message.
+          const currentAttach = currentAttachRef.current
+          const isTruncatedReplay = currentAttach
+            && msg.reason === 'replay_window_exceeded'
+            && seqStateRef.current.pendingReplay
+          if (isTruncatedReplay) {
+            setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          } else {
+            const reason = msg.reason === 'replay_window_exceeded'
+              ? 'reconnect window exceeded'
+              : 'slow link backlog'
+            try {
+              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
+            } catch {
+              // disposed
+            }
           }
           const previousSeqState = seqStateRef.current
           const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
@@ -1999,7 +2019,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
             ? 'keepalive_delta'
             : 'viewport_hydrate'
-          attachTerminal(currentTerminalId, intent)
+          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : undefined)
         }
       } else {
         deferredAttachStateRef.current = {
