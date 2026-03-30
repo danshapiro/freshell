@@ -38,11 +38,29 @@ describe('EditorPane auto-save', () => {
     vi.useFakeTimers()
     store = createMockStore()
     vi.mocked(fetch).mockReset()
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      text: () => Promise.resolve(JSON.stringify({ success: true })),
-      json: () => Promise.resolve({ success: true }),
-    } as Response)
+    vi.mocked(fetch).mockImplementation((url: string | Request | URL) => {
+      const urlStr = typeof url === 'string' ? url : url.toString()
+      if (urlStr.includes('/api/files/stat')) {
+        return Promise.resolve({
+          ok: true,
+          text: () => Promise.resolve(JSON.stringify({
+            exists: true,
+            size: 100,
+            modifiedAt: '2026-01-01T00:00:00.000Z',
+          })),
+          json: () => Promise.resolve({
+            exists: true,
+            size: 100,
+            modifiedAt: '2026-01-01T00:00:00.000Z',
+          }),
+        } as Response)
+      }
+      return Promise.resolve({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ success: true, modifiedAt: '2026-01-01T00:00:00.000Z' })),
+        json: () => Promise.resolve({ success: true, modifiedAt: '2026-01-01T00:00:00.000Z' }),
+      } as Response)
+    })
   })
 
   afterEach(() => {
@@ -67,27 +85,29 @@ describe('EditorPane auto-save', () => {
 
     const editor = screen.getByTestId('monaco-mock')
 
-    // Simulate typing by triggering onChange via fireEvent
+    const writeCalls = () => vi.mocked(fetch).mock.calls.filter(
+      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/write')
+    )
+
     await act(async () => {
       fireEvent.change(editor, { target: { value: 'changed content' } })
     })
 
-    // Fast-forward 4 seconds - should not save yet
     await act(async () => {
       vi.advanceTimersByTime(4000)
     })
-    expect(fetch).not.toHaveBeenCalled()
+    expect(writeCalls()).toHaveLength(0)
 
-    // Fast-forward 1 more second (total 5s) - should save
     await act(async () => {
       vi.advanceTimersByTime(1000)
     })
-    expect(fetch).toHaveBeenCalledWith(
+    expect(writeCalls().length).toBeGreaterThanOrEqual(1)
+    expect(writeCalls()[0]).toEqual([
       '/api/files/write',
       expect.objectContaining({
         method: 'POST',
-      })
-    )
+      }),
+    ])
   })
 
   it('does not auto-save scratch pads (no filePath)', async () => {
@@ -130,34 +150,33 @@ describe('EditorPane auto-save', () => {
 
     const editor = screen.getByTestId('monaco-mock')
 
-    // First change
+    const writeCalls = () => vi.mocked(fetch).mock.calls.filter(
+      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/write')
+    )
+
     await act(async () => {
       fireEvent.change(editor, { target: { value: 'first change' } })
     })
 
-    // Wait 3 seconds
     await act(async () => {
       vi.advanceTimersByTime(3000)
     })
 
-    // Another change - should reset the timer
     await act(async () => {
       fireEvent.change(editor, { target: { value: 'second change' } })
     })
 
-    // Wait 3 more seconds (6s total from start, but only 3s since last change)
     await act(async () => {
       vi.advanceTimersByTime(3000)
     })
 
-    expect(fetch).not.toHaveBeenCalled()
+    expect(writeCalls()).toHaveLength(0)
 
-    // Wait 2 more seconds (5s since last change)
     await act(async () => {
       vi.advanceTimersByTime(2000)
     })
 
-    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(writeCalls()).toHaveLength(1)
   })
 
   it('sends correct content in auto-save request', async () => {
@@ -177,25 +196,24 @@ describe('EditorPane auto-save', () => {
 
     const editor = screen.getByTestId('monaco-mock')
 
-    // Simulate content change
     await act(async () => {
       fireEvent.change(editor, { target: { value: 'updated content' } })
     })
 
-    // Wait for debounce
     await act(async () => {
       vi.advanceTimersByTime(5000)
     })
 
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/files/write',
-      expect.objectContaining({
-        method: 'POST',
-      })
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/write')
     )
+    expect(writeCalls.length).toBeGreaterThanOrEqual(1)
+    expect(writeCalls[0]).toEqual([
+      '/api/files/write',
+      expect.objectContaining({ method: 'POST' }),
+    ])
 
-    // Verify the body content
-    const [, options] = vi.mocked(fetch).mock.calls[0]
+    const [, options] = writeCalls[0]
     expect(options?.body).toBeDefined()
     const body = JSON.parse(options?.body as string)
     expect(body).toEqual({
@@ -219,12 +237,14 @@ describe('EditorPane auto-save', () => {
       </Provider>
     )
 
-    // Fast-forward past debounce time
     await act(async () => {
       vi.advanceTimersByTime(10000)
     })
 
-    expect(fetch).not.toHaveBeenCalled()
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/write')
+    )
+    expect(writeCalls).toHaveLength(0)
   })
 
   it('cleans up timer on unmount', async () => {
@@ -244,20 +264,19 @@ describe('EditorPane auto-save', () => {
 
     const editor = screen.getByTestId('monaco-mock')
 
-    // Trigger a change to schedule auto-save
     await act(async () => {
       fireEvent.change(editor, { target: { value: 'changed' } })
     })
 
-    // Unmount before timer fires
     unmount()
 
-    // Advance past the debounce time
     await act(async () => {
       vi.advanceTimersByTime(10000)
     })
 
-    // Should not have saved since component unmounted
-    expect(fetch).not.toHaveBeenCalled()
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/api/files/write')
+    )
+    expect(writeCalls).toHaveLength(0)
   })
 })
