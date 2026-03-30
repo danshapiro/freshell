@@ -275,6 +275,7 @@ export type SearchResult = {
   sessionId: string
   provider: CodingCliProviderName
   projectPath: string
+  checkoutPath?: string
   title?: string
   summary?: string
   sessionType?: string

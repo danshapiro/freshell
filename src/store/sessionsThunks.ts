@@ -68,6 +68,7 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
       provider: result.provider,
       sessionId: result.sessionId,
       projectPath: result.projectPath,
+      ...(result.checkoutPath ? { checkoutPath: result.checkoutPath } : {}),
       lastActivityAt: result.lastActivityAt,
       createdAt: result.createdAt,
       archived: result.archived,
