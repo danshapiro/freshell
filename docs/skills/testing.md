@@ -6,6 +6,7 @@
 
 | Command | Purpose |
 |---------|---------|
+| `npm run typecheck:client` | Cheap client-only compile gate; safe while prod is live |
 | `npm test` | Coordinated full suite (`vitest run` plus `vitest run --config vitest.server.config.ts`) |
 | `npm run test:all` | Alias for the same coordinated full suite |
 | `npm run check` | Run `typecheck`, then the coordinated full suite |
@@ -31,12 +32,14 @@
 
 1. Run `npm run test:status` if you need to know whether another agent is already holding the coordinated gate.
 2. Set `FRESHELL_TEST_SUMMARY="why this run matters"` before broad runs so holder/status output is readable.
-3. Use the narrowest truthful public command you can.
-4. If another holder is active, wait rather than killing a foreign process.
+3. Use `npm run typecheck:client` when you only need the cheap frontend compile gate.
+4. Use the narrowest truthful public command you can.
+5. If another holder is active, wait rather than killing a foreign process.
 
 ## Focused Examples
 
 ```bash
+npm run typecheck:client
 FRESHELL_TEST_SUMMARY="Verify coordinated full suite" npm test
 npm run test:server -- --help
 npm run test:server -- --run
