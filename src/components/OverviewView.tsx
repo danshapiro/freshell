@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { nanoid } from 'nanoid'
 import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
 import { getWsClient } from '@/lib/ws-client'
+import { collectTerminalIds } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
 import { RefreshCw, Circle, Play, Pencil, Trash2, Sparkles, ExternalLink } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -44,8 +47,19 @@ function formatDuration(ms: number): string {
 export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const tabs = useAppSelector((s) => s.tabs.tabs)
+  const paneLayouts = useAppSelector((s) => s.panes.layouts)
 
   const ws = useMemo(() => getWsClient(), [])
+
+  const findTabByTerminalId = useCallback((terminalId: string) => {
+    for (const tab of tabs) {
+      const layout = paneLayouts[tab.id]
+      if (layout && collectTerminalIds(layout).includes(terminalId)) {
+        return tab
+      }
+    }
+    return undefined
+  }, [tabs, paneLayouts])
 
   const [items, setItems] = useState<TerminalOverview[]>([])
   const [loading, setLoading] = useState(false)
@@ -137,15 +151,17 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                     <TerminalCard
                       key={t.terminalId}
                       terminal={t}
-                      isOpen={tabs.some((x) => x.terminalId === t.terminalId)}
+                      isOpen={!!findTabByTerminalId(t.terminalId)}
                       onOpen={() => {
-                        const existing = tabs.find((x) => x.terminalId === t.terminalId)
+                        const existing = findTabByTerminalId(t.terminalId)
                         if (existing) {
                           dispatch(setActiveTab(existing.id))
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: 'shell' }))
+                        const tabId = nanoid()
+                        dispatch(addTab({ id: tabId, title: t.title, status: 'running', mode: 'shell' }))
+                        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', terminalId: t.terminalId, status: 'running' } }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
@@ -153,7 +169,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                           titleOverride: title || undefined,
                           descriptionOverride: description || undefined,
                         })
-                        const existing = tabs.find((x) => x.terminalId === t.terminalId)
+                        const existing = findTabByTerminalId(t.terminalId)
                         if (existing && title) {
                           dispatch(updateTab({ id: existing.id, updates: { title } }))
                         }
@@ -192,15 +208,17 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                     <TerminalCard
                       key={t.terminalId}
                       terminal={t}
-                      isOpen={tabs.some((x) => x.terminalId === t.terminalId)}
+                      isOpen={!!findTabByTerminalId(t.terminalId)}
                       onOpen={() => {
-                        const existing = tabs.find((x) => x.terminalId === t.terminalId)
+                        const existing = findTabByTerminalId(t.terminalId)
                         if (existing) {
                           dispatch(setActiveTab(existing.id))
                           onOpenTab?.()
                           return
                         }
-                        dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'exited', mode: 'shell' }))
+                        const tabId = nanoid()
+                        dispatch(addTab({ id: tabId, title: t.title, status: 'exited', mode: 'shell' }))
+                        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', terminalId: t.terminalId, status: 'exited' } }))
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {

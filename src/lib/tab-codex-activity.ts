@@ -13,13 +13,6 @@ export function getBusyCodexActivityTerminalIdsForTab(
 ): string[] {
   const layout = paneLayouts[tab.id]
   if (!layout) {
-    if (
-      tab.terminalId
-      && tab.status === 'running'
-      && codexActivityByTerminalId[tab.terminalId]?.phase === 'busy'
-    ) {
-      return [tab.terminalId]
-    }
     return EMPTY_ACTIVITY_TERMINAL_IDS
   }
 
@@ -30,7 +23,6 @@ export function getBusyCodexActivityTerminalIdsForTab(
     if (content.status !== 'running') continue
     const record = resolveExactCodexActivity(codexActivityByTerminalId, {
       terminalId: content.terminalId,
-      tabTerminalId: tab.terminalId,
       isOnlyPane,
     })
     if (record?.phase === 'busy') {

@@ -185,7 +185,6 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           shell: tab.shell,
           createRequestId: tab.createRequestId,
           status: tab.status,
-          terminalId: tab.terminalId,
           resumeSessionId: tab.resumeSessionId,
           initialCwd: tab.initialCwd,
         },
@@ -202,7 +201,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         return Array.from(new Set(ids))
       }
     }
-    return tab.terminalId ? [tab.terminalId] : []
+    return []
   }, [paneLayouts])
 
   const getBusyPaneIds = useCallback((tab: Tab): string[] => getBusyPaneIdsForTab({

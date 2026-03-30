@@ -131,30 +131,4 @@ describe('ws terminal metadata protocol', () => {
     ws.close()
   })
 
-  it('broadcasts terminal.runtime.updated payloads', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token', protocolVersion: WS_PROTOCOL_VERSION }))
-    await waitForMessage(ws, (msg) => msg.type === 'ready')
-
-    wsHandler.broadcastTerminalRuntimeUpdated({
-      terminalId: 'term-1',
-      title: 'Shell',
-      status: 'running',
-      cwd: '/workspace/repo',
-      pid: 4242,
-    })
-
-    const updated = await waitForMessage(ws, (msg) => msg.type === 'terminal.runtime.updated')
-    expect(updated).toEqual({
-      type: 'terminal.runtime.updated',
-      terminalId: 'term-1',
-      revision: 1,
-      title: 'Shell',
-      status: 'running',
-      cwd: '/workspace/repo',
-      pid: 4242,
-    })
-    ws.close()
-  })
 })

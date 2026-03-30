@@ -167,6 +167,21 @@ export class SessionRepairService extends EventEmitter {
     }
 
     if (this.queue.has(sessionId)) {
+      // Check disk cache before waiting for queue processing.
+      // Sessions discovered at startup are enqueued before cache is consulted,
+      // so this avoids blocking on the queue when the cache has a valid result.
+      const cachedPath = this.resolveCachedPath(sessionId)
+      if (cachedPath) {
+        const cached = await this.cache.get(cachedPath, { allowStaleMs: ACTIVE_CACHE_GRACE_MS })
+        if (cached) {
+          const normalized = cached.sessionId === sessionId
+            ? cached
+            : { ...cached, sessionId }
+          this.queue.seedResult(sessionId, normalized)
+          await this.ensureSessionArtifacts(normalized)
+          return normalized
+        }
+      }
       return this.queue.waitFor(sessionId, timeoutMs)
     }
 

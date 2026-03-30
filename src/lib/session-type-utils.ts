@@ -46,7 +46,6 @@ export function buildResumeContent(opts: {
   sessionType: string
   sessionId: string
   cwd?: string
-  terminalId?: string
   agentChatProviderSettings?: {
     defaultModel?: string
     defaultPermissionMode?: string
@@ -75,7 +74,5 @@ export function buildResumeContent(opts: {
     mode: provider,
     resumeSessionId: opts.sessionId,
     initialCwd: opts.cwd,
-    terminalId: opts.terminalId,
-    status: opts.terminalId ? 'running' as const : 'creating' as const,
   }
 }
