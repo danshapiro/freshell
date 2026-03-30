@@ -1027,12 +1027,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       linkHandler: {
         activate: (event: MouseEvent, uri: string) => {
           if (event.button !== 0) return
-          // Only open http/https URLs in browser panes. Reject javascript:,
-          // data:, and other potentially dangerous schemes from OSC 8 links.
-          if (!/^https?:\/\//i.test(uri)) {
-            window.open(uri, '_blank', 'noopener,noreferrer')
-            return
-          }
+          // Only open http/https URLs. Block javascript:, data:, and other
+          // potentially dangerous schemes from OSC 8 links.
+          if (!/^https?:\/\//i.test(uri)) return
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {
