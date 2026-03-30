@@ -49,6 +49,8 @@ function createDeferred<T>() {
 function createStore(options?: {
   projects?: ProjectGroup[]
   sessions?: Record<string, unknown>
+  tabs?: any[]
+  panes?: any
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -90,10 +92,10 @@ function createStore(options?: {
         lastSavedAt: undefined,
       },
       tabs: {
-        tabs: [],
+        tabs: options?.tabs ?? [],
         activeTabId: null,
       },
-      panes: {
+      panes: options?.panes ?? {
         layouts: {},
         activePane: {},
         paneTitles: {},
@@ -139,6 +141,13 @@ function renderSidebar(store: ReturnType<typeof createStore>) {
     </Provider>,
   )
   return { ...result, onNavigate }
+}
+
+function getSidebarSessionOrder(labels: string[]): string[] {
+  const list = screen.getByTestId('sidebar-session-list')
+  return Array.from(list.querySelectorAll('button'))
+    .map((button) => labels.find((label) => button.textContent?.includes(label)))
+    .filter((label): label is string => Boolean(label))
 }
 
 describe('sidebar search flow (e2e)', () => {
@@ -213,6 +222,163 @@ describe('sidebar search flow (e2e)', () => {
 
     // Search results rendered
     expect(screen.getByText('Deploy Pipeline')).toBeInTheDocument()
+  })
+
+  it('renders a preloaded requested search and dispatches it on mount without local typing', async () => {
+    const searchRequest = createDeferred<any>()
+    vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+    const store = createStore({
+      sessions: {
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            query: 'prefilled',
+            searchTier: 'title',
+            projects: [],
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(async () => {
+      vi.advanceTimersByTime(300)
+      await Promise.resolve()
+    })
+
+    expect(screen.getByPlaceholderText('Search...')).toHaveValue('prefilled')
+    expect(screen.getByRole('combobox', { name: /search tier/i })).toHaveValue('title')
+    expect(screen.getByLabelText('Clear search')).toBeInTheDocument()
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'prefilled',
+      tier: 'title',
+    }))
+    expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+
+    await act(async () => {
+      searchRequest.resolve({
+        results: [],
+        tier: 'title',
+        query: 'prefilled',
+        totalScanned: 0,
+      })
+      await Promise.resolve()
+    })
+  })
+
+  it('matches subdirectory leaves and only shows matching open-tab fallbacks without pinning them above newer server results', async () => {
+    const matchingFallbackSessionId = 'fallback-trycycle'
+    vi.mocked(mockSearchSessions)
+      .mockResolvedValueOnce({
+        results: [
+          {
+            sessionId: 'server-newer',
+            provider: 'codex',
+            projectPath: '/proj/server',
+            title: 'Newer Server Result',
+            matchedIn: 'title',
+            lastActivityAt: 3_000,
+            archived: false,
+          },
+          {
+            sessionId: 'server-leaf',
+            provider: 'codex',
+            projectPath: '/proj/code/trycycle',
+            cwd: '/proj/code/trycycle/server',
+            title: 'Routine work',
+            matchedIn: 'title',
+            lastActivityAt: 2_500,
+            archived: false,
+          },
+        ],
+        tier: 'title',
+        query: 'trycycle',
+        totalScanned: 8,
+      } as any)
+      .mockResolvedValueOnce({
+        results: [],
+        tier: 'title',
+        query: 'code',
+        totalScanned: 8,
+      } as any)
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-fallback',
+        title: 'Open Matching Tab',
+        mode: 'codex',
+        resumeSessionId: matchingFallbackSessionId,
+        createdAt: 1_000,
+      }],
+      panes: {
+        layouts: {
+          'tab-fallback': {
+            type: 'leaf',
+            id: 'pane-fallback',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              status: 'running',
+              createRequestId: 'req-fallback',
+              resumeSessionId: matchingFallbackSessionId,
+              initialCwd: '/tmp/code/trycycle',
+            },
+          },
+        },
+        activePane: {
+          'tab-fallback': 'pane-fallback',
+        },
+        paneTitles: {
+          'tab-fallback': {
+            'pane-fallback': 'Open Matching Tab',
+          },
+        },
+      },
+    })
+
+    renderSidebar(store)
+    await act(() => vi.advanceTimersByTime(100))
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'trycycle' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'trycycle',
+      tier: 'title',
+    }))
+    expect(screen.getByText('Routine work')).toBeInTheDocument()
+    expect(screen.getByText('Newer Server Result')).toBeInTheDocument()
+    expect(screen.getByText('Open Matching Tab')).toBeInTheDocument()
+    expect(getSidebarSessionOrder([
+      'Newer Server Result',
+      'Routine work',
+      'Open Matching Tab',
+    ])).toEqual([
+      'Newer Server Result',
+      'Routine work',
+      'Open Matching Tab',
+    ])
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'code' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(mockSearchSessions).toHaveBeenLastCalledWith(expect.objectContaining({
+      query: 'code',
+      tier: 'title',
+    }))
+    expect(screen.queryByText('Routine work')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open Matching Tab')).not.toBeInTheDocument()
   })
 
   it('deep-tier search shows title results first, then merged results after Phase 2', async () => {
@@ -397,6 +563,7 @@ describe('sidebar search flow (e2e)', () => {
   it('clearing search returns to browse mode', async () => {
     const phase1Deferred = createDeferred<any>()
     const phase2Deferred = createDeferred<any>()
+    const browseDeferred = createDeferred<any>()
     vi.mocked(mockSearchSessions)
       .mockReturnValueOnce(phase1Deferred.promise) // Phase 1
       .mockReturnValueOnce(phase2Deferred.promise) // Phase 2 (will hang)
@@ -412,15 +579,38 @@ describe('sidebar search flow (e2e)', () => {
       }],
     }]
 
-    vi.mocked(mockFetchSnapshot).mockResolvedValue({
+    vi.mocked(mockFetchSnapshot).mockReturnValue(browseDeferred.promise)
+
+    const store = createStore({
+      projects: browseProjects,
+      sessions: {
+        activeSurface: 'sidebar',
+        projects: browseProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: browseProjects,
+            lastLoadedAt: 1_000,
+            query: '',
+            searchTier: 'title',
+            appliedQuery: '',
+            appliedSearchTier: 'title',
+            loading: false,
+            hasMore: false,
+            oldestLoadedTimestamp: 1_000,
+            oldestLoadedSessionId: 'claude:session-browse',
+          },
+        },
+      },
+    })
+
+    browseDeferred.resolve({
       projects: browseProjects,
       totalSessions: 1,
       oldestIncludedTimestamp: 1_000,
       oldestIncludedSessionId: 'claude:session-browse',
       hasMore: false,
     })
-
-    const store = createStore({ projects: browseProjects })
 
     renderSidebar(store)
     await act(() => vi.advanceTimersByTime(100))
@@ -461,9 +651,23 @@ describe('sidebar search flow (e2e)', () => {
     const clearButton = screen.getByLabelText('Clear search')
     fireEvent.click(clearButton)
 
-    // Wait for browse re-fetch
+    // Wait for browse re-fetch to start while leaving it unresolved.
     await act(async () => {
       vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
+
+    await act(async () => {
+      browseDeferred.resolve({
+        projects: browseProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-browse',
+        hasMore: false,
+      })
       await Promise.resolve()
       await Promise.resolve()
     })

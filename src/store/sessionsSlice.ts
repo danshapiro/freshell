@@ -6,6 +6,7 @@ export type SessionWindowLoadingKind = 'initial' | 'search' | 'background' | 'pa
 export interface SessionWindowState {
   projects: ProjectGroup[]
   lastLoadedAt?: number
+  resultVersion?: number
   totalSessions?: number
   oldestLoadedTimestamp?: number
   oldestLoadedSessionId?: string
@@ -15,6 +16,8 @@ export interface SessionWindowState {
   error?: string
   query?: string
   searchTier?: 'title' | 'userMessages' | 'fullText'
+  appliedQuery?: string
+  appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   deepSearchPending?: boolean
   partial?: boolean
   partialReason?: 'budget' | 'io_error'
@@ -115,6 +118,37 @@ function syncTopLevelFromWindow(state: SessionsState, surface: string) {
   state.loadingKind = window.loadingKind
 }
 
+type SessionWindowCommitPayload = {
+  surface: string
+  projects: ProjectGroup[]
+  totalSessions?: number
+  oldestLoadedTimestamp?: number
+  oldestLoadedSessionId?: string
+  hasMore?: boolean
+  query?: string
+  searchTier?: 'title' | 'userMessages' | 'fullText'
+  deepSearchPending?: boolean
+  partial?: boolean
+  partialReason?: 'budget' | 'io_error'
+}
+
+function commitWindowPayload(
+  window: SessionWindowState,
+  payload: SessionWindowCommitPayload,
+) {
+  window.projects = normalizeProjects(payload.projects)
+  window.lastLoadedAt = Date.now()
+  window.resultVersion = (window.resultVersion ?? 0) + 1
+  window.totalSessions = payload.totalSessions
+  window.oldestLoadedTimestamp = payload.oldestLoadedTimestamp
+  window.oldestLoadedSessionId = payload.oldestLoadedSessionId
+  window.hasMore = payload.hasMore
+  window.error = undefined
+  window.deepSearchPending = payload.deepSearchPending ?? false
+  window.partial = payload.partial
+  window.partialReason = payload.partialReason
+}
+
 function syncActiveWindowFromTopLevel(state: SessionsState) {
   if (!state.activeSurface) return
   const window = ensureWindow(state, state.activeSurface)
@@ -190,37 +224,42 @@ export const sessionsSlice = createSlice({
         }
       }
     },
-    setSessionWindowData: (
+    commitSessionWindowReplacement: (
       state,
-      action: PayloadAction<{
-        surface: string
-        projects: ProjectGroup[]
-        totalSessions?: number
-        oldestLoadedTimestamp?: number
-        oldestLoadedSessionId?: string
-        hasMore?: boolean
-        query?: string
-        searchTier?: 'title' | 'userMessages' | 'fullText'
-        deepSearchPending?: boolean
-        partial?: boolean
-        partialReason?: 'budget' | 'io_error'
-      }>,
+      action: PayloadAction<SessionWindowCommitPayload>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
-      window.projects = normalizeProjects(action.payload.projects)
-      window.lastLoadedAt = Date.now()
-      window.totalSessions = action.payload.totalSessions
-      window.oldestLoadedTimestamp = action.payload.oldestLoadedTimestamp
-      window.oldestLoadedSessionId = action.payload.oldestLoadedSessionId
-      window.hasMore = action.payload.hasMore
+      commitWindowPayload(window, action.payload)
       window.loading = false
       window.loadingKind = undefined
-      window.error = undefined
-      window.deepSearchPending = action.payload.deepSearchPending ?? false
-      window.partial = action.payload.partial
-      window.partialReason = action.payload.partialReason
-      if (action.payload.query !== undefined) window.query = action.payload.query
-      if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
+      if (action.payload.query !== undefined) {
+        window.query = action.payload.query
+        window.appliedQuery = action.payload.query
+      }
+      if (action.payload.searchTier !== undefined) {
+        window.searchTier = action.payload.searchTier
+        window.appliedSearchTier = action.payload.searchTier
+      }
+      if (!state.activeSurface || state.activeSurface === action.payload.surface) {
+        syncTopLevelFromWindow(state, action.payload.surface)
+      }
+    },
+    commitSessionWindowVisibleRefresh: (
+      state,
+      action: PayloadAction<SessionWindowCommitPayload & { preserveLoading?: boolean }>,
+    ) => {
+      const window = ensureWindow(state, action.payload.surface)
+      commitWindowPayload(window, action.payload)
+      if (!action.payload.preserveLoading) {
+        window.loading = false
+        window.loadingKind = undefined
+      }
+      if (action.payload.query !== undefined) {
+        window.appliedQuery = action.payload.query
+      }
+      if (action.payload.searchTier !== undefined) {
+        window.appliedSearchTier = action.payload.searchTier
+      }
       if (!state.activeSurface || state.activeSurface === action.payload.surface) {
         syncTopLevelFromWindow(state, action.payload.surface)
       }
@@ -385,7 +424,8 @@ export const {
   setActiveSessionSurface,
   setSessionWindowLoading,
   setSessionWindowError,
-  setSessionWindowData,
+  commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
   setProjects,

@@ -103,9 +103,6 @@ function createStore(options: {
     } satisfies ServerSettingsPatch,
   )
   const localSettings = resolveLocalSettings({
-    panes: {
-      sessionOpenMode: options.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
-    },
     sidebar: {
       sortMode: 'activity',
       showProjectBadges: true,
@@ -113,6 +110,9 @@ function createStore(options: {
       ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
       showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
       hideEmptySessions: false,
+    },
+    panes: {
+      sessionOpenMode: options.sessionOpenMode ?? defaultSettings.panes.sessionOpenMode,
     },
   })
 
