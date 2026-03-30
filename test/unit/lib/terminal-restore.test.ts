@@ -22,4 +22,22 @@ describe('terminal-restore', () => {
     // Consumed — second call returns false
     expect(consumeTerminalRestoreRequestId('new-reconnect-id')).toBe(false)
   })
+
+  it('registering new IDs after clearDeadTerminals enables restore bypass', async () => {
+    const { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } = await import('@/lib/terminal-restore')
+    // Simulate the flow: clearDeadTerminals generates new IDs,
+    // then App.tsx registers them with addTerminalRestoreRequestId
+    const newIds = ['new-id-1', 'new-id-2', 'new-id-3']
+    for (const id of newIds) {
+      addTerminalRestoreRequestId(id)
+    }
+    // All new IDs should be consumable (enabling restore: true)
+    for (const id of newIds) {
+      expect(consumeTerminalRestoreRequestId(id)).toBe(true)
+    }
+    // Already consumed
+    for (const id of newIds) {
+      expect(consumeTerminalRestoreRequestId(id)).toBe(false)
+    }
+  })
 })

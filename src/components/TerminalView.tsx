@@ -73,9 +73,9 @@ import { createLogger } from '@/lib/client-logger'
 const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
-const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 3
-const RATE_LIMIT_RETRY_BASE_MS = 250
-const RATE_LIMIT_RETRY_MAX_MS = 1000
+export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
+export const RATE_LIMIT_RETRY_BASE_MS = 2000
+export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
@@ -218,6 +218,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const suppressNetworkEffects = typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
+  const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
@@ -1277,6 +1278,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [isTerminal, dispatch, tabId])
 
   const markAttachComplete = useCallback(() => {
+    wasCreatedFreshRef.current = false
     deferredAttachStateRef.current = {
       mode: 'live',
       pendingIntent: null,
@@ -1522,7 +1524,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      term.writeln(`\r\n[Rate limited - retrying in ${delayMs}ms]\r\n`)
+      term.writeln(`\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
       return true
     }
 
@@ -1992,7 +1994,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
   const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
-  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating'
+  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
   const inlineStatusMessage = showInlineOfflineStatus
     ? 'Offline: input will queue until reconnected.'
     : (showInlineRecoveringStatus ? 'Recovering terminal output...' : null)

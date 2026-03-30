@@ -311,6 +311,7 @@ export class WsHandler {
   private terminalsRevision = 0
   private terminalRuntimeRevisions = new Map<string, number>()
   private readonly serverInstanceId: string
+  private readonly bootId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
   private clientMessageSchema: z.ZodTypeAny
@@ -352,6 +353,7 @@ export class WsHandler {
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
+    this.bootId = `boot-${randomUUID()}`
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
     // Build the set of valid CLI provider/mode names from extensions
@@ -972,6 +974,16 @@ export class WsHandler {
       if (snapshot.configFallback) {
         this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
       }
+
+      // Send terminal inventory so the client knows what's alive
+      const terminals = this.registry.list()
+      const terminalMeta = this.terminalMetaListProvider?.() ?? []
+      this.safeSend(ws, {
+        type: 'terminal.inventory',
+        bootId: this.bootId,
+        terminals,
+        terminalMeta,
+      })
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
@@ -1072,6 +1084,7 @@ export class WsHandler {
           type: 'ready',
           timestamp: nowIso(),
           serverInstanceId: this.serverInstanceId,
+          bootId: this.bootId,
         })
         this.scheduleHandshakeSnapshot(ws, state)
         return

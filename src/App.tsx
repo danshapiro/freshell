@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
@@ -54,7 +54,9 @@ import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
-import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { clearDeadTerminals } from '@/store/panesSlice'
+import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -136,6 +138,7 @@ const ReadyMessageSchema = z.object({
   type: z.literal('ready'),
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
+  bootId: z.string().min(1).optional(),
 })
 
 export default function App() {
@@ -446,6 +449,7 @@ export default function App() {
     let startupRecoveryRerunRequested = false
     let platformCapabilitiesLoaded = false
     let lastReadyServerInstanceId: string | undefined
+    let lastSessionsRevision = -1
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
@@ -717,15 +721,28 @@ export default function App() {
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
+          const newBootId = ready.success ? ready.data.bootId : undefined
+          const previousBootId = appStore.getState().connection.bootId
+          const serverRestarted = !!previousBootId && previousBootId !== newBootId
+          dispatch(setBootId(newBootId))
+          dispatch(setServerRestarted(serverRestarted))
+          if (serverRestarted) {
+            dispatch(setLiveTerminalIds([]))
+          }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
+          lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
         if (msg.type === 'sessions.changed') {
-          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+          const rev = typeof msg.revision === 'number' ? msg.revision : -1
+          if (rev > lastSessionsRevision) {
+            lastSessionsRevision = rev
+            void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+          }
         }
         if (msg.type === 'settings.updated') {
           dispatch(setServerSettings(msg.settings as ServerSettings))
@@ -747,6 +764,35 @@ export default function App() {
           for (const terminalId of remove) {
             dispatch(removeTerminalMeta(terminalId))
           }
+        }
+        if (msg.type === 'terminal.inventory') {
+          const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
+          const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
+          const liveIds = terminals
+            .filter((t: any) => t.status === 'running')
+            .map((t: any) => t.terminalId as string)
+          dispatch(setLiveTerminalIds(liveIds))
+          dispatch(setServerRestarted(false))
+          dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
+          // Register new createRequestIds with the restore set so the
+          // subsequent terminal.create messages include restore: true
+          // and bypass the server's rate limiter.
+          const layouts = appStore.getState().panes.layouts
+          for (const layout of Object.values(layouts)) {
+            ;(function walk(node: any) {
+              if (!node) return
+              if (node.type === 'leaf') {
+                if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
+                  addTerminalRestoreRequestId(node.content.createRequestId)
+                }
+                return
+              }
+              if (node.type === 'split' && Array.isArray(node.children)) {
+                for (const child of node.children) walk(child)
+              }
+            })(layout)
+          }
+          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: Date.now() }))
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''

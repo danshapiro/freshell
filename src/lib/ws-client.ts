@@ -95,7 +95,10 @@ export class WsClient {
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
   private baseReconnectDelay = 1000
+  private maxReconnectDelay = 4000
+  private postShutdownBaseDelay = 500
   private wasConnectedOnce = false
+  private fastReconnectMode = false
 
   private maxQueueSize = 1000
   private connectStartedAt: number | null = null
@@ -176,6 +179,7 @@ export class WsClient {
       this.ws.onopen = () => {
         this._state = 'connected'
         this.reconnectAttempts = 0
+        this.fastReconnectMode = false
 
         // Send hello with token in message body (not URL).
         const token = getAuthToken()
@@ -368,8 +372,9 @@ export class WsClient {
 
         if (event.code === 4009) {
           // SERVER_SHUTDOWN — server is rebinding and will be back shortly.
-          // Reset backoff for a fast ~1s reconnect.
+          // Reset backoff and use faster base delay for quick recovery.
           this.reconnectAttempts = 0
+          this.fastReconnectMode = true
           finishReject(new Error('Server restarting (rebind)'))
           this.scheduleReconnect()
           return
@@ -410,8 +415,11 @@ export class WsClient {
       return
     }
 
-    const baseDelay = this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts)
-    const delay = Math.max(baseDelay, opts?.minDelayMs ?? 0)
+    const base = this.fastReconnectMode ? this.postShutdownBaseDelay : this.baseReconnectDelay
+    const exponential = base * Math.pow(2, this.reconnectAttempts)
+    const capped = Math.min(exponential, this.maxReconnectDelay)
+    const jitter = capped * (0.8 + Math.random() * 0.4)
+    const delay = Math.max(Math.round(jitter), opts?.minDelayMs ?? 0)
     this.reconnectAttempts++
 
     this.clearReconnectTimer()

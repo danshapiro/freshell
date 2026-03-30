@@ -6,6 +6,9 @@ import connectionReducer, {
   setPlatform,
   setAvailableClis,
   setFeatureFlags,
+  setBootId,
+  setServerRestarted,
+  setLiveTerminalIds,
   ConnectionState,
   ConnectionStatus,
 } from '../../../../src/store/connectionSlice'
@@ -360,6 +363,32 @@ describe('connectionSlice', () => {
       state = connectionReducer(state, setPlatform('linux'))
       expect(state.platform).toBe('linux')
       expect(state.featureFlags).toEqual({ kilroy: true })
+    })
+  })
+
+  describe('bootId and server restart detection', () => {
+    it('stores bootId via setBootId', () => {
+      const state = connectionReducer(undefined, setBootId('boot-abc'))
+      expect(state.bootId).toBe('boot-abc')
+    })
+
+    it('tracks server restart flag', () => {
+      let state = connectionReducer(undefined, setServerRestarted(true))
+      expect(state.serverRestarted).toBe(true)
+
+      state = connectionReducer(state, setServerRestarted(false))
+      expect(state.serverRestarted).toBe(false)
+    })
+
+    it('stores live terminal IDs', () => {
+      const state = connectionReducer(undefined, setLiveTerminalIds(['t1', 't2']))
+      expect(state.liveTerminalIds).toEqual(['t1', 't2'])
+    })
+
+    it('clears live terminal IDs', () => {
+      let state = connectionReducer(undefined, setLiveTerminalIds(['t1']))
+      state = connectionReducer(state, setLiveTerminalIds(undefined))
+      expect(state.liveTerminalIds).toBeUndefined()
     })
   })
 
