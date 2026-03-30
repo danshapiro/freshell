@@ -312,6 +312,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     sinceSeq: number
     cols: number
     rows: number
+    usedMaxReplayBytes: boolean
   } | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
     terminalId: string
@@ -1464,6 +1465,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       sinceSeq,
       cols,
       rows,
+      usedMaxReplayBytes: !!opts?.maxReplayBytes,
     }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }
@@ -1742,10 +1744,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          // If this gap is from a truncated replay (maxReplayBytes), store it
-          // for the "load more history" UI instead of printing a gap message.
+          // Only show "load more" when the gap is from our byte-budget truncation
+          // (usedMaxReplayBytes), not from ring overflow where the data is gone.
           const currentAttach = currentAttachRef.current
-          const isTruncatedReplay = currentAttach
+          const isTruncatedReplay = currentAttach?.usedMaxReplayBytes
             && msg.reason === 'replay_window_exceeded'
             && seqStateRef.current.pendingReplay
           if (isTruncatedReplay) {
