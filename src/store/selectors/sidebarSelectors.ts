@@ -1,6 +1,6 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
-import type { BackgroundTerminal, CodingCliProviderName } from '../types'
+import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -42,6 +42,7 @@ const selectSessionActivityForSort = (state: RootState) => {
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }
+const selectWorktreeGrouping = (state: RootState): WorktreeGrouping => state.settings.settings.sidebar?.worktreeGrouping || 'repo'
 const selectShowSubagents = (state: RootState) => state.settings.settings.sidebar?.showSubagents ?? false
 const selectIgnoreCodexSubagents = (state: RootState) => state.settings.settings.sidebar?.ignoreCodexSubagents ?? true
 const selectShowNoninteractiveSessions = (state: RootState) => state.settings.settings.sidebar?.showNoninteractiveSessions ?? false
@@ -61,7 +62,8 @@ export function buildSessionItems(
   tabs: RootState['tabs']['tabs'],
   panes: RootState['panes'],
   terminals: BackgroundTerminal[],
-  sessionActivity: Record<string, number>
+  sessionActivity: Record<string, number>,
+  worktreeGrouping: WorktreeGrouping = 'repo',
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
   const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[] }>()
@@ -100,6 +102,9 @@ export function buildSessionItems(
       const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
       const hasTitle = !!session.title
+      const effectivePath = worktreeGrouping === 'worktree'
+        ? (session.checkoutPath || project.projectPath)
+        : project.projectPath
       items.push({
         id: `session-${provider}-${session.sessionId}`,
         sessionId: session.sessionId,
@@ -107,8 +112,8 @@ export function buildSessionItems(
         sessionType: session.sessionType || provider,
         title: session.title || session.sessionId.slice(0, 8),
         hasTitle,
-        subtitle: getProjectName(project.projectPath),
-        projectPath: project.projectPath,
+        subtitle: getProjectName(effectivePath),
+        projectPath: effectivePath,
         projectColor: project.color,
         archived: session.archived,
         timestamp: session.lastActivityAt,
@@ -366,6 +371,7 @@ export const makeSelectSortedSessionItems = () =>
       selectPanes,
       selectSessionActivityForSort,
       selectSortMode,
+      selectWorktreeGrouping,
       selectShowSubagents,
       selectIgnoreCodexSubagents,
       selectShowNoninteractiveSessions,
@@ -381,6 +387,7 @@ export const makeSelectSortedSessionItems = () =>
       panes,
       sessionActivity,
       sortMode,
+      worktreeGrouping,
       showSubagents,
       ignoreCodexSubagents,
       showNoninteractiveSessions,
@@ -390,7 +397,7 @@ export const makeSelectSortedSessionItems = () =>
       terminals,
       filter
     ) => {
-      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity)
+      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping)
       const visible = filterSessionItemsByVisibility(items, {
         showSubagents,
         ignoreCodexSubagents,
