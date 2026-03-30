@@ -94,19 +94,7 @@ describe('buildResumeContent', () => {
     expect(content.mode).toBe('claude')
   })
 
-  it('passes terminalId through for terminal panes', () => {
-    const content = buildResumeContent({
-      sessionType: 'claude',
-      sessionId: 'abc-123',
-      terminalId: 'term-42',
-    })
-    expect(content.kind).toBe('terminal')
-    if (content.kind !== 'terminal') throw new Error('expected terminal')
-    expect(content.terminalId).toBe('term-42')
-    expect(content.status).toBe('running')
-  })
-
-  it('sets status to creating when no terminalId', () => {
+  it('returns terminal content without terminalId (set at pane level)', () => {
     const content = buildResumeContent({
       sessionType: 'claude',
       sessionId: 'abc-123',
@@ -114,17 +102,16 @@ describe('buildResumeContent', () => {
     expect(content.kind).toBe('terminal')
     if (content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.terminalId).toBeUndefined()
-    expect(content.status).toBe('creating')
+    expect(content.mode).toBe('claude')
+    expect(content.resumeSessionId).toBe('abc-123')
   })
 
-  it('ignores terminalId for agent-chat panes', () => {
+  it('agent-chat panes have no terminalId', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
-      terminalId: 'term-42',
     })
     expect(content.kind).toBe('agent-chat')
-    // Agent-chat panes don't have terminalId
     expect('terminalId' in content).toBe(false)
   })
 

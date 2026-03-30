@@ -368,12 +368,11 @@ describe('TabBar', () => {
       expect(blueIcons).toHaveLength(0)
     })
 
-    it('falls back to the exact tab terminal id for a single-pane rehydrate gap', () => {
+    it('shows no activity when pane has no terminalId during rehydrate gap', () => {
       const tab = createTab({
         id: 'tab-rehydrate',
         title: 'Rehydrate Gap',
         mode: 'codex',
-        terminalId: 'term-tab',
       })
       const store = createStore(
         { tabs: [tab], activeTabId: 'tab-rehydrate' },
@@ -410,7 +409,7 @@ describe('TabBar', () => {
       const blueIcons = within(tabElement).getAllByTestId('pane-icon')
         .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
-      expect(blueIcons.length).toBeGreaterThan(0)
+      expect(blueIcons).toHaveLength(0)
     })
   })
 
@@ -556,17 +555,33 @@ describe('TabBar', () => {
       expect(state.tabs[0].id).toBe('tab-2')
     })
 
-    it('close button sends detach message when tab has terminalId', () => {
+    it('close button sends detach message when pane has terminalId', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
-        terminalId: 'term-123',
       })
 
-      const store = createStore({
-        tabs: [tab],
-        activeTabId: 'tab-1',
-      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'shell',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-123',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
 
       renderWithStore(<TabBar />, store)
 
@@ -583,13 +598,29 @@ describe('TabBar', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
-        terminalId: 'term-456',
       })
 
-      const store = createStore({
-        tabs: [tab],
-        activeTabId: 'tab-1',
-      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'shell',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-456',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
 
       renderWithStore(<TabBar />, store)
 
@@ -606,7 +637,6 @@ describe('TabBar', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
-        terminalId: 'term-stale',
       })
 
       const store = createStore(

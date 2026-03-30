@@ -53,7 +53,6 @@ function renderHarness(options: RenderHarnessOptions = {}) {
     status: 'running',
     mode: 'codex',
     shell: 'system',
-    terminalId: 'term-live',
     createdAt: 1,
     ...options.tab,
   }
@@ -162,9 +161,8 @@ describe('codex activity indicator flow (e2e)', () => {
     expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('falls back to the exact tab terminal id during single-pane rehydrate gaps', () => {
+  it('shows no activity when pane has no terminalId even during single-pane rehydrate gaps', () => {
     renderHarness({
-      tab: { terminalId: 'term-tab' },
       pane: { terminalId: undefined },
       codexActivity: {
         byTerminalId: {
@@ -177,16 +175,15 @@ describe('codex activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     const tabButton = getVisibleSinglePaneTab()
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
   it('never shows blue from resumeSessionId, sessionRef, cwd, or provider-only terminal meta fallbacks', () => {
     renderHarness({
       tab: {
-        terminalId: undefined,
         resumeSessionId: 'session-1',
       },
       pane: {

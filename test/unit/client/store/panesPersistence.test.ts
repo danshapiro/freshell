@@ -25,6 +25,7 @@ import {
   persistMiddleware,
   resetPersistFlushListenersForTests,
   resetPersistedPanesCacheForTests,
+  resetPersistedLayoutCacheForTests,
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
 
@@ -35,6 +36,7 @@ describe('Panes Persistence Integration', () => {
     vi.useFakeTimers()
     resetPersistFlushListenersForTests()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   afterEach(() => {
@@ -74,10 +76,10 @@ describe('Panes Persistence Integration', () => {
 
     // 6. Check localStorage was updated
     vi.runAllTimers()
-    const savedPanes = localStorage.getItem('freshell.panes.v2')
-    expect(savedPanes).not.toBeNull()
-    const parsedPanes = JSON.parse(savedPanes!)
-    expect(parsedPanes.layouts[tabId].type).toBe('split')
+    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    expect(savedLayout).not.toBeNull()
+    const parsedLayout = JSON.parse(savedLayout!)
+    expect(parsedLayout.panes.layouts[tabId].type).toBe('split')
 
     // 7. Simulate page refresh - create new store and hydrate
     // (Using explicit hydration to test that path still works)
@@ -191,9 +193,9 @@ describe('Panes Persistence Integration', () => {
 
     // Verify state was persisted
     vi.runAllTimers()
-    const savedPanes = localStorage.getItem('freshell.panes.v2')
-    expect(savedPanes).not.toBeNull()
-    expect(JSON.parse(savedPanes!).layouts[tabId].type).toBe('split')
+    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    expect(savedLayout).not.toBeNull()
+    expect(JSON.parse(savedLayout!).panes.layouts[tabId].type).toBe('split')
 
     // 2. Verify loadPersistedPanes returns correct data
     const loaded = loadPersistedPanes()
@@ -228,10 +230,10 @@ describe('Panes Persistence Integration', () => {
 
     vi.runAllTimers()
 
-    const savedPanes = localStorage.getItem('freshell.panes.v2')
-    expect(savedPanes).not.toBeNull()
-    const parsedPanes = JSON.parse(savedPanes!)
-    const layout = parsedPanes.layouts[tabId]
+    const savedLayout = localStorage.getItem('freshell.layout.v3')
+    expect(savedLayout).not.toBeNull()
+    const parsedLayout = JSON.parse(savedLayout!)
+    const layout = parsedLayout.panes.layouts[tabId]
     expect(layout.content.kind).toBe('editor')
     expect(layout.content.content).toBe('')
   })
@@ -353,8 +355,8 @@ describe('Panes Persistence Integration', () => {
 
     vi.runAllTimers()
 
-    const saved = JSON.parse(localStorage.getItem('freshell.panes.v2')!)
-    expect(saved.refreshRequestsByPane).toBeUndefined()
+    const saved = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    expect(saved.panes.refreshRequestsByPane).toBeUndefined()
   })
 
   it('flushes pending writes on visibility change', () => {
@@ -370,12 +372,12 @@ describe('Panes Persistence Integration', () => {
     const tabId = store.getState().tabs.tabs[0].id
     store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
 
-    expect(localStorage.getItem('freshell.panes.v2')).toBeNull()
+    expect(localStorage.getItem('freshell.layout.v3')).toBeNull()
 
     Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
     document.dispatchEvent(new Event('visibilitychange'))
 
-    expect(localStorage.getItem('freshell.panes.v2')).not.toBeNull()
+    expect(localStorage.getItem('freshell.layout.v3')).not.toBeNull()
   })
 })
 
@@ -383,6 +385,7 @@ describe('PaneContent migration', () => {
   beforeEach(() => {
     localStorageMock.clear()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   it('migrates old terminal pane content to include lifecycle fields', () => {
@@ -542,6 +545,7 @@ describe('version 3 migration', () => {
   beforeEach(() => {
     localStorageMock.clear()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   it('adds empty paneTitles when migrating from version 2', () => {
@@ -578,6 +582,7 @@ describe('loadInitialPanesState consistency', () => {
   beforeEach(() => {
     localStorageMock.clear()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   it('initial pane state matches loadPersistedPanes output for migrated data', async () => {
@@ -618,6 +623,7 @@ describe('orphaned layout cleanup', () => {
   beforeEach(() => {
     localStorageMock.clear()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   it('removes pane layouts for tabs that no longer exist', async () => {
@@ -660,6 +666,7 @@ describe('version 5 migration (drop claude-chat panes)', () => {
   beforeEach(() => {
     localStorageMock.clear()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   it('drops claude-chat leaf panes during v4→v5 migration', () => {
@@ -743,6 +750,7 @@ describe('schema version consistency', () => {
     vi.useFakeTimers()
     resetPersistFlushListenersForTests()
     resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
   })
 
   afterEach(() => {
@@ -760,9 +768,9 @@ describe('schema version consistency', () => {
     store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.panes.v2')!
+    const raw = localStorage.getItem('freshell.layout.v3')!
     const parsed = JSON.parse(raw)
     // The version written by persist middleware must match persistedState's version
-    expect(parsed.version).toBe(PANES_SCHEMA_VERSION)
+    expect(parsed.panes.version).toBe(PANES_SCHEMA_VERSION)
   })
 })

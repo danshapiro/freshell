@@ -411,12 +411,6 @@ export const sessionsSlice = createSlice({
       if (expanded) state.expandedProjects.add(projectPath)
       else state.expandedProjects.delete(projectPath)
     },
-    collapseAll: (state) => {
-      state.expandedProjects = new Set()
-    },
-    expandAll: (state) => {
-      state.expandedProjects = new Set(state.projects.map((p) => p.projectPath))
-    },
   },
 })
 
@@ -438,8 +432,6 @@ export const {
   setLoadingMore,
   toggleProjectExpanded,
   setProjectExpanded,
-  collapseAll,
-  expandAll,
 } =
   sessionsSlice.actions
 

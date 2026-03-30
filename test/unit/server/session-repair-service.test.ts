@@ -320,4 +320,57 @@ describe('SessionRepairService', () => {
       await service.stop()
     }
   })
+
+  it('returns cached result immediately when session is queued but cache is valid', async () => {
+    const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
+    await fs.mkdir(projectDir, { recursive: true })
+
+    const targetSessionId = 'target-session'
+    const targetFile = path.join(projectDir, `${targetSessionId}.jsonl`)
+    await fs.writeFile(targetFile, createTranscript(targetSessionId, '/tmp/target'))
+
+    // Scanner that should never be called for the target session
+    const scan = vi.fn(async (filePath: string): Promise<SessionScanResult> => {
+      await new Promise(() => {}) // block forever
+      throw new Error('unreachable')
+    })
+
+    const service = new SessionRepairService({
+      cacheDir: tempDir,
+      scanner: { scan, repair: vi.fn() } as any,
+    })
+
+    // Seed the cache and session path index
+    const cachedResult: SessionScanResult = {
+      sessionId: targetSessionId,
+      filePath: targetFile,
+      status: 'healthy',
+      chainDepth: 5,
+      orphanCount: 0,
+      fileSize: 100,
+      messageCount: 10,
+    }
+    await (service as any).cache.set(targetFile, cachedResult)
+
+    // Directly enqueue the session in the queue (simulating what discovery does)
+    // but DON'T start the queue, so it stays queued and never processes
+    const queue = (service as any).queue
+    queue.enqueue([{ sessionId: targetSessionId, filePath: targetFile, priority: 'disk' }])
+
+    // Also set the session path index (normally done by discovery)
+    ;(service as any).sessionPathIndex.set(targetSessionId, targetFile)
+
+    // The session is now queued but not processed.
+    // waitForSession should find it via cache and return immediately.
+    const before = Date.now()
+    const result = await service.waitForSession(targetSessionId, 100)
+    const elapsed = Date.now() - before
+
+    expect(result.sessionId).toBe(targetSessionId)
+    expect(result.status).toBe('healthy')
+    expect(result.chainDepth).toBe(5)
+    expect(elapsed).toBeLessThan(50)
+    // Scanner should NOT have been called — cache hit bypassed it
+    expect(scan).not.toHaveBeenCalled()
+  })
 })
