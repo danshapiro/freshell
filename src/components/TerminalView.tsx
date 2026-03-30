@@ -2089,6 +2089,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
   }, [isMobile, mobileBottomInsetPx])
 
+  const handleLoadMoreHistory = useCallback(() => {
+    const tid = terminalIdRef.current
+    if (!tid) return
+    setTruncatedHistoryGap(null)
+    attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+  }, [attachTerminal])
+
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
     return null
@@ -2168,6 +2175,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           <span className="rounded bg-background/90 px-2 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60">
             {inlineStatusMessage}
           </span>
+        </div>
+      )}
+      {truncatedHistoryGap && (
+        <div className="absolute inset-x-0 top-0 z-10 flex justify-center">
+          <button
+            type="button"
+            className="rounded-b bg-muted/90 px-3 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60 hover:bg-muted hover:text-foreground transition-colors"
+            onClick={handleLoadMoreHistory}
+            aria-label="Load earlier terminal history"
+          >
+            Load more history
+          </button>
         </div>
       )}
       <ConnectionErrorOverlay />
