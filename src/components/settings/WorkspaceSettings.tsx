@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react'
 import { KEYBOARD_SHORTCUTS } from '@/lib/keyboard-shortcuts'
 import type {
   SidebarSortMode,
+  WorktreeGrouping,
   SessionOpenMode,
   TabAttentionStyle,
   AttentionDismiss,
@@ -56,6 +57,20 @@ export default function WorkspaceSettings({
             <option value="recency-pinned">Recency (pinned)</option>
             <option value="activity">Activity (tabs first)</option>
             <option value="project">Project</option>
+          </select>
+        </SettingsRow>
+
+        <SettingsRow label="Worktree grouping">
+          <select
+            value={settings.sidebar?.worktreeGrouping || 'repo'}
+            onChange={(e) => {
+              const v = e.target.value as WorktreeGrouping
+              applyLocalSetting({ sidebar: { worktreeGrouping: v } })
+            }}
+            className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
+          >
+            <option value="repo">Repository</option>
+            <option value="worktree">Worktree</option>
           </select>
         </SettingsRow>
 

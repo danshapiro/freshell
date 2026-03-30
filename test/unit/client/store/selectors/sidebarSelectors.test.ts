@@ -465,6 +465,70 @@ describe('sidebarSelectors', () => {
     })
   })
 
+  describe('worktree grouping', () => {
+    const emptyTabs: [] = []
+    const emptyPanes = { layouts: {} } as any
+    const emptyTerminals: [] = []
+    const emptyActivity: Record<string, number> = {}
+
+    function makeProject(sessions: Partial<CodingCliSession>[], projectPath = '/test/repo', color?: string): ProjectGroup {
+      return {
+        projectPath,
+        color,
+        sessions: sessions.map((s) => ({
+          provider: 'claude' as const,
+          sessionId: 'sess-1',
+          projectPath,
+          lastActivityAt: 1000,
+          ...s,
+        })),
+      }
+    }
+
+    it('uses projectPath for subtitle in repo mode (default)', () => {
+      const projects = [
+        makeProject([
+          { sessionId: 'wt-1', checkoutPath: '/test/repo/.worktrees/feature-a' },
+          { sessionId: 'wt-2' },
+        ], '/test/repo'),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items[0].subtitle).toBe('repo')
+      expect(items[0].projectPath).toBe('/test/repo')
+      expect(items[1].subtitle).toBe('repo')
+      expect(items[1].projectPath).toBe('/test/repo')
+    })
+
+    it('uses checkoutPath for subtitle in worktree mode', () => {
+      const projects = [
+        makeProject([
+          { sessionId: 'wt-1', checkoutPath: '/test/repo/.worktrees/feature-a' },
+          { sessionId: 'wt-2' },
+        ], '/test/repo'),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity, 'worktree')
+
+      expect(items[0].subtitle).toBe('feature-a')
+      expect(items[0].projectPath).toBe('/test/repo/.worktrees/feature-a')
+      expect(items[1].subtitle).toBe('repo')
+      expect(items[1].projectPath).toBe('/test/repo')
+    })
+
+    it('falls back to projectPath when session has no checkoutPath in worktree mode', () => {
+      const projects = [
+        makeProject([{ sessionId: 'no-wt' }], '/test/repo'),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity, 'worktree')
+
+      expect(items[0].subtitle).toBe('repo')
+      expect(items[0].projectPath).toBe('/test/repo')
+    })
+  })
+
   describe('makeSelectSortedSessionItems', () => {
     it('uses the applied title query to keep only matching fallback rows and rejects ancestor-only matches', () => {
       const matchingFallback = createFallbackTab('tab-match', 'fallback-match', 'Matching Fallback', '/tmp/local/trycycle')

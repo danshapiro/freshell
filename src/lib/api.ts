@@ -275,6 +275,7 @@ export type SearchResult = {
   sessionId: string
   provider: CodingCliProviderName
   projectPath: string
+  checkoutPath?: string
   title?: string
   summary?: string
   sessionType?: string
@@ -329,6 +330,7 @@ function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
       provider: item.provider,
       sessionId: item.sessionId,
       projectPath: item.projectPath,
+      ...(item.checkoutPath ? { checkoutPath: item.checkoutPath } : {}),
       lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
       archived: item.archived,

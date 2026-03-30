@@ -18,6 +18,7 @@ import type {
   TerminalRendererMode,
   TerminalTheme,
   TabAttentionStyle,
+  WorktreeGrouping,
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
@@ -81,6 +82,7 @@ export interface CodingCliSession {
   sessionType?: string
   sessionId: string
   projectPath: string
+  checkoutPath?: string
   createdAt?: number
   lastActivityAt: number
   messageCount?: number
@@ -134,6 +136,7 @@ export type {
   TabAttentionStyle,
   TerminalRendererMode,
   TerminalTheme,
+  WorktreeGrouping,
 }
 
 export type AppSettings = ResolvedSettings

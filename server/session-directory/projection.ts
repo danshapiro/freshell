@@ -15,6 +15,7 @@ function comparableItemsEqual(a: SessionDirectoryComparableItem, b: SessionDirec
     a.provider === b.provider &&
     a.sessionId === b.sessionId &&
     a.projectPath === b.projectPath &&
+    a.checkoutPath === b.checkoutPath &&
     a.title === b.title &&
     a.summary === b.summary &&
     a.lastActivityAt === b.lastActivityAt &&
@@ -33,6 +34,7 @@ export function toSessionDirectoryComparableItem(session: CodingCliSession): Ses
     provider: session.provider,
     sessionId: session.sessionId,
     projectPath: session.projectPath,
+    checkoutPath: session.checkoutPath,
     title: session.title,
     summary: session.summary,
     lastActivityAt: session.lastActivityAt,

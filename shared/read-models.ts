@@ -41,6 +41,7 @@ export const SessionDirectoryItemSchema = z.object({
   sessionId: z.string().min(1),
   provider: z.string().min(1),
   projectPath: z.string().min(1),
+  checkoutPath: z.string().optional(),
   title: z.string().optional(),
   summary: z.string().optional(),
   snippet: z.string().optional(),
