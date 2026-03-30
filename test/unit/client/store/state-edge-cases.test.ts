@@ -25,8 +25,6 @@ import sessionsReducer, {
   setProjects,
   toggleProjectExpanded,
   setProjectExpanded,
-  collapseAll,
-  expandAll,
   SessionsState,
 } from '@/store/sessionsSlice'
 import connectionReducer, {
@@ -500,26 +498,6 @@ describe('State Edge Cases', () => {
         expect(store.getState().sessions.expandedProjects.has('/old/project')).toBe(false)
       })
 
-      it('handles expandAll when projects are empty', () => {
-        const store = createTestStore()
-
-        store.dispatch(expandAll())
-
-        expect(store.getState().sessions.expandedProjects.size).toBe(0)
-      })
-
-      it('handles collapseAll when nothing is expanded', () => {
-        const store = createTestStore()
-
-        const projects: ProjectGroup[] = [
-          { projectPath: '/project/a', sessions: [] },
-        ]
-        store.dispatch(setProjects(projects))
-        store.dispatch(collapseAll())
-
-        expect(store.getState().sessions.expandedProjects.size).toBe(0)
-      })
-
       it('handles rapid setProjects calls', () => {
         const store = createTestStore()
 
@@ -575,7 +553,7 @@ describe('State Edge Cases', () => {
           { projectPath: 'C:\\Windows\\Path', sessions: [] },
         ]
         store.dispatch(setProjects(projects))
-        store.dispatch(expandAll())
+        for (const p of projects) store.dispatch(toggleProjectExpanded(p.projectPath))
 
         const expanded = store.getState().sessions.expandedProjects
         expect(expanded.size).toBe(4)

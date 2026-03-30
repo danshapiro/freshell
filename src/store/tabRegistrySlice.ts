@@ -304,9 +304,6 @@ export const tabRegistrySlice = createSlice({
     recordClosedTabSnapshot: (state, action: PayloadAction<RegistryTabRecord>) => {
       state.localClosed[action.payload.tabKey] = action.payload
     },
-    clearClosedTabSnapshot: (state, action: PayloadAction<string>) => {
-      delete state.localClosed[action.payload]
-    },
     pushReopenEntry: (state, action: PayloadAction<ClosedTabEntry>) => {
       state.reopenStack.push(action.payload)
       if (state.reopenStack.length > REOPEN_STACK_MAX) {
@@ -329,7 +326,6 @@ export const {
   setTabRegistrySnapshot,
   setTabRegistrySyncError,
   recordClosedTabSnapshot,
-  clearClosedTabSnapshot,
   pushReopenEntry,
   popReopenEntry,
 } = tabRegistrySlice.actions
