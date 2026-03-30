@@ -165,6 +165,15 @@ export default function EditorPane({
   const [terminalCwds, setTerminalCwds] = useState<Record<string, string>>({})
   const [filePickerMessage, setFilePickerMessage] = useState<string | null>(null)
 
+  const lastSavedContent = useRef<string>(content)
+  const lastKnownMtime = useRef<string | null>(null)
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
+
+  const [conflictState, setConflictState] = useState<{
+    diskContent: string
+    diskMtime: string
+  } | null>(null)
+
   const firstTerminalCwd = useMemo(
     () => (layout ? getFirstTerminalCwd(layout, terminalCwds) : null),
     [layout, terminalCwds]
@@ -351,6 +360,7 @@ export default function EditorPane({
           content: string
           language?: string
           filePath?: string
+          modifiedAt?: string
         }>(`/api/files/read?path=${encodeURIComponent(resolvedPath)}`)
 
         const resolvedFilePath = response.filePath || resolvedPath
@@ -370,6 +380,8 @@ export default function EditorPane({
         setCurrentLanguage(resolvedLanguage)
         setCurrentViewMode(nextViewMode)
         pendingContent.current = response.content
+        lastSavedContent.current = response.content
+        lastKnownMtime.current = response.modifiedAt || null
 
         if (editorRef.current) {
           const model = editorRef.current.getModel()
@@ -581,10 +593,12 @@ export default function EditorPane({
           if (filePath) {
             const resolved = resolvePath(filePath)
             if (!resolved) return
-            await api.post('/api/files/write', {
+            const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
               path: resolved,
               content: value,
             })
+            lastKnownMtime.current = saveResult?.modifiedAt || null
+            lastSavedContent.current = value
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
@@ -616,10 +630,12 @@ export default function EditorPane({
       if (filePath) {
         const resolved = resolvePath(filePath)
         if (!resolved) return
-        await api.post('/api/files/write', {
+        const saveResult = await api.post<{ success: boolean; modifiedAt?: string }>('/api/files/write', {
           path: resolved,
           content: value,
         })
+        lastKnownMtime.current = saveResult?.modifiedAt || null
+        lastSavedContent.current = value
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -676,6 +692,106 @@ export default function EditorPane({
     updateContent({ viewMode: nextMode })
   }, [currentViewMode, updateContent])
 
+  const handleReloadFromDisk = useCallback(() => {
+    if (!conflictState) return
+    if (autoSaveTimer.current) {
+      clearTimeout(autoSaveTimer.current)
+      autoSaveTimer.current = null
+    }
+    setEditorValue(conflictState.diskContent)
+    pendingContent.current = conflictState.diskContent
+    lastSavedContent.current = conflictState.diskContent
+    lastKnownMtime.current = conflictState.diskMtime
+    updateContent({ content: conflictState.diskContent })
+    setConflictState(null)
+  }, [conflictState, updateContent])
+
+  const handleKeepLocal = useCallback(() => {
+    if (!conflictState) return
+    if (autoSaveTimer.current) {
+      clearTimeout(autoSaveTimer.current)
+      autoSaveTimer.current = null
+    }
+    lastKnownMtime.current = conflictState.diskMtime
+    setConflictState(null)
+    scheduleAutoSave(pendingContent.current)
+  }, [conflictState, scheduleAutoSave])
+
+  useEffect(() => {
+    if (!filePath) return
+    if (fileHandleRef.current) return
+
+    const poll = async () => {
+      if (!mountedRef.current) return
+      if (conflictState) return
+
+      const resolved = resolvePath(filePath)
+      if (!resolved) return
+
+      try {
+        const statResult = await api.get<{
+          exists: boolean
+          size: number | null
+          modifiedAt: string | null
+        }>(`/api/files/stat?path=${encodeURIComponent(resolved)}`)
+
+        if (!mountedRef.current) return
+
+        if (!statResult.exists || !statResult.modifiedAt) return
+        if (statResult.modifiedAt === lastKnownMtime.current) return
+
+        const wasClean = pendingContent.current === lastSavedContent.current
+        const response = await api.get<{
+          content: string
+          language?: string
+          filePath?: string
+          modifiedAt?: string
+        }>(`/api/files/read?path=${encodeURIComponent(resolved)}`)
+
+        if (!mountedRef.current) return
+
+        const stillClean = pendingContent.current === lastSavedContent.current
+        if (wasClean && stillClean) {
+          setEditorValue(response.content)
+          pendingContent.current = response.content
+          lastSavedContent.current = response.content
+          lastKnownMtime.current = response.modifiedAt || null
+
+          updateContent({
+            content: response.content,
+          })
+        } else {
+          if (autoSaveTimer.current) {
+            clearTimeout(autoSaveTimer.current)
+            autoSaveTimer.current = null
+          }
+          setConflictState({
+            diskContent: response.content,
+            diskMtime: response.modifiedAt || statResult.modifiedAt!,
+          })
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        log.error(
+          JSON.stringify({
+            severity: 'error',
+            event: 'editor_stat_poll_failed',
+            error: message,
+          })
+        )
+      }
+    }
+
+    pollIntervalRef.current = setInterval(poll, 3000)
+
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current)
+        pollIntervalRef.current = null
+      }
+    }
+  }, [filePath, resolvePath, conflictState, updateContent])
+
   useEffect(() => {
     return registerEditorActions(paneId, {
       cut: () => editorRef.current?.getAction('editor.action.clipboardCutAction')?.run(),
@@ -720,6 +836,31 @@ export default function EditorPane({
       {filePickerMessage && (
         <div className="px-3 py-1 text-xs text-muted-foreground" role="status">
           {filePickerMessage}
+        </div>
+      )}
+      {conflictState && (
+        <div
+          className="flex items-center gap-2 px-3 py-2 bg-yellow-500/10 border-b border-yellow-500/30 text-sm"
+          role="alert"
+          data-testid="editor-conflict-banner"
+        >
+          <span className="flex-1 text-yellow-700 dark:text-yellow-400">
+            File changed on disk
+          </span>
+          <button
+            className="rounded px-2 py-1 text-xs font-medium bg-yellow-500/20 hover:bg-yellow-500/30"
+            onClick={handleReloadFromDisk}
+            aria-label="Reload file from disk"
+          >
+            Reload
+          </button>
+          <button
+            className="rounded px-2 py-1 text-xs font-medium bg-muted hover:bg-muted/80"
+            onClick={handleKeepLocal}
+            aria-label="Keep local changes"
+          >
+            Keep Mine
+          </button>
         </div>
       )}
       <div className="flex-1 relative min-h-0 overflow-hidden">

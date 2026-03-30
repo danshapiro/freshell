@@ -213,8 +213,7 @@ describe('Editor Pane Integration', () => {
   })
 
   afterEach(async () => {
-    // Flush all pending timers (e.g., debounced functions) before cleanup
-    await vi.runAllTimersAsync()
+    await vi.runOnlyPendingTimersAsync()
     cleanup()
     vi.useRealTimers()
     vi.unstubAllGlobals()
