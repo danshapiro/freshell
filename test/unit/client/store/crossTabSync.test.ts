@@ -264,7 +264,7 @@ describe('crossTabSync', () => {
     })
   })
 
-  it('ignores empty browser-preference writes for Redux local settings and search range', () => {
+  it('ignores toolStrip-only browser-preference writes for Redux local settings and search range', () => {
     const store = configureStore({
       reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
     })
@@ -278,7 +278,11 @@ describe('crossTabSync', () => {
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: BROWSER_PREFERENCES_STORAGE_KEY,
-      newValue: JSON.stringify({}),
+      newValue: JSON.stringify({
+        toolStrip: {
+          expanded: true,
+        },
+      }),
     }))
 
     expect(store.getState().settings.settings.theme).toBe('dark')
@@ -308,7 +312,11 @@ describe('crossTabSync', () => {
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: BROWSER_PREFERENCES_STORAGE_KEY,
-      newValue: JSON.stringify({}),
+      newValue: JSON.stringify({
+        toolStrip: {
+          expanded: true,
+        },
+      }),
     }))
 
     expect(store.getState().settings.settings.theme).toBe('system')

@@ -451,7 +451,28 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const timelineItems = useMemo(() => session?.timelineItems ?? [], [session?.timelineItems])
   const timelineBodies = session?.timelineBodies ?? {}
 
+  // Auto-expand: count completed tools across all messages, expand the most recent N
+  const RECENT_TOOLS_EXPANDED = 3
   const messages = useMemo(() => session?.messages ?? [], [session?.messages])
+  const { completedToolOffsets, autoExpandAbove } = useMemo(() => {
+    let totalCompletedTools = 0
+    const offsets: number[] = []
+    for (const msg of messages) {
+      offsets.push(totalCompletedTools)
+      for (const b of msg.content) {
+        if (b.type === 'tool_use' && b.id) {
+          const hasResult = msg.content.some(
+            r => r.type === 'tool_result' && r.tool_use_id === b.id
+          )
+          if (hasResult) totalCompletedTools++
+        }
+      }
+    }
+    return {
+      completedToolOffsets: offsets,
+      autoExpandAbove: Math.max(0, totalCompletedTools - RECENT_TOOLS_EXPANDED),
+    }
+  }, [messages])
 
   // Debounce streaming text to limit markdown re-parsing to ~20x/sec
   const debouncedStreamingText = useStreamDebounce(
@@ -640,6 +661,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     showThinking={paneContent.showThinking ?? defaultShowThinking}
                     showTools={paneContent.showTools ?? defaultShowTools}
                     showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    completedToolOffset={completedToolOffsets[item.msgIndices[1]]}
+                    autoExpandAbove={autoExpandAbove}
                   />
                 </React.Fragment>
               )
@@ -656,6 +679,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 showThinking={paneContent.showThinking ?? defaultShowThinking}
                 showTools={paneContent.showTools ?? defaultShowTools}
                 showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                completedToolOffset={completedToolOffsets[item.msgIndex]}
+                autoExpandAbove={autoExpandAbove}
               />
             )
           })

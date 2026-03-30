@@ -143,6 +143,10 @@ function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserP
     next.legacyLocalSettingsSeedApplied = true
   }
 
+  if (current.toolStrip?.expanded !== undefined) {
+    next.toolStrip = { expanded: current.toolStrip.expanded }
+  }
+
   const settingsPatch = buildLocalSettingsPatch(state.settings.localSettings)
   if (Object.keys(settingsPatch).length > 0) {
     next.settings = settingsPatch

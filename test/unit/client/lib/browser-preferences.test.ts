@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   BROWSER_PREFERENCES_STORAGE_KEY,
   getSearchRangeDaysPreference,
+  getToolStripExpandedPreference,
   loadBrowserPreferencesRecord,
   patchBrowserPreferencesRecord,
   seedBrowserPreferencesSettingsIfEmpty,
@@ -39,8 +40,9 @@ describe('browser preferences', () => {
     })
   })
 
-  it('migrates legacy font key into the new blob once', () => {
+  it('migrates legacy font and tool-strip keys into the new blob once', () => {
     localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
+    localStorage.setItem('freshell:toolStripExpanded', 'true')
 
     expect(loadBrowserPreferencesRecord()).toEqual({
       settings: {
@@ -48,19 +50,27 @@ describe('browser preferences', () => {
           fontFamily: 'Fira Code',
         },
       },
+      toolStrip: {
+        expanded: true,
+      },
     })
     expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBeNull()
+    expect(localStorage.getItem('freshell:toolStripExpanded')).toBeNull()
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBe(JSON.stringify({
       settings: {
         terminal: {
           fontFamily: 'Fira Code',
         },
       },
+      toolStrip: {
+        expanded: true,
+      },
     }))
   })
 
   it('keeps legacy keys when migrating into the new blob fails to save', () => {
     localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
+    localStorage.setItem('freshell:toolStripExpanded', 'true')
 
     const originalSetItem = Storage.prototype.setItem
     const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (key: string, value: string) {
@@ -76,8 +86,12 @@ describe('browser preferences', () => {
           fontFamily: 'Fira Code',
         },
       },
+      toolStrip: {
+        expanded: true,
+      },
     })
     expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBe('Fira Code')
+    expect(localStorage.getItem('freshell:toolStripExpanded')).toBe('true')
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
 
     setItemSpy.mockRestore()
@@ -123,13 +137,17 @@ describe('browser preferences', () => {
     })
   })
 
-  it('reads search-range preferences from the new blob', () => {
+  it('reads tool-strip and search-range preferences from the new blob', () => {
     patchBrowserPreferencesRecord({
+      toolStrip: {
+        expanded: true,
+      },
       tabs: {
         searchRangeDays: 365,
       },
     })
 
+    expect(getToolStripExpandedPreference()).toBe(true)
     expect(getSearchRangeDaysPreference()).toBe(365)
   })
 })

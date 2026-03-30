@@ -1,5 +1,10 @@
-import { memo, useMemo, useState } from 'react'
+import { memo, useMemo, useSyncExternalStore } from 'react'
 import { ChevronRight } from 'lucide-react'
+import {
+  getToolStripExpandedPreference,
+  setToolStripExpandedPreference,
+  subscribeToolStripPreference,
+} from '@/lib/browser-preferences'
 import { cn } from '@/lib/utils'
 import { getToolPreview } from './tool-preview'
 import ToolBlock from './ToolBlock'
@@ -17,22 +22,33 @@ export interface ToolPair {
 interface ToolStripProps {
   pairs: ToolPair[]
   isStreaming: boolean
+  /** Index offset for this strip's completed tool blocks in the global sequence. */
+  completedToolOffset?: number
+  /** Completed tools at globalIndex >= this value get initialExpanded=true. */
+  autoExpandAbove?: number
   /** When false, strip is locked to collapsed view (no expand chevron). Default true. */
   showTools?: boolean
 }
 
-function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
-  const [stripExpanded, setStripExpanded] = useState(showTools)
+function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, showTools = true }: ToolStripProps) {
+  const expandedPref = useSyncExternalStore(
+    subscribeToolStripPreference,
+    getToolStripExpandedPreference,
+    () => false,
+  )
+  const expanded = showTools && expandedPref
 
   const handleToggle = () => {
-    setStripExpanded(!stripExpanded)
+    setToolStripExpandedPreference(!expandedPref)
   }
 
   const hasErrors = pairs.some(p => p.isError)
   const allComplete = pairs.every(p => p.status === 'complete')
   const isSettled = allComplete && !isStreaming
 
+  // Determine the current (latest active or last completed) tool for the reel
   const currentTool = useMemo(() => {
+    // Find the last running tool, or fall back to the last tool
     for (let i = pairs.length - 1; i >= 0; i--) {
       if (pairs[i].status === 'running') return pairs[i]
     }
@@ -42,13 +58,19 @@ function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
   const toolCount = pairs.length
   const settledText = `${toolCount} tool${toolCount !== 1 ? 's' : ''} used`
 
+  // NOTE: ToolStrip is a borderless wrapper. In collapsed mode, the collapsed
+  // row gets its own tool-colored left border (since no ToolBlock is visible).
+  // In expanded mode, ToolBlocks render their own border-l-2 exactly as today,
+  // producing two border levels (MessageBubble > ToolBlock) -- not three.
+
   return (
     <div
       role="region"
       aria-label="Tool strip"
       className="my-0.5"
     >
-      {!stripExpanded && (
+      {/* Collapsed view: single-line reel with tool-colored border + chevron */}
+      {!expanded && (
         <div
           className={cn(
             'flex items-center gap-1 px-2 py-0.5 text-xs min-w-0 border-l-2',
@@ -57,14 +79,16 @@ function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
               : 'border-l-[hsl(var(--claude-tool))]',
           )}
         >
-          <button
-            type="button"
-            onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
-            aria-label="Toggle tool details"
-          >
-            <ChevronRight className="h-3 w-3" />
-          </button>
+          {showTools && (
+            <button
+              type="button"
+              onClick={handleToggle}
+              className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
+              aria-label="Toggle tool details"
+            >
+              <ChevronRight className="h-3 w-3" />
+            </button>
+          )}
           <SlotReel
             toolName={isSettled ? null : (currentTool?.name ?? null)}
             previewText={
@@ -77,7 +101,11 @@ function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
         </div>
       )}
 
-      {stripExpanded && (
+      {/* Expanded view: toggle button + ToolBlock list (looks like today).
+          No header text -- the user specified expanded mode shows "a list of
+          tools run so far, with an expando to see each one", matching today.
+          ToolBlocks provide their own border-l-2, so no border on the wrapper. */}
+      {expanded && (
         <>
           <button
             type="button"
@@ -87,17 +115,23 @@ function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
           </button>
-          {pairs.map((pair) => (
-            <ToolBlock
-              key={pair.id}
-              name={pair.name}
-              input={pair.input}
-              output={pair.output}
-              isError={pair.isError}
-              status={pair.status}
-              initialExpanded={showTools}
-            />
-          ))}
+          {pairs.map((pair, i) => {
+            const globalIndex = (completedToolOffset ?? 0) + i
+            const shouldAutoExpand = autoExpandAbove != null
+              ? globalIndex >= autoExpandAbove && pair.status === 'complete'
+              : false
+            return (
+              <ToolBlock
+                key={pair.id}
+                name={pair.name}
+                input={pair.input}
+                output={pair.output}
+                isError={pair.isError}
+                status={pair.status}
+                initialExpanded={shouldAutoExpand}
+              />
+            )
+          })}
         </>
       )}
     </div>

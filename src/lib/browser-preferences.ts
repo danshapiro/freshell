@@ -10,10 +10,12 @@ import { BROWSER_PREFERENCES_STORAGE_KEY as STORAGE_KEY } from '@/store/storage-
 export const BROWSER_PREFERENCES_STORAGE_KEY = STORAGE_KEY
 
 const LEGACY_TERMINAL_FONT_KEY = 'freshell.terminal.fontFamily.v1'
+const LEGACY_TOOL_STRIP_STORAGE_KEY = ['freshell', 'toolStripExpanded'].join(':')
 const DEFAULT_SEARCH_RANGE_DAYS = 30
 
 export type BrowserPreferencesRecord = {
   settings?: LocalSettingsPatch
+  toolStrip?: { expanded?: boolean }
   tabs?: { searchRangeDays?: number }
   legacyLocalSettingsSeedApplied?: boolean
 }
@@ -43,6 +45,10 @@ function normalizeRecord(value: unknown): BrowserPreferencesRecord {
 
   if (value.legacyLocalSettingsSeedApplied === true) {
     normalized.legacyLocalSettingsSeedApplied = true
+  }
+
+  if (isRecord(value.toolStrip) && typeof value.toolStrip.expanded === 'boolean') {
+    normalized.toolStrip = { expanded: value.toolStrip.expanded }
   }
 
   if (
@@ -99,6 +105,18 @@ function migrateLegacyKeys(record: BrowserPreferencesRecord): BrowserPreferences
         needsPersist = true
       }
     }
+
+    const legacyToolStrip = window.localStorage.getItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
+    if (legacyToolStrip === 'true' || legacyToolStrip === 'false') {
+      sawLegacyKeys = true
+      if (next.toolStrip?.expanded === undefined) {
+        next = {
+          ...next,
+          toolStrip: { expanded: legacyToolStrip === 'true' },
+        }
+        needsPersist = true
+      }
+    }
   } catch {
     return record
   }
@@ -110,6 +128,7 @@ function migrateLegacyKeys(record: BrowserPreferencesRecord): BrowserPreferences
   if (sawLegacyKeys) {
     try {
       window.localStorage.removeItem(LEGACY_TERMINAL_FONT_KEY)
+      window.localStorage.removeItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
     } catch {
       // Ignore cleanup failures and keep the migrated in-memory value.
     }
@@ -153,6 +172,16 @@ export function patchBrowserPreferencesRecord(patch: BrowserPreferencesRecord): 
         ...next,
         settings: mergeLocalSettings(current.settings, normalizedSettings),
       }
+    }
+  }
+
+  if (isRecord(patch.toolStrip) && typeof patch.toolStrip.expanded === 'boolean') {
+    next = {
+      ...next,
+      toolStrip: {
+        ...(current.toolStrip || {}),
+        expanded: patch.toolStrip.expanded,
+      },
     }
   }
 
@@ -210,6 +239,42 @@ export function resolveBrowserPreferenceSettings(record?: BrowserPreferencesReco
   return resolveLocalSettings(record?.settings)
 }
 
+export function getToolStripExpandedPreference(): boolean {
+  return loadBrowserPreferencesRecord().toolStrip?.expanded ?? false
+}
+
+export function setToolStripExpandedPreference(expanded: boolean): void {
+  patchBrowserPreferencesRecord({
+    toolStrip: { expanded },
+  })
+
+  if (!canUseStorage()) {
+    return
+  }
+
+  try {
+    window.dispatchEvent(new StorageEvent('storage', { key: BROWSER_PREFERENCES_STORAGE_KEY }))
+  } catch {
+    window.dispatchEvent(new Event('storage'))
+  }
+}
+
 export function getSearchRangeDaysPreference(): number {
   return loadBrowserPreferencesRecord().tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS
+}
+
+export function subscribeToolStripPreference(listener: () => void): () => void {
+  if (typeof window === 'undefined') {
+    return () => {}
+  }
+
+  const handler = (event: Event) => {
+    if (event instanceof StorageEvent && event.key && event.key !== BROWSER_PREFERENCES_STORAGE_KEY) {
+      return
+    }
+    listener()
+  }
+
+  window.addEventListener('storage', handler)
+  return () => window.removeEventListener('storage', handler)
 }

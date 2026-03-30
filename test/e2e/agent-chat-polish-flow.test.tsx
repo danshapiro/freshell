@@ -21,12 +21,18 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
-import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  setToolStripExpandedPreference,
+} from '@/lib/browser-preferences'
 
+// jsdom doesn't implement scrollIntoView
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
+// Render MarkdownRenderer synchronously to avoid React.lazy timing issues
+// when running in the full test suite (dynamic import may not resolve in time)
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
   const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
   return {
@@ -82,14 +88,17 @@ describe('freshclaude polish e2e: left-border message layout', () => {
     const messages = screen.getAllByRole('article')
     expect(messages).toHaveLength(2)
 
+    // User message labeled correctly
     const userMsg = screen.getByLabelText('user message')
     expect(userMsg).toBeInTheDocument()
     expect(userMsg.className).toContain('border-l-')
 
+    // Assistant message labeled correctly
     const assistantMsg = screen.getByLabelText('assistant message')
     expect(assistantMsg).toBeInTheDocument()
     expect(assistantMsg.className).toContain('border-l-')
 
+    // Different border widths distinguish them: user=3px, assistant=2px
     expect(userMsg.className).toContain('border-l-[3px]')
     expect(assistantMsg.className).toContain('border-l-2')
   })
@@ -151,6 +160,8 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
   })
 
   it('collapses and expands tool blocks on click', () => {
+    // Tool strips are collapsed by default; set expanded to test ToolBlock interaction
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Run a command' }))
@@ -174,7 +185,7 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
     const toolButton = screen.getByRole('button', { name: /tool call/i })
     expect(toolButton).toBeInTheDocument()
 
-    // With showTools=true (default), ToolBlocks start expanded
+    // With only 1 tool (< RECENT_TOOLS_EXPANDED=3), it should start expanded
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 
     // Click to collapse
@@ -187,13 +198,15 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
   })
 })
 
-describe('freshclaude polish e2e: all tools expanded when showTools=true', () => {
+describe('freshclaude polish e2e: auto-collapse old tools', () => {
   afterEach(() => {
     cleanup()
     localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
-  it('all tools start expanded when showTools=true', () => {
+  it('old tools start collapsed while recent tools start expanded', () => {
+    // Tool strips are collapsed by default; set expanded to test auto-expand behavior
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Do things' }))
@@ -217,9 +230,9 @@ describe('freshclaude polish e2e: all tools expanded when showTools=true', () =>
     const toolButtons = screen.getAllByRole('button', { name: /tool call/i })
     expect(toolButtons).toHaveLength(5)
 
-    // All tools should start expanded when showTools=true (default)
-    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'true')
-    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
+    // RECENT_TOOLS_EXPANDED=3: first 2 collapsed, last 3 expanded
+    expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'false')
+    expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'false')
     expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[3]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[4]).toHaveAttribute('aria-expanded', 'true')
@@ -323,6 +336,8 @@ describe('freshclaude polish e2e: diff view for Edit tool', () => {
   })
 
   it('shows color-coded diff when an Edit tool result contains old_string/new_string', () => {
+    // Tool strips are collapsed by default; set expanded to test ToolBlock content
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Edit a file' }))
@@ -354,8 +369,11 @@ describe('freshclaude polish e2e: diff view for Edit tool', () => {
       </Provider>,
     )
 
-    // Tool block should be present; with showTools=true (default), it starts expanded
+    // Tool block should be present; ensure it is expanded
     const toolButton = screen.getByRole('button', { name: /tool call/i })
+    if (toolButton.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(toolButton)
+    }
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 
     // DiffView should render with the diff figure role
@@ -375,6 +393,8 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
   })
 
   it('strips <system-reminder> tags from tool result output', () => {
+    // Tool strips are collapsed by default; set expanded to verify content is sanitized
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Read a file' }))
@@ -397,8 +417,11 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
       </Provider>,
     )
 
-    // ToolBlock should be expanded (showTools=true default)
+    // Ensure the ToolBlock is expanded to verify the sanitized output
     const toolButton = screen.getByRole('button', { name: /tool call/i })
+    if (toolButton.getAttribute('aria-expanded') !== 'true') {
+      fireEvent.click(toolButton)
+    }
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 
     // The visible output should contain the real content
