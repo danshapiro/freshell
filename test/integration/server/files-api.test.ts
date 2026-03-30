@@ -296,7 +296,7 @@ describe('Files API Integration', () => {
     // from WSL_WINDOWS_SYS32 via a regex that matches the first single-letter path
     // component. This only works reliably on Linux where temp paths lack single-letter
     // components (macOS /var/folders/.../T/ confuses the regex).
-    it.skipIf(process.platform !== 'linux')('supports Windows drive prefixes when running in WSL', async () => {
+    it('supports Windows drive prefixes when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
       const originalPlatform = process.platform
@@ -386,7 +386,7 @@ describe('Files API Integration', () => {
     })
 
     // WSL path simulation only works on Linux; macOS temp paths confuse the mount prefix regex
-    it.skipIf(process.platform !== 'linux')('validates Windows drive paths when running in WSL', async () => {
+    it('validates Windows drive paths when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
       const originalPlatform = process.platform

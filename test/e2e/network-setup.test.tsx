@@ -47,6 +47,15 @@ const configuredRemoteStatus: NetworkStatusResponse = {
   firewall: { platform: 'linux-none', active: false, portOpen: true, commands: [], configuring: false },
 }
 
+function resetNetworkMocks(defaultPostResult: unknown = configuredRemoteStatus) {
+  mockPost.mockReset()
+  mockGet.mockReset()
+  mockFetchFirewallConfig.mockReset()
+  mockCancelFirewallConfirmation.mockReset()
+  mockCancelFirewallConfirmation.mockResolvedValue(undefined)
+  mockPost.mockResolvedValue(defaultPostResult)
+}
+
 function createStore(networkStatus: NetworkStatusResponse | null = unconfiguredStatus) {
   return configureStore({
     reducer: {
@@ -73,22 +82,14 @@ function createStore(networkStatus: NetworkStatusResponse | null = unconfiguredS
   })
 }
 
-function resetNetworkMocks() {
-  mockPost.mockReset()
-  mockGet.mockReset()
-  mockFetchFirewallConfig.mockReset()
-  mockCancelFirewallConfirmation.mockReset()
-  mockCancelFirewallConfirmation.mockResolvedValue(undefined)
-}
-
-function openSafetyTab() {
-  fireEvent.click(screen.getByRole('tab', { name: /safety/i }))
+async function openSafetySettings() {
+  fireEvent.click(screen.getByRole('tab', { name: /^safety$/i }))
+  return screen.findByRole('switch', { name: /remote access/i })
 }
 
 describe('Network Setup Wizard (e2e)', () => {
   beforeEach(() => {
     resetNetworkMocks()
-    mockPost.mockResolvedValue(configuredRemoteStatus)
   })
 
   afterEach(() => {
@@ -297,7 +298,7 @@ describe('Settings network section (e2e)', () => {
     cleanup()
   })
 
-  it('renders remote access toggle in settings', () => {
+  it('renders remote access toggle in settings', async () => {
     const store = createStore(unconfiguredStatus)
     render(
       <Provider store={store}>
@@ -305,8 +306,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    openSafetyTab()
-    expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
+    expect(await openSafetySettings()).toBeInTheDocument()
   })
 
   it('toggles remote access on and dispatches configure', async () => {
@@ -319,8 +319,7 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    openSafetyTab()
-    const toggle = screen.getByRole('switch', { name: /remote access/i })
+    const toggle = await openSafetySettings()
     fireEvent.click(toggle)
 
     await waitFor(() => {
@@ -359,8 +358,8 @@ describe('Settings network section (e2e)', () => {
       </Provider>,
     )
 
-    openSafetyTab()
-    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+    await openSafetySettings()
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall configuration/i }))
 
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
     expect(confirmationDialog).toBeInTheDocument()
