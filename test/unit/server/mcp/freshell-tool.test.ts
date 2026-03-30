@@ -1137,3 +1137,76 @@ describe('executeAction -- error handling', () => {
     expect(result.hint).toContain('Freshell')
   })
 })
+
+describe('executeAction -- parameter validation', () => {
+  it('new-tab with url param returns error suggesting open-browser', async () => {
+    const result = await executeAction('new-tab', { url: 'https://example.com' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('open-browser')
+    expect(result).toHaveProperty('hint')
+    expect(result.hint).toContain('Valid params')
+  })
+
+  it('new-tab with url and name returns error about url', async () => {
+    const result = await executeAction('new-tab', { url: 'https://example.com', name: 'My Tab' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('url')
+    expect(result.error).toContain('open-browser')
+  })
+
+  it('unknown param on any action returns error listing valid params', async () => {
+    const result = await executeAction('screenshot', { scope: 'pane', badparam: 'value' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('badparam')
+    expect(result).toHaveProperty('hint')
+    expect(result.hint).toContain('Valid params')
+  })
+
+  it('multiple unknown params returns error listing all of them', async () => {
+    const result = await executeAction('health', { foo: 1, bar: 2 })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('foo')
+    expect(result.error).toContain('bar')
+    expect(result.hint).toContain('(none)')
+  })
+
+  it('valid params pass through without error', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    const result = await executeAction('new-tab', { name: 'Work', mode: 'claude' })
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
+  })
+
+  it('tmux alias validates params against the resolved action', async () => {
+    const result = await executeAction('new-window', { unknownParam: 'value' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('unknownParam')
+  })
+
+  it('tmux alias with valid params routes through', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    const result = await executeAction('new-window', { name: 'Work', mode: 'claude' })
+    expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
+  })
+
+  it('tmux alias surfaces common confusion hints', async () => {
+    const result = await executeAction('new-window', { url: 'https://example.com' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('open-browser')
+  })
+
+  it('empty params on paramless action succeeds', async () => {
+    mockClient.get.mockResolvedValue({ ok: true })
+    const result = await executeAction('health')
+    expect(result).not.toHaveProperty('error')
+  })
+
+  it('help text mentions open-browser for URLs', async () => {
+    const result = await executeAction('help')
+    const text = typeof result === 'string' ? result : JSON.stringify(result)
+    expect(text).toContain("use 'open-browser'")
+    expect(text).toContain('open-browser')
+    expect(text).toContain('Playbook: open a URL')
+  })
+})
