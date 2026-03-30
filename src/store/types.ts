@@ -18,6 +18,7 @@ import type {
   TerminalRendererMode,
   TerminalTheme,
   TabAttentionStyle,
+  WorktreeGrouping,
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
@@ -135,6 +136,7 @@ export type {
   TabAttentionStyle,
   TerminalRendererMode,
   TerminalTheme,
+  WorktreeGrouping,
 }
 
 export type AppSettings = ResolvedSettings
