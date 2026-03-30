@@ -736,4 +736,46 @@ describe('crossTabSync', () => {
       .filter((a: any) => a?.type === 'tabs/hydrateTabs')
     expect(hydrateCalls).toHaveLength(2)
   })
+
+  it('hydrates paired panes when tabs event arrives first', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    // Install sync first (captures current empty localStorage as baseline)
+    cleanups.push(installCrossTabSync(store as any))
+
+    const tabsRaw = JSON.stringify({
+      version: 1,
+      tabs: {
+        activeTabId: 't1',
+        tabs: [
+          { id: 't1', title: 'T1', mode: 'shell' },
+          { id: 't2', title: 'T2', mode: 'shell' },
+        ],
+      },
+    })
+
+    const panesRaw = JSON.stringify({
+      version: 6,
+      layouts: {
+        't1': { type: 'leaf', id: 'p1', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r1', status: 'running' } },
+        't2': { type: 'leaf', id: 'p2', content: { kind: 'terminal', mode: 'shell', createRequestId: 'r2', status: 'running' } },
+      },
+      activePane: { 't1': 'p1', 't2': 'p2' },
+      paneTitles: {},
+    })
+
+    // Simulate flush() in another tab: both are written to localStorage
+    localStorage.setItem(TABS_STORAGE_KEY, tabsRaw)
+    localStorage.setItem(PANES_STORAGE_KEY, panesRaw)
+
+    // Only the tabs event arrives — panes should also be hydrated from localStorage
+    window.dispatchEvent(new StorageEvent('storage', { key: TABS_STORAGE_KEY, newValue: tabsRaw }))
+
+    // Both tabs and panes should be hydrated consistently
+    expect(store.getState().tabs.tabs.map((t: any) => t.id)).toEqual(['t1', 't2'])
+    expect(store.getState().panes.layouts).toHaveProperty('t1')
+    expect(store.getState().panes.layouts).toHaveProperty('t2')
+  })
 })

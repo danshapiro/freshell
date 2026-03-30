@@ -826,6 +826,57 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
+  it('does not skip resume for healthy sessions with inline-progress resume issue', async () => {
+    // Simulate: getResult returns a cached result with resumeIssue
+    sessionRepairService.result = {
+      sessionId: VALID_SESSION_ID,
+      filePath: `/tmp/${VALID_SESSION_ID}.jsonl`,
+      status: 'healthy',
+      chainDepth: 5,
+      orphanCount: 0,
+      fileSize: 500,
+      messageCount: 5,
+      resumeIssue: 'inline_stop_hook_progress',
+    }
+
+    // waitForSession should still be called because the cached result has a resume issue
+    // After repair, it returns the clean result
+    sessionRepairService.waitForSessionResult = {
+      sessionId: VALID_SESSION_ID,
+      filePath: `/tmp/${VALID_SESSION_ID}.jsonl`,
+      status: 'healthy',
+      chainDepth: 5,
+      orphanCount: 0,
+      fileSize: 500,
+      messageCount: 5,
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'resume-inline-progress-1'
+      const createdPromise = waitForCreated(ws, requestId, 3000)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      }))
+
+      const created = await createdPromise
+
+      // Resume should proceed (not be dropped)
+      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      // waitForSession should have been called despite cached result
+      expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('passes non-UUID resumeSessionId through to create and skips session repair wait', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 

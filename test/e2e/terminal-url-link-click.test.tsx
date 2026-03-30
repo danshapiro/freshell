@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, waitFor, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabContent from '@/components/TabContent'
@@ -20,13 +20,6 @@ const wsMocks = vi.hoisted(() => ({
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(async (path: string) => {
     if (path === '/api/terminals') return []
-    if (path === '/api/files/read?path=%2Ftmp%2Fexample.txt') {
-      return {
-        content: 'console.log(42)\n',
-        language: 'typescript',
-        filePath: '/tmp/example.txt',
-      }
-    }
     throw new Error(`Unexpected api.get path: ${path}`)
   }),
 }))
@@ -70,19 +63,13 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
   }),
 }))
 
-vi.mock('@monaco-editor/react', () => {
-  const MonacoMock = ({ value = '' }: { value?: string }) => (
-    <textarea data-testid="monaco-mock" value={value} readOnly />
-  )
-
-  return {
-    default: MonacoMock,
-    Editor: MonacoMock,
-  }
-})
-
-const linkProvidersByPaneId = new Map<string, {
+// Track URL link providers by pane ID (index 1 = URL provider, index 0 = file path provider)
+const urlLinkProvidersByPaneId = new Map<string, {
   provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
+}>()
+
+const linkHandlersByPaneId = new Map<string, {
+  activate: (event: MouseEvent, uri: string) => void
 }>()
 
 vi.mock('@xterm/xterm', () => {
@@ -95,18 +82,23 @@ vi.mock('@xterm/xterm', () => {
       active: {
         viewportY: 0,
         getLine: vi.fn(() => ({
-          translateToString: () => '/tmp/example.txt',
+          translateToString: () => 'Visit https://example.com/docs for more info',
         })),
       },
     }
     open = vi.fn((element: HTMLElement) => {
       this.paneId = element.closest('[data-pane-id]')?.getAttribute('data-pane-id') ?? null
+      if (this.paneId && this.options.linkHandler) {
+        linkHandlersByPaneId.set(this.paneId, this.options.linkHandler as any)
+      }
     })
     loadAddon = vi.fn()
+    private providerCount = 0
     registerLinkProvider = vi.fn((provider: any) => {
-      // Store only the first registered provider (file path provider)
-      if (this.paneId && !linkProvidersByPaneId.has(this.paneId)) {
-        linkProvidersByPaneId.set(this.paneId, provider)
+      this.providerCount++
+      // Second provider is the URL provider
+      if (this.providerCount === 2 && this.paneId) {
+        urlLinkProvidersByPaneId.set(this.paneId, provider)
       }
       return { dispose: vi.fn() }
     })
@@ -124,6 +116,11 @@ vi.mock('@xterm/xterm', () => {
     select = vi.fn()
     selectLines = vi.fn()
     scrollLines = vi.fn()
+    scrollToBottom = vi.fn()
+
+    constructor(opts?: Record<string, unknown>) {
+      if (opts) this.options = opts
+    }
   }
 
   return { Terminal: MockTerminal }
@@ -149,7 +146,7 @@ function createTerminalContent(createRequestId: string, terminalId: string): Ter
   }
 }
 
-function createStore() {
+function createStore(opts?: { warnExternalLinks?: boolean }) {
   const clickedPaneId = 'pane-clicked'
   const layout: PaneNode = {
     type: 'split',
@@ -183,6 +180,14 @@ function createStore() {
     ],
   }
 
+  const settings = {
+    ...defaultSettings,
+    terminal: {
+      ...defaultSettings.terminal,
+      warnExternalLinks: opts?.warnExternalLinks ?? false,
+    },
+  }
+
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -212,11 +217,11 @@ function createStore() {
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,
-        zoomedPane: { 'tab-1': clickedPaneId },
+        zoomedPane: {},
         refreshRequestsByPane: {},
       },
       settings: {
-        settings: defaultSettings,
+        settings,
         loaded: true,
       },
       connection: {
@@ -229,7 +234,7 @@ function createStore() {
   })
 }
 
-describe('terminal file links open Monaco on the clicked pane branch without navigating tabs', () => {
+describe('terminal URL links open browser pane on the clicked pane branch without navigating tabs', () => {
   beforeEach(() => {
     apiMocks.get.mockClear()
     wsMocks.send.mockClear()
@@ -237,7 +242,8 @@ describe('terminal file links open Monaco on the clicked pane branch without nav
     wsMocks.onMessage.mockClear()
     wsMocks.onReconnect.mockClear()
     wsMocks.setHelloExtensionProvider.mockClear()
-    linkProvidersByPaneId.clear()
+    urlLinkProvidersByPaneId.clear()
+    linkHandlersByPaneId.clear()
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
@@ -246,7 +252,7 @@ describe('terminal file links open Monaco on the clicked pane branch without nav
     vi.unstubAllGlobals()
   })
 
-  it('keeps the same tab, clears zoom, and opens the editor off the clicked nested pane instead of the active pane', async () => {
+  it('clicking a URL in a nested terminal pane opens a browser pane on the same tab branch', async () => {
     const store = createStore()
 
     render(
@@ -256,60 +262,92 @@ describe('terminal file links open Monaco on the clicked pane branch without nav
     )
 
     await waitFor(() => {
-      expect(linkProvidersByPaneId.has('pane-clicked')).toBe(true)
+      expect(urlLinkProvidersByPaneId.has('pane-clicked')).toBe(true)
     })
 
-    const clickedProvider = linkProvidersByPaneId.get('pane-clicked')!
+    const clickedProvider = urlLinkProvidersByPaneId.get('pane-clicked')!
     let links: any[] | undefined
     clickedProvider.provideLinks(1, (provided) => {
       links = provided
     })
 
     expect(links).toHaveLength(1)
-    expect(links![0].text).toBe('/tmp/example.txt')
+    expect(links![0].text).toBe('https://example.com/docs')
 
-    links![0].activate()
+    links![0].activate(new MouseEvent('click'))
 
     await waitFor(() => {
       expect(store.getState().tabs.tabs).toHaveLength(1)
       expect(store.getState().tabs.activeTabId).toBe('tab-1')
-      expect(store.getState().panes.zoomedPane['tab-1']).toBeUndefined()
-      expect(screen.getByTestId('monaco-mock')).toBeInTheDocument()
     })
 
     const root = store.getState().panes.layouts['tab-1']
     expect(root.type).toBe('split')
-    if (root.type !== 'split') {
-      throw new Error('expected root split layout')
-    }
+    if (root.type !== 'split') throw new Error('expected root split layout')
 
     expect(root.children[0]).toMatchObject({ type: 'leaf', id: 'pane-left' })
 
     const rightBranch = root.children[1]
     expect(rightBranch.type).toBe('split')
-    if (rightBranch.type !== 'split') {
-      throw new Error('expected right branch split layout')
-    }
+    if (rightBranch.type !== 'split') throw new Error('expected right branch split layout')
 
     expect(rightBranch.children[0]).toMatchObject({ type: 'leaf', id: 'pane-middle' })
 
     const clickedBranch = rightBranch.children[1]
     expect(clickedBranch.type).toBe('split')
-    if (clickedBranch.type !== 'split') {
-      throw new Error('expected clicked branch split layout')
-    }
+    if (clickedBranch.type !== 'split') throw new Error('expected clicked branch split layout')
 
     expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: 'pane-clicked' })
     expect(clickedBranch.children[1]).toMatchObject({
       type: 'leaf',
       content: {
-        kind: 'editor',
-        filePath: '/tmp/example.txt',
+        kind: 'browser',
+        url: 'https://example.com/docs',
+        devToolsOpen: false,
       },
     })
+  })
+
+  it('OSC 8 link click in a nested pane opens browser pane (with warnExternalLinks disabled)', async () => {
+    const store = createStore({ warnExternalLinks: false })
+
+    render(
+      <Provider store={store}>
+        <TabContent tabId="tab-1" />
+      </Provider>
+    )
 
     await waitFor(() => {
-      expect(apiMocks.get).toHaveBeenCalledWith('/api/files/read?path=%2Ftmp%2Fexample.txt')
+      expect(linkHandlersByPaneId.has('pane-clicked')).toBe(true)
+    })
+
+    const handler = linkHandlersByPaneId.get('pane-clicked')!
+    handler.activate(new MouseEvent('click'), 'https://osc8.example.com/path')
+
+    await waitFor(() => {
+      expect(store.getState().tabs.tabs).toHaveLength(1)
+    })
+
+    const root = store.getState().panes.layouts['tab-1']
+    expect(root.type).toBe('split')
+    if (root.type !== 'split') throw new Error('expected root split layout')
+
+    const rightBranch = root.children[1]
+    expect(rightBranch.type).toBe('split')
+    if (rightBranch.type !== 'split') throw new Error('expected right branch split layout')
+
+    const clickedBranch = rightBranch.children[1]
+    expect(clickedBranch.type).toBe('split')
+    if (clickedBranch.type !== 'split') throw new Error('expected clicked branch split layout')
+
+    expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: 'pane-clicked' })
+    expect(clickedBranch.children[1]).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'browser',
+        url: 'https://osc8.example.com/path',
+        devToolsOpen: false,
+      },
     })
   })
 })

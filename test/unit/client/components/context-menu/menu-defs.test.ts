@@ -51,6 +51,16 @@ function createMockActions(): MenuActions {
     copyAgentChatDiffNew: vi.fn(),
     copyAgentChatDiffOld: vi.fn(),
     copyAgentChatFilePath: vi.fn(),
+    refreshTab: vi.fn(),
+    refreshPane: vi.fn(),
+    replacePane: vi.fn(),
+    reopenClosedTab: vi.fn(),
+    generateSessionTitle: vi.fn(),
+    showKeyboardShortcuts: vi.fn(),
+    openUrlInPane: vi.fn(),
+    openUrlInTab: vi.fn(),
+    openUrlInBrowser: vi.fn(),
+    copyUrl: vi.fn(),
   }
 }
 
@@ -81,6 +91,7 @@ function createMockContext(actions: MenuActions): MenuBuildContext {
     contextElement: null,
     clickTarget: null,
     actions,
+    aiEnabled: false,
     platform: null,
   }
 }
@@ -288,5 +299,106 @@ describe('buildMenuItems — agent-chat context-sensitive items', () => {
     const sessionIdx = items.findIndex(i => i.type === 'item' && i.id === 'fc-copy-session')
     expect(sessionIdx).toBeGreaterThan(0)
     expect(items[sessionIdx - 1]?.type).toBe('separator')
+  })
+})
+
+describe('buildMenuItems — terminal context with hoveredUrl', () => {
+  function buildTerminalItems(hoveredUrl?: string) {
+    const mockActions = createMockActions()
+    const mockContext = createMockContext(mockActions)
+    ;(mockActions.getTerminalActions as ReturnType<typeof vi.fn>).mockReturnValue({
+      hasSelection: () => false,
+      copySelection: vi.fn(),
+      paste: vi.fn(),
+      selectAll: vi.fn(),
+      clearScrollback: vi.fn(),
+      reset: vi.fn(),
+      scrollToBottom: vi.fn(),
+      openSearch: vi.fn(),
+    })
+    const target: ContextTarget = { kind: 'terminal', tabId: 'tab1', paneId: 'pane1', hoveredUrl }
+    const items = buildMenuItems(target, mockContext)
+    return { items, mockActions }
+  }
+
+  it('terminal target with hoveredUrl includes URL menu items at the top', () => {
+    const { items } = buildTerminalItems('https://example.com')
+    const actionItems = items.filter(i => i.type === 'item')
+    const ids = actionItems.map(i => i.id)
+    expect(ids[0]).toBe('url-open-pane')
+    expect(ids[1]).toBe('url-open-tab')
+    expect(ids[2]).toBe('url-open-browser')
+    expect(ids[3]).toBe('url-copy')
+    // After URL items there should be a separator, then clipboard items
+    const urlSepIdx = items.findIndex(i => i.type === 'separator' && i.id === 'url-sep')
+    expect(urlSepIdx).toBeGreaterThan(0)
+  })
+
+  it('terminal target without hoveredUrl has no URL menu items', () => {
+    const { items } = buildTerminalItems()
+    const ids = items.filter(i => i.type === 'item').map(i => i.id)
+    expect(ids).not.toContain('url-open-pane')
+    expect(ids).not.toContain('url-open-tab')
+    expect(ids).not.toContain('url-open-browser')
+    expect(ids).not.toContain('url-copy')
+    // First item should be terminal-copy
+    expect(ids[0]).toBe('terminal-copy')
+  })
+
+  it('url-open-pane item calls openUrlInPane with correct args', () => {
+    const { items, mockActions } = buildTerminalItems('https://test.url')
+    const item = items.find(i => i.type === 'item' && i.id === 'url-open-pane')
+    expect(item).toBeDefined()
+    if (item?.type === 'item') item.onSelect()
+    expect(mockActions.openUrlInPane).toHaveBeenCalledWith('tab1', 'pane1', 'https://test.url')
+  })
+
+  it('url-open-tab item calls openUrlInTab with correct args', () => {
+    const { items, mockActions } = buildTerminalItems('https://test.url')
+    const item = items.find(i => i.type === 'item' && i.id === 'url-open-tab')
+    expect(item).toBeDefined()
+    if (item?.type === 'item') item.onSelect()
+    expect(mockActions.openUrlInTab).toHaveBeenCalledWith('https://test.url')
+  })
+
+  it('url-open-browser item calls openUrlInBrowser with correct args', () => {
+    const { items, mockActions } = buildTerminalItems('https://test.url')
+    const item = items.find(i => i.type === 'item' && i.id === 'url-open-browser')
+    expect(item).toBeDefined()
+    if (item?.type === 'item') item.onSelect()
+    expect(mockActions.openUrlInBrowser).toHaveBeenCalledWith('https://test.url')
+  })
+
+  it('url-copy item calls copyUrl with correct args', () => {
+    const { items, mockActions } = buildTerminalItems('https://test.url')
+    const item = items.find(i => i.type === 'item' && i.id === 'url-copy')
+    expect(item).toBeDefined()
+    if (item?.type === 'item') item.onSelect()
+    expect(mockActions.copyUrl).toHaveBeenCalledWith('https://test.url')
+  })
+
+  it('URL items have correct labels', () => {
+    const { items } = buildTerminalItems('https://example.com')
+    const urlItems = items.filter(i => i.type === 'item' && i.id.startsWith('url-'))
+    expect(urlItems).toHaveLength(4)
+    const labels = urlItems.map(i => i.type === 'item' ? i.label : '')
+    expect(labels).toEqual([
+      'Open URL in pane',
+      'Open URL in new tab',
+      'Open in external browser',
+      'Copy URL',
+    ])
+  })
+
+  it('existing terminal menu items still present after URL items', () => {
+    const { items } = buildTerminalItems('https://example.com')
+    const ids = items.filter(i => i.type === 'item').map(i => i.id)
+    expect(ids).toContain('terminal-copy')
+    expect(ids).toContain('terminal-paste')
+    expect(ids).toContain('terminal-select-all')
+    expect(ids).toContain('terminal-search')
+    expect(ids).toContain('terminal-clear')
+    expect(ids).toContain('terminal-reset')
+    expect(ids).toContain('replace-pane')
   })
 })

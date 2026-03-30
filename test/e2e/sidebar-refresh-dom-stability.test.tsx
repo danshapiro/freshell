@@ -341,4 +341,92 @@ describe('sidebar refresh DOM stability (e2e)', () => {
 
     expect(screen.getByRole('button', { name: /Stable A/i })).toBe(stableAButton)
   })
+
+  it('skips redundant session fetches when revision has not increased', async () => {
+    const initialProjects = [
+      {
+        projectPath: '/proj',
+        sessions: [
+          { provider: 'codex', sessionId: 's-1', projectPath: '/proj', lastActivityAt: 10, title: 'S1' },
+        ],
+      },
+    ]
+
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: initialProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 10,
+      oldestIncludedSessionId: 'codex:s-1',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        totalSessions: 1,
+        oldestLoadedTimestamp: 10,
+        oldestLoadedSessionId: 'codex:s-1',
+        hasMore: false,
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            totalSessions: 1,
+            oldestLoadedTimestamp: 10,
+            oldestLoadedSessionId: 'codex:s-1',
+            hasMore: false,
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    act(() => {
+      wsMocks.isReady = true
+      wsMocks.serverInstanceId = 'srv-dedup'
+      broadcastWs({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-dedup',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+    })
+
+    // First broadcast with revision 5 — should trigger fetch
+    act(() => {
+      broadcastWs({ type: 'sessions.changed', revision: 5 })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+
+    // Same revision 5 again — should NOT trigger another fetch
+    act(() => {
+      broadcastWs({ type: 'sessions.changed', revision: 5 })
+    })
+
+    // Give time for any async dispatch
+    await act(async () => { await new Promise((r) => setTimeout(r, 50)) })
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+
+    // Higher revision 6 — should trigger fetch
+    act(() => {
+      broadcastWs({ type: 'sessions.changed', revision: 6 })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
+    })
+  })
 })

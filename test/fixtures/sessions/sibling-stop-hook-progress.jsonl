@@ -1,0 +1,5 @@
+{"type":"user","message":"Help me with a task","uuid":"u-001","parentUuid":null,"timestamp":"2026-01-30T10:00:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure, I can help."}]},"uuid":"a-002","parentUuid":"u-001","timestamp":"2026-01-30T10:00:01.000Z"}
+{"type":"progress","data":{"type":"hook_progress","hookEvent":"Stop","hookName":"Stop","command":"echo done"},"toolUseID":"tool-001","parentToolUseID":"tool-001","uuid":"p-003","parentUuid":"a-002","timestamp":"2026-01-30T10:00:02.000Z"}
+{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"echo done"}],"hookErrors":[],"preventedContinuation":false,"stopReason":"","hasOutput":false,"level":"suggestion","uuid":"s-004","parentUuid":"a-002","toolUseID":"tool-001","timestamp":"2026-01-30T10:00:03.000Z"}
+{"type":"system","subtype":"turn_duration","durationMs":2500,"uuid":"td-005","parentUuid":"s-004","timestamp":"2026-01-30T10:00:04.000Z"}

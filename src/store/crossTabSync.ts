@@ -159,13 +159,39 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
   }
 }
 
-function handleIncomingRaw(store: StoreLike, key: string, raw: string, previousRaw?: string) {
+function handleIncomingRaw(
+  store: StoreLike,
+  key: string,
+  raw: string,
+  previousRaw?: string,
+  dedupeCheck?: (key: string, raw: string) => boolean,
+) {
+  if (key === TABS_STORAGE_KEY) {
+    dispatchHydrateTabsFromPersisted(store, raw)
+    // Also hydrate panes from localStorage to keep tabs+panes atomic.
+    // The writing tab's flush() wrote both synchronously, so panes data
+    // is already in localStorage even if the panes event hasn't arrived yet.
+    readAndHydratePairedKey(store, PANES_STORAGE_KEY, dedupeCheck)
+  } else if (key === PANES_STORAGE_KEY) {
+    dispatchHydratePanesFromPersisted(store, raw)
+    readAndHydratePairedKey(store, TABS_STORAGE_KEY, dedupeCheck)
+  } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
+    dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
+  }
+}
+
+function readAndHydratePairedKey(
+  store: StoreLike,
+  key: string,
+  dedupeCheck?: (key: string, raw: string) => boolean,
+) {
+  const raw = localStorage.getItem(key)
+  if (typeof raw !== 'string') return
+  if (dedupeCheck && !dedupeCheck(key, raw)) return
   if (key === TABS_STORAGE_KEY) {
     dispatchHydrateTabsFromPersisted(store, raw)
   } else if (key === PANES_STORAGE_KEY) {
     dispatchHydratePanesFromPersisted(store, raw)
-  } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
-    dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
   }
 }
 
@@ -182,11 +208,20 @@ export function installCrossTabSync(store: StoreLike): () => void {
     }
   }
 
+  // tryDedupeAndMark is passed into handleIncomingRaw so that when a tabs event
+  // triggers a paired panes read from localStorage (or vice versa), the paired
+  // key also goes through dedup. This prevents the later StorageEvent for the
+  // paired key from re-hydrating what we already processed eagerly.
+  const tryDedupeAndMark = (key: string, raw: string): boolean => {
+    if (lastProcessedRawByKey.get(key) === raw) return false
+    lastProcessedRawByKey.set(key, raw)
+    return true
+  }
+
   const handleIncomingRawDeduped = (key: string, raw: string) => {
     const previousRaw = lastProcessedRawByKey.get(key)
-    if (previousRaw === raw) return
-    lastProcessedRawByKey.set(key, raw)
-    handleIncomingRaw(store, key, raw, previousRaw)
+    if (!tryDedupeAndMark(key, raw)) return
+    handleIncomingRaw(store, key, raw, previousRaw, tryDedupeAndMark)
   }
 
   // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
