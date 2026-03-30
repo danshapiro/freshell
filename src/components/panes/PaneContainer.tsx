@@ -1,7 +1,7 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
-import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
+import { closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
@@ -71,7 +71,6 @@ function resolvePaneRuntimeMeta(
   terminalMetaById: Record<string, TerminalMetaRecord>,
   options: {
     terminalId?: string
-    tabTerminalId?: string
     isOnlyPane: boolean
     provider?: CodingCliProviderName
     resumeSessionId?: string
@@ -81,13 +80,6 @@ function resolvePaneRuntimeMeta(
   if (options.terminalId) {
     const byTerminalId = terminalMetaById[options.terminalId]
     if (byTerminalId) return byTerminalId
-  }
-
-  // During refresh/rehydration, single-pane tabs can briefly have tab-level
-  // terminal IDs before the pane content is fully reattached.
-  if (!options.terminalId && options.isOnlyPane && options.tabTerminalId) {
-    const byTabTerminalId = terminalMetaById[options.tabTerminalId]
-    if (byTabTerminalId) return byTabTerminalId
   }
 
   if (options.resumeSessionId && options.provider) {
@@ -162,7 +154,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
-  const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
@@ -277,11 +268,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         type: 'terminal.detach',
         terminalId: content.terminalId,
       })
-      // Clear stale tab.terminalId so background-terminal dedup doesn't
-      // focus this tab after the pane's terminal has been detached
-      if (tabTerminalId === content.terminalId) {
-        dispatch(updateTab({ id: tabId, updates: { terminalId: undefined } }))
-      }
     }
     // Clean up agent-chat resources
     if (content.kind === 'agent-chat') {
@@ -305,7 +291,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
+  }, [dispatch, tabId, ws, sdkPendingCreates])
 
   const handleFocus = useCallback((paneId: string) => {
     if (attentionDismiss === 'click' && attentionByPane[paneId]) {
@@ -407,7 +393,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       node.content.kind === 'terminal'
         ? resolvePaneRuntimeMeta(terminalMetaById, {
           terminalId: node.content.terminalId,
-          tabTerminalId,
           isOnlyPane,
           provider: paneProvider,
           resumeSessionId: paneResumeSessionId,
@@ -432,7 +417,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       paneId: node.id,
       content: node.content,
       tabMode: tab?.mode,
-      tabTerminalId,
       isOnlyPane,
       codexActivityByTerminalId,
       paneRuntimeActivityByPaneId,

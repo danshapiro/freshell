@@ -50,7 +50,6 @@ export interface Tab {
   createRequestId: string
   title: string
   description?: string
-  terminalId?: string          // For shell mode
   codingCliSessionId?: string  // For coding CLI session view
   codingCliProvider?: CodingCliProviderName
   claudeSessionId?: string     // Legacy field (migrated to codingCliSessionId)
@@ -61,6 +60,7 @@ export interface Tab {
   resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
+  updatedAt?: number
   titleSetByUser?: boolean     // If true, don't auto-update title
   lastInputAt?: number
 }

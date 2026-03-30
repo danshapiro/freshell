@@ -292,6 +292,42 @@ describe('search tiers through the HTTP route (full round-trip)', () => {
     expect(res.body.items[0].matchedIn).toBe('title')
   })
 
+  it('matches a project-path leaf through the HTTP contract and rejects ancestor-only path text', async () => {
+    createAppWithProjects([{
+      projectPath: '/home/user/code/trycycle',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-1',
+        projectPath: '/home/user/code/trycycle',
+        cwd: '/home/user/code/trycycle/server',
+        lastActivityAt: 100,
+        title: 'Routine work',
+      }],
+    }])
+
+    const leafResponse = await request(app)
+      .get('/api/session-directory?priority=visible&query=trycycle&tier=title')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(leafResponse.status).toBe(200)
+    expect(leafResponse.body.items).toHaveLength(1)
+    expect(leafResponse.body.items[0]).toMatchObject({
+      sessionId: 'session-1',
+      matchedIn: 'title',
+      snippet: 'trycycle',
+      projectPath: '/home/user/code/trycycle',
+      cwd: '/home/user/code/trycycle/server',
+    })
+    expect(leafResponse.body.items[0]).not.toHaveProperty('matchedPath')
+
+    const ancestorResponse = await request(app)
+      .get('/api/session-directory?priority=visible&query=code&tier=title')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(ancestorResponse.status).toBe(200)
+    expect(ancestorResponse.body.items).toHaveLength(0)
+  })
+
   it('userMessages tier searches JSONL user messages', async () => {
     const sessionFile = path.join(tempDir, 'session-1.jsonl')
     await fsp.writeFile(sessionFile, [

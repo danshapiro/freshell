@@ -332,10 +332,9 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.attachCalls).toHaveLength(0)
       expect(registry.createCalls).toHaveLength(0)
 
-      const attachMessagesPromise = waitForMessages(ws, [
+      const attachReadyPromise = waitForMessage(ws,
         (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
-        (m) => m.type === 'terminal.runtime.updated' && m.terminalId === created.terminalId,
-      ])
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -344,14 +343,8 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existing-codex-attach',
       }))
-      const [ready, runtimeUpdated] = await attachMessagesPromise
+      const ready = await attachReadyPromise
       expect(ready.headSeq).toBeGreaterThanOrEqual(0)
-      expect(runtimeUpdated).toEqual(expect.objectContaining({
-        type: 'terminal.runtime.updated',
-        terminalId: created.terminalId,
-        status: 'running',
-        title: 'Codex',
-      }))
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
     } finally {

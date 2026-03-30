@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest'
 import type { SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
+import type { ProjectGroup, CodingCliSession } from '@/store/types'
+
+import {
+  buildSessionItems,
+  filterSessionItemsByVisibility,
+  makeSelectSortedSessionItems,
+  sortSessionItems,
+} from '@/store/selectors/sidebarSelectors'
 
 // Helper to create test session items
 function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessionItem {
@@ -17,9 +25,77 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
   }
 }
 
-// Import the sort function and buildSessionItems for testing
-import { sortSessionItems, buildSessionItems, filterSessionItemsByVisibility } from '@/store/selectors/sidebarSelectors'
-import type { CodingCliSession, ProjectGroup } from '@/store/types'
+function createFallbackTab(tabId: string, sessionId: string, title: string, cwd: string, mode: 'claude' | 'codex' = 'codex') {
+  const paneId = `pane-${tabId}`
+  return {
+    tab: { id: tabId, title, mode, resumeSessionId: sessionId, createdAt: 1_000 },
+    paneId,
+    layout: {
+      type: 'leaf',
+      id: paneId,
+      content: {
+        kind: 'terminal',
+        mode,
+        status: 'running',
+        createRequestId: `req-${tabId}`,
+        resumeSessionId: sessionId,
+        initialCwd: cwd,
+      },
+    },
+  }
+}
+
+function createSelectorState(options: {
+  projects?: ProjectGroup[]
+  tabs?: any[]
+  panes?: any
+  sortMode?: 'recency' | 'activity' | 'recency-pinned' | 'project'
+  query?: string
+  searchTier?: 'title' | 'userMessages' | 'fullText'
+  appliedQuery?: string
+  appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
+  sessionActivity?: Record<string, number>
+} = {}) {
+  const projects = options.projects ?? []
+  return {
+    sessions: {
+      projects,
+      windows: {
+        sidebar: {
+          projects,
+          query: options.query ?? '',
+          searchTier: options.searchTier ?? 'title',
+          appliedQuery: options.appliedQuery,
+          appliedSearchTier: options.appliedSearchTier,
+        },
+      },
+    },
+    tabs: {
+      tabs: options.tabs ?? [],
+    },
+    panes: options.panes ?? {
+      layouts: {},
+      activePane: {},
+      paneTitles: {},
+    },
+    settings: {
+      settings: {
+        sidebar: {
+          sortMode: options.sortMode ?? 'activity',
+          showSubagents: true,
+          ignoreCodexSubagents: false,
+          showNoninteractiveSessions: true,
+          hideEmptySessions: false,
+          excludeFirstChatSubstrings: [],
+          excludeFirstChatMustStart: false,
+        },
+      },
+    },
+    sessionActivity: {
+      sessions: options.sessionActivity ?? {},
+    },
+  } as any
+}
 
 describe('sidebarSelectors', () => {
   describe('buildSessionItems', () => {
@@ -286,8 +362,39 @@ describe('sidebarSelectors', () => {
           hasTab: true,
           hasTitle: true,
           cwd: '/tmp/restored-project',
+          isFallback: true,
         }),
       ])
+    })
+
+    it('marks synthesized rows as fallback-only while leaving server-backed rows unmarked', () => {
+      const fallback = createFallbackTab('tab-restored', 'codex-restored', 'Restored Session', '/tmp/restored-project')
+      const items = buildSessionItems(
+        [
+          makeProject([{ sessionId: 'server-session', provider: 'claude', title: 'Server Session' }]),
+        ],
+        [fallback.tab] as any,
+        {
+          layouts: {
+            [fallback.tab.id]: fallback.layout,
+          },
+          activePane: {
+            [fallback.tab.id]: fallback.paneId,
+          },
+          paneTitles: {
+            [fallback.tab.id]: {
+              [fallback.paneId]: fallback.tab.title,
+            },
+          },
+        } as any,
+        emptyTerminals,
+        emptyActivity,
+      )
+
+      expect(items.find((item) => item.sessionId === 'server-session')?.isFallback).toBeUndefined()
+      expect(items.find((item) => item.sessionId === 'codex-restored')).toMatchObject({
+        isFallback: true,
+      })
     })
 
     it('preserves fallback visibility metadata from tab session metadata so hidden sessions stay filtered', () => {
@@ -422,6 +529,176 @@ describe('sidebarSelectors', () => {
     })
   })
 
+  describe('makeSelectSortedSessionItems', () => {
+    it('uses the applied title query to keep only matching fallback rows and rejects ancestor-only matches', () => {
+      const matchingFallback = createFallbackTab('tab-match', 'fallback-match', 'Matching Fallback', '/tmp/local/trycycle')
+      const ancestorFallback = createFallbackTab('tab-ancestor', 'fallback-ancestor', 'Ancestor Fallback', '/tmp/code/local/project')
+      const unrelatedFallback = createFallbackTab('tab-unrelated', 'fallback-unrelated', 'Unrelated Fallback', '/tmp/local/elsewhere')
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      const items = selectSortedItems(createSelectorState({
+        projects: [
+          {
+            projectPath: '/repo/server',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'server-newer',
+              projectPath: '/repo/server',
+              lastActivityAt: 3_000,
+              title: 'Newer Server Result',
+            }],
+          },
+          {
+            projectPath: '/repo/code/trycycle',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'server-leaf',
+              projectPath: '/repo/code/trycycle',
+              cwd: '/repo/code/trycycle/server',
+              lastActivityAt: 2_500,
+              title: 'Routine work',
+            }],
+          },
+        ],
+        tabs: [matchingFallback.tab, ancestorFallback.tab, unrelatedFallback.tab],
+        panes: {
+          layouts: {
+            [matchingFallback.tab.id]: matchingFallback.layout,
+            [ancestorFallback.tab.id]: ancestorFallback.layout,
+            [unrelatedFallback.tab.id]: unrelatedFallback.layout,
+          },
+          activePane: {
+            [matchingFallback.tab.id]: matchingFallback.paneId,
+            [ancestorFallback.tab.id]: ancestorFallback.paneId,
+            [unrelatedFallback.tab.id]: unrelatedFallback.paneId,
+          },
+          paneTitles: {
+            [matchingFallback.tab.id]: { [matchingFallback.paneId]: matchingFallback.tab.title },
+            [ancestorFallback.tab.id]: { [ancestorFallback.paneId]: ancestorFallback.tab.title },
+            [unrelatedFallback.tab.id]: { [unrelatedFallback.paneId]: unrelatedFallback.tab.title },
+          },
+        },
+        sortMode: 'activity',
+        query: 'code',
+        searchTier: 'title',
+        appliedQuery: 'trycycle',
+        appliedSearchTier: 'title',
+      }), [], '')
+
+      expect(items.map((item) => item.sessionId)).toEqual([
+        'server-newer',
+        'server-leaf',
+        'fallback-match',
+      ])
+      expect(items.find((item) => item.sessionId === 'fallback-match')).toMatchObject({
+        isFallback: true,
+      })
+      expect(items.some((item) => item.sessionId === 'fallback-ancestor')).toBe(false)
+      expect(items.some((item) => item.sessionId === 'fallback-unrelated')).toBe(false)
+    })
+
+    it('drops fallback rows entirely for applied deep-search tiers', () => {
+      const matchingFallback = createFallbackTab('tab-match', 'fallback-match', 'Matching Fallback', '/tmp/local/trycycle')
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      const items = selectSortedItems(createSelectorState({
+        projects: [{
+          projectPath: '/repo/server',
+          sessions: [{
+            provider: 'claude',
+            sessionId: 'server-deep',
+            projectPath: '/repo/server',
+            lastActivityAt: 3_000,
+            title: 'Deep Search Result',
+          }],
+        }],
+        tabs: [matchingFallback.tab],
+        panes: {
+          layouts: {
+            [matchingFallback.tab.id]: matchingFallback.layout,
+          },
+          activePane: {
+            [matchingFallback.tab.id]: matchingFallback.paneId,
+          },
+          paneTitles: {
+            [matchingFallback.tab.id]: { [matchingFallback.paneId]: matchingFallback.tab.title },
+          },
+        },
+        appliedQuery: 'trycycle',
+        appliedSearchTier: 'fullText',
+      }), [], '')
+
+      expect(items.map((item) => item.sessionId)).toEqual(['server-deep'])
+    })
+
+    it('disables tab pinning during applied search in recency-pinned mode while preserving archived-last ordering', () => {
+      const matchingFallback = createFallbackTab('tab-match', 'fallback-match', 'Matching Fallback', '/tmp/local/trycycle')
+      const selectSortedItems = makeSelectSortedSessionItems()
+      const baseOptions = {
+        projects: [
+          {
+            projectPath: '/repo/server',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'server-newer',
+              projectPath: '/repo/server',
+              lastActivityAt: 3_000,
+              title: 'Newer Server Result',
+            }],
+          },
+          {
+            projectPath: '/repo/archive',
+            sessions: [{
+              provider: 'claude',
+              sessionId: 'server-archived',
+              projectPath: '/repo/archive',
+              lastActivityAt: 4_000,
+              title: 'Archived Result',
+              archived: true,
+            }],
+          },
+        ],
+        tabs: [matchingFallback.tab],
+        panes: {
+          layouts: {
+            [matchingFallback.tab.id]: matchingFallback.layout,
+          },
+          activePane: {
+            [matchingFallback.tab.id]: matchingFallback.paneId,
+          },
+          paneTitles: {
+            [matchingFallback.tab.id]: { [matchingFallback.paneId]: matchingFallback.tab.title },
+          },
+        },
+        sortMode: 'recency-pinned' as const,
+      }
+
+      const searchItems = selectSortedItems(createSelectorState({
+        ...baseOptions,
+        appliedQuery: 'trycycle',
+        appliedSearchTier: 'title',
+      }), [], '')
+
+      expect(searchItems.map((item) => item.sessionId)).toEqual([
+        'server-newer',
+        'fallback-match',
+        'server-archived',
+      ])
+
+      const browseItems = selectSortedItems(createSelectorState({
+        ...baseOptions,
+        query: 'trycycle',
+        searchTier: 'title',
+      }), [], '')
+
+      expect(browseItems.map((item) => item.sessionId)).toEqual([
+        'fallback-match',
+        'server-newer',
+        'server-archived',
+      ])
+    })
+  })
+
   describe('sortSessionItems', () => {
     describe('recency mode', () => {
       it('sorts by timestamp descending', () => {
@@ -542,6 +819,18 @@ describe('sidebarSelectors', () => {
         // Active first (unpinned), then archived (pinned first within archived)
         expect(sorted.map((i) => i.id)).toEqual(['3', '2', '1'])
       })
+
+      it('can disable tab pinning while keeping archived items last', () => {
+        const items = [
+          createSessionItem({ id: '1', timestamp: 3000, hasTab: false }),
+          createSessionItem({ id: '2', timestamp: 1000, hasTab: true }),
+          createSessionItem({ id: '3', timestamp: 4000, hasTab: true, archived: true }),
+        ]
+
+        const sorted = sortSessionItems(items, 'recency-pinned', { disableTabPinning: true })
+
+        expect(sorted.map((i) => i.id)).toEqual(['1', '2', '3'])
+      })
     })
 
     describe('activity mode', () => {
@@ -565,6 +854,18 @@ describe('sidebarSelectors', () => {
         const sorted = sortSessionItems(items, 'activity')
 
         expect(sorted.map((i) => i.id)).toEqual(['1', '2'])
+      })
+
+      it('can disable tab pinning and use the normal activity comparator for every item', () => {
+        const items = [
+          createSessionItem({ id: '1', timestamp: 3000, hasTab: false }),
+          createSessionItem({ id: '2', timestamp: 1000, hasTab: true }),
+          createSessionItem({ id: '3', timestamp: 4000, hasTab: true, archived: true }),
+        ]
+
+        const sorted = sortSessionItems(items, 'activity', { disableTabPinning: true })
+
+        expect(sorted.map((i) => i.id)).toEqual(['1', '2', '3'])
       })
     })
 

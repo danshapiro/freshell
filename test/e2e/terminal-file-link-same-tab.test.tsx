@@ -104,7 +104,8 @@ vi.mock('@xterm/xterm', () => {
     })
     loadAddon = vi.fn()
     registerLinkProvider = vi.fn((provider: any) => {
-      if (this.paneId) {
+      // Store only the first registered provider (file path provider)
+      if (this.paneId && !linkProvidersByPaneId.has(this.paneId)) {
         linkProvidersByPaneId.set(this.paneId, provider)
       }
       return { dispose: vi.fn() }

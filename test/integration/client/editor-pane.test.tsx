@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
@@ -176,6 +176,13 @@ const createTestStore = () =>
     },
   })
 
+async function selectEditorFromPicker(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole('button', { name: /add pane/i }))
+  const picker = await screen.findByRole('toolbar', { name: /pane type picker/i })
+  await user.click(screen.getByRole('button', { name: 'Editor' }))
+  fireEvent.transitionEnd(picker)
+}
+
 describe('Editor Pane Integration', () => {
   let store: ReturnType<typeof createTestStore>
   let fetchRouter: ReturnType<typeof createRoutedFetch>
@@ -214,8 +221,7 @@ describe('Editor Pane Integration', () => {
     vi.restoreAllMocks()
   })
 
-  // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
-  it.skip('can add editor pane via FAB', async () => {
+  it('can add editor pane via FAB', async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     // Initialize with terminal
@@ -235,11 +241,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    // Click FAB to add picker pane
-    await user.click(screen.getByRole('button', { name: /add pane/i }))
-
-    // Select Editor from picker (using keyboard shortcut for reliability)
-    await user.keyboard('e')
+    await selectEditorFromPicker(user)
 
     // Should see empty state with Open File button
     await waitFor(() => {
@@ -251,8 +253,7 @@ describe('Editor Pane Integration', () => {
     expect(state.layouts['tab-1'].type).toBe('split')
   })
 
-  // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
-  it.skip('displays editor toolbar with path input', async () => {
+  it('displays editor toolbar with path input', async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     store.dispatch(
@@ -271,9 +272,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    // Add editor pane via picker
-    await user.click(screen.getByRole('button', { name: /add pane/i }))
-    await user.keyboard('e')
+    await selectEditorFromPicker(user)
 
     // Should see the path input
     await waitFor(() => {
@@ -600,8 +599,7 @@ describe('Editor Pane Integration', () => {
     consoleSpy.mockRestore()
   })
 
-  // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
-  it.skip('integrates with terminal and editor panes in split view', async () => {
+  it('integrates with terminal and editor panes in split view', async () => {
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     // Start with a terminal
@@ -630,10 +628,7 @@ describe('Editor Pane Integration', () => {
       }
     })
 
-    // Add an editor pane
-    await user.click(screen.getByRole('button', { name: /add pane/i }))
-    // Click the Editor option directly (keyboard shortcuts require transition animation)
-    await user.click(screen.getByText('Editor'))
+    await selectEditorFromPicker(user)
 
     // Both terminal and editor should be visible
     await waitFor(() => {

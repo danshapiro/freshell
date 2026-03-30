@@ -4,9 +4,8 @@ import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRe
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
-import { loadPersistedPanes } from './persistMiddleware.js'
+import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
-import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
@@ -105,10 +104,9 @@ function normalizePaneContent(
  */
 function cleanOrphanedLayouts(state: PanesState): PanesState {
   try {
-    const rawTabs = localStorage.getItem(TABS_STORAGE_KEY)
-    if (!rawTabs) return state
-    const parsedTabs = JSON.parse(rawTabs)
-    const tabs = parsedTabs?.tabs?.tabs
+    const persistedTabs = loadPersistedTabs()
+    if (!persistedTabs) return state
+    const tabs = persistedTabs?.tabs?.tabs
     if (!Array.isArray(tabs)) return state
 
     const tabIds = new Set(tabs.map((t: any) => t?.id).filter(Boolean))

@@ -46,7 +46,12 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
         : null
     case ContextIds.Terminal:
       return data.tabId && data.paneId
-        ? { kind: 'terminal', tabId: data.tabId, paneId: data.paneId }
+        ? {
+            kind: 'terminal',
+            tabId: data.tabId,
+            paneId: data.paneId,
+            hoveredUrl: data.hoveredUrl,
+          }
         : null
     case ContextIds.Browser:
       return data.tabId && data.paneId

@@ -9,13 +9,15 @@
  * 3. Port conflicts - detects if freshell is already running
  */
 
-import { readFileSync, existsSync } from 'fs'
+import { readFileSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
+import { createRequire } from 'module'
 import { runUpdateCheck, shouldSkipUpdateCheck } from '../server/updater/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const rootDir = resolve(__dirname, '..')
+const workspaceRequire = createRequire(resolve(rootDir, 'package.json'))
 
 // Load package.json for version
 function getPackageVersion(): string {
@@ -32,6 +34,29 @@ function getPackageVersion(): string {
  * Check if node_modules is missing required dependencies from package.json.
  * Returns list of missing packages.
  */
+function hasInstalledDependency(dep: string): boolean {
+  try {
+    // Use Node's resolver so worktrees can inherit dependencies from the
+    // parent checkout's node_modules instead of requiring a duplicate install.
+    workspaceRequire.resolve(`${dep}/package.json`)
+    return true
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error
+      ? String((error as { code?: unknown }).code)
+      : ''
+    if (code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') {
+      return false
+    }
+  }
+
+  try {
+    workspaceRequire.resolve(dep)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function checkMissingDependencies(): string[] {
   const missing: string[] = []
   try {
@@ -43,8 +68,7 @@ function checkMissingDependencies(): string[] {
     }
 
     for (const dep of Object.keys(allDeps)) {
-      const depPath = resolve(rootDir, 'node_modules', dep)
-      if (!existsSync(depPath)) {
+      if (!hasInstalledDependency(dep)) {
         missing.push(dep)
       }
     }

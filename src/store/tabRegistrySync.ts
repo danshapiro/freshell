@@ -96,7 +96,6 @@ function lifecycleSignature(state: RootState): string {
       title: tab.title,
       status: tab.status,
       mode: tab.mode,
-      terminalId: tab.terminalId,
       titleSetByUser: !!tab.titleSetByUser,
     })),
     panes: Object.entries(state.panes.layouts).map(([tabId, node]) => ({
