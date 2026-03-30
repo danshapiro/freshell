@@ -340,6 +340,61 @@ describe('files-router path validation', () => {
     })
   })
 
+  describe('GET /api/files/stat', () => {
+    it('returns file metadata without reading content', async () => {
+      const mtime = new Date('2026-03-29T12:00:00.000Z')
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockResolvedValue({ isDirectory: () => false, size: 1024, mtime })
+
+      const res = await request(app)
+        .get('/api/files/stat')
+        .query({ path: '/home/user/file.txt' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({
+        exists: true,
+        size: 1024,
+        modifiedAt: '2026-03-29T12:00:00.000Z',
+      })
+      expect(mockReadFile).not.toHaveBeenCalled()
+    })
+
+    it('returns exists:false for missing files', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockRejectedValue({ code: 'ENOENT' })
+
+      const res = await request(app)
+        .get('/api/files/stat')
+        .query({ path: '/home/user/nonexistent.txt' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ exists: false, size: null, modifiedAt: null })
+    })
+
+    it('returns 403 for paths outside allowed directories', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
+
+      const res = await request(app)
+        .get('/api/files/stat')
+        .query({ path: '/etc/passwd' })
+
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('Path not allowed')
+    })
+
+    it('returns exists:false for directories', async () => {
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
+      mockStat.mockResolvedValue({ isDirectory: () => true, size: 4096, mtime: new Date() })
+
+      const res = await request(app)
+        .get('/api/files/stat')
+        .query({ path: '/home/user/projects' })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ exists: false, size: null, modifiedAt: null })
+    })
+  })
+
   describe('POST /api/files/validate-dir', () => {
     it('allows validation when allowedFilePaths is undefined', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
