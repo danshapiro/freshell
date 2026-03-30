@@ -11,6 +11,7 @@ import type {
   SessionScanner,
   SessionScanResult,
   SessionRepairResult,
+  SessionRepairOptions,
   ParsedMessage,
 } from './types.js'
 
@@ -39,6 +40,10 @@ function parseMessage(line: string, lineNumber: number): ParsedMessage | null {
       parentUuid: obj.parentUuid,
       type: obj.type,
       lineNumber,
+      subtype: obj.subtype,
+      toolUseID: obj.toolUseID,
+      dataType: obj.data?.type,
+      dataHookEvent: obj.data?.hookEvent,
     }
   } catch {
     return null
@@ -79,6 +84,65 @@ function findOrphans(
   return messages.filter(
     (msg) => msg.parentUuid && !uuidToMessage.has(msg.parentUuid)
   )
+}
+
+/**
+ * Detect the inline stop-hook progress chain shape on the active leaf.
+ *
+ * The problematic shape is (from leaf toward root):
+ *   turn_duration? -> stop_hook_summary -> progress(hook_progress/Stop) -> assistant
+ *
+ * Where stop_hook_summary.parentUuid === progress.uuid
+ *   and stop_hook_summary.toolUseID === progress.toolUseID
+ *   and progress.dataType === 'hook_progress'
+ *   and progress.dataHookEvent === 'Stop'
+ *   and the progress is parented to an assistant message.
+ *
+ * Returns the matched nodes if found, or undefined.
+ */
+interface InlineProgressMatch {
+  stopSummary: ParsedMessage
+  progress: ParsedMessage
+  assistant: ParsedMessage
+}
+
+function detectInlineStopHookProgress(
+  lastMessage: ParsedMessage | undefined,
+  uuidToMessage: Map<string, ParsedMessage>,
+): InlineProgressMatch | undefined {
+  if (!lastMessage) return undefined
+
+  // The leaf may be turn_duration (skip it) or stop_hook_summary directly
+  let candidate = lastMessage
+  if (candidate.type === 'system' && candidate.subtype === 'turn_duration' && candidate.parentUuid) {
+    const parent = uuidToMessage.get(candidate.parentUuid)
+    if (parent) candidate = parent
+  }
+
+  // Candidate should be stop_hook_summary
+  if (candidate.type !== 'system' || candidate.subtype !== 'stop_hook_summary') return undefined
+  const stopSummary = candidate
+
+  // Parent of stop_hook_summary should be the progress record
+  if (!stopSummary.parentUuid) return undefined
+  const progress = uuidToMessage.get(stopSummary.parentUuid)
+  if (!progress) return undefined
+
+  // Validate progress record
+  if (progress.type !== 'progress') return undefined
+  if (progress.dataType !== 'hook_progress') return undefined
+  if (progress.dataHookEvent !== 'Stop') return undefined
+
+  // Validate toolUseID match
+  if (!stopSummary.toolUseID || stopSummary.toolUseID !== progress.toolUseID) return undefined
+
+  // Parent of progress should be an assistant message
+  if (!progress.parentUuid) return undefined
+  const assistant = uuidToMessage.get(progress.parentUuid)
+  if (!assistant) return undefined
+  if (assistant.type !== 'assistant') return undefined
+
+  return { stopSummary, progress, assistant }
 }
 
 /**
@@ -137,6 +201,10 @@ export function createSessionScanner(): SessionScanner {
     const orphans = findOrphans(messages, uuidToMessage)
     const chainDepth = calculateChainDepth(messages, uuidToMessage)
 
+    // Detect resume issue on active chain (bounded: at most 3 parent hops from leaf)
+    const lastMessage = messages.length > 0 ? messages[messages.length - 1] : undefined
+    const resumeMatch = detectInlineStopHookProgress(lastMessage, uuidToMessage)
+
     return {
       sessionId,
       filePath,
@@ -145,10 +213,11 @@ export function createSessionScanner(): SessionScanner {
       orphanCount: orphans.length,
       fileSize: stat.size,
       messageCount: messages.length,
+      resumeIssue: resumeMatch ? 'inline_stop_hook_progress' : undefined,
     }
   }
 
-  async function repair(filePath: string): Promise<SessionRepairResult> {
+  async function repair(filePath: string, options?: SessionRepairOptions): Promise<SessionRepairResult> {
     const sessionId = extractSessionId(filePath)
 
     // Read file
@@ -160,6 +229,7 @@ export function createSessionScanner(): SessionScanner {
         sessionId,
         status: 'failed',
         orphansFixed: 0,
+        resumeIssuesFixed: 0,
         newChainDepth: 0,
         error: `Failed to read file: ${err instanceof Error ? err.message : String(err)}`,
       }
@@ -184,6 +254,10 @@ export function createSessionScanner(): SessionScanner {
             parentUuid: obj.parentUuid,
             type: obj.type,
             lineNumber: i,
+            subtype: obj.subtype,
+            toolUseID: obj.toolUseID,
+            dataType: obj.data?.type,
+            dataHookEvent: obj.data?.hookEvent,
           }
           messages.push(msg)
           uuidToMessage.set(obj.uuid, msg)
@@ -196,12 +270,21 @@ export function createSessionScanner(): SessionScanner {
     // Find orphans
     const orphans = findOrphans(messages, uuidToMessage)
 
-    if (orphans.length === 0) {
+    // Detect inline-progress match when resume issue repair is enabled
+    const inlineMatch = options?.includeResumeIssues
+      ? detectInlineStopHookProgress(
+          messages.length > 0 ? messages[messages.length - 1] : undefined,
+          uuidToMessage,
+        )
+      : undefined
+
+    if (orphans.length === 0 && !inlineMatch) {
       const chainDepth = calculateChainDepth(messages, uuidToMessage)
       return {
         sessionId,
         status: 'already_healthy',
         orphansFixed: 0,
+        resumeIssuesFixed: 0,
         newChainDepth: chainDepth,
       }
     }
@@ -242,6 +325,17 @@ export function createSessionScanner(): SessionScanner {
       }
     }
 
+    // Fix inline stop-hook progress if detected
+    let resumeIssuesFixed = 0
+    if (inlineMatch) {
+      const obj = lineToObj.get(inlineMatch.stopSummary.lineNumber)
+      if (obj) {
+        obj.parentUuid = inlineMatch.assistant.uuid
+        fixedLines[inlineMatch.stopSummary.lineNumber] = JSON.stringify(obj)
+        resumeIssuesFixed = 1
+      }
+    }
+
     // Write repaired content
     await fs.writeFile(filePath, fixedLines.join('\n'))
 
@@ -266,6 +360,7 @@ export function createSessionScanner(): SessionScanner {
       status: 'repaired',
       backupPath,
       orphansFixed: orphans.length,
+      resumeIssuesFixed,
       newChainDepth,
     }
   }

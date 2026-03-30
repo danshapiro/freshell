@@ -6,6 +6,12 @@
  */
 
 /**
+ * Known resume issues that don't constitute corruption but prevent
+ * successful `--resume` in Claude CLI.
+ */
+export type SessionResumeIssue = 'inline_stop_hook_progress'
+
+/**
  * Result of scanning a session file for chain integrity.
  */
 export interface SessionScanResult {
@@ -23,6 +29,16 @@ export interface SessionScanResult {
   fileSize: number
   /** Total number of messages in the file */
   messageCount: number
+  /** Resume issue detected on the active chain, if any */
+  resumeIssue?: SessionResumeIssue
+}
+
+/**
+ * Options for session repair.
+ */
+export interface SessionRepairOptions {
+  /** Also fix resume issues (not just orphans). Default: false. */
+  includeResumeIssues?: boolean
 }
 
 /**
@@ -37,6 +53,8 @@ export interface SessionRepairResult {
   backupPath?: string
   /** Number of orphan messages that were re-parented */
   orphansFixed: number
+  /** Number of resume issues that were fixed */
+  resumeIssuesFixed: number
   /** Chain depth after repair */
   newChainDepth: number
   /** Error message if failed */
@@ -57,7 +75,7 @@ export interface SessionScanner {
    * Repair a corrupted session file.
    * Creates backup before modifying. Idempotent - safe to call on healthy files.
    */
-  repair(filePath: string): Promise<SessionRepairResult>
+  repair(filePath: string, options?: SessionRepairOptions): Promise<SessionRepairResult>
 
   /**
    * Scan multiple files in parallel.
@@ -75,4 +93,12 @@ export interface ParsedMessage {
   parentUuid?: string
   type?: string
   lineNumber: number
+  /** System message subtype (e.g. 'stop_hook_summary', 'turn_duration') */
+  subtype?: string
+  /** Tool use ID for progress/hook records */
+  toolUseID?: string
+  /** data.type for progress records (e.g. 'hook_progress') */
+  dataType?: string
+  /** data.hookEvent for progress records (e.g. 'Stop') */
+  dataHookEvent?: string
 }
