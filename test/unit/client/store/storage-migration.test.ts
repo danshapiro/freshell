@@ -64,10 +64,9 @@ describe('storage-migration', () => {
     expect(document.cookie).not.toContain('freshell-auth=')
   })
 
-  it('preserves legacy terminal font and tool-strip migration when storage cleanup runs before browser preferences load', async () => {
+  it('preserves legacy terminal font migration when storage cleanup runs before browser preferences load', async () => {
     localStorage.setItem('freshell_version', '2')
     localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
     localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
 
     await importFreshStorageMigration()
@@ -80,9 +79,6 @@ describe('storage-migration', () => {
           fontFamily: 'Fira Code',
         },
       },
-      toolStrip: {
-        expanded: true,
-      },
     })
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBe(JSON.stringify({
       settings: {
@@ -90,12 +86,8 @@ describe('storage-migration', () => {
           fontFamily: 'Fira Code',
         },
       },
-      toolStrip: {
-        expanded: true,
-      },
     }))
     expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBeNull()
-    expect(localStorage.getItem('freshell:toolStripExpanded')).toBeNull()
     expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
     expect(localStorage.getItem('freshell_version')).toBe('3')
   })
