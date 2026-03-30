@@ -5,7 +5,7 @@ import { setLocalSettings } from './settingsSlice'
 import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
-import { parsePersistedPanesRaw, parsePersistedTabsRaw, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './persistedState'
+import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
@@ -46,34 +46,27 @@ function collectPaneIdsSafe(node: unknown): string[] {
   return ids
 }
 
-function dispatchHydrateTabsFromPersisted(store: StoreLike, raw: string) {
-  const parsed = parsePersistedTabsRaw(raw)
+function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string) {
+  const parsed = parsePersistedLayoutRaw(raw)
   if (!parsed) return
 
-  const remoteTabs = parsed.tabs.tabs
-  const remoteTombstones = parsed.tombstones || []
-
+  // Hydrate tabs with merge
   store.dispatch({
     ...hydrateTabs({
-      tabs: remoteTabs,
+      tabs: parsed.tabs.tabs,
       activeTabId: parsed.tabs.activeTabId,
       renameRequestTabId: null,
-      tombstones: remoteTombstones,
+      tombstones: parsed.tombstones,
     } as any),
     meta: { skipPersist: true, source: 'cross-tab' },
   })
-}
 
-function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
-  const parsed = parsePersistedPanesRaw(raw)
-  if (!parsed) return
-
+  // Hydrate panes
   const state = store.getState()
   const localActiveByTab = (state?.panes?.activePane || {}) as Record<string, string>
-
   const nextActive: Record<string, string> = {}
 
-  for (const [tabId, node] of Object.entries(parsed.layouts || {})) {
+  for (const [tabId, node] of Object.entries(parsed.panes.layouts || {})) {
     const leafIds = collectPaneIdsSafe(node)
     if (leafIds.length === 0) continue
     const leafSet = new Set(leafIds)
@@ -84,7 +77,7 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
       continue
     }
 
-    const remoteDesired = parsed.activePane?.[tabId]
+    const remoteDesired = parsed.panes.activePane?.[tabId]
     if (typeof remoteDesired === 'string' && leafSet.has(remoteDesired)) {
       nextActive[tabId] = remoteDesired
       continue
@@ -95,10 +88,10 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
 
   store.dispatch({
     ...hydratePanes({
-      layouts: parsed.layouts as any,
+      layouts: parsed.panes.layouts as any,
       activePane: nextActive,
-      paneTitles: parsed.paneTitles,
-      paneTitleSetByUser: parsed.paneTitleSetByUser,
+      paneTitles: parsed.panes.paneTitles,
+      paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
     } as any),
     meta: { skipPersist: true, source: 'cross-tab' },
   })
@@ -156,34 +149,11 @@ function handleIncomingRaw(
   key: string,
   raw: string,
   previousRaw?: string,
-  dedupeCheck?: (key: string, raw: string) => boolean,
 ) {
-  if (key === TABS_STORAGE_KEY) {
-    dispatchHydrateTabsFromPersisted(store, raw)
-    // Also hydrate panes from localStorage to keep tabs+panes atomic.
-    // The writing tab's flush() wrote both synchronously, so panes data
-    // is already in localStorage even if the panes event hasn't arrived yet.
-    readAndHydratePairedKey(store, PANES_STORAGE_KEY, dedupeCheck)
-  } else if (key === PANES_STORAGE_KEY) {
-    dispatchHydratePanesFromPersisted(store, raw)
-    readAndHydratePairedKey(store, TABS_STORAGE_KEY, dedupeCheck)
+  if (key === LAYOUT_STORAGE_KEY) {
+    dispatchHydrateLayoutFromPersisted(store, raw)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
-  }
-}
-
-function readAndHydratePairedKey(
-  store: StoreLike,
-  key: string,
-  dedupeCheck?: (key: string, raw: string) => boolean,
-) {
-  const raw = localStorage.getItem(key)
-  if (typeof raw !== 'string') return
-  if (dedupeCheck && !dedupeCheck(key, raw)) return
-  if (key === TABS_STORAGE_KEY) {
-    dispatchHydrateTabsFromPersisted(store, raw)
-  } else if (key === PANES_STORAGE_KEY) {
-    dispatchHydratePanesFromPersisted(store, raw)
   }
 }
 
@@ -193,17 +163,13 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Storage events and BroadcastChannel can both deliver the same persisted payload.
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
-  for (const key of [TABS_STORAGE_KEY, PANES_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
+  for (const key of [LAYOUT_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
     }
   }
 
-  // tryDedupeAndMark is passed into handleIncomingRaw so that when a tabs event
-  // triggers a paired panes read from localStorage (or vice versa), the paired
-  // key also goes through dedup. This prevents the later StorageEvent for the
-  // paired key from re-hydrating what we already processed eagerly.
   const tryDedupeAndMark = (key: string, raw: string): boolean => {
     if (lastProcessedRawByKey.get(key) === raw) return false
     lastProcessedRawByKey.set(key, raw)
@@ -213,7 +179,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const handleIncomingRawDeduped = (key: string, raw: string) => {
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
-    handleIncomingRaw(store, key, raw, previousRaw, tryDedupeAndMark)
+    handleIncomingRaw(store, key, raw, previousRaw)
   }
 
   // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
@@ -221,8 +187,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
     if (
-      msg.key !== TABS_STORAGE_KEY
-      && msg.key !== PANES_STORAGE_KEY
+      msg.key !== LAYOUT_STORAGE_KEY
       && msg.key !== BROWSER_PREFERENCES_STORAGE_KEY
     ) {
       return
@@ -234,8 +199,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
     if (
-      key !== TABS_STORAGE_KEY
-      && key !== PANES_STORAGE_KEY
+      key !== LAYOUT_STORAGE_KEY
       && key !== BROWSER_PREFERENCES_STORAGE_KEY
     ) {
       return

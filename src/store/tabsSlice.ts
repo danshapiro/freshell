@@ -17,7 +17,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
-import { TABS_STORAGE_KEY } from './storage-keys'
+import { loadPersistedLayout } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 
@@ -62,24 +62,23 @@ function loadInitialTabsState(): TabsState {
   }
 
   try {
-    const raw = localStorage.getItem(TABS_STORAGE_KEY)
-    if (!raw) return defaultState
-    const parsed = JSON.parse(raw)
-    // The persisted format is { tabs: TabsState }
-    const tabsState = parsed?.tabs as Partial<TabsState> | undefined
+    const layout = loadPersistedLayout()
+    if (!layout) return defaultState
+
+    const tabsState = layout.tabs?.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
-    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
+    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t: Tab) => t.id))
 
     const mappedTabs = tabsState.tabs.map(migrateTabFields)
     const desired = tabsState.activeTabId
-    const has = desired && mappedTabs.some((t) => t.id === desired)
+    const has = desired && mappedTabs.some((t: Tab) => t.id === desired)
 
     return {
       tabs: mappedTabs,
       activeTabId: has ? desired! : (mappedTabs[0]?.id ?? null),
       renameRequestTabId: null,
-      tombstones: Array.isArray((parsed as any)?.tombstones) ? (parsed as any).tombstones : [],
+      tombstones: Array.isArray(layout.tombstones) ? layout.tombstones : [],
     }
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
