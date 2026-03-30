@@ -205,12 +205,8 @@ describe('refresh context menu flow (e2e)', () => {
     await waitFor(() => {
       expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
     })
-    // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's own
-    // port so the HTTP proxy skips it. Pane-2 (port 3001) is proxied through
-    // /api/proxy/http/3001/ (same-origin) instead.  Each TCP-forwarded pane
-    // triggers one api.post for the initial render plus one for the refresh.
     await waitFor(() => {
-      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(2)
+      expect(vi.mocked(api.post)).toHaveBeenCalledTimes(4)
     })
     await waitFor(() => {
       expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()

@@ -3,7 +3,12 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import MessageBubble from '../../../../../src/components/agent-chat/MessageBubble'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+} from '@/lib/browser-preferences'
 
+// Render MarkdownRenderer synchronously to avoid React.lazy timing issues
+// when running in the full test suite (dynamic import may not resolve in time)
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
   const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
   return {
@@ -14,6 +19,9 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 })
 
 describe('MessageBubble', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(() => {
     cleanup()
   })
@@ -23,6 +31,7 @@ describe('MessageBubble', () => {
     )
     expect(screen.getByText('Hello world')).toBeInTheDocument()
     expect(screen.getByRole('article', { name: 'user message' })).toBeInTheDocument()
+    // User messages have thicker left border
     const article = container.querySelector('[role="article"]')!
     expect(article.className).toContain('border-l-[3px]')
   })
@@ -68,15 +77,15 @@ describe('MessageBubble', () => {
     expect(screen.getByText(/Thinking/)).toBeInTheDocument()
   })
 
-  it('renders tool use block inside a tool strip (expanded when showTools=true)', () => {
+  it('renders tool use block inside a tool strip', () => {
     render(
       <MessageBubble
         role="assistant"
         content={[{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls -la' } }]}
-        showTools={true}
       />
     )
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    // Tool is now inside a strip in collapsed mode
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
   })
 
   it('renders timestamp and model', async () => {
@@ -115,6 +124,7 @@ describe('MessageBubble', () => {
           content={[{ type: 'text', text: SCRIPT_PAYLOAD }]}
         />
       )
+      // react-markdown strips script tags entirely
       expect(container.querySelector('script')).toBeNull()
     })
 
@@ -143,7 +153,6 @@ describe('MessageBubble', () => {
         <MessageBubble
           role="assistant"
           content={[{ type: 'tool_result', tool_use_id: 't1', content: SCRIPT_PAYLOAD }]}
-          showTools={false}
         />
       )
       expect(container.querySelector('script')).toBeNull()
@@ -152,6 +161,9 @@ describe('MessageBubble', () => {
 })
 
 describe('MessageBubble display toggles', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(cleanup)
 
   const textBlock: ChatContentBlock = { type: 'text', text: 'Hello world' }
@@ -182,8 +194,7 @@ describe('MessageBubble display toggles', () => {
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
   })
 
-  it('shows collapsed tool strip when showTools is false, chevron still works', async () => {
-    const user = userEvent.setup()
+  it('shows collapsed tool strip when showTools is false', () => {
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -191,13 +202,10 @@ describe('MessageBubble display toggles', () => {
         showTools={false}
       />
     )
+    // Tool strip should still be visible (collapsed summary)
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
-    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
-
-    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
-    await user.click(toggle)
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    // But no expand chevron should be available
+    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
   })
 
   it('shows collapsed tool strip for tool_result when showTools is false', () => {
@@ -208,6 +216,7 @@ describe('MessageBubble display toggles', () => {
         showTools={false}
       />
     )
+    // Tool strip should still be visible (collapsed summary)
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
   })
 
@@ -244,12 +253,16 @@ describe('MessageBubble display toggles', () => {
       />
     )
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
+    // Tool is now in a strip
     expect(screen.getByRole('region', { name: /tool strip/i })).toBeInTheDocument()
     expect(screen.getByRole('article').querySelector('time')).not.toBeInTheDocument()
   })
 })
 
 describe('MessageBubble empty message hiding', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(cleanup)
 
   it('shows collapsed strip when all content is tools and showTools is false', () => {
@@ -263,6 +276,7 @@ describe('MessageBubble empty message hiding', () => {
         showTools={false}
       />
     )
+    // Message should still render (collapsed strip is visible content)
     expect(container.querySelector('[role="article"]')).toBeInTheDocument()
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
   })
@@ -290,6 +304,7 @@ describe('MessageBubble empty message hiding', () => {
         showTools={false}
       />
     )
+    // Message should still render because the collapsed tool strip is visible
     expect(container.querySelector('[role="article"]')).toBeInTheDocument()
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
   })
@@ -311,9 +326,13 @@ describe('MessageBubble empty message hiding', () => {
 })
 
 describe('MessageBubble system-reminder stripping', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(cleanup)
 
   it('strips system-reminder tags from standalone tool result content', async () => {
+    const user = userEvent.setup()
     render(
       <MessageBubble
         role="assistant"
@@ -322,15 +341,17 @@ describe('MessageBubble system-reminder stripping', () => {
           tool_use_id: 't1',
           content: 'actual content\n<system-reminder>\nHidden system text\n</system-reminder>\nmore content',
         }]}
-        showTools={true}
       />
     )
-    expect(screen.getByRole('button', { name: 'Result tool call' })).toHaveAttribute('aria-expanded', 'true')
+    // First expand the strip, then click the individual tool
+    await user.click(screen.getByRole('button', { name: /toggle tool details/i }))
+    await user.click(screen.getByRole('button', { name: 'Result tool call' }))
     expect(screen.getByText(/actual content/)).toBeInTheDocument()
     expect(screen.queryByText(/Hidden system text/)).not.toBeInTheDocument()
   })
 
   it('strips system-reminder tags from paired tool_use/tool_result content', async () => {
+    const user = userEvent.setup()
     render(
       <MessageBubble
         role="assistant"
@@ -342,19 +363,23 @@ describe('MessageBubble system-reminder stripping', () => {
             content: 'file content\n<system-reminder>\nSecret metadata\n</system-reminder>\nmore',
           },
         ]}
-        showTools={true}
       />
     )
-    expect(screen.getByRole('button', { name: 'Read tool call' })).toHaveAttribute('aria-expanded', 'true')
+    // First expand the strip, then click the individual tool
+    await user.click(screen.getByRole('button', { name: /toggle tool details/i }))
+    await user.click(screen.getByRole('button', { name: 'Read tool call' }))
     expect(screen.getByText(/file content/)).toBeInTheDocument()
     expect(screen.queryByText(/Secret metadata/)).not.toBeInTheDocument()
   })
 })
 
 describe('MessageBubble tool strip grouping', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(cleanup)
 
-  it('groups contiguous tool blocks into a single ToolStrip (expanded when showTools=true)', () => {
+  it('groups contiguous tool blocks into a single ToolStrip', () => {
     render(
       <MessageBubble
         role="assistant"
@@ -366,11 +391,11 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_result', tool_use_id: 't2', content: 'content' },
           { type: 'text', text: 'More text' },
         ]}
-        showTools={true}
       />
     )
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
+    // Should render a single ToolStrip (with "2 tools used"), not individual ToolBlocks
+    expect(screen.getByText('2 tools used')).toBeInTheDocument()
+    // Both text blocks should still be visible outside the strip
     expect(screen.getByText('Here is some text')).toBeInTheDocument()
     expect(screen.getByText('More text')).toBeInTheDocument()
   })
@@ -386,15 +411,15 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'echo 2' } },
           { type: 'tool_result', tool_use_id: 't2', content: '2' },
         ]}
-        showTools={true}
       />
     )
+    // Two separate strips, each with 1 tool
     const strips = container.querySelectorAll('[aria-label="Tool strip"]')
     expect(strips).toHaveLength(2)
     expect(screen.getByText('Middle text')).toBeInTheDocument()
   })
 
-  it('renders a single tool as a strip (expanded when showTools=true)', () => {
+  it('renders a single tool as a strip', () => {
     render(
       <MessageBubble
         role="assistant"
@@ -402,14 +427,12 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
           { type: 'tool_result', tool_use_id: 't1', content: 'output' },
         ]}
-        showTools={true}
       />
     )
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
   })
 
-  it('shows collapsed strips when showTools is false, chevron works', async () => {
-    const user = userEvent.setup()
+  it('shows collapsed strips when showTools is false', () => {
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -421,14 +444,11 @@ describe('MessageBubble tool strip grouping', () => {
         showTools={false}
       />
     )
+    // Tool strip should be visible (collapsed summary)
     expect(container.querySelectorAll('[aria-label="Tool strip"]')).toHaveLength(1)
-    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+    // But no expand button
+    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
     expect(screen.getByText('Hello')).toBeInTheDocument()
-
-    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
-    await user.click(toggle)
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
   it('includes running tool_use without result in the strip', () => {
@@ -441,28 +461,31 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } },
         ]}
         isLastMessage={true}
-        showTools={true}
       />
     )
+    // The strip should contain 2 tools (one complete, one running)
     const strip = screen.getByRole('region', { name: /tool strip/i })
     expect(strip).toBeInTheDocument()
   })
 
-  it('renders orphaned tool_result as standalone strip named "Result"', () => {
+  it('renders orphaned tool_result as standalone strip named "Result"', async () => {
+    const user = userEvent.setup()
     render(
       <MessageBubble
         role="assistant"
         content={[
           { type: 'tool_result', tool_use_id: 'orphan-1', content: 'orphaned data' },
         ]}
-        showTools={true}
       />
     )
+    // Should render as a ToolStrip
     const strip = screen.getByRole('region', { name: /tool strip/i })
     expect(strip).toBeInTheDocument()
+    // Expand the strip and then the "Result" tool block to verify content
+    await user.click(screen.getByRole('button', { name: /toggle tool details/i }))
     const resultButton = screen.getByRole('button', { name: 'Result tool call' })
     expect(resultButton).toBeInTheDocument()
-    expect(resultButton).toHaveAttribute('aria-expanded', 'true')
+    await user.click(resultButton)
     expect(screen.getByText('orphaned data')).toBeInTheDocument()
   })
 
@@ -476,19 +499,20 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
           { type: 'tool_result', tool_use_id: 't1', content: 'output' },
         ]}
-        showTools={true}
       />
     )
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
   })
 })
 
 describe('MessageBubble tool strip visual behavior', () => {
+  beforeEach(() => {
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+  })
   afterEach(cleanup)
 
-  it('renders collapsed strip with summary text when showTools is false, chevron works', async () => {
-    const user = userEvent.setup()
+  it('renders collapsed strip with summary text when showTools is false', () => {
     const { container } = render(
       <MessageBubble
         role="assistant"
@@ -506,41 +530,24 @@ describe('MessageBubble tool strip visual behavior', () => {
       />
     )
 
+    // The message renders
     expect(screen.getByRole('article')).toBeInTheDocument()
+    // Text blocks are visible
     expect(screen.getByText('Let me check that for you.')).toBeInTheDocument()
     expect(screen.getByText('All looks good!')).toBeInTheDocument()
+    // Tool strip is visible with collapsed summary
     const strips = container.querySelectorAll('[aria-label="Tool strip"]')
     expect(strips).toHaveLength(1)
     expect(screen.getByText('3 tools used')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
+    // No expand chevron
+    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    // No individual tool blocks visible
     expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Read tool call/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Grep tool call/i })).not.toBeInTheDocument()
-
-    const toggle = screen.getByRole('button', { name: /toggle tool details/i })
-    await user.click(toggle)
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Read tool call/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Grep tool call/i })).toBeInTheDocument()
   })
 
-  it('renders expanded strip with tool blocks when showTools is true', () => {
-    render(
-      <MessageBubble
-        role="assistant"
-        content={[
-          { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
-          { type: 'tool_result', tool_use_id: 't1', content: 'output' },
-        ]}
-        showTools={true}
-      />
-    )
-
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
-  })
-
-  it('can collapse strip by clicking toggle when showTools is true', async () => {
+  it('renders expandable strip with chevron when showTools is true', async () => {
     const user = userEvent.setup()
     render(
       <MessageBubble
@@ -553,9 +560,13 @@ describe('MessageBubble tool strip visual behavior', () => {
       />
     )
 
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
-    const chevron = screen.getByRole('button', { name: /toggle tool details/i })
-    await user.click(chevron)
+    // Collapsed by default with chevron
     expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    const chevron = screen.getByRole('button', { name: /toggle tool details/i })
+    expect(chevron).toBeInTheDocument()
+
+    // Click to expand
+    await user.click(chevron)
+    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 })

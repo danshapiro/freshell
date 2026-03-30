@@ -4,6 +4,7 @@ import type { ChatContentBlock } from '@/store/agentChatTypes'
 import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
 import ToolStrip, { type ToolPair } from './ToolStrip'
 
+/** Strip SDK-injected <system-reminder>...</system-reminder> tags from text. */
 function stripSystemReminders(text: string): string {
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
 }
@@ -22,7 +23,14 @@ interface MessageBubbleProps {
   showThinking?: boolean
   showTools?: boolean
   showTimecodes?: boolean
+  /** When true, unpaired tool_use blocks show a spinner (they may still be running).
+   *  When false (default), unpaired tool_use blocks show as complete — their results
+   *  arrived in a later message. */
   isLastMessage?: boolean
+  /** Index offset for this message's completed tool blocks in the global sequence. */
+  completedToolOffset?: number
+  /** Completed tools at globalIndex >= this value get initialExpanded=true. */
+  autoExpandAbove?: number
 }
 
 function MessageBubble({
@@ -35,8 +43,11 @@ function MessageBubble({
   showTools = true,
   showTimecodes = false,
   isLastMessage = false,
+  completedToolOffset,
+  autoExpandAbove,
 }: MessageBubbleProps) {
   const resolvedSpeaker = speaker ?? role ?? 'assistant'
+  // Build a map of tool_use_id -> tool_result for pairing
   const resultMap = useMemo(() => {
     const map = new Map<string, ChatContentBlock>()
     for (const block of content) {
@@ -47,6 +58,7 @@ function MessageBubble({
     return map
   }, [content])
 
+  // Group content blocks into render groups: text, thinking, or contiguous tool runs.
   const groups = useMemo(() => {
     const result: RenderGroup[] = []
     let currentToolPairs: ToolPair[] | null = null
@@ -68,6 +80,7 @@ function MessageBubble({
           currentToolPairs = []
           toolStartIndex = i
         }
+        // Look up the matching tool_result
         const resultBlock = block.id ? resultMap.get(block.id) : undefined
         const rawResult = resultBlock
           ? (typeof resultBlock.content === 'string' ? resultBlock.content : JSON.stringify(resultBlock.content))
@@ -86,12 +99,15 @@ function MessageBubble({
       }
 
       if (block.type === 'tool_result') {
+        // If we're in a tool group, skip (already consumed via resultMap pairing above).
         if (currentToolPairs) continue
 
+        // If it has a matching tool_use elsewhere in this message, skip (already consumed)
         if (block.tool_use_id && content.some(b => b.type === 'tool_use' && b.id === block.tool_use_id)) {
           continue
         }
 
+        // Orphaned result: render as standalone tool strip
         const raw = typeof block.content === 'string'
           ? block.content
           : block.content != null ? JSON.stringify(block.content) : ''
@@ -111,6 +127,7 @@ function MessageBubble({
         continue
       }
 
+      // Non-tool block: flush any pending tool group
       flushTools()
 
       if (block.type === 'text' && block.text) {
@@ -120,11 +137,16 @@ function MessageBubble({
       }
     }
 
+    // Flush any trailing tool group
     flushTools()
 
     return result
   }, [content, resultMap, isLastMessage])
 
+  // Check if any blocks will be visible after applying toggle filters.
+  // Note: tool groups are unconditionally visible (collapsed summary always shows),
+  // so showTools is intentionally absent from the dependency array. Only thinking
+  // blocks are conditionally hidden via their toggle.
   const hasVisibleContent = useMemo(() => {
     return groups.some((group) => {
       if (group.kind === 'text') return true
@@ -133,6 +155,19 @@ function MessageBubble({
       return false
     })
   }, [groups, showThinking])
+
+  // Track completed tool offset across tool groups for auto-expand
+  const toolGroupOffsets = useMemo(() => {
+    const offsets: number[] = []
+    let offset = completedToolOffset ?? 0
+    for (const group of groups) {
+      if (group.kind === 'tools') {
+        offsets.push(offset)
+        offset += group.pairs.filter(p => p.status === 'complete').length
+      }
+    }
+    return offsets
+  }, [groups, completedToolOffset])
 
   if (!hasVisibleContent) return null
 
@@ -184,6 +219,8 @@ function MessageBubble({
               key={`tools-${group.startIndex}`}
               pairs={group.pairs}
               isStreaming={isStreaming}
+              completedToolOffset={toolGroupOffsets[group.toolGroupIndex]}
+              autoExpandAbove={autoExpandAbove}
               showTools={showTools}
             />
           )

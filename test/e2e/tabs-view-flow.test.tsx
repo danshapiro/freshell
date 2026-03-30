@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '../../src/store/tabsSlice'
@@ -17,10 +17,6 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: vi.fn(() => () => {}),
     onReconnect: vi.fn(() => () => {}),
   }),
-}))
-
-vi.mock('@/lib/clipboard', () => ({
-  copyText: vi.fn(() => Promise.resolve(true)),
 }))
 
 describe('tabs view flow', () => {
@@ -75,11 +71,9 @@ describe('tabs view flow', () => {
       </Provider>,
     )
 
-    // Click the remote tab card to pull it
-    const remoteCard = screen.getByLabelText('remote-device: work item')
+    const remoteCard = screen.getByText('remote-device: work item').closest('article')
     expect(remoteCard).toBeTruthy()
-    fireEvent.click(remoteCard)
-
+    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: /Open copy/i }))
     expect(store.getState().tabs.tabs).toHaveLength(1)
     expect(store.getState().tabs.tabs[0]?.title).toBe('work item')
     const tabId = store.getState().tabs.tabs[0]!.id
@@ -135,10 +129,9 @@ describe('tabs view flow', () => {
       </Provider>,
     )
 
-    // Click the remote tab card to pull it
-    const remoteCard = screen.getByLabelText('remote-device: codex run')
+    const remoteCard = screen.getByText('remote-device: codex run').closest('article')
     expect(remoteCard).toBeTruthy()
-    fireEvent.click(remoteCard)
+    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: /Open copy/i }))
 
     const copiedTab = store.getState().tabs.tabs[0]
     expect(copiedTab?.title).toBe('codex run')
