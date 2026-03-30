@@ -1,3 +1,5 @@
+// Detects http/https URLs in terminal output text with balanced-paren handling.
+
 export type UrlMatch = {
   url: string
   startIndex: number

@@ -101,6 +101,29 @@ describe('SessionScanner', () => {
       const stat = await fs.stat(path.join(FIXTURES_DIR, 'healthy.jsonl'))
       expect(result.fileSize).toBe(stat.size)
     })
+
+    it('flags inline stop-hook progress on the active chain as a resume issue', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'inline-stop-hook-progress.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.orphanCount).toBe(0)
+      expect(result.resumeIssue).toBe('inline_stop_hook_progress')
+    })
+
+    it('does not flag sibling stop-hook progress that is off the active chain', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'sibling-stop-hook-progress.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.orphanCount).toBe(0)
+      expect(result.resumeIssue).toBeUndefined()
+    })
+
+    it('does not flag resume issue for files without stop-hook progress', async () => {
+      const result = await scanner.scan(path.join(FIXTURES_DIR, 'healthy.jsonl'))
+
+      expect(result.status).toBe('healthy')
+      expect(result.resumeIssue).toBeUndefined()
+    })
   })
 
   describe('repair()', () => {
@@ -221,6 +244,115 @@ describe('SessionScanner', () => {
       const scanAfter = await scanner.scan(testFile)
       expect(scanAfter.status).toBe('healthy')
       expect(scanAfter.chainDepth).toBe(21)
+    })
+
+    it('rewrites stop_hook_summary parentUuid to bypass inline stop-hook progress when enabled', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+
+      const result = await scanner.repair(testFile, { includeResumeIssues: true })
+
+      expect(result.status).toBe('repaired')
+      expect(result.resumeIssuesFixed).toBe(1)
+      expect(result.orphansFixed).toBe(0)
+
+      // Verify the file is now clean (no resume issue)
+      const scanAfter = await scanner.scan(testFile)
+      expect(scanAfter.status).toBe('healthy')
+      expect(scanAfter.resumeIssue).toBeUndefined()
+    })
+
+    it('does not rewrite inline-progress sessions during default repair (no options)', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+
+      const result = await scanner.repair(testFile)
+
+      expect(result.status).toBe('already_healthy')
+      expect(result.resumeIssuesFixed).toBe(0)
+      expect(result.orphansFixed).toBe(0)
+
+      // Resume issue should still be present
+      const scanAfter = await scanner.scan(testFile)
+      expect(scanAfter.resumeIssue).toBe('inline_stop_hook_progress')
+    })
+
+    it('repair is idempotent for inline stop-hook progress', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+
+      const result1 = await scanner.repair(testFile, { includeResumeIssues: true })
+      expect(result1.status).toBe('repaired')
+      expect(result1.resumeIssuesFixed).toBe(1)
+
+      const result2 = await scanner.repair(testFile, { includeResumeIssues: true })
+      expect(result2.status).toBe('already_healthy')
+      expect(result2.resumeIssuesFixed).toBe(0)
+    })
+
+    it('preserves all fields except stop_hook_summary.parentUuid during inline progress repair', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+      const linesBefore = (await fs.readFile(testFile, 'utf8')).split('\n').filter(Boolean)
+
+      await scanner.repair(testFile, { includeResumeIssues: true })
+
+      const linesAfter = (await fs.readFile(testFile, 'utf8')).split('\n').filter(Boolean)
+      expect(linesAfter.length).toBe(linesBefore.length)
+
+      for (let i = 0; i < linesBefore.length; i++) {
+        const before = JSON.parse(linesBefore[i])
+        const after = JSON.parse(linesAfter[i])
+
+        // uuid, type, and all non-parentUuid fields must be preserved
+        expect(after.uuid).toBe(before.uuid)
+        expect(after.type).toBe(before.type)
+
+        // Only the stop_hook_summary line should have a changed parentUuid
+        if (before.uuid === 's-004') {
+          // stop_hook_summary was re-parented from progress (p-003) to assistant (a-002)
+          expect(before.parentUuid).toBe('p-003')
+          expect(after.parentUuid).toBe('a-002')
+        } else {
+          expect(after.parentUuid).toBe(before.parentUuid)
+        }
+      }
+    })
+
+    it('creates backup before inline progress repair', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+      const originalContent = await fs.readFile(testFile, 'utf8')
+
+      const result = await scanner.repair(testFile, { includeResumeIssues: true })
+
+      expect(result.backupPath).toBeDefined()
+      expect(result.backupPath).toMatch(/\.backup-\d+$/)
+
+      const backupContent = await fs.readFile(result.backupPath!, 'utf8')
+      expect(backupContent).toBe(originalContent)
+    })
+
+    it('does not create backup when inline progress repair is not enabled', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+
+      const result = await scanner.repair(testFile)
+
+      expect(result.status).toBe('already_healthy')
+      expect(result.backupPath).toBeUndefined()
+    })
+
+    it('leaves progress record in file as side leaf after repair', async () => {
+      const testFile = await copyFixture('inline-stop-hook-progress.jsonl')
+
+      await scanner.repair(testFile, { includeResumeIssues: true })
+
+      const content = await fs.readFile(testFile, 'utf8')
+      const lines = content.split('\n').filter(Boolean)
+      const progressLine = lines.find(l => {
+        const obj = JSON.parse(l)
+        return obj.uuid === 'p-003'
+      })
+      expect(progressLine).toBeDefined()
+      // Progress record should still be parented to assistant
+      const progressObj = JSON.parse(progressLine!)
+      expect(progressObj.parentUuid).toBe('a-002')
+      expect(progressObj.type).toBe('progress')
     })
 
     it('repairs real-world corrupted session from production', async () => {

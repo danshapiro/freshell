@@ -10,6 +10,7 @@ import type {
   SessionScanner,
   SessionScanResult,
   SessionRepairResult,
+  SessionRepairOptions,
 } from './types.js'
 import type { SessionCache } from './cache.js'
 
@@ -195,14 +196,19 @@ export class SessionRepairQueue extends EventEmitter {
           allowStaleMs: item.priority === 'active' ? ACTIVE_CACHE_GRACE_MS : undefined,
         })
         if (cached) {
-          const normalized = cached.sessionId === item.sessionId
-            ? cached
-            : { ...cached, sessionId: item.sessionId }
-          await this.postScan?.(normalized)
-          this.setProcessed(item.sessionId, normalized)
-          this.emit('scanned', normalized)
-          this.resolveWaiting(item.sessionId, normalized)
-          return
+          // For active priority: bypass cache if result has a resume issue that needs repair
+          if (item.priority === 'active' && cached.resumeIssue) {
+            // Fall through to scan/repair path below
+          } else {
+            const normalized = cached.sessionId === item.sessionId
+              ? cached
+              : { ...cached, sessionId: item.sessionId }
+            await this.postScan?.(normalized)
+            this.setProcessed(item.sessionId, normalized)
+            this.emit('scanned', normalized)
+            this.resolveWaiting(item.sessionId, normalized)
+            return
+          }
         }
 
         // Scan the session
@@ -213,9 +219,15 @@ export class SessionRepairQueue extends EventEmitter {
           : { ...scanResult, sessionId: item.sessionId }
         this.emit('scanned', normalizedScan)
 
-        // Repair if corrupted
-        if (normalizedScan.status === 'corrupted') {
-          const repairResult = await this.scanner.repair(item.filePath)
+        // Repair if corrupted, or if active priority and has resume issue
+        const needsRepair = normalizedScan.status === 'corrupted'
+          || (item.priority === 'active' && !!normalizedScan.resumeIssue)
+
+        if (needsRepair) {
+          const repairOptions: SessionRepairOptions = item.priority === 'active' && normalizedScan.resumeIssue
+            ? { includeResumeIssues: true }
+            : {}
+          const repairResult = await this.scanner.repair(item.filePath, repairOptions)
           this.emit('repaired', repairResult)
 
           // Re-scan to get updated result
@@ -380,6 +392,14 @@ export class SessionRepairQueue extends EventEmitter {
    */
   has(sessionId: string): boolean {
     return this.queuedBySessionId.has(sessionId) || this.processing.has(sessionId) || this.processed.has(sessionId)
+  }
+
+  /**
+   * Remove a processed result so the session can be re-enqueued and re-awaited.
+   * Used by the service layer to force active-priority re-processing.
+   */
+  clearProcessed(sessionId: string): void {
+    this.processed.delete(sessionId)
   }
 
   /**

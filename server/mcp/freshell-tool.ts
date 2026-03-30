@@ -750,8 +750,13 @@ async function routeAction(
         // For screenshot aliases, inject scope from the alias name
         if (action.startsWith('screenshot-')) {
           const scope = action.replace('screenshot-', '')
-          return routeAction(resolved, { ...params, scope })
+          const mergedParams = { ...params, scope }
+          const aliasParamError = validateParams(resolved, mergedParams)
+          if (aliasParamError) return aliasParamError
+          return routeAction(resolved, mergedParams)
         }
+        const aliasParamError = validateParams(resolved, params)
+        if (aliasParamError) return aliasParamError
         return routeAction(resolved, params)
       }
       return {

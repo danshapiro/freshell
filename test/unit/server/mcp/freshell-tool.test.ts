@@ -1190,11 +1190,23 @@ describe('executeAction -- parameter validation', () => {
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
   })
 
-  it('action without params schema (tmux alias) skips validation', async () => {
-    mockClient.post.mockResolvedValue({ id: 't1' })
+  it('tmux alias validates params against the resolved action', async () => {
     const result = await executeAction('new-window', { unknownParam: 'value' })
-    // new-window is a tmux alias, not in ACTION_PARAMS directly, so no validation
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('unknownParam')
+  })
+
+  it('tmux alias with valid params routes through', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+    const result = await executeAction('new-window', { name: 'Work', mode: 'claude' })
     expect(result).not.toHaveProperty('error')
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
+  })
+
+  it('tmux alias surfaces common confusion hints', async () => {
+    const result = await executeAction('new-window', { url: 'https://example.com' })
+    expect(result).toHaveProperty('error')
+    expect(result.error).toContain('open-browser')
   })
 
   it('empty params on paramless action succeeds', async () => {
