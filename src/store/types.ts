@@ -81,6 +81,7 @@ export interface CodingCliSession {
   sessionType?: string
   sessionId: string
   projectPath: string
+  checkoutPath?: string
   createdAt?: number
   lastActivityAt: number
   messageCount?: number
