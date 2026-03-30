@@ -350,7 +350,7 @@ describe('State Edge Cases', () => {
         expect(store.getState().tabs.tabs).toHaveLength(0)
       })
 
-      it('handles hydrateTabs called multiple times', () => {
+      it('handles hydrateTabs called multiple times — set union', () => {
         const store = createTestStore()
 
         const firstHydration: Tab[] = [
@@ -364,11 +364,14 @@ describe('State Edge Cases', () => {
         store.dispatch(hydrateTabs({ tabs: firstHydration, activeTabId: 'first-1' }))
         store.dispatch(hydrateTabs({ tabs: secondHydration, activeTabId: 'second-2' }))
 
-        // Second hydration should completely replace first
+        // Set union: remote tabs (second-1, second-2) + local-only (first-1) appended
         const state = store.getState().tabs
-        expect(state.tabs).toHaveLength(2)
+        expect(state.tabs).toHaveLength(3)
         expect(state.tabs[0].id).toBe('second-1')
-        expect(state.activeTabId).toBe('second-2')
+        expect(state.tabs[1].id).toBe('second-2')
+        expect(state.tabs[2].id).toBe('first-1')
+        // Local activeTabId (first-1) still exists in merged set, so it's preserved
+        expect(state.activeTabId).toBe('first-1')
       })
     })
 

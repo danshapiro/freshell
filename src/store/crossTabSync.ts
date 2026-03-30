@@ -51,22 +51,14 @@ function dispatchHydrateTabsFromPersisted(store: StoreLike, raw: string) {
   if (!parsed) return
 
   const remoteTabs = parsed.tabs.tabs
-  const remoteIds = new Set(remoteTabs.map((t: any) => t?.id).filter((id: any): id is string => typeof id === 'string'))
-
-  const state = store.getState()
-  const localActive = state?.tabs?.activeTabId as string | null | undefined
-
-  const desired = (localActive && remoteIds.has(localActive)) ? localActive : parsed.tabs.activeTabId
-  const activeTabId =
-    desired && remoteIds.has(desired)
-      ? desired
-      : (remoteTabs[0]?.id ?? null)
+  const remoteTombstones = parsed.tombstones || []
 
   store.dispatch({
     ...hydrateTabs({
       tabs: remoteTabs,
-      activeTabId,
+      activeTabId: parsed.tabs.activeTabId,
       renameRequestTabId: null,
+      tombstones: remoteTombstones,
     } as any),
     meta: { skipPersist: true, source: 'cross-tab' },
   })

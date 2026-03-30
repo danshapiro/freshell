@@ -323,12 +323,18 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     const state = store.getState()
 
     if (tabsDirty) {
+      // Prune tombstones older than 1 hour
+      const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
+      const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
+      const tombstones = (state.tabs.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
+
       const tabsPayload = {
         tabs: {
           // Persist only stable tab state. Keep ephemeral UI fields out of storage.
           activeTabId: state.tabs.activeTabId,
           tabs: state.tabs.tabs.map(stripTabVolatileFields),
         },
+        tombstones,
       }
 
       try {

@@ -24,14 +24,21 @@ const zPersistedTabsState = z.object({
   tabs: z.array(zTab),
 }).passthrough()
 
+const zTombstone = z.object({
+  id: z.string(),
+  deletedAt: z.number(),
+})
+
 const zPersistedTabsPayload = z.object({
   version: z.number().optional(),
   tabs: zPersistedTabsState,
+  tombstones: z.array(zTombstone).optional(),
 }).passthrough()
 
 export type ParsedPersistedTabs = {
   version: number
   tabs: z.infer<typeof zPersistedTabsState>
+  tombstones: Array<{ id: string; deletedAt: number }>
 }
 
 export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
@@ -54,6 +61,7 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
     },
+    tombstones: res.data.tombstones || [],
   }
 }
 
