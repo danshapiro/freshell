@@ -65,6 +65,23 @@ describe('createProxyRouter', () => {
       targetApp.get('/path/to/page', (_req, res) => res.send('deep path'))
       targetApp.get('/with-query', (req, res) => res.json({ q: req.query.q }))
       targetApp.post('/echo', express.json(), (req, res) => res.json(req.body))
+      targetApp.get('/with-xfo', (_req, res) => {
+        res.set('X-Frame-Options', 'DENY')
+        res.send('framed content')
+      })
+      targetApp.get('/with-csp', (_req, res) => {
+        res.set('Content-Security-Policy', "frame-ancestors 'none'; default-src 'self'")
+        res.send('csp content')
+      })
+      targetApp.get('/with-both', (_req, res) => {
+        res.set('X-Frame-Options', 'SAMEORIGIN')
+        res.set('Content-Security-Policy', "frame-ancestors 'none'")
+        res.send('both headers')
+      })
+      targetApp.get('/no-frame-headers', (_req, res) => {
+        res.set('X-Custom-Header', 'keep-me')
+        res.send('no frame headers')
+      })
       targetServer = await new Promise((resolve) => {
         const server = targetApp.listen(0, '127.0.0.1', () => resolve(server))
       })
@@ -152,6 +169,63 @@ describe('createProxyRouter', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
 
       expect(res.status).toBe(400)
+    })
+
+    it('strips X-Frame-Options header from proxied responses', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/with-xfo`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('framed content')
+      expect(res.headers['x-frame-options']).toBeUndefined()
+    })
+
+    it('strips Content-Security-Policy header from proxied responses', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/with-csp`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('csp content')
+      expect(res.headers['content-security-policy']).toBeUndefined()
+    })
+
+    it('strips both X-Frame-Options and Content-Security-Policy simultaneously', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/with-both`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('both headers')
+      expect(res.headers['x-frame-options']).toBeUndefined()
+      expect(res.headers['content-security-policy']).toBeUndefined()
+    })
+
+    it('preserves non-iframe-blocking headers from proxied responses', async () => {
+      process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+      const manager = { forward: vi.fn(), close: vi.fn() } as unknown as PortForwardManager
+      const app = createApp(manager)
+
+      const res = await request(app)
+        .get(`/api/proxy/http/${targetPort}/no-frame-headers`)
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.text).toBe('no frame headers')
+      expect(res.headers['x-custom-header']).toBe('keep-me')
     })
   })
 

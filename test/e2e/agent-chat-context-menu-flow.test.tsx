@@ -22,12 +22,8 @@ import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
-import {
-  BROWSER_PREFERENCES_STORAGE_KEY,
-  setToolStripExpandedPreference,
-} from '@/lib/browser-preferences'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
 
-// jsdom doesn't implement scrollIntoView
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
@@ -132,8 +128,6 @@ describe('freshclaude context menu integration', () => {
   })
 
   it('right-click on tool input in rendered DOM produces "Copy command" menu item', () => {
-    // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Run a command' }))
@@ -153,18 +147,11 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Ensure ToolBlock is expanded so data attributes are in the DOM
-    const toolButton = screen.getByRole('button', { name: /tool call/i })
-    if (toolButton.getAttribute('aria-expanded') !== 'true') {
-      fireEvent.click(toolButton)
-    }
-
-    // Step 1: Verify the data attributes are present in the rendered DOM
+    // Tool strips start expanded when showTools=true (default), so ToolBlock data attributes are in the DOM
     const toolInputEl = container.querySelector('[data-tool-input]')
     expect(toolInputEl).not.toBeNull()
     expect(toolInputEl?.getAttribute('data-tool-name')).toBe('Bash')
 
-    // Step 2: Feed the actual DOM element into buildMenuItems as clickTarget
     const mockActions = createMockActions()
     const ctx = createMockContext(mockActions, {
       clickTarget: toolInputEl as HTMLElement,
@@ -173,7 +160,6 @@ describe('freshclaude context menu integration', () => {
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
 
-    // Step 3: Verify the correct context-sensitive menu items appear
     expect(ids).toContain('fc-copy')
     expect(ids).toContain('fc-select-all')
     expect(ids).toContain('fc-copy-command')
@@ -181,8 +167,6 @@ describe('freshclaude context menu integration', () => {
   })
 
   it('right-click on diff in rendered DOM produces diff-specific menu items', () => {
-    // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Edit a file' }))
@@ -214,22 +198,14 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Ensure ToolBlock is expanded so data attributes are in the DOM
-    const toolButton = screen.getByRole('button', { name: /tool call/i })
-    if (toolButton.getAttribute('aria-expanded') !== 'true') {
-      fireEvent.click(toolButton)
-    }
-
-    // Step 1: Verify the data attributes are present in the rendered DOM
+    // Tool strips start expanded when showTools=true (default)
     const diffEl = container.querySelector('[data-diff]')
     expect(diffEl).not.toBeNull()
     expect(diffEl?.getAttribute('data-file-path')).toBe('/tmp/test.ts')
 
-    // The click target would be a child element inside the diff (e.g. a span with diff text)
     const clickTarget = diffEl?.querySelector('span') ?? diffEl
     expect(clickTarget).not.toBeNull()
 
-    // Step 2: Feed the actual DOM element into buildMenuItems as clickTarget
     const mockActions = createMockActions()
     const ctx = createMockContext(mockActions, {
       clickTarget: clickTarget as HTMLElement,
@@ -238,7 +214,6 @@ describe('freshclaude context menu integration', () => {
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
 
-    // Step 3: Verify the correct context-sensitive menu items appear
     expect(ids).toContain('fc-copy')
     expect(ids).toContain('fc-select-all')
     expect(ids).toContain('fc-copy-new-version')
@@ -248,8 +223,6 @@ describe('freshclaude context menu integration', () => {
   })
 
   it('right-click on tool output in rendered DOM produces "Copy output" menu item', () => {
-    // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'List files' }))
@@ -268,17 +241,10 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Ensure ToolBlock is expanded so data attributes are in the DOM
-    const toolButton = screen.getByRole('button', { name: /tool call/i })
-    if (toolButton.getAttribute('aria-expanded') !== 'true') {
-      fireEvent.click(toolButton)
-    }
-
-    // Verify the tool output data attribute exists in the DOM
+    // Tool strips start expanded when showTools=true (default)
     const toolOutputEl = container.querySelector('[data-tool-output]')
     expect(toolOutputEl).not.toBeNull()
 
-    // Feed it into buildMenuItems
     const mockActions = createMockActions()
     const ctx = createMockContext(mockActions, {
       clickTarget: toolOutputEl as HTMLElement,

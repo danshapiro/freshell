@@ -15,6 +15,7 @@ interface TabContentProps {
 
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const hasLayout = useAppSelector((s) => !!s.panes.layouts[tabId])
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
   const previousHiddenRef = useRef(hidden)
 
@@ -27,8 +28,8 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   if (!tab) return null
 
-  // For coding CLI session views with no terminal, use SessionView
-  if (tab.codingCliSessionId && !tab.terminalId) {
+  // For coding CLI session views with no terminal pane, use SessionView
+  if (tab.codingCliSessionId && !hasLayout) {
     return <SessionView sessionId={tab.codingCliSessionId} hidden={hidden} />
   }
 
@@ -36,16 +37,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   let defaultContent: PaneContentInput
   const resumeSessionType = getTabResumeSessionType(tab)
 
-  if (tab.terminalId) {
-    defaultContent = {
-      kind: 'terminal',
-      mode: tab.mode,
-      shell: tab.shell,
-      resumeSessionId: tab.resumeSessionId,
-      initialCwd: tab.initialCwd,
-      terminalId: tab.terminalId,
-    }
-  } else if (tab.resumeSessionId && resumeSessionType) {
+  if (tab.resumeSessionId && resumeSessionType) {
     defaultContent = buildResumeContent({
       sessionType: resumeSessionType,
       sessionId: tab.resumeSessionId,
@@ -58,7 +50,6 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       shell: tab.shell,
       resumeSessionId: tab.resumeSessionId,
       initialCwd: tab.initialCwd,
-      terminalId: tab.terminalId,
     }
   } else if (defaultNewPane === 'ask') {
     defaultContent = { kind: 'picker' }
@@ -81,7 +72,6 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       shell: tab.shell,
       resumeSessionId: tab.resumeSessionId,
       initialCwd: tab.initialCwd,
-      terminalId: tab.terminalId,
     }
   }
 

@@ -9,6 +9,31 @@ import { getRequesterIdentity } from './request-ip.js'
 
 const log = logger.child({ component: 'proxy-router' })
 
+/**
+ * Headers that prevent iframe embedding. The HTTP reverse proxy strips these
+ * so that proxied localhost content renders inside Freshell's browser pane
+ * iframe. Without this, dev servers that send X-Frame-Options or CSP
+ * frame-ancestors directives cause the browser to block the iframe content,
+ * which in turn makes the MCP screenshot tool fall back to a placeholder.
+ */
+const IFRAME_BLOCKED_HEADERS = new Set([
+  'x-frame-options',
+  'content-security-policy',
+  'content-security-policy-report-only',
+])
+
+function stripIframeBlockingHeaders(
+  headers: http.IncomingHttpHeaders,
+): http.IncomingHttpHeaders {
+  const cleaned: http.IncomingHttpHeaders = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (!IFRAME_BLOCKED_HEADERS.has(key.toLowerCase())) {
+      cleaned[key] = value
+    }
+  }
+  return cleaned
+}
+
 export interface ProxyRouterDeps {
   portForwardManager: PortForwardManager
 }
@@ -76,7 +101,8 @@ export function createProxyRouter(deps: ProxyRouterDeps): Router {
         headers,
       },
       (proxyRes) => {
-        res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers)
+        const strippedHeaders = stripIframeBlockingHeaders(proxyRes.headers)
+        res.writeHead(proxyRes.statusCode ?? 502, strippedHeaders)
         proxyRes.pipe(res)
       },
     )

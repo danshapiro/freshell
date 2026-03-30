@@ -19,6 +19,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
+import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -72,6 +73,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.projectColor !== bi.projectColor ||
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
+      ai.isFallback !== bi.isFallback ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -123,6 +125,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
+    a.isFallback === b.isFallback &&
     a.ratchetedActivity === b.ratchetedActivity &&
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
@@ -197,13 +200,22 @@ export default function Sidebar({
   const terminals = useAppSelector((state) => (
     (state as any).terminalDirectory?.windows?.sidebar?.items ?? EMPTY_TERMINALS
   )) as BackgroundTerminal[]
-  const [filter, setFilter] = useState('')
-  const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const lastMarkedSearchQueryRef = useRef<string | null>(null)
   const wasSearchingRef = useRef(false)
+  const hasInitializedSearchEffectRef = useRef(false)
   const listRef = useRef<HTMLDivElement | null>(null)
   const listContentRef = useRef<HTMLDivElement | null>(null)
   const listMetricsRef = useRef({ clientHeight: 0, scrollHeight: 0 })
+
+  const requestedQueryValue = sidebarWindow?.query ?? ''
+  const requestedQuery = requestedQueryValue.trim()
+  const requestedSearchTier = sidebarWindow?.searchTier ?? 'title'
+  const appliedQuery = (sidebarWindow?.appliedQuery ?? '').trim()
+  const appliedSearchTier = sidebarWindow?.appliedSearchTier ?? 'title'
+  const [filter, setFilter] = useState(requestedQueryValue)
+  const [searchTier, setSearchTier] = useState<typeof requestedSearchTier>(requestedSearchTier)
+  const localQuery = filter.trim()
+  const localMatchesRequestedSearch = filter === requestedQueryValue && searchTier === requestedSearchTier
 
   // Tick counter that increments every 15s to keep relative timestamps fresh.
   // The custom comparator on SidebarItem ensures only the timestamp text node
@@ -215,8 +227,42 @@ export default function Sidebar({
   }, [])
 
   useEffect(() => {
-    const query = filter.trim()
-    if (!query) {
+    setFilter(requestedQueryValue)
+  }, [requestedQueryValue])
+
+  useEffect(() => {
+    setSearchTier(requestedSearchTier)
+  }, [requestedSearchTier])
+
+  useEffect(() => {
+    let shouldDispatchInitialRequestedSearch = false
+
+    if (!hasInitializedSearchEffectRef.current) {
+      const currentSidebarWindow = store.getState().sessions.windows?.sidebar
+      const currentRequestedQuery = (currentSidebarWindow?.query ?? '').trim()
+      const currentRequestedSearchTier = currentSidebarWindow?.searchTier ?? 'title'
+      const currentAppliedQuery = (currentSidebarWindow?.appliedQuery ?? '').trim()
+      const currentAppliedSearchTier = currentSidebarWindow?.appliedSearchTier ?? 'title'
+      shouldDispatchInitialRequestedSearch = localMatchesRequestedSearch
+        && currentRequestedQuery.length > 0
+        && (
+          currentRequestedQuery !== currentAppliedQuery
+          || currentRequestedSearchTier !== currentAppliedSearchTier
+          || typeof currentSidebarWindow?.lastLoadedAt !== 'number'
+        )
+
+      hasInitializedSearchEffectRef.current = true
+      wasSearchingRef.current = currentRequestedQuery.length > 0 || currentAppliedQuery.length > 0
+      if (!shouldDispatchInitialRequestedSearch) {
+        return
+      }
+    }
+
+    if (localMatchesRequestedSearch && !shouldDispatchInitialRequestedSearch) {
+      return
+    }
+
+    if (!localQuery) {
       if (wasSearchingRef.current) {
         wasSearchingRef.current = false
         lastMarkedSearchQueryRef.current = null
@@ -233,7 +279,7 @@ export default function Sidebar({
       void dispatch(fetchSessionWindow({
         surface: 'sidebar',
         priority: 'visible',
-        query,
+        query: localQuery,
         searchTier,
       }) as any)
     }, 300) // Debounce 300ms
@@ -241,7 +287,13 @@ export default function Sidebar({
     return () => {
       clearTimeout(timeoutId)
     }
-  }, [dispatch, filter, searchTier])
+  }, [
+    dispatch,
+    localMatchesRequestedSearch,
+    localQuery,
+    searchTier,
+    store,
+  ])
 
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
   const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
@@ -337,7 +389,6 @@ export default function Sidebar({
         sessionType,
         sessionId: item.sessionId,
         cwd: item.cwd,
-        terminalId: runningTerminalId,
         agentChatProviderSettings: providerSettings,
       }),
     }))
@@ -370,33 +421,33 @@ export default function Sidebar({
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 
-  const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
-  const activeTerminalId = activeTab?.terminalId
-  const activeSearchTier = sidebarWindow?.searchTier ?? searchTier
+  const activeTerminalId = useAppSelector((s) => activeTabId ? selectPrimaryTerminalIdForTab(s, activeTabId) : undefined)
   const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
   const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
-  const activeQuery = (sidebarWindow?.query ?? filter).trim()
+  const visibleQuery = appliedQuery || requestedQuery
+  const visibleSearchTier = appliedQuery ? appliedSearchTier : requestedSearchTier
   const loadingKind = sidebarWindow?.loadingKind
+  const hasRequestedQuery = requestedQuery.length > 0
   const showBlockingLoad = !!sidebarWindow?.loading
     && loadingKind === 'initial'
     && !hasLoadedSidebarWindow
     && !sidebarWindowHasItems
-  const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
+  const showSearchLoading = !!sidebarWindow?.loading
+    && loadingKind === 'search'
+    && hasRequestedQuery
   const showDeepSearchPending = !!sidebarWindow?.deepSearchPending
   const sidebarHasMore = sidebarWindow?.hasMore ?? false
   const sidebarOldestLoadedTimestamp = sidebarWindow?.oldestLoadedTimestamp
   const sidebarOldestLoadedSessionId = sidebarWindow?.oldestLoadedSessionId
-  const localQuery = filter.trim()
-  const committedQuery = (sidebarWindow?.query ?? '').trim()
-  const hasActiveQuery = localQuery.length > 0 || committedQuery.length > 0
+  const hasAppliedQuery = appliedQuery.length > 0
 
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const requestSidebarAppend = useCallback(() => {
     if (!sidebarHasMore || sidebarWindow?.loading || loadMoreInFlightRef.current) return
     if (sidebarOldestLoadedTimestamp == null || sidebarOldestLoadedSessionId == null) return
-    if (hasActiveQuery) return
+    if (hasAppliedQuery) return
 
     loadMoreInFlightRef.current = true
     void dispatch(fetchSessionWindow({
@@ -410,7 +461,7 @@ export default function Sidebar({
     }, 15_000)
   }, [
     dispatch,
-    hasActiveQuery,
+    hasAppliedQuery,
     sidebarHasMore,
     sidebarOldestLoadedSessionId,
     sidebarOldestLoadedTimestamp,
@@ -491,17 +542,16 @@ export default function Sidebar({
   }, [])
 
   useEffect(() => {
-    const query = filter.trim()
-    if (!query) return
+    if (!requestedQuery) return
     if (sidebarWindow?.loading) return
     if (sortedItems.length === 0) return
-    if (lastMarkedSearchQueryRef.current === query) return
+    if (lastMarkedSearchQueryRef.current === requestedQuery) return
     getInstalledPerfAuditBridge()?.mark('sidebar.search_results_visible', {
-      query,
+      query: requestedQuery,
       resultCount: sortedItems.length,
     })
-    lastMarkedSearchQueryRef.current = query
-  }, [filter, sidebarWindow?.loading, sortedItems.length])
+    lastMarkedSearchQueryRef.current = requestedQuery
+  }, [requestedQuery, sidebarWindow?.loading, sortedItems.length])
 
   return (
     <div
@@ -599,12 +649,12 @@ export default function Sidebar({
             ) : null}
           </div>
         </div>
-        {filter.trim() && (
+        {localQuery && (
           <div className="mt-2">
             <select
               aria-label="Search tier"
               value={searchTier}
-              onChange={(e) => setSearchTier(e.target.value as typeof searchTier)}
+              onChange={(e) => setSearchTier(e.target.value as typeof requestedSearchTier)}
               className="w-full h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
             >
               <option value="title">Title</option>
@@ -652,11 +702,11 @@ export default function Sidebar({
           {showBlockingLoad ? (
             <div
               className="flex items-center justify-center py-8"
-              data-testid={activeQuery ? 'search-loading' : undefined}
+              data-testid={hasRequestedQuery ? 'search-loading' : undefined}
             >
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               <span className="ml-2 text-sm text-muted-foreground">
-                {activeQuery ? 'Searching...' : 'Loading sessions...'}
+                {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
               </span>
             </div>
           ) : sortedItems.length === 0 ? (
@@ -667,9 +717,9 @@ export default function Sidebar({
             </div>
           ) : (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {activeQuery && activeSearchTier !== 'title'
+            {visibleQuery && visibleSearchTier !== 'title'
               ? 'No results found'
-              : activeQuery
+              : visibleQuery
               ? 'No matching sessions'
               : 'No sessions yet'}
           </div>
@@ -750,7 +800,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
-    a.projectPath === b.projectPath
+    a.projectPath === b.projectPath &&
+    a.isFallback === b.isFallback
   )
 }
 

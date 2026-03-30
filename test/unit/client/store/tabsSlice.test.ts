@@ -436,7 +436,6 @@ describe('tabsSlice', () => {
         createRequestId: 'full-tab',
         title: 'Full Tab',
         description: 'A description',
-        terminalId: 'terminal-789',
         status: 'running',
         mode: 'codex',
         shell: 'wsl',
@@ -457,7 +456,6 @@ describe('tabsSlice', () => {
       expect(tab.id).toBe('full-tab')
       expect(tab.title).toBe('Full Tab')
       expect(tab.description).toBe('A description')
-      expect(tab.terminalId).toBe('terminal-789')
       expect(tab.status).toBe('running')
       expect(tab.mode).toBe('codex')
       expect(tab.shell).toBe('wsl')
@@ -758,7 +756,11 @@ describe('tabsSlice', () => {
         },
       })
 
-      store.dispatch(addTab({ id: 'tab-1', mode: 'claude', terminalId: 'term-1', status: 'running' }))
+      store.dispatch(addTab({ id: 'tab-1', mode: 'claude', status: 'running' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-1', status: 'running' },
+      }))
       store.dispatch(addTab({ id: 'tab-2', mode: 'shell' }))
 
       await store.dispatch(openSessionTab({ sessionId: VALID_CLAUDE_SESSION_ID, provider: 'claude', terminalId: 'term-1' }))
@@ -784,9 +786,14 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].terminalId).toBe('term-2')
       expect(tabs[0].status).toBe('running')
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      // terminalId lives in pane content, not on the tab
+      const layout = store.getState().panes.layouts[tabs[0].id]
+      expect(layout).toBeDefined()
+      if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
+        expect(layout.content.terminalId).toBe('term-2')
+      }
     })
 
     it('uses capitalized provider label for codex tab title', async () => {

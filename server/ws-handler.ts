@@ -309,7 +309,7 @@ export class WsHandler {
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private sessionsRevision = 0
   private terminalsRevision = 0
-  private terminalRuntimeRevisions = new Map<string, number>()
+
   private readonly serverInstanceId: string
   private readonly bootId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
@@ -1435,7 +1435,6 @@ export class WsHandler {
         }
         if (attachResult === 'duplicate') return
         state.attachedTerminalIds.add(m.terminalId)
-        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1447,7 +1446,6 @@ export class WsHandler {
           return
         }
         this.send(ws, { type: 'terminal.detached', terminalId: m.terminalId })
-        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1474,7 +1472,6 @@ export class WsHandler {
           return
         }
         this.broadcastTerminalsChanged()
-        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -2037,59 +2034,6 @@ export class WsHandler {
     })
   }
 
-  private resolveTerminalRuntimePayload(terminalId: string): {
-    terminalId: string
-    title: string
-    status: 'running' | 'detached' | 'exited'
-    cwd?: string
-    pid?: number
-  } | null {
-    const record = this.registry.get(terminalId) as
-      | {
-          terminalId: string
-          title: string
-          status: 'running' | 'exited'
-          cwd?: string
-          pty?: { pid?: number }
-          clients?: Set<unknown>
-        }
-      | null
-      | undefined
-
-    if (!record) return null
-
-    return {
-      terminalId: record.terminalId,
-      title: record.title,
-      status: record.status === 'exited'
-        ? 'exited'
-        : ((record.clients?.size ?? 0) > 0 ? 'running' : 'detached'),
-      ...(record.cwd ? { cwd: record.cwd } : {}),
-      ...(typeof record.pty?.pid === 'number' ? { pid: record.pty.pid } : {}),
-    }
-  }
-
-  broadcastTerminalRuntimeUpdated(msg: {
-    terminalId: string
-    title: string
-    status: 'running' | 'detached' | 'exited'
-    cwd?: string
-    pid?: number
-  }): void {
-    const revision = (this.terminalRuntimeRevisions.get(msg.terminalId) ?? 0) + 1
-    this.terminalRuntimeRevisions.set(msg.terminalId, revision)
-    this.broadcastAuthenticated({
-      type: 'terminal.runtime.updated',
-      revision,
-      ...msg,
-    })
-  }
-
-  private broadcastTerminalRuntimeUpdatedForId(terminalId: string): void {
-    const payload = this.resolveTerminalRuntimePayload(terminalId)
-    if (!payload) return
-    this.broadcastTerminalRuntimeUpdated(payload)
-  }
 
   broadcastTerminalMetaUpdated(msg: { upsert?: TerminalMeta[]; remove?: string[] }): void {
     const parsed = TerminalMetaUpdatedSchema.safeParse({

@@ -156,11 +156,32 @@ export class SessionRepairService extends EventEmitter {
     // Check if already processed
     const existing = this.queue.getResult(sessionId)
     if (existing) {
+      // If the processed result has a resume issue, force active-priority repair
+      if (existing.resumeIssue) {
+        this.queue.clearProcessed(sessionId)
+        this.queue.enqueue([{ sessionId, filePath: existing.filePath, priority: 'active' }])
+        return this.queue.waitFor(sessionId, timeoutMs)
+      }
       await this.ensureSessionArtifacts(existing)
       return existing
     }
 
     if (this.queue.has(sessionId)) {
+      // Check disk cache before waiting for queue processing.
+      // Sessions discovered at startup are enqueued before cache is consulted,
+      // so this avoids blocking on the queue when the cache has a valid result.
+      const cachedPath = this.resolveCachedPath(sessionId)
+      if (cachedPath) {
+        const cached = await this.cache.get(cachedPath, { allowStaleMs: ACTIVE_CACHE_GRACE_MS })
+        if (cached) {
+          const normalized = cached.sessionId === sessionId
+            ? cached
+            : { ...cached, sessionId }
+          this.queue.seedResult(sessionId, normalized)
+          await this.ensureSessionArtifacts(normalized)
+          return normalized
+        }
+      }
       return this.queue.waitFor(sessionId, timeoutMs)
     }
 
@@ -174,6 +195,18 @@ export class SessionRepairService extends EventEmitter {
     const fileSessionId = path.basename(filePath, '.jsonl')
     const legacyResult = this.queue.getResult(fileSessionId)
     if (legacyResult) {
+      // If the legacy result has a resume issue, force active-priority repair
+      if (legacyResult.resumeIssue) {
+        this.queue.clearProcessed(fileSessionId)
+        this.queue.enqueue([{ sessionId: fileSessionId, filePath, priority: 'active' }])
+        const result = await this.queue.waitFor(fileSessionId, timeoutMs)
+        const normalized = result.sessionId === sessionId
+          ? result
+          : { ...result, sessionId }
+        this.queue.seedResult(sessionId, normalized)
+        await this.ensureSessionArtifacts(normalized)
+        return normalized
+      }
       const normalized = legacyResult.sessionId === sessionId
         ? legacyResult
         : { ...legacyResult, sessionId }
@@ -198,6 +231,12 @@ export class SessionRepairService extends EventEmitter {
     if (cached) {
       if (cached.status === 'missing') {
         this.sessionPathIndex.delete(sessionId)
+      }
+      // If cached result has a resume issue, force active-priority repair
+      if (cached.resumeIssue) {
+        this.queue.clearProcessed(sessionId)
+        this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
+        return this.queue.waitFor(sessionId, timeoutMs)
       }
       const normalized = cached.sessionId === sessionId
         ? cached

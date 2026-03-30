@@ -37,7 +37,10 @@ vi.mock('lucide-react', () => ({
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
 let capturedOnData: ((data: string) => void) | null = null
 let capturedTerminal: { paste: ReturnType<typeof vi.fn> } | null = null
-let capturedLinkProvider: {
+let capturedLinkProviders: Array<{
+  provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
+}> = []
+let capturedFilePathProvider: {
   provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
 } | null = null
 
@@ -56,7 +59,7 @@ vi.mock('@xterm/xterm', () => {
     open = vi.fn()
     loadAddon = vi.fn()
     registerLinkProvider = vi.fn((provider: any) => {
-      capturedLinkProvider = provider
+      capturedLinkProviders.push(provider)
       return { dispose: vi.fn() }
     })
     write = vi.fn()
@@ -308,7 +311,8 @@ describe('TerminalView keyboard handling', () => {
     capturedKeyHandler = null
     capturedOnData = null
     capturedTerminal = null
-    capturedLinkProvider = null
+    capturedLinkProviders = []
+    capturedFilePathProvider = null
     wsMocks.send.mockClear()
     clipboardMocks.readText.mockClear()
     clipboardMocks.copyText.mockClear()
@@ -860,11 +864,12 @@ describe('TerminalView keyboard handling', () => {
       )
 
       await waitFor(() => {
-        expect(capturedLinkProvider).not.toBeNull()
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
       })
 
       let links: any[] | undefined
-      capturedLinkProvider!.provideLinks(1, (provided) => {
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
         links = provided
       })
 
@@ -874,27 +879,31 @@ describe('TerminalView keyboard handling', () => {
 
       links![0].activate()
 
-      const state = store.getState()
-      expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.activeTabId).toBe(tabId)
+      expect(store.getState().panes.layouts[tabId].type).toBe('leaf')
 
-      const layout = state.panes.layouts[tabId]
-      expect(layout.type).toBe('split')
-      if (layout.type !== 'split') {
-        throw new Error('expected split layout')
-      }
+      await waitFor(() => {
+        const state = store.getState()
+        expect(state.tabs.tabs).toHaveLength(1)
+        expect(state.tabs.activeTabId).toBe(tabId)
 
-      expect(layout.children[0]).toMatchObject({ type: 'leaf', id: paneId })
-      expect(layout.children[1]).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'editor',
-          filePath: '/tmp/example.txt',
-          language: null,
-          readOnly: false,
-          content: '',
-          viewMode: 'source',
-        },
+        const layout = state.panes.layouts[tabId]
+        expect(layout.type).toBe('split')
+        if (layout.type !== 'split') {
+          throw new Error('expected split layout')
+        }
+
+        expect(layout.children[0]).toMatchObject({ type: 'leaf', id: paneId })
+        expect(layout.children[1]).toMatchObject({
+          type: 'leaf',
+          content: {
+            kind: 'editor',
+            filePath: '/tmp/example.txt',
+            language: null,
+            readOnly: false,
+            content: '',
+            viewMode: 'source',
+          },
+        })
       })
     })
 
@@ -930,38 +939,74 @@ describe('TerminalView keyboard handling', () => {
       )
 
       await waitFor(() => {
-        expect(capturedLinkProvider).not.toBeNull()
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
       })
 
       let links: any[] | undefined
-      capturedLinkProvider!.provideLinks(1, (provided) => {
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
         links = provided
       })
 
       links![0].activate()
 
-      const root = store.getState().panes.layouts[tabId]
-      expect(root.type).toBe('split')
-      if (root.type !== 'split') {
-        throw new Error('expected root split layout')
-      }
+      expect(store.getState().panes.layouts[tabId]).toEqual(layout)
 
-      expect(root.children[0]).toMatchObject({ type: 'leaf', id: activePaneId })
+      await waitFor(() => {
+        const root = store.getState().panes.layouts[tabId]
+        expect(root.type).toBe('split')
+        if (root.type !== 'split') {
+          throw new Error('expected root split layout')
+        }
 
-      const clickedBranch = root.children[1]
-      expect(clickedBranch.type).toBe('split')
-      if (clickedBranch.type !== 'split') {
-        throw new Error('expected clicked branch split layout')
-      }
+        expect(root.children[0]).toMatchObject({ type: 'leaf', id: activePaneId })
 
-      expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: clickedPaneId })
-      expect(clickedBranch.children[1]).toMatchObject({
-        type: 'leaf',
-        content: {
-          kind: 'editor',
-          filePath: '/tmp/example.txt',
-        },
+        const clickedBranch = root.children[1]
+        expect(clickedBranch.type).toBe('split')
+        if (clickedBranch.type !== 'split') {
+          throw new Error('expected clicked branch split layout')
+        }
+
+        expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: clickedPaneId })
+        expect(clickedBranch.children[1]).toMatchObject({
+          type: 'leaf',
+          content: {
+            kind: 'editor',
+            filePath: '/tmp/example.txt',
+          },
+        })
       })
+    })
+
+    it('does not activate file path link on right-click', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        capturedFilePathProvider = capturedLinkProviders[0] ?? null
+        expect(capturedFilePathProvider).not.toBeNull()
+      })
+
+      let links: any[] | undefined
+      capturedFilePathProvider!.provideLinks(1, (provided) => {
+        links = provided
+      })
+
+      expect(links).toBeDefined()
+      expect(links).toHaveLength(1)
+
+      const layoutBefore = store.getState().panes.layouts[tabId]
+      expect(layoutBefore.type).toBe('leaf')
+
+      links![0].activate(new MouseEvent('click', { button: 2 }))
+
+      const layoutAfter = store.getState().panes.layouts[tabId]
+      expect(layoutAfter.type).toBe('leaf')
     })
   })
 })

@@ -332,10 +332,9 @@ describe('terminal.create reuse running claude terminal', () => {
       await terminalsChangedPromise
 
       expect(registry.attachCalls).toHaveLength(0)
-      const attachMessagesPromise = waitForMessages(ws, [
+      const attachReadyPromise = waitForMessage(ws,
         (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-1-attach',
-        (m) => m.type === 'terminal.runtime.updated' && m.terminalId === created.terminalId,
-      ])
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -344,15 +343,9 @@ describe('terminal.create reuse running claude terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-1-attach',
       }))
-      const [ready, runtimeUpdated] = await attachMessagesPromise
+      const ready = await attachReadyPromise
 
       expect(ready.type).toBe('terminal.attach.ready')
-      expect(runtimeUpdated).toEqual(expect.objectContaining({
-        type: 'terminal.runtime.updated',
-        terminalId: created.terminalId,
-        status: 'running',
-        title: 'Shell',
-      }))
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.opts?.suppressOutput).toBe(true)
       expect(snapshotSpy).not.toHaveBeenCalled()

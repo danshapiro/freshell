@@ -1,6 +1,7 @@
 import { z } from 'zod'
+import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
-export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
 export const TABS_SCHEMA_VERSION = 1
 export const PANES_SCHEMA_VERSION = 6
@@ -24,14 +25,21 @@ const zPersistedTabsState = z.object({
   tabs: z.array(zTab),
 }).passthrough()
 
+const zTombstone = z.object({
+  id: z.string(),
+  deletedAt: z.number(),
+})
+
 const zPersistedTabsPayload = z.object({
   version: z.number().optional(),
   tabs: zPersistedTabsState,
+  tombstones: z.array(zTombstone).optional(),
 }).passthrough()
 
 export type ParsedPersistedTabs = {
   version: number
   tabs: z.infer<typeof zPersistedTabsState>
+  tombstones: Array<{ id: string; deletedAt: number }>
 }
 
 export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
@@ -54,6 +62,7 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
     },
+    tombstones: res.data.tombstones || [],
   }
 }
 
@@ -100,4 +109,109 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
     paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
   }
+}
+
+// --- Combined layout key (v3) ---
+
+export const LAYOUT_SCHEMA_VERSION = 3
+
+const zPersistedLayoutPayload = z.object({
+  version: z.number(),
+  tabs: zPersistedTabsState,
+  panes: zPersistedPanesPayload,
+  tombstones: z.array(zTombstone).optional(),
+}).passthrough()
+
+export type ParsedPersistedLayout = {
+  version: number
+  tabs: z.infer<typeof zPersistedTabsState>
+  panes: ParsedPersistedPanes
+  tombstones: Array<{ id: string; deletedAt: number }>
+  persistedAt?: number
+}
+
+export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | null {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+
+  const res = zPersistedLayoutPayload.safeParse(parsed)
+  if (!res.success) return null
+
+  const panes = res.data.panes
+  let panesVersion = typeof panes.version === 'number' ? panes.version : 1
+  if (panesVersion < 1) panesVersion = 1
+
+  return {
+    version: res.data.version,
+    tabs: {
+      ...res.data.tabs,
+      activeTabId: res.data.tabs.activeTabId ?? null,
+    },
+    panes: {
+      version: panesVersion,
+      layouts: (panes.layouts || {}) as Record<string, unknown>,
+      activePane: (panes.activePane || {}) as Record<string, string>,
+      paneTitles: (panes.paneTitles || {}) as Record<string, Record<string, string>>,
+      paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
+    },
+    tombstones: res.data.tombstones || [],
+    persistedAt: typeof (res.data as any).persistedAt === 'number' ? (res.data as any).persistedAt : undefined,
+  }
+}
+
+/**
+ * Migrate from separate v2 tabs+panes keys to the combined v3 layout key.
+ * Returns the parsed v3 layout, or null if no v2 data existed.
+ */
+export function migrateV2ToV3(): ParsedPersistedLayout | null {
+  const tabsKey = TABS_STORAGE_KEY
+  const panesKey = PANES_STORAGE_KEY
+  const layoutKey = LAYOUT_STORAGE_KEY
+
+  const tabsRaw = localStorage.getItem(tabsKey)
+  if (!tabsRaw) return null
+
+  const tabsParsed = parsePersistedTabsRaw(tabsRaw)
+  if (!tabsParsed) return null
+
+  const panesRaw = localStorage.getItem(panesKey)
+  const panesParsed = panesRaw ? parsePersistedPanesRaw(panesRaw) : null
+
+  const emptyPanes: ParsedPersistedPanes = {
+    version: PANES_SCHEMA_VERSION,
+    layouts: {},
+    activePane: {},
+    paneTitles: {},
+    paneTitleSetByUser: {},
+  }
+
+  const layout: ParsedPersistedLayout = {
+    version: LAYOUT_SCHEMA_VERSION,
+    tabs: tabsParsed.tabs,
+    panes: panesParsed || emptyPanes,
+    tombstones: tabsParsed.tombstones,
+  }
+
+  // Write v3 key and clean up v2 keys
+  const v3Payload = {
+    version: LAYOUT_SCHEMA_VERSION,
+    tabs: layout.tabs,
+    panes: {
+      version: layout.panes.version,
+      layouts: layout.panes.layouts,
+      activePane: layout.panes.activePane,
+      paneTitles: layout.panes.paneTitles,
+      paneTitleSetByUser: layout.panes.paneTitleSetByUser,
+    },
+    tombstones: layout.tombstones,
+  }
+  localStorage.setItem(layoutKey, JSON.stringify(v3Payload))
+  localStorage.removeItem(tabsKey)
+  localStorage.removeItem(panesKey)
+
+  return layout
 }

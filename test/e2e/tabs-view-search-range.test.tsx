@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '../../src/store/tabsSlice'
@@ -19,6 +19,10 @@ const wsMock = {
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMock,
+}))
+
+vi.mock('@/lib/clipboard', () => ({
+  copyText: vi.fn(() => Promise.resolve(true)),
 }))
 
 describe('tabs view search range loading', () => {

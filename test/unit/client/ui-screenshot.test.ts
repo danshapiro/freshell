@@ -240,6 +240,55 @@ describe('captureUiScreenshot iframe handling', () => {
     expect(iframe.hasAttribute('data-screenshot-iframe-marker')).toBe(false)
   })
 
+  it('captures proxy-URL iframe as image content when document is accessible', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <iframe id="proxy-frame" src="/api/proxy/http/3000/"></iframe>
+      </div>
+    `
+    const target = document.querySelector('[data-context="global"]') as HTMLElement
+    const iframe = document.getElementById('proxy-frame') as HTMLIFrameElement
+    setRect(target, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Proxied localhost content</p></body></html>')
+    iframeDoc?.close()
+
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (_el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = target.cloneNode(true) as HTMLElement
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,PROXYPNG',
+        } as any
+      }
+
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEPROXYPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'view' }, createRuntime() as any)
+
+    expect(result.ok).toBe(true)
+    expect(result.imageBase64).toBe('PROXYPNG')
+    // The iframe should be replaced with an image, not a placeholder
+    expect(clonedHtml).toContain('data-screenshot-iframe-image="true"')
+    expect(clonedHtml).not.toContain('data-screenshot-iframe-placeholder')
+    expect(clonedHtml).not.toContain('<iframe')
+  })
+
   it('uses an explicit placeholder when iframe content cannot be captured', async () => {
     document.body.innerHTML = `
       <div data-context="global">

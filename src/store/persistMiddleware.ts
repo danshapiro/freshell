@@ -5,8 +5,8 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
-import { PANES_SCHEMA_VERSION } from './persistedState.js'
-import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
+import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw, parsePersistedTabsRaw, parsePersistedPanesRaw } from './persistedState.js'
+import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
@@ -67,15 +67,57 @@ export function resetPersistedPanesCacheForTests() {
   cachedPersistedPanes = undefined
 }
 
-export function loadPersistedTabs(): any | null {
+import { migrateV2ToV3 } from './persistedState.js'
+
+let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any; persistedAt?: number } | null | undefined
+
+/**
+ * Load the combined layout from v3 key, or migrate from v2 keys.
+ * Cached so both tabs and panes loading see the same data.
+ */
+export function loadPersistedLayout(): typeof cachedPersistedLayout {
+  if (cachedPersistedLayout !== undefined) return cachedPersistedLayout
+
   try {
-    const raw = localStorage.getItem(TABS_STORAGE_KEY)
-    if (!raw) return null
-    const parsed = JSON.parse(raw)
-    return parsed
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    if (raw) {
+      const layoutParsed = parsePersistedLayoutRaw(raw)
+      if (layoutParsed) {
+        cachedPersistedLayout = {
+          tabs: { tabs: layoutParsed.tabs },
+          panes: layoutParsed.panes,
+          tombstones: layoutParsed.tombstones,
+          persistedAt: typeof layoutParsed.persistedAt === 'number' ? layoutParsed.persistedAt : undefined,
+        }
+        return cachedPersistedLayout
+      }
+    }
+
+    // Try migration from v2 keys
+    const migrated = migrateV2ToV3()
+    if (migrated) {
+      cachedPersistedLayout = {
+        tabs: { tabs: migrated.tabs },
+        panes: migrated.panes,
+        tombstones: migrated.tombstones,
+      }
+      return cachedPersistedLayout
+    }
   } catch {
-    return null
+    // ignore
   }
+
+  cachedPersistedLayout = null
+  return null
+}
+
+export function resetPersistedLayoutCacheForTests() {
+  cachedPersistedLayout = undefined
+}
+
+export function loadPersistedTabs(): any | null {
+  const layout = loadPersistedLayout()
+  return layout?.tabs ?? null
 }
 
 /**
@@ -201,15 +243,32 @@ export function loadPersistedPanes(): any | null {
   // Memoize: legacy migrations generate nanoid() values, so both callers
   // (panesSlice and terminal-restore) must see the same result.
   if (cachedPersistedPanes !== undefined) return cachedPersistedPanes
-  cachedPersistedPanes = loadPersistedPanesUncached()
+
+  // Try the combined v3 layout first
+  const layout = loadPersistedLayout()
+  if (layout?.panes) {
+    cachedPersistedPanes = migratePanesData(layout.panes)
+    return cachedPersistedPanes
+  }
+
+  // Fall back to v2 panes key
+  cachedPersistedPanes = loadPersistedPanesFromV2Key()
   return cachedPersistedPanes
 }
 
-function loadPersistedPanesUncached(): any | null {
+function loadPersistedPanesFromV2Key(): any | null {
   try {
     const raw = localStorage.getItem(PANES_STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw)
+    return migratePanesData(parsed)
+  } catch {
+    return null
+  }
+}
+
+function migratePanesData(parsed: any): any | null {
+  try {
 
     // Check if migration needed
     const currentVersion = parsed.version || 1
@@ -322,31 +381,24 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
     const state = store.getState()
 
-    if (tabsDirty) {
-      const tabsPayload = {
-        persistedAt: Date.now(),
-        tabs: {
-          // Persist only stable tab state. Keep ephemeral UI fields out of storage.
-          activeTabId: state.tabs.activeTabId,
-          tabs: state.tabs.tabs.map(stripTabVolatileFields),
-        },
-      }
+    try {
+      // Prune tombstones older than 1 hour
+      const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
+      const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
+      const tombstones = (state.tabs.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
 
-      try {
-        const raw = JSON.stringify(tabsPayload)
-        localStorage.setItem(TABS_STORAGE_KEY, raw)
-        broadcastPersistedRaw(TABS_STORAGE_KEY, raw)
-      } catch {
-        // ignore quota
-      }
-    }
-
-    if (panesDirty) {
-      try {
-        const sanitizedLayouts: Record<string, any> = {}
+      const sanitizedLayouts: Record<string, any> = {}
+      if (state.panes?.layouts) {
         for (const [tabId, node] of Object.entries(state.panes.layouts)) {
           sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
         }
+      }
+
+      let persistablePanesSection: Record<string, any> = {
+        layouts: sanitizedLayouts,
+        version: PANES_SCHEMA_VERSION,
+      }
+      if (state.panes) {
         const {
           renameRequestTabId: _rrt,
           renameRequestPaneId: _rrp,
@@ -354,17 +406,29 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           refreshRequestsByPane: _rrbp,
           ...persistablePanes
         } = state.panes
-        const panesPayload = {
+        persistablePanesSection = {
           ...persistablePanes,
           layouts: sanitizedLayouts,
           version: PANES_SCHEMA_VERSION,
         }
-        const panesJson = JSON.stringify(panesPayload)
-        localStorage.setItem(PANES_STORAGE_KEY, panesJson)
-        broadcastPersistedRaw(PANES_STORAGE_KEY, panesJson)
-      } catch (err) {
-        log.error('Failed to save to localStorage:', err)
       }
+
+      const layoutPayload = {
+        persistedAt: Date.now(),
+        version: LAYOUT_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: state.tabs.activeTabId,
+          tabs: state.tabs.tabs.map(stripTabVolatileFields),
+        },
+        panes: persistablePanesSection,
+        tombstones,
+      }
+
+      const raw = JSON.stringify(layoutPayload)
+      localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
+      broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
+    } catch (err) {
+      log.error('Failed to save to localStorage:', err)
     }
 
     tabsDirty = false
