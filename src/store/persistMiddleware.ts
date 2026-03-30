@@ -69,7 +69,7 @@ export function resetPersistedPanesCacheForTests() {
 
 import { migrateV2ToV3 } from './persistedState.js'
 
-let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any } | null | undefined
+let cachedPersistedLayout: { tabs: any; panes: any; tombstones: any; persistedAt?: number } | null | undefined
 
 /**
  * Load the combined layout from v3 key, or migrate from v2 keys.
@@ -87,6 +87,7 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
           tabs: { tabs: layoutParsed.tabs },
           panes: layoutParsed.panes,
           tombstones: layoutParsed.tombstones,
+          persistedAt: typeof layoutParsed.persistedAt === 'number' ? layoutParsed.persistedAt : undefined,
         }
         return cachedPersistedLayout
       }
@@ -370,6 +371,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let tabsDirty = false
   let panesDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+  const sessionPersistedAt = Date.now()
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
@@ -413,6 +415,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       const layoutPayload = {
+        persistedAt: sessionPersistedAt,
         version: LAYOUT_SCHEMA_VERSION,
         tabs: {
           activeTabId: state.tabs.activeTabId,

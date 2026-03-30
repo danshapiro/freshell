@@ -127,6 +127,7 @@ export type ParsedPersistedLayout = {
   tabs: z.infer<typeof zPersistedTabsState>
   panes: ParsedPersistedPanes
   tombstones: Array<{ id: string; deletedAt: number }>
+  persistedAt?: number
 }
 
 export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | null {
@@ -158,6 +159,7 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
       paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
     },
     tombstones: res.data.tombstones || [],
+    persistedAt: typeof (res.data as any).persistedAt === 'number' ? (res.data as any).persistedAt : undefined,
   }
 }
 
