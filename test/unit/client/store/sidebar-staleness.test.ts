@@ -196,4 +196,45 @@ describe('sidebar staleness', () => {
       expect(sidebar.error).toBeDefined()
     })
   })
+
+  describe('activity sort does not let stale ratchetedActivity trump recent server timestamps', () => {
+    it('sorts by most recent of ratchetedActivity or server timestamp', async () => {
+      const { sortSessionItems } = await import('@/store/selectors/sidebarSelectors')
+
+      const staleWithActivity = {
+        id: 'stale',
+        sessionId: 'stale',
+        provider: 'claude',
+        sessionType: 'claude',
+        title: 'Stale session with old activity',
+        hasTitle: true,
+        timestamp: 1_000,  // old server timestamp
+        hasTab: false,
+        isRunning: false,
+        ratchetedActivity: 2_000,  // slightly newer but still old
+      }
+
+      const freshNoActivity = {
+        id: 'fresh',
+        sessionId: 'fresh',
+        provider: 'claude',
+        sessionType: 'claude',
+        title: 'Fresh session without activity tracking',
+        hasTitle: true,
+        timestamp: 9_000,  // recent server timestamp
+        hasTab: false,
+        isRunning: false,
+        // no ratchetedActivity
+      }
+
+      const sorted = sortSessionItems(
+        [staleWithActivity, freshNoActivity],
+        'activity',
+      )
+
+      // Fresh session (timestamp 9000) should sort before stale session (activity 2000)
+      expect(sorted[0].id).toBe('fresh')
+      expect(sorted[1].id).toBe('stale')
+    })
+  })
 })

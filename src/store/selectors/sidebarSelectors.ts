@@ -341,11 +341,8 @@ export function sortSessionItems(
 
   const compareByRecency = (a: SidebarSessionItem, b: SidebarSessionItem) => b.timestamp - a.timestamp
   const compareByActivity = (a: SidebarSessionItem, b: SidebarSessionItem) => {
-    const aHasRatcheted = typeof a.ratchetedActivity === 'number'
-    const bHasRatcheted = typeof b.ratchetedActivity === 'number'
-    if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
-    const aTime = a.ratchetedActivity ?? a.timestamp
-    const bTime = b.ratchetedActivity ?? b.timestamp
+    const aTime = Math.max(a.ratchetedActivity ?? 0, a.timestamp)
+    const bTime = Math.max(b.ratchetedActivity ?? 0, b.timestamp)
     return bTime - aTime
   }
 
@@ -378,20 +375,8 @@ export function sortSessionItems(
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
-      withTabs.sort((a, b) => {
-        const aTime = a.ratchetedActivity ?? a.timestamp
-        const bTime = b.ratchetedActivity ?? b.timestamp
-        return bTime - aTime
-      })
-
-      withoutTabs.sort((a, b) => {
-        const aHasRatcheted = typeof a.ratchetedActivity === 'number'
-        const bHasRatcheted = typeof b.ratchetedActivity === 'number'
-        if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
-        const aTime = a.ratchetedActivity ?? a.timestamp
-        const bTime = b.ratchetedActivity ?? b.timestamp
-        return bTime - aTime
-      })
+      withTabs.sort(compareByActivity)
+      withoutTabs.sort(compareByActivity)
 
       return [...withTabs, ...withoutTabs]
     }
