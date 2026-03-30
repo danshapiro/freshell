@@ -150,6 +150,10 @@ describe('turnCompletionSlice', () => {
             activePane: { 'tab-1': 'pane-1' },
             paneTitles: {},
             paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+            refreshRequestsByPane: {},
           },
           settings: { settings: defaultSettings, loaded: true },
           turnCompletion: {
@@ -186,7 +190,8 @@ describe('turnCompletionSlice', () => {
 
     it('closeTab clears tab and all pane attention entries', async () => {
       const store = createFullStore()
-      await store.dispatch(closeTab('tab-1'))
+      const result = await store.dispatch(closeTab('tab-1'))
+      expect(result.type).toBe(closeTab.fulfilled.type)
       expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
       expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
       expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()

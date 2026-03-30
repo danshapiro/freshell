@@ -18,6 +18,10 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+vi.mock('@/lib/clipboard', () => ({
+  copyText: vi.fn(() => Promise.resolve(true)),
+}))
+
 describe('TabsView websocket error state', () => {
   it('shows a clear tabs sync error banner when websocket is disconnected', () => {
     const store = configureStore({

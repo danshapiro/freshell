@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
-import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -94,6 +93,31 @@ describe('Sidebar perf audit milestone', () => {
           wsSnapshotReceived: false,
           isLoading: false,
           error: null,
+          activeSurface: 'sidebar',
+          windows: {
+            sidebar: {
+              projects: [
+                {
+                  projectPath: '/tmp/project-alpha',
+                  sessions: [
+                    {
+                      provider: 'claude',
+                      sessionId: '00000000-0000-4000-8000-000000000999',
+                      title: 'alpha project session',
+                      projectPath: '/tmp/project-alpha',
+                      lastActivityAt: 1_000,
+                      cwd: '/tmp/project-alpha',
+                    },
+                  ],
+                },
+              ],
+              lastLoadedAt: 1_000,
+              query: 'alpha',
+              searchTier: 'title',
+              appliedQuery: 'alpha',
+              appliedSearchTier: 'title',
+            },
+          },
         },
       },
     })
@@ -103,9 +127,6 @@ describe('Sidebar perf audit milestone', () => {
         <Sidebar view="terminal" onNavigate={() => undefined} width={288} />
       </Provider>,
     )
-
-    const user = userEvent.setup()
-    await user.type(screen.getByPlaceholderText('Search...'), 'alpha')
 
     expect(await screen.findByText(/alpha project session/i)).toBeVisible()
     expect(bridge.snapshot().milestones['sidebar.search_results_visible']).toBeTypeOf('number')

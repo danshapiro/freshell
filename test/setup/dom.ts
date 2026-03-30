@@ -142,7 +142,9 @@ const clipboardMock = {
   readText: vi.fn().mockResolvedValue(''),
 }
 
-Object.defineProperty(globalThis.navigator, 'clipboard', {
-  value: clipboardMock,
-  configurable: true,
-})
+if (typeof globalThis.navigator !== 'undefined') {
+  Object.defineProperty(globalThis.navigator, 'clipboard', {
+    value: clipboardMock,
+    configurable: true,
+  })
+}

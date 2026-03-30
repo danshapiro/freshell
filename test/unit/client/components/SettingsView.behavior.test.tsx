@@ -32,6 +32,15 @@ function getSlider(predicate: (slider: HTMLElement) => boolean) {
   return screen.getAllByRole('slider').find((slider) => predicate(slider))!
 }
 
+function getSettingsSection(title: string) {
+  const heading = screen.getByRole('heading', { name: title })
+  const section = heading.parentElement?.parentElement
+  if (!section) {
+    throw new Error(`Could not find settings section for "${title}"`)
+  }
+  return section
+}
+
 describe('SettingsView behavior sections', () => {
   describe('additional settings interactions', () => {
     it('updates terminal theme locally without calling /api/settings', async () => {
@@ -414,11 +423,13 @@ describe('SettingsView behavior sections', () => {
       renderSettingsView(store)
       switchSettingsTab('Workspace')
 
-      expect(screen.getAllByText('New tab').length).toBeGreaterThan(0)
-      expect(screen.getByText('Close tab')).toBeInTheDocument()
-      expect(screen.getByText('Previous tab')).toBeInTheDocument()
-      expect(screen.getByText('Next tab')).toBeInTheDocument()
-      expect(screen.getByText('Newline')).toBeInTheDocument()
+      const keyboardShortcuts = within(getSettingsSection('Keyboard shortcuts'))
+
+      expect(keyboardShortcuts.getByText('New tab')).toBeInTheDocument()
+      expect(keyboardShortcuts.getByText('Close tab')).toBeInTheDocument()
+      expect(keyboardShortcuts.getByText('Previous tab')).toBeInTheDocument()
+      expect(keyboardShortcuts.getByText('Next tab')).toBeInTheDocument()
+      expect(keyboardShortcuts.getByText('Newline')).toBeInTheDocument()
     })
 
     it('displays keyboard shortcut keys', () => {
@@ -426,11 +437,13 @@ describe('SettingsView behavior sections', () => {
       renderSettingsView(store)
       switchSettingsTab('Workspace')
 
-      expect(screen.getAllByText('Alt').length).toBeGreaterThan(0)
-      expect(screen.getAllByText('Ctrl').length).toBeGreaterThan(0)
-      expect(screen.getAllByText('Shift').length).toBeGreaterThan(0)
-      expect(screen.getAllByText('[').length).toBeGreaterThan(0)
-      expect(screen.getAllByText(']').length).toBeGreaterThan(0)
+      const keyboardShortcuts = within(getSettingsSection('Keyboard shortcuts'))
+
+      expect(keyboardShortcuts.getAllByText('Alt').length).toBeGreaterThan(0)
+      expect(keyboardShortcuts.getAllByText('Ctrl').length).toBeGreaterThan(0)
+      expect(keyboardShortcuts.getAllByText('Shift').length).toBeGreaterThan(0)
+      expect(keyboardShortcuts.getAllByText('[').length).toBeGreaterThan(0)
+      expect(keyboardShortcuts.getAllByText(']').length).toBeGreaterThan(0)
     })
   })
 

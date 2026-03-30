@@ -95,29 +95,23 @@ function toIframeSrc(url: string): string {
 }
 
 /**
- * Build an HTTP proxy URL for localhost URLs when the browser itself is on
- * localhost. This handles WSL2/Docker where "localhost" traverses a networking
- * layer that may not forward all ports — routing through Freshell's own
- * (known-reachable) port avoids the problem.
+ * Build an HTTP proxy URL for localhost http: URLs. The proxy is same-origin
+ * with Freshell, which means:
+ * - Screenshots can access iframe content (no cross-origin restriction)
+ * - WSL2/Docker networking issues are bypassed (known-reachable port)
  *
- * When the browser is remote, needsPortForward() handles it via TCP forward
- * which works because the forwarded port is reachable on the server's actual IP.
+ * Works for both local and remote browsers since `/api/proxy/http/:port/`
+ * is always same-origin with the Freshell page.
+ *
+ * https: localhost URLs are NOT proxied — the HTTP proxy can't do TLS
+ * passthrough, so those fall through to TCP port forwarding for remote
+ * browsers or direct access for local browsers.
  */
 function buildHttpProxyUrl(url: string): string | null {
-  // Only needed when the browser is on localhost — remote browsers use TCP forward
-  if (!isLoopbackHostname(window.location.hostname)) return null
-
   try {
     const parsed = new URL(url)
-    if (
-      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
-      isLoopbackHostname(parsed.hostname)
-    ) {
-      const targetPort = parsed.port
-        ? parseInt(parsed.port, 10)
-        : parsed.protocol === 'https:'
-          ? 443
-          : 80
+    if (parsed.protocol === 'http:' && isLoopbackHostname(parsed.hostname)) {
+      const targetPort = parsed.port ? parseInt(parsed.port, 10) : 80
 
       // Don't proxy requests to Freshell's own port — it's already reachable
       const freshellPort =
@@ -135,8 +129,10 @@ function buildHttpProxyUrl(url: string): string | null {
 }
 
 /**
- * Determine whether a URL needs port forwarding (localhost URL + remote access).
- * Returns the parsed URL and target port, or null if no forwarding needed.
+ * Determine whether a URL needs TCP port forwarding (remote browser + localhost).
+ * This is the fallback for URLs that buildHttpProxyUrl cannot handle:
+ * - https: localhost URLs (HTTP proxy can't do TLS passthrough)
+ * - http: localhost URLs on the same port as Freshell (proxy skips those)
  */
 function needsPortForward(url: string): { parsed: URL; targetPort: number } | null {
   if (isLoopbackHostname(window.location.hostname)) return null

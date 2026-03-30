@@ -6,6 +6,7 @@ import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/se
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
+import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
 
 export interface SidebarSessionItem {
   id: string
@@ -28,6 +29,7 @@ export interface SidebarSessionItem {
   isNonInteractive?: boolean
   firstUserMessage?: string
   hasTitle: boolean
+  isFallback?: true
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
@@ -48,12 +50,13 @@ const selectShowNoninteractiveSessions = (state: RootState) => state.settings.se
 const selectHideEmptySessions = (state: RootState) => state.settings.settings.sidebar?.hideEmptySessions ?? true
 const selectExcludeFirstChatSubstrings = (state: RootState) => state.settings.settings.sidebar?.excludeFirstChatSubstrings ?? EMPTY_STRINGS
 const selectExcludeFirstChatMustStart = (state: RootState) => state.settings.settings.sidebar?.excludeFirstChatMustStart ?? false
+const selectAppliedQuery = (state: RootState) => state.sessions.windows?.sidebar?.appliedQuery ?? ''
+const selectAppliedSearchTier = (state: RootState) => state.sessions.windows?.sidebar?.appliedSearchTier
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter
 
 function getProjectName(projectPath: string): string {
-  const parts = projectPath.replace(/\\/g, '/').split('/')
-  return parts[parts.length - 1] || projectPath
+  return getLeafDirectoryName(projectPath) ?? projectPath
 }
 
 export function buildSessionItems(
@@ -164,6 +167,7 @@ export function buildSessionItems(
       isSubagent: input.metadata?.isSubagent,
       isNonInteractive: input.metadata?.isNonInteractive,
       firstUserMessage: input.metadata?.firstUserMessage,
+      isFallback: true,
     })
   }
 
@@ -252,6 +256,29 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
   )
 }
 
+function filterSessionItemsForAppliedSearch(
+  items: SidebarSessionItem[],
+  appliedQuery: string,
+  appliedSearchTier?: 'title' | 'userMessages' | 'fullText',
+): SidebarSessionItem[] {
+  const query = appliedQuery.trim()
+  if (!query) return items
+
+  const tier = appliedSearchTier ?? 'title'
+  if (tier !== 'title') {
+    return items.filter((item) => !item.isFallback)
+  }
+
+  return items.filter((item) => (
+    !item.isFallback || matchTitleTierMetadata({
+      title: item.title,
+      projectPath: item.projectPath,
+      cwd: item.cwd,
+      firstUserMessage: item.firstUserMessage,
+    }, query) !== null
+  ))
+}
+
 export interface VisibilitySettings {
   showSubagents: boolean
   ignoreCodexSubagents: boolean
@@ -297,31 +324,52 @@ export function filterSessionItemsByVisibility(
   })
 }
 
-export function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
+export function sortSessionItems(
+  items: SidebarSessionItem[],
+  sortMode: string,
+  options?: { disableTabPinning?: boolean },
+): SidebarSessionItem[] {
   const sorted = [...items]
 
   const active = sorted.filter((i) => !i.archived)
   const archived = sorted.filter((i) => i.archived)
 
+  const compareByRecency = (a: SidebarSessionItem, b: SidebarSessionItem) => b.timestamp - a.timestamp
+  const compareByActivity = (a: SidebarSessionItem, b: SidebarSessionItem) => {
+    const aHasRatcheted = typeof a.ratchetedActivity === 'number'
+    const bHasRatcheted = typeof b.ratchetedActivity === 'number'
+    if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
+    const aTime = a.ratchetedActivity ?? a.timestamp
+    const bTime = b.ratchetedActivity ?? b.timestamp
+    return bTime - aTime
+  }
+
   const sortByMode = (list: SidebarSessionItem[]) => {
     const copy = [...list]
 
     if (sortMode === 'recency') {
-      return copy.sort((a, b) => b.timestamp - a.timestamp)
+      return copy.sort(compareByRecency)
     }
 
     if (sortMode === 'recency-pinned') {
+      if (options?.disableTabPinning) {
+        return copy.sort(compareByRecency)
+      }
+
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
-      // Sort both groups by recency (timestamp)
-      withTabs.sort((a, b) => b.timestamp - a.timestamp)
-      withoutTabs.sort((a, b) => b.timestamp - a.timestamp)
+      withTabs.sort(compareByRecency)
+      withoutTabs.sort(compareByRecency)
 
       return [...withTabs, ...withoutTabs]
     }
 
     if (sortMode === 'activity') {
+      if (options?.disableTabPinning) {
+        return copy.sort(compareByActivity)
+      }
+
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
@@ -372,6 +420,8 @@ export const makeSelectSortedSessionItems = () =>
       selectHideEmptySessions,
       selectExcludeFirstChatSubstrings,
       selectExcludeFirstChatMustStart,
+      selectAppliedQuery,
+      selectAppliedSearchTier,
       selectTerminals,
       selectFilter,
     ],
@@ -387,6 +437,8 @@ export const makeSelectSortedSessionItems = () =>
       hideEmptySessions,
       excludeFirstChatSubstrings,
       excludeFirstChatMustStart,
+      appliedQuery,
+      appliedSearchTier,
       terminals,
       filter
     ) => {
@@ -399,8 +451,11 @@ export const makeSelectSortedSessionItems = () =>
         excludeFirstChatSubstrings,
         excludeFirstChatMustStart,
       })
-      const filtered = filterSessionItems(visible, filter)
-      return sortSessionItems(filtered, sortMode)
+      const searchAware = filterSessionItemsForAppliedSearch(visible, appliedQuery, appliedSearchTier)
+      const filtered = filterSessionItems(searchAware, filter)
+      return sortSessionItems(filtered, sortMode, {
+        disableTabPinning: appliedQuery.trim().length > 0,
+      })
     }
   )
 
