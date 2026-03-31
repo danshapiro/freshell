@@ -33,7 +33,7 @@ Fix at the message creation boundary, not the rendering boundary. This is cleane
 | `server/session-history-loader.ts` | Modify | Add coalescing logic to `extractChatMessagesFromJsonl` |
 | `test/unit/client/agentChatSlice.test.ts` | Modify | Add tests for coalescing |
 | `test/unit/server/session-history-loader.test.ts` | Modify | Add tests for coalescing |
-| `test/browser-use/tool-coalesce.test.ts` | Create | Visual verification with LLM as judge |
+| `test/browser-use/tool-coalesce.md` | Create | Browser-use test procedure documentation |
 
 ---
 
@@ -513,115 +513,143 @@ git commit -m "fix: address test/typecheck/lint issues from tool coalescing"
 ## Task 5: Browser-Use Visual Verification
 
 **Files:**
-- Create: `test/browser-use/tool-coalesce.spec.ts`
+- Create: `test/browser-use/tool-coalesce.md` (test instructions, not code)
 
-- [ ] **Step 1: Create browser-use test file**
+**Prerequisites:**
+- `browser-use` CLI installed: `uvx "browser-use[cli]" --help` (or `pip install "browser-use[cli]"`)
+- Chromium installed: `browser-use install`
+- API key for LLM extraction: `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variable
 
-Create `test/browser-use/tool-coalesce.spec.ts`:
-
-```typescript
-/**
- * @browser-use
- * 
- * Test: Tool Coalescing Visual Verification
- * 
- * Intent: Verify that consecutive tool uses in an assistant turn
- * are grouped into a single ToolStrip showing "N tools used"
- * instead of multiple separate "1 tool used" strips.
- * 
- * Setup:
- * 1. Start a Freshell server on a unique port (e.g., 3355)
- * 2. Open Freshell in browser
- * 3. Navigate to a Freshclaude session with multiple tool uses
- * 
- * Verification (LLM as judge):
- * 1. Look for tool strip regions in the DOM
- * 2. Verify there is exactly ONE tool strip containing all tools
- * 3. Verify the collapsed summary shows "N tools used" (not multiple "1 tool used")
- * 4. Expand the strip and verify all individual tools are present
- * 
- * Expected behavior:
- * - When showTools=false: Collapsed strip shows "N tools used" with chevron
- * - When showTools=true: Expanded strip shows all individual tools
- * - Chevron toggles strip visibility
- * - Individual tool toggles work independently
- */
-
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-
-describe('Tool Coalescing Visual Verification', () => {
-  const TEST_PORT = 3355
-  let serverPid: string | null = null
-
-  beforeAll(async () => {
-    // Start server if needed - actual implementation would use browser-use
-  })
-
-  afterAll(async () => {
-    // Stop server if started
-    if (serverPid) {
-      // Cleanup
-    }
-  })
-
-  it('shows single tool strip for multiple consecutive tools', async () => {
-    // This test is executed via browser-use CLI
-    // The implementation agent will:
-    // 1. Open browser to Freshell
-    // 2. Navigate to a Freshclaude session
-    // 3. Use LLM to verify tool strip grouping
-    // 
-    // Intent-based verification:
-    // - "Find all tool strip regions on the page"
-    // - "Count how many show 'N tools used' text"
-    // - "Verify exactly ONE strip exists with combined count"
-    expect(true).toBe(true) // Placeholder - actual browser-use execution
-  })
-
-  it('collapses multiple tools to single summary line', async () => {
-    // Intent: When multiple tools are in a turn, the collapsed view
-    // shows one summary line with total count, not multiple lines
-    expect(true).toBe(true) // Placeholder
-  })
-})
-```
-
-- [ ] **Step 2: Run browser-use verification**
-
-The executing agent will run browser-use commands:
+- [ ] **Step 1: Ensure browser-use is available**
 
 ```bash
-# Start Freshell server on test port
+# Check if browser-use is installed
+browser-use --version || uvx "browser-use[cli]" --help
+
+# Install Chromium if needed
+browser-use install
+```
+
+Expected: browser-use CLI available, Chromium installed
+
+- [ ] **Step 2: Start Freshell server on test port**
+
+```bash
 cd /home/user/code/freshell/.worktrees/tool-coalesce
 PORT=3355 npm run dev:server > /tmp/freshell-3355.log 2>&1 & echo $! > /tmp/freshell-3355.pid
-
-# Wait for server to start
 sleep 5
+curl -s http://localhost:3355/api/health > /dev/null && echo "Server ready"
+```
 
-# Open browser and navigate to Freshell
+Expected: "Server ready"
+
+- [ ] **Step 3: Navigate to Freshell and find a session with tools**
+
+```bash
 browser-use open http://localhost:3355
+browser-use state
+```
 
-# Wait for page load
-browser-use wait selector "[aria-label='Tool strip']" --timeout 10000
+Expected: Page loads, shows Freshell UI
 
-# Take screenshot for verification
+- [ ] **Step 4: Navigate to Freshclaude session**
+
+Using browser-use, find and click on a Freshclaude session in the sidebar that has tool uses. If no session exists with multiple tools, create a test scenario by sending a message that triggers multiple tool calls.
+
+```bash
+# Get page state to find Freshclaude sessions
+browser-use state
+
+# Click on a session that shows tool indicators (look for "tools" or tool count)
+# Example: browser-use click 3  # where 3 is the index of a Freshclaude session
+```
+
+- [ ] **Step 5: Verify tool strip coalescing with LLM as judge**
+
+Use browser-use's `extract` command with LLM to verify the tool strip behavior:
+
+```bash
+# Extract tool strip information using LLM
+browser-use extract "Find all tool strip regions on this page. For each strip, report: 1) The text shown (e.g., '2 tools used' or individual tool names), 2) Whether it's collapsed or expanded. Return as a JSON array."
+```
+
+Expected output: Single tool strip showing combined count like "2 tools used" or "3 tools used" - NOT multiple strips each showing "1 tool used"
+
+- [ ] **Step 6: Take screenshot for evidence**
+
+```bash
 browser-use screenshot /tmp/tool-coalesce-verify.png
+```
 
-# Verify tool strip count using LLM extraction
-browser-use extract "Count how many tool strip regions exist on this page. Each tool strip shows either 'N tools used' or individual tool names. Return only the count as a number."
+- [ ] **Step 7: Verify collapsed state shows single summary**
 
-# Expected: 1 (single strip with all tools)
+When the tool strip is collapsed, verify it shows one summary line:
 
-# Cleanup
+```bash
+browser-use extract "Count how many separate lines contain the text 'tool' or 'tools used'. Return only the number."
+```
+
+Expected: 1 (single summary line, not multiple "1 tool used" lines)
+
+- [ ] **Step 8: Verify expand/collapse toggle works**
+
+```bash
+# Find and click the chevron to expand
+browser-use state
+# Look for chevron/expand button in the state output
+# browser-use click <index>  # click the chevron
+
+# Verify tools are now visible individually
+browser-use extract "List all tool names visible on the page. Return as a comma-separated list."
+```
+
+Expected: Individual tool names visible after expansion
+
+- [ ] **Step 9: Cleanup**
+
+```bash
 browser-use close
 kill "$(cat /tmp/freshell-3355.pid)" && rm -f /tmp/freshell-3355.pid
 ```
 
-- [ ] **Step 3: Commit browser-use test**
+- [ ] **Step 10: Create test documentation file**
+
+Create `test/browser-use/tool-coalesce.md` documenting the test procedure:
+
+```markdown
+# Tool Coalescing Browser-Use Test
+
+## Purpose
+Verify that consecutive tool uses in an assistant turn are grouped into a single ToolStrip showing "N tools used" instead of multiple separate "1 tool used" strips.
+
+## Prerequisites
+- browser-use CLI installed
+- Chromium installed (`browser-use install`)
+- API key for LLM extraction (OPENAI_API_KEY or ANTHROPIC_API_KEY)
+
+## Test Steps
+
+1. Start Freshell server: `PORT=3355 npm run dev:server`
+2. Navigate to Freshell: `browser-use open http://localhost:3355`
+3. Open a Freshclaude session with multiple tool uses
+4. Verify single tool strip with combined count using: `browser-use extract "Find all tool strip regions..."`
+5. Verify collapsed state shows one summary line, not multiple
+6. Verify expand/collapse chevron works
+
+## Expected Results
+- Single tool strip per assistant turn showing "N tools used"
+- Chevron toggles strip visibility
+- No multiple "1 tool used" strips for consecutive tools in same turn
+
+## LLM Judge Criteria
+Pass if LLM extraction returns single strip with combined count.
+Fail if multiple strips each showing "1 tool used" for tools in same turn.
+```
 
 ```bash
-git add test/browser-use/tool-coalesce.spec.ts
-git commit -m "test(browser-use): add visual verification for tool coalescing"
+mkdir -p test/browser-use
+git add test/browser-use/tool-coalesce.md
+git commit -m "test(browser-use): add tool coalescing visual verification procedure"
 ```
 
 ---
@@ -655,7 +683,7 @@ Files changed:
 - `server/session-history-loader.ts` - Coalescing in `extractChatMessagesFromJsonl`
 - `test/unit/client/agentChatSlice.test.ts` - Unit tests for Redux coalescing
 - `test/unit/server/session-history-loader.test.ts` - Unit tests for loader coalescing
-- `test/browser-use/tool-coalesce.spec.ts` - Visual verification (optional)
+- `test/browser-use/tool-coalesce.md` - Browser-use test procedure
 
 ---
 
