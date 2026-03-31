@@ -8,6 +8,13 @@ import type {
   QuestionDefinition,
 } from './agentChatTypes'
 
+/** Check if content blocks contain only tool_use and tool_result blocks (no text or thinking). */
+function isToolOnlyContent(blocks: ChatContentBlock[]): boolean {
+  return blocks.length > 0 && blocks.every(
+    (b) => b.type === 'tool_use' || b.type === 'tool_result'
+  )
+}
+
 const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
@@ -113,12 +120,26 @@ const agentChatSlice = createSlice({
     }>) {
       const session = state.sessions[action.payload.sessionId]
       if (!session) return
-      session.messages.push({
-        role: 'assistant',
-        content: action.payload.content,
-        timestamp: new Date().toISOString(),
-        model: action.payload.model,
-      })
+
+      const newContent = action.payload.content
+      const prevMessage = session.messages[session.messages.length - 1]
+
+      // Coalesce consecutive tool-only assistant messages
+      if (
+        prevMessage?.role === 'assistant' &&
+        isToolOnlyContent(prevMessage.content) &&
+        isToolOnlyContent(newContent)
+      ) {
+        // Append content blocks to previous message instead of creating new one
+        prevMessage.content = [...prevMessage.content, ...newContent]
+      } else {
+        session.messages.push({
+          role: 'assistant',
+          content: newContent,
+          timestamp: new Date().toISOString(),
+          model: action.payload.model,
+        })
+      }
       session.status = 'running'
     },
 

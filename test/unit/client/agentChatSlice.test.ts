@@ -361,3 +361,108 @@ describe('agentChatSlice', () => {
     expect(state.sessions['s1'].totalInputTokens).toBe(100)
   })
 })
+
+describe('tool message coalescing', () => {
+  const initial = agentChatReducer(undefined, { type: 'init' })
+
+  it('coalesces consecutive tool-only assistant messages', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+
+    // First tool-only message
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(1)
+
+    // Second tool-only message - should coalesce
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [
+        { type: 'tool_result', tool_use_id: 't1', content: 'output' },
+        { type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } },
+      ],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(1)
+    expect(state.sessions['s1'].messages[0].content).toHaveLength(3)
+    expect(state.sessions['s1'].messages[0].content[0]).toEqual({ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } })
+    expect(state.sessions['s1'].messages[0].content[1]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: 'output' })
+    expect(state.sessions['s1'].messages[0].content[2]).toEqual({ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } })
+  })
+
+  it('does not coalesce when previous message has text content', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+
+    // Message with text
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'text', text: 'Hello' }],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(1)
+
+    // Tool-only message - should NOT coalesce (previous has text)
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(2)
+  })
+
+  it('does not coalesce when new message has text content', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+
+    // Tool-only message
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(1)
+
+    // Message with text - should NOT coalesce (new has text)
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'text', text: 'Done' }],
+    }))
+    expect(state.sessions['s1'].messages).toHaveLength(2)
+  })
+
+  it('coalesces multiple consecutive tool-only messages', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }],
+    }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_result', tool_use_id: 't1', content: 'file1' }],
+    }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } }],
+    }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_result', tool_use_id: 't2', content: 'content' }],
+    }))
+
+    expect(state.sessions['s1'].messages).toHaveLength(1)
+    expect(state.sessions['s1'].messages[0].content).toHaveLength(4)
+  })
+
+  it('does not coalesce across user messages', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }],
+    }))
+    state = agentChatReducer(state, addUserMessage({ sessionId: 's1', text: 'Thanks' }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 's1',
+      content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } }],
+    }))
+
+    expect(state.sessions['s1'].messages).toHaveLength(3) // assistant, user, assistant
+  })
+})
