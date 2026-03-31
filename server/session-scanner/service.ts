@@ -29,6 +29,9 @@ export interface SessionRepairServiceOptions {
   scanner?: SessionScanner
   /** Optional resolver for canonical session IDs */
   getFilePathForSession?: (sessionId: string) => string | undefined
+  /** Skip eager discovery of all session files at startup.
+   *  When true, sessions are repaired on-demand via waitForSession(). */
+  skipDiscovery?: boolean
 }
 
 /**
@@ -45,12 +48,14 @@ export class SessionRepairService extends EventEmitter {
   private indexInitialized = false
   private filePathResolver?: (sessionId: string) => string | undefined
   private historyRepairer: ClaudeHistoryRepairer
+  private readonly skipDiscovery: boolean
 
   constructor(options: SessionRepairServiceOptions = {}) {
     super()
     this.cacheDir = options.cacheDir || getFreshellConfigDir()
     this.scanner = options.scanner || createSessionScanner()
     this.cache = new SessionCache(path.join(this.cacheDir, CACHE_FILENAME))
+    this.skipDiscovery = options.skipDiscovery ?? false
     this.historyRepairer = new ClaudeHistoryRepairer({ claudeHome: getClaudeHome() })
     this.queue = new SessionRepairQueue(this.scanner, this.cache, {
       postScan: async (result) => this.ensureSessionArtifacts(result),
@@ -89,14 +94,16 @@ export class SessionRepairService extends EventEmitter {
     // Cleanup old backups
     await this.cleanupOldBackups()
 
-    // Discover top-level Claude sessions so automatic repair covers dormant sessions too.
-    await this.discoverTopLevelSessions()
-
-    // Start background processing
+    // Start queue before discovery so waitForSession() can proceed immediately.
     this.queue.start()
     this.initialized = true
 
-    logger.info('Session repair service started')
+    if (!this.skipDiscovery) {
+      // Discover top-level Claude sessions so automatic repair covers dormant sessions too.
+      await this.discoverTopLevelSessions()
+    }
+
+    logger.info({ skipDiscovery: this.skipDiscovery }, 'Session repair service started')
   }
 
   /**
