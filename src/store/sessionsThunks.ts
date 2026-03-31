@@ -426,11 +426,11 @@ async function refreshVisibleSessionWindowSilently(args: {
   } catch (error) {
     log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
     if (canCommit()) {
-      dispatch(setSessionWindowError({
-        surface,
-        error: error instanceof Error ? error.message : 'Background refresh failed',
-      }))
       if (!preserveLoadingState) {
+        dispatch(setSessionWindowError({
+          surface,
+          error: error instanceof Error ? error.message : 'Background refresh failed',
+        }))
         dispatch(setSessionWindowLoading({
           surface,
           loading: false,
