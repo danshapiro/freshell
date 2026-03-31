@@ -8,6 +8,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type TouchEvent as ReactTouchEvent,
 } from 'react'
+import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
@@ -212,7 +213,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
-  const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id))
+  const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
@@ -312,7 +313,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     sinceSeq: number
     cols: number
     rows: number
-    usedMaxReplayBytes: boolean
   } | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
     terminalId: string
@@ -1465,7 +1465,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       sinceSeq,
       cols,
       rows,
-      usedMaxReplayBytes: !!opts?.maxReplayBytes,
     }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }
@@ -1744,11 +1743,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          // Only show "load more" when the gap is from our byte-budget truncation
-          // (usedMaxReplayBytes), not from ring overflow where the data is gone.
-          const currentAttach = currentAttachRef.current
-          const isTruncatedReplay = currentAttach?.usedMaxReplayBytes
-            && msg.reason === 'replay_window_exceeded'
+          // Only show "load more" when the server confirms the gap is from
+          // byte-budget truncation (recoverable), not ring overflow (data gone).
+          const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
           if (isTruncatedReplay) {
             setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })

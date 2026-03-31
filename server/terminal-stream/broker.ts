@@ -130,6 +130,7 @@ export class TerminalStreamBroker {
       const replay = terminalState.replayRing.replaySince(normalizedSinceSeq)
       let replayFrames = replay.frames
       let effectiveMissedFromSeq = replay.missedFromSeq
+      let budgetTruncated = false
       const headSeq = terminalState.replayRing.headSeq()
 
       // Truncate replay to tail frames within byte budget
@@ -145,6 +146,7 @@ export class TerminalStreamBroker {
           const truncatedFromSeq = replayFrames[0].seqStart
           const truncatedToSeq = replayFrames[keepFromIndex - 1].seqEnd
           effectiveMissedFromSeq = effectiveMissedFromSeq ?? truncatedFromSeq
+          budgetTruncated = true
           replayFrames = replayFrames.slice(keepFromIndex)
 
           this.perfEventLogger('terminal_stream_replay_truncated', {
@@ -186,6 +188,7 @@ export class TerminalStreamBroker {
 
       if (effectiveMissedFromSeq !== undefined) {
         const missedToSeq = replayFromSeq - 1
+        const gapReason = budgetTruncated ? 'replay_budget_exceeded' as const : 'replay_window_exceeded' as const
         if (missedToSeq >= effectiveMissedFromSeq) {
           this.perfEventLogger('terminal_stream_replay_miss', {
             terminalId,
@@ -202,7 +205,7 @@ export class TerminalStreamBroker {
             connectionId: ws.connectionId,
             fromSeq: effectiveMissedFromSeq,
             toSeq: missedToSeq,
-            reason: 'replay_window_exceeded',
+            reason: gapReason,
           }, 'warn')
 
           if (!this.safeSend(ws, {
@@ -210,7 +213,7 @@ export class TerminalStreamBroker {
             terminalId,
             fromSeq: effectiveMissedFromSeq,
             toSeq: missedToSeq,
-            reason: 'replay_window_exceeded',
+            reason: gapReason,
             ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
           })) {
             return

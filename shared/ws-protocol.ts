@@ -464,7 +464,7 @@ export type TerminalOutputGapMessage = {
   terminalId: string
   fromSeq: number
   toSeq: number
-  reason: 'queue_overflow' | 'replay_window_exceeded'
+  reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
   attachRequestId?: string
 }
 
