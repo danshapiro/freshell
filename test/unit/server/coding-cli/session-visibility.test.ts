@@ -50,20 +50,21 @@ describe('session visibility flags', () => {
   })
 
   describe('Claude isNonInteractive detection', () => {
-    it('does not classify Claude sessions as non-interactive based on queue-operation events', () => {
+    it('marks single-message session as non-interactive', () => {
       const content = [
-        JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
         JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Automated task' } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }),
       ].join('\n')
 
       const meta = parseSessionContent(content)
-      expect(meta.isNonInteractive).toBeUndefined()
+      expect(meta.isNonInteractive).toBe(true)
     })
 
-    it('does not set isNonInteractive for normal Claude sessions', () => {
+    it('treats multi-message session as interactive', () => {
       const content = [
         JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Help me' } }),
         JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Sure!' }] } }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: 'Now do this' } }),
       ].join('\n')
 
       const meta = parseSessionContent(content)
