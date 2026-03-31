@@ -9,13 +9,21 @@ import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
-import { resolveGitCheckoutRoot } from './utils.js'
+import { resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
 const SESSION_SNIPPET_BYTES = 256 * 1024
+const LIGHTWEIGHT_HEAD_BYTES = 4096
+const LIGHTWEIGHT_TAIL_BYTES = 16384
+// How many recent sessions to fully enrich on startup for accurate isNonInteractive filtering.
+const ENRICHMENT_BATCH_SIZE = 150
+// Cap concurrent file reads to avoid EMFILE on systems with low fd limits (Windows default: 512, macOS: 256).
+const LIGHTWEIGHT_SCAN_CONCURRENCY = 50
+// Artificial per-file delay (ms) for testing event-loop behavior at scale.
+const INDEXER_DELAY_MS = Number(process.env.FRESHELL_INDEXER_DELAY_MS || 0)
 const SEEN_SESSION_RETENTION_MS = Number(process.env.CODING_CLI_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
 const MAX_SEEN_SESSION_IDS = Number(process.env.CODING_CLI_SEEN_SESSION_MAX || 10_000)
 
@@ -128,11 +136,112 @@ async function readSessionSnippet(filePath: string): Promise<SessionSnippet> {
   }
 }
 
+type LightweightFileMeta = {
+  filePath: string
+  mtimeMs: number
+  size: number
+  sessionId?: string
+  cwd?: string
+  title?: string
+  createdAt?: number
+  lastActivityAt?: number
+}
+
+/**
+ * Read just the head and tail of a session file to extract sidebar-ready metadata.
+ * Head gives sessionId, cwd, title; tail gives lastActivityAt for correct sort ordering.
+ */
+async function readLightweightMeta(filePath: string): Promise<LightweightFileMeta> {
+  try {
+    const stat = await fsp.stat(filePath)
+    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const size = stat.size
+    if (size === 0) return { filePath, mtimeMs, size }
+
+    const headSize = Math.min(LIGHTWEIGHT_HEAD_BYTES, size)
+    const fd = await fsp.open(filePath, 'r')
+    try {
+      const headBuf = Buffer.alloc(headSize)
+      const reads: Promise<any>[] = [fd.read(headBuf, 0, headSize, 0)]
+      let tailBuf: Buffer | undefined
+      if (size > headSize) {
+        const tailSize = Math.min(LIGHTWEIGHT_TAIL_BYTES, size)
+        tailBuf = Buffer.alloc(tailSize)
+        reads.push(fd.read(tailBuf, 0, tailSize, Math.max(0, size - tailSize)))
+      }
+      await Promise.all(reads)
+
+      // Parse head for sessionId, cwd, title, createdAt
+      const headLines = headBuf.toString('utf8').split('\n').filter(Boolean)
+      let sessionId: string | undefined
+      let cwd: string | undefined
+      let title: string | undefined
+      let createdAt: number | undefined
+
+      for (const line of headLines) {
+        let obj: any
+        try { obj = JSON.parse(line) } catch { continue }
+
+        if (!sessionId) {
+          sessionId = obj?.sessionId || obj?.session_id
+            || obj?.payload?.id || obj?.message?.sessionId
+        }
+        if (!cwd) {
+          const c = obj?.cwd || obj?.context?.cwd || obj?.payload?.cwd
+            || obj?.data?.cwd || obj?.message?.cwd
+          if (typeof c === 'string' && (c.startsWith('/') || (IS_WINDOWS && /^[a-zA-Z]:/.test(c)))) cwd = c
+        }
+        if (!createdAt && obj?.timestamp) {
+          const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+          if (Number.isFinite(parsed)) createdAt = parsed
+        }
+        if (!title) {
+          const isUser = obj?.role === 'user' || obj?.type === 'user' || obj?.message?.role === 'user'
+          if (isUser) {
+            const content = obj?.message?.content || obj?.content
+            const text = typeof content === 'string'
+              ? content
+              : Array.isArray(content)
+                ? content.filter((b: any) => typeof b?.text === 'string').map((b: any) => b.text).join(' ')
+                : undefined
+            if (typeof text === 'string' && text.trim()) title = text.trim().slice(0, 200)
+          }
+        }
+        if (sessionId && cwd && title && createdAt) break
+      }
+
+      // Parse tail backwards for lastActivityAt (skip timestampless records like file-history-snapshot)
+      let lastActivityAt: number | undefined
+      if (tailBuf) {
+        const tailLines = tailBuf.toString('utf8').split('\n').filter(Boolean)
+        for (let i = tailLines.length - 1; i >= 0; i--) {
+          try {
+            const obj = JSON.parse(tailLines[i])
+            if (obj?.timestamp) {
+              const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
+              if (Number.isFinite(parsed)) { lastActivityAt = parsed; break }
+            }
+          } catch { /* skip malformed lines */ }
+        }
+      }
+      if (!lastActivityAt) lastActivityAt = createdAt
+
+      return { filePath, mtimeMs, size, sessionId, cwd, title, createdAt, lastActivityAt }
+    } finally {
+      await fd.close()
+    }
+  } catch {
+    return { filePath, mtimeMs: 0, size: 0 }
+  }
+}
+
 type CachedSessionEntry = {
   provider: CodingCliProviderName
   mtimeMs: number
   size: number
   baseSession: CodingCliSession | null
+  /** True when populated by a lightweight scan and not yet fully enriched. */
+  lightweight?: boolean
 }
 
 export type SessionIndexerOptions = {
@@ -487,7 +596,7 @@ export class CodingCliSessionIndexer {
     const size = stat.size
 
     const cached = this.fileCache.get(cacheKey)
-    if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    if (cached && cached.mtimeMs === mtimeMs && cached.size === size && !cached.lightweight) {
       return
     }
 
@@ -519,7 +628,7 @@ export class CodingCliSessionIndexer {
 
     const projectPath = await provider.resolveProjectPath(filePath, meta)
     const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
-    const previous = cached?.baseSession
+    const previous = cached?.lightweight ? undefined : cached?.baseSession
     const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
     const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
     const createdAt = appendOnlyReparse
@@ -649,6 +758,230 @@ export class CodingCliSessionIndexer {
     }
   }
 
+  /**
+   * Build sorted, grouped project list from the current file cache.
+   */
+  private buildProjectGroups(
+    colors: Record<string, string | undefined>,
+    cfg: { sessionOverrides?: Record<string, SessionOverride> },
+    sessionMetadata: Record<string, SessionMetadataEntry>,
+    enabledSet: Set<string>,
+  ): { groups: ProjectGroup[]; sessionCount: number } {
+    const groupsByPath = new Map<string, ProjectGroup>()
+    let sessionCount = 0
+
+    for (const [, cached] of this.fileCache) {
+      if (!enabledSet.has(cached.provider)) continue
+      if (!cached.baseSession) continue
+      const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
+      let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[cached.baseSession.sessionId]
+      if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
+        const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
+        if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
+          const legacyKey = makeSessionKey(cached.baseSession.provider, legacySessionId)
+          const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[legacySessionId]
+          if (legacyOverride) {
+            logger.warn({ sessionId: cached.baseSession.sessionId, legacySessionId }, 'Using legacy Claude session override')
+            ov = legacyOverride
+          }
+        }
+      }
+      const merged = applyOverride(cached.baseSession, ov)
+      if (!merged) continue
+      const metaKey = makeSessionKey(merged.provider, merged.sessionId)
+      const meta = sessionMetadata[metaKey]
+      if (meta?.sessionType) {
+        merged.sessionType = meta.sessionType
+      }
+      const group = groupsByPath.get(merged.projectPath) || {
+        projectPath: merged.projectPath,
+        sessions: [],
+      }
+      group.sessions.push(merged)
+      groupsByPath.set(merged.projectPath, group)
+      sessionCount += 1
+    }
+
+    const groups: ProjectGroup[] = Array.from(groupsByPath.values()).map((group) => ({
+      ...group,
+      color: colors[group.projectPath],
+      sessions: group.sessions.sort((a, b) => b.lastActivityAt - a.lastActivityAt),
+    }))
+
+    groups.sort((a, b) => {
+      const diff = (b.sessions[0]?.lastActivityAt || 0) - (a.sessions[0]?.lastActivityAt || 0)
+      if (diff !== 0) return diff
+      if (a.projectPath < b.projectPath) return -1
+      if (a.projectPath > b.projectPath) return 1
+      return 0
+    })
+
+    return { groups, sessionCount }
+  }
+
+  /**
+   * Publish current project groups to listeners if they changed.
+   */
+  private commitProjects(groups: ProjectGroup[], sessionCount: number, fileCount: number): boolean {
+    const allSessions = groups.flatMap((g) => g.sessions)
+    this.detectNewSessions(allSessions)
+
+    const projectsDiff = diffProjects(this.projects, groups)
+    const changed = projectsDiff.upsertProjects.length > 0 || projectsDiff.removeProjectPaths.length > 0
+    if (changed) {
+      this.projects = groups
+      this.emitUpdate()
+    }
+    return changed
+  }
+
+  /**
+   * Fast parallel scan that reads head+tail of each file to populate the sidebar.
+   * Returns file lists per provider so the enrichment pass can reuse them.
+   */
+  private async lightweightScan(
+    enabledSet: Set<string>,
+    colors: Record<string, string | undefined>,
+    cfg: { sessionOverrides?: Record<string, SessionOverride> },
+    sessionMetadata: Record<string, SessionMetadataEntry>,
+  ): Promise<{ filesByProvider: Map<CodingCliProvider, string[]>; seenCacheKeys: Set<string> }> {
+    const endTimer = startPerfTimer('coding_cli_lightweight_scan', {}, { minDurationMs: 200, level: 'info' })
+    const filesByProvider = new Map<CodingCliProvider, string[]>()
+    const seenCacheKeys = new Set<string>()
+
+    // Discover files across all file-based providers in parallel.
+    await Promise.all(this.providers
+      .filter((p) => enabledSet.has(p.name) && !p.listSessionsDirect)
+      .map(async (provider) => {
+        try {
+          const files = await provider.listSessionFiles()
+          filesByProvider.set(provider, files)
+        } catch (err) {
+          logger.warn({ err, provider: provider.name }, 'Could not list session files')
+        }
+      }),
+    )
+
+    const allFiles: Array<{ provider: CodingCliProvider; filePath: string }> = []
+    for (const [provider, files] of filesByProvider) {
+      for (const f of files) allFiles.push({ provider, filePath: f })
+    }
+
+    if (allFiles.length === 0) {
+      endTimer({ fileCount: 0, sessionCount: 0 })
+      return { filesByProvider, seenCacheKeys }
+    }
+
+    // Read head+tail of every file with bounded concurrency to avoid EMFILE.
+    const metas: Array<{ provider: CodingCliProvider; meta: LightweightFileMeta }> = []
+    for (let i = 0; i < allFiles.length; i += LIGHTWEIGHT_SCAN_CONCURRENCY) {
+      const batch = allFiles.slice(i, i + LIGHTWEIGHT_SCAN_CONCURRENCY)
+      const results = await Promise.all(batch.map(({ provider, filePath }) =>
+        readLightweightMeta(filePath).then((meta) => ({ provider, meta })),
+      ))
+      metas.push(...results)
+    }
+
+    // Build lightweight cache entries.
+    for (const { provider, meta } of metas) {
+      const cacheKey = normalizeFilePath(meta.filePath)
+      seenCacheKeys.add(cacheKey)
+
+      if (!meta.cwd) continue
+      // Don't overwrite a full entry from a prior scan.
+      const existing = this.fileCache.get(cacheKey)
+      if (existing && existing.baseSession) continue
+
+      const sessionId = meta.sessionId || provider.extractSessionId(meta.filePath)
+      const projectPath = meta.cwd ? await resolveGitRepoRoot(meta.cwd) : meta.cwd
+      const baseSession: CodingCliSession = {
+        provider: provider.name,
+        sessionId,
+        projectPath,
+        lastActivityAt: meta.lastActivityAt || meta.mtimeMs,
+        createdAt: meta.createdAt,
+        title: meta.title,
+        cwd: meta.cwd,
+        sourceFile: meta.filePath,
+        isSubagent: isSubagentSession(meta.filePath) || undefined,
+      }
+
+      this.fileCache.set(cacheKey, {
+        provider: provider.name,
+        mtimeMs: meta.mtimeMs,
+        size: meta.size,
+        baseSession,
+        lightweight: true,
+      })
+      this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), meta.filePath)
+    }
+
+    // Emit early only when there are enough files that enrichment will take noticeable time.
+    // With few files the full enrichment completes within milliseconds and the early emit
+    // would just cause a redundant sessions.changed broadcast.
+    let lightweightSessionCount = this.fileCache.size
+    if (allFiles.length > ENRICHMENT_BATCH_SIZE) {
+      const built = this.buildProjectGroups(colors, cfg, sessionMetadata, enabledSet)
+      this.commitProjects(built.groups, built.sessionCount, allFiles.length)
+      lightweightSessionCount = built.sessionCount
+    }
+    endTimer({ fileCount: allFiles.length, sessionCount: lightweightSessionCount })
+    logger.info({ fileCount: allFiles.length, sessionCount: lightweightSessionCount }, 'Lightweight scan complete')
+
+    return { filesByProvider, seenCacheKeys }
+  }
+
+  /**
+   * Enrich the most recent sessions with full metadata (isNonInteractive, token usage, etc).
+   * Only enriches the top N by recency — enough to fill the first sidebar page with filtered results.
+   */
+  private async enrichRecentSessions(
+    filesByProvider: Map<CodingCliProvider, string[]>,
+    enabledSet: Set<string>,
+    seenCacheKeys: Set<string>,
+  ): Promise<void> {
+    // Collect all file-based entries for enrichment.
+    const candidates: Array<{ provider: CodingCliProvider; filePath: string; cacheKey: string; lastActivityAt: number; isSubagent: boolean }> = []
+    for (const [provider, files] of filesByProvider) {
+      if (!enabledSet.has(provider.name)) continue
+      for (const filePath of files) {
+        const cacheKey = normalizeFilePath(filePath)
+        const cached = this.fileCache.get(cacheKey)
+        const lastActivityAt = cached?.baseSession?.lastActivityAt ?? 0
+        const isSubagent = cached?.baseSession?.isSubagent ?? isSubagentSession(filePath)
+        candidates.push({ provider, filePath, cacheKey, lastActivityAt, isSubagent })
+      }
+    }
+
+    // When there are few enough files, enrich all of them. The lightweight scan is
+    // an optimization for large libraries; small sets don't benefit from deferral.
+    let batch: typeof candidates
+    if (candidates.length <= ENRICHMENT_BATCH_SIZE) {
+      batch = candidates
+    } else {
+      // Prioritize non-subagent, most-recent sessions for the first sidebar page.
+      candidates.sort((a, b) => {
+        if (a.isSubagent !== b.isSubagent) return a.isSubagent ? 1 : -1
+        return b.lastActivityAt - a.lastActivityAt
+      })
+      batch = candidates.slice(0, ENRICHMENT_BATCH_SIZE)
+    }
+
+    let enriched = 0
+    for (const { provider, filePath, cacheKey } of batch) {
+      if (INDEXER_DELAY_MS > 0) {
+        await new Promise((r) => setTimeout(r, INDEXER_DELAY_MS))
+      }
+      await this.updateCacheEntry(provider, filePath, cacheKey)
+      enriched += 1
+      if (enriched % REFRESH_YIELD_EVERY === 0) {
+        await yieldToEventLoop()
+      }
+    }
+
+    logger.info({ enriched, total: candidates.length }, 'Enriched recent sessions')
+  }
+
   private async performRefresh() {
     const endRefreshTimer = startPerfTimer(
       'coding_cli_refresh',
@@ -668,64 +1001,76 @@ export class CodingCliSessionIndexer {
       this.needsFullScan = true
     }
 
-    const groupsByPath = new Map<string, ProjectGroup>()
     let fileCount = 0
-    let sessionCount = 0
     let processedEntries = 0
 
     const shouldFullScan = this.needsFullScan || this.fileCache.size === 0
     if (shouldFullScan) {
+      const isColdStart = this.fileCache.size === 0
       this.needsFullScan = false
       this.dirtyFiles.clear()
       this.deletedFiles.clear()
       this.dirtyProviders.clear()
 
+      let filesByProvider: Map<CodingCliProvider, string[]> | undefined
       const seenCacheKeys = new Set<string>()
+
+      if (isColdStart) {
+        // Cold start: lightweight parallel scan populates the sidebar immediately,
+        // then selective enrichment fills in filtering metadata for the first page.
+        const result = await this.lightweightScan(enabledSet, colors, cfg, sessionMetadata)
+        filesByProvider = result.filesByProvider
+        for (const key of result.seenCacheKeys) seenCacheKeys.add(key)
+      }
+
+      // Handle direct-listing providers.
       for (const provider of this.providers) {
-        if (!enabledSet.has(provider.name)) continue
-        if (provider.listSessionsDirect) {
-          const seenDirectKeys = await this.refreshDirectProvider(provider)
-          fileCount += seenDirectKeys.size
-          for (const cacheKey of seenDirectKeys) {
+        if (!enabledSet.has(provider.name) || !provider.listSessionsDirect) continue
+        const seenDirectKeys = await this.refreshDirectProvider(provider)
+        fileCount += seenDirectKeys.size
+        for (const cacheKey of seenDirectKeys) seenCacheKeys.add(cacheKey)
+      }
+
+      // Full enrichment pass for file-based providers.
+      // On cold start this only enriches the top N (rest already have lightweight data).
+      // On warm rescan this processes all files normally.
+      for (const provider of this.providers) {
+        if (!enabledSet.has(provider.name) || provider.listSessionsDirect) continue
+        const files = filesByProvider?.get(provider) ?? await provider.listSessionFiles().catch((err) => {
+          logger.warn({ err, provider: provider.name }, 'Could not list session files')
+          return [] as string[]
+        })
+        fileCount += files.length
+
+        if (isColdStart) {
+          // Selective enrichment: only the most recent non-subagent sessions.
+          await this.enrichRecentSessions(
+            new Map([[provider, files]]), enabledSet, seenCacheKeys,
+          )
+          for (const f of files) seenCacheKeys.add(normalizeFilePath(f))
+        } else {
+          // Warm rescan: process all files (cache hits skip unchanged files).
+          for (const file of files) {
             processedEntries += 1
             if (processedEntries % REFRESH_YIELD_EVERY === 0) {
               await yieldToEventLoop()
             }
+            const cacheKey = normalizeFilePath(file)
             seenCacheKeys.add(cacheKey)
+            await this.updateCacheEntry(provider, file, cacheKey)
           }
-          continue
-        }
-        let files: string[] = []
-        try {
-          files = await provider.listSessionFiles()
-        } catch (err) {
-          logger.warn({ err, provider: provider.name }, 'Could not list session files')
-          continue
-        }
-        fileCount += files.length
-
-        for (const file of files) {
-          processedEntries += 1
-          if (processedEntries % REFRESH_YIELD_EVERY === 0) {
-            await yieldToEventLoop()
-          }
-          const cacheKey = normalizeFilePath(file)
-          seenCacheKeys.add(cacheKey)
-          await this.updateCacheEntry(provider, file, cacheKey)
         }
       }
 
+      // Prune cache entries for files that no longer exist.
       for (const cachedFile of this.fileCache.keys()) {
-        processedEntries += 1
-        if (processedEntries % REFRESH_YIELD_EVERY === 0) {
-          await yieldToEventLoop()
-        }
         const cached = this.fileCache.get(cachedFile)
         if (!cached || !enabledSet.has(cached.provider) || !seenCacheKeys.has(cachedFile)) {
           this.deleteCacheEntry(cachedFile)
         }
       }
     } else {
+      // Incremental refresh — only process changed files.
       const deletedFiles = Array.from(this.deletedFiles)
       const dirtyFiles = Array.from(this.dirtyFiles)
       const dirtyProviders = Array.from(this.dirtyProviders)
@@ -777,71 +1122,16 @@ export class CodingCliSessionIndexer {
       fileCount = this.fileCache.size
     }
 
-    processedEntries = 0
+    // Prune disabled providers from cache.
     for (const [cachedFile, cached] of this.fileCache) {
-      processedEntries += 1
-      if (processedEntries % REFRESH_YIELD_EVERY === 0) {
-        await yieldToEventLoop()
-      }
       if (!enabledSet.has(cached.provider)) {
         this.deleteCacheEntry(cachedFile)
-        continue
       }
-      if (!cached.baseSession) continue
-      const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
-      let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[cached.baseSession.sessionId]
-      if (!ov && cached.baseSession.provider === 'claude' && cached.baseSession.sourceFile) {
-        const legacySessionId = path.basename(cached.baseSession.sourceFile, '.jsonl')
-        if (legacySessionId && legacySessionId !== cached.baseSession.sessionId) {
-          const legacyKey = makeSessionKey(cached.baseSession.provider, legacySessionId)
-          const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[legacySessionId]
-          if (legacyOverride) {
-            logger.warn({ sessionId: cached.baseSession.sessionId, legacySessionId }, 'Using legacy Claude session override')
-            ov = legacyOverride
-          }
-        }
-      }
-      const merged = applyOverride(cached.baseSession, ov)
-      if (!merged) continue
-      // Merge sessionType from metadata store
-      const metaKey = makeSessionKey(merged.provider, merged.sessionId)
-      const meta = sessionMetadata[metaKey]
-      if (meta?.sessionType) {
-        merged.sessionType = meta.sessionType
-      }
-      const group = groupsByPath.get(merged.projectPath) || {
-        projectPath: merged.projectPath,
-        sessions: [],
-      }
-      group.sessions.push(merged)
-      groupsByPath.set(merged.projectPath, group)
-      sessionCount += 1
     }
 
-    const groups: ProjectGroup[] = Array.from(groupsByPath.values()).map((group) => ({
-      ...group,
-      color: colors[group.projectPath],
-      sessions: group.sessions.sort((a, b) => b.lastActivityAt - a.lastActivityAt),
-    }))
-
-    // Sort projects by most recent session activity.
-    groups.sort((a, b) => {
-      const diff = (b.sessions[0]?.lastActivityAt || 0) - (a.sessions[0]?.lastActivityAt || 0)
-      if (diff !== 0) return diff
-      if (a.projectPath < b.projectPath) return -1
-      if (a.projectPath > b.projectPath) return 1
-      return 0
-    })
-
-    const allSessions = groups.flatMap((g) => g.sessions)
-    this.detectNewSessions(allSessions)
-
-    const projectsDiff = diffProjects(this.projects, groups)
-    const changed = projectsDiff.upsertProjects.length > 0 || projectsDiff.removeProjectPaths.length > 0
-    if (changed) {
-      this.projects = groups
-      this.emitUpdate()
-    } else {
+    const { groups, sessionCount } = this.buildProjectGroups(colors, cfg, sessionMetadata, enabledSet)
+    const changed = this.commitProjects(groups, sessionCount, fileCount)
+    if (!changed) {
       logger.debug({ sessionCount, fileCount }, 'Skipping no-op refresh (no project changes)')
     }
     endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount, skipped: !changed })

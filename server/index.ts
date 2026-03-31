@@ -184,7 +184,7 @@ async function main() {
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
 
-  const sessionRepairService = getSessionRepairService()
+  const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
 
   const sdkBridge = new SdkBridge()
