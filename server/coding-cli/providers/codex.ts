@@ -328,7 +328,11 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
         if (ideRequest) {
           title = extractTitleFromMessage(ideRequest, 200)
         } else if (!isSystemContext(text)) {
-          title = extractTitleFromMessage(text, 200)
+          // Strip image markup tags so titles show the actual user request
+          const cleaned = text.replace(/<\/?image[^>]*>/g, '').trim()
+          if (cleaned) {
+            title = extractTitleFromMessage(cleaned, 200)
+          }
         }
       }
     }

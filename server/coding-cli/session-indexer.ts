@@ -933,14 +933,28 @@ export class CodingCliSessionIndexer {
     enabledSet: Set<string>,
     seenCacheKeys: Set<string>,
   ): Promise<void> {
-    // Collect all file-based entries for enrichment.
+    // Collect all file-based entries for enrichment. Files the lightweight scan couldn't
+    // parse (e.g. Codex with 14KB first lines) use file mtime as the recency estimate.
+    const statCache = new Map<string, number>()
     const candidates: Array<{ provider: CodingCliProvider; filePath: string; cacheKey: string; lastActivityAt: number; isSubagent: boolean }> = []
     for (const [provider, files] of filesByProvider) {
       if (!enabledSet.has(provider.name)) continue
       for (const filePath of files) {
         const cacheKey = normalizeFilePath(filePath)
         const cached = this.fileCache.get(cacheKey)
-        const lastActivityAt = cached?.baseSession?.lastActivityAt ?? 0
+        let lastActivityAt = cached?.baseSession?.lastActivityAt ?? cached?.mtimeMs ?? 0
+        if (lastActivityAt === 0) {
+          // No cache entry — file wasn't parseable from 4KB. Use mtime for sorting.
+          try {
+            let mtime = statCache.get(cacheKey)
+            if (mtime === undefined) {
+              const stat = await fsp.stat(filePath)
+              mtime = stat.mtimeMs || stat.mtime.getTime()
+              statCache.set(cacheKey, mtime)
+            }
+            lastActivityAt = mtime
+          } catch { /* file may have been deleted */ }
+        }
         const isSubagent = cached?.baseSession?.isSubagent ?? isSubagentSession(filePath)
         candidates.push({ provider, filePath, cacheKey, lastActivityAt, isSubagent })
       }

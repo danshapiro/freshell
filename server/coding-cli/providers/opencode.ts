@@ -52,7 +52,7 @@ export class OpencodeProvider implements CodingCliProvider {
     try {
       sqlite = await import('node:sqlite')
     } catch {
-      logger.debug({ provider: this.name }, 'node:sqlite unavailable (requires Node 22.5+); skipping OpenCode sessions')
+      logger.warn({ provider: this.name, nodeVersion: process.version }, 'node:sqlite unavailable — OpenCode sessions will not appear. Upgrade to Node 22.5+ to enable.')
       return []
     }
 
