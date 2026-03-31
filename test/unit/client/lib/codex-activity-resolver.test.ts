@@ -17,32 +17,23 @@ describe('resolveExactCodexActivity', () => {
 
     expect(resolveExactCodexActivity(
       { 'term-1': record },
-      { terminalId: 'term-1', tabTerminalId: 'term-tab', isOnlyPane: true },
+      { terminalId: 'term-1', isOnlyPane: true },
     )).toEqual(record)
   })
 
-  it('falls back to the exact tab terminal id only for a single-pane tab', () => {
+  it('returns undefined when pane has no terminalId even for single-pane tab', () => {
     const record = makeRecord({ terminalId: 'term-tab' })
 
     expect(resolveExactCodexActivity(
       { 'term-tab': record },
-      { terminalId: undefined, tabTerminalId: 'term-tab', isOnlyPane: true },
-    )).toEqual(record)
-  })
-
-  it('does not use the tab terminal id fallback for multi-pane tabs', () => {
-    const record = makeRecord({ terminalId: 'term-tab' })
-
-    expect(resolveExactCodexActivity(
-      { 'term-tab': record },
-      { terminalId: undefined, tabTerminalId: 'term-tab', isOnlyPane: false },
+      { terminalId: undefined, isOnlyPane: true },
     )).toBeUndefined()
   })
 
   it('returns undefined when there is no exact terminal id match', () => {
     expect(resolveExactCodexActivity(
       { 'term-other': makeRecord({ terminalId: 'term-other' }) },
-      { terminalId: undefined, tabTerminalId: undefined, isOnlyPane: true },
+      { terminalId: undefined, isOnlyPane: true },
     )).toBeUndefined()
   })
 })

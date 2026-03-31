@@ -1,3 +1,6 @@
+// Tracks which URL is currently hovered per terminal pane for context menus.
+
+
 const hoveredUrls = new Map<string, string>()
 
 export function setHoveredUrl(paneId: string, url: string): void {

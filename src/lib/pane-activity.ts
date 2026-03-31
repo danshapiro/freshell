@@ -94,7 +94,6 @@ function buildSyntheticTerminalContent(tab: Tab): TerminalPaneContent | null {
     status: tab.status,
     mode: tab.mode,
     shell: tab.shell,
-    terminalId: tab.terminalId,
     resumeSessionId: tab.resumeSessionId,
     initialCwd: tab.initialCwd,
   }
@@ -104,7 +103,6 @@ export function resolvePaneActivity(input: {
   paneId: string
   content: PaneContent
   tabMode?: Tab['mode']
-  tabTerminalId?: string
   isOnlyPane: boolean
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
@@ -122,7 +120,6 @@ export function resolvePaneActivity(input: {
     if (effectiveMode === 'codex') {
       const record = resolveExactCodexActivity(input.codexActivityByTerminalId, {
         terminalId: input.content.terminalId,
-        tabTerminalId: input.tabTerminalId,
         isOnlyPane: input.isOnlyPane,
       })
       return record?.phase === 'busy'
@@ -171,7 +168,6 @@ export function getBusyPaneIdsForTab(input: {
       paneId: input.tab.id,
       content: syntheticContent,
       tabMode: input.tab.mode,
-      tabTerminalId: input.tab.terminalId,
       isOnlyPane: true,
       codexActivityByTerminalId: input.codexActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
@@ -187,7 +183,6 @@ export function getBusyPaneIdsForTab(input: {
       paneId: entry.paneId,
       content: entry.content,
       tabMode: input.tab.mode,
-      tabTerminalId: input.tab.terminalId,
       isOnlyPane,
       codexActivityByTerminalId: input.codexActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
@@ -215,7 +210,6 @@ export function collectBusySessionKeys(input: {
         paneId: tab.id,
         content: syntheticContent,
         tabMode: tab.mode,
-        tabTerminalId: tab.terminalId,
         isOnlyPane: true,
         codexActivityByTerminalId: input.codexActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
@@ -234,7 +228,6 @@ export function collectBusySessionKeys(input: {
         paneId: entry.paneId,
         content: entry.content,
         tabMode: tab.mode,
-        tabTerminalId: tab.terminalId,
         isOnlyPane,
         codexActivityByTerminalId: input.codexActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,

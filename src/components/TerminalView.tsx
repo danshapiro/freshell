@@ -1027,12 +1027,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       linkHandler: {
         activate: (event: MouseEvent, uri: string) => {
           if (event.button !== 0) return
-          // Only open http/https URLs in browser panes. Reject javascript:,
-          // data:, and other potentially dangerous schemes from OSC 8 links.
-          if (!/^https?:\/\//i.test(uri)) {
-            window.open(uri, '_blank', 'noopener,noreferrer')
-            return
-          }
+          // Only open http/https URLs. Block javascript:, data:, and other
+          // potentially dangerous schemes from OSC 8 links.
+          if (!/^https?:\/\//i.test(uri)) return
           if (warnExternalLinksRef.current !== false) {
             setPendingLinkUriRef.current(uri)
           } else {
@@ -1786,10 +1783,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
-          // Also update tab for title purposes
+          // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
-            dispatch(updateTab({ id: currentTab.id, updates: { terminalId: newId, status: 'running' } }))
+            dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
           }
           if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
             updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
@@ -1831,7 +1828,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
             // Only modify title if user hasn't manually set it
-            const updates: { terminalId: undefined; status: 'exited'; title?: string } = { terminalId: undefined, status: 'exited' }
+            const updates: { status: 'exited'; title?: string } = { status: 'exited' }
             if (!exitTab.titleSetByUser) {
               updates.title = exitTab.title + (code !== undefined ? ` (exit ${code})` : '')
             }
@@ -1943,11 +1940,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             }
             applySeqState(createAttachSeqState())
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
-            // Also clear the tab's terminalId to keep it in sync.
-            // This prevents openSessionTab from using the stale terminalId for dedup.
             const currentTab = tabRef.current
             if (currentTab) {
-              dispatch(updateTab({ id: currentTab.id, updates: { terminalId: undefined, status: 'creating' } }))
+              dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
             }
           } else if (current?.status === 'exited') {
             term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')

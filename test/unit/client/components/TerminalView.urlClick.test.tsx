@@ -540,25 +540,23 @@ describe('TerminalView URL click behavior', () => {
 
     const handler = getLinkHandler()
 
-    // javascript: URI should NOT open a browser pane
+    // javascript: URI should be silently blocked
     act(() => {
       handler.activate(new MouseEvent('click'), 'javascript:alert(1)')
     })
 
     const layout = store.getState().panes.layouts['tab-1']
     expect(layout.type).toBe('leaf')
-    expect(windowOpenSpy).toHaveBeenCalledWith('javascript:alert(1)', '_blank', 'noopener,noreferrer')
+    expect(windowOpenSpy).not.toHaveBeenCalled()
 
-    windowOpenSpy.mockClear()
-
-    // data: URI should NOT open a browser pane
+    // data: URI should be silently blocked
     act(() => {
       handler.activate(new MouseEvent('click'), 'data:text/html,<h1>hi</h1>')
     })
 
     const layout2 = store.getState().panes.layouts['tab-1']
     expect(layout2.type).toBe('leaf')
-    expect(windowOpenSpy).toHaveBeenCalledWith('data:text/html,<h1>hi</h1>', '_blank', 'noopener,noreferrer')
+    expect(windowOpenSpy).not.toHaveBeenCalled()
   })
 
   it('OSC 8 linkHandler.activate with https scheme opens browser pane normally', async () => {

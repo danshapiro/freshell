@@ -17,12 +17,15 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
-import { TABS_STORAGE_KEY } from './storage-keys'
+import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
+import { loadPersistedLayout } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 
 
 const log = createLogger('TabsSlice')
+
+export type Tombstone = { id: string; deletedAt: number }
 
 export interface TabsState {
   tabs: Tab[]
@@ -30,6 +33,25 @@ export interface TabsState {
   // Ephemeral UI signal: request TabBar to enter inline rename mode for a tab.
   // This must never be persisted.
   renameRequestTabId: string | null
+  // IDs of tabs that were explicitly closed. Prevents resurrection during cross-tab merge.
+  tombstones: Tombstone[]
+}
+
+function migrateTabFields(t: Tab): Tab {
+  const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+  // Strip legacy terminalId field from persisted data
+  const { terminalId: _legacyTerminalId, ...rest } = t as Tab & { terminalId?: unknown }
+  return {
+    ...rest,
+    codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
+    codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+    createdAt: t.createdAt || Date.now(),
+    createRequestId: (t as any).createRequestId || t.id,
+    status: t.status || 'creating',
+    mode: t.mode || 'shell',
+    shell: t.shell || 'system',
+    lastInputAt: t.lastInputAt,
+  }
 }
 
 // Load persisted tabs state directly at module initialization time
@@ -39,40 +61,33 @@ function loadInitialTabsState(): TabsState {
     tabs: [],
     activeTabId: null,
     renameRequestTabId: null,
+    tombstones: [],
   }
 
   try {
-    const raw = localStorage.getItem(TABS_STORAGE_KEY)
-    if (!raw) return defaultState
-    const parsed = JSON.parse(raw)
-    // The persisted format is { tabs: TabsState }
-    const tabsState = parsed?.tabs as Partial<TabsState> | undefined
+    const layout = loadPersistedLayout()
+    if (!layout) return defaultState
+
+    const tabsState = layout.tabs?.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
-    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
+    const persistedAt = typeof layout.persistedAt === 'number' ? layout.persistedAt : undefined
+    const ageMs = persistedAt ? Date.now() - persistedAt : undefined
+    const ageHours = ageMs ? Math.round(ageMs / 3600000) : undefined
+    if (ageHours !== undefined && ageHours > 24) {
+      log.warn(`Restoring tab state from ${ageHours}h ago — may be stale (persistedAt: ${new Date(persistedAt!).toISOString()})`)
+    }
+    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t: Tab) => t.id), persistedAt ? `(${ageHours}h old)` : '(no timestamp)')
 
-    // Apply same transformations as hydrateTabs to ensure consistency
-    const mappedTabs = tabsState.tabs.map((t: Tab) => {
-      const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
-      return {
-        ...t,
-        codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
-        codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
-        createdAt: t.createdAt || Date.now(),
-        createRequestId: (t as any).createRequestId || t.id,
-        status: t.status || 'creating',
-        mode: t.mode || 'shell',
-        shell: t.shell || 'system',
-        lastInputAt: t.lastInputAt,
-      }
-    })
+    const mappedTabs = tabsState.tabs.map(migrateTabFields)
     const desired = tabsState.activeTabId
-    const has = desired && mappedTabs.some((t) => t.id === desired)
+    const has = desired && mappedTabs.some((t: Tab) => t.id === desired)
 
     return {
       tabs: mappedTabs,
       activeTabId: has ? desired! : (mappedTabs[0]?.id ?? null),
       renameRequestTabId: null,
+      tombstones: Array.isArray(layout.tombstones) ? layout.tombstones : [],
     }
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
@@ -86,7 +101,6 @@ type AddTabPayload = {
   id?: string
   title?: string
   description?: string
-  terminalId?: string
   codingCliSessionId?: string
   codingCliProvider?: CodingCliProviderName
   claudeSessionId?: string
@@ -119,7 +133,6 @@ export const tabsSlice = createSlice({
         createRequestId: payload.createRequestId || id,
         title: payload.title || `Tab ${state.tabs.length + 1}`,
         description: payload.description,
-        terminalId: payload.terminalId,
         codingCliSessionId,
         codingCliProvider,
         claudeSessionId: payload.claudeSessionId,
@@ -130,6 +143,7 @@ export const tabsSlice = createSlice({
         resumeSessionId: payload.resumeSessionId,
         sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),
+        updatedAt: Date.now(),
         titleSetByUser: payload.titleSetByUser,
         lastInputAt: undefined,
       }
@@ -147,7 +161,10 @@ export const tabsSlice = createSlice({
     },
     updateTab: (state, action: PayloadAction<{ id: string; updates: Partial<Tab> }>) => {
       const tab = state.tabs.find((t) => t.id === action.payload.id)
-      if (tab) Object.assign(tab, action.payload.updates)
+      if (tab) {
+        Object.assign(tab, action.payload.updates)
+        tab.updatedAt = Date.now()
+      }
     },
     removeTab: (state, action: PayloadAction<string>) => {
       const removedTabId = action.payload
@@ -155,6 +172,8 @@ export const tabsSlice = createSlice({
       const wasActive = state.activeTabId === removedTabId
 
       state.tabs = state.tabs.filter((t) => t.id !== removedTabId)
+      if (!state.tombstones) state.tombstones = []
+      state.tombstones.push({ id: removedTabId, deletedAt: Date.now() })
 
       if (wasActive) {
         if (state.tabs.length === 0) {
@@ -167,23 +186,55 @@ export const tabsSlice = createSlice({
       }
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
-      // Basic sanity: ensure dates exist, status defaults.
-      state.tabs = (action.payload.tabs || []).map((t) => {
-        const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
-        return {
-          ...t,
-          codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
-          codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
-          createdAt: t.createdAt || Date.now(),
-          createRequestId: (t as any).createRequestId || t.id,
-          status: t.status || 'creating',
-          mode: t.mode || 'shell',
-          shell: t.shell || 'system',
+      const remoteTabs = (action.payload.tabs || []).map(migrateTabFields)
+      const remoteTombstones: Tombstone[] = Array.isArray(action.payload.tombstones) ? action.payload.tombstones : []
+
+      // Union tombstones from both sides, deduped by ID
+      const tombstoneMap = new Map<string, number>()
+      for (const t of (state.tombstones || [])) tombstoneMap.set(t.id, Math.max(tombstoneMap.get(t.id) ?? 0, t.deletedAt))
+      for (const t of remoteTombstones) tombstoneMap.set(t.id, Math.max(tombstoneMap.get(t.id) ?? 0, t.deletedAt))
+      state.tombstones = Array.from(tombstoneMap, ([id, deletedAt]) => ({ id, deletedAt }))
+
+      const tombstoned = new Set(tombstoneMap.keys())
+      const localById = new Map(state.tabs.map((t) => [t.id, t]))
+      const remoteById = new Map(remoteTabs.map((t) => [t.id, t]))
+
+      // Build merged list: remote order for shared tabs, then local-only tabs appended
+      const merged: Tab[] = []
+      const seen = new Set<string>()
+
+      for (const remoteTab of remoteTabs) {
+        if (tombstoned.has(remoteTab.id)) continue
+        seen.add(remoteTab.id)
+        const localTab = localById.get(remoteTab.id)
+        if (localTab) {
+          // Both sides have this tab — resolve by updatedAt (remote wins ties)
+          merged.push((localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab)
+        } else {
+          merged.push(remoteTab)
         }
-      })
-      const desired = action.payload.activeTabId
-      const has = desired && state.tabs.some((t) => t.id === desired)
-      state.activeTabId = has ? desired! : (state.tabs[0]?.id ?? null)
+      }
+
+      // Append local-only tabs (not in remote, not tombstoned)
+      for (const localTab of state.tabs) {
+        if (seen.has(localTab.id) || tombstoned.has(localTab.id)) continue
+        if (!remoteById.has(localTab.id)) {
+          merged.push(localTab)
+        }
+      }
+
+      state.tabs = merged
+
+      // Prefer local activeTabId if it still exists in merged set
+      const localActive = state.activeTabId
+      const mergedIds = new Set(merged.map((t) => t.id))
+      if (localActive && mergedIds.has(localActive)) {
+        // keep local
+      } else {
+        const desired = action.payload.activeTabId
+        state.activeTabId = (desired && mergedIds.has(desired)) ? desired : (merged[0]?.id ?? null)
+      }
+
       state.renameRequestTabId = null
     },
     reorderTabs: (
@@ -448,7 +499,10 @@ export const openSessionTab = createAsyncThunk(
 
     if (terminalId) {
       if (!forceNew) {
-        const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
+        const existingTabId = selectTabIdByTerminalId(state, terminalId)
+        const existingTab = existingTabId
+          ? state.tabs.tabs.find((t) => t.id === existingTabId)
+          : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
           dispatch(setActiveTab(existingTab.id))
@@ -456,15 +510,27 @@ export const openSessionTab = createAsyncThunk(
         }
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
+      const tabId = nanoid()
       dispatch(addTab({
+        id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
-        terminalId,
         status: 'running',
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
         resumeSessionId: sessionId,
         sessionMetadataByKey: buildSessionMetadataByKey(),
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: {
+          kind: 'terminal',
+          mode: resolvedProvider,
+          terminalId,
+          resumeSessionId: sessionId,
+          initialCwd: cwd,
+          status: 'running',
+        },
       }))
       return
     }

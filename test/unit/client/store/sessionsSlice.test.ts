@@ -8,8 +8,6 @@ import sessionsReducer, {
   applySessionsPatch,
   toggleProjectExpanded,
   setProjectExpanded,
-  collapseAll,
-  expandAll,
   SessionsState,
   setActiveSessionSurface,
   commitSessionWindowReplacement,
@@ -600,73 +598,6 @@ describe('sessionsSlice', () => {
     })
   })
 
-  describe('collapseAll', () => {
-    it('collapses all expanded projects', () => {
-      const stateWithExpanded = {
-        ...initialState,
-        expandedProjects: new Set(['/project/one', '/project/two', '/project/three']),
-      }
-      const state = sessionsReducer(stateWithExpanded, collapseAll())
-      expect(state.expandedProjects.size).toBe(0)
-    })
-
-    it('works when no projects are expanded', () => {
-      const state = sessionsReducer(initialState, collapseAll())
-      expect(state.expandedProjects.size).toBe(0)
-    })
-
-    it('preserves projects list', () => {
-      const stateWithProjects = {
-        ...initialState,
-        projects: mockProjects,
-        expandedProjects: new Set(['/project/one']),
-      }
-      const state = sessionsReducer(stateWithProjects, collapseAll())
-      expect(state.projects).toEqual(mockProjects)
-    })
-  })
-
-  describe('expandAll', () => {
-    it('expands all projects in the list', () => {
-      const stateWithProjects = {
-        ...initialState,
-        projects: mockProjects,
-        expandedProjects: new Set<string>(),
-      }
-      const state = sessionsReducer(stateWithProjects, expandAll())
-      expect(state.expandedProjects.size).toBe(3)
-      expect(state.expandedProjects.has('/project/one')).toBe(true)
-      expect(state.expandedProjects.has('/project/two')).toBe(true)
-      expect(state.expandedProjects.has('/project/three')).toBe(true)
-    })
-
-    it('works when some projects are already expanded', () => {
-      const stateWithProjects = {
-        ...initialState,
-        projects: mockProjects,
-        expandedProjects: new Set(['/project/one']),
-      }
-      const state = sessionsReducer(stateWithProjects, expandAll())
-      expect(state.expandedProjects.size).toBe(3)
-    })
-
-    it('replaces expandedProjects with new Set', () => {
-      const stateWithProjects = {
-        ...initialState,
-        projects: mockProjects,
-        expandedProjects: new Set(['/old/project']),
-      }
-      const state = sessionsReducer(stateWithProjects, expandAll())
-      expect(state.expandedProjects.has('/old/project')).toBe(false)
-      expect(state.expandedProjects.size).toBe(3)
-    })
-
-    it('handles empty projects list', () => {
-      const state = sessionsReducer(initialState, expandAll())
-      expect(state.expandedProjects.size).toBe(0)
-    })
-  })
-
   describe('state immutability', () => {
     it('does not mutate original state on setProjects', () => {
       const originalProjects = [...initialState.projects]
@@ -686,7 +617,7 @@ describe('sessionsSlice', () => {
   })
 
   describe('complex scenarios', () => {
-    it('handles workflow: load projects, expand some, collapse all, expand all', () => {
+    it('handles workflow: load projects, expand some, toggle back', () => {
       let state = sessionsReducer(initialState, setProjects(mockProjects))
       expect(state.projects.length).toBe(3)
 
@@ -694,16 +625,16 @@ describe('sessionsSlice', () => {
       state = sessionsReducer(state, toggleProjectExpanded('/project/two'))
       expect(state.expandedProjects.size).toBe(2)
 
-      state = sessionsReducer(state, collapseAll())
+      state = sessionsReducer(state, toggleProjectExpanded('/project/one'))
+      state = sessionsReducer(state, toggleProjectExpanded('/project/two'))
       expect(state.expandedProjects.size).toBe(0)
-
-      state = sessionsReducer(state, expandAll())
-      expect(state.expandedProjects.size).toBe(3)
     })
 
     it('handles replacing projects while some are expanded', () => {
       let state = sessionsReducer(initialState, setProjects(mockProjects))
-      state = sessionsReducer(state, expandAll())
+      state = sessionsReducer(state, toggleProjectExpanded('/project/one'))
+      state = sessionsReducer(state, toggleProjectExpanded('/project/two'))
+      state = sessionsReducer(state, toggleProjectExpanded('/project/three'))
       expect(state.expandedProjects.size).toBe(3)
 
       const newProjects: ProjectGroup[] = [

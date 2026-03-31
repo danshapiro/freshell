@@ -54,7 +54,7 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
       'terminal.attach.ready',
       'terminal.output',
       'terminal.output.gap',
-      'terminal.runtime.updated',
+
       'terminals.changed',
     ],
     buildUrl: ({ token }) => buildRootUrl(token),
@@ -87,7 +87,7 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
       'terminal.attach.ready',
       'terminal.output',
       'terminal.output.gap',
-      'terminal.runtime.updated',
+
       'terminals.changed',
     ],
     buildUrl: ({ token }) => buildRootUrl(token),

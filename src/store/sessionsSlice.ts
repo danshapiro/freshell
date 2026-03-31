@@ -263,6 +263,10 @@ export const sessionsSlice = createSlice({
       if (!state.activeSurface || state.activeSurface === action.payload.surface) {
         syncTopLevelFromWindow(state, action.payload.surface)
       }
+      // A successful HTTP fetch establishes a valid baseline for WS patches.
+      if (!state.wsSnapshotReceived) {
+        state.wsSnapshotReceived = true
+      }
     },
     markWsSnapshotReceived: (state) => {
       state.wsSnapshotReceived = true
@@ -411,12 +415,6 @@ export const sessionsSlice = createSlice({
       if (expanded) state.expandedProjects.add(projectPath)
       else state.expandedProjects.delete(projectPath)
     },
-    collapseAll: (state) => {
-      state.expandedProjects = new Set()
-    },
-    expandAll: (state) => {
-      state.expandedProjects = new Set(state.projects.map((p) => p.projectPath))
-    },
   },
 })
 
@@ -438,8 +436,6 @@ export const {
   setLoadingMore,
   toggleProjectExpanded,
   setProjectExpanded,
-  collapseAll,
-  expandAll,
 } =
   sessionsSlice.actions
 

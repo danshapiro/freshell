@@ -21,6 +21,7 @@ const TAB_ATTENTION_STYLE_VALUES = ['highlight', 'pulse', 'darken', 'none'] as c
 const ATTENTION_DISMISS_VALUES = ['click', 'type'] as const
 const SESSION_OPEN_MODE_VALUES = ['tab', 'split'] as const
 const SIDEBAR_SORT_MODE_VALUES = ['recency', 'recency-pinned', 'activity', 'project'] as const
+const WORKTREE_GROUPING_VALUES = ['repo', 'worktree'] as const
 export const CODEX_SANDBOX_VALUES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'] as const
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
@@ -50,6 +51,7 @@ const TERMINAL_LOCAL_KEYS = [
 const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
+  'worktreeGrouping',
   'showProjectBadges',
   'showSubagents',
   'ignoreCodexSubagents',
@@ -68,6 +70,7 @@ export type TabAttentionStyle = (typeof TAB_ATTENTION_STYLE_VALUES)[number]
 export type AttentionDismiss = (typeof ATTENTION_DISMISS_VALUES)[number]
 export type SessionOpenMode = (typeof SESSION_OPEN_MODE_VALUES)[number]
 export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number]
+export type WorktreeGrouping = (typeof WORKTREE_GROUPING_VALUES)[number]
 export type CodexSandboxMode = (typeof CODEX_SANDBOX_VALUES)[number]
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODE_VALUES)[number]
 export type ExternalEditor = (typeof EXTERNAL_EDITOR_VALUES)[number]
@@ -168,6 +171,7 @@ export type LocalSettings = {
   }
   sidebar: {
     sortMode: SidebarSortMode
+    worktreeGrouping: WorktreeGrouping
     showProjectBadges: boolean
     showSubagents: boolean
     ignoreCodexSubagents: boolean
@@ -255,6 +259,10 @@ function mergeRecordOfObjects<T extends Record<string, unknown>>(
     merged[key] = mergeOwnKeys((merged[key] || {}) as T, value || {})
   }
   return merged
+}
+
+function normalizeWorktreeGrouping(value: unknown): WorktreeGrouping {
+  return WORKTREE_GROUPING_VALUES.includes(value as WorktreeGrouping) ? (value as WorktreeGrouping) : 'repo'
 }
 
 function normalizeLocalSortMode(mode: unknown): SidebarSortMode {
@@ -422,6 +430,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     const sidebar: LocalSettingsPatch['sidebar'] = {}
     if (hasOwn(patch.sidebar, 'sortMode')) {
       sidebar.sortMode = normalizeLocalSortMode(patch.sidebar.sortMode)
+    }
+    if (hasOwn(patch.sidebar, 'worktreeGrouping')) {
+      sidebar.worktreeGrouping = normalizeWorktreeGrouping(patch.sidebar.worktreeGrouping)
     }
     if (typeof patch.sidebar.showProjectBadges === 'boolean') {
       sidebar.showProjectBadges = patch.sidebar.showProjectBadges as boolean
@@ -675,6 +686,7 @@ export const defaultLocalSettings: LocalSettings = {
   },
   sidebar: {
     sortMode: 'activity',
+    worktreeGrouping: 'repo',
     showProjectBadges: true,
     showSubagents: false,
     ignoreCodexSubagents: true,
@@ -964,6 +976,7 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
     sidebar: {
       ...mergeDefined(defaultLocalSettings.sidebar, patch?.sidebar),
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
+      worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
@@ -997,6 +1010,9 @@ export function mergeLocalSettings(base: LocalSettingsPatch | undefined, patch: 
   )
   if (hasOwn(sidebar, 'sortMode')) {
     sidebar.sortMode = normalizeLocalSortMode(sidebar.sortMode)
+  }
+  if (hasOwn(sidebar, 'worktreeGrouping')) {
+    sidebar.worktreeGrouping = normalizeWorktreeGrouping(sidebar.worktreeGrouping)
   }
   if (Object.keys(sidebar).length > 0) {
     next.sidebar = sidebar as LocalSettingsPatch['sidebar']

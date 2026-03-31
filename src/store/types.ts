@@ -18,6 +18,7 @@ import type {
   TerminalRendererMode,
   TerminalTheme,
   TabAttentionStyle,
+  WorktreeGrouping,
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
@@ -49,7 +50,6 @@ export interface Tab {
   createRequestId: string
   title: string
   description?: string
-  terminalId?: string          // For shell mode
   codingCliSessionId?: string  // For coding CLI session view
   codingCliProvider?: CodingCliProviderName
   claudeSessionId?: string     // Legacy field (migrated to codingCliSessionId)
@@ -60,6 +60,7 @@ export interface Tab {
   resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
+  updatedAt?: number
   titleSetByUser?: boolean     // If true, don't auto-update title
   lastInputAt?: number
 }
@@ -81,6 +82,7 @@ export interface CodingCliSession {
   sessionType?: string
   sessionId: string
   projectPath: string
+  checkoutPath?: string
   createdAt?: number
   lastActivityAt: number
   messageCount?: number
@@ -134,6 +136,7 @@ export type {
   TabAttentionStyle,
   TerminalRendererMode,
   TerminalTheme,
+  WorktreeGrouping,
 }
 
 export type AppSettings = ResolvedSettings

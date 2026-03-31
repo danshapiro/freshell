@@ -9,6 +9,7 @@ import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
+import { resolveGitCheckoutRoot } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -530,10 +531,14 @@ export class CodingCliSessionIndexer {
           ? (meta.lastActivityAt ?? previous?.lastActivityAt ?? createdAt ?? 0)
           : (meta.lastActivityAt ?? createdAt ?? 0))
 
+    const checkoutRoot = meta.cwd ? await resolveGitCheckoutRoot(meta.cwd) : undefined
+    const checkoutPath = checkoutRoot && checkoutRoot !== projectPath ? checkoutRoot : undefined
+
     const baseSession: CodingCliSession = {
       provider: provider.name,
       sessionId,
       projectPath,
+      ...(checkoutPath ? { checkoutPath } : {}),
       lastActivityAt,
       createdAt,
       messageCount: meta.messageCount,

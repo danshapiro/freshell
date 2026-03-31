@@ -237,22 +237,14 @@ export function ContextMenuProvider({
     dispatch(requestTabRefresh({ tabId }))
   }, [dispatch])
 
-  const clearStaleTabTerminalId = useCallback((tabId: string, detachedTerminalId: string) => {
-    const tab = tabsState.tabs.find((t) => t.id === tabId)
-    if (tab?.terminalId === detachedTerminalId) {
-      dispatch(updateTab({ id: tabId, updates: { terminalId: undefined } }))
-    }
-  }, [dispatch, tabsState.tabs])
-
   const replacePaneAction = useCallback((tabId: string, paneId: string) => {
     if (!panes[tabId]) return
     const content = findPaneContent(panes[tabId], paneId)
     if (content?.kind === 'terminal' && content.terminalId) {
       ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
-      clearStaleTabTerminalId(tabId, content.terminalId)
     }
     dispatch(replacePane({ tabId, paneId }))
-  }, [dispatch, panes, ws, clearStaleTabTerminalId])
+  }, [dispatch, panes, ws])
 
   const closeTabById = useCallback((tabId: string) => {
     const layout = panes[tabId]
@@ -414,7 +406,6 @@ export function ContextMenuProvider({
         sessionType,
         sessionId: session.sessionId,
         cwd: session.cwd,
-        terminalId: runningTerminalId || undefined,
         agentChatProviderSettings: providerSettings,
       }),
     }))
@@ -619,14 +610,29 @@ export function ContextMenuProvider({
     await copyText(projectPath)
   }, [])
 
+  const findTabByTerminalId = useCallback((terminalId: string) => {
+    for (const tab of tabsState.tabs) {
+      const layout = panes[tab.id]
+      if (layout && collectTerminalIds(layout).includes(terminalId)) {
+        return tab
+      }
+    }
+    return undefined
+  }, [tabsState.tabs, panes])
+
   const openTerminal = useCallback((terminalId: string) => {
-    const existing = tabsState.tabs.find((t) => t.terminalId === terminalId)
+    const existing = findTabByTerminalId(terminalId)
     if (existing) {
       dispatch(setActiveTab(existing.id))
       return
     }
-    dispatch(addTab({ terminalId, status: 'running', mode: 'shell' }))
-  }, [dispatch, tabsState.tabs])
+    const tabId = nanoid()
+    dispatch(addTab({ id: tabId, status: 'running', mode: 'shell' }))
+    dispatch(initLayout({
+      tabId,
+      content: { kind: 'terminal', mode: 'shell', terminalId, status: 'running' },
+    }))
+  }, [dispatch, findTabByTerminalId])
 
   const renameTerminal = useCallback(async (terminalId: string) => {
     let currentTitle = ''
@@ -650,14 +656,14 @@ export function ContextMenuProvider({
         titleOverride: title || undefined,
         descriptionOverride: description || undefined,
       })
-      const existing = tabsState.tabs.find((t) => t.terminalId === terminalId)
+      const existing = findTabByTerminalId(terminalId)
       if (existing && title) {
         dispatch(updateTab({ id: existing.id, updates: { title } }))
       }
     } catch {
       // ignore
     }
-  }, [dispatch, tabsState.tabs])
+  }, [dispatch, findTabByTerminalId])
 
   const generateTerminalSummary = useCallback(async (terminalId: string) => {
     try {
@@ -948,7 +954,6 @@ export function ContextMenuProvider({
           const content = panes[tabId] ? findPaneContent(panes[tabId], paneId) : null
           if (content?.kind === 'terminal' && content.terminalId) {
             ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
-            clearStaleTabTerminalId(tabId, content.terminalId)
           }
           dispatch(closePaneWithCleanup({ tabId, paneId }))
         },
@@ -1019,7 +1024,6 @@ export function ContextMenuProvider({
     renamePane,
     refreshPaneAction,
     replacePaneAction,
-    clearStaleTabTerminalId,
     ws,
     dispatch,
     openSessionInNewTab,

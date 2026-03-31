@@ -1,4 +1,4 @@
-import { memo, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getToolPreview } from './tool-preview'
@@ -23,6 +23,7 @@ interface ToolStripProps {
 
 function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
   const [stripExpanded, setStripExpanded] = useState(showTools)
+  useEffect(() => { setStripExpanded(showTools) }, [showTools])
 
   const handleToggle = () => {
     setStripExpanded(!stripExpanded)
