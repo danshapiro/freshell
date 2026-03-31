@@ -1428,6 +1428,7 @@ export class WsHandler {
           m.rows,
           m.sinceSeq,
           m.attachRequestId,
+          m.maxReplayBytes,
         )
         if (attachResult === 'missing') {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })

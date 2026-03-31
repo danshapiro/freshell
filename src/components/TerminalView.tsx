@@ -8,6 +8,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type TouchEvent as ReactTouchEvent,
 } from 'react'
+import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
@@ -70,6 +71,7 @@ import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneContent } from '@/store/paneTypes'
 import '@xterm/xterm/css/xterm.css'
+import { getHydrationQueue } from '@/lib/hydration-queue'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('TerminalView')
@@ -92,6 +94,7 @@ const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
+const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
@@ -210,6 +213,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+  const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
@@ -227,6 +231,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const suppressNetworkEffects = typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
+  const [truncatedHistoryGap, setTruncatedHistoryGap] = useState<{ fromSeq: number; toSeq: number } | null>(null)
+  const [backgroundHydrationTriggered, setBackgroundHydrationTriggered] = useState(false)
   const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
@@ -251,6 +257,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   })
   const mountedRef = useRef(false)
   const hiddenRef = useRef(hidden)
+  const hydrationRegisteredRef = useRef(false)
   const lastSessionActivityAtRef = useRef(0)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
@@ -1362,6 +1369,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return () => disposable.dispose()
   }, [isTerminal, dispatch, tabId])
 
+  const tabOrderRef = useRef(tabOrder)
+  tabOrderRef.current = tabOrder
   const markAttachComplete = useCallback(() => {
     wasCreatedFreshRef.current = false
     deferredAttachStateRef.current = {
@@ -1369,7 +1378,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       pendingIntent: null,
       pendingSinceSeq: 0,
     }
-  }, [])
+    const queue = getHydrationQueue()
+    if (hiddenRef.current) {
+      queue.onHydrationComplete(paneId)
+    } else {
+      queue.onActiveTabReady(tabId, tabOrderRef.current)
+    }
+  }, [paneId, tabId])
 
   const isCurrentAttachMessage = useCallback((msg: {
     type: string
@@ -1395,7 +1410,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean; skipPreAttachFit?: boolean },
+    opts?: {
+      clearViewportFirst?: boolean
+      suppressNextMatchingResize?: boolean
+      skipPreAttachFit?: boolean
+      maxReplayBytes?: number
+    },
   ) => {
     if (suppressNetworkEffects) return
     const term = termRef.current
@@ -1411,6 +1431,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
     setIsAttaching(true)
+    setTruncatedHistoryGap(null)
 
     const persistedSeq = loadTerminalCursor(tid)
     const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
@@ -1456,6 +1477,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       rows,
       sinceSeq,
       attachRequestId,
+      ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
@@ -1483,7 +1505,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       setIsAttaching(false)
     } else {
-      attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+      attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true, maxReplayBytes: TRUNCATED_REPLAY_BYTES })
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
@@ -1521,16 +1543,32 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       const tid = terminalIdRef.current
       const deferred = deferredAttachStateRef.current
       if (tid && deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
+        // Unregister from background queue — this tab is now being directly hydrated
+        if (hydrationRegisteredRef.current) {
+          getHydrationQueue().unregister(paneId)
+          hydrationRegisteredRef.current = false
+        }
+        getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
         attachTerminal(tid, deferred.pendingIntent, {
           clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
+          ...(deferred.pendingIntent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : {}),
         })
         return
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
   }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
+
+  // Background hydration: triggered by the hydration queue for hidden tabs
+  useEffect(() => {
+    if (!backgroundHydrationTriggered) return
+    setBackgroundHydrationTriggered(false)
+    const tid = terminalIdRef.current
+    if (!tid || !hiddenRef.current) return
+    attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+  }, [backgroundHydrationTriggered, attachTerminal])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1705,13 +1743,21 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          const reason = msg.reason === 'replay_window_exceeded'
-            ? 'reconnect window exceeded'
-            : 'slow link backlog'
-          try {
-            term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
-          } catch {
-            // disposed
+          // Only show "load more" when the server confirms the gap is from
+          // byte-budget truncation (recoverable), not ring overflow (data gone).
+          const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
+            && seqStateRef.current.pendingReplay
+          if (isTruncatedReplay) {
+            setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          } else {
+            const reason = msg.reason === 'replay_window_exceeded'
+              ? 'reconnect window exceeded'
+              : 'slow link backlog'
+            try {
+              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
+            } catch {
+              // disposed
+            }
           }
           const previousSeqState = seqStateRef.current
           const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
@@ -1995,11 +2041,22 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
             : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
           setIsAttaching(false)
+
+          // Register with hydration queue for progressive background hydration
+          if (!hydrationRegisteredRef.current && deferredAttachStateRef.current.pendingIntent === 'viewport_hydrate') {
+            hydrationRegisteredRef.current = true
+            const setBgTriggered = setBackgroundHydrationTriggered
+            getHydrationQueue().register({
+              tabId,
+              paneId: paneIdRef.current,
+              trigger: () => setBgTriggered(true),
+            })
+          }
         } else {
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
             ? 'keepalive_delta'
             : 'viewport_hydrate'
-          attachTerminal(currentTerminalId, intent)
+          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate' ? { maxReplayBytes: TRUNCATED_REPLAY_BYTES } : undefined)
         }
       } else {
         deferredAttachStateRef.current = {
@@ -2017,6 +2074,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       clearRateLimitRetry()
       unsub()
       unsubReconnect()
+      if (hydrationRegisteredRef.current) {
+        getHydrationQueue().unregister(paneIdRef.current)
+        hydrationRegisteredRef.current = false
+      }
     }
   // Dependencies explanation:
   // - isTerminal: skip effect for non-terminal panes
@@ -2068,6 +2129,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       height: `calc(100% - ${mobileBottomInsetPx}px)`,
     }
   }, [isMobile, mobileBottomInsetPx])
+
+  const handleLoadMoreHistory = useCallback(() => {
+    const tid = terminalIdRef.current
+    if (!tid) return
+    setTruncatedHistoryGap(null)
+    attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+  }, [attachTerminal])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
@@ -2148,6 +2216,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           <span className="rounded bg-background/90 px-2 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60">
             {inlineStatusMessage}
           </span>
+        </div>
+      )}
+      {truncatedHistoryGap && (
+        <div className="absolute inset-x-0 top-0 z-10 flex justify-center">
+          <button
+            type="button"
+            className="rounded-b bg-muted/90 px-3 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60 hover:bg-muted hover:text-foreground transition-colors"
+            onClick={handleLoadMoreHistory}
+            aria-label="Load earlier terminal history"
+          >
+            Load more history
+          </button>
         </div>
       )}
       <ConnectionErrorOverlay />
