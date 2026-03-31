@@ -35,4 +35,5 @@ artifacts/perf/
 
 # Runtime / agent artifacts
 .superpowers/
+.opencode/
 sdk.session.snapshot

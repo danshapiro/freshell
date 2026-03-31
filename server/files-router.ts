@@ -83,6 +83,33 @@ export function createFilesRouter(deps: FilesRouterDeps): Router {
     }
   })
 
+  router.get('/stat', validatePath, async (req, res) => {
+    const filePath = req.query.path as string
+    if (!filePath) {
+      return res.status(400).json({ error: 'path query parameter required' })
+    }
+
+    const resolved = await resolveUserFilesystemPath(filePath)
+
+    try {
+      const stat = await fsp.stat(resolved)
+      if (stat.isDirectory()) {
+        return res.json({ exists: false, size: null, modifiedAt: null })
+      }
+
+      res.json({
+        exists: true,
+        size: stat.size,
+        modifiedAt: stat.mtime.toISOString(),
+      })
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return res.json({ exists: false, size: null, modifiedAt: null })
+      }
+      return res.status(500).json({ error: err.message })
+    }
+  })
+
   router.post('/write', validatePath, async (req, res) => {
     const { path: filePath, content } = req.body
 

@@ -529,6 +529,7 @@ describe('sidebarSelectors', () => {
     })
   })
 
+
   describe('makeSelectSortedSessionItems', () => {
     it('uses the applied title query to keep only matching fallback rows and rejects ancestor-only matches', () => {
       const matchingFallback = createFallbackTab('tab-match', 'fallback-match', 'Matching Fallback', '/tmp/local/trycycle')
