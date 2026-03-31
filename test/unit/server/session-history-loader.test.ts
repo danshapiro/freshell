@@ -92,6 +92,24 @@ describe('extractChatMessagesFromJsonl', () => {
     expect(messages).toHaveLength(2)
   })
 
+  it('coalesces tool messages even when malformed lines are interspersed', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      'not valid json',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"output"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      'also malformed',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].content).toHaveLength(3)
+    expect(messages[0].content[0]).toEqual({ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } })
+    expect(messages[0].content[1]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: 'output' })
+    expect(messages[0].content[2]).toEqual({ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } })
+  })
+
   it('returns empty array for empty content', () => {
     expect(extractChatMessagesFromJsonl('')).toEqual([])
     expect(extractChatMessagesFromJsonl('\n\n')).toEqual([])

@@ -205,3 +205,37 @@ async def _run(args: argparse.Namespace) -> int:
   return 1
 
 
+def main(argv: list[str]) -> int:
+  p = argparse.ArgumentParser(description="browser_use test for tool strip coalescing in Freshell.")
+  p.add_argument("--base-url", default=None, help="Base URL (default: http://localhost:$VITE_PORT)")
+  p.add_argument("--token", default=None, help="Auth token (default: AUTH_TOKEN env or .env)")
+  p.add_argument("--model", default=None, help="Browser Use model (default: $BROWSER_USE_MODEL or bu-latest)")
+  p.add_argument("--headless", action="store_true", help="Run browser headless (default: headful)")
+  p.add_argument("--width", type=int, default=1024, help="Browser viewport width")
+  p.add_argument("--height", type=int, default=768, help="Browser viewport height")
+  p.add_argument("--max-steps", type=int, default=60, help="Max agent steps")
+  p.add_argument("--preflight", action="store_true", help="Fail fast if /api/health is unreachable")
+  p.add_argument("--debug", action="store_true", help="Enable debug logging")
+  p.add_argument(
+    "--no-require-api-key",
+    dest="require_api_key",
+    action="store_false",
+    help="Do not fail fast if BROWSER_USE_API_KEY is missing (may still fail later).",
+  )
+  p.set_defaults(require_api_key=True)
+  args = p.parse_args(argv)
+  try:
+    return asyncio.run(_run(args))
+  except KeyboardInterrupt:
+    return 130
+  except Exception:
+    import traceback
+    sys.stderr.write(traceback.format_exc())
+    sys.stderr.flush()
+    return 1
+
+
+if __name__ == "__main__":
+  raise SystemExit(main(sys.argv[1:]))
+
+
