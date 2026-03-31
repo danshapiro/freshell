@@ -54,7 +54,7 @@ export default function WorkspaceSettings({
             className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
           >
             <option value="recency">Recency</option>
-            <option value="recency-pinned">Recency (pinned)</option>
+            <option value="recency-pinned">Recency (tabs first)</option>
             <option value="activity">Activity (tabs first)</option>
             <option value="project">Project</option>
           </select>

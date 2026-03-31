@@ -39,7 +39,11 @@ const selectProjects = (state: RootState) => state.sessions.windows?.sidebar?.pr
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectPanes = (state: RootState) => state.panes
 const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'activity'
-const selectSessionActivityForSort = (_state: RootState) => EMPTY_ACTIVITY
+const selectSessionActivityForSort = (state: RootState) => {
+  const sortMode = state.settings.settings.sidebar?.sortMode || 'activity'
+  if (sortMode !== 'activity') return EMPTY_ACTIVITY
+  return state.sessionActivity?.sessions || EMPTY_ACTIVITY
+}
 const selectWorktreeGrouping = (state: RootState): WorktreeGrouping => state.settings.settings.sidebar?.worktreeGrouping || 'repo'
 const selectShowSubagents = (state: RootState) => state.settings.settings.sidebar?.showSubagents ?? false
 const selectIgnoreCodexSubagents = (state: RootState) => state.settings.settings.sidebar?.ignoreCodexSubagents ?? true
@@ -336,7 +340,14 @@ export function sortSessionItems(
   const archived = sorted.filter((i) => i.archived)
 
   const compareByRecency = (a: SidebarSessionItem, b: SidebarSessionItem) => b.timestamp - a.timestamp
-  const compareByActivity = compareByRecency
+  const compareByActivity = (a: SidebarSessionItem, b: SidebarSessionItem) => {
+    const aHasRatcheted = typeof a.ratchetedActivity === 'number'
+    const bHasRatcheted = typeof b.ratchetedActivity === 'number'
+    if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
+    const aTime = a.ratchetedActivity ?? a.timestamp
+    const bTime = b.ratchetedActivity ?? b.timestamp
+    return bTime - aTime
+  }
 
   const sortByMode = (list: SidebarSessionItem[]) => {
     const copy = [...list]
@@ -367,8 +378,20 @@ export function sortSessionItems(
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
-      withTabs.sort(compareByActivity)
-      withoutTabs.sort(compareByActivity)
+      withTabs.sort((a, b) => {
+        const aTime = a.ratchetedActivity ?? a.timestamp
+        const bTime = b.ratchetedActivity ?? b.timestamp
+        return bTime - aTime
+      })
+
+      withoutTabs.sort((a, b) => {
+        const aHasRatcheted = typeof a.ratchetedActivity === 'number'
+        const bHasRatcheted = typeof b.ratchetedActivity === 'number'
+        if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
+        const aTime = a.ratchetedActivity ?? a.timestamp
+        const bTime = b.ratchetedActivity ?? b.timestamp
+        return bTime - aTime
+      })
 
       return [...withTabs, ...withoutTabs]
     }

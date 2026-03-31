@@ -197,44 +197,43 @@ describe('sidebar staleness', () => {
     })
   })
 
-  describe('activity sort does not let stale ratchetedActivity trump recent server timestamps', () => {
-    it('sorts by most recent of ratchetedActivity or server timestamp', async () => {
+  describe('activity sort uses ratchetedActivity when present', () => {
+    it('sorts items with ratchetedActivity above those without', async () => {
       const { sortSessionItems } = await import('@/store/selectors/sidebarSelectors')
 
-      const staleWithActivity = {
-        id: 'stale',
-        sessionId: 'stale',
+      const recentlyActive = {
+        id: 'active',
+        sessionId: 'active',
         provider: 'claude',
         sessionType: 'claude',
-        title: 'Stale session with old activity',
+        title: 'Session with recent client activity',
         hasTitle: true,
-        timestamp: 1_000,  // old server timestamp
+        timestamp: 1_000,
         hasTab: false,
         isRunning: false,
-        ratchetedActivity: 2_000,  // slightly newer but still old
+        ratchetedActivity: 5_000,
       }
 
-      const freshNoActivity = {
-        id: 'fresh',
-        sessionId: 'fresh',
+      const recentServer = {
+        id: 'server-recent',
+        sessionId: 'server-recent',
         provider: 'claude',
         sessionType: 'claude',
-        title: 'Fresh session without activity tracking',
+        title: 'Session with recent server timestamp only',
         hasTitle: true,
-        timestamp: 9_000,  // recent server timestamp
+        timestamp: 9_000,
         hasTab: false,
         isRunning: false,
-        // no ratchetedActivity
       }
 
       const sorted = sortSessionItems(
-        [staleWithActivity, freshNoActivity],
+        [recentServer, recentlyActive],
         'activity',
       )
 
-      // Fresh session (timestamp 9000) should sort before stale session (activity 2000)
-      expect(sorted[0].id).toBe('fresh')
-      expect(sorted[1].id).toBe('stale')
+      // Item with ratchetedActivity sorts above item without, regardless of server timestamp
+      expect(sorted[0].id).toBe('active')
+      expect(sorted[1].id).toBe('server-recent')
     })
   })
 })
