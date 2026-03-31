@@ -513,12 +513,12 @@ git commit -m "fix: address test/typecheck/lint issues from tool coalescing"
 ## Task 5: Browser-Use Visual Verification
 
 **Files:**
-- Create: `test/browser-use/tool-coalesce.md` (test instructions, not code)
+- Create: `test/browser_use/tool-coalesce.md` (test instructions, not code)
 
 **Prerequisites:**
 - `browser-use` CLI installed: `uvx "browser-use[cli]" --help` (or `pip install "browser-use[cli]"`)
 - Chromium installed: `browser-use install`
-- API key for LLM extraction: `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variable
+- API key: `BROWSER_USE_API_KEY` environment variable (for Browser Use's hosted LLM gateway)
 
 - [ ] **Step 1: Ensure browser-use is available**
 
@@ -614,7 +614,7 @@ kill "$(cat /tmp/freshell-3355.pid)" && rm -f /tmp/freshell-3355.pid
 
 - [ ] **Step 10: Create test documentation file**
 
-Create `test/browser-use/tool-coalesce.md` documenting the test procedure:
+Create `test/browser_use/tool-coalesce.md` documenting the test procedure:
 
 ```markdown
 # Tool Coalescing Browser-Use Test
@@ -625,7 +625,7 @@ Verify that consecutive tool uses in an assistant turn are grouped into a single
 ## Prerequisites
 - browser-use CLI installed
 - Chromium installed (`browser-use install`)
-- API key for LLM extraction (OPENAI_API_KEY or ANTHROPIC_API_KEY)
+- API key: `BROWSER_USE_API_KEY` environment variable
 
 ## Test Steps
 
@@ -647,8 +647,7 @@ Fail if multiple strips each showing "1 tool used" for tools in same turn.
 ```
 
 ```bash
-mkdir -p test/browser-use
-git add test/browser-use/tool-coalesce.md
+git add test/browser_use/tool-coalesce.md
 git commit -m "test(browser-use): add tool coalescing visual verification procedure"
 ```
 
@@ -683,7 +682,7 @@ Files changed:
 - `server/session-history-loader.ts` - Coalescing in `extractChatMessagesFromJsonl`
 - `test/unit/client/agentChatSlice.test.ts` - Unit tests for Redux coalescing
 - `test/unit/server/session-history-loader.test.ts` - Unit tests for loader coalescing
-- `test/browser-use/tool-coalesce.md` - Browser-use test procedure
+- `test/browser_use/tool-coalesce.md` - Browser-use test procedure
 
 ---
 
