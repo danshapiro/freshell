@@ -934,45 +934,71 @@ describe('claude provider cross-platform tests', () => {
 })
 
 describe('parseSessionContent() - non-interactive detection', () => {
-  it('sets isNonInteractive when content contains a queue-operation event', () => {
+  it('marks session with single user message as non-interactive', () => {
     const content = [
-      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
       JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Do something' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }),
     ].join('\n')
 
     const meta = parseSessionContent(content)
     expect(meta.isNonInteractive).toBe(true)
   })
 
-  it('does not set isNonInteractive for normal interactive sessions', () => {
-    const content = [
-      JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
-      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Hello' } }),
-      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] } }),
-    ].join('\n')
-
-    const meta = parseSessionContent(content)
-    expect(meta.isNonInteractive).toBeFalsy()
-  })
-
-  it('does not set isNonInteractive for sessions with only file-history-snapshot events', () => {
+  it('marks session with zero user messages as non-interactive', () => {
     const content = [
       JSON.stringify({ type: 'file-history-snapshot', messageId: 'a', snapshot: {} }),
       JSON.stringify({ type: 'file-history-snapshot', messageId: 'b', snapshot: {} }),
     ].join('\n')
 
     const meta = parseSessionContent(content)
-    expect(meta.isNonInteractive).toBeFalsy()
+    expect(meta.isNonInteractive).toBe(true)
   })
 
-  it('sets isNonInteractive even when queue-operation is not the first line', () => {
+  it('treats session with multiple user messages as interactive', () => {
     const content = [
-      JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
-      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-2' }),
-      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Run tests' } }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Hello' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Now do this' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Sure' }] } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeUndefined()
+  })
+
+  it('does not count system-context user messages toward interaction count', () => {
+    const content = [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '<environment_context>system info</environment_context>' } }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Run the task' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }),
     ].join('\n')
 
     const meta = parseSessionContent(content)
     expect(meta.isNonInteractive).toBe(true)
+  })
+
+  it('treats session as interactive when real user messages follow system context', () => {
+    const content = [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: '<environment_context>system info</environment_context>' } }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Initial task' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Working on it' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Follow-up question' } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeUndefined()
+  })
+
+  it('ignores queue-operation events for non-interactive classification', () => {
+    const content = [
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'First message' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Response' }] } }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-2' }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Second message' } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeUndefined()
   })
 })

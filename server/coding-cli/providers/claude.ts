@@ -331,7 +331,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
   let model: string | undefined
-  let isNonInteractive: boolean | undefined
+  let userMessageCount = 0
   const usageSeen = new Set<string>()
   let latestUsage:
     | {
@@ -356,8 +356,6 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       lastActivityAt = clock.lastActivityAt
     }
 
-    if (obj.type === 'queue-operation') isNonInteractive = true
-
     if (!sessionId) {
       const candidates = [
         obj?.sessionId,
@@ -376,6 +374,9 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       if (typeof modelCandidate === 'string') model = modelCandidate
     }
     const userMessageText = extractUserMessageText(obj)
+    if (userMessageText !== undefined && !isSystemContext(userMessageText)) {
+      userMessageCount++
+    }
 
     const candidates = [
       obj?.cwd,
@@ -460,6 +461,11 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       }
     }
   }
+
+  // A session with at most one real user message (excluding injected system context)
+  // is non-interactive: either a headless dispatch (claude -p) or an abandoned session.
+  // 2+ user messages means a human engaged in conversation.
+  const isNonInteractive = userMessageCount <= 1 ? true : undefined
 
   if (!sessionId && options.fallbackSessionId && isValidClaudeSessionId(options.fallbackSessionId)) {
     sessionId = options.fallbackSessionId
