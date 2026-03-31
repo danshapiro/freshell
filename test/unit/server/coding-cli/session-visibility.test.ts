@@ -50,14 +50,14 @@ describe('session visibility flags', () => {
   })
 
   describe('Claude isNonInteractive detection', () => {
-    it('sets isNonInteractive when queue-operation events are present', () => {
+    it('does not classify Claude sessions as non-interactive based on queue-operation events', () => {
       const content = [
         JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
         JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Automated task' } }),
       ].join('\n')
 
       const meta = parseSessionContent(content)
-      expect(meta.isNonInteractive).toBe(true)
+      expect(meta.isNonInteractive).toBeUndefined()
     })
 
     it('does not set isNonInteractive for normal Claude sessions', () => {
@@ -67,7 +67,7 @@ describe('session visibility flags', () => {
       ].join('\n')
 
       const meta = parseSessionContent(content)
-      expect(meta.isNonInteractive).toBeFalsy()
+      expect(meta.isNonInteractive).toBeUndefined()
     })
   })
 })
