@@ -149,17 +149,36 @@ function commitWindowPayload(
   window.partialReason = payload.partialReason
 }
 
-function syncActiveWindowFromTopLevel(state: SessionsState) {
-  if (!state.activeSurface) return
-  const window = ensureWindow(state, state.activeSurface)
+function syncWindowProjectsFromTopLevel(window: SessionWindowState, state: SessionsState) {
   window.projects = state.projects
   window.lastLoadedAt = state.lastLoadedAt
   window.totalSessions = state.totalSessions
   window.oldestLoadedTimestamp = state.oldestLoadedTimestamp
   window.oldestLoadedSessionId = state.oldestLoadedSessionId
   window.hasMore = state.hasMore
+}
+
+function syncActiveWindowFromTopLevel(state: SessionsState) {
+  if (!state.activeSurface) return
+  const window = ensureWindow(state, state.activeSurface)
+  syncWindowProjectsFromTopLevel(window, state)
   window.loading = state.loadingMore
   window.loadingKind = state.loadingKind
+}
+
+function syncAllWindowsFromTopLevel(state: SessionsState) {
+  if (!state.windows) return
+  for (const [surface, window] of Object.entries(state.windows)) {
+    if (!window) continue
+    // Skip windows with active search queries — their results are query-specific
+    if (window.appliedQuery) continue
+    syncWindowProjectsFromTopLevel(window, state)
+    // Only sync loading state to the active surface
+    if (surface === state.activeSurface) {
+      window.loading = state.loadingMore
+      window.loadingKind = state.loadingKind
+    }
+  }
 }
 
 export const sessionsSlice = createSlice({
@@ -279,7 +298,7 @@ export const sessionsSlice = createSlice({
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
-      syncActiveWindowFromTopLevel(state)
+      syncAllWindowsFromTopLevel(state)
     },
     clearProjects: (state) => {
       state.projects = []
@@ -309,7 +328,7 @@ export const sessionsSlice = createSlice({
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
-      syncActiveWindowFromTopLevel(state)
+      syncAllWindowsFromTopLevel(state)
     },
     applySessionsPatch: (
       state,
@@ -329,7 +348,7 @@ export const sessionsSlice = createSlice({
 
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
-      syncActiveWindowFromTopLevel(state)
+      syncAllWindowsFromTopLevel(state)
     },
     clearPaginationMeta: (state) => {
       state.totalSessions = undefined

@@ -110,7 +110,7 @@ describe('SettingsView behavior sections', () => {
         return select.querySelector('option[value="recency-pinned"]') !== null
       })
 
-      expect(sortModeSelect.querySelector('option[value="recency-pinned"]')?.textContent).toBe('Recency (pinned)')
+      expect(sortModeSelect.querySelector('option[value="recency-pinned"]')?.textContent).toBe('Recency (tabs first)')
       fireEvent.change(sortModeSelect, { target: { value: 'recency-pinned' } })
 
       expect(store.getState().settings.settings.sidebar.sortMode).toBe('recency-pinned')

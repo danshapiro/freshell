@@ -4,8 +4,11 @@ import {
   type SearchOptions,
   type SearchResult,
 } from '@/lib/api'
+import { createLogger } from '@/lib/client-logger'
 import type { AppDispatch, RootState } from './store'
 import type { ProjectGroup } from './types'
+
+const log = createLogger('SessionsThunks')
 import {
   commitSessionWindowReplacement,
   commitSessionWindowVisibleRefresh,
@@ -340,7 +343,10 @@ async function refreshVisibleSessionWindowSilently(args: {
     query?: string
     searchTier?: SearchOptions['tier']
   }) => {
-    if (!canCommit()) return false
+    if (!canCommit()) {
+      log.debug('Discarded refresh result for', surface, '— identity mismatch or generation changed')
+      return false
+    }
     dispatch(commitSessionWindowVisibleRefresh({
       ...payload,
       preserveLoading: preserveLoadingState,
@@ -417,12 +423,19 @@ async function refreshVisibleSessionWindowSilently(args: {
       query: identity.query,
       searchTier: identity.searchTier,
     })
-  } catch {
-    if (!preserveLoadingState && canCommit()) {
-      dispatch(setSessionWindowLoading({
-        surface,
-        loading: false,
-      }))
+  } catch (error) {
+    log.warn('Background refresh failed for', surface, error instanceof Error ? error.message : error)
+    if (canCommit()) {
+      if (!preserveLoadingState) {
+        dispatch(setSessionWindowError({
+          surface,
+          error: error instanceof Error ? error.message : 'Background refresh failed',
+        }))
+        dispatch(setSessionWindowLoading({
+          surface,
+          loading: false,
+        }))
+      }
     }
   }
 }
