@@ -934,7 +934,7 @@ describe('claude provider cross-platform tests', () => {
 })
 
 describe('parseSessionContent() - non-interactive detection', () => {
-  it('sets isNonInteractive when content contains a queue-operation event', () => {
+  it('marks session with queue-operation and single user message as non-interactive', () => {
     const content = [
       JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
       JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Do something' } }),
@@ -965,7 +965,7 @@ describe('parseSessionContent() - non-interactive detection', () => {
     expect(meta.isNonInteractive).toBeFalsy()
   })
 
-  it('sets isNonInteractive even when queue-operation is not the first line', () => {
+  it('marks session as non-interactive when queue-operation is not the first line', () => {
     const content = [
       JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
       JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-2' }),
@@ -974,5 +974,46 @@ describe('parseSessionContent() - non-interactive detection', () => {
 
     const meta = parseSessionContent(content)
     expect(meta.isNonInteractive).toBe(true)
+  })
+
+  it('treats session as interactive when queue-operation exists but user continued interacting', () => {
+    const content = [
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Initial dispatched prompt' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Here is what I found' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Now do this other thing' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeFalsy()
+  })
+
+  it('marks session with queue-operation and zero user messages as non-interactive', () => {
+    const content = [
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-1' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Automated response' }] } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBe(true)
+  })
+
+  it('treats session as interactive with many user messages despite multiple queue-operations', () => {
+    const lines = [
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-1' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'First prompt' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Response 1' }] } }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-2' }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-2' }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Second prompt' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Response 2' }] } }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Third prompt from human' } }),
+    ]
+
+    const meta = parseSessionContent(lines.join('\n'))
+    expect(meta.isNonInteractive).toBeFalsy()
   })
 })

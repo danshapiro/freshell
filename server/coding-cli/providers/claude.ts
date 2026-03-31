@@ -331,7 +331,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
   let model: string | undefined
-  let isNonInteractive: boolean | undefined
+  let hasQueueOperation = false
+  let userMessageCount = 0
   const usageSeen = new Set<string>()
   let latestUsage:
     | {
@@ -356,7 +357,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       lastActivityAt = clock.lastActivityAt
     }
 
-    if (obj.type === 'queue-operation') isNonInteractive = true
+    if (obj.type === 'queue-operation') hasQueueOperation = true
 
     if (!sessionId) {
       const candidates = [
@@ -376,6 +377,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       if (typeof modelCandidate === 'string') model = modelCandidate
     }
     const userMessageText = extractUserMessageText(obj)
+    if (userMessageText !== undefined) userMessageCount++
 
     const candidates = [
       obj?.cwd,
@@ -460,6 +462,11 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       }
     }
   }
+
+  // A session is non-interactive only if it was dispatched via queue AND the user
+  // didn't continue interacting. A single user message is the dispatched prompt itself;
+  // 2+ means a human engaged with the session after dispatch.
+  const isNonInteractive = hasQueueOperation && userMessageCount <= 1 ? true : undefined
 
   if (!sessionId && options.fallbackSessionId && isValidClaudeSessionId(options.fallbackSessionId)) {
     sessionId = options.fallbackSessionId
