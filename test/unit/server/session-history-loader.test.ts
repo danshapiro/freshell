@@ -208,3 +208,56 @@ describe('loadSessionHistory', () => {
     expect(messages![0].content[0].text).toBe('Found me')
   })
 })
+
+describe('tool message coalescing', () => {
+  it('coalesces consecutive tool-only assistant messages from JSONL', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1\\nfile2"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].content).toHaveLength(3)
+    expect(messages[0].content[0]).toEqual({ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } })
+    expect(messages[0].content[1]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: 'file1\nfile2' })
+    expect(messages[0].content[2]).toEqual({ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } })
+  })
+
+  it('does not coalesce when assistant message has text content', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(2)
+  })
+
+  it('does not coalesce across user messages', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Thanks"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(3)
+  })
+
+  it('preserves timestamp from first message in coalesced group', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"output"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].timestamp).toBe('2026-01-01T00:00:01Z')
+  })
+})
