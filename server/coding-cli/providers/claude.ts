@@ -326,6 +326,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let createdAt: number | undefined
   let lastActivityAt: number | undefined
   let title: string | undefined
+  let customTitle: string | undefined
+  let agentName: string | undefined
   let summary: string | undefined
   let firstUserMessage: string | undefined
   let gitBranch: string | undefined
@@ -406,6 +408,13 @@ export function parseSessionContent(content: string, options: ParseSessionOption
           title = extractTitleFromMessage(t, 200)
         }
       }
+    }
+
+    if (obj?.type === 'custom-title' && typeof obj?.customTitle === 'string' && obj.customTitle.trim()) {
+      customTitle = obj.customTitle.trim().slice(0, 200)
+    }
+    if (obj?.type === 'agent-name' && typeof obj?.agentName === 'string' && obj.agentName.trim()) {
+      agentName = obj.agentName.trim().slice(0, 200)
     }
 
     if (!firstUserMessage) {
@@ -496,7 +505,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     cwd,
     createdAt,
     lastActivityAt,
-    title,
+    title: customTitle ?? agentName ?? title,
     summary,
     firstUserMessage,
     messageCount: lines.length,
