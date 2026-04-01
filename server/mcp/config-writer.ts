@@ -86,7 +86,7 @@ function resolveDependencyPath(specifier: string): string {
  * When platform is 'windows' and running on WSL, paths are converted to
  * Windows UNC format so Windows-native agent processes can resolve them.
  */
-function buildMcpServerCommandArgs(platform?: 'unix' | 'windows'): string[] {
+export function buildMcpServerCommandArgs(platform?: 'unix' | 'windows'): string[] {
   const repoRoot = findRepoRoot()
   const needsWinPaths = platform === 'windows' && isWslEnvironment()
   const resolveRepoPath = (p: string) => needsWinPaths ? convertToWindowsPath(resolve(repoRoot, p)) : resolve(repoRoot, p)
