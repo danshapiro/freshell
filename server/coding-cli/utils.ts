@@ -308,8 +308,9 @@ async function resolveCommonDirFromGitFile(gitdir: string): Promise<string> {
 export function isSystemContext(text: string): boolean {
   const trimmed = text.trim()
   if (!trimmed) return false
-  // XML-wrapped system context: <system_context>, <environment_context>, <INSTRUCTIONS>, etc.
-  if (/^<[a-zA-Z_][\w_-]*[>\s]/.test(trimmed)) return true
+  // XML-wrapped system context injected by coding CLIs. Uses an allowlist of known system
+  // context tag names to avoid false-positives on user content like <image>, <file>, <analysis>.
+  if (/^<(environment_context|system_context|system|context|INSTRUCTIONS|user_instructions|permissions|collaboration_mode|skills_instructions)[>\s]/i.test(trimmed)) return true
   // Instruction file headers: "# AGENTS.md instructions for...", "# System", "# Instructions"
   if (/^#\s*(AGENTS|Instructions?|System)/i.test(trimmed)) return true
   // Bracketed agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
