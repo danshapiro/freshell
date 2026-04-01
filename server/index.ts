@@ -48,6 +48,7 @@ import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
+import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
@@ -508,33 +509,27 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
-    const nonClaudeProjects = projects.map((project) => ({
-      ...project,
-      sessions: project.sessions.filter((session) => session.provider !== 'claude'),
-    }))
-    for (const session of associationCoordinator.collectNewOrAdvanced(nonClaudeProjects)) {
-      const result = associationCoordinator.associateSingleSession(session)
-      if (!result.associated || !result.terminalId) continue
+    for (const { session, terminalId } of collectAppliedSessionAssociations(associationCoordinator, projects)) {
       log.info({
         event: 'session_bind_applied',
-        terminalId: result.terminalId,
+        terminalId,
         sessionId: session.sessionId,
         provider: session.provider,
       }, 'session_bind_applied')
       try {
         wsHandler.broadcast({
           type: 'terminal.session.associated' as const,
-          terminalId: result.terminalId,
+          terminalId,
           sessionId: session.sessionId,
         })
         const metaUpsert = terminalMetadata.associateSession(
-          result.terminalId,
+          terminalId,
           session.provider,
           session.sessionId,
         )
         if (metaUpsert) associationMetaUpserts.push(metaUpsert)
       } catch (err) {
-        log.warn({ err, terminalId: result.terminalId }, 'Failed to broadcast session association')
+        log.warn({ err, terminalId }, 'Failed to broadcast session association')
       }
     }
 
@@ -577,10 +572,9 @@ async function main() {
     }
   })
 
-  // One-time session association for newly discovered Claude sessions.
-  // When the indexer first discovers a session file, associate it with the oldest
-  // unassociated claude-mode terminal matching the session's cwd. This allows the
-  // terminal to resume the session after server restart.
+  // Fast-path session association for newly discovered Claude sessions.
+  // Most providers now associate from onUpdate, but onNewSession still reduces the
+  // delay before a freshly discovered Claude session binds to a matching terminal.
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
   codingCliIndexer.onNewSession((session) => {
