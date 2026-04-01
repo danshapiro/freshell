@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest'
-import { TerminalRegistry, modeSupportsResume } from '../../server/terminal-registry'
+import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
-import { makeSessionKey, type CodingCliSession } from '../../server/coding-cli/types'
+import { makeSessionKey, type CodingCliSession, type ProjectGroup } from '../../server/coding-cli/types'
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
+import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -698,28 +699,16 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
 
   function associateOnUpdate(
     registry: TerminalRegistry,
-    projects: { projectPath: string; sessions: CodingCliSession[] }[],
+    projects: ProjectGroup[],
     broadcasts: any[],
   ) {
-    for (const project of projects) {
-      for (const session of project.sessions) {
-        if (!modeSupportsResume(session.provider)) continue
-        if (!session.cwd) continue
-        const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
-        if (unassociated.length === 0) continue
-
-        const term = unassociated[0]
-        if (session.lastActivityAt < term.createdAt - ASSOCIATION_MAX_AGE_MS) continue
-
-        const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
-        if (!associated) continue
-
-        broadcasts.push({
-          type: 'terminal.session.associated',
-          terminalId: term.terminalId,
-          sessionId: session.sessionId,
-        })
-      }
+    const coordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+    for (const { session, terminalId } of collectAppliedSessionAssociations(coordinator, projects)) {
+      broadcasts.push({
+        type: 'terminal.session.associated',
+        terminalId,
+        sessionId: session.sessionId,
+      })
     }
   }
 

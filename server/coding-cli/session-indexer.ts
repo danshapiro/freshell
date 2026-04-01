@@ -20,6 +20,8 @@ const LIGHTWEIGHT_HEAD_BYTES = 4096
 const LIGHTWEIGHT_TAIL_BYTES = 16384
 // How many recent sessions to fully enrich on startup for accurate isNonInteractive filtering.
 const ENRICHMENT_BATCH_SIZE = 150
+// Cap concurrent file reads to avoid EMFILE on systems with low fd limits (Windows default: 512, macOS: 256).
+const LIGHTWEIGHT_SCAN_CONCURRENCY = 50
 // Artificial per-file delay (ms) for testing event-loop behavior at scale.
 const INDEXER_DELAY_MS = Number(process.env.FRESHELL_INDEXER_DELAY_MS || 0)
 const SEEN_SESSION_RETENTION_MS = Number(process.env.CODING_CLI_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
@@ -870,10 +872,15 @@ export class CodingCliSessionIndexer {
       return { filesByProvider, seenCacheKeys }
     }
 
-    // Read head+tail of every file in parallel.
-    const metas = await Promise.all(allFiles.map(({ provider, filePath }) =>
-      readLightweightMeta(filePath).then((meta) => ({ provider, meta })),
-    ))
+    // Read head+tail of every file with bounded concurrency to avoid EMFILE.
+    const metas: Array<{ provider: CodingCliProvider; meta: LightweightFileMeta }> = []
+    for (let i = 0; i < allFiles.length; i += LIGHTWEIGHT_SCAN_CONCURRENCY) {
+      const batch = allFiles.slice(i, i + LIGHTWEIGHT_SCAN_CONCURRENCY)
+      const results = await Promise.all(batch.map(({ provider, filePath }) =>
+        readLightweightMeta(filePath).then((meta) => ({ provider, meta })),
+      ))
+      metas.push(...results)
+    }
 
     // Build lightweight cache entries.
     for (const { provider, meta } of metas) {

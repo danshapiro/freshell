@@ -1207,6 +1207,22 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     })
 
+    // When the clipboard contains an image but no text, the browser paste event
+    // fires but xterm has nothing to write. CLI tools like Codex listen for the
+    // raw Ctrl+V byte (\x16) to trigger a native clipboard read. Send it so
+    // image paste works for CLIs running inside the terminal.
+    const xtermTextarea = term.textarea
+    const handleImagePaste = (e: ClipboardEvent) => {
+      const hasText = e.clipboardData?.types.includes('text/plain')
+      const hasImage = Array.from(e.clipboardData?.items ?? []).some(
+        (item) => item.kind === 'file' && item.type.startsWith('image/'),
+      )
+      if (hasImage && !hasText) {
+        sendInput('\x16')
+      }
+    }
+    xtermTextarea?.addEventListener('paste', handleImagePaste)
+
     term.attachCustomKeyEventHandler((event) => {
       if (
         event.ctrlKey &&
@@ -1290,6 +1306,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         delete wrapperEl.dataset.hoveredUrl
       }
       ro.disconnect()
+      xtermTextarea?.removeEventListener('paste', handleImagePaste)
       unregisterActions()
       unregisterCaptureHandler()
       if (writeQueueRef.current === writeQueue) {

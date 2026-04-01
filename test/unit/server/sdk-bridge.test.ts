@@ -888,6 +888,91 @@ describe('SdkBridge', () => {
     })
   })
 
+  describe('mcpServers injection', () => {
+    it('passes freshell MCP server config to SDK query', async () => {
+      await bridge.createSession({ cwd: '/tmp' })
+      expect(mockQueryOptions?.mcpServers).toBeDefined()
+      expect(mockQueryOptions.mcpServers.freshell).toBeDefined()
+      expect(mockQueryOptions.mcpServers.freshell.command).toBe('node')
+      expect(Array.isArray(mockQueryOptions.mcpServers.freshell.args)).toBe(true)
+      expect(mockQueryOptions.mcpServers.freshell.args.length).toBeGreaterThan(0)
+    })
+
+    it('includes FRESHELL_URL and FRESHELL_TOKEN in MCP server env', async () => {
+      await bridge.createSession({ cwd: '/tmp' })
+      const env = mockQueryOptions?.mcpServers?.freshell?.env
+      expect(env).toBeDefined()
+      expect(env.FRESHELL_URL).toBeDefined()
+      expect(typeof env.FRESHELL_URL).toBe('string')
+      expect(typeof env.FRESHELL_TOKEN).toBe('string')
+    })
+
+    it('derives FRESHELL_URL from PORT env var', async () => {
+      const origPort = process.env.PORT
+      const origUrl = process.env.FRESHELL_URL
+      process.env.PORT = '4455'
+      delete process.env.FRESHELL_URL
+      try {
+        await bridge.createSession({ cwd: '/tmp' })
+        expect(mockQueryOptions.mcpServers.freshell.env.FRESHELL_URL).toBe('http://localhost:4455')
+      } finally {
+        if (origPort !== undefined) process.env.PORT = origPort
+        else delete process.env.PORT
+        if (origUrl !== undefined) process.env.FRESHELL_URL = origUrl
+        else delete process.env.FRESHELL_URL
+      }
+    })
+
+    it('uses FRESHELL_URL env var when set', async () => {
+      const origUrl = process.env.FRESHELL_URL
+      process.env.FRESHELL_URL = 'http://custom:9999'
+      try {
+        await bridge.createSession({ cwd: '/tmp' })
+        expect(mockQueryOptions.mcpServers.freshell.env.FRESHELL_URL).toBe('http://custom:9999')
+      } finally {
+        if (origUrl !== undefined) process.env.FRESHELL_URL = origUrl
+        else delete process.env.FRESHELL_URL
+      }
+    })
+
+    it('uses AUTH_TOKEN env var as FRESHELL_TOKEN', async () => {
+      const origToken = process.env.AUTH_TOKEN
+      process.env.AUTH_TOKEN = 'test-secret-token'
+      try {
+        await bridge.createSession({ cwd: '/tmp' })
+        expect(mockQueryOptions.mcpServers.freshell.env.FRESHELL_TOKEN).toBe('test-secret-token')
+      } finally {
+        if (origToken !== undefined) process.env.AUTH_TOKEN = origToken
+        else delete process.env.AUTH_TOKEN
+      }
+    })
+
+    it('defaults FRESHELL_URL to localhost:3001 when no env vars set', async () => {
+      const origPort = process.env.PORT
+      const origUrl = process.env.FRESHELL_URL
+      delete process.env.PORT
+      delete process.env.FRESHELL_URL
+      try {
+        await bridge.createSession({ cwd: '/tmp' })
+        expect(mockQueryOptions.mcpServers.freshell.env.FRESHELL_URL).toBe('http://localhost:3001')
+      } finally {
+        if (origPort !== undefined) process.env.PORT = origPort
+        if (origUrl !== undefined) process.env.FRESHELL_URL = origUrl
+      }
+    })
+
+    it('defaults FRESHELL_TOKEN to empty string when AUTH_TOKEN unset', async () => {
+      const origToken = process.env.AUTH_TOKEN
+      delete process.env.AUTH_TOKEN
+      try {
+        await bridge.createSession({ cwd: '/tmp' })
+        expect(mockQueryOptions.mcpServers.freshell.env.FRESHELL_TOKEN).toBe('')
+      } finally {
+        if (origToken !== undefined) process.env.AUTH_TOKEN = origToken
+      }
+    })
+  })
+
   describe('setModel', () => {
     it('returns false for nonexistent session', () => {
       expect(bridge.setModel('nonexistent', 'claude-sonnet-4-5-20250929')).toBe(false)

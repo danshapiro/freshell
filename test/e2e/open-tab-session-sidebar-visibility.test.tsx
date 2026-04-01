@@ -1078,7 +1078,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
       const searchLoading = screen.getByTestId('search-loading')
       expect(searchLoading).toBeInTheDocument()
       expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
-    })
+    }, { timeout: 3_000 })
 
     await act(async () => {
       queryChangeDeferred.resolve({

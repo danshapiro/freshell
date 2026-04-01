@@ -13,6 +13,7 @@ import {
   type Query as SdkQuery,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
+import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import type {
@@ -96,6 +97,16 @@ export class SdkBridge extends EventEmitter {
         includePartialMessages: true,
         abortController,
         env: cleanEnv,
+        mcpServers: {
+          freshell: {
+            command: 'node',
+            args: buildMcpServerCommandArgs(),
+            env: {
+              FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${Number(process.env.PORT || 3001)}`,
+              FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+            },
+          },
+        },
         stderr: (data: string) => {
           log.warn({ sessionId, data: data.trimEnd() }, 'SDK subprocess stderr')
         },
