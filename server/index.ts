@@ -572,10 +572,9 @@ async function main() {
     }
   })
 
-  // One-time session association for newly discovered Claude sessions.
-  // When the indexer first discovers a session file, associate it with the oldest
-  // unassociated claude-mode terminal matching the session's cwd. This allows the
-  // terminal to resume the session after server restart.
+  // Fast-path session association for newly discovered Claude sessions.
+  // Most providers now associate from onUpdate, but onNewSession still reduces the
+  // delay before a freshly discovered Claude session binds to a matching terminal.
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
   codingCliIndexer.onNewSession((session) => {

@@ -115,7 +115,7 @@ describe('parseSessionContent() - token usage snapshots', () => {
     expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:04.000Z'))
   })
 
-  it('prefers a renamed custom title over the initial prompt-derived title', () => {
+  it('prefers a renamed custom title over agent and prompt-derived titles', () => {
     const meta = parseSessionContent([
       JSON.stringify({
         type: 'user',
@@ -130,6 +130,23 @@ describe('parseSessionContent() - token usage snapshots', () => {
       JSON.stringify({
         type: 'agent-name',
         agentName: 'ignored older name',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      }),
+    ].join('\n'))
+
+    expect(meta.title).toBe('familiar dedup')
+  })
+
+  it('falls back to the agent name when no custom title is present', () => {
+    const meta = parseSessionContent([
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'Original prompt title' },
+        timestamp: '2026-03-01T00:00:03.000Z',
+      }),
+      JSON.stringify({
+        type: 'agent-name',
+        agentName: 'familiar dedup',
         sessionId: VALID_CLAUDE_SESSION_ID,
       }),
     ].join('\n'))
