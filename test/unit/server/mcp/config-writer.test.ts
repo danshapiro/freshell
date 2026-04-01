@@ -204,6 +204,25 @@ describe('generateMcpInjection -- per-agent config', () => {
     const result = generateMcpInjection('unknown-mode' as any, 'term-xyz')
     expect(result).toEqual({ args: [], env: {} })
   })
+
+  describe('buildMcpServerCommandArgs (exported)', () => {
+    it('returns array with server entry point path', async () => {
+      const { buildMcpServerCommandArgs } = await importModule()
+      const args = buildMcpServerCommandArgs()
+      expect(Array.isArray(args)).toBe(true)
+      expect(args.length).toBeGreaterThan(0)
+      // In dev mode (NODE_ENV !== 'production'), includes tsx import
+      expect(args.some((a: string) => a.includes('server') && a.includes('mcp'))).toBe(true)
+    })
+
+    it('returns production path when NODE_ENV=production', async () => {
+      process.env.NODE_ENV = 'production'
+      const { buildMcpServerCommandArgs } = await importModule()
+      const args = buildMcpServerCommandArgs()
+      expect(args).toHaveLength(1)
+      expect(args[0]).toMatch(/dist\/server\/mcp\/server\.js$/)
+    })
+  })
 })
 
 describe('generateMcpInjection -- dev/production detection', () => {
