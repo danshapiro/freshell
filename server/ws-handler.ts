@@ -23,6 +23,7 @@ import { loadSessionHistory, type ChatMessage } from './session-history-loader.j
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
+import { stripAnsi } from './ai-prompts.js'
 import {
   ErrorCode,
   ShellSchema,
@@ -135,12 +136,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-const ANSI_ESCAPE_RE = /\u001B\[[0-?]*[ -/]*[@-~]/g
 const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
 
 function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
-  const cleaned = snapshot
-    .replace(ANSI_ESCAPE_RE, '')
+  const cleaned = stripAnsi(snapshot)
     .replace(/\r/g, '\n')
     .split('\n')
     .map((line) => line.trim())
