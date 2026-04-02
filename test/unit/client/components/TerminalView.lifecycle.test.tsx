@@ -1994,6 +1994,94 @@ describe('TerminalView lifecycle updates', () => {
     expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('execvp(3) failed.: No such file or directory'))
   })
 
+  it('marks startup exit before first attach as a launch failure', async () => {
+    const tabId = 'tab-startup-exit'
+    const paneId = 'pane-startup-exit'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-startup-exit',
+      status: 'creating',
+      mode: 'shell',
+      shell: 'system',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell',
+            status: 'creating',
+            title: 'Shell',
+            titleSetByUser: false,
+            createRequestId: 'req-startup-exit',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    const term = terminalInstances[0]
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-startup-exit',
+        terminalId: 'term-startup-exit',
+        createdAt: Date.now(),
+      })
+    })
+
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.exit',
+        terminalId: 'term-startup-exit',
+        exitCode: 2,
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+      expect(layout.content.status).toBe('error')
+      expect(layout.content.terminalId).toBeUndefined()
+    })
+
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')).toHaveLength(0)
+    expect(store.getState().tabs.tabs.find((entry) => entry.id === tabId)?.status).toBe('error')
+    expect(term.writeln).toHaveBeenCalledWith(
+      expect.stringContaining('[Launch failed] The terminal exited before it finished starting (exit 2).'),
+    )
+  })
+
   it('marks restored terminal.create requests', async () => {
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
     const tabId = 'tab-restore'
