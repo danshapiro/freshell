@@ -6,7 +6,7 @@ import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
-import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
+import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
@@ -133,6 +133,35 @@ function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean 
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+const ANSI_ESCAPE_RE = /\u001B\[[0-?]*[ -/]*[@-~]/g
+const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
+
+function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
+  const cleaned = snapshot
+    .replace(ANSI_ESCAPE_RE, '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1)
+
+  if (!cleaned) return undefined
+  if (cleaned.length <= TERMINAL_FAILURE_SUMMARY_MAX_CHARS) return cleaned
+  return `...${cleaned.slice(-TERMINAL_FAILURE_SUMMARY_MAX_CHARS)}`
+}
+
+function formatExitedTerminalAttachMessage(record: Pick<TerminalRecord, 'title' | 'mode' | 'exitCode' | 'buffer'>): string {
+  const label = isNonEmptyString(record.title)
+    ? record.title.trim()
+    : record.mode.charAt(0).toUpperCase() + record.mode.slice(1)
+  const exitSuffix = typeof record.exitCode === 'number' ? ` (exit ${record.exitCode})` : ''
+  const summary = summarizeTerminalFailureOutput(record.buffer.snapshot())
+  if (summary) {
+    return `${label} is no longer running${exitSuffix}. Last output: ${summary}`
+  }
+  return `${label} is no longer running${exitSuffix}.`
 }
 
 function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | undefined {
@@ -1416,8 +1445,17 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
-        if (!this.registry.get(m.terminalId)) {
+        const record = this.registry.get(m.terminalId)
+        if (!record) {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+          return
+        }
+        if (record.status !== 'running') {
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: formatExitedTerminalAttachMessage(record),
+            terminalId: m.terminalId,
+          })
           return
         }
 
@@ -1431,6 +1469,15 @@ export class WsHandler {
           m.maxReplayBytes,
         )
         if (attachResult === 'missing') {
+          const latestRecord = this.registry.get(m.terminalId)
+          if (latestRecord && latestRecord.status !== 'running') {
+            this.sendError(ws, {
+              code: 'INVALID_TERMINAL_ID',
+              message: formatExitedTerminalAttachMessage(latestRecord),
+              terminalId: m.terminalId,
+            })
+            return
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
