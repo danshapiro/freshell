@@ -66,7 +66,9 @@ export async function scanFileForUserTextMessages(filePath: string): Promise<boo
       while (position < stat.size) {
         const readSize = Math.min(chunkSize + USER_TEXT_PATTERN.length, stat.size - position)
         const { bytesRead } = await fd.read(buf, 0, readSize, position)
-        let offset = 0
+        // Skip byte 0 on non-first chunks — it was already the last scannable
+        // position in the previous chunk's overlap region.
+        let offset = position > 0 ? 1 : 0
         while (offset < bytesRead) {
           const idx = buf.indexOf(USER_TEXT_PATTERN, offset)
           if (idx === -1 || idx >= bytesRead) break

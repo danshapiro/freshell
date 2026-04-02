@@ -110,6 +110,26 @@ describe('scanFileForUserTextMessages', () => {
     expect(await scanFileForUserTextMessages(filePath)).toBe(true)
   })
 
+  it('does not double-count a pattern at an exact chunk boundary', async () => {
+    // Place a single user text message so the target byte pattern starts at
+    // exactly byte 64KB — the overlap position scanned by both adjacent chunks.
+    const chunkSize = 64 * 1024
+    const filePath = path.join(tempDir, 'boundary.jsonl')
+    const pattern = '"role":"user","content":"'
+    // Build a user message line, then figure out where the pattern sits inside it
+    const userLine = userTextMessage('Only message')
+    const patternOffsetInLine = userLine.indexOf(pattern)
+    // Pad so that (padding + \n + patternOffsetInLine) = chunkSize
+    const prefixLength = chunkSize - 1 - patternOffsetInLine // -1 for \n separator
+    const padding = 'x'.repeat(prefixLength)
+    const content = padding + '\n' + userLine
+    // Sanity-check alignment
+    expect(content.indexOf(pattern)).toBe(chunkSize)
+    await fsp.writeFile(filePath, content)
+    // Only one text user message — must return false, not double-count
+    expect(await scanFileForUserTextMessages(filePath)).toBe(false)
+  })
+
   it('returns false for nonexistent file', async () => {
     const filePath = path.join(tempDir, 'nonexistent.jsonl')
     expect(await scanFileForUserTextMessages(filePath)).toBe(false)
