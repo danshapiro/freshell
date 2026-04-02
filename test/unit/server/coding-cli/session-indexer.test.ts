@@ -1367,6 +1367,72 @@ describe('CodingCliSessionIndexer', () => {
       }
     })
 
+    it('falls back to periodic full scans when the root watcher degrades', async () => {
+      const providerHome = path.join(tempDir, '.codex')
+      await fsp.mkdir(providerHome, { recursive: true })
+      const sessionsDir = path.join(providerHome, 'sessions')
+
+      const provider = makeProvider([], {
+        name: 'codex',
+        displayName: 'Codex',
+        homeDir: providerHome,
+        getSessionRoots: () => [sessionsDir],
+        listSessionFiles: async () => {
+          try {
+            const entries = await fsp.readdir(sessionsDir)
+            return entries
+              .filter((e) => e.endsWith('.jsonl'))
+              .map((e) => path.join(sessionsDir, e))
+          } catch {
+            return []
+          }
+        },
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {},
+        settings: {
+          codingCli: {
+            enabledProviders: ['codex'],
+            providers: {},
+          },
+        },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 20,
+        throttleMs: 0,
+        fullScanIntervalMs: 0,
+        rootFallbackScanIntervalMs: 25,
+      })
+      await indexer.start()
+
+      try {
+        expect(indexer.getProjects()).toHaveLength(0)
+
+        const rootWatcher = (indexer as unknown as {
+          rootWatcher: { emit: (event: string, payload: unknown) => boolean } | null
+        }).rootWatcher
+        expect(rootWatcher).not.toBeNull()
+        rootWatcher?.emit('error', new Error('EMFILE: too many open files'))
+
+        await fsp.mkdir(sessionsDir, { recursive: true })
+        const sessionFile = path.join(sessionsDir, 'fallback-session.jsonl')
+        await fsp.writeFile(sessionFile, JSON.stringify({ cwd: '/project/a', title: 'Fallback Session' }) + '\n')
+
+        await vi.waitFor(
+          () => {
+            expect(indexer.getProjects()).toHaveLength(1)
+          },
+          { timeout: 1000, interval: 50 },
+        )
+
+        expect(indexer.getProjects()[0].sessions[0].title).toBe('Fallback Session')
+      } finally {
+        indexer.stop()
+      }
+    })
+
     it('stop() cleans up root watcher', async () => {
       const providerHome = path.join(tempDir, '.codex')
       const sessionsDir = path.join(providerHome, 'sessions')

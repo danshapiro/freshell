@@ -288,11 +288,13 @@ export type SessionIndexerOptions = {
   debounceMs?: number
   throttleMs?: number
   fullScanIntervalMs?: number
+  rootFallbackScanIntervalMs?: number
 }
 
 const DEFAULT_DEBOUNCE_MS = 2_000
 const DEFAULT_THROTTLE_MS = 5_000
 const DEFAULT_FULL_SCAN_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
+const DEFAULT_ROOT_FALLBACK_SCAN_INTERVAL_MS = 1_000
 const URGENT_REFRESH_MS = 300 // Fast refresh when a titleless session might have just gained content
 const URGENT_THROTTLE_MS = 1000 // Minimum spacing between urgent refreshes to cap worst-case frequency
 
@@ -300,6 +302,7 @@ export class CodingCliSessionIndexer {
   private watcher: chokidar.FSWatcher | null = null
   private rootWatcher: chokidar.FSWatcher | null = null
   private fullScanTimer: NodeJS.Timeout | null = null
+  private rootFallbackScanTimer: NodeJS.Timeout | null = null
   private projects: ProjectGroup[] = []
   private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
   private refreshTimer: NodeJS.Timeout | null = null
@@ -314,6 +317,7 @@ export class CodingCliSessionIndexer {
   private readonly debounceMs: number
   private readonly throttleMs: number
   private readonly fullScanIntervalMs: number
+  private readonly rootFallbackScanIntervalMs: number
   private knownSessionIds = new Set<string>()
   private seenSessionIds = new Map<string, number>()
   private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
@@ -321,6 +325,9 @@ export class CodingCliSessionIndexer {
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
   private dirtyProviders = new Set<CodingCliProviderName>()
+  private sessionRoots: string[] = []
+  private watchersDegraded = false
+  private running = false
 
   constructor(
     private providers: CodingCliProvider[],
@@ -331,12 +338,28 @@ export class CodingCliSessionIndexer {
     this.throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS
     this.fullScanIntervalMs = options.fullScanIntervalMs ??
       Number(process.env.CODING_CLI_FULL_SCAN_INTERVAL_MS || DEFAULT_FULL_SCAN_INTERVAL_MS)
+    this.rootFallbackScanIntervalMs = options.rootFallbackScanIntervalMs ?? DEFAULT_ROOT_FALLBACK_SCAN_INTERVAL_MS
   }
 
   async start() {
+    this.running = true
     this.needsFullScan = true
     await this.refresh()
     this.initialized = true
+    this.startSessionWatcher()
+    this.startRootWatcher()
+    this.syncRootFallbackScanning()
+
+    // Periodic safety full-scan to catch anything the file watchers might miss.
+    if (this.fullScanIntervalMs > 0) {
+      this.fullScanTimer = setInterval(() => {
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }, this.fullScanIntervalMs)
+    }
+  }
+
+  private startSessionWatcher() {
     const globs = this.providers.map((p) => p.getSessionGlob())
     logger.info({ globs, debounceMs: this.debounceMs, throttleMs: this.throttleMs }, 'Starting coding CLI sessions watcher')
 
@@ -357,24 +380,19 @@ export class CodingCliSessionIndexer {
       this.markDeleted(filePath)
       schedule()
     })
-    this.watcher.on('error', (err) => logger.warn({ err }, 'Coding CLI watcher error'))
+    this.watcher.on('error', (err) => {
+      logger.warn({ err }, 'Coding CLI watcher error')
+      this.markWatchersDegraded()
+    })
 
     // Watch parent directories of provider roots for late directory creation/removal.
     // When a provider root (e.g. ~/.codex/sessions) doesn't exist at startup, chokidar's
     // glob watcher silently ignores it. This root watcher detects when the directory
     // appears and triggers a full rescan.
-    this.startRootWatcher()
-
-    // Periodic safety full-scan to catch anything the file watchers might miss.
-    if (this.fullScanIntervalMs > 0) {
-      this.fullScanTimer = setInterval(() => {
-        this.needsFullScan = true
-        this.scheduleRefresh()
-      }, this.fullScanIntervalMs)
-    }
   }
 
   stop() {
+    this.running = false
     this.watcher?.close().catch(() => {})
     this.watcher = null
     this.rootWatcher?.close().catch(() => {})
@@ -383,6 +401,8 @@ export class CodingCliSessionIndexer {
     this.refreshTimer = null
     if (this.fullScanTimer) clearInterval(this.fullScanTimer)
     this.fullScanTimer = null
+    if (this.rootFallbackScanTimer) clearInterval(this.rootFallbackScanTimer)
+    this.rootFallbackScanTimer = null
   }
 
   private startRootWatcher() {
@@ -393,6 +413,7 @@ export class CodingCliSessionIndexer {
       }
     }
 
+    this.sessionRoots = Array.from(rootSet)
     if (rootSet.size === 0) return
 
     // Watch the nearest existing ancestor of each root so we still detect late
@@ -412,7 +433,7 @@ export class CodingCliSessionIndexer {
       depth: Math.max(0, maxDepth),
     })
 
-    const roots = Array.from(rootSet)
+    const roots = this.sessionRoots
     const affectsWatchedRoot = (entryPath: string) => {
       const normalized = normalizeFilePath(entryPath)
       return roots.some((root) => {
@@ -427,6 +448,7 @@ export class CodingCliSessionIndexer {
         logger.info({ dirPath }, 'Provider session root created, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
+        this.syncRootFallbackScanning()
       }
     })
 
@@ -435,6 +457,7 @@ export class CodingCliSessionIndexer {
         logger.info({ dirPath }, 'Provider session root removed, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
+        this.syncRootFallbackScanning()
       }
     })
 
@@ -443,6 +466,7 @@ export class CodingCliSessionIndexer {
         logger.info({ filePath }, 'Provider session root file created, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
+        this.syncRootFallbackScanning()
       }
     })
 
@@ -451,10 +475,61 @@ export class CodingCliSessionIndexer {
         logger.info({ filePath }, 'Provider session root file removed, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
+        this.syncRootFallbackScanning()
       }
     })
 
-    this.rootWatcher.on('error', (err) => logger.warn({ err }, 'Root watcher error'))
+    this.rootWatcher.on('error', (err) => {
+      logger.warn({ err }, 'Root watcher error')
+      this.markWatchersDegraded()
+    })
+  }
+
+  private hasMissingSessionRoots() {
+    return this.sessionRoots.some((root) => {
+      try {
+        return !fs.existsSync(root)
+      } catch {
+        return true
+      }
+    })
+  }
+
+  private shouldRunRootFallbackScanning() {
+    return this.watchersDegraded || this.hasMissingSessionRoots()
+  }
+
+  private syncRootFallbackScanning() {
+    if (!this.shouldRunRootFallbackScanning()) {
+      if (this.rootFallbackScanTimer) clearInterval(this.rootFallbackScanTimer)
+      this.rootFallbackScanTimer = null
+      return
+    }
+
+    if (this.rootFallbackScanTimer) return
+
+    this.rootFallbackScanTimer = setInterval(() => {
+      if (!this.running) return
+
+      if (!this.shouldRunRootFallbackScanning()) {
+        if (this.rootFallbackScanTimer) clearInterval(this.rootFallbackScanTimer)
+        this.rootFallbackScanTimer = null
+        return
+      }
+
+      this.needsFullScan = true
+      this.scheduleRefresh()
+    }, this.rootFallbackScanIntervalMs)
+  }
+
+  private markWatchersDegraded() {
+    if (this.watchersDegraded) return
+    this.watchersDegraded = true
+    logger.warn(
+      { intervalMs: this.rootFallbackScanIntervalMs },
+      'Coding CLI watcher degraded; falling back to periodic full scans',
+    )
+    this.syncRootFallbackScanning()
   }
 
   onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
