@@ -317,9 +317,9 @@ describe('TerminalRegistry Production Edge Cases', () => {
         emitData(largeChunk)
       }
 
-      // Buffer should be capped at DEFAULT_MAX_SCROLLBACK_CHARS (64KB default)
+      // Buffer should be capped at DEFAULT_MAX_SCROLLBACK_CHARS (512KB default)
       const snapshot = record.buffer.snapshot()
-      expect(snapshot.length).toBeLessThanOrEqual(64 * 1024)
+      expect(snapshot.length).toBeLessThanOrEqual(512 * 1024)
     })
 
     it('idle monitor timer is created and runs', () => {
