@@ -47,6 +47,46 @@ function maxDefined(a: number | undefined, b: number | undefined): number | unde
   return Math.max(a, b)
 }
 
+// Byte pattern for a text user message (content is a string, not a tool_result array).
+const USER_TEXT_PATTERN = Buffer.from('"role":"user","content":"')
+
+/**
+ * Fast byte scan of a full file for multiple text user messages.
+ * Returns true if >1 match is found, indicating the session is interactive.
+ */
+export async function scanFileForUserTextMessages(filePath: string): Promise<boolean> {
+  try {
+    const fd = await fsp.open(filePath, 'r')
+    try {
+      const stat = await fd.stat()
+      const chunkSize = 64 * 1024
+      let found = 0
+      const buf = Buffer.alloc(chunkSize + USER_TEXT_PATTERN.length)
+      let position = 0
+      while (position < stat.size) {
+        const readSize = Math.min(chunkSize + USER_TEXT_PATTERN.length, stat.size - position)
+        const { bytesRead } = await fd.read(buf, 0, readSize, position)
+        // Skip byte 0 on non-first chunks — it was already the last scannable
+        // position in the previous chunk's overlap region.
+        let offset = position > 0 ? 1 : 0
+        while (offset < bytesRead) {
+          const idx = buf.indexOf(USER_TEXT_PATTERN, offset)
+          if (idx === -1 || idx >= bytesRead) break
+          found++
+          if (found > 1) return true
+          offset = idx + USER_TEXT_PATTERN.length
+        }
+        position += chunkSize
+      }
+    } finally {
+      await fd.close()
+    }
+  } catch {
+    // If we can't read the file, leave the classification as-is.
+  }
+  return false
+}
+
 function findNearestExistingAncestor(targetPath: string): string {
   let current = normalizeFilePath(targetPath)
   let parent = path.dirname(current)
@@ -607,6 +647,13 @@ export class CodingCliSessionIndexer {
 
     const snippet = await readSessionSnippet(filePath)
     const meta = await provider.parseSessionFile(snippet.content, filePath)
+    // Snippet-based parsing can misclassify large sessions as non-interactive
+    // when text user messages fall outside the head+tail window. A fast byte
+    // scan of the full file for the user-text pattern corrects this cheaply.
+    if (snippet.truncated && meta.isNonInteractive) {
+      const hasMultipleUserMessages = await scanFileForUserTextMessages(filePath)
+      if (hasMultipleUserMessages) meta.isNonInteractive = undefined
+    }
     if (snippet.truncated && provider.name === 'codex') {
       const tailMeta = snippet.tailContent
         ? await provider.parseSessionFile(snippet.tailContent, filePath)
