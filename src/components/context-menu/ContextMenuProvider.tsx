@@ -392,10 +392,6 @@ export function ContextMenuProvider({
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
-    const runningTerminalId =
-      target?.kind === 'sidebar-session' && target.sessionId === sessionId
-        ? target.runningTerminalId
-        : undefined
     const agentConfig = getAgentChatProviderConfig(sessionType)
     const providerSettings = agentConfig
       ? appSettings.agentChat?.providers?.[agentConfig.name]

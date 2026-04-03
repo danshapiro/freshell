@@ -185,7 +185,6 @@ export default function Sidebar({
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const settings = useAppSelector((s) => s.settings.settings)
-  const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activeSessionKeyFromPanes = useAppSelector((s) => {
     const tabId = s.tabs.activeTabId
