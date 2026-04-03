@@ -1,4 +1,5 @@
 import { isValidClaudeSessionId } from '../claude-session-id.js'
+import { logger } from '../logger.js'
 import type { SdkSessionState } from '../sdk-bridge-types.js'
 import type { ChatMessage } from '../session-history-loader.js'
 import type { ContentBlock } from '../../shared/ws-protocol.js'
@@ -30,6 +31,8 @@ export type AgentHistorySourceDeps = {
   getLiveSessionByCliSessionId: (timelineSessionId: string) => SdkSessionState | undefined
   logDivergence?: (details: AgentHistoryDivergenceDetails) => void
 }
+
+const log = logger.child({ component: 'agent-timeline-history-source' })
 
 function toRevision(messages: ChatMessage[]): number {
   return messages.reduce((maxRevision, message, index) => {
@@ -197,9 +200,20 @@ export function createAgentHistorySource(deps: AgentHistorySourceDeps): AgentHis
       const liveSession = deps.getLiveSessionBySdkSessionId(queryId)
         ?? (isValidClaudeSessionId(queryId) ? deps.getLiveSessionByCliSessionId(queryId) : undefined)
       const timelineSessionId = resolveTimelineSessionId(queryId, liveSession)
-      const durableMessages = timelineSessionId
-        ? (await deps.loadSessionHistory(timelineSessionId)) ?? []
-        : []
+      let durableMessages: ChatMessage[] = []
+      if (timelineSessionId) {
+        try {
+          durableMessages = (await deps.loadSessionHistory(timelineSessionId)) ?? []
+        } catch (error) {
+          if (!liveSession) throw error
+          log.warn({
+            err: error instanceof Error ? error : new Error(String(error)),
+            queryId,
+            sdkSessionId: liveSession.sessionId,
+            timelineSessionId,
+          }, 'Failed to load durable agent history; falling back to live session history')
+        }
+      }
       const liveMessages = liveSession?.messages ?? []
 
       if (!liveSession && durableMessages.length === 0) {

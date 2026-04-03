@@ -950,6 +950,87 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('falls back to a live-only snapshot when sdk.create durable history resolution fails', async () => {
+      mockSdkBridge.createSession.mockResolvedValue({
+        sessionId: 'sdk-sess-live-only',
+        status: 'running',
+        messages: [makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockHistorySource.resolve.mockRejectedValue(new Error('jsonl read failed'))
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collected = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (
+              parsed.type === 'sdk.created'
+              || parsed.type === 'sdk.session.snapshot'
+              || parsed.type === 'sdk.session.init'
+              || parsed.type === 'error'
+            ) {
+              messages.push(parsed)
+            }
+            if (
+              messages.some((message) => message.type === 'sdk.created')
+              && messages.some((message) => message.type === 'sdk.session.snapshot')
+              && messages.some((message) => message.type === 'sdk.session.init')
+            ) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-live-only',
+        }))
+
+        await collected
+
+        expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-sess-live-only',
+          latestTurnId: 'turn-0',
+          status: 'running',
+          streamingActive: true,
+          streamingText: 'partial reply',
+        }))
+        expect(messages.some((message) => message.type === 'error')).toBe(false)
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns sdk.error when sdk.attach cannot resolve durable history and no live session exists', async () => {
+      mockSdkBridge.getSession.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockRejectedValue(new Error('jsonl read failed'))
+
+      const ws = await connectAndAuth()
+      try {
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.attach',
+          sessionId: 'sdk-missing-history',
+        }, 'sdk.error')
+
+        expect(response).toEqual({
+          type: 'sdk.error',
+          sessionId: 'sdk-missing-history',
+          code: 'INTERNAL_ERROR',
+          message: 'Failed to restore SDK session history',
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
     it('returns sdk.error for sdk.attach with unknown session', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
       mockHistorySource.resolve.mockResolvedValue(null)

@@ -370,4 +370,32 @@ describe('agent timeline history source', () => {
     expect(resolved?.timelineSessionId).toBe('00000000-0000-4000-8000-000000000123')
     expect(resolved?.messages).toHaveLength(2)
   })
+
+  it('degrades to live-only history when durable history loading fails for a live session', async () => {
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockRejectedValue(new Error('jsonl read failed')),
+      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
+        sessionId: 'sdk-history-fallback',
+        cliSessionId: '00000000-0000-4000-8000-000000000124',
+        messages: [
+          makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'live reply', '2026-03-10T10:00:01.000Z'),
+        ],
+      })),
+      getLiveSessionByCliSessionId: vi.fn(),
+      logDivergence: vi.fn(),
+    })
+
+    const resolved = await source.resolve('sdk-history-fallback')
+
+    expect(resolved).toEqual({
+      liveSessionId: 'sdk-history-fallback',
+      timelineSessionId: '00000000-0000-4000-8000-000000000124',
+      messages: [
+        makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z'),
+        makeMessage('assistant', 'live reply', '2026-03-10T10:00:01.000Z'),
+      ],
+      revision: Date.parse('2026-03-10T10:00:01.000Z'),
+    })
+  })
 })

@@ -15,7 +15,7 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
+import { createAgentHistorySource, type AgentHistorySource, type ResolvedAgentHistory } from './agent-timeline/history-source.js'
 import type { CodexActivityRecord, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
@@ -119,6 +119,31 @@ const CLOSE_CODES = {
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function toSnapshotRevision(messages: ChatMessage[]): number {
+  return messages.reduce((maxRevision, message, index) => {
+    if (!message.timestamp) return Math.max(maxRevision, index + 1)
+    const timestamp = Date.parse(message.timestamp)
+    if (!Number.isFinite(timestamp)) return Math.max(maxRevision, index + 1)
+    return Math.max(maxRevision, timestamp)
+  }, 0)
+}
+
+function resolveSnapshotTimelineSessionId(queryId: string, liveSession?: SdkSessionState): string | undefined {
+  if (isValidClaudeSessionId(liveSession?.cliSessionId)) return liveSession.cliSessionId
+  if (isValidClaudeSessionId(liveSession?.resumeSessionId)) return liveSession.resumeSessionId
+  if (isValidClaudeSessionId(queryId)) return queryId
+  return undefined
+}
+
+function buildLiveOnlyResolvedHistory(queryId: string, liveSession: SdkSessionState): ResolvedAgentHistory {
+  return {
+    liveSessionId: liveSession.sessionId,
+    timelineSessionId: resolveSnapshotTimelineSessionId(queryId, liveSession),
+    messages: liveSession.messages,
+    revision: toSnapshotRevision(liveSession.messages),
+  }
 }
 
 function isMobileUserAgent(userAgent: string | undefined): boolean {
@@ -971,7 +996,21 @@ export class WsHandler {
       resolvedHistory?: Awaited<ReturnType<AgentHistorySource['resolve']>>
     },
   ) {
-    const resolved = opts.resolvedHistory ?? await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
+    let resolved = opts.resolvedHistory ?? null
+    if (!resolved) {
+      try {
+        resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
+      } catch (error) {
+        if (!opts.liveSession) throw error
+        log.warn({
+          err: error instanceof Error ? error : new Error(String(error)),
+          historyQueryId: opts.historyQueryId,
+          sessionId: opts.sessionId,
+          liveSessionId: opts.liveSession.sessionId,
+        }, 'Failed to resolve durable SDK session history; falling back to live session snapshot')
+        resolved = buildLiveOnlyResolvedHistory(opts.historyQueryId, opts.liveSession)
+      }
+    }
     this.send(ws, {
       type: 'sdk.session.snapshot',
       sessionId: opts.sessionId,
@@ -1979,9 +2018,21 @@ export class WsHandler {
           return
         }
         const directSession = this.sdkBridge.getSession(m.sessionId)
-        const resolved = !directSession
-          ? await this.agentHistorySource?.resolve(m.sessionId) ?? null
-          : null
+        let resolved: Awaited<ReturnType<AgentHistorySource['resolve']>> | null = null
+        if (!directSession) {
+          try {
+            resolved = await this.agentHistorySource?.resolve(m.sessionId) ?? null
+          } catch (err) {
+            log.warn({ err, sessionId: m.sessionId }, 'sdk.attach history resolution failed')
+            this.send(ws, {
+              type: 'sdk.error',
+              sessionId: m.sessionId,
+              code: 'INTERNAL_ERROR',
+              message: 'Failed to restore SDK session history',
+            } as SdkServerMessage)
+            return
+          }
+        }
         const liveSession = directSession
           ?? (resolved?.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
         if (!liveSession) {
