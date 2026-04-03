@@ -52,6 +52,10 @@ import {
   type Osc52Event,
   type Osc52Policy,
 } from '@/lib/terminal-osc52'
+import {
+  createTerminalStartupProbeState,
+  extractTerminalStartupProbes,
+} from '@/lib/terminal-startup-probes'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
@@ -270,7 +274,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
+  const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const osc52ParserRef = useRef(createOsc52ParserState())
+  const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
   const pendingOsc52EventRef = useRef<Osc52Event | null>(null)
   const osc52QueueRef = useRef<Osc52Event[]>([])
@@ -825,8 +831,49 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
-    const osc = extractOsc52Events(raw, osc52ParserRef.current)
+  const sendInput = useCallback((data: string) => {
+    const tid = terminalIdRef.current
+    if (!tid) return
+    // In 'type' mode, clear attention when user sends input.
+    // In 'click' mode, attention is cleared by the notification hook on tab switch.
+    if (attentionDismissRef.current === 'type') {
+      if (hasAttentionRef.current) {
+        dispatch(clearTabAttention({ tabId }))
+      }
+      if (hasPaneAttentionRef.current) {
+        dispatch(clearPaneAttention({ paneId }))
+      }
+    }
+    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
+      turnCompletedSinceLastInputRef.current = false
+      dispatch(setPaneRuntimeActivity({
+        paneId: paneIdRef.current,
+        source: 'terminal',
+        phase: 'pending',
+      }))
+    }
+    ws.send({ type: 'terminal.input', terminalId: tid, data })
+  }, [dispatch, tabId, paneId, ws])
+
+  const handleTerminalOutput = useCallback((
+    raw: string,
+    mode: TerminalPaneContent['mode'],
+    tid: string | undefined,
+    allowReplies: boolean,
+  ) => {
+    const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
+      foreground: resolvedThemeRef.current.foreground,
+      background: resolvedThemeRef.current.background,
+      cursor: resolvedThemeRef.current.cursor,
+    })
+
+    if (allowReplies) {
+      for (const reply of startup.replies) {
+        sendInput(reply)
+      }
+    }
+
+    const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
     if (count > 0 && tid) {
@@ -863,31 +910,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     for (const event of osc.events) {
       handleOsc52Event(event)
     }
-  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, tabId])
-
-  const sendInput = useCallback((data: string) => {
-    const tid = terminalIdRef.current
-    if (!tid) return
-    // In 'type' mode, clear attention when user sends input.
-    // In 'click' mode, attention is cleared by the notification hook on tab switch.
-    if (attentionDismissRef.current === 'type') {
-      if (hasAttentionRef.current) {
-        dispatch(clearTabAttention({ tabId }))
-      }
-      if (hasPaneAttentionRef.current) {
-        dispatch(clearPaneAttention({ paneId }))
-      }
-    }
-    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
-      turnCompletedSinceLastInputRef.current = false
-      dispatch(setPaneRuntimeActivity({
-        paneId: paneIdRef.current,
-        source: 'terminal',
-        phase: 'pending',
-      }))
-    }
-    ws.send({ type: 'terminal.input', terminalId: tid, data })
-  }, [dispatch, tabId, paneId, ws])
+  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
     const terminalId = terminalIdRef.current
@@ -1029,6 +1052,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
 
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
+    resolvedThemeRef.current = resolvedTheme
     const term = new Terminal({
       allowProposedApi: true,
       convertEol: true,
@@ -1543,6 +1567,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const term = termRef.current
     if (!term) return
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
+    resolvedThemeRef.current = resolvedTheme
     term.options.cursorBlink = settings.terminal.cursorBlink
     term.options.fontSize = settings.terminal.fontSize
     term.options.fontFamily = resolveTerminalFontFamily(settings.terminal.fontFamily)
@@ -1603,6 +1628,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!termCandidate) return
     const term = termCandidate
     turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
+    startupProbeStateRef.current = createTerminalStartupProbeState()
     osc52ParserRef.current = createOsc52ParserState()
     osc52QueueRef.current = []
     pendingOsc52EventRef.current = null
@@ -1762,7 +1788,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          handleTerminalOutput(raw, mode, tid)
+          handleTerminalOutput(raw, mode, tid, !previousSeqState.pendingReplay)
           if (
             raw.length > 0
             && !terminalFirstOutputMarkedRef.current

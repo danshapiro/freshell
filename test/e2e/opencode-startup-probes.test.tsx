@@ -271,7 +271,7 @@ describe('opencode startup probes (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(terminalInstances[0]!.write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, expect.any(Function))
+      expect(terminalInstances[0]!.write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, undefined)
     })
 
     const inputMessages = sentMessages().filter((msg) => msg?.type === 'terminal.input')
