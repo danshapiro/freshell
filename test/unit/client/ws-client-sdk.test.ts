@@ -122,7 +122,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      agentChatSlice.clearStreaming({ sessionId: 'sess-1' })
+      agentChatSlice.setStreaming({ sessionId: 'sess-1', active: false })
     )
   })
 

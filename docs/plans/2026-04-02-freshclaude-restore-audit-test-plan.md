@@ -120,7 +120,7 @@ No new harnesses need to be built. The existing harnesses already cover the requ
     - **Harness:** `server-unit-di`
     - **Preconditions:** A live SDK session receives `stream_event` messages that open, extend, and end a text stream; a durable Claude id becomes known through `cliSessionId` or `resumeSessionId`.
     - **Actions:** Drive `SdkBridge` through streamed events; inspect in-memory session state and any lookup helper used by restore.
-    - **Expected outcome:** Per the `Restore Contract` requirement that mid-stream reconnects must show work in progress, the bridge keeps `streamingActive` and accumulated `streamingText` in session state until a terminal assistant/result message closes the stream, and it can locate the live session by the durable Claude id so later attach snapshots can restore from canonical identity rather than only the transient SDK id.
+    - **Expected outcome:** Per the `Restore Contract` requirement that mid-stream reconnects must show work in progress, the bridge preserves accumulated `streamingText` in session state until a terminal assistant/result message closes the stream, while `content_block_stop` ends active streaming by setting `streamingActive = false`; it can also locate the live session by the durable Claude id so later attach snapshots can restore from canonical identity rather than only the transient SDK id.
     - **Interactions:** SDK stream consumption, in-memory session bookkeeping, attach-time history lookup support.
 
 ## Coverage summary

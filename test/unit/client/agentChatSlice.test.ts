@@ -99,6 +99,15 @@ describe('agentChatSlice', () => {
     expect(state.sessions['s1'].streamingActive).toBe(false)
   })
 
+  it('can mark streaming inactive without discarding the partial preview text', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hello' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: false }))
+    expect(state.sessions['s1'].streamingText).toBe('Hello')
+    expect(state.sessions['s1'].streamingActive).toBe(false)
+  })
+
   it('tracks permission requests', () => {
     let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
     state = agentChatReducer(state, addPermissionRequest({

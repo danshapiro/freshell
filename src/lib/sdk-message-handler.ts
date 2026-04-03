@@ -7,7 +7,6 @@ import {
   addAssistantMessage,
   setStreaming,
   appendStreamDelta,
-  clearStreaming,
   addPermissionRequest,
   removePermission,
   addQuestionRequest,
@@ -106,7 +105,7 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         }
       }
       if (event?.type === 'content_block_stop') {
-        dispatch(clearStreaming({ sessionId: msg.sessionId as string }))
+        dispatch(setStreaming({ sessionId: msg.sessionId as string, active: false }))
       }
       return true
     }

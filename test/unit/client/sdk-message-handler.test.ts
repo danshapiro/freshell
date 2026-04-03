@@ -127,6 +127,26 @@ describe('sdk-message-handler', () => {
     expect(calls[0].type).toBe('agentChat/turnResult')
   })
 
+  it('marks streaming inactive without clearing partial text on content_block_stop', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.stream',
+      sessionId: 's1',
+      event: { type: 'content_block_stop' },
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/setStreaming',
+      payload: {
+        sessionId: 's1',
+        active: false,
+      },
+    })
+  })
+
   it('returns false for unknown message types', () => {
     const { dispatch } = createMockDispatch()
 
