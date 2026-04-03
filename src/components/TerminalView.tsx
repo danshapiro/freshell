@@ -101,8 +101,47 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
+type StartupProbeReplayDiscardState = {
+  remainder: string | null
+  buffered: string
+}
+
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
+
+function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
+  const remainder = state.remainder
+  if (!remainder) {
+    state.buffered = ''
+    return raw
+  }
+
+  let matched = state.buffered
+  let index = 0
+  while (
+    index < raw.length
+    && matched.length < remainder.length
+    && raw[index] === remainder[matched.length]
+  ) {
+    matched += raw[index]
+    index += 1
+  }
+
+  if (matched.length === remainder.length) {
+    state.remainder = null
+    state.buffered = ''
+    return raw.slice(index)
+  }
+
+  if (index < raw.length) {
+    state.remainder = null
+    state.buffered = ''
+    return `${matched}${raw.slice(index)}`
+  }
+
+  state.buffered = matched
+  return ''
 }
 
 function deferTerminalPointerMutation(callback: () => void): void {
@@ -276,7 +315,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
-  const startupProbeReplayDiscardRemainderRef = useRef<string | null>(null)
+  const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
+    remainder: null,
+    buffered: '',
+  })
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
@@ -860,14 +902,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
     if (opts?.discardReplayRemainder) {
       const pendingProbe = startupProbeStateRef.current.pending
-      startupProbeReplayDiscardRemainderRef.current =
-        pendingProbe
-        && pendingProbe !== STARTUP_PROBE_OSC11_QUERY
-        && STARTUP_PROBE_OSC11_QUERY.startsWith(pendingProbe)
-          ? STARTUP_PROBE_OSC11_QUERY.slice(pendingProbe.length)
-          : null
+      startupProbeReplayDiscardStateRef.current = {
+        remainder:
+          pendingProbe
+          && pendingProbe !== STARTUP_PROBE_OSC11_QUERY
+          && STARTUP_PROBE_OSC11_QUERY.startsWith(pendingProbe)
+            ? STARTUP_PROBE_OSC11_QUERY.slice(pendingProbe.length)
+            : null,
+        buffered: '',
+      }
     } else {
-      startupProbeReplayDiscardRemainderRef.current = null
+      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
     }
     startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
@@ -1816,28 +1861,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const enteringFreshLiveOutput = !frameOverlapsReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (enteringFreshLiveOutput) {
-            resetStartupProbeParser({ discardReplayRemainder: true })
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
           }
-          if (startupProbeReplayDiscardRemainderRef.current) {
-            const remainder = startupProbeReplayDiscardRemainderRef.current
-            let consumedChars = 0
-            while (
-              consumedChars < raw.length
-              && consumedChars < remainder.length
-              && raw[consumedChars] === remainder[consumedChars]
-            ) {
-              consumedChars += 1
-            }
-            if (consumedChars > 0) {
-              raw = raw.slice(consumedChars)
-              startupProbeReplayDiscardRemainderRef.current =
-                consumedChars === remainder.length
-                  ? null
-                  : remainder.slice(consumedChars)
-            } else {
-              startupProbeReplayDiscardRemainderRef.current = null
-            }
-          }
+          raw = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
           handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0

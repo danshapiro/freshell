@@ -632,6 +632,60 @@ describe('opencode startup probes (e2e)', () => {
     ])
   })
 
+  it('does not trim unrelated live bytes that only share a stale replay-suffix prefix', async () => {
+    const terminalId = 'term-opencode-replay-gap-prefix-match'
+    const { attach } = await renderCreatedTerminal(terminalId)
+    const replayFragment = OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, 2)
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 2,
+      replayFromSeq: 1,
+      replayToSeq: 2,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: replayFragment,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output.gap',
+      terminalId,
+      fromSeq: 2,
+      toSeq: 2,
+      reason: 'replay_budget_exceeded',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: '1hello',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0]!.write).toHaveBeenCalled()
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([
+      { kind: 'write', data: '1hello' },
+    ])
+  })
+
   it('buffers a split live startup probe and replies exactly once when it completes', async () => {
     const terminalId = 'term-opencode-split-live'
     const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES

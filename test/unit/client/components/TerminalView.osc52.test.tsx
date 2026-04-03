@@ -350,8 +350,8 @@ describe('TerminalView OSC52 policy handling', () => {
     ])
   })
 
-  it('strips startup probes for non-opencode terminal modes too', async () => {
-    const { terminalId } = await renderView('always', 'codex')
+  it('strips startup probes for shell terminal modes too', async () => {
+    const { terminalId } = await renderView('always', 'shell')
     wsMocks.send.mockClear()
     ioEvents.length = 0
 
