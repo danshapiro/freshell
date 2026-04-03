@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import agentChatReducer from '@/store/agentChatSlice'
+import agentChatReducer, { turnBodyReceived } from '@/store/agentChatSlice'
 import {
   loadAgentTimelineWindow,
   loadAgentTurnBody,
@@ -116,6 +116,44 @@ describe('agentChatThunks', () => {
       expect.anything(),
     )
     expect(getAgentTurnBody).not.toHaveBeenCalled()
+  })
+
+  it('preserves previously expanded bodies when appending an older timeline page', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-sess-1',
+      items: [
+        { turnId: 'turn-older', sessionId: 'cli-sess-1', role: 'user', summary: 'Older summary', timestamp: '2026-03-10T09:59:00.000Z' },
+      ],
+      nextCursor: null,
+      revision: 3,
+    })
+
+    const store = makeStore()
+    store.dispatch(turnBodyReceived({
+      sessionId: 'sdk-sess-1',
+      turnId: 'turn-newest',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Newest full body' }],
+        timestamp: '2026-03-10T10:01:00.000Z',
+      },
+    }))
+
+    await store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-1',
+      timelineSessionId: 'cli-sess-1',
+      requestKey: 'tab-1:pane-1',
+      cursor: 'cursor-2',
+    }))
+
+    expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      'cli-sess-1',
+      expect.objectContaining({ priority: 'visible', cursor: 'cursor-2' }),
+      expect.anything(),
+    )
+    expect(store.getState().agentChat.sessions['sdk-sess-1'].timelineBodies['turn-newest']).toEqual(expect.objectContaining({
+      content: [{ type: 'text', text: 'Newest full body' }],
+    }))
   })
 
   it('aborts a stale timeline request when a pane switches sessions', async () => {

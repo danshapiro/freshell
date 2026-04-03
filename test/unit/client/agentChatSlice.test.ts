@@ -320,6 +320,34 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-1'].timelineBodies['stale-turn']).toBeUndefined()
   })
 
+  it('preserves previously expanded bodies when appending an older timeline page', () => {
+    let state = agentChatReducer(initial, turnBodyReceived({
+      sessionId: 'sdk-1',
+      turnId: 'turn-newest',
+      message: makeChatMessage('assistant', 'newest full body'),
+    }))
+
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-1',
+      items: [{ turnId: 'turn-older', sessionId: 'cli-1', role: 'user', summary: 'older question' }],
+      nextCursor: 'cursor-older',
+      revision: 13,
+      replace: false,
+      bodies: {
+        'turn-older': {
+          sessionId: 'cli-1',
+          turnId: 'turn-older',
+          message: makeChatMessage('user', 'older full body'),
+        },
+      },
+    }))
+
+    expect(state.sessions['sdk-1'].timelineBodies).toEqual(expect.objectContaining({
+      'turn-newest': makeChatMessage('assistant', 'newest full body'),
+      'turn-older': makeChatMessage('user', 'older full body'),
+    }))
+  })
+
   it('bootstraps session on timelinePageReceived for unknown sessionId', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'unknown-sess',

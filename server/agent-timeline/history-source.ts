@@ -96,7 +96,6 @@ function timestampsPlausiblySame(left?: string, right?: string): boolean {
   if (leftParsed != null && rightParsed != null) {
     return leftParsed === rightParsed
   }
-  if (left == null && right == null) return true
   if (left != null && right != null) return left === right
   return false
 }
@@ -146,11 +145,18 @@ function mergeResumedDeltaHistory(
     durableTail
     && liveHead
     && sameMessageCore(durableTail, liveHead)
-    && timestampsMateriallyDifferent(durableTail.timestamp, liveHead.timestamp)
   ) {
     logDivergence?.({
       ...details,
       reason: 'ambiguous_overlap',
+    })
+    return [...durableMessages, ...liveMessages]
+  }
+
+  if (durableMessages.length > 0 && liveMessages.length > 0) {
+    logDivergence?.({
+      ...details,
+      reason: 'conflict',
     })
   }
 
