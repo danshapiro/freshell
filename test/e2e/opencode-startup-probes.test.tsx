@@ -360,6 +360,75 @@ describe('opencode startup probes (e2e)', () => {
     ])
   })
 
+  it('does not complete a replay-fragment startup probe from the first live frame', async () => {
+    const terminalId = 'term-opencode-replay-live-boundary'
+    const store = createStore(terminalId)
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId={`tab-${terminalId}`}
+          paneId={`pane-${terminalId}`}
+          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
+          hidden={false}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        attachRequestId: expect.any(String),
+      })
+    })
+
+    const attach = lastSent('terminal.attach', terminalId)
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 1,
+      replayFromSeq: 1,
+      replayToSeq: 1,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[0],
+      attachRequestId: attach.attachRequestId,
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([])
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 2,
+      seqEnd: 2,
+      data: `${OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[1]}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0]!.write).toHaveBeenCalled()
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toHaveLength(1)
+    expect(ioEvents[0]).toEqual({
+      kind: 'write',
+      data: expect.stringContaining(OPEN_CODE_STARTUP_VISIBLE_TEXT),
+    })
+  })
+
   it('buffers a split live startup probe and replies exactly once when it completes', async () => {
     const terminalId = 'term-opencode-split-live'
     const store = createStore(terminalId)

@@ -855,6 +855,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
 
+  const resetStartupProbeParser = useCallback(() => {
+    startupProbeStateRef.current = createTerminalStartupProbeState()
+  }, [])
+
   const handleTerminalOutput = useCallback((
     raw: string,
     mode: TerminalPaneContent['mode'],
@@ -1486,6 +1490,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
     const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
+    // Startup probes must not leak across attach generations.
+    resetStartupProbeParser()
+
     if (intent === 'viewport_hydrate') {
       if (opts?.clearViewportFirst) {
         try {
@@ -1530,7 +1537,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState])
+  }, [suppressNetworkEffects, ws, applySeqState, resetStartupProbeParser])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1628,7 +1635,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!termCandidate) return
     const term = termCandidate
     turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
-    startupProbeStateRef.current = createTerminalStartupProbeState()
+    resetStartupProbeParser()
     osc52ParserRef.current = createOsc52ParserState()
     osc52QueueRef.current = []
     pendingOsc52EventRef.current = null
@@ -1807,6 +1814,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnFrame) {
+            resetStartupProbeParser()
             setIsAttaching(false)
             markAttachComplete()
           }
@@ -1848,6 +1856,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
+            resetStartupProbeParser()
             setIsAttaching(false)
             markAttachComplete()
           }
@@ -2239,6 +2248,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     handleTerminalOutput,
     attachTerminal,
     markAttachComplete,
+    resetStartupProbeParser,
     runRefreshAttach,
   ])
 
