@@ -61,6 +61,16 @@ describe('terminal-startup-probes', () => {
     expect(result.replies).toEqual([])
   })
 
+  it('passes malformed recognized startup-probe traffic through unchanged', () => {
+    const state = createTerminalStartupProbeState()
+    const input = 'prefix\u001b]11;?\u001b\\suffix'
+
+    const result = extractTerminalStartupProbes(input, state, COLORS)
+
+    expect(result.cleaned).toBe(input)
+    expect(result.replies).toEqual([])
+  })
+
   it('preserves incomplete unknown escape traffic until the frame completes', () => {
     const state = createTerminalStartupProbeState()
 

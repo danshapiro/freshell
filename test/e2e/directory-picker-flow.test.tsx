@@ -30,6 +30,11 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
     picker: { shortcut: 'X' },
     cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
   },
+  {
+    name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli',
+    picker: { shortcut: 'O' },
+    cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'] },
+  },
 ]
 
 const { mockApiGet, mockApiPost, mockApiPatch, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
@@ -84,7 +89,11 @@ function createSettingsState(options: {
   }
 }
 
-function renderPickerFlow() {
+function renderPickerFlow(options: {
+  availableClis?: Record<string, boolean>
+  enabledProviders?: string[]
+  providerCwds?: Record<string, { cwd: string }>
+} = {}) {
   const node: PaneNode = {
     type: 'leaf',
     id: 'pane-1',
@@ -115,7 +124,7 @@ function renderPickerFlow() {
       connection: {
         status: 'ready' as const,
         platform: 'linux',
-        availableClis: { claude: true },
+        availableClis: options.availableClis ?? { claude: true },
       },
       settings: createSettingsState({
         server: {
@@ -123,8 +132,8 @@ function renderPickerFlow() {
           safety: { autoKillIdleMinutes: 180 },
           panes: { defaultNewPane: 'ask' },
           codingCli: {
-            enabledProviders: ['claude'],
-            providers: { claude: { cwd: '/home/user/work' } },
+            enabledProviders: options.enabledProviders ?? ['claude'],
+            providers: options.providerCwds ?? { claude: { cwd: '/home/user/work' } },
           },
           logging: { debug: false },
         },
@@ -291,6 +300,40 @@ describe('directory picker flow (e2e)', () => {
       codingCli: {
         providers: {
           claude: expect.objectContaining({ cwd: '/home/user/next' }),
+        },
+      },
+    })
+  })
+
+  it('launches OpenCode terminal with confirmed directory', async () => {
+    const { store } = renderPickerFlow({
+      availableClis: { opencode: true },
+      enabledProviders: ['opencode'],
+      providerCwds: { opencode: { cwd: '/home/user/work' } },
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'OpenCode' }))
+    const picker = document.querySelector('[data-context="pane-picker"]')
+    if (!picker) throw new Error('Pane picker not found')
+    fireEvent.transitionEnd(picker)
+
+    const input = screen.getByLabelText('Starting directory for OpenCode')
+    fireEvent.change(input, { target: { value: '/home/user/next' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const content = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(content.kind).toBe('terminal')
+      if (content.kind === 'terminal') {
+        expect(content.mode).toBe('opencode')
+        expect(content.initialCwd).toBe('/home/user/next')
+      }
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      codingCli: {
+        providers: {
+          opencode: expect.objectContaining({ cwd: '/home/user/next' }),
         },
       },
     })
