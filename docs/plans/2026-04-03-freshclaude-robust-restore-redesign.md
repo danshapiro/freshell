@@ -108,25 +108,32 @@
 - `sdk.create` is atomic from the client's perspective.
 - The client must never see a live session id before coherent restore state exists.
 - The bridge must not auto-broadcast early SDK events for a newly created session until `WsHandler` explicitly drains them.
+- Snapshot/replay cutover must be lossless and non-duplicating:
+  - the bridge replay gate must expose a deterministic watermark or sequence boundary
+  - the authoritative snapshot must be derived from ledger state up to that boundary
+  - buffered events already represented in the snapshot must not be replayed to the client a second time
+  - only buffered events strictly after the snapshot watermark may be replayed after readiness
 - Required server sequence:
   1. create or resume the SDK session internally
   2. establish a gated replay handle for early SDK events before anything can be sent to the client
-  3. create or hydrate the ledger
-  4. derive the authoritative snapshot from the ledger
+  3. freeze the replay gate at a snapshot watermark and fold all buffered events through that watermark into the ledger
+  4. derive the authoritative snapshot from the ledger at that same watermark
   5. emit `sdk.created`
   6. emit `sdk.session.snapshot`
   7. emit a server-synthesized readiness message
-  8. replay gated early SDK events in protocol order, with raw early `system/init` converted into an explicit metadata refresh message instead of a second readiness event
+  8. replay only buffered early SDK events after that watermark in protocol order, with raw early `system/init` converted into an explicit metadata refresh message instead of a second readiness event
   9. switch the client to the normal live subscription path
 - Early SDK event handling must be explicit:
   - add a replay-drain API at the bridge boundary so `WsHandler` can inspect buffered early events before they are pushed to the client
   - define the bridge contract so `createSession()` returns both the created session state and a replay gate handle for that session
+  - define the replay gate in terms of a stable sequence or watermark so snapshot construction and replay filtering use the same cutover
   - partition replayed events into `system/init` vs non-init messages
   - derive the synthesized readiness event from `createSession()` return data, not from the buffered raw init
-  - replay non-init events after the synthesized readiness event
+  - replay non-init events after the synthesized readiness event only when they are not already represented in the emitted snapshot
   - replay the raw buffered `system/init` last as `sdk.session.metadata`, not as a second `sdk.session.init`
 - If steps 3-4 fail:
   - kill the tentative session
+  - tear down the tentative ledger aliasing and replay gate for that request so no orphaned state survives the failed create
   - do not emit `sdk.created`
   - emit request-scoped `sdk.create.failed`
 
@@ -217,7 +224,7 @@
 - Modify: `src/store/crossTabSync.ts`
   Responsibility: reject stale layout payloads that would regress canonical durable identity after a newer flush, across both pane state and tab fallback metadata.
 - Modify: `src/store/tabsSlice.ts`
-  Responsibility: preserve canonical tab fallback identity and keyed session metadata when a stale cross-tab hydrate would otherwise regress them.
+  Responsibility: preserve canonical tab fallback identity and keyed session metadata when a stale cross-tab hydrate would otherwise regress them, using layout-level `persistedAt` propagated into the hydrate merge path.
 - Modify: `test/unit/server/agent-timeline-history-source.test.ts`
   Responsibility: pin typed restore outcomes and explicitly narrow the legacy compatibility path.
 - Create: `test/unit/server/agent-timeline-ledger.test.ts`
@@ -456,6 +463,18 @@ it('emits created then snapshot then readiness init before replaying buffered me
   ])
 })
 
+it('does not replay buffered events that were already folded into the emitted snapshot', async () => {
+  const { snapshot, replayedEvents } = await sendSdkCreateWithBufferedAssistantDelta()
+  expect(snapshot.streamingText).toBe('hello')
+  expect(replayedEvents).not.toContainEqual(expect.objectContaining({
+    type: 'sdk.stream',
+    event: expect.objectContaining({
+      type: 'content_block_delta',
+      delta: expect.objectContaining({ text: 'hello' }),
+    }),
+  }))
+})
+
 it('records sdk.create.failed as a request-scoped create failure, not a lost session', () => {
   dispatch(handleSdkMessage(store.dispatch, {
     type: 'sdk.create.failed',
@@ -523,7 +542,8 @@ it('dispatches sdk.create.failed through the ws client without regressing existi
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create red" npm run test:vitest -- test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore create red server" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
+FRESHELL_TEST_SUMMARY="robust restore create red client" npm run test:vitest -- test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: FAIL because request-scoped create failure, replay draining, and ordered transactional create do not exist yet.
@@ -542,8 +562,10 @@ export type SdkCreateFailedMessage = {
 
 - Add a bridge-level replay-drain seam so `WsHandler` can:
   - collect early buffered events without immediately broadcasting them
+  - freeze them at a stable snapshot watermark before building the initial snapshot
   - separate raw `system/init` from other replayable messages
   - emit the synthesized readiness init first
+  - exclude any buffered event already represented in the snapshot at that watermark
   - replay the raw init last as `sdk.session.metadata`
 - Extend `src/store/agentChatTypes.ts` in this task so Redux explicitly models:
   - pending create failure by `requestId`
@@ -575,7 +597,8 @@ Remove redundant old assumptions that `sdk.created` must arrive merely to guard 
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create verify" npm run test:vitest -- test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore create verify server" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts
+FRESHELL_TEST_SUMMARY="robust restore create verify client" npm run test:vitest -- test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: PASS.
@@ -804,6 +827,10 @@ export const flushPersistedLayoutNow = createAction('persist/flushNow')
   - pane `resumeSessionId`
   - tab fallback `resumeSessionId` and `sessionMetadataByKey`
 - Use `persistedAt` as the primary freshness signal, then canonical durable-id precedence as the guard against stale named-resume overwrite, so a newer rename/title/layout change can still merge without downgrading session identity.
+- Thread layout-level `persistedAt` through the cross-tab hydrate path explicitly:
+  - `crossTabSync.ts` must read `persistedAt` from the parsed layout payload
+  - the tabs hydrate merge path must receive that remote layout timestamp via payload or action meta instead of inferring freshness from per-tab `updatedAt`
+  - pane-level resume-id protection may remain in `crossTabSync.ts`, but tab fallback identity protection must use the same explicit remote layout timestamp contract
 
 - [ ] **Step 4: Re-run the targeted persistence tests**
 
@@ -843,6 +870,8 @@ git commit -m "fix: persist canonical freshclaude identity immediately"
 - Modify: `test/unit/server/ws-sdk-session-history-cache.test.ts`
 - Modify: `test/unit/client/agentChatSlice.test.ts`
 - Modify: `test/unit/client/store/panesSlice.test.ts`
+- Modify: `test/unit/client/store/tabsSlice.merge.test.ts`
+- Modify: `test/unit/client/store/crossTabSync.test.ts`
 - Modify: `test/unit/client/ws-client-sdk.test.ts`
 
 - [ ] **Step 1: Add the remaining adversarial coverage**
