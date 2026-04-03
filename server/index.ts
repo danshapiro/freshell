@@ -65,6 +65,7 @@ import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
+import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
@@ -275,6 +276,18 @@ async function main() {
       resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
       contentCache: sessionContentCache,
     })
+  const agentHistorySource = createAgentHistorySource({
+    loadSessionHistory: loadSessionHistoryWithCache,
+    getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getSession(sdkSessionId),
+    getLiveSessionByCliSessionId: (timelineSessionId) => (
+      sdkBridge.listSessions().find((session) => (
+        session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId
+      ))
+    ),
+    logDivergence: (details) => {
+      log.warn(details, 'FreshClaude history source detected divergent durable/live history')
+    },
+  })
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
@@ -449,7 +462,7 @@ async function main() {
 
   app.use('/api', createAgentTimelineRouter({
     service: createAgentTimelineService({
-      loadSessionHistory: loadSessionHistoryWithCache,
+      agentHistorySource,
     }),
   }))
 

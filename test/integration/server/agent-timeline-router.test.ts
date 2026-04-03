@@ -66,6 +66,17 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
     })
   })
 
+  it('passes includeBodies through the route family', async () => {
+    await request(app)
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&includeBodies=true')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(getTimelinePage).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'agent-session-1',
+      includeBodies: true,
+    }))
+  })
+
   it('hydrates turn bodies on demand', async () => {
     const res = await request(app)
       .get('/api/agent-sessions/agent-session-1/turns/turn-2')

@@ -1,5 +1,6 @@
 import { MAX_AGENT_TIMELINE_ITEMS } from '../../shared/read-models.js'
 import type { ChatMessage } from '../session-history-loader.js'
+import type { AgentHistorySource, ResolvedAgentHistory } from './history-source.js'
 import type {
   AgentTimelineItem,
   AgentTimelinePage,
@@ -26,7 +27,7 @@ export type AgentTimelineService = {
 }
 
 export type AgentTimelineServiceDeps = {
-  loadSessionHistory: (sessionId: string) => Promise<ChatMessage[] | null>
+  agentHistorySource: AgentHistorySource
 }
 
 function encodeCursor(payload: TimelineCursorPayload): string {
@@ -43,15 +44,6 @@ function decodeCursor(cursor: string): TimelineCursorPayload {
   } catch {
     throw new Error('Invalid agent-timeline cursor')
   }
-}
-
-function toRevision(messages: ChatMessage[]): number {
-  return messages.reduce((maxRevision, message, index) => {
-    if (!message.timestamp) return Math.max(maxRevision, index + 1)
-    const timestamp = Date.parse(message.timestamp)
-    if (!Number.isFinite(timestamp)) return Math.max(maxRevision, index + 1)
-    return Math.max(maxRevision, timestamp)
-  }, 0)
 }
 
 function summarizeMessage(message: ChatMessage): string {
@@ -95,9 +87,18 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
     }
   }
 
-  async function loadTimeline(sessionId: string): Promise<TimelineMessageRecord[]> {
-    const messages = await deps.loadSessionHistory(sessionId)
-    return buildTimeline(messages ?? [], sessionId)
+  async function loadTimeline(queryId: string): Promise<{ sessionId: string, revision: number, records: TimelineMessageRecord[] }> {
+    const resolved = await deps.agentHistorySource.resolve(queryId)
+    return buildResolvedTimeline(queryId, resolved)
+  }
+
+  function buildResolvedTimeline(queryId: string, resolved: ResolvedAgentHistory | null): { sessionId: string, revision: number, records: TimelineMessageRecord[] } {
+    const sessionId = resolved?.timelineSessionId ?? queryId
+    return {
+      sessionId,
+      revision: resolved?.revision ?? 0,
+      records: buildTimeline(resolved?.messages ?? [], sessionId),
+    }
   }
 
   return {
@@ -107,22 +108,21 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       const offset = query.cursor ? decodeCursor(query.cursor).offset : 0
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
-      const pageItems = timeline.slice(offset, offset + limit)
+      const pageItems = timeline.records.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
-      const fullMessages = timeline.map((record) => record.message).reverse()
 
       const result: AgentTimelinePage = {
-        sessionId: query.sessionId,
+        sessionId: timeline.sessionId,
         items: pageItems.map(toTimelineItem),
-        nextCursor: nextOffset < timeline.length ? encodeCursor({ offset: nextOffset }) : null,
-        revision: toRevision(fullMessages),
+        nextCursor: nextOffset < timeline.records.length ? encodeCursor({ offset: nextOffset }) : null,
+        revision: timeline.revision,
       }
 
       if (query.includeBodies) {
         const bodies: Record<string, AgentTimelineTurn> = {}
         for (const record of pageItems) {
           bodies[record.turnId] = {
-            sessionId: query.sessionId,
+            sessionId: timeline.sessionId,
             turnId: record.turnId,
             message: record.message,
           }
@@ -135,11 +135,11 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
 
     async getTurnBody({ sessionId, turnId }) {
       const timeline = await loadTimeline(sessionId)
-      const match = timeline.find((record) => record.turnId === turnId)
+      const match = timeline.records.find((record) => record.turnId === turnId)
       if (!match) return null
 
       return {
-        sessionId,
+        sessionId: timeline.sessionId,
         turnId,
         message: match.message,
       }

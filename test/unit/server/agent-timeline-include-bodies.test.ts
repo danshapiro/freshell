@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { AgentTimelinePageQuerySchema } from '../../../shared/read-models.js'
 import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
 
@@ -58,7 +58,13 @@ describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
 describe('agent timeline includeBodies', () => {
   it('includeBodies=false (default): no bodies field in response', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sess-1',
+          messages: mockMessages,
+          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+        }),
+      },
     })
 
     const page = await service.getTimelinePage({
@@ -72,11 +78,18 @@ describe('agent timeline includeBodies', () => {
 
   it('includeBodies=true: bodies map includes all page items', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sdk-sess-1',
+          timelineSessionId: '00000000-0000-4000-8000-000000000010',
+          messages: mockMessages,
+          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+        }),
+      },
     })
 
     const page = await service.getTimelinePage({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       priority: 'visible',
       includeBodies: true,
     })
@@ -84,10 +97,11 @@ describe('agent timeline includeBodies', () => {
     expect(page.items).toHaveLength(3)
     expect(page.bodies).toBeDefined()
     expect(Object.keys(page.bodies!)).toHaveLength(3)
+    expect(page.sessionId).toBe('00000000-0000-4000-8000-000000000010')
     for (const item of page.items) {
       const body = page.bodies![item.turnId]
       expect(body).toBeDefined()
-      expect(body.sessionId).toBe('sess-1')
+      expect(body.sessionId).toBe('00000000-0000-4000-8000-000000000010')
       expect(body.turnId).toBe(item.turnId)
       expect(body.message.content).toBeDefined()
       expect(body.message.content.length).toBeGreaterThan(0)
@@ -96,7 +110,13 @@ describe('agent timeline includeBodies', () => {
 
   it('bodies map keys match item turnIds', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sess-1',
+          messages: mockMessages,
+          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+        }),
+      },
     })
 
     const page = await service.getTimelinePage({
@@ -118,7 +138,13 @@ describe('agent timeline includeBodies', () => {
     }))
 
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(fiveMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sess-1',
+          messages: fiveMessages,
+          revision: Date.parse('2026-03-10T10:04:00.000Z'),
+        }),
+      },
     })
 
     const page1 = await service.getTimelinePage({
@@ -151,21 +177,28 @@ describe('agent timeline includeBodies', () => {
 
   it('getTurnBody still works independently (backward compatible)', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sdk-sess-1',
+          timelineSessionId: '00000000-0000-4000-8000-000000000011',
+          messages: mockMessages,
+          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+        }),
+      },
     })
 
     const page = await service.getTimelinePage({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       priority: 'visible',
     })
 
     const turn = await service.getTurnBody({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       turnId: page.items[0].turnId,
     })
 
     expect(turn).not.toBeNull()
-    expect(turn!.sessionId).toBe('sess-1')
+    expect(turn!.sessionId).toBe('00000000-0000-4000-8000-000000000011')
     expect(turn!.turnId).toBe(page.items[0].turnId)
     expect(turn!.message.content).toHaveLength(1)
   })
