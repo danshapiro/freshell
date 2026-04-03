@@ -374,7 +374,13 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
   })
 
-  it('does not prefetch timeline while the pane is hidden', async () => {
+  it('defers restored timeline hydration while hidden and fetches exactly once when the pane becomes visible', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'sess-reload-1',
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
       sessionId: 'sess-reload-1',
@@ -382,7 +388,7 @@ describe('AgentChatView reload/restore behavior', () => {
       status: 'idle',
     }))
 
-    render(
+    const { rerender } = render(
       <Provider store={store}>
         <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} hidden />
       </Provider>,
@@ -393,6 +399,26 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     expect(getAgentTimelinePage).not.toHaveBeenCalled()
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
+    expect(wsSend).toHaveBeenCalledWith({
+      type: 'sdk.attach',
+      sessionId: 'sess-reload-1',
+    })
+
+    rerender(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'sess-reload-1',
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
     expect(getAgentTurnBody).not.toHaveBeenCalled()
   })
 

@@ -93,20 +93,16 @@ function parseTimestamp(value?: string): number | undefined {
 function timestampsPlausiblySame(left?: string, right?: string): boolean {
   const leftParsed = parseTimestamp(left)
   const rightParsed = parseTimestamp(right)
-  if (leftParsed == null || rightParsed == null) {
-    return left === undefined || right === undefined || left === right
+  if (leftParsed != null && rightParsed != null) {
+    return leftParsed === rightParsed
   }
-  return leftParsed === rightParsed
+  if (left == null && right == null) return true
+  if (left != null && right != null) return left === right
+  return false
 }
 
 function timestampsMateriallyDifferent(left?: string, right?: string): boolean {
-  const leftParsed = parseTimestamp(left)
-  const rightParsed = parseTimestamp(right)
-  if (leftParsed != null && rightParsed != null) {
-    return leftParsed !== rightParsed
-  }
-  if (left == null || right == null) return false
-  return left !== right
+  return !timestampsPlausiblySame(left, right) && (left != null || right != null)
 }
 
 function messagesMatch(left: ChatMessage, right: ChatMessage): boolean {

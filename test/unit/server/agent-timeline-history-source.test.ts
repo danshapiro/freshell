@@ -143,6 +143,41 @@ describe('agent timeline history source', () => {
     ])
   })
 
+  it('keeps a repeated single-message prompt when timestamp evidence is missing on one side and logs the ambiguity', async () => {
+    const logDivergence = vi.fn()
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+      ]),
+      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
+        sessionId: 'sdk-missing-ts',
+        resumeSessionId: '00000000-0000-4000-8000-000000000099',
+        messages: [
+          makeMessage('user', 'continue'),
+          makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
+        ],
+      })),
+      getLiveSessionByCliSessionId: vi.fn(),
+      logDivergence,
+    })
+
+    const resolved = await source.resolve('sdk-missing-ts')
+    expect(resolved?.messages).toEqual([
+      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+      makeMessage('user', 'continue'),
+      makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
+    ])
+    expect(logDivergence).toHaveBeenCalledWith(expect.objectContaining({
+      queryId: 'sdk-missing-ts',
+      sdkSessionId: 'sdk-missing-ts',
+      timelineSessionId: '00000000-0000-4000-8000-000000000099',
+      liveMode: 'delta',
+      liveCount: 2,
+      durableCount: 1,
+      reason: 'ambiguous_overlap',
+    }))
+  })
+
   it('prefers the live full transcript when a fresh session has outrun durable JSONL', async () => {
     const source = createAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue([
