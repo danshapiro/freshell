@@ -878,13 +878,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     tid: string | undefined,
     allowReplies: boolean,
   ) => {
-    const startup = mode === 'opencode'
-      ? extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
-        foreground: resolvedThemeRef.current.foreground,
-        background: resolvedThemeRef.current.background,
-        cursor: resolvedThemeRef.current.cursor,
-      })
-      : { cleaned: raw, replies: [] }
+    const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
+      foreground: resolvedThemeRef.current.foreground,
+      background: resolvedThemeRef.current.background,
+      cursor: resolvedThemeRef.current.cursor,
+    })
 
     if (allowReplies) {
       for (const reply of startup.replies) {
@@ -1903,7 +1901,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
-            resetStartupProbeParser()
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
             setIsAttaching(false)
             markAttachComplete()
           }

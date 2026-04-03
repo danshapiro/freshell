@@ -577,6 +577,61 @@ describe('opencode startup probes (e2e)', () => {
     ])
   })
 
+  it('discards replay fragments when replay completion arrives via terminal.output.gap', async () => {
+    const terminalId = 'term-opencode-replay-gap-fragment'
+    const { attach } = await renderCreatedTerminal(terminalId)
+    const replayFragment = OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, -2)
+    const liveRemainder = OPEN_CODE_STARTUP_PROBE_FRAME.slice(replayFragment.length)
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 2,
+      replayFromSeq: 1,
+      replayToSeq: 2,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: replayFragment,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output.gap',
+      terminalId,
+      fromSeq: 2,
+      toSeq: 2,
+      reason: 'replay_budget_exceeded',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 3,
+      seqEnd: 5,
+      data: `${liveRemainder}${OPEN_CODE_STARTUP_POST_REPLY_FRAMES[0] ?? ''}`,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0]!.write).toHaveBeenCalled()
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([
+      { kind: 'write', data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+    ])
+  })
+
   it('buffers a split live startup probe and replies exactly once when it completes', async () => {
     const terminalId = 'term-opencode-split-live'
     const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES

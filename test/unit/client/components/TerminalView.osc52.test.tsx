@@ -157,7 +157,10 @@ function createSettingsState(policy: 'ask' | 'always' | 'never') {
   }
 }
 
-function createStore(policy: 'ask' | 'always' | 'never') {
+function createStore(
+  policy: 'ask' | 'always' | 'never',
+  mode: TerminalPaneContent['mode'] = 'opencode',
+) {
   const tabId = 'tab-osc52'
   const paneId = 'pane-osc52'
   const terminalId = 'term-osc52'
@@ -166,7 +169,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
     kind: 'terminal',
     createRequestId: 'req-osc52',
     status: 'running',
-    mode: 'opencode',
+    mode,
     shell: 'system',
     terminalId,
   }
@@ -185,9 +188,9 @@ function createStore(policy: 'ask' | 'always' | 'never') {
       tabs: {
         tabs: [{
           id: tabId,
-          mode: 'opencode',
+          mode,
           status: 'running',
-          title: 'OpenCode',
+          title: mode === 'opencode' ? 'OpenCode' : 'Terminal',
           terminalId,
           createRequestId: 'req-osc52',
         }],
@@ -244,8 +247,11 @@ describe('TerminalView OSC52 policy handling', () => {
     messageHandler = null
   })
 
-  async function renderView(policy: 'ask' | 'always' | 'never') {
-    const { store, tabId, paneId, paneContent, terminalId } = createStore(policy)
+  async function renderView(
+    policy: 'ask' | 'always' | 'never',
+    mode: TerminalPaneContent['mode'] = 'opencode',
+  ) {
+    const { store, tabId, paneId, paneContent, terminalId } = createStore(policy, mode)
     render(
       <Provider store={store}>
         <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
@@ -342,6 +348,48 @@ describe('TerminalView OSC52 policy handling', () => {
       ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
       ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
     ])
+  })
+
+  it('strips startup probes for non-opencode terminal modes too', async () => {
+    const { terminalId } = await renderView('always', 'codex')
+    wsMocks.send.mockClear()
+    ioEvents.length = 0
+
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
+    })
+
+    expect(terminalInstances[0].write).not.toHaveBeenCalled()
+
+    const probeInputMessages = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.input')
+    expect(probeInputMessages).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+
+    OPEN_CODE_STARTUP_POST_REPLY_FRAMES.forEach((frame, index) => {
+      const range = postReplySeqRange(index)
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: range.seqStart,
+        seqEnd: range.seqEnd,
+        data: frame,
+      })
+    })
+
+    await waitFor(() => {
+      expect(writeEvents().map((event) => event.data).join('')).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
+    })
   })
 
   it('never policy does not copy and does not prompt', async () => {
