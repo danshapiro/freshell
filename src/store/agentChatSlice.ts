@@ -6,12 +6,14 @@ import type {
   ChatContentBlock,
   ChatMessage,
   ChatSessionState,
+  PendingCreateFailure,
   QuestionDefinition,
 } from './agentChatTypes'
 
 const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
+  pendingCreateFailures: {},
   availableModels: [],
 }
 
@@ -60,6 +62,8 @@ const agentChatSlice = createSlice({
       // restore mode until snapshot/timeline data establishes durable history.
       session.historyLoaded = !expectsHistoryHydration
       session.awaitingDurableHistory = expectsHistoryHydration
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
       state.pendingCreates[requestId] = {
         sessionId,
         expectsHistoryHydration,
@@ -86,6 +90,20 @@ const agentChatSlice = createSlice({
       }
     },
 
+    sessionMetadataReceived(state, action: PayloadAction<{
+      sessionId: string
+      cliSessionId?: string
+      model?: string
+      cwd?: string
+      tools?: Array<{ name: string }>
+    }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      session.model = action.payload.model ?? session.model
+      session.cwd = action.payload.cwd ?? session.cwd
+      session.tools = action.payload.tools ?? session.tools
+    },
+
     sessionSnapshotReceived(state, action: PayloadAction<{
       sessionId: string
       latestTurnId: string | null
@@ -102,6 +120,7 @@ const agentChatSlice = createSlice({
       session.timelineRevision = action.payload.revision
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
+      session.restoreFailureCode = undefined
       if (action.payload.latestTurnId === null) {
         const hasDurableHistoryIdentity = Boolean(session.timelineSessionId || session.cliSessionId)
         if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
@@ -269,6 +288,8 @@ const agentChatSlice = createSlice({
       session.timelineError = undefined
       session.awaitingDurableHistory = false
       session.historyLoaded = true
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
     },
 
     timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string }>) {
@@ -303,6 +324,23 @@ const agentChatSlice = createSlice({
       session.historyLoaded = true
     },
 
+    restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
+      session.restoreFailureCode = action.payload.code
+      session.timelineLoading = false
+      session.timelineError = undefined
+    },
+
+    createFailed(state, action: PayloadAction<{ requestId: string } & PendingCreateFailure>) {
+      const { requestId, ...failure } = action.payload
+      state.pendingCreateFailures[requestId] = failure
+    },
+
+    clearPendingCreateFailure(state, action: PayloadAction<{ requestId: string }>) {
+      delete state.pendingCreateFailures[action.payload.requestId]
+    },
+
     clearPendingCreate(state, action: PayloadAction<{ requestId: string }>) {
       delete state.pendingCreates[action.payload.requestId]
     },
@@ -323,6 +361,7 @@ export const {
   registerPendingCreate,
   sessionCreated,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   addUserMessage,
   addAssistantMessage,
@@ -342,6 +381,9 @@ export const {
   turnBodyReceived,
   sessionError,
   markSessionLost,
+  restoreRetryRequested,
+  createFailed,
+  clearPendingCreateFailure,
   clearPendingCreate,
   removeSession,
   setAvailableModels,

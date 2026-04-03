@@ -8,12 +8,14 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { getClaudeHome } from './claude-home.js'
 import type { ContentBlock } from '../shared/ws-protocol.js'
+import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: ContentBlock[]
   timestamp?: string
   model?: string
+  messageId?: string
 }
 
 export interface LoadSessionHistoryDeps {
@@ -30,6 +32,7 @@ export interface LoadSessionHistoryDeps {
 export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
   const lines = content.split(/\r?\n/).filter(Boolean)
   const messages: ChatMessage[] = []
+  const fingerprintOccurrences = new Map<string, number>()
 
   for (const line of lines) {
     let obj: any
@@ -48,19 +51,32 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
 
     if (typeof msg === 'string') {
       // Simple/legacy format: message is a plain string
-      messages.push({
+      const nextMessage: ChatMessage = {
         role,
         content: [{ type: 'text', text: msg }],
         ...(timestamp ? { timestamp } : {}),
-      })
+      }
+      const fingerprint = createDurableMessageFingerprint(nextMessage)
+      const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+      fingerprintOccurrences.set(fingerprint, occurrence + 1)
+      nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      messages.push(nextMessage)
     } else if (msg && typeof msg === 'object' && Array.isArray(msg.content)) {
       // Structured format: message is a ClaudeMessage object
-      messages.push({
+      const nextMessage: ChatMessage = {
         role: msg.role || role,
         content: msg.content as ContentBlock[],
         ...(timestamp ? { timestamp } : {}),
         ...(msg.model ? { model: msg.model } : {}),
-      })
+        ...(typeof msg.id === 'string' && msg.id.trim().length > 0 ? { messageId: msg.id } : {}),
+      }
+      if (!nextMessage.messageId) {
+        const fingerprint = createDurableMessageFingerprint(nextMessage)
+        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+        fingerprintOccurrences.set(fingerprint, occurrence + 1)
+        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      }
+      messages.push(nextMessage)
     }
   }
 

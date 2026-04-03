@@ -97,4 +97,24 @@ describe('handleSdkMessage — session-lost error handling', () => {
     expect(session.lastError).toBe('Something went wrong')
     expect(session.lost).toBeUndefined()
   })
+
+  it('records sdk.create.failed as a request-scoped create failure instead of impersonating lost-session recovery', () => {
+    const handled = handleSdkMessage(store.dispatch, {
+      type: 'sdk.create.failed',
+      requestId: 'req-1',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+
+    expect(handled).toBe(true)
+    const session = store.getState().agentChat.sessions['sess-1']
+    expect(session).toBeDefined()
+    expect(session.lost).not.toBe(true)
+    expect((store.getState().agentChat as any).pendingCreateFailures['req-1']).toEqual({
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+  })
 })

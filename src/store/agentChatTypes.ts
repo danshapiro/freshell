@@ -62,6 +62,12 @@ export interface QuestionRequest {
   questions: QuestionDefinition[]
 }
 
+export interface PendingCreateFailure {
+  code: string
+  message: string
+  retryable?: boolean
+}
+
 export interface ChatSessionState {
   sessionId: string
   cliSessionId?: string
@@ -92,6 +98,10 @@ export interface ChatSessionState {
   awaitingDurableHistory?: boolean
   /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
   lost?: boolean
+  /** Number of restore restarts already requested for stale-revision handling. */
+  restoreRetryCount?: number
+  /** Last restore-specific failure code surfaced during hydration. */
+  restoreFailureCode?: string
 }
 
 export interface PendingAgentCreate {
@@ -103,6 +113,8 @@ export interface AgentChatState {
   sessions: Record<string, ChatSessionState>
   /** Maps createRequestId -> sessionId for correlating sdk.created responses */
   pendingCreates: Record<string, PendingAgentCreate>
+  /** Request-scoped pre-session failures keyed by createRequestId. */
+  pendingCreateFailures: Record<string, PendingCreateFailure>
   /** Available models from SDK supportedModels() */
   availableModels: Array<{ value: string; displayName: string; description: string }>
 }

@@ -7,12 +7,13 @@ import type { ChatMessage } from '../../../server/session-history-loader.js'
 function makeMessage(
   role: 'user' | 'assistant',
   text: string,
-  timestamp?: string,
+  options: Partial<ChatMessage> = {},
 ): ChatMessage {
   return {
     role,
     content: [{ type: 'text', text }],
-    ...(timestamp ? { timestamp } : {}),
+    timestamp: '2026-04-03T12:00:00.000Z',
+    ...options,
   }
 }
 
@@ -36,18 +37,30 @@ function makeLiveSession(
 }
 
 describe('agent timeline history source', () => {
-  it('appends live post-resume delta onto durable backlog', async () => {
+  it('returns a typed missing outcome instead of null when no restore authority exists', async () => {
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockResolvedValue(null),
+      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(undefined),
+      getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
+    })
+
+    await expect(source.resolve('missing-session')).resolves.toEqual({
+      kind: 'missing',
+      queryId: 'missing-session',
+    })
+  })
+
+  it('returns a typed merged outcome with canonical turn identity', async () => {
     const source = createAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'older question'),
-        makeMessage('assistant', 'older answer'),
+        makeMessage('user', 'older durable prompt', { messageId: 'durable-1' }),
       ]),
       getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
         sessionId: 'sdk-1',
-        resumeSessionId: '00000000-0000-4000-8000-000000000001',
+        cliSessionId: '00000000-0000-4000-8000-000000000111',
+        resumeSessionId: 'named-resume',
         messages: [
-          makeMessage('user', 'new prompt'),
-          makeMessage('assistant', 'new reply'),
+          makeMessage('assistant', 'live reply', { messageId: 'live-2' }),
         ],
       })),
       getLiveSessionByCliSessionId: vi.fn(),
@@ -56,357 +69,21 @@ describe('agent timeline history source', () => {
 
     const resolved = await source.resolve('sdk-1')
 
-    expect(resolved?.timelineSessionId).toBe('00000000-0000-4000-8000-000000000001')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'older question'),
-      makeMessage('assistant', 'older answer'),
-      makeMessage('user', 'new prompt'),
-      makeMessage('assistant', 'new reply'),
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      timelineSessionId: '00000000-0000-4000-8000-000000000111',
+      latestTurnId: 'turn:live-2',
+      revision: expect.any(Number),
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => ({
+      turnId: turn.turnId,
+      messageId: turn.messageId,
+      ordinal: turn.ordinal,
+    }))).toEqual([
+      { turnId: 'turn:durable-1', messageId: 'durable-1', ordinal: 0 },
+      { turnId: 'turn:live-2', messageId: 'live-2', ordinal: 1 },
     ])
-  })
-
-  it('de-duplicates the overlap when durable history has already flushed the first live delta turn', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'older question'),
-        makeMessage('assistant', 'older answer'),
-        makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-2',
-        resumeSessionId: '00000000-0000-4000-8000-000000000002',
-        messages: [
-          makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-          makeMessage('assistant', 'new reply'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-2')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'older question'),
-      makeMessage('assistant', 'older answer'),
-      makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-      makeMessage('assistant', 'new reply'),
-    ])
-  })
-
-  it('de-duplicates a clearly flushed multi-message overlap even when some shared messages lack timestamps', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'older question', '2026-03-10T10:00:00.000Z'),
-        makeMessage('assistant', 'older answer'),
-        makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-        makeMessage('assistant', 'new reply'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-overlap',
-        resumeSessionId: '00000000-0000-4000-8000-000000000777',
-        messages: [
-          makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-          makeMessage('assistant', 'new reply'),
-          makeMessage('user', 'next prompt', '2026-03-10T10:02:00.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-overlap')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'older question', '2026-03-10T10:00:00.000Z'),
-      makeMessage('assistant', 'older answer'),
-      makeMessage('user', 'new prompt', '2026-03-10T10:01:00.000Z'),
-      makeMessage('assistant', 'new reply'),
-      makeMessage('user', 'next prompt', '2026-03-10T10:02:00.000Z'),
-    ])
-  })
-
-  it('keeps an ambiguous repeated single-message prompt when timestamps show it is a new turn', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-ambiguous',
-        resumeSessionId: '00000000-0000-4000-8000-000000000003',
-        messages: [
-          makeMessage('user', 'continue', '2026-03-10T10:15:00.000Z'),
-          makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-ambiguous')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      makeMessage('user', 'continue', '2026-03-10T10:15:00.000Z'),
-      makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
-    ])
-  })
-
-  it('keeps a repeated single-message prompt when the timestamps differ by seconds', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-seconds-apart',
-        resumeSessionId: '00000000-0000-4000-8000-000000000031',
-        messages: [
-          makeMessage('user', 'continue', '2026-03-10T10:00:30.000Z'),
-          makeMessage('assistant', 'new reply', '2026-03-10T10:00:35.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-seconds-apart')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      makeMessage('user', 'continue', '2026-03-10T10:00:30.000Z'),
-      makeMessage('assistant', 'new reply', '2026-03-10T10:00:35.000Z'),
-    ])
-  })
-
-  it('keeps a repeated single-message prompt when timestamp evidence is missing on one side and logs the ambiguity', async () => {
-    const logDivergence = vi.fn()
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-missing-ts',
-        resumeSessionId: '00000000-0000-4000-8000-000000000099',
-        messages: [
-          makeMessage('user', 'continue'),
-          makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence,
-    })
-
-    const resolved = await source.resolve('sdk-missing-ts')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
-      makeMessage('user', 'continue'),
-      makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
-    ])
-    expect(logDivergence).toHaveBeenCalledWith(expect.objectContaining({
-      queryId: 'sdk-missing-ts',
-      sdkSessionId: 'sdk-missing-ts',
-      timelineSessionId: '00000000-0000-4000-8000-000000000099',
-      liveMode: 'delta',
-      liveCount: 2,
-      durableCount: 1,
-      reason: 'ambiguous_overlap',
-    }))
-  })
-
-  it('keeps a repeated single-message prompt when both copies are timestamp-less and logs the ambiguity', async () => {
-    const logDivergence = vi.fn()
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'continue'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-no-ts',
-        resumeSessionId: '00000000-0000-4000-8000-000000000555',
-        messages: [
-          makeMessage('user', 'continue'),
-          makeMessage('assistant', 'reply'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence,
-    })
-
-    const resolved = await source.resolve('sdk-no-ts')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'continue'),
-      makeMessage('user', 'continue'),
-      makeMessage('assistant', 'reply'),
-    ])
-    expect(logDivergence).toHaveBeenCalledWith(expect.objectContaining({
-      queryId: 'sdk-no-ts',
-      sdkSessionId: 'sdk-no-ts',
-      timelineSessionId: '00000000-0000-4000-8000-000000000555',
-      liveMode: 'delta',
-      liveCount: 2,
-      durableCount: 1,
-      reason: 'ambiguous_overlap',
-    }))
-  })
-
-  it('logs resumed-delta conflicts instead of silently weaving contradictory durable and live turns', async () => {
-    const logDivergence = vi.fn()
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'older durable turn'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-conflict',
-        resumeSessionId: '00000000-0000-4000-8000-000000000556',
-        messages: [
-          makeMessage('assistant', 'contradictory live turn'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence,
-    })
-
-    const resolved = await source.resolve('sdk-conflict')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'older durable turn'),
-      makeMessage('assistant', 'contradictory live turn'),
-    ])
-    expect(logDivergence).toHaveBeenCalledWith(expect.objectContaining({
-      queryId: 'sdk-conflict',
-      sdkSessionId: 'sdk-conflict',
-      timelineSessionId: '00000000-0000-4000-8000-000000000556',
-      liveMode: 'delta',
-      liveCount: 1,
-      durableCount: 1,
-      reason: 'conflict',
-    }))
-  })
-
-  it('prefers the live full transcript when a fresh session has outrun durable JSONL', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'prompt'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-3',
-        cliSessionId: '00000000-0000-4000-8000-000000000004',
-        messages: [
-          makeMessage('user', 'prompt'),
-          makeMessage('assistant', 'reply'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-3')
-    expect(resolved?.timelineSessionId).toBe('00000000-0000-4000-8000-000000000004')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'prompt'),
-      makeMessage('assistant', 'reply'),
-    ])
-  })
-
-  it('prefers the fuller live transcript when a fresh-session shared prefix contains timestamp-less messages', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'prompt', '2026-03-10T10:00:00.000Z'),
-        makeMessage('assistant', 'reply'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-fresh-prefix',
-        cliSessionId: '00000000-0000-4000-8000-000000000778',
-        messages: [
-          makeMessage('user', 'prompt', '2026-03-10T10:00:00.000Z'),
-          makeMessage('assistant', 'reply'),
-          makeMessage('user', 'follow-up', '2026-03-10T10:02:00.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-fresh-prefix')
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'prompt', '2026-03-10T10:00:00.000Z'),
-      makeMessage('assistant', 'reply'),
-      makeMessage('user', 'follow-up', '2026-03-10T10:02:00.000Z'),
-    ])
-  })
-
-  it('keeps named resume targets live-only until a durable Claude UUID is known', async () => {
-    const loadSessionHistory = vi.fn()
-    const source = createAgentHistorySource({
-      loadSessionHistory,
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-named',
-        resumeSessionId: 'worktree-hotfix',
-        messages: [
-          makeMessage('user', 'resume me'),
-          makeMessage('assistant', 'still live only'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-named')
-
-    expect(loadSessionHistory).not.toHaveBeenCalled()
-    expect(resolved?.timelineSessionId).toBeUndefined()
-    expect(resolved?.messages).toEqual([
-      makeMessage('user', 'resume me'),
-      makeMessage('assistant', 'still live only'),
-    ])
-  })
-
-  it('returns durable-only history after restart when no live session exists', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockResolvedValue([
-        makeMessage('user', 'persisted'),
-        makeMessage('assistant', 'persisted reply'),
-      ]),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(undefined),
-      getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('00000000-0000-4000-8000-000000000123')
-    expect(resolved?.timelineSessionId).toBe('00000000-0000-4000-8000-000000000123')
-    expect(resolved?.messages).toHaveLength(2)
-  })
-
-  it('degrades to live-only history when durable history loading fails for a live session', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockRejectedValue(new Error('jsonl read failed')),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
-        sessionId: 'sdk-history-fallback',
-        cliSessionId: '00000000-0000-4000-8000-000000000124',
-        messages: [
-          makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z'),
-          makeMessage('assistant', 'live reply', '2026-03-10T10:00:01.000Z'),
-        ],
-      })),
-      getLiveSessionByCliSessionId: vi.fn(),
-      logDivergence: vi.fn(),
-    })
-
-    const resolved = await source.resolve('sdk-history-fallback')
-
-    expect(resolved).toEqual({
-      liveSessionId: 'sdk-history-fallback',
-      timelineSessionId: '00000000-0000-4000-8000-000000000124',
-      messages: [
-        makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z'),
-        makeMessage('assistant', 'live reply', '2026-03-10T10:00:01.000Z'),
-      ],
-      revision: Date.parse('2026-03-10T10:00:01.000Z'),
-    })
-  })
-
-  it('still throws when durable history loading fails and no live session exists', async () => {
-    const source = createAgentHistorySource({
-      loadSessionHistory: vi.fn().mockRejectedValue(new Error('jsonl read failed')),
-      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(undefined),
-      getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
-      logDivergence: vi.fn(),
-    })
-
-    await expect(source.resolve('00000000-0000-4000-8000-000000000125')).rejects.toThrow('jsonl read failed')
   })
 })

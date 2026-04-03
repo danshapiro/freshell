@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest'
 import agentChatReducer, {
   sessionCreated,
   registerPendingCreate,
+  createFailed,
+  clearPendingCreateFailure,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   addAssistantMessage,
   addUserMessage,
@@ -165,6 +168,33 @@ describe('agentChatSlice', () => {
     })
   })
 
+  it('records request-scoped create failures by requestId', () => {
+    const state = agentChatReducer(initial, createFailed({
+      requestId: 'req-failed',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    }))
+
+    expect((state as any).pendingCreateFailures['req-failed']).toEqual({
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+  })
+
+  it('clears request-scoped create failures independently of session state', () => {
+    let state = agentChatReducer(initial, createFailed({
+      requestId: 'req-failed',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    }))
+    state = agentChatReducer(state, clearPendingCreateFailure({ requestId: 'req-failed' }))
+
+    expect((state as any).pendingCreateFailures['req-failed']).toBeUndefined()
+  })
+
   it('marks a fresh create as history-loaded immediately', () => {
     let state = agentChatReducer(initial, registerPendingCreate({
       requestId: 'fresh-req',
@@ -311,6 +341,36 @@ describe('agentChatSlice', () => {
       cliSessionId: 'cli-running',
       streamingActive: true,
       streamingText: 'partial reply',
+    })
+  })
+
+  it('updates authoritative metadata without reusing the readiness transition', () => {
+    let state = agentChatReducer(initial, sessionCreated({
+      requestId: 'req-meta',
+      sessionId: 'sdk-meta',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-meta',
+      latestTurnId: 'turn-1',
+      status: 'running',
+      timelineSessionId: 'cli-meta',
+      revision: 5,
+    }))
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-meta',
+      cliSessionId: 'cli-meta',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp/project',
+      tools: [{ name: 'Bash' }],
+    }))
+
+    expect(state.sessions['sdk-meta']).toMatchObject({
+      status: 'running',
+      cliSessionId: 'cli-meta',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp/project',
+      tools: [{ name: 'Bash' }],
+      timelineRevision: 5,
     })
   })
 

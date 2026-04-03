@@ -20,12 +20,35 @@ const baseMessages = [
   },
 ]
 
+function toResolvedHistory(sessionId: string, timelineSessionId: string | undefined, messages = baseMessages) {
+  return {
+    kind: 'resolved' as const,
+    queryId: sessionId,
+    liveSessionId: sessionId,
+    timelineSessionId,
+    readiness: 'merged' as const,
+    revision: Date.parse('2026-03-10T10:02:00.000Z'),
+    latestTurnId: `turn:${messages[messages.length - 1]?.messageId ?? `${sessionId}-${messages.length - 1}`}`,
+    turns: messages.map((message, index) => {
+      const messageId = message.messageId ?? `${sessionId}-${index}`
+      return {
+        turnId: `turn:${messageId}`,
+        messageId,
+        ordinal: index,
+        source: index < messages.length - 1 ? 'durable' as const : 'live' as const,
+        message: {
+          ...message,
+          messageId,
+        },
+      }
+    }),
+  }
+}
+
 describe('agent timeline service', () => {
   it('returns recent-first timeline pages with a cursor', async () => {
     const resolve = vi.fn().mockResolvedValue({
-      liveSessionId: 'agent-session-1',
-      messages: baseMessages,
-      revision: Date.parse('2026-03-10T10:02:00.000Z'),
+      ...toResolvedHistory('agent-session-1', undefined),
     })
     const service = createAgentTimelineService({
       agentHistorySource: { resolve },
@@ -59,8 +82,7 @@ describe('agent timeline service', () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
-          liveSessionId: 'agent-session-2',
-          messages: [
+          ...toResolvedHistory('agent-session-2', undefined, [
             {
               role: 'assistant',
               timestamp: '2026-03-10T10:02:00.000Z',
@@ -68,9 +90,9 @@ describe('agent timeline service', () => {
                 { type: 'text', text: 'expanded turn body' },
                 { type: 'text', text: 'with extra content' },
               ],
+              messageId: 'agent-session-2-0',
             },
-          ],
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+          ]),
         }),
       },
     })
@@ -100,16 +122,14 @@ describe('agent timeline service', () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
-          liveSessionId: 'sdk-1',
-          timelineSessionId: '00000000-0000-4000-8000-000000000001',
-          messages: [
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001', [
             {
               role: 'assistant',
               timestamp: '2026-03-10T10:02:00.000Z',
               content: [{ type: 'text', text: 'canonical turn body' }],
+              messageId: 'canonical-body-1',
             },
-          ],
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
+          ]),
         }),
       },
     })
@@ -135,8 +155,12 @@ describe('agent timeline service', () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
         resolve: vi.fn().mockResolvedValue({
+          kind: 'resolved',
+          queryId: 'agent-session-3',
           liveSessionId: 'agent-session-3',
-          messages: [],
+          readiness: 'live_only',
+          latestTurnId: null,
+          turns: [],
           revision: 0,
         }),
       },
@@ -147,5 +171,47 @@ describe('agent timeline service', () => {
       priority: 'background',
       cursor: 'not-a-valid-cursor',
     })).rejects.toThrow(/cursor/i)
+  })
+
+  it('rejects stale timeline-page revisions with the current ledger revision', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
+          revision: 13,
+        }),
+      },
+    })
+
+    await expect(service.getTimelinePage({
+      sessionId: 'sdk-1',
+      priority: 'visible',
+      revision: 12,
+    })).rejects.toMatchObject({
+      code: 'RESTORE_STALE_REVISION',
+      requestedRevision: 12,
+      actualRevision: 13,
+    })
+  })
+
+  it('rejects stale turn-body revisions with the current ledger revision', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
+          revision: 13,
+        }),
+      },
+    })
+
+    await expect(service.getTurnBody({
+      sessionId: 'sdk-1',
+      turnId: 'turn:sdk-1-2',
+      revision: 12,
+    })).rejects.toMatchObject({
+      code: 'RESTORE_STALE_REVISION',
+      requestedRevision: 12,
+      actualRevision: 13,
+    })
   })
 })

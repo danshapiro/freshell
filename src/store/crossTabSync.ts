@@ -7,6 +7,7 @@ import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
 import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
+import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 
@@ -46,9 +47,69 @@ function collectPaneIdsSafe(node: unknown): string[] {
   return ids
 }
 
-function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string) {
+function findLeafContentById(node: unknown, paneId: string): any | undefined {
+  const visit = (candidate: any): any | undefined => {
+    if (!candidate || typeof candidate !== 'object') return undefined
+    if (candidate.type === 'leaf') {
+      return candidate.id === paneId ? candidate.content : undefined
+    }
+    if (candidate.type === 'split' && Array.isArray(candidate.children) && candidate.children.length >= 2) {
+      return visit(candidate.children[0]) ?? visit(candidate.children[1])
+    }
+    return undefined
+  }
+
+  return visit(node)
+}
+
+function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: unknown): unknown {
+  const visit = (candidate: any): any => {
+    if (!candidate || typeof candidate !== 'object') return candidate
+    if (candidate.type === 'leaf') {
+      const localContent = findLeafContentById(localLayout, candidate.id)
+      const localResumeSessionId = localContent?.resumeSessionId
+      const remoteResumeSessionId = candidate.content?.resumeSessionId
+      if (
+        (candidate.content?.kind === 'terminal' || candidate.content?.kind === 'agent-chat')
+        && shouldPreserveLocalCanonicalResumeSessionId(localResumeSessionId, remoteResumeSessionId)
+      ) {
+        return {
+          ...candidate,
+          content: {
+            ...candidate.content,
+            resumeSessionId: localResumeSessionId,
+          },
+        }
+      }
+      return candidate
+    }
+    if (candidate.type === 'split' && Array.isArray(candidate.children) && candidate.children.length >= 2) {
+      return {
+        ...candidate,
+        children: [
+          visit(candidate.children[0]),
+          visit(candidate.children[1]),
+        ],
+      }
+    }
+    return candidate
+  }
+
+  return visit(remoteNode)
+}
+
+function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string, previousRaw?: string) {
   const parsed = parsePersistedLayoutRaw(raw)
   if (!parsed) return
+  const previousParsed = previousRaw ? parsePersistedLayoutRaw(previousRaw) : null
+  const state = store.getState()
+  const localLayouts = (state?.panes?.layouts || {}) as Record<string, unknown>
+  const protectedLayouts = Object.fromEntries(
+    Object.entries(parsed.panes.layouts || {}).map(([tabId, node]) => [
+      tabId,
+      protectCanonicalPaneResumeIdentity(node, localLayouts[tabId]),
+    ]),
+  )
 
   // Hydrate tabs with merge
   store.dispatch({
@@ -58,15 +119,19 @@ function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string) {
       renameRequestTabId: null,
       tombstones: parsed.tombstones,
     } as any),
-    meta: { skipPersist: true, source: 'cross-tab' },
+    meta: {
+      skipPersist: true,
+      source: 'cross-tab',
+      localLayoutPersistedAt: previousParsed?.persistedAt,
+      remoteLayoutPersistedAt: parsed.persistedAt,
+    },
   })
 
   // Hydrate panes
-  const state = store.getState()
   const localActiveByTab = (state?.panes?.activePane || {}) as Record<string, string>
   const nextActive: Record<string, string> = {}
 
-  for (const [tabId, node] of Object.entries(parsed.panes.layouts || {})) {
+  for (const [tabId, node] of Object.entries(protectedLayouts)) {
     const leafIds = collectPaneIdsSafe(node)
     if (leafIds.length === 0) continue
     const leafSet = new Set(leafIds)
@@ -88,7 +153,7 @@ function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string) {
 
   store.dispatch({
     ...hydratePanes({
-      layouts: parsed.panes.layouts as any,
+      layouts: protectedLayouts as any,
       activePane: nextActive,
       paneTitles: parsed.panes.paneTitles,
       paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
@@ -151,7 +216,7 @@ function handleIncomingRaw(
   previousRaw?: string,
 ) {
   if (key === LAYOUT_STORAGE_KEY) {
-    dispatchHydrateLayoutFromPersisted(store, raw)
+    dispatchHydrateLayoutFromPersisted(store, raw, previousRaw)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
   }

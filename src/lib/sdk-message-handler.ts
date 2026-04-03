@@ -3,7 +3,9 @@ import type { ChatContentBlock } from '@/store/agentChatTypes'
 import type { QuestionDefinition } from '@/store/agentChatTypes'
 import {
   sessionCreated,
+  createFailed,
   sessionInit,
+  sessionMetadataReceived,
   addAssistantMessage,
   setStreaming,
   appendStreamDelta,
@@ -60,8 +62,27 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       return true
     }
 
+    case 'sdk.create.failed':
+      dispatch(createFailed({
+        requestId: msg.requestId as string,
+        code: msg.code as string,
+        message: msg.message as string,
+        retryable: msg.retryable as boolean | undefined,
+      }))
+      return true
+
     case 'sdk.session.init':
       dispatch(sessionInit({
+        sessionId: msg.sessionId as string,
+        cliSessionId: msg.cliSessionId as string | undefined,
+        model: msg.model as string | undefined,
+        cwd: msg.cwd as string | undefined,
+        tools: msg.tools as Array<{ name: string }> | undefined,
+      }))
+      return true
+
+    case 'sdk.session.metadata':
+      dispatch(sessionMetadataReceived({
         sessionId: msg.sessionId as string,
         cliSessionId: msg.cliSessionId as string | undefined,
         model: msg.model as string | undefined,

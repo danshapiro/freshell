@@ -81,6 +81,7 @@ function normalizePaneContent(
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
+      createError: input.createError,
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,
@@ -1052,6 +1053,40 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    restartAgentChatCreate: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const { tabId, paneId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function restartContent(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') {
+          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+            return node
+          }
+          return {
+            ...node,
+            content: normalizePaneContent({
+              ...node.content,
+              sessionId: undefined,
+              createRequestId: nanoid(),
+              status: 'creating',
+              createError: undefined,
+            }, node.content),
+          }
+        }
+        return {
+          ...node,
+          children: [restartContent(node.children[0]), restartContent(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = restartContent(root)
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
     requestPaneRefresh: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -1319,6 +1354,7 @@ export const {
   swapPanes,
   updatePaneContent,
   mergePaneContent,
+  restartAgentChatCreate,
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,

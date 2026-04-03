@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest'
 import tabsReducer, { addTab, hydrateTabs, removeTab, updateTab } from '@/store/tabsSlice'
 import type { Tab } from '@/store/types'
 import type { TabsState } from '@/store/tabsSlice'
+import { sessionMetadataKey } from '@/lib/session-metadata'
 
 function makeTab(overrides: Partial<Tab> & { id: string }): Tab {
   return {
@@ -226,6 +227,64 @@ describe('hydrateTabs merge', () => {
     const tombstoneIds = result.tombstones.map(t => t.id)
     expect(tombstoneIds).toContain('local-deleted')
     expect(tombstoneIds).toContain('remote-deleted')
+  })
+
+  it('allows a newer remote tab change to merge without regressing canonical durable fallback identity', () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const localTab = makeTab({
+      id: 'tab-1',
+      title: 'Local title',
+      mode: 'shell',
+      codingCliProvider: 'claude',
+      updatedAt: 100,
+      resumeSessionId: canonicalSessionId,
+      sessionMetadataByKey: {
+        [sessionMetadataKey('claude', canonicalSessionId)]: {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Continue locally',
+        },
+      },
+    })
+    const remoteTab = makeTab({
+      id: 'tab-1',
+      title: 'Renamed elsewhere',
+      mode: 'shell',
+      updatedAt: 200,
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        [sessionMetadataKey('claude', 'named-resume')]: {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Remote stale resume',
+        },
+      },
+    })
+
+    const result = tabsReducer(
+      makeState([localTab], 'tab-1'),
+      {
+        ...hydrateTabs({
+          tabs: [remoteTab],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+          tombstones: [],
+        }),
+        meta: {
+          localLayoutPersistedAt: 200,
+          remoteLayoutPersistedAt: 250,
+        },
+      } as any,
+    )
+
+    expect(result.tabs[0]).toEqual(expect.objectContaining({
+      title: 'Renamed elsewhere',
+      resumeSessionId: canonicalSessionId,
+    }))
+    expect(result.tabs[0].sessionMetadataByKey).toEqual(expect.objectContaining({
+      [sessionMetadataKey('claude', canonicalSessionId)]: expect.objectContaining({
+        sessionType: 'freshclaude',
+      }),
+    }))
+    expect(result.tabs[0].sessionMetadataByKey).not.toHaveProperty(sessionMetadataKey('claude', 'named-resume'))
   })
 })
 

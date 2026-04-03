@@ -14,6 +14,7 @@ import agentChatReducer, {
   turnBodyReceived,
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
@@ -374,6 +375,41 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
   })
 
+  it('requests one fresh sdk.attach when the first visible timeline read returns RESTORE_STALE_REVISION', async () => {
+    getAgentTimelinePage.mockRejectedValue({
+      status: 409,
+      message: 'Stale restore revision',
+      details: {
+        code: 'RESTORE_STALE_REVISION',
+        currentRevision: 13,
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 12,
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+      expect(attachCalls[1]?.[0]).toEqual({
+        type: 'sdk.attach',
+        sessionId: 'sess-reload-1',
+      })
+    })
+  })
+
   it('defers restored timeline hydration while hidden and fetches exactly once when the pane becomes visible', async () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'sess-reload-1',
@@ -605,6 +641,54 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
     }))
+  })
+
+  it('dispatches a targeted flush when a canonical durable id upgrades from named resume', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const store = makeStoreWithTabs()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-flush',
+      sessionId: 'sdk-flush-1',
+      status: 'starting',
+      resumeSessionId: 'named-resume',
+    } satisfies AgentChatPaneContent
+    store.dispatch(addTab({
+      id: 't-flush',
+      title: 'Flush Tab',
+      mode: 'claude',
+      codingCliProvider: 'claude',
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        'claude:named-resume': {
+          sessionType: 'freshclaude',
+        },
+      },
+    }))
+    store.dispatch(initLayout({ tabId: 't-flush', paneId: 'p1', content: pane }))
+    dispatchSpy.mockClear()
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t-flush" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-flush-1',
+        latestTurnId: 'turn-live-4',
+        status: 'running',
+        timelineSessionId: canonicalSessionId,
+        revision: 9,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(dispatchSpy).toHaveBeenCalledWith(flushPersistedLayoutNow())
+    })
   })
 
   it('shows a restored partial assistant stream after reconnect', () => {

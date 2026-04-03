@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
-import type { AgentTimelineService } from './service.js'
+import { RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
 import {
@@ -29,6 +29,7 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
     const query = AgentTimelinePageQuerySchema.safeParse({
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
+      revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
       includeBodies: typeof req.query.includeBodies === 'string' ? req.query.includeBodies : undefined,
     })
@@ -62,8 +63,11 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
         return
       }
       const message = error instanceof Error ? error.message : 'Agent timeline request failed'
-      const status = /cursor/i.test(message) ? 400 : 500
-      res.status(status).json({ error: message })
+      const status = error instanceof RestoreStaleRevisionError ? 409 : /cursor/i.test(message) ? 400 : 500
+      const body = error instanceof RestoreStaleRevisionError
+        ? { error: 'Stale restore revision', code: error.code, currentRevision: error.actualRevision }
+        : { error: message }
+      res.status(status).json(body)
     }
   })
 
@@ -73,12 +77,22 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
       return res.status(400).json({ error: 'Invalid request', details: params.error.issues })
     }
 
-    const turn = await deps.service.getTurnBody(params.data)
-    if (!turn) {
-      return res.status(404).json({ error: 'Turn not found' })
-    }
+    try {
+      const revision = typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined
+      const turn = await deps.service.getTurnBody({ ...params.data, revision })
+      if (!turn) {
+        return res.status(404).json({ error: 'Turn not found' })
+      }
 
-    res.json(turn)
+      res.json(turn)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Agent turn request failed'
+      const status = error instanceof RestoreStaleRevisionError ? 409 : 500
+      const body = error instanceof RestoreStaleRevisionError
+        ? { error: 'Stale restore revision', code: error.code, currentRevision: error.actualRevision }
+        : { error: message }
+      res.status(status).json(body)
+    }
   })
 
   return router

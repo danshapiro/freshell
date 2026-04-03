@@ -7,6 +7,38 @@ import { createAgentTimelineService } from '../../../server/agent-timeline/servi
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
+function makeResolvedHistory(options: {
+  queryId: string
+  liveSessionId?: string
+  timelineSessionId?: string
+  revision: number
+  messages: Array<{
+    role: 'user' | 'assistant'
+    timestamp: string
+    content: Array<{ type: 'text'; text: string }>
+  }>
+}) {
+  return {
+    kind: 'resolved' as const,
+    queryId: options.queryId,
+    liveSessionId: options.liveSessionId,
+    timelineSessionId: options.timelineSessionId,
+    readiness: options.liveSessionId && options.timelineSessionId ? 'merged' as const : options.timelineSessionId ? 'durable_only' as const : 'live_only' as const,
+    revision: options.revision,
+    latestTurnId: options.messages.length > 0 ? `turn-${options.messages.length - 1}` : null,
+    turns: options.messages.map((message, index) => ({
+      turnId: `turn-${index}`,
+      messageId: `message-${index}`,
+      ordinal: index,
+      source: options.timelineSessionId ? 'durable' as const : 'live' as const,
+      message: {
+        ...message,
+        messageId: `message-${index}`,
+      },
+    })),
+  }
+}
+
 describe('GET /api/agent-sessions/:sessionId/timeline', () => {
   let app: Express
   let getTimelinePage: ReturnType<typeof vi.fn>
@@ -115,7 +147,8 @@ describe('agent timeline router with the real service', () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-session-321',
           liveSessionId: 'sdk-session-321',
           timelineSessionId: canonicalSessionId,
           revision: 123,
@@ -131,7 +164,7 @@ describe('agent timeline router with the real service', () => {
               content: [{ type: 'text', text: 'latest reply' }],
             },
           ],
-        }),
+        })),
       },
     })
 
@@ -153,5 +186,50 @@ describe('agent timeline router with the real service', () => {
     expect(turnResponse.status).toBe(200)
     expect(turnResponse.body.sessionId).toBe(canonicalSessionId)
     expect(turnResponse.body.turnId).toBe(timelineResponse.body.items[0].turnId)
+  })
+
+  it('rejects stale page and turn-body revisions with RESTORE_STALE_REVISION', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000654'
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-session-654',
+          liveSessionId: 'sdk-session-654',
+          timelineSessionId: canonicalSessionId,
+          revision: 13,
+          messages: [
+            {
+              role: 'assistant',
+              timestamp: '2026-03-10T10:01:00.000Z',
+              content: [{ type: 'text', text: 'latest reply' }],
+            },
+          ],
+        })),
+      },
+    })
+
+    const app = createAuthedApp(service)
+
+    const staleTimeline = await request(app)
+      .get('/api/agent-sessions/sdk-session-654/timeline?priority=visible&revision=12')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(staleTimeline.status).toBe(409)
+    expect(staleTimeline.body).toEqual({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })
+
+    const staleTurn = await request(app)
+      .get('/api/agent-sessions/sdk-session-654/turns/turn-0?revision=12')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(staleTurn.status).toBe(409)
+    expect(staleTurn.body).toEqual({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })
   })
 })

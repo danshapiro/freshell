@@ -112,6 +112,56 @@ describe('sdk-message-handler', () => {
     })
   })
 
+  it('dispatches createFailed on sdk.create.failed without fabricating a session id', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.create.failed',
+      requestId: 'req-1',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/createFailed',
+      payload: {
+        requestId: 'req-1',
+        code: 'RESTORE_INTERNAL',
+        message: 'boom',
+        retryable: true,
+      },
+    })
+  })
+
+  it('dispatches sessionMetadataReceived on sdk.session.metadata', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.session.metadata',
+      sessionId: 's1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+      cwd: '/home/user',
+      tools: [{ name: 'Bash' }],
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/sessionMetadataReceived',
+      payload: {
+        sessionId: 's1',
+        cliSessionId: 'cli-abc',
+        model: 'claude-opus-4-6',
+        cwd: '/home/user',
+        tools: [{ name: 'Bash' }],
+      },
+    })
+  })
+
   it('dispatches turnResult on sdk.result', () => {
     const { dispatch, calls } = createMockDispatch()
 

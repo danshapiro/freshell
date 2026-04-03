@@ -37,6 +37,35 @@ function makeMessage(role: 'user' | 'assistant', text: string, timestamp?: strin
   }
 }
 
+function makeResolvedHistory(options: {
+  queryId?: string
+  liveSessionId?: string
+  timelineSessionId?: string
+  revision?: number
+  messages: ReturnType<typeof makeMessage>[]
+}) {
+  const queryId = options.queryId ?? options.liveSessionId ?? options.timelineSessionId ?? 'sdk-sess-1'
+  return {
+    kind: 'resolved' as const,
+    queryId,
+    liveSessionId: options.liveSessionId,
+    timelineSessionId: options.timelineSessionId,
+    readiness: options.liveSessionId && options.timelineSessionId ? 'merged' as const : options.timelineSessionId ? 'durable_only' as const : 'live_only' as const,
+    revision: options.revision ?? 1,
+    latestTurnId: options.messages.length > 0 ? `turn-${options.messages.length - 1}` : null,
+    turns: options.messages.map((message, index) => ({
+      turnId: `turn-${index}`,
+      messageId: `message-${index}`,
+      ordinal: index,
+      source: options.timelineSessionId ? 'durable' as const : 'live' as const,
+      message: {
+        ...message,
+        messageId: `message-${index}`,
+      },
+    })),
+  }
+}
+
 describe('WS Handler SDK Integration', () => {
   let originalAuthToken: string | undefined
 
@@ -245,11 +274,12 @@ describe('WS Handler SDK Integration', () => {
       registry = new TerminalRegistry()
       loadSessionHistoryMock.mockReset()
       mockHistorySource = {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-sess-1',
           liveSessionId: 'sdk-sess-1',
           revision: 1,
           messages: [makeMessage('user', 'hello', '2026-01-01T00:00:00Z')],
-        }),
+        })),
       }
 
       mockSdkBridge = {
@@ -387,6 +417,46 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('does not emit sdk.created when create-time restore resolution fails', async () => {
+      mockHistorySource.resolve.mockResolvedValue({
+        kind: 'fatal',
+        code: 'RESTORE_INTERNAL',
+        message: 'boom',
+      })
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const response = await new Promise<any>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.create.failed') {
+              ws.off('message', onMessage)
+              resolve(parsed)
+            }
+          }
+          ws.on('message', onMessage)
+          ws.send(JSON.stringify({
+            type: 'sdk.create',
+            requestId: 'req-fail',
+            cwd: '/tmp/project',
+          }))
+        })
+
+        expect(response).toEqual({
+          type: 'sdk.create.failed',
+          requestId: 'req-fail',
+          code: 'RESTORE_INTERNAL',
+          message: 'boom',
+          retryable: true,
+        })
+        expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-1')
+      } finally {
+        ws.close()
+      }
+    })
+
     it('routes sdk.send to sdkBridge.sendUserMessage', async () => {
       const ws = await connectAndAuth()
       try {
@@ -502,11 +572,12 @@ describe('WS Handler SDK Integration', () => {
     })
 
     it('routes sdk.attach and returns snapshot + status without sdk.history', async () => {
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-1',
         liveSessionId: 'sdk-sess-1',
         revision: 1,
         messages: [makeMessage('user', 'hello', '2026-01-01T00:00:00Z')],
-      })
+      }))
       const ws = await connectAndAuth()
       try {
         const messages: any[] = []
@@ -562,7 +633,8 @@ describe('WS Handler SDK Integration', () => {
         pendingPermissions: new Map(),
         pendingQuestions: new Map(),
       })
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-1',
         liveSessionId: 'sdk-sess-1',
         timelineSessionId: 'cli-sess-1',
         revision: 123,
@@ -571,7 +643,7 @@ describe('WS Handler SDK Integration', () => {
           makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
           makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
         ],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -636,7 +708,8 @@ describe('WS Handler SDK Integration', () => {
         })
         return { off: () => {}, replayed: true }
       })
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-1',
         liveSessionId: 'sdk-sess-1',
         timelineSessionId: 'cli-sess-1',
         revision: 123,
@@ -645,7 +718,7 @@ describe('WS Handler SDK Integration', () => {
           makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
           makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
         ],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -689,14 +762,15 @@ describe('WS Handler SDK Integration', () => {
     it('hydrates sdk.attach from durable Claude history when no live SDK session exists', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
       mockSdkBridge.getSession.mockReturnValue(undefined)
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: durableSessionId,
         timelineSessionId: durableSessionId,
         revision: 123,
         messages: [
           makeMessage('user', 'Earlier question', '2026-03-10T10:00:00.000Z'),
           makeMessage('assistant', 'Earlier answer', '2026-03-10T10:00:01.000Z'),
         ],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -773,7 +847,8 @@ describe('WS Handler SDK Integration', () => {
         subscriptionListener = listener
         return { off: () => {}, replayed: false }
       })
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: durableSessionId,
         liveSessionId: liveSession.sessionId,
         timelineSessionId: durableSessionId,
         revision: 123,
@@ -782,7 +857,7 @@ describe('WS Handler SDK Integration', () => {
           makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
           makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
         ],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -863,7 +938,8 @@ describe('WS Handler SDK Integration', () => {
 
     it('for resumed sdk.create sends sdk.created, then sdk.session.snapshot, then sdk.session.init', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-1',
         liveSessionId: 'sdk-sess-1',
         timelineSessionId: durableSessionId,
         revision: 123,
@@ -871,7 +947,7 @@ describe('WS Handler SDK Integration', () => {
           makeMessage('user', 'Earlier question', '2026-03-10T10:00:00.000Z'),
           makeMessage('assistant', 'Earlier answer', '2026-03-10T10:00:01.000Z'),
         ],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -927,11 +1003,12 @@ describe('WS Handler SDK Integration', () => {
         status: 'starting',
         messages: [],
       })
-      mockHistorySource.resolve.mockResolvedValue({
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-named',
         liveSessionId: 'sdk-sess-named',
         revision: 1,
         messages: [makeMessage('user', 'live only', '2026-03-10T10:00:00.000Z')],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {
@@ -949,7 +1026,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('returns sdk.error instead of fabricating a live-only snapshot when sdk.create history resolution fails unexpectedly', async () => {
+    it('returns sdk.create.failed instead of fabricating a live-only snapshot when sdk.create history resolution fails unexpectedly', async () => {
       mockSdkBridge.createSession.mockResolvedValue({
         sessionId: 'sdk-sess-live-only',
         status: 'running',
@@ -971,14 +1048,11 @@ describe('WS Handler SDK Integration', () => {
               parsed.type === 'sdk.created'
               || parsed.type === 'sdk.session.snapshot'
               || parsed.type === 'sdk.session.init'
-              || parsed.type === 'sdk.error'
+              || parsed.type === 'sdk.create.failed'
             ) {
               messages.push(parsed)
             }
-            if (
-              messages.some((message) => message.type === 'sdk.created')
-              && messages.some((message) => message.type === 'sdk.error')
-            ) {
+            if (messages.some((message) => message.type === 'sdk.create.failed')) {
               ws.off('message', onMessage)
               resolve()
             }
@@ -993,18 +1067,17 @@ describe('WS Handler SDK Integration', () => {
 
         await collected
 
-        expect(messages.find((message) => message.type === 'sdk.created')).toEqual(expect.objectContaining({
-          type: 'sdk.created',
-          sessionId: 'sdk-sess-live-only',
-        }))
-        expect(messages.find((message) => message.type === 'sdk.error')).toEqual({
-          type: 'sdk.error',
-          sessionId: 'sdk-sess-live-only',
-          code: 'INTERNAL_ERROR',
-          message: 'Failed to restore SDK session history',
+        expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
+        expect(messages.find((message) => message.type === 'sdk.create.failed')).toEqual({
+          type: 'sdk.create.failed',
+          requestId: 'req-live-only',
+          code: 'RESTORE_INTERNAL',
+          message: 'jsonl read failed',
+          retryable: true,
         })
         expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
         expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-live-only')
       } finally {
         ws.close()
       }

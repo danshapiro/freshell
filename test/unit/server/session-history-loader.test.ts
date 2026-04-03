@@ -16,12 +16,12 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages).toHaveLength(2)
-    expect(messages[0]).toEqual({
+    expect(messages[0]).toMatchObject({
       role: 'user',
       content: [{ type: 'text', text: 'Hello' }],
       timestamp: '2026-01-01T00:00:01Z',
     })
-    expect(messages[1]).toEqual({
+    expect(messages[1]).toMatchObject({
       role: 'assistant',
       content: [{ type: 'text', text: 'Hi there!' }],
       timestamp: '2026-01-01T00:00:02Z',
@@ -37,12 +37,12 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages).toHaveLength(2)
-    expect(messages[0]).toEqual({
+    expect(messages[0]).toMatchObject({
       role: 'user',
       content: [{ type: 'text', text: 'What is 2+2?' }],
       timestamp: '2026-01-01T00:00:01Z',
     })
-    expect(messages[1]).toEqual({
+    expect(messages[1]).toMatchObject({
       role: 'assistant',
       content: [{ type: 'text', text: '2+2 equals 4.' }],
       timestamp: '2026-01-01T00:00:02Z',
@@ -105,6 +105,31 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages[0].model).toBe('claude-opus-4-6')
+  })
+
+  it('preserves authoritative upstream message ids when present', () => {
+    const content = [
+      '{"type":"assistant","message":{"id":"upstream-msg-1","role":"assistant","content":[{"type":"text","text":"Hi"}],"model":"claude-opus-4-6"},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages[0].messageId).toBe('upstream-msg-1')
+  })
+
+  it('synthesizes deterministic message ids for idless equivalent rewrites', () => {
+    const original = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello  \\r\\nworld"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+    const rewritten = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello  \\nworld"}]},"timestamp":"2026-01-02T00:00:01Z"}',
+    ].join('\n')
+
+    const originalMessages = extractChatMessagesFromJsonl(original)
+    const rewrittenMessages = extractChatMessagesFromJsonl(rewritten)
+
+    expect(originalMessages[0].messageId).toBeDefined()
+    expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
   })
 })
 

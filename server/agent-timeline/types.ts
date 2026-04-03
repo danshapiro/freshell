@@ -1,4 +1,5 @@
 import type { ChatMessage } from '../session-history-loader.js'
+import type { CanonicalTurn } from './ledger.js'
 import type {
   AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
 } from '../../shared/read-models.js'
@@ -7,6 +8,9 @@ export type AgentTimelinePageQuery = SharedAgentTimelinePageQuery
 
 export type AgentTimelineItem = {
   turnId: string
+  messageId: string
+  ordinal: number
+  source: CanonicalTurn['source']
   sessionId: string
   role: ChatMessage['role']
   summary: string
@@ -15,6 +19,7 @@ export type AgentTimelineItem = {
 
 export type AgentTimelinePage = {
   sessionId: string
+  latestTurnId: string | null
   items: AgentTimelineItem[]
   nextCursor: string | null
   revision: number
@@ -25,5 +30,8 @@ export type AgentTimelinePage = {
 export type AgentTimelineTurn = {
   sessionId: string
   turnId: string
+  messageId: string
+  ordinal: number
+  source: CanonicalTurn['source']
   message: ChatMessage
 }

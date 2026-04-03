@@ -205,6 +205,7 @@ export async function getAgentTimelinePage(
     `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
+      ['revision', parsed.revision],
       ['limit', parsed.limit],
       ['includeBodies', parsed.includeBodies ? 'true' : undefined],
     ])}`,
@@ -215,11 +216,20 @@ export async function getAgentTimelinePage(
 export async function getAgentTurnBody(
   sessionId: string,
   turnId: string,
-  options: ApiRequestOptions = {},
+  queryOrOptions: ApiRequestOptions | { revision?: number; signal?: AbortSignal } = {},
+  maybeOptions: ApiRequestOptions = {},
 ): Promise<any> {
+  const query = 'revision' in queryOrOptions || 'signal' in queryOrOptions
+    ? queryOrOptions as { revision?: number; signal?: AbortSignal }
+    : {}
+  const options = ('revision' in queryOrOptions)
+    ? maybeOptions
+    : queryOrOptions as ApiRequestOptions
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}`,
-    options,
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+      ['revision', query.revision],
+    ])}`,
+    { ...options, signal: query.signal ?? options.signal },
   )
 }
 

@@ -22,6 +22,7 @@ import panesReducer, {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
+  restartAgentChatCreate,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -334,6 +335,35 @@ describe('panesSlice', () => {
       if (leaf.content.kind === 'terminal') {
         // Non-UUID resume names are valid for Claude (named resume support)
         expect(leaf.content.resumeSessionId).toBe('not-a-uuid')
+      }
+    })
+  })
+
+  describe('restartAgentChatCreate', () => {
+    it('moves an agent-chat pane into stable create-failed state until an explicit retry restarts it', () => {
+      const state = panesReducer(
+        stateWithLeaf('pane-agent', {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-1',
+          status: 'create-failed' as any,
+          createError: {
+            code: 'RESTORE_INTERNAL',
+            message: 'boom',
+            retryable: true,
+          },
+        } as any),
+        restartAgentChatCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
+      )
+
+      const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(layout.content).toMatchObject({
+        kind: 'agent-chat',
+        status: 'creating',
+      })
+      if (layout.content.kind === 'agent-chat') {
+        expect((layout.content as any).createError).toBeUndefined()
+        expect(layout.content.createRequestId).not.toBe('req-1')
       }
     })
   })

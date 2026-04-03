@@ -2,11 +2,12 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
+import { updatePaneContent, mergePaneContent, restartAgentChatCreate } from '@/store/panesSlice'
 import { updateTab } from '@/store/tabsSlice'
 import {
   addUserMessage,
   clearPendingCreate,
+  clearPendingCreateFailure,
   registerPendingCreate,
   removePermission,
   removeQuestion,
@@ -28,9 +29,8 @@ import { setSessionMetadata } from '@/lib/api'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
-import { sessionMetadataKey } from '@/lib/session-metadata'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
-import type { Tab } from '@/store/types'
+import { buildAgentChatPersistedIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -64,6 +64,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const providerLabel = providerConfig?.label ?? 'Agent Chat'
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
+  const staleRetryAttachKeyRef = useRef<string | null>(null)
   const composerRef = useRef<ChatComposerHandle>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -78,6 +79,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Resolve pendingCreates -> pane sessionId
   const pendingSessionId = useAppSelector(
     (s) => s.agentChat.pendingCreates[paneContent.createRequestId]?.sessionId,
+  )
+  const pendingCreateFailure = useAppSelector(
+    (s) => s.agentChat.pendingCreateFailures[paneContent.createRequestId],
   )
   const sessionId = paneContent.sessionId
   const session = useAppSelector(
@@ -154,6 +158,23 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     triggerRecovery()
   }, [sessionLost, paneContent.sessionId, suppressNetworkEffects, triggerRecovery])
 
+  useEffect(() => {
+    if (suppressNetworkEffects) return
+    if (!paneContent.sessionId) return
+    if (session?.restoreFailureCode !== 'RESTORE_STALE_REVISION') return
+    if ((session.restoreRetryCount ?? 0) !== 1) return
+    const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}`
+    if (staleRetryAttachKeyRef.current === retryKey) return
+    staleRetryAttachKeyRef.current = retryKey
+    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
+  }, [
+    paneContent.sessionId,
+    session?.restoreFailureCode,
+    session?.restoreRetryCount,
+    suppressNetworkEffects,
+    ws,
+  ])
+
   // Fallback: auto-recover when restore times out (e.g. server restarted, error was
   // not routed through sdk.error). Safety net for the immediate recovery above.
   useEffect(() => {
@@ -172,6 +193,23 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }))
     dispatch(clearPendingCreate({ requestId: paneContent.createRequestId }))
   }, [pendingSessionId, paneContent.sessionId, paneContent.createRequestId, tabId, paneId, dispatch])
+
+  useEffect(() => {
+    if (!pendingCreateFailure || paneContent.sessionId) return
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: {
+        sessionId: undefined,
+        status: 'create-failed',
+        createError: pendingCreateFailure,
+      } as Partial<AgentChatPaneContent>,
+    }))
+    dispatch(clearPendingCreateFailure({ requestId: paneContent.createRequestId }))
+    dispatch(clearPendingCreate({ requestId: paneContent.createRequestId }))
+    createSentRef.current = false
+    attachSentRef.current = false
+  }, [pendingCreateFailure, paneContent.sessionId, paneContent.createRequestId, tabId, paneId, dispatch])
 
   // Update pane status from session state.
   // Uses mergePaneContent (not updatePaneContent) to avoid stale-ref overwrites when
@@ -198,71 +236,37 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   // Persist the canonical durable Claude ID as soon as the server knows it so later
   // reload/recovery paths do not depend on sdk.session.init arriving first.
-  const durableResumeSessionId = session?.timelineSessionId ?? session?.cliSessionId
   useEffect(() => {
-    if (!durableResumeSessionId) return
-    if (paneContentRef.current.resumeSessionId !== durableResumeSessionId) {
+    const metadataProvider = providerConfig?.codingCliProvider
+      ?? currentTab?.codingCliProvider
+      ?? (currentTab?.mode !== 'shell' ? currentTab?.mode : undefined)
+    const identityUpdate = buildAgentChatPersistedIdentityUpdate({
+      session,
+      paneContent: paneContentRef.current,
+      currentTab,
+      metadataProvider,
+    })
+    if (!identityUpdate) return
+
+    if (identityUpdate.paneUpdates) {
       dispatch(mergePaneContent({
         tabId,
         paneId,
-        updates: { resumeSessionId: durableResumeSessionId },
+        updates: identityUpdate.paneUpdates,
       }))
     }
 
-    if (!currentTab) return
-    const metadataProvider = providerConfig?.codingCliProvider
-      ?? currentTab.codingCliProvider
-      ?? (currentTab.mode !== 'shell' ? currentTab.mode : undefined)
-
-    const updates: Partial<Tab> = {}
-    if (currentTab.resumeSessionId !== durableResumeSessionId) {
-      updates.resumeSessionId = durableResumeSessionId
-    }
-    if (metadataProvider && currentTab.codingCliProvider !== metadataProvider) {
-      updates.codingCliProvider = metadataProvider
+    if (currentTab && identityUpdate.tabUpdates) {
+      dispatch(updateTab({
+        id: currentTab.id,
+        updates: identityUpdate.tabUpdates,
+      }))
     }
 
-    if (metadataProvider) {
-      const existing = currentTab.sessionMetadataByKey ?? {}
-      const nextKey = sessionMetadataKey(metadataProvider, durableResumeSessionId)
-      const priorIds = new Set<string>([
-        currentTab.resumeSessionId,
-        paneContentRef.current.resumeSessionId,
-      ].filter((value): value is string => typeof value === 'string' && value.length > 0))
-      const carriedMetadata = Array.from(priorIds)
-        .map((sessionId) => existing[sessionMetadataKey(metadataProvider, sessionId)])
-        .reduce<Record<string, unknown>>(
-          (acc, metadata) => (metadata ? { ...acc, ...metadata } : acc),
-          {},
-        )
-      const nextSessionMetadataByKey = { ...existing }
-
-      for (const priorId of priorIds) {
-        const priorKey = sessionMetadataKey(metadataProvider, priorId)
-        if (priorKey !== nextKey) {
-          delete nextSessionMetadataByKey[priorKey]
-        }
-      }
-
-      nextSessionMetadataByKey[nextKey] = {
-        ...carriedMetadata,
-        ...(existing[nextKey] ?? {}),
-        sessionType: paneContent.provider,
-      }
-
-      const currentJson = JSON.stringify(existing)
-      const nextJson = JSON.stringify(nextSessionMetadataByKey)
-      if (currentJson !== nextJson) {
-        updates.sessionMetadataByKey = nextSessionMetadataByKey
-      }
+    if (identityUpdate.shouldFlush) {
+      dispatch(flushPersistedLayoutNow())
     }
-
-    if (Object.keys(updates).length === 0) return
-    dispatch(updateTab({
-      id: currentTab.id,
-      updates,
-    }))
-  }, [currentTab, dispatch, durableResumeSessionId, paneContent.provider, paneId, providerConfig?.codingCliProvider, tabId])
+  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabId])
 
   // Tag this Claude Code session as belonging to this agent-chat provider.
   // Fires once when cliSessionId first becomes available (including resumes).
@@ -270,20 +274,21 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!durableResumeSessionId) return
-    if (taggedSessionRef.current === durableResumeSessionId) return
-    taggedSessionRef.current = durableResumeSessionId
+    const preferredResumeSessionId = session?.timelineSessionId ?? session?.cliSessionId
+    if (!preferredResumeSessionId) return
+    if (taggedSessionRef.current === preferredResumeSessionId) return
+    taggedSessionRef.current = preferredResumeSessionId
 
     if (providerConfig?.codingCliProvider) {
       setSessionMetadata(
         providerConfig.codingCliProvider,
-        durableResumeSessionId,
+        preferredResumeSessionId,
         paneContent.provider,
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [durableResumeSessionId, providerConfig?.codingCliProvider, paneContent.provider, suppressNetworkEffects])
+  }, [paneContent.provider, providerConfig?.codingCliProvider, session?.cliSessionId, session?.timelineSessionId, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -402,6 +407,12 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (!paneContent.sessionId) return
     ws.send({ type: 'sdk.interrupt', sessionId: paneContent.sessionId })
   }, [paneContent.sessionId, ws])
+
+  const handleRetryCreate = useCallback(() => {
+    dispatch(restartAgentChatCreate({ tabId, paneId }))
+    createSentRef.current = false
+    attachSentRef.current = false
+  }, [dispatch, paneId, tabId])
 
   const handlePermissionAllow = useCallback((requestId: string) => {
     if (!paneContent.sessionId) return
@@ -605,6 +616,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           {!hasWaitingItems && paneContent.status === 'running' && 'Running...'}
           {!hasWaitingItems && paneContent.status === 'idle' && 'Ready'}
           {!hasWaitingItems && paneContent.status === 'compacting' && 'Compacting context...'}
+          {!hasWaitingItems && paneContent.status === 'create-failed' && 'Create failed'}
           {!hasWaitingItems && paneContent.status === 'exited' && 'Session ended'}
         </span>
         <div className="flex items-center gap-2">
@@ -639,8 +651,22 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           </div>
         )}
 
+        {paneContent.status === 'create-failed' && paneContent.createError && (
+          <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
+            <p className="font-medium text-red-700 dark:text-red-300">Session start failed</p>
+            <p className="mt-1 text-red-700/90 dark:text-red-200">{paneContent.createError.message}</p>
+            <button
+              type="button"
+              className="mt-3 rounded-md border border-red-400/60 px-3 py-1.5 text-sm font-medium text-red-700 transition-colors hover:bg-red-500/10 dark:text-red-200"
+              onClick={handleRetryCreate}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
-        {!session?.messages.length && timelineItems.length === 0 && (!isRestoring || restoreTimedOut) && (
+        {!session?.messages.length && timelineItems.length === 0 && (!isRestoring || restoreTimedOut) && paneContent.status !== 'create-failed' && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
@@ -791,6 +817,12 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         {session?.lastError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.lastError}
+          </div>
+        )}
+
+        {session?.timelineError && (
+          <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
+            {session.timelineError}
           </div>
         )}
 

@@ -385,9 +385,6 @@ export class WsHandler {
         loadSessionHistory,
         getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getSession(sdkSessionId),
         getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findSessionByCliSessionId(timelineSessionId),
-        logDivergence: (details) => {
-          log.warn(details, 'FreshClaude restore snapshot history diverged')
-        },
       })
       : undefined)
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
@@ -972,13 +969,14 @@ export class WsHandler {
     if (!resolved) {
       resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
     }
+    const resolvedHistory = resolved?.kind === 'resolved' ? resolved : null
     this.send(ws, {
       type: 'sdk.session.snapshot',
       sessionId: opts.sessionId,
-      latestTurnId: resolved && resolved.messages.length > 0 ? `turn-${resolved.messages.length - 1}` : null,
+      latestTurnId: resolvedHistory?.latestTurnId ?? null,
       status: opts.status,
-      ...(resolved?.timelineSessionId ? { timelineSessionId: resolved.timelineSessionId } : {}),
-      ...(resolved ? { revision: resolved.revision } : {}),
+      ...(resolvedHistory?.timelineSessionId ? { timelineSessionId: resolvedHistory.timelineSessionId } : {}),
+      ...(resolvedHistory ? { revision: resolvedHistory.revision } : {}),
       ...(opts.liveSession ? {
         streamingActive: opts.liveSession.streamingActive,
         streamingText: opts.liveSession.streamingText,
@@ -998,6 +996,57 @@ export class WsHandler {
       code: 'INTERNAL_ERROR',
       message: 'Failed to restore SDK session history',
     } as SdkServerMessage)
+  }
+
+  private sendSdkCreateFailed(
+    ws: LiveWebSocket,
+    requestId: string,
+    params: { code: string; message: string; retryable?: boolean },
+  ) {
+    this.send(ws, {
+      type: 'sdk.create.failed',
+      requestId,
+      code: params.code,
+      message: params.message,
+      retryable: params.retryable ?? true,
+    } as SdkServerMessage)
+  }
+
+  private transactionalCreateMessage(msg: SdkServerMessage, clientSessionId: string): SdkServerMessage {
+    const rewritten = this.rewriteSdkMessageSessionId(msg, clientSessionId)
+    if (rewritten.type !== 'sdk.session.init') {
+      return rewritten
+    }
+    return {
+      type: 'sdk.session.metadata',
+      sessionId: rewritten.sessionId,
+      cliSessionId: rewritten.cliSessionId,
+      model: rewritten.model,
+      cwd: rewritten.cwd,
+      tools: rewritten.tools,
+    } satisfies SdkServerMessage
+  }
+
+  private flushTransactionalCreateReplay(
+    ws: LiveWebSocket,
+    clientSessionId: string,
+    queuedMessages: SdkServerMessage[],
+  ): void {
+    const metadataMessages: SdkServerMessage[] = []
+    for (const message of queuedMessages) {
+      if (message.type === 'sdk.stream') {
+        continue
+      }
+      const transformed = this.transactionalCreateMessage(message, clientSessionId)
+      if (transformed.type === 'sdk.session.metadata') {
+        metadataMessages.push(transformed)
+        continue
+      }
+      this.safeSend(ws, transformed)
+    }
+    for (const metadata of metadataMessages) {
+      this.safeSend(ws, metadata)
+    }
   }
 
   private resolveSdkSessionTarget(state: ClientState, clientSessionId: string): string {
@@ -1821,8 +1870,10 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled', requestId: m.requestId })
           return
         }
+        let session: SdkSessionState | undefined
+        let releaseCreateSubscription: (() => void) | undefined
         try {
-          const session = await this.sdkBridge.createSession({
+          session = await this.sdkBridge.createSession({
             cwd: m.cwd,
             resumeSessionId: m.resumeSessionId,
             model: m.model,
@@ -1830,23 +1881,45 @@ export class WsHandler {
             effort: m.effort,
             plugins: m.plugins,
           })
-          state.sdkSessions.add(session.sessionId)
-          state.sdkSessionTargets.set(session.sessionId, session.sessionId)
+          const queuedMessages: SdkServerMessage[] = []
+          let createReadyForLiveForward = false
+          const createSubscription = this.sdkBridge.subscribe(session.sessionId, (message: SdkServerMessage) => {
+            if (!createReadyForLiveForward) {
+              queuedMessages.push(message)
+              return
+            }
+            this.safeSend(ws, this.transactionalCreateMessage(message, session!.sessionId))
+          })
+          if (!createSubscription) {
+            throw new Error('SDK session subscription failed during create')
+          }
+          releaseCreateSubscription = createSubscription.off
 
-          // Send sdk.created FIRST so the client creates the Redux session
-          // before any buffered messages (sdk.session.init, sdk.error) arrive.
-          this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
-          try {
-            await this.sendSdkSessionSnapshot(ws, {
-              sessionId: session.sessionId,
-              status: session.status,
-              historyQueryId: session.sessionId,
-              liveSession: session,
+          const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId) ?? null
+          const fatalRestore = resolvedHistory && typeof resolvedHistory === 'object' && (resolvedHistory as { kind?: unknown }).kind === 'fatal'
+            ? resolvedHistory as unknown as { code: string; message: string }
+            : null
+          if (fatalRestore) {
+            releaseCreateSubscription()
+            releaseCreateSubscription = undefined
+            this.sdkBridge.killSession(session.sessionId)
+            this.sendSdkCreateFailed(ws, m.requestId, {
+              code: fatalRestore.code,
+              message: fatalRestore.message,
+              retryable: true,
             })
-          } catch (err) {
-            this.sendSdkRestoreError(ws, session.sessionId, err)
             return
           }
+
+          // Send sdk.created only after coherent restore state exists.
+          this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
+          await this.sendSdkSessionSnapshot(ws, {
+            sessionId: session.sessionId,
+            status: session.status,
+            historyQueryId: session.sessionId,
+            liveSession: session,
+            ...(resolvedHistory ? { resolvedHistory } : {}),
+          })
 
           // Send preliminary sdk.session.init so the client can start interacting.
           // The SDK subprocess only emits system/init after the first user message,
@@ -1861,8 +1934,11 @@ export class WsHandler {
             tools: [],
           })
 
-          // Subscribe this client to session events (replays buffered messages)
-          this.subscribeClientToSdkSession(ws, state, session.sessionId, session.sessionId)
+          state.sdkSessions.add(session.sessionId)
+          state.sdkSessionTargets.set(session.sessionId, session.sessionId)
+          state.sdkSubscriptions.set(session.sessionId, createSubscription.off)
+          this.flushTransactionalCreateReplay(ws, session.sessionId, queuedMessages)
+          createReadyForLiveForward = true
 
           if (m.cwd?.trim()) {
             void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
@@ -1871,7 +1947,18 @@ export class WsHandler {
           }
         } catch (err: any) {
           log.warn({ err }, 'sdk.create failed')
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: err?.message || 'Failed to create SDK session', requestId: m.requestId })
+          if (releaseCreateSubscription) {
+            releaseCreateSubscription()
+            releaseCreateSubscription = undefined
+          }
+          if (session?.sessionId) {
+            this.sdkBridge.killSession(session.sessionId)
+          }
+          this.sendSdkCreateFailed(ws, m.requestId, {
+            code: 'RESTORE_INTERNAL',
+            message: err?.message || 'Failed to create SDK session',
+            retryable: true,
+          })
         }
         return
       }
@@ -2007,9 +2094,9 @@ export class WsHandler {
           }
         }
         const liveSession = directSession
-          ?? (resolved?.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
+          ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
         if (!liveSession) {
-          if (resolved) {
+          if (resolved?.kind === 'resolved') {
             await this.sendSdkSessionSnapshot(ws, {
               sessionId: m.sessionId,
               status: 'idle',

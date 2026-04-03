@@ -284,9 +284,6 @@ async function main() {
         session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId
       ))
     ),
-    logDivergence: (details) => {
-      log.warn(details, 'FreshClaude history source detected divergent durable/live history')
-    },
   })
 
   const server = http.createServer(app)
