@@ -4,7 +4,7 @@
 
 **Goal:** Make FreshClaude restore complete and deterministic across reloads, remounts, reconnects, and server restarts by restoring one canonical history, preserving the durable Claude identity as soon as the server knows it, and rendering the first visible restored page with full bodies and in-progress stream state.
 
-**Architecture:** Introduce a shared server-side agent history source that understands two live-history modes: full live transcript for fresh SDK sessions and post-resume delta for resumed SDK sessions. That source merges durable Claude JSONL history with live delta, exposes an optional canonical durable `timelineSessionId`, and feeds both HTTP timeline reads and WebSocket restore snapshots. The client stores those richer snapshots, requests `includeBodies=true` for the first visible timeline page, persists the canonical durable ID back into pane content before `sdk.session.init` arrives, and updates FreshClaude metadata/activity consumers to prefer that identity during restore gaps.
+**Architecture:** Introduce a shared server-side agent history source that understands two live-history modes: full live transcript for fresh SDK sessions and post-resume delta for resumed SDK sessions. That source merges durable Claude JSONL history with live delta, exposes an optional canonical durable `timelineSessionId`, and feeds both HTTP timeline reads and WebSocket restore snapshots. The client stores those richer snapshots, requests `includeBodies=true` for the first visible timeline page, persists the canonical durable ID back into pane content as soon as a snapshot reveals it, and distinguishes the durable identity (`timelineSessionId`) from the restore query id so live-only restores still fall back to the SDK session ID until Claude has disclosed the durable one.
 
 **Tech Stack:** TypeScript, React 18, Redux Toolkit, Express, WebSocket (`ws`), Anthropic Claude Agent SDK, Vitest, Testing Library
 
@@ -17,6 +17,7 @@
   - in-memory SDK messages for work observed after this bridge process started
 - For resumed sessions, `SdkSessionState.messages` is a post-resume delta, not a full transcript. Do not choose between durable and live history by message count alone.
 - `timelineSessionId` means the canonical durable Claude session ID. It is optional. Never populate it with an SDK session ID.
+- `timelineSessionId` is not the same thing as the restore query id. When no durable Claude ID is known yet, restore must still query history by the live SDK session ID instead of skipping hydration.
 - When `timelineSessionId` exists, every FreshClaude restore consumer that needs the durable Claude identity must prefer it over `cliSessionId` and persisted `resumeSessionId`.
 - As soon as `sdk.session.snapshot` carries `timelineSessionId`, persist that value back into pane content as `resumeSessionId` so later recovery does not depend on `sdk.session.init` arriving first.
 - The first visible restore page must arrive with bodies inline. The client may still fetch older collapsed turns on demand, but it must not immediately double-fetch the newest turn if the page already contains it.
@@ -24,6 +25,7 @@
 - Server-restart recovery must still work: once a snapshot revealed the durable Claude ID, a later lost-session recovery must be able to re-create the session with that durable ID even if `sdk.session.init` never happened.
 - Mid-stream reconnects must restore enough state to show work in progress. A restored running pane cannot regress to a blank "Running..." state with no visible partial output.
 - Divergent live-vs-durable histories are a real boundary. Log them with enough context to diagnose the source (`sdk session id`, `timeline session id`, live mode, live count, durable count). Do not silently weave contradictory middles together.
+- Overlap removal for resumed-delta merges must be conservative. Never drop an ambiguous repeated single-message turn just because the text matches; use any available timestamp evidence to distinguish a true durable/live overlap from a legitimately repeated prompt.
 
 ## File Structure
 
@@ -43,6 +45,8 @@
   Responsibility: define the richer `sdk.session.snapshot` server-to-client contract.
 - Modify: `src/lib/api.ts`
   Responsibility: send `includeBodies=true` on the first visible timeline page request.
+- Modify: `test/unit/client/lib/api.test.ts`
+  Responsibility: verify `getAgentTimelinePage()` serializes `includeBodies=true` on the first visible restore request.
 - Modify: `src/store/agentChatTypes.ts`
   Responsibility: model canonical durable timeline identity and timeline revision in Redux.
 - Modify: `src/store/agentChatSlice.ts`
@@ -91,6 +95,8 @@
   Responsibility: verify restored FreshClaude runtime metadata uses `timelineSessionId` before `cliSessionId` exists and over stale persisted resume IDs.
 - Modify: `test/unit/client/lib/pane-activity.test.ts`
   Responsibility: verify FreshClaude busy-session keys prefer `timelineSessionId` during restore gaps.
+- Modify: `test/e2e/pane-activity-indicator-flow.test.tsx`
+  Responsibility: verify the visible activity indicator restores from `timelineSessionId` when only the canonical durable ID is known.
 - Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
   Responsibility: verify pane header metadata restores from `timelineSessionId` when only the canonical durable ID is known.
 
@@ -99,6 +105,7 @@
 - Do not patch only `AgentChatView.tsx`. The visible symptom is in the component, but the underlying defect is that WebSocket restore and HTTP timeline reads do not use the same history model.
 - Do not treat live SDK messages as a full transcript for resumed sessions. In this codebase they are only the post-resume delta, so a count comparison or "prefer longer list" rule is wrong.
 - Do not populate `timelineSessionId` with SDK session IDs. That would make metadata/activity consumers and later recovery persist the wrong identity.
+- Do not conflate `timelineSessionId` with the restore query id. The durable ID is optional; live-only restore still needs the SDK session ID fallback until Claude reveals the durable one.
 - Do not fix the restore fetch and leave `resumeSessionId` persistence untouched. If the canonical durable ID is not written back into pane content before `sdk.session.init`, later server-restart recovery can still regress.
 - Do not add a second client-side heuristic for "which session ID should I trust". The server already knows whether live session state is fresh, resumed-delta, or durable-only.
 - Keep the visible-first behavior. Hidden panes still defer the heavier history read until visible, but the first visible fetch must be complete.
@@ -173,6 +180,31 @@ it('de-duplicates the overlap when durable history has already flushed the first
     makeMessage('assistant', 'older answer'),
     makeMessage('user', 'new prompt'),
     makeMessage('assistant', 'new reply'),
+  ])
+})
+
+it('keeps an ambiguous repeated single-message prompt when timestamps show it is a new turn', async () => {
+  const source = createAgentHistorySource({
+    loadSessionHistory: vi.fn().mockResolvedValue([
+      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+    ]),
+    getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
+      sessionId: 'sdk-ambiguous',
+      resumeSessionId: 'cli-ambiguous',
+      messages: [
+        makeMessage('user', 'continue', '2026-03-10T10:15:00.000Z'),
+        makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
+      ],
+    })),
+    getLiveSessionByCliSessionId: vi.fn(),
+    logDivergence: vi.fn(),
+  })
+
+  const resolved = await source.resolve('sdk-ambiguous')
+  expect(resolved?.messages).toEqual([
+    makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+    makeMessage('user', 'continue', '2026-03-10T10:15:00.000Z'),
+    makeMessage('assistant', 'new reply', '2026-03-10T10:15:05.000Z'),
   ])
 })
 
@@ -273,6 +305,7 @@ export function createAgentHistorySource(deps: {
     sdkSessionId?: string
     timelineSessionId?: string
     liveMode: 'full' | 'delta'
+    reason: 'conflict' | 'ambiguous_overlap'
     liveCount: number
     durableCount: number
   }) => void
@@ -284,7 +317,7 @@ export function createAgentHistorySource(deps: {
       //    live.cliSessionId ?? live.resumeSessionId ?? (isValidClaudeSessionId(queryId) ? queryId : undefined)
       // 3. Load durable history once when timelineSessionId exists.
       // 4. If the live session was created with resumeSessionId, treat live messages as post-resume delta:
-      //    append them onto durable history after removing the longest durable-tail/live-head overlap.
+      //    append them onto durable history after removing only a conservative durable-tail/live-head overlap.
       // 5. Otherwise treat live messages as a full transcript for this process:
       //    prefer the full live list when durable is a strict prefix,
       //    prefer durable when live is a strict prefix,
@@ -300,7 +333,8 @@ Keep the message-equality helper deterministic:
 - compare `role`
 - compare normalized content block payloads
 - compare `model` when present
-- do not use timestamp equality as the merge key
+- when both timestamps exist, treat them as evidence: only collapse a single-message overlap when they plausibly describe the same event, not merely matching text
+- when a one-message overlap is text-identical but timestamp evidence is missing or materially different, keep both messages and log `reason: 'ambiguous_overlap'`
 
 Update `server/agent-timeline/service.ts` so it accepts the shared history source instead of `loadSessionHistory` directly, and uses `resolved.timelineSessionId ?? query.sessionId` for:
 
@@ -537,8 +571,8 @@ private async sendSdkSessionSnapshot(
 For `sdk.attach`:
 
 - when a live SDK session exists, query the shared history source with the live SDK session ID
-- when only a durable Claude session exists, query the shared history source with the durable Claude session ID and send an idle snapshot plus idle status
-- when neither exists, continue sending `sdk.error` with `INVALID_SESSION_ID`
+- when `sdk.attach` itself targets a durable Claude session ID, query the shared history source with that durable ID and send an idle snapshot plus idle status
+- when the query ID is a stale SDK session ID that resolves to neither a live session nor a durable Claude history, continue sending `sdk.error` with `INVALID_SESSION_ID`; recovery comes from the already-persisted `resumeSessionId`, not server-side guessing
 
 Keep the existing ordering invariant:
 
@@ -579,6 +613,7 @@ git commit -m "fix: enrich freshclaude restore snapshots"
 
 **Files:**
 - Modify: `src/lib/api.ts`
+- Modify: `test/unit/client/lib/api.test.ts`
 - Modify: `src/store/agentChatTypes.ts`
 - Modify: `src/store/agentChatSlice.ts`
 - Modify: `src/store/agentChatThunks.ts`
@@ -677,12 +712,23 @@ it('requests includeBodies on the first visible page and skips getAgentTurnBody 
 
 Extend `test/unit/client/sdk-message-handler.test.ts` so the snapshot payload assertion includes `timelineSessionId`, `revision`, `streamingActive`, and `streamingText`.
 
+Extend `test/unit/client/lib/api.test.ts` so the API helper assertion covers the serialized inline-body request:
+
+```ts
+await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true }, { signal })
+
+expect(mockFetch).toHaveBeenCalledWith(
+  '/api/agent-sessions/session-1/timeline?priority=visible&includeBodies=true',
+  expect.objectContaining({ signal, headers: expect.any(Headers) }),
+)
+```
+
 - [ ] **Step 2: Run the focused client tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
+npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
 ```
 
 Expected:
@@ -758,7 +804,7 @@ Update `src/lib/sdk-message-handler.ts` to forward the richer snapshot payload u
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
+npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
 ```
 
 Expected: PASS.
@@ -774,7 +820,7 @@ Keep the reducer rules explicit:
 Re-run:
 
 ```bash
-npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
+npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
 ```
 
 Expected: all PASS.
@@ -782,7 +828,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/lib/api.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/lib/sdk-message-handler.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
+git add src/lib/api.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/lib/sdk-message-handler.ts test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts
 git commit -m "fix: hydrate freshclaude restore state from canonical snapshots"
 ```
 
@@ -820,6 +866,30 @@ it('uses timelineSessionId from sdk.session.snapshot for visible restore hydrati
   await waitFor(() => {
     expect(getAgentTimelinePage).toHaveBeenCalledWith(
       'cli-sess-1',
+      expect.objectContaining({ includeBodies: true }),
+      expect.anything(),
+    )
+  })
+})
+
+it('keeps the live-only restore fallback on the SDK session id until a durable timelineSessionId exists', async () => {
+  getAgentTimelinePage.mockResolvedValue({ sessionId: 'sdk-sess-1', items: [], nextCursor: null, revision: 1 })
+
+  store.dispatch(sessionSnapshotReceived({
+    sessionId: 'sdk-sess-1',
+    latestTurnId: 'turn-2',
+    status: 'idle',
+  }))
+
+  render(
+    <Provider store={store}>
+      <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sdk-sess-1' }} />
+    </Provider>,
+  )
+
+  await waitFor(() => {
+    expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      'sdk-sess-1',
       expect.objectContaining({ includeBodies: true }),
       expect.anything(),
     )
@@ -904,6 +974,7 @@ npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.relo
 Expected:
 
 - the reload tests fail because `AgentChatView` still prefers persisted `resumeSessionId` over `session.timelineSessionId`
+- the live-only fallback test fails if the component stops querying by SDK session ID before a durable Claude ID exists
 - the persistence test fails because the canonical durable ID is not yet written back into pane content before `sdk.session.init`
 - the e2e resumed-create test fails because the old path still expects a second newest-turn fetch
 
@@ -915,6 +986,7 @@ Update `src/components/agent-chat/AgentChatView.tsx`:
 const timelineSessionId = session?.timelineSessionId
   ?? session?.cliSessionId
   ?? paneContent.resumeSessionId
+const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
 
 useEffect(() => {
   const durableId = session?.timelineSessionId ?? session?.cliSessionId
@@ -929,6 +1001,8 @@ useEffect(() => {
 ```
 
 Keep the visible-first load gate, but rely on the thunk to request inline bodies on the first page. The component must not assume it still needs a separate newest-turn fetch.
+
+When deciding whether to start restore hydration, gate on `restoreHistoryQueryId`, not `timelineSessionId`. `timelineSessionId` is durable identity only; live-only restore must continue to work before Claude has disclosed that durable ID.
 
 Preserve the existing restored-stream rendering path by letting the richer snapshot seed `session.streamingActive` and `session.streamingText`.
 
@@ -972,6 +1046,7 @@ git commit -m "fix: complete freshclaude visible restore flow"
 - Modify: `src/lib/pane-activity.ts`
 - Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
 - Modify: `test/unit/client/lib/pane-activity.test.ts`
+- Modify: `test/e2e/pane-activity-indicator-flow.test.tsx`
 - Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
 
 - [ ] **Step 1: Identify or write the failing tests**
@@ -1037,18 +1112,21 @@ it('collects FreshClaude busy session keys from timelineSessionId during restore
 
 Extend `test/e2e/pane-header-runtime-meta-flow.test.tsx` so the restored FreshClaude header path still resolves indexed Claude metadata when the Redux session has `timelineSessionId: 'claude-session-1'`, no `cliSessionId`, and the pane content has no `resumeSessionId`.
 
+Extend `test/e2e/pane-activity-indicator-flow.test.tsx` so a restored FreshClaude pane turns blue from `timelineSessionId` when the Redux session is `running`, `timelineSessionId: 'claude-session-1'`, there is no `cliSessionId`, and the pane content has no `resumeSessionId`.
+
 - [ ] **Step 2: Run the focused metadata/activity tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 ```
 
 Expected:
 
 - the FreshClaude metadata tests fail because runtime metadata still depends on `cliSessionId` or persisted `resumeSessionId`
 - the pane-activity test fails because busy-session keys still ignore `timelineSessionId`
+- the activity-indicator e2e fails because the visible blue-state path still ignores `timelineSessionId` during restore gaps
 
 - [ ] **Step 3: Write the minimal implementation**
 
@@ -1075,7 +1153,7 @@ Keep this identity preference scoped to FreshClaude/Claude-index lookups. Do not
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 ```
 
 Expected: PASS.
@@ -1087,7 +1165,7 @@ Run the restore regressions that now share canonical identity, then the coordina
 ```bash
 npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
-npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
+npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 npm run lint
 npm run test:status
 FRESHELL_TEST_SUMMARY="freshclaude restore audit" npm run check
@@ -1103,14 +1181,17 @@ Expected:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/components/panes/PaneContainer.tsx src/lib/pane-activity.ts test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+git add src/components/panes/PaneContainer.tsx src/lib/pane-activity.ts test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 git commit -m "fix: restore freshclaude metadata from canonical timeline identity"
 ```
 
 ## Notes For Execution
 
 - `timelineSessionId` is the durable Claude session ID only. If the server only knows an SDK session ID, leave `timelineSessionId` undefined and keep using the existing fallback path for live-only fetches.
+- Distinguish durable identity from restore query ID in the client. Metadata/activity consumers should prefer `timelineSessionId`; restore hydration may still need `paneContent.sessionId` until the durable Claude ID is known.
 - Resumed-session live messages are post-resume delta. Never regress this plan back to "choose the longer list" or "prefer live on any mismatch" logic.
+- Make overlap removal conservative. If the tail/head match is only a single repeated prompt and timestamp evidence does not support a true flush overlap, keep both messages and log the ambiguity instead of silently dropping one.
 - The key recovery guarantee is: once any snapshot exposes the durable Claude ID, it must be written back into `paneContent.resumeSessionId` before `sdk.session.init` arrives.
+- `sdk.attach` cannot magically recover from a stale SDK session ID after a server restart. That path should still emit `INVALID_SESSION_ID`; the recovery path is the already-persisted durable `resumeSessionId`.
 - No extra `session-utils` or sidebar identity plumbing is planned here. Task 4's immediate `resumeSessionId` persistence keeps pane-content-only consumers aligned without introducing a parallel client-side identity system.
 - If any broader suite fails outside this feature area, stop and fix the failure before merging. The repo rules for main-branch safety still apply.
