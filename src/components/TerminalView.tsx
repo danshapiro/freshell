@@ -1795,7 +1795,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          handleTerminalOutput(raw, mode, tid, !previousSeqState.pendingReplay)
+          const frameOverlapsReplay = Boolean(
+            previousSeqState.pendingReplay
+            && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
+            && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
+          )
+          handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0
             && !terminalFirstOutputMarkedRef.current

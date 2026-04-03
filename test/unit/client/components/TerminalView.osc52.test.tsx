@@ -17,6 +17,7 @@ import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
+  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const wsMocks = vi.hoisted(() => ({
@@ -277,7 +278,7 @@ describe('TerminalView OSC52 policy handling', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}${OSC52_COPY}`,
+      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}${OSC52_COPY}`,
     })
 
     await waitFor(() => {
