@@ -71,6 +71,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
         timelineSessionId ?? sessionId,
         {
           priority: 'visible',
+          ...(!cursor ? { includeBodies: true } : {}),
           ...(cursor ? { cursor } : {}),
         },
         { signal: controller.signal },
@@ -82,10 +83,11 @@ export const loadAgentTimelineWindow = createAsyncThunk<
         nextCursor: page.nextCursor,
         revision: page.revision,
         replace: !cursor,
+        bodies: page.bodies,
       }))
 
       const newestTurn = page.items[0]
-      if (!newestTurn) return
+      if (!newestTurn || page.bodies?.[newestTurn.turnId]) return
 
       const turn = await getAgentTurnBody(
         timelineSessionId ?? sessionId,

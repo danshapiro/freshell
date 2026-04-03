@@ -84,6 +84,40 @@ describe('agentChatThunks', () => {
     expect(session.nextTimelineCursor).toBe('cursor-2')
   })
 
+  it('requests includeBodies on the first visible page and skips getAgentTurnBody when the newest body is inline', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-sess-1',
+      items: [{ turnId: 'turn-2', sessionId: 'cli-sess-1', role: 'assistant', summary: 'Latest summary' }],
+      nextCursor: null,
+      revision: 2,
+      bodies: {
+        'turn-2': {
+          sessionId: 'cli-sess-1',
+          turnId: 'turn-2',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Latest full body' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
+      },
+    })
+
+    const store = makeStore()
+    await store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-1',
+      timelineSessionId: 'cli-sess-1',
+      requestKey: 'tab-1:pane-1',
+    }))
+
+    expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      'cli-sess-1',
+      expect.objectContaining({ priority: 'visible', includeBodies: true }),
+      expect.anything(),
+    )
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
+  })
+
   it('aborts a stale timeline request when a pane switches sessions', async () => {
     let capturedSignal: AbortSignal | undefined
     getAgentTimelinePage.mockImplementation(async (_sessionId, _query, options) => {

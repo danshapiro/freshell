@@ -22,6 +22,14 @@ import agentChatReducer, {
   setAvailableModels,
 } from '../../../src/store/agentChatSlice'
 
+function makeChatMessage(role: 'user' | 'assistant', text: string) {
+  return {
+    role,
+    content: [{ type: 'text' as const, text }],
+    timestamp: '2026-03-10T10:01:00.000Z',
+  }
+}
+
 describe('agentChatSlice', () => {
   const initial = agentChatReducer(undefined, { type: 'init' })
 
@@ -224,6 +232,25 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sess-snapshot'].historyLoaded).toBeUndefined()
   })
 
+  it('stores timelineSessionId, timelineRevision, and stream snapshot from sdk.session.snapshot', () => {
+    const state = agentChatReducer(initial, sessionSnapshotReceived({
+      sessionId: 'sdk-1',
+      latestTurnId: 'turn-2',
+      status: 'running',
+      timelineSessionId: 'cli-1',
+      revision: 12,
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+
+    expect(state.sessions['sdk-1']).toMatchObject({
+      timelineSessionId: 'cli-1',
+      timelineRevision: 12,
+      streamingActive: true,
+      streamingText: 'partial reply',
+    })
+  })
+
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',
@@ -265,6 +292,32 @@ describe('agentChatSlice', () => {
         content: [{ type: 'text', text: 'Hydrated older turn' }],
       }),
     )
+  })
+
+  it('hydrates inline page bodies and clears stale replace-mode bodies', () => {
+    let state = agentChatReducer(initial, turnBodyReceived({
+      sessionId: 'sdk-1',
+      turnId: 'stale-turn',
+      message: makeChatMessage('assistant', 'stale'),
+    }))
+
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-1',
+      items: [{ turnId: 'turn-2', sessionId: 'cli-1', role: 'assistant', summary: 'hello' }],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+      bodies: {
+        'turn-2': {
+          sessionId: 'cli-1',
+          turnId: 'turn-2',
+          message: makeChatMessage('assistant', 'hello'),
+        },
+      },
+    }))
+
+    expect(state.sessions['sdk-1'].timelineBodies['turn-2']).toEqual(makeChatMessage('assistant', 'hello'))
+    expect(state.sessions['sdk-1'].timelineBodies['stale-turn']).toBeUndefined()
   })
 
   it('bootstraps session on timelinePageReceived for unknown sessionId', () => {

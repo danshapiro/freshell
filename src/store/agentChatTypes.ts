@@ -30,6 +30,12 @@ export interface AgentTimelineItem {
   timestamp?: string
 }
 
+export interface AgentTimelineTurn {
+  sessionId: string
+  turnId: string
+  message: ChatMessage
+}
+
 export interface PermissionRequest {
   requestId: string
   subtype: string
@@ -59,6 +65,8 @@ export interface QuestionRequest {
 export interface ChatSessionState {
   sessionId: string
   cliSessionId?: string
+  timelineSessionId?: string
+  timelineRevision?: number
   cwd?: string
   model?: string
   latestTurnId?: string | null

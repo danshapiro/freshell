@@ -206,6 +206,7 @@ export async function getAgentTimelinePage(
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
       ['limit', parsed.limit],
+      ['includeBodies', parsed.includeBodies ? 'true' : undefined],
     ])}`,
     options,
   )

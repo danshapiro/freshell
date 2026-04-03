@@ -76,6 +76,10 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         sessionId: msg.sessionId as string,
         latestTurnId: (msg.latestTurnId as string | null | undefined) ?? null,
         status: msg.status as any,
+        timelineSessionId: msg.timelineSessionId as string | undefined,
+        revision: msg.revision as number | undefined,
+        streamingActive: msg.streamingActive as boolean | undefined,
+        streamingText: msg.streamingText as string | undefined,
       }))
       return true
 

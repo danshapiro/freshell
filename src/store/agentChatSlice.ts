@@ -2,6 +2,7 @@ import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import type {
   AgentChatState,
   AgentTimelineItem,
+  AgentTimelineTurn,
   ChatContentBlock,
   ChatMessage,
   ChatSessionState,
@@ -83,10 +84,18 @@ const agentChatSlice = createSlice({
       sessionId: string
       latestTurnId: string | null
       status: ChatSessionState['status']
+      timelineSessionId?: string
+      revision?: number
+      streamingActive?: boolean
+      streamingText?: string
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
+      session.timelineSessionId = action.payload.timelineSessionId
+      session.timelineRevision = action.payload.revision
+      session.streamingActive = action.payload.streamingActive ?? false
+      session.streamingText = action.payload.streamingText ?? ''
       if (action.payload.latestTurnId === null) {
         session.historyLoaded = true
       }
@@ -230,11 +239,19 @@ const agentChatSlice = createSlice({
       nextCursor: string | null
       revision: number
       replace?: boolean
+      bodies?: Record<string, AgentTimelineTurn>
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const nextBodies = Object.fromEntries(
+        Object.entries(action.payload.bodies ?? {}).map(([turnId, turn]) => [turnId, turn.message]),
+      )
       session.timelineItems = action.payload.replace === false
         ? [...session.timelineItems, ...action.payload.items]
         : action.payload.items
+      session.timelineBodies = action.payload.replace === false
+        ? { ...session.timelineBodies, ...nextBodies }
+        : nextBodies
+      session.timelineRevision = action.payload.revision
       session.nextTimelineCursor = action.payload.nextCursor
       session.timelineLoading = false
       session.timelineError = undefined

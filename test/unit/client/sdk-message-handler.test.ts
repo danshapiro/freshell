@@ -92,6 +92,10 @@ describe('sdk-message-handler', () => {
       sessionId: 's1',
       latestTurnId: 'turn-9',
       status: 'idle',
+      timelineSessionId: 'cli-1',
+      revision: 2,
+      streamingActive: true,
+      streamingText: 'partial reply',
     })
 
     expect(handled).toBe(true)
@@ -101,6 +105,10 @@ describe('sdk-message-handler', () => {
       sessionId: 's1',
       latestTurnId: 'turn-9',
       status: 'idle',
+      timelineSessionId: 'cli-1',
+      revision: 2,
+      streamingActive: true,
+      streamingText: 'partial reply',
     })
   })
 
