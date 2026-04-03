@@ -82,9 +82,12 @@
     - `text`: preserve interior whitespace, normalize Unicode to NFC, normalize line endings to `\n`, trim only trailing whitespace at the end of the block
     - `thinking`: same normalization as `text`
     - `tool_use`: include `id`, `name`, and sorted-key JSON for `input`
-    - `tool_result`: include `tool_use_id`, `is_error`, and sorted-key JSON for structured `content`
+    - `tool_result`: include `tool_use_id`, `is_error`, and normalized `content`
+      - if `content` is a string, normalize it with the same rules as `text`
+      - if `content` is an array, preserve array order and normalize each entry recursively
+      - if an entry is structured data, encode it with stable sorted-key JSON
   - ignore timestamps, cache metadata, JSONL byte layout, raw formatting, and read-order artifacts
-  - serialize with stable sorted-key JSON and hash that representation
+  - serialize with stable sorted-key JSON and hash that representation using one ledger-owned helper reused by both loader tests and runtime code
 - Equivalent JSONL rewrites must preserve synthesized durable ids. Material conversation rewrites may produce new ids and therefore a new durable revision.
 - Live message ids are assigned at ingest time and remain stable for the lifetime of the session. If the SDK later exposes authoritative ids, prefer them and keep local ids only as fallback.
 - Merge policy:
@@ -95,6 +98,7 @@
 
 - `sdk.create` is atomic from the client's perspective.
 - The client must never see a live session id before coherent restore state exists.
+- The bridge must not auto-broadcast early SDK events for a newly created session until `WsHandler` explicitly drains them.
 - Required server sequence:
   1. create or resume the SDK session internally
   2. establish a gated replay handle for early SDK events before anything can be sent to the client
@@ -107,7 +111,9 @@
   9. switch the client to the normal live subscription path
 - Early SDK event handling must be explicit:
   - add a replay-drain API at the bridge boundary so `WsHandler` can inspect buffered early events before they are pushed to the client
+  - define the bridge contract so `createSession()` returns both the created session state and a replay gate handle for that session
   - partition replayed events into `system/init` vs non-init messages
+  - derive the synthesized init from `createSession()` return data, not from the buffered raw init
   - replay non-init events after the synthesized init
   - replay the raw buffered `system/init` last, as a metadata update, not as the readiness gate
 - If steps 3-4 fail:
@@ -177,9 +183,13 @@
 - Modify: `src/lib/api.ts`
   Responsibility: send revision-pinned timeline and turn-body requests and surface stale-revision failures distinctly.
 - Modify: `src/store/agentChatTypes.ts`
-  Responsibility: represent canonical ids, revision-aware restore state, pending create failures, and stale-revision retry state.
+  Responsibility: represent canonical ids, revision-aware restore state, request-scoped create failures, and stale-revision retry state.
 - Modify: `src/store/agentChatSlice.ts`
-  Responsibility: store create failure, revision-aware snapshots, canonical durable-id upgrades, and restore retry bookkeeping.
+  Responsibility: store request-scoped create failure handoff, revision-aware snapshots, canonical durable-id upgrades, and restore retry bookkeeping.
+- Modify: `src/store/paneTypes.ts`
+  Responsibility: represent pane-local retryable pre-session create errors so failures remain visible even after a fresh `createRequestId` is issued.
+- Modify: `src/store/panesSlice.ts`
+  Responsibility: preserve pane-local create error state, clear it on a new create attempt, and keep retryable pre-session UI ownership in pane state rather than in fabricated session state.
 - Modify: `src/store/agentChatThunks.ts`
   Responsibility: restart restore exactly once on stale revision and preserve coherent state transitions.
 - Modify: `src/lib/sdk-message-handler.ts`
@@ -196,16 +206,26 @@
   Responsibility: pin typed restore outcomes and explicitly narrow the legacy compatibility path.
 - Create: `test/unit/server/agent-timeline-ledger.test.ts`
   Responsibility: verify stable ids, late durable-id upgrade, id-first merge, revisioning, and deterministic durable-id synthesis.
+- Modify: `test/unit/server/session-history-loader.test.ts`
+  Responsibility: verify durable-id extraction and deterministic synthesis at the JSONL loader boundary.
 - Modify: `test/unit/server/ws-handler-sdk.test.ts`
   Responsibility: verify transactional `sdk.create`, create failure cleanup, replay ordering, and attach behavior against ledger outcomes.
+- Modify: `test/unit/server/ws-sdk-session-history-cache.test.ts`
+  Responsibility: preserve the injected-history-source and module-backed fallback seams while shifting them onto the ledger-backed resolver contract.
+- Modify: `test/unit/server/sdk-bridge-types.test.ts`
+  Responsibility: verify replay-drain and request-scoped create-failure schema changes at the bridge boundary.
 - Modify: `test/integration/server/agent-timeline-router.test.ts`
   Responsibility: verify revision-pinned reads, stale-revision rejection, and revision-bearing cursors.
 - Modify: `test/unit/client/sdk-message-handler.test.ts`
   Responsibility: verify request-scoped create failure and restore-specific error handling.
 - Create: `test/unit/client/lib/sdk-message-handler.session-lost.test.ts`
   Responsibility: verify `INVALID_SESSION_ID` still triggers lost-session recovery while `sdk.create.failed` does not impersonate a lost session.
+- Modify: `test/unit/client/ws-client-sdk.test.ts`
+  Responsibility: verify the browser-side WS client accepts and dispatches `sdk.create.failed` without regressing existing sdk message handling.
+- Modify: `test/unit/client/agentChatSlice.test.ts`
+  Responsibility: verify request-scoped create failure bookkeeping, revision-aware restore state, and retry-count handling.
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
-  Responsibility: verify one-retry stale-revision behavior, canonical durable-id flush, and coherent restore sequencing.
+  Responsibility: verify one-retry stale-revision behavior, request-scoped create failure handoff into pane-local retryable UI, canonical durable-id flush, and coherent restore sequencing.
 - Create: `test/unit/client/store/persistControl.test.ts`
   Responsibility: verify only the canonical durable-id upgrade path forces immediate flush.
 - Modify: `test/unit/client/store/crossTabSync.test.ts`
@@ -220,6 +240,7 @@
 - Do not keep two peer restore paths.
 - Do not expose a session id to the client before coherent restore state exists.
 - Do not leave a pane stranded in `starting` after a request-scoped create failure; pre-session failures must leave the pane explicitly retryable.
+- Do not force pre-session error UI into fabricated `ChatSessionState`; request-scoped failure bookkeeping may live in `agentChat`, but durable visible retry state belongs to pane content.
 - Do not use array index as canonical turn identity.
 - Do not make content/timestamp overlap the primary merge algorithm.
 - Do not make all persistence synchronous.
@@ -242,6 +263,7 @@
 - Modify: `server/index.ts`
 - Test: `test/unit/server/agent-timeline-ledger.test.ts`
 - Test: `test/unit/server/agent-timeline-history-source.test.ts`
+- Test: `test/unit/server/session-history-loader.test.ts`
 
 - [ ] **Step 1: Write the failing server ledger and identity tests**
 
@@ -258,6 +280,14 @@ it('keeps durable ids stable across equivalent jsonl rewrites', async () => {
   const original = extractChatMessagesFromJsonl(jsonlFixtureWithoutIds)
   const rewritten = extractChatMessagesFromJsonl(jsonlFixtureEquivalentRewriteWithoutIds)
   expect(rewritten.map((m) => m.messageId)).toEqual(original.map((m) => m.messageId))
+})
+
+it('preserves upstream durable ids when jsonl records already provide them', async () => {
+  const messages = extractChatMessagesFromJsonl(jsonlFixtureWithIds)
+  expect(messages.map((m) => m.messageId)).toEqual([
+    'durable-upstream-1',
+    'durable-upstream-2',
+  ])
 })
 
 it('upgrades a live_only ledger in place when the canonical durable id arrives', () => {
@@ -289,6 +319,7 @@ Run:
 
 ```bash
 FRESHELL_TEST_SUMMARY="robust restore ledger red" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
+FRESHELL_TEST_SUMMARY="robust restore loader red" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-history-loader.test.ts
 ```
 
 Expected: FAIL because the ledger, deterministic identity rules, typed outcomes, and shared runtime wiring do not exist yet.
@@ -312,7 +343,8 @@ export type RestoreResolution =
 ```
 
 - Implement the canonical fingerprint algorithm exactly as defined above rather than leaving normalization to local judgment.
-- Introduce a single ledger manager instance in `server/index.ts` and pass it into the WebSocket-side restore stack now (`createAgentHistorySource()`, `SdkBridge`, and `WsHandler`). Keep the HTTP timeline service on its existing seam until Task 3, when its revision-aware service contract is upgraded and the same ledger manager can be injected there without a temporary shim.
+- Introduce a single ledger manager instance in `server/index.ts` and pass it into the WebSocket-side restore stack now (`createAgentHistorySource()`, `SdkBridge`, and `WsHandler`).
+- Preserve existing constructor compatibility for non-agent `WsHandler` tests while changing the restore internals, then thread the same singleton into the HTTP timeline service in Task 3 so both surfaces end on one runtime authority without a second implementation.
 
 - [ ] **Step 4: Re-run the focused server tests**
 
@@ -328,6 +360,7 @@ Run:
 
 ```bash
 FRESHELL_TEST_SUMMARY="robust restore ledger verify" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
+FRESHELL_TEST_SUMMARY="robust restore loader verify" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/session-history-loader.test.ts
 ```
 
 Expected: PASS with no test weakening.
@@ -335,7 +368,7 @@ Expected: PASS with no test weakening.
 - [ ] **Step 6: Commit the ledger foundation**
 
 ```bash
-git add server/agent-timeline/ledger.ts server/agent-timeline/history-source.ts server/agent-timeline/types.ts server/session-history-loader.ts server/sdk-bridge-types.ts server/sdk-bridge.ts server/index.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts
+git add server/agent-timeline/ledger.ts server/agent-timeline/history-source.ts server/agent-timeline/types.ts server/session-history-loader.ts server/sdk-bridge-types.ts server/sdk-bridge.ts server/index.ts test/unit/server/agent-timeline-ledger.test.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts
 git commit -m "refactor: add canonical freshclaude restore ledger"
 ```
 
@@ -349,10 +382,15 @@ git commit -m "refactor: add canonical freshclaude restore ledger"
 - Modify: `src/lib/sdk-message-handler.ts`
 - Modify: `src/store/agentChatTypes.ts`
 - Modify: `src/store/agentChatSlice.ts`
+- Modify: `src/store/paneTypes.ts`
+- Modify: `src/store/panesSlice.ts`
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
+- Test: `test/unit/server/sdk-bridge-types.test.ts`
 - Test: `test/unit/server/ws-handler-sdk.test.ts`
 - Test: `test/unit/client/sdk-message-handler.test.ts`
 - Test: `test/unit/client/lib/sdk-message-handler.session-lost.test.ts`
+- Test: `test/unit/client/agentChatSlice.test.ts`
+- Test: `test/unit/client/ws-client-sdk.test.ts`
 - Test: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
 
 - [ ] **Step 1: Write the failing transactional create and replay-order tests**
@@ -383,18 +421,22 @@ it('emits created then snapshot then synthesized init before replaying buffered 
   ])
 })
 
-it('treats sdk.create.failed as a retryable pending-create failure, not a lost session', () => {
+it('records sdk.create.failed as a request-scoped create failure, not a lost session', () => {
   dispatch(handleSdkMessage(store.dispatch, {
     type: 'sdk.create.failed',
     requestId: 'req-1',
     code: 'RESTORE_INTERNAL',
     message: 'boom',
   }))
-  expect(selectPendingCreate(state, 'req-1')).toBeUndefined()
+  expect(selectPendingCreateFailure(state, 'req-1')).toEqual({
+    code: 'RESTORE_INTERNAL',
+    message: 'boom',
+    retryable: true,
+  })
   expect(selectSession(state, 'sdk-1')?.lost).not.toBe(true)
 })
 
-it('returns the pane to a retryable pre-session state when sdk.create.failed matches the active request', async () => {
+it('moves the pane back to retryable pre-session state and preserves a visible create error when sdk.create.failed matches the active request', async () => {
   render(<AgentChatView ... />)
   deliverSdkCreateFailed({
     requestId: 'req-1',
@@ -406,8 +448,26 @@ it('returns the pane to a retryable pre-session state when sdk.create.failed mat
     sessionId: undefined,
     status: 'creating',
     createRequestId: expect.not.stringMatching(/^req-1$/),
+    createError: {
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    },
   }))
   expect(screen.getByText(/boom/i)).toBeVisible()
+})
+
+it('dispatches sdk.create.failed through the ws client without regressing existing sdk message routing', () => {
+  handleServerMessage({
+    type: 'sdk.create.failed',
+    requestId: 'req-1',
+    code: 'RESTORE_INTERNAL',
+    message: 'boom',
+    retryable: true,
+  })
+  expect(store.getActions()).toContainEqual(expect.objectContaining({
+    type: 'agentChat/createFailed',
+  }))
 })
 ```
 
@@ -416,7 +476,7 @@ it('returns the pane to a retryable pre-session state when sdk.create.failed mat
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create red" npm run test:vitest -- test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore create red" npm run test:vitest -- test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: FAIL because request-scoped create failure, replay draining, and ordered transactional create do not exist yet.
@@ -442,10 +502,11 @@ export type SdkCreateFailedMessage = {
   - pending create failure by `requestId`
   - snapshot revision
   - canonical `turnId` / `messageId` on timeline state
+- Extend `src/store/paneTypes.ts` and `src/store/panesSlice.ts` so agent-chat panes can hold a retryable pre-session `createError` that survives issuing a fresh `createRequestId` and is cleared on the next outbound create attempt.
 - Update `AgentChatView.tsx` so a matching `sdk.create.failed`:
-  - clears the active pending-create bookkeeping for that request
+  - clears the active pending-create bookkeeping for that request after promoting it into pane-local `createError`
   - surfaces the request-scoped failure visibly on the pane even though no session exists yet
-  - resets the pane to an explicit retryable pre-session state instead of leaving it stranded in `starting`
+  - resets the pane to an explicit retryable pre-session state with a fresh `createRequestId` instead of leaving it stranded in `starting`
   - does not impersonate lost-session recovery or fabricate a session id
 
 - [ ] **Step 4: Re-run the focused protocol and client tests**
@@ -461,7 +522,7 @@ Remove redundant old assumptions that `sdk.created` must arrive merely to guard 
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore create verify" npm run test:vitest -- test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore create verify" npm run test:vitest -- test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: PASS.
@@ -469,7 +530,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit the transactional protocol change**
 
 ```bash
-git add server/sdk-bridge-types.ts server/sdk-bridge.ts server/ws-handler.ts shared/ws-protocol.ts src/lib/sdk-message-handler.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/components/agent-chat/AgentChatView.tsx test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+git add server/sdk-bridge-types.ts server/sdk-bridge.ts server/ws-handler.ts shared/ws-protocol.ts src/lib/sdk-message-handler.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/paneTypes.ts src/store/panesSlice.ts src/components/agent-chat/AgentChatView.tsx test/unit/server/sdk-bridge-types.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 git commit -m "refactor: make freshclaude create transactional"
 ```
 
@@ -489,6 +550,7 @@ git commit -m "refactor: make freshclaude create transactional"
 - Test: `test/unit/server/agent-timeline/service.test.ts`
 - Test: `test/integration/server/agent-timeline-router.test.ts`
 - Test: `test/unit/client/lib/api.test.ts`
+- Test: `test/unit/client/agentChatSlice.test.ts`
 - Test: `test/unit/client/store/agentChatThunks.test.ts`
 - Test: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
 - Test: `test/e2e/agent-chat-restore-flow.test.tsx`
@@ -548,7 +610,7 @@ Run:
 ```bash
 FRESHELL_TEST_SUMMARY="robust restore revision red server" npm run test:vitest -- --config vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
 FRESHELL_TEST_SUMMARY="robust restore revision red service" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
-FRESHELL_TEST_SUMMARY="robust restore revision red client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore revision red client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected: FAIL because snapshot revision is not yet a strict read contract.
@@ -590,7 +652,7 @@ Run:
 ```bash
 FRESHELL_TEST_SUMMARY="robust restore revision verify server" npm run test:vitest -- --config vitest.server.config.ts test/integration/server/agent-timeline-router.test.ts
 FRESHELL_TEST_SUMMARY="robust restore revision verify service" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline/service.test.ts
-FRESHELL_TEST_SUMMARY="robust restore revision verify client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore revision verify client" npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected: PASS.
@@ -598,7 +660,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit revision coherence**
 
 ```bash
-git add shared/read-models.ts server/agent-timeline/types.ts server/agent-timeline/service.ts server/agent-timeline/router.ts server/index.ts src/lib/api.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/components/agent-chat/AgentChatView.tsx test/unit/server/agent-timeline/service.test.ts test/integration/server/agent-timeline-router.test.ts test/unit/client/lib/api.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+git add shared/read-models.ts server/agent-timeline/types.ts server/agent-timeline/service.ts server/agent-timeline/router.ts server/index.ts src/lib/api.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/components/agent-chat/AgentChatView.tsx test/unit/server/agent-timeline/service.test.ts test/integration/server/agent-timeline-router.test.ts test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 git commit -m "refactor: pin freshclaude restore to ledger revision"
 ```
 
@@ -694,7 +756,11 @@ git commit -m "fix: persist canonical freshclaude identity immediately"
 - Modify: `test/e2e/agent-chat-resume-history-flow.test.tsx`
 - Modify: `test/e2e/agent-chat-restore-flow.test.tsx`
 - Modify: `test/unit/server/agent-timeline-history-source.test.ts`
+- Modify: `test/unit/server/session-history-loader.test.ts`
 - Modify: `test/unit/server/ws-handler-sdk.test.ts`
+- Modify: `test/unit/server/ws-sdk-session-history-cache.test.ts`
+- Modify: `test/unit/client/agentChatSlice.test.ts`
+- Modify: `test/unit/client/ws-client-sdk.test.ts`
 
 - [ ] **Step 1: Add the remaining adversarial coverage**
 
@@ -703,6 +769,7 @@ Add or extend tests for:
 - named-resume upgrade from `live_only` to canonical durable id
 - durable-only restore after server restart
 - legacy idless durable-session compatibility path
+- upstream durable-id preservation plus equivalent-JSONL rewrite stability at the loader boundary
 - stale-revision retry limit
 - stale cross-tab overwrite rejection after immediate flush
 
@@ -711,8 +778,8 @@ Add or extend tests for:
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore adversarial" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts
-FRESHELL_TEST_SUMMARY="robust restore adversarial client" npm run test:vitest -- test/e2e/agent-chat-restore-flow.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore adversarial" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
+FRESHELL_TEST_SUMMARY="robust restore adversarial client" npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
 ```
 
 Expected: PASS with no restore regression gaps left untested.
@@ -747,7 +814,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit adversarial coverage and documentation handoff**
 
 ```bash
-git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts
+git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.test.ts
 git commit -m "test: lock in robust freshclaude restore contract"
 ```
 
