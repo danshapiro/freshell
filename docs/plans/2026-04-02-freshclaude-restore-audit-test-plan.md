@@ -114,6 +114,20 @@ No new harnesses need to be built. The existing harnesses already cover the requ
     - **Expected outcome:** Per `shared/read-models.ts` and the `Restore Contract`, the first visible request serializes `includeBodies=true`, the thunk dispatches inline bodies into replace-mode state, stale replace-mode bodies are cleared while append-mode bodies are preserved, `timelineSessionId` and `timelineRevision` are stored unchanged, and the newest-turn `getAgentTurnBody` call is skipped when the first page already carried that body.
     - **Interactions:** query serialization, Redux reducers, thunk controller cancellation, SDK message forwarding.
 
+### Streaming-State Decision Note
+
+This audit previously drifted on the meaning of `streamingActive`. The adjudicated contract for all tests and reviews is:
+
+- `streamingActive` means new text deltas are actively arriving.
+- `status === 'running'` means the turn is still in progress.
+- After `content_block_stop`, the correct state is `streamingActive = false` with the accumulated `streamingText` still preserved until `assistant` or `result`.
+
+Reasoning:
+
+- Restore correctness requires the partial assistant preview to remain visible through reconnects and reloads.
+- Semantic correctness requires quiet post-stop gaps to stop counting as active streaming.
+- Reviewer guidance should therefore reject only implementations that lose the preview text or collapse to a blank running state, not implementations that mark streaming inactive after `content_block_stop`.
+
 12. **Name:** The SDK bridge preserves reconnect-restorable stream state and durable-id lookups for later attach snapshots
     - **Type:** unit
     - **Disposition:** extend

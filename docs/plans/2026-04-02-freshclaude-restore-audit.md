@@ -25,8 +25,19 @@
 - Hidden panes should remain cheap: attach for ownership/status, but defer the visible-history fetch until visible.
 - Server-restart recovery must still work: once a snapshot revealed the durable Claude ID, a later lost-session recovery must be able to re-create the session with that durable ID even if `sdk.session.init` never happened.
 - Mid-stream reconnects must restore enough state to show work in progress. A restored running pane cannot regress to a blank "Running..." state with no visible partial output.
+- `streamingActive` means "the bridge is actively receiving text deltas right now," not merely "the turn has not committed yet." Unfinished-turn state is already represented by `status === 'running'`.
+- When `content_block_stop` arrives, set `streamingActive = false` but preserve `streamingText` until the terminal `assistant` or `result` message arrives. This preserves visible partial output across reconnect and restore without falsely labeling a quiet gap as active streaming.
 - Divergent live-vs-durable histories are a real boundary. Log them with enough context to diagnose the source (`sdk session id`, `timeline session id`, live mode, live count, durable count). Do not silently weave contradictory middles together.
 - Overlap removal for resumed-delta merges must be conservative. Never drop an ambiguous repeated single-message turn just because the text matches; use any available timestamp evidence to distinguish a true durable/live overlap from a legitimately repeated prompt.
+
+### Streaming-State Decision Note
+
+Adjudicated on 2026-04-03 by an independent reviewer with no prior thread context:
+
+- Chosen contract: `content_block_stop` ends active streaming, but does not clear the partial preview text.
+- Reasoning: `streamingActive` and `streamingText` intentionally model different things. `streamingActive` tracks whether new deltas are still arriving; `streamingText` tracks the uncommitted assistant preview that restore must keep visible.
+- Why this matters: if `streamingActive` stays `true` until `assistant` or `result`, the boolean silently changes meaning from "actively streaming" to "turn still unfinished." That duplicates `status === 'running'`, blurs protocol semantics, and can suppress the thinking indicator during quiet gaps.
+- UI consequence: the correct restored state after `content_block_stop` is "running session, no active stream, partial preview still visible." That avoids the blank "Running..." regression while keeping activity semantics precise.
 
 ## File Structure
 
