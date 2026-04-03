@@ -146,10 +146,14 @@
 - The canonical durable Claude id is recovery-critical.
 - As soon as a session upgrades from named resume or live-only identity to a canonical durable id, the client must:
   - update pane content
-  - update tab fallback metadata
+  - update tab fallback metadata and its keyed session metadata
   - dispatch a targeted immediate persistence flush
 - This is not a general synchronous persistence policy.
 - Cross-tab rebroadcast must reject older payloads that would overwrite a newer canonical durable id after that flush.
+- That protection applies to both restore identities Freshell uses during bootstrap and recovery:
+  - pane `resumeSessionId`
+  - tab fallback `resumeSessionId` plus `sessionMetadataByKey`
+- Use the persisted layout timestamp together with canonical-id precedence so an older cross-tab payload cannot regress a newer canonical durable upgrade, while a genuinely newer non-conflicting layout change still hydrates.
 
 ### 6. Explicit restore failure semantics
 
@@ -211,7 +215,9 @@
 - Modify: `src/store/persistMiddleware.ts`
   Responsibility: honor targeted flush without changing normal debounce behavior.
 - Modify: `src/store/crossTabSync.ts`
-  Responsibility: reject stale layout payloads that would regress canonical durable identity after a newer flush.
+  Responsibility: reject stale layout payloads that would regress canonical durable identity after a newer flush, across both pane state and tab fallback metadata.
+- Modify: `src/store/tabsSlice.ts`
+  Responsibility: preserve canonical tab fallback identity and keyed session metadata when a stale cross-tab hydrate would otherwise regress them.
 - Modify: `test/unit/server/agent-timeline-history-source.test.ts`
   Responsibility: pin typed restore outcomes and explicitly narrow the legacy compatibility path.
 - Create: `test/unit/server/agent-timeline-ledger.test.ts`
@@ -241,7 +247,9 @@
 - Create: `test/unit/client/store/persistControl.test.ts`
   Responsibility: verify only the canonical durable-id upgrade path forces immediate flush.
 - Modify: `test/unit/client/store/crossTabSync.test.ts`
-  Responsibility: verify stale rebroadcast cannot overwrite a newer canonical durable id.
+  Responsibility: verify stale rebroadcast cannot overwrite a newer canonical durable id in either pane state or tab fallback metadata.
+- Modify: `test/unit/client/store/tabsSlice.merge.test.ts`
+  Responsibility: verify stale tab hydration cannot regress canonical fallback identity or keyed session metadata while newer non-conflicting tab updates still merge.
 - Modify: `test/e2e/agent-chat-restore-flow.test.tsx`
   Responsibility: verify the full reload/reconnect restore contract.
 - Modify: `test/e2e/agent-chat-resume-history-flow.test.tsx`
@@ -715,11 +723,13 @@ git commit -m "refactor: pin freshclaude restore to ledger revision"
 - Create: `src/store/persistControl.ts`
 - Modify: `src/store/persistMiddleware.ts`
 - Modify: `src/store/crossTabSync.ts`
+- Modify: `src/store/tabsSlice.ts`
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
 - Modify: `src/store/agentChatTypes.ts`
 - Modify: `src/store/agentChatSlice.ts`
 - Test: `test/unit/client/store/persistControl.test.ts`
 - Test: `test/unit/client/store/crossTabSync.test.ts`
+- Test: `test/unit/client/store/tabsSlice.merge.test.ts`
 - Test: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
 
 - [ ] **Step 1: Write the failing persistence and cross-tab protection tests**
@@ -741,6 +751,29 @@ it('rejects stale rebroadcast layout that would overwrite a newer canonical dura
   hydrateLocalStateWithResumeId('00000000-0000-4000-8000-000000000321')
   deliverCrossTabLayoutWithResumeId('named-resume')
   expect(selectPaneResumeSessionId(store.getState(), 'pane-1')).toBe('00000000-0000-4000-8000-000000000321')
+  expect(selectTabResumeSessionId(store.getState(), 'tab-1')).toBe('00000000-0000-4000-8000-000000000321')
+  expect(selectTabSessionMetadata(store.getState(), 'tab-1')).toEqual(expect.objectContaining({
+    'claude:00000000-0000-4000-8000-000000000321': expect.any(Object),
+  }))
+})
+
+it('allows a newer cross-tab layout payload to merge unrelated tab changes without regressing canonical durable identity', () => {
+  const local = withCanonicalDurableTabIdentity({
+    tabId: 'tab-1',
+    sessionId: '00000000-0000-4000-8000-000000000321',
+    persistedAt: 200,
+  })
+  const remote = withRenamedTabButStaleNamedResume({
+    tabId: 'tab-1',
+    title: 'Renamed elsewhere',
+    sessionId: 'named-resume',
+    persistedAt: 250,
+  })
+  const merged = tabsReducer(local, hydrateTabs(remote))
+  expect(selectTabById({ tabs: merged }, 'tab-1')).toEqual(expect.objectContaining({
+    title: 'Renamed elsewhere',
+    resumeSessionId: '00000000-0000-4000-8000-000000000321',
+  }))
 })
 
 it('does not force immediate flush for unrelated session updates', () => {
@@ -754,7 +787,7 @@ it('does not force immediate flush for unrelated session updates', () => {
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore persist red" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore persist red" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: FAIL because no targeted flush control or stale rebroadcast rejection exists yet.
@@ -767,6 +800,10 @@ export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
 - Use canonical durable-id transition detection in Redux/client state, not ad hoc component-local comparison, so the flush rule has one owner.
 - Update `crossTabSync.ts` to compare incoming persisted identity against local canonical identity and ignore regressive payloads while still accepting non-conflicting remote changes.
+- Preserve both recovery-critical identity surfaces during cross-tab hydrate:
+  - pane `resumeSessionId`
+  - tab fallback `resumeSessionId` and `sessionMetadataByKey`
+- Use `persistedAt` as the primary freshness signal, then canonical durable-id precedence as the guard against stale named-resume overwrite, so a newer rename/title/layout change can still merge without downgrading session identity.
 
 - [ ] **Step 4: Re-run the targeted persistence tests**
 
@@ -781,7 +818,7 @@ Make sure the flush trigger is specific to the canonical durable-id upgrade and 
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore persist verify" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore persist verify" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: PASS.
@@ -789,7 +826,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit the recovery-critical persistence behavior**
 
 ```bash
-git add src/store/persistControl.ts src/store/persistMiddleware.ts src/store/crossTabSync.ts src/components/agent-chat/AgentChatView.tsx src/store/agentChatTypes.ts src/store/agentChatSlice.ts test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+git add src/store/persistControl.ts src/store/persistMiddleware.ts src/store/crossTabSync.ts src/store/tabsSlice.ts src/components/agent-chat/AgentChatView.tsx src/store/agentChatTypes.ts src/store/agentChatSlice.ts test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 git commit -m "fix: persist canonical freshclaude identity immediately"
 ```
 
@@ -818,7 +855,7 @@ Add or extend tests for:
 - legacy idless durable-session compatibility path
 - upstream durable-id preservation plus equivalent-JSONL rewrite stability at the loader boundary
 - stale-revision retry limit
-- stale cross-tab overwrite rejection after immediate flush
+- stale cross-tab overwrite rejection after immediate flush for both pane and tab fallback metadata
 - ledger alias teardown after unrecoverable live-session kill so stale in-memory authority cannot outlive the session
 
 - [ ] **Step 2: Run the focused adversarial suite**
@@ -827,7 +864,7 @@ Run:
 
 ```bash
 FRESHELL_TEST_SUMMARY="robust restore adversarial" npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts
-FRESHELL_TEST_SUMMARY="robust restore adversarial client" npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore adversarial client" npm run test:vitest -- test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/ws-client-sdk.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx
 ```
 
 Expected: PASS with no restore regression gaps left untested.
@@ -862,7 +899,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit adversarial coverage and documentation handoff**
 
 ```bash
-git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/ws-client-sdk.test.ts
+git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/unit/server/session-history-loader.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/ws-sdk-session-history-cache.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/ws-client-sdk.test.ts
 git commit -m "test: lock in robust freshclaude restore contract"
 ```
 
