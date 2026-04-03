@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Restore OpenCode startup inside Freshell by answering the exact startup probes newer OpenCode emits but Freshell currently leaves unanswered, without regressing the existing CSI request-mode bypass.
+**Goal:** Restore OpenCode startup inside Freshell by handling the exact terminal startup probes that current OpenCode emits during bootstrap, without regressing existing terminal protocol behavior.
 
-**Architecture:** Keep the existing xterm CSI request-mode bypass in `request-mode-bypass.ts`; it already solves a different, still-valid compatibility gap. Add a small incremental client-side startup-probe extractor for only the missing non-CSI probes observed in the failing repro, run it in `TerminalView` before OSC52 and turn-complete cleanup, and send truthful replies back through the existing `terminal.input` websocket path. Use captured probe bytes from the real failing session to drive tests so the implementation stays narrow and protocol-accurate.
+**Architecture:** Keep the existing CSI request-mode bypass exactly as-is; it solves a separate compatibility contract and should not be reworked unless new failing tests prove it is wrong. Add a small incremental non-CSI startup-probe parser on the client side, feed it the real captured OpenCode bootstrap bytes, and send only truthful replies for the exact probe forms proven by that capture. Reuse one shared fixture across pure-parser, `TerminalView`, and attach/replay regression tests so the fix stays narrow and protocol-accurate.
 
 **Tech Stack:** React 18, TypeScript, xterm.js, Vitest, Testing Library, Freshell websocket terminal protocol
 
@@ -12,98 +12,110 @@
 
 ## Strategy Gate
 
-This plan intentionally does **not** rewrite the existing request-mode path.
-
 Why this is the right problem:
-- The PTY starts and remains alive; the blank pane happens after OpenCode emits terminal startup probes.
-- The regression reproduces with different OpenCode versions under the same Freshell build, which points to an OpenCode compatibility change rather than a directory-picker or PTY-spawn failure.
-- The known missing behavior is in non-CSI startup negotiation. Freshell already has a working CSI request-mode shim, so replacing it would be unnecessary risk.
+- The PTY launches and stays alive, so this is not a pane-picker, cwd, or spawn failure.
+- The repro differs by OpenCode version under the same Freshell build, which points to a compatibility change in OpenCode startup negotiation.
+- The observed stall happens before UI rendering and after startup probe output begins, so the missing contract is terminal-probe handling.
 
 Why this architecture is the right one:
-- It fixes the actual missing contract with the smallest truthful surface area: only the startup probes proven to matter.
-- It keeps reply injection in the client where terminal emulation already lives and avoids server-side OpenCode special cases.
-- It preserves the existing xterm parser-based CSI workaround instead of moving a working path into a new raw-string parser.
+- Terminal capability negotiation belongs in the terminal client path, not in server-side OpenCode-specific launch hacks.
+- A narrow incremental parser matches Freshell’s existing OSC52 and turn-complete preprocessing pattern and avoids destabilizing xterm parser registration for unrelated traffic.
+- One shared captured-fixture source prevents three tests from drifting into three different guesses about what OpenCode really sent.
 
 Execution risks this plan must avoid:
-- Do not replace `registerTerminalRequestModeBypass()` unless a failing test proves it is part of the bug. Current evidence says it is not.
-- Do not implement speculative support for every OSC/APC form. Limit behavior to the exact probe bytes captured from the OpenCode repro plus safe buffering/passthrough.
-- Do not claim kitty graphics support. Reply truthfully for recognized query forms only.
-- Do not add a nonexistent test target such as `test/unit/client/components/TerminalView.lifecycle.test.tsx`.
-- Do not weaken tests by asserting only that bytes disappear; assert both the cleaned terminal output and the outbound reply bytes.
+- Do not replace or broaden `registerTerminalRequestModeBypass()` unless a new failing test proves the CSI path is part of this bug.
+- Do not invent reply formats from memory. First capture the exact bytes, then encode the exact contract in shared fixtures and tests.
+- Do not assume kitty/APC handling is required unless the capture proves OpenCode emitted an APC probe that matters.
+- Do not claim support for a terminal feature Freshell does not actually implement. Unsupported replies must be explicit and truthful.
+- Do not rely on manual QA for completion. Manual repro is optional supporting evidence after automated checks are green.
 
 ## User-Visible Behavior And Invariants
 
-- Selecting a directory for an `opencode` pane must lead to a live OpenCode UI instead of a blank hanging pane.
-- Raw startup probe bytes must not appear in visible terminal output or scrollback.
-- Replies for recognized startup probes must be sent before the cleaned visible payload from the same websocket frame is written to xterm.
-- Existing CSI request-mode replies must keep working exactly as they do today.
-- Partial startup probe sequences split across websocket frames must be buffered and completed correctly.
+- Selecting a directory for an `opencode` pane must lead to a visible OpenCode UI instead of a blank hanging pane.
+- Recognized startup probe bytes must not be written into visible terminal output or retained in replayed scrollback.
+- For a frame that contains recognized startup probes plus visible text, Freshell must send probe replies before writing the cleaned visible text to xterm.
+- Partial recognized probe sequences split across websocket frames must be buffered and completed correctly.
 - Unknown, malformed, or unrelated OSC/APC traffic must pass through unchanged.
+- Existing CSI request-mode replies must continue to work exactly as they do today.
 
 ## File Structure
 
 - Create: `src/lib/terminal-startup-probes.ts`
-  - Pure incremental parser for the exact non-CSI startup probes observed in the OpenCode repro plus reply builders and passthrough buffering.
+  - Pure incremental parser for the exact captured non-CSI OpenCode startup probes plus truthful reply builders.
 - Modify: `src/components/TerminalView.tsx`
-  - Run startup-probe extraction before OSC52 and turn-complete processing while keeping `registerTerminalRequestModeBypass()` in place.
+  - Run startup-probe extraction before OSC52 and turn-complete processing; send any generated replies over the existing `terminal.input` websocket path.
+- Create: `test/helpers/opencode-startup-probes.ts`
+  - Single shared fixture module containing the exact captured probe bytes, expected cleaned output, expected replies, and split-frame variants used by all tests.
 - Create: `test/unit/client/lib/terminal-startup-probes.test.ts`
-  - Pure parser coverage for the captured probe bytes, reply generation, partial-frame buffering, and passthrough behavior.
+  - Pure parser coverage for the shared fixture contract, partial-frame buffering, and passthrough behavior.
 - Modify: `test/unit/client/components/TerminalView.osc52.test.tsx`
-  - Extend the existing raw-output preprocessing harness to assert startup-probe replies, cleaned writes, and reply-before-write ordering without regressing OSC52 handling.
+  - Extend the existing terminal-output preprocessing harness to assert startup-probe replies, cleaned writes, reply-before-write ordering, and preserved OSC52 behavior with deterministic terminal theme colors.
 - Create: `test/e2e/opencode-startup-probes.test.tsx`
-  - App-level regression for attach-ready + replayed startup probe traffic + visible OpenCode output.
+  - Attach/replay regression using the shared fixture bytes and visible OpenCode output.
 
 ## Protocol Scope
 
-- **Keep as-is:** `CSI Ps $ p` and `CSI ? Ps $ p` handling in `request-mode-bypass.ts`.
-- **Add:** only the non-CSI startup probes proven by the current failing OpenCode session, expected at minimum to include:
-  - the observed OSC background-color query
-  - the observed kitty-style APC startup query or queries
-- **Preserve:** unrelated OSC/APC traffic untouched.
+- **Keep as-is:** `CSI Ps $ p` and `CSI ? Ps $ p` handling in `src/components/terminal/request-mode-bypass.ts`.
+- **Add only if capture proves it:** non-CSI startup probe forms emitted by the failing OpenCode session.
+- **Preserve:** unrelated OSC/APC/DCS traffic untouched.
 
-If the captured repro bytes show fewer probe forms than expected, implement only those fewer forms. If they show more, extend coverage to exactly that observed set before writing production code.
+If the capture shows only an OSC color query, implement only that. If it shows an APC or other non-CSI probe that requires a reply, implement exactly that form and no more.
 
-## Task 1: Capture The Real Probe Contract In Tests
+## Task 1: Freeze The Real OpenCode Probe Contract
 
 **Files:**
-- Create: `test/unit/client/lib/terminal-startup-probes.test.ts`
+- Create: `test/helpers/opencode-startup-probes.ts`
 - Modify: `test/unit/client/components/TerminalView.osc52.test.tsx`
 - Create: `test/e2e/opencode-startup-probes.test.tsx`
 
-- [ ] **Step 1: Identify or write the failing tests**
+- [ ] **Step 1: Identify the exact failing probe bytes and encode them once**
 
-Use the exact startup probe bytes from the failing OpenCode repro as fixtures in tests. Add focused tests that lock down:
+Source the probe contract from the real failing OpenCode repro before writing parser logic. Use one of these acceptable sources:
+- an existing captured failing session artifact already present in the workspace
+- a reproducible rerun against the current failing OpenCode version that records the raw startup bytes
+
+Create `test/helpers/opencode-startup-probes.ts` exporting:
 
 ```ts
-it('extracts the captured OSC startup query and returns the expected reply bytes', () => {})
-it('extracts the captured kitty APC startup query and returns a truthful unsupported reply', () => {})
-it('buffers a split startup probe across websocket frames', () => {})
-it('passes unrelated OSC/APC traffic through unchanged', () => {})
+export const OPEN_CODE_STARTUP_PROBE_FRAME = '...exact raw bytes...'
+export const OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES = ['...part 1...', '...part 2...']
+export const OPEN_CODE_STARTUP_VISIBLE_TEXT = '...first visible OpenCode text...'
+export const OPEN_CODE_STARTUP_EXPECTED_REPLIES = ['...exact reply 1...', '...exact reply 2...']
+export const OPEN_CODE_STARTUP_EXPECTED_CLEANED = '...visible text with probes removed...'
 ```
 
-Extend `TerminalView.osc52.test.tsx` with a websocket frame containing:
-- captured startup probe bytes
-- visible terminal text after those probes
-- an OSC52 sequence in the same or a later frame
+Rules:
+- Record bytes exactly as captured, including ESC/BEL/ST delimiters.
+- If the capture proves there is no APC probe, do not export APC expectations.
+- Add a short comment naming where the bytes came from so future debugging can reproduce the fixture source.
+
+- [ ] **Step 2: Write the failing tests against the shared contract**
+
+Create `test/unit/client/lib/terminal-startup-probes.test.ts` with tests shaped by the shared fixture:
+
+```ts
+it('extracts the captured startup probes and returns the exact expected replies', () => {})
+it('buffers a captured startup probe split across frames', () => {})
+it('passes unrelated OSC/APC traffic through unchanged', () => {})
+it('preserves incomplete unknown escape traffic until the frame completes', () => {})
+```
+
+Extend `test/unit/client/components/TerminalView.osc52.test.tsx` so one test frame includes:
+- `OPEN_CODE_STARTUP_PROBE_FRAME`
+- visible text after the probes
+- an OSC52 sequence in the same or later frame
 
 Assert:
-- `ws.send` includes the expected `terminal.input` replies
-- xterm `write()` receives only the cleaned visible text
-- replies are sent before that visible text is written
-- OSC52 behavior still works
+- `ws.send` includes the expected `terminal.input` reply messages
+- xterm `write()` receives only `OPEN_CODE_STARTUP_EXPECTED_CLEANED`
+- reply messages are sent before the cleaned write from that frame
+- existing OSC52 policy behavior still works
 
-Create `test/e2e/opencode-startup-probes.test.tsx` using the same websocket harness style as `test/e2e/terminal-create-attach-ordering.test.tsx`:
-- attach a running `opencode` pane
-- emit `terminal.attach.ready`
-- replay the captured startup probes, including at least one split across frames
-- follow with visible OpenCode output
+Use a deterministic mocked terminal theme in this file so any color-query reply bytes are stable and explicit.
 
-Assert:
-- visible OpenCode text renders
-- reply traffic is sent back over `terminal.input`
-- the pane does not stay blank
+Create `test/e2e/opencode-startup-probes.test.tsx` using the existing attach/replay harness style from `test/e2e/terminal-create-attach-ordering.test.tsx`. Replay the shared fixture, including a split-frame variant, then visible OpenCode text. Assert that visible text renders and reply traffic is emitted.
 
-- [ ] **Step 2: Run the focused tests to verify they fail**
+- [ ] **Step 3: Run the new tests to verify the contract is red**
 
 Run:
 
@@ -115,12 +127,43 @@ npm run test:vitest -- --run \
 ```
 
 Expected:
-- the new pure-parser test fails because the module does not exist yet
-- the `TerminalView` and e2e regressions fail because no startup-probe extraction/reply path exists for the captured non-CSI probes
+- the new pure parser test fails because the implementation module does not exist yet
+- the `TerminalView` and attach/replay tests fail because startup probes are still written through and no replies are sent
 
-- [ ] **Step 3: Write the minimal implementation scaffold**
+- [ ] **Step 4: Commit the frozen failing contract**
 
-Create `src/lib/terminal-startup-probes.ts` with a narrow API driven by the tests:
+```bash
+git add \
+  test/helpers/opencode-startup-probes.ts \
+  test/unit/client/components/TerminalView.osc52.test.tsx \
+  test/e2e/opencode-startup-probes.test.tsx \
+  test/unit/client/lib/terminal-startup-probes.test.ts
+git commit -m "test: capture opencode startup probe contract"
+```
+
+## Task 2: Implement The Narrow Startup-Probe Parser
+
+**Files:**
+- Create: `src/lib/terminal-startup-probes.ts`
+- Modify: `test/unit/client/lib/terminal-startup-probes.test.ts`
+
+- [ ] **Step 1: Write the failing pure-parser test or confirm it is still failing**
+
+Use the parser test from Task 1 as the red target. Confirm it is failing for the missing-implementation reason, not because the shared fixture is malformed.
+
+- [ ] **Step 2: Run the pure parser test to verify it fails for the expected reason**
+
+Run:
+
+```bash
+npm run test:vitest -- --run test/unit/client/lib/terminal-startup-probes.test.ts
+```
+
+Expected: FAIL because `src/lib/terminal-startup-probes.ts` does not exist or does not yet satisfy the captured contract.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Create `src/lib/terminal-startup-probes.ts` with a narrow API:
 
 ```ts
 export type TerminalStartupProbeState = {
@@ -148,31 +191,28 @@ export function extractTerminalStartupProbes(
 ```
 
 Implementation constraints:
-- support only the captured non-CSI startup probes
-- preserve unknown content in `cleaned`
+- support only the exact captured probe forms exported by `test/helpers/opencode-startup-probes.ts`
+- preserve unrelated content in `cleaned`
 - buffer incomplete escape sequences in `state.pending`
-- format any color reply in the exact form required by the captured query
-- keep the module pure
+- generate only truthful replies for the recognized captured forms
+- keep the module pure and independent of React/xterm/websocket concerns
 
-- [ ] **Step 4: Run the focused tests to verify they pass**
+- [ ] **Step 4: Run the pure parser test to verify it passes**
 
 Run:
 
 ```bash
-npm run test:vitest -- --run \
-  test/unit/client/lib/terminal-startup-probes.test.ts \
-  test/unit/client/components/TerminalView.osc52.test.tsx \
-  test/e2e/opencode-startup-probes.test.tsx
+npm run test:vitest -- --run test/unit/client/lib/terminal-startup-probes.test.ts
 ```
 
-Expected: parser tests pass; `TerminalView` and e2e tests may still fail until wiring is added in Task 2.
+Expected: PASS.
 
 - [ ] **Step 5: Refactor and verify**
 
-Refactor only for clarity:
-- keep one buffering path for partial escape sequences
-- keep reply builders small and query-specific
-- keep captured probe fixtures obvious in tests so future regressions are readable
+Tighten the parser without broadening scope:
+- keep one buffering path for incomplete escape traffic
+- keep reply builders query-specific and small
+- keep fixture-driven expectations readable
 
 Re-run:
 
@@ -187,25 +227,22 @@ Expected: PASS.
 ```bash
 git add \
   src/lib/terminal-startup-probes.ts \
-  test/unit/client/lib/terminal-startup-probes.test.ts \
-  test/unit/client/components/TerminalView.osc52.test.tsx \
-  test/e2e/opencode-startup-probes.test.tsx
-git commit -m "test: capture opencode startup probe contract"
+  test/unit/client/lib/terminal-startup-probes.test.ts
+git commit -m "fix: parse opencode startup probes"
 ```
 
-## Task 2: Wire Startup Probe Replies Into TerminalView
+## Task 3: Wire Startup-Probe Replies Into TerminalView
 
 **Files:**
 - Modify: `src/components/TerminalView.tsx`
-- Modify: `src/lib/terminal-startup-probes.ts`
 - Modify: `test/unit/client/components/TerminalView.osc52.test.tsx`
 - Modify: `test/e2e/opencode-startup-probes.test.tsx`
 
-- [ ] **Step 1: Identify or confirm the failing wiring tests**
+- [ ] **Step 1: Confirm the integration tests are still red**
 
-Use the red tests from Task 1. Before changing production code, confirm:
+Before changing `TerminalView`, confirm:
 - the pure parser test is green
-- the `TerminalView` and e2e tests are still red for the integration reason, not due to a broken fixture
+- the `TerminalView` and attach/replay tests are still red for integration reasons
 
 - [ ] **Step 2: Run the integration tests to verify they fail for the expected reason**
 
@@ -221,17 +258,15 @@ Expected: FAIL because `TerminalView` does not yet strip the captured startup pr
 
 - [ ] **Step 3: Write the minimal implementation**
 
-Update `TerminalView` to add startup-probe preprocessing while preserving the existing CSI bypass.
-
-Required implementation details:
+Update `src/components/TerminalView.tsx`:
 - add `startupProbeStateRef` alongside `osc52ParserRef` and `turnCompleteSignalStateRef`
-- reset `startupProbeStateRef` in the same create/attach lifecycle effect that resets the other parser state
-- derive reply colors from the resolved terminal theme Freshell is already using
-- call the new extractor before `extractOsc52Events()` and `extractTurnCompleteSignals()`
-- send each startup-probe reply with the existing `terminal.input` websocket path
-- keep `registerTerminalRequestModeBypass(term, sendInput)` intact
+- reset `startupProbeStateRef` in the same lifecycle effect that resets the other parser states
+- derive reply colors from `getTerminalTheme(settings.terminal.theme, settings.theme)`
+- call `extractTerminalStartupProbes()` before `extractOsc52Events()` and `extractTurnCompleteSignals()`
+- send each reply through the existing `sendInput()` path
+- keep `registerTerminalRequestModeBypass(term, sendInput)` unchanged
 
-The intended processing order is:
+Intended output flow:
 
 ```ts
 const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
@@ -245,12 +280,17 @@ for (const reply of startup.replies) {
 }
 
 const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
-const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
+const { cleaned, count } = extractTurnCompleteSignals(
+  osc.cleaned,
+  mode,
+  turnCompleteSignalStateRef.current,
+)
 ```
 
-Implementation notes:
-- if `handleTerminalOutput` needs `sendInput`, move `sendInput` above it or extract a lower-level sender helper so hook dependency order stays valid
-- avoid storing duplicate theme state if the resolved theme can be recomputed from existing settings where needed
+Keep the implementation narrow:
+- do not special-case OpenCode by mode if the captured probe handling is safe for all terminals
+- do not move protocol logic to the server
+- do not reorder OSC52 or turn-complete handling after visible writes
 
 - [ ] **Step 4: Run the integration tests to verify they pass**
 
@@ -266,37 +306,32 @@ Expected: PASS.
 
 - [ ] **Step 5: Refactor and verify**
 
-Re-run the focused stack:
+Re-run the focused regression stack:
 
 ```bash
 npm run test:vitest -- --run \
   test/unit/client/lib/terminal-startup-probes.test.ts \
   test/unit/client/components/TerminalView.osc52.test.tsx \
-  test/e2e/opencode-startup-probes.test.tsx \
-  test/unit/client/components/terminal/request-mode-bypass.test.ts
+  test/unit/client/components/terminal/request-mode-bypass.test.ts \
+  test/e2e/opencode-startup-probes.test.tsx
 ```
 
-Expected: PASS, including the unchanged request-mode coverage.
+Expected: PASS, including unchanged request-mode coverage.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add \
   src/components/TerminalView.tsx \
-  src/lib/terminal-startup-probes.ts \
   test/unit/client/components/TerminalView.osc52.test.tsx \
   test/e2e/opencode-startup-probes.test.tsx
 git commit -m "fix: answer opencode startup probes"
 ```
 
-## Task 3: Broad Verification And Manual Repro Check
+## Task 4: Broad Verification
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx`
-- Modify: `src/lib/terminal-startup-probes.ts`
-- Modify: `test/unit/client/lib/terminal-startup-probes.test.ts`
-- Modify: `test/unit/client/components/TerminalView.osc52.test.tsx`
-- Modify: `test/e2e/opencode-startup-probes.test.tsx`
+- Modify only if broad verification exposes a real defect that requires code or test changes
 
 - [ ] **Step 1: Run the focused regression stack one more time**
 
@@ -320,7 +355,7 @@ Run:
 npm run test:status
 ```
 
-Expected: no conflicting holder that requires intervention; if another holder is active, wait rather than interrupt it.
+Expected: no conflicting holder that requires waiting. If another holder is active, wait rather than interrupt it.
 
 - [ ] **Step 3: Run the required broad suite**
 
@@ -332,45 +367,37 @@ FRESHELL_TEST_SUMMARY="opencode startup probe fix" npm test
 
 Expected: PASS.
 
-- [ ] **Step 4: Manual worktree repro check**
+- [ ] **Step 4: If broad verification reveals a real defect, fix it before proceeding**
 
-Start a worktree-local server on a safe port:
+If any valid check fails:
+- diagnose the actual defect
+- update code and/or tests without weakening coverage
+- re-run the focused stack and `npm test`
+- make an additional commit only if this step required real file changes
+
+- [ ] **Step 5: Optional manual repro for extra confidence**
+
+Only after automated checks are green, optionally confirm the original user path in a worktree-local server:
 
 ```bash
 PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid
 ```
 
-Check manually:
+Check:
 - create an `opencode` pane through the normal directory-picker flow
 - confirm OpenCode renders instead of hanging
-- confirm raw startup probe bytes are not visible in the pane
+- confirm raw startup probe bytes are not visible
 
-- [ ] **Step 5: Stop only the worktree-owned process and review logs if needed**
-
-Run:
+Then stop only the worktree-owned process:
 
 ```bash
 ps -fp "$(cat /tmp/freshell-3344.pid)"
 kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid
 ```
 
-If behavior is wrong, inspect `/tmp/freshell-3344.log` before making more code changes.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add \
-  src/components/TerminalView.tsx \
-  src/lib/terminal-startup-probes.ts \
-  test/unit/client/lib/terminal-startup-probes.test.ts \
-  test/unit/client/components/TerminalView.osc52.test.tsx \
-  test/e2e/opencode-startup-probes.test.tsx
-git commit -m "test: verify opencode startup probe fix"
-```
-
 ## Notes For The Implementer
 
-- Treat the captured OpenCode startup bytes as the source of truth. This is a compatibility fix, not a generic terminal-parser project.
+- The shared probe fixture is the source of truth. If the implementation starts drifting away from those exact bytes, stop and recapture rather than guessing.
 - Preserve existing request-mode behavior unless a new failing test proves a defect there.
-- Do not add a server-side OpenCode fallback, do not pin OpenCode versions, and do not fake kitty graphics success.
-- If the real failing capture shows the background-color query alone is sufficient, keep the APC handling equally narrow rather than broadening scope “just in case”.
+- Do not pin OpenCode versions, do not add server-side OpenCode fallbacks, and do not fake support for unsupported terminal features.
+- If the capture proves only one probe form matters, keep the implementation limited to that one form.
