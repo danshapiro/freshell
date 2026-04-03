@@ -7,9 +7,8 @@ import {
 import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
+  OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
-  OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES,
-  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const COLORS = {
@@ -19,23 +18,33 @@ const COLORS = {
 }
 
 describe('terminal-startup-probes', () => {
-  it('extracts the captured startup probes and returns the exact expected replies', () => {
-    const state = createTerminalStartupProbeState()
-    const result = extractTerminalStartupProbes(
-      `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
-      state,
-      COLORS,
-    )
+  const deriveSplitProbeFrames = (): [string, string] => [
+    OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, -1),
+    OPEN_CODE_STARTUP_PROBE_FRAME.slice(-1),
+  ]
 
-    expect(result.cleaned).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
-    expect(result.replies).toEqual(OPEN_CODE_STARTUP_EXPECTED_REPLIES)
+  it('extracts the captured startup probe and passes the captured post-reply frames through unchanged', () => {
+    const state = createTerminalStartupProbeState()
+    const probe = extractTerminalStartupProbes(OPEN_CODE_STARTUP_PROBE_FRAME, state, COLORS)
+
+    expect(probe.cleaned).toBe('')
+    expect(probe.replies).toEqual(OPEN_CODE_STARTUP_EXPECTED_REPLIES)
+
+    const cleaned = OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((frame) => {
+      const result = extractTerminalStartupProbes(frame, state, COLORS)
+      expect(result.replies).toEqual([])
+      return result.cleaned
+    }).join('')
+
+    expect(cleaned).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
   })
 
-  it('buffers a captured startup probe split across frames', () => {
+  it('buffers a startup probe split across frames derived from the captured query', () => {
     const state = createTerminalStartupProbeState()
+    const [firstFrame, secondFrame] = deriveSplitProbeFrames()
 
     const first = extractTerminalStartupProbes(
-      OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[0]!,
+      firstFrame,
       state,
       COLORS,
     )
@@ -43,7 +52,7 @@ describe('terminal-startup-probes', () => {
     expect(first.replies).toEqual([])
 
     const second = extractTerminalStartupProbes(
-      `${OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[1]}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      `${secondFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
       state,
       COLORS,
     )

@@ -14,8 +14,6 @@ import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
-  OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES,
-  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const terminalTheme = {
@@ -199,6 +197,11 @@ function lastSent(type: string, terminalId?: string) {
 }
 
 describe('opencode startup probes (e2e)', () => {
+  const deriveSplitProbeFrames = (): [string, string] => [
+    OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, -1),
+    OPEN_CODE_STARTUP_PROBE_FRAME.slice(-1),
+  ]
+
   beforeEach(() => {
     wsHarness.reset()
     wsHarness.send.mockClear()
@@ -225,7 +228,7 @@ describe('opencode startup probes (e2e)', () => {
     vi.unstubAllGlobals()
   })
 
-  it('replies to live startup probes before writing visible output', async () => {
+  it('replies to live startup probes before writing the first captured post-reply output', async () => {
     const terminalId = 'term-opencode-live'
     const store = createStore(terminalId)
 
@@ -266,7 +269,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -291,6 +294,7 @@ describe('opencode startup probes (e2e)', () => {
   it('strips historical startup probes during replay without sending late replies', async () => {
     const terminalId = 'term-opencode-replay'
     const store = createStore(terminalId)
+    const [firstSplitFrame, secondSplitFrame] = deriveSplitProbeFrames()
 
     render(
       <Provider store={store}>
@@ -329,7 +333,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[0],
+      data: firstSplitFrame,
       attachRequestId: attach.attachRequestId,
     })
     wsHarness.emit({
@@ -337,7 +341,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 2,
       seqEnd: 2,
-      data: `${OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[1]}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
       attachRequestId: attach.attachRequestId,
     })
     wsHarness.emit({
@@ -363,6 +367,7 @@ describe('opencode startup probes (e2e)', () => {
   it('does not complete a replay-fragment startup probe from the first live frame', async () => {
     const terminalId = 'term-opencode-replay-live-boundary'
     const store = createStore(terminalId)
+    const [firstSplitFrame, secondSplitFrame] = deriveSplitProbeFrames()
 
     render(
       <Provider store={store}>
@@ -401,7 +406,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[0],
+      data: firstSplitFrame,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -413,7 +418,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 2,
       seqEnd: 2,
-      data: `${OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[1]}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -425,13 +430,14 @@ describe('opencode startup probes (e2e)', () => {
     expect(ioEvents).toHaveLength(1)
     expect(ioEvents[0]).toEqual({
       kind: 'write',
-      data: expect.stringContaining(OPEN_CODE_STARTUP_VISIBLE_TEXT),
+      data: expect.stringContaining(OPEN_CODE_STARTUP_EXPECTED_CLEANED),
     })
   })
 
   it('buffers a split live startup probe and replies exactly once when it completes', async () => {
     const terminalId = 'term-opencode-split-live'
     const store = createStore(terminalId)
+    const [firstSplitFrame, secondSplitFrame] = deriveSplitProbeFrames()
 
     render(
       <Provider store={store}>
@@ -470,7 +476,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[0],
+      data: firstSplitFrame,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -482,7 +488,7 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 2,
       seqEnd: 2,
-      data: `${OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES[1]}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
       attachRequestId: attach.attachRequestId,
     })
 
