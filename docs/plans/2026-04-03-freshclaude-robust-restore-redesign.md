@@ -53,6 +53,11 @@
   - `source`: `durable` | `live`
 - Durable history must preserve any upstream identity available in Claude JSONL.
 - If upstream identity is absent, synthesize deterministic durable message ids from a normalized message fingerprint plus the occurrence index of that fingerprint within the durable session, not from the current array index.
+- The normalized fingerprint must hash a canonical semantic representation of the message only:
+  - include role, content-block kind, text payload, tool-use/tool-result payload, and any upstream parent/reference ids that affect meaning
+  - normalize Unicode to NFC, line endings to `\n`, and structured object keys to sorted-key JSON before hashing
+  - ignore JSONL byte offsets, raw formatting, timestamps, cache metadata, and other transport-only fields
+  - preserve meaningful intra-message whitespace; only trim trailing whitespace that Claude JSONL rewrite passes routinely normalize away
 - That synthesis rule must remain stable across equivalent JSONL rewrites and cache rebuilds. If Claude compaction materially rewrites the conversation content, treat that as a new durable revision; do not allow byte-level formatting changes to churn ids.
 - Live SDK events must receive stable ids at ingest time and append-only ordinals in memory.
 - Merging durable backlog with live delta becomes id-first and ordinal-based. Content/timestamp heuristics are kept only as an explicit legacy compatibility fallback for old idless durable sessions, not as the main algorithm.
@@ -67,8 +72,10 @@
   3. build the authoritative snapshot from the ledger
   4. emit `sdk.created`
   5. emit `sdk.session.snapshot`
-  6. emit preliminary `sdk.session.init`
-  7. subscribe/replay live buffered SDK events
+  6. emit a server-synthesized preliminary `sdk.session.init`
+  7. subscribe/replay live buffered SDK events, including any raw SDK `system/init` that arrived during steps 1-5
+- The preliminary `sdk.session.init` is synthesized by `WsHandler` from create-time inputs plus any metadata already known from the bridge.
+- Raw SDK `system/init` is never allowed to race ahead of `sdk.created` or `sdk.session.snapshot`. If it arrives early, buffer it and replay it after step 6 as a normal metadata refresh, not as a second gate on restore readiness.
 - If steps 2-3 fail, the server must kill the tentative SDK session and emit a request-scoped create failure. The client must never see a half-created session id.
 
 ### 4. Revision-pinned restore hydration
@@ -78,6 +85,8 @@
 - The first timeline page request and subsequent turn-body requests must send the revision they are restoring against.
 - The timeline router/service must reject revision mismatches with a restore-specific stale response instead of silently serving the newest state.
 - Cursor payloads for agent timeline reads must encode the revision so pagination cannot drift across revisions.
+- The client gets one automatic stale-revision retry per restore attempt by reacquiring a fresh snapshot and restarting hydration once.
+- If the restarted hydration still returns `RESTORE_STALE_REVISION`, fail the restore visibly instead of looping indefinitely.
 
 ### 5. Immediate durable identity persistence
 
@@ -213,6 +222,12 @@ it('assigns stable deterministic durable message ids for idless jsonl records', 
   ])
 })
 
+it('keeps synthesized durable ids stable across equivalent jsonl rewrites', async () => {
+  const first = extractChatMessagesFromJsonl(jsonlFixtureWithoutIds)
+  const rewritten = extractChatMessagesFromJsonl(jsonlFixtureEquivalentRewriteWithoutIds)
+  expect(rewritten.map((m) => m.messageId)).toEqual(first.map((m) => m.messageId))
+})
+
 it('appends live turns after the durable base without recomputing overlap from content', () => {
   const ledger = createAgentRestoreLedger(makeBaseHistory('cli-1', durableTurns))
   ledger.appendLiveTurn(makeLiveTurn('sdk-1', 3, 'live:sdk-1:3'))
@@ -284,8 +299,10 @@ git commit -m "refactor: add canonical freshclaude restore ledger"
 
 **Files:**
 - Modify: `server/ws-handler.ts`
+- Modify: `server/index.ts`
 - Modify: `shared/ws-protocol.ts`
 - Modify: `src/lib/sdk-message-handler.ts`
+- Modify: `src/store/agentChatTypes.ts`
 - Modify: `src/store/agentChatSlice.ts`
 - Test: `test/unit/server/ws-handler-sdk.test.ts`
 - Test: `test/unit/client/sdk-message-handler.test.ts`
@@ -330,6 +347,18 @@ it('returns the pane to a retryable create state without marking the session los
   }))
   expect(selectSession('sdk-sess-1')?.lost).not.toBe(true)
 })
+
+it('emits the synthesized init only after created and snapshot, then replays any buffered sdk init metadata update', async () => {
+  const messages = await sendSdkCreateWithEarlyBufferedInit()
+  expect(messages.map((m) => m.type)).toEqual([
+    'sdk.created',
+    'sdk.session.snapshot',
+    'sdk.session.init',
+    'sdk.session.init',
+  ])
+  expect(messages[2]).toEqual(expect.objectContaining({ tools: [] }))
+  expect(messages[3]).toEqual(expect.objectContaining({ cliSessionId: 'cli-1' }))
+})
 ```
 
 - [ ] **Step 2: Run focused protocol/client tests to verify they fail**
@@ -354,6 +383,9 @@ type SdkCreateFailedMessage = {
 }
 ```
 
+- Buffer raw SDK `system/init` events until after `sdk.created` and `sdk.session.snapshot` have been emitted, then replay them as metadata updates after the synthesized preliminary init.
+- Update `server/index.ts` in this task so the running server actually injects the ledger-backed restore dependency into `WsHandler` rather than leaving the new constructor path unwired.
+
 - [ ] **Step 4: Re-run the focused protocol/client tests**
 
 Run the command from Step 2.
@@ -363,17 +395,20 @@ Expected: PASS with no half-created client-visible sessions.
 - [ ] **Step 5: Commit the transactional protocol change**
 
 ```bash
-git add server/ws-handler.ts shared/ws-protocol.ts src/lib/sdk-message-handler.ts src/store/agentChatSlice.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts
+git add server/ws-handler.ts server/index.ts shared/ws-protocol.ts src/lib/sdk-message-handler.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts test/unit/server/ws-handler-sdk.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts
 git commit -m "refactor: make freshclaude restore create transactional"
 ```
 
 ### Task 3: Make Snapshot And Timeline Hydration Revision-Coherent
 
 **Files:**
+- Modify: `server/index.ts`
 - Modify: `shared/read-models.ts`
 - Modify: `server/agent-timeline/service.ts`
 - Modify: `server/agent-timeline/router.ts`
 - Modify: `src/lib/api.ts`
+- Modify: `src/store/agentChatTypes.ts`
+- Modify: `src/store/agentChatSlice.ts`
 - Modify: `src/store/agentChatThunks.ts`
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
 - Test: `test/integration/server/agent-timeline-router.test.ts`
@@ -392,6 +427,11 @@ it('rejects a timeline request whose requested revision no longer matches the le
 it('restarts restore hydration when the first visible page returns RESTORE_STALE_REVISION', async () => {
   mockGetAgentTimelinePage.mockRejectedValueOnce({ status: 409, message: 'Stale restore revision', details: { code: 'RESTORE_STALE_REVISION', currentRevision: 13 } })
   // Expect the component to request a fresh snapshot/attach path instead of rendering mixed state.
+})
+
+it('fails the restore after a second consecutive stale-revision response instead of retrying forever', async () => {
+  mockGetAgentTimelinePage.mockRejectedValue({ status: 409, message: 'Stale restore revision', details: { code: 'RESTORE_STALE_REVISION', currentRevision: 13 } })
+  // Expect one automatic restart attempt, then a visible restore error state.
 })
 ```
 
@@ -418,6 +458,9 @@ export const AgentTimelinePageQuerySchema = z.object({
 })
 ```
 
+- Wire the shared ledger instance through `server/index.ts` into both the WebSocket restore path and the HTTP timeline router in this task so the runtime uses the same revision source on both surfaces.
+- Store a retry-attempt marker in Redux restore state and stop after one automatic stale-revision restart.
+
 - [ ] **Step 4: Re-run the revision tests**
 
 Run the commands from Step 2.
@@ -427,7 +470,7 @@ Expected: PASS with explicit stale-revision behavior instead of mixed snapshot/t
 - [ ] **Step 5: Commit revision coherence**
 
 ```bash
-git add shared/read-models.ts server/agent-timeline/service.ts server/agent-timeline/router.ts src/lib/api.ts src/store/agentChatThunks.ts src/components/agent-chat/AgentChatView.tsx test/integration/server/agent-timeline-router.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+git add server/index.ts shared/read-models.ts server/agent-timeline/service.ts server/agent-timeline/router.ts src/lib/api.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/components/agent-chat/AgentChatView.tsx test/integration/server/agent-timeline-router.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 git commit -m "refactor: pin freshclaude restore to snapshot revision"
 ```
 
@@ -474,7 +517,7 @@ it('does not force immediate flush for unrelated pane status changes', () => {
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="robust restore persist red" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+FRESHELL_TEST_SUMMARY="robust restore persist red" npm run test:vitest -- test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 ```
 
 Expected: FAIL because no targeted flush control exists.
@@ -494,7 +537,7 @@ Expected: PASS with the crash window closed and normal debounce behavior unchang
 - [ ] **Step 5: Commit the recovery-critical flush behavior**
 
 ```bash
-git add src/store/persistControl.ts src/store/persistMiddleware.ts src/components/agent-chat/AgentChatView.tsx test/unit/client/store/persistControl.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+git add src/store/persistControl.ts src/store/persistMiddleware.ts src/store/crossTabSync.ts src/components/agent-chat/AgentChatView.tsx test/unit/client/store/persistControl.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
 git commit -m "fix: flush canonical restore identity immediately"
 ```
 
@@ -515,7 +558,6 @@ Add tests for:
 - durable-only restore after restart
 - legacy idless durable session fallback
 - no stale named resume overwrite after durable-id upgrade
-- no stale cross-tab rebroadcast overwrite after targeted flush
 
 - [ ] **Step 2: Run the broad coordinated verification**
 
@@ -535,7 +577,7 @@ Add a short top-note in both existing docs pointing to this redesign plan as the
 - [ ] **Step 4: Commit the adversarial verification and doc handoff**
 
 ```bash
-git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/unit/client/store/crossTabSync.test.ts
+git add docs/plans/2026-04-02-freshclaude-restore-audit.md docs/plans/2026-04-02-freshclaude-restore-audit-test-plan.md test/e2e/agent-chat-resume-history-flow.test.tsx test/unit/server/agent-timeline-history-source.test.ts test/e2e/agent-chat-restore-flow.test.tsx
 git commit -m "test: lock in robust freshclaude restore contract"
 ```
 
