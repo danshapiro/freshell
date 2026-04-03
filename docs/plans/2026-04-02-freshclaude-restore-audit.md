@@ -893,6 +893,7 @@ git commit -m "fix: hydrate freshclaude restore state from canonical snapshots"
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx`
+- Modify: `test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx`
 - Modify: `test/e2e/agent-chat-resume-history-flow.test.tsx`
 - Create: `test/e2e/agent-chat-restore-flow.test.tsx`
 
@@ -1018,6 +1019,55 @@ Extend `test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx
 - the newest restored turn renders immediately from inline bodies
 - `getAgentTurnBody()` is still used when the user expands an older collapsed turn
 
+Extend `test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx` with the lost-session race the executor must not miss:
+
+```tsx
+it('recovers with timelineSessionId from sdk.session.snapshot even when the session is marked lost before sdk.session.init', async () => {
+  const store = makeStore()
+  const pane = {
+    kind: 'agent-chat',
+    provider: 'freshclaude',
+    createRequestId: 'req-stale',
+    sessionId: 'sdk-stale-1',
+    status: 'idle',
+    resumeSessionId: 'named-resume',
+  } satisfies AgentChatPaneContent
+
+  store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
+
+  function Wrapper() {
+    const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
+    const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      ? root.content
+      : undefined
+    if (!content) return null
+    return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+  }
+
+  render(
+    <Provider store={store}>
+      <Wrapper />
+    </Provider>,
+  )
+
+  act(() => {
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-stale-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-session-abc-123',
+      revision: 2,
+    }))
+    store.dispatch(markSessionLost({ sessionId: 'sdk-stale-1' }))
+  })
+
+  await waitFor(() => {
+    const createCalls = wsSend.mock.calls.filter((c: any[]) => c[0]?.type === 'sdk.create')
+    expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe('cli-session-abc-123')
+  })
+})
+```
+
 Update `test/e2e/agent-chat-resume-history-flow.test.tsx` so the resumed-create path expects:
 
 - `sdk.session.snapshot` to include `timelineSessionId`
@@ -1041,7 +1091,7 @@ it('restores a reloaded pane from sdk.session.snapshot, persists timelineSession
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected:
@@ -1049,6 +1099,7 @@ Expected:
 - the reload tests fail because `AgentChatView` still prefers persisted `resumeSessionId` over `session.timelineSessionId`
 - the live-only fallback test fails if the component stops querying by SDK session ID before a durable Claude ID exists
 - the persistence test fails because the canonical durable ID is not yet written back into pane content and tab fallback metadata before `sdk.session.init`
+- the session-lost test fails because recovery still preserves only `paneContent.resumeSessionId`, dropping a snapshot-derived durable Claude ID when loss happens before the persistence effect runs
 - the e2e resumed-create test fails because the old path still expects a second newest-turn fetch
 
 - [ ] **Step 3: Write the minimal implementation**
@@ -1087,6 +1138,17 @@ useEffect(() => {
 
 Build `nextClaudeSessionMetadataByKey` by re-keying any existing Claude metadata from the old tab `resumeSessionId` onto the new durable Claude ID, then overlay `sessionType: paneContent.provider`. This keeps no-layout `TabContent` fallback rebuilding a FreshClaude pane instead of a plain Claude terminal.
 
+Update the recovery path itself so it does not depend on the persistence effect winning the race. When `triggerRecovery()` clears the stale SDK session, preserve:
+
+```ts
+const recoveryResumeId =
+  session?.timelineSessionId
+  ?? session?.cliSessionId
+  ?? paneContentRef.current.resumeSessionId
+```
+
+Use the latest session state when computing `recoveryResumeId` (for example, by reading the current render value or a ref, not a stale callback closure). Then use that `recoveryResumeId` in the replacement pane content and the follow-up `sdk.create` payload. This is the guarantee that makes server-restart recovery work when `sdk.session.snapshot` revealed the durable Claude ID and `markSessionLost()` lands before `sdk.session.init`.
+
 Keep the visible-first load gate, but rely on the thunk to request inline bodies on the first page. The component must not assume it still needs a separate newest-turn fetch.
 
 When deciding whether to start restore hydration, gate on `restoreHistoryQueryId`, not `timelineSessionId`. `timelineSessionId` is durable identity only; live-only restore must continue to work before Claude has disclosed that durable ID.
@@ -1104,7 +1166,7 @@ Do not clear restore mode until one of these is true:
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected: PASS.
@@ -1114,7 +1176,7 @@ Expected: PASS.
 Re-run the targeted restore regressions:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected: all PASS.
@@ -1122,7 +1184,7 @@ Expected: all PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/components/agent-chat/AgentChatView.tsx test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
+git add src/components/agent-chat/AgentChatView.tsx test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx
 git commit -m "fix: complete freshclaude visible restore flow"
 ```
 
@@ -1252,7 +1314,7 @@ Run the restore regressions that now share canonical identity, then the coordina
 ```bash
 npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/sdk-bridge.test.ts test/unit/server/sdk-bridge-types.test.ts
 npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
-npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
+npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-resume-history-flow.test.tsx test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-activity-indicator-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 npm run lint
 npm run test:status
 FRESHELL_TEST_SUMMARY="freshclaude restore audit" npm run check
@@ -1280,6 +1342,7 @@ git commit -m "fix: restore freshclaude metadata from canonical timeline identit
 - Resumed-session live messages are post-resume delta. Never regress this plan back to "choose the longer list" or "prefer live on any mismatch" logic.
 - Make overlap removal conservative. If the tail/head match is only a single repeated prompt and timestamp evidence does not support a true flush overlap, keep both messages and log the ambiguity instead of silently dropping one.
 - The key recovery guarantee is: once any snapshot exposes the durable Claude ID, it must be written back into `paneContent.resumeSessionId`, `tab.resumeSessionId`, and the tab's Claude metadata key before `sdk.session.init` arrives.
+- Do not rely on the persistence effect to win the race against `markSessionLost()`. The recovery path itself must prefer `session.timelineSessionId`, then `session.cliSessionId`, before falling back to persisted `resumeSessionId`.
 - `sdk.attach` cannot magically recover from a stale SDK session ID after a server restart. That path should still emit `INVALID_SESSION_ID`; the recovery path is the already-persisted durable `resumeSessionId`.
 - No extra `session-utils` or sidebar identity plumbing is planned here. Task 4 keeps the existing fallback surfaces aligned by updating pane content and tab fallback state immediately, rather than inventing a second client-side identity system.
 - If any broader suite fails outside this feature area, stop and fix the failure before merging. The repo rules for main-branch safety still apply.
