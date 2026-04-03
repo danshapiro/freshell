@@ -68,6 +68,8 @@ export class SdkBridge extends EventEmitter {
       status: 'starting',
       createdAt: Date.now(),
       messages: [],
+      streamingActive: false,
+      streamingText: '',
       pendingPermissions: new Map(),
       pendingQuestions: new Map(),
       costUsd: 0,
@@ -296,6 +298,8 @@ export class SdkBridge extends EventEmitter {
           content: blocks,
           timestamp: new Date().toISOString(),
         })
+        state.streamingActive = false
+        state.streamingText = ''
         state.status = 'running'
         this.broadcastToSession(sessionId, {
           type: 'sdk.assistant',
@@ -313,6 +317,8 @@ export class SdkBridge extends EventEmitter {
           state.totalInputTokens += rMsg.usage.input_tokens ?? 0
           state.totalOutputTokens += rMsg.usage.output_tokens ?? 0
         }
+        state.streamingActive = false
+        state.streamingText = ''
         state.status = 'idle'
         // Extract usage fields to satisfy the Zod-inferred structural type (SDK's
         // NonNullableUsage is a mapped type that is structurally compatible but not directly
@@ -338,6 +344,17 @@ export class SdkBridge extends EventEmitter {
 
       case 'stream_event': {
         const sMsg = msg as SDKPartialAssistantMessage
+        if (sMsg.event?.type === 'content_block_start') {
+          state.streamingActive = true
+          state.streamingText = ''
+        }
+        if (sMsg.event?.type === 'content_block_delta' && sMsg.event.delta?.type === 'text_delta') {
+          state.streamingActive = true
+          state.streamingText += sMsg.event.delta.text
+        }
+        if (sMsg.event?.type === 'content_block_stop') {
+          state.streamingActive = false
+        }
         this.broadcastToSession(sessionId, {
           type: 'sdk.stream',
           sessionId,
@@ -476,6 +493,15 @@ export class SdkBridge extends EventEmitter {
 
   getSession(sessionId: string): SdkSessionState | undefined {
     return this.sessions.get(sessionId)
+  }
+
+  findSessionByCliSessionId(timelineSessionId: string): SdkSessionState | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId) {
+        return session
+      }
+    }
+    return undefined
   }
 
   listSessions(): SdkSessionState[] {

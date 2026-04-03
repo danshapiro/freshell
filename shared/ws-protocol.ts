@@ -614,6 +614,16 @@ export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running'
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }
+  | {
+    type: 'sdk.session.snapshot'
+    sessionId: string
+    latestTurnId: string | null
+    status: SdkSessionStatus
+    timelineSessionId?: string
+    revision?: number
+    streamingActive?: boolean
+    streamingText?: string
+  }
   | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
   | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }

@@ -15,11 +15,13 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import type { CodexActivityRecord, SdkServerMessage } from '../shared/ws-protocol.js'
+import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
+import type { CodexActivityRecord, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
+import type { SdkSessionState } from './sdk-bridge-types.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
@@ -331,6 +333,7 @@ export class WsHandler {
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
   private loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>
+  private agentHistorySource?: AgentHistorySource
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
@@ -367,6 +370,7 @@ export class WsHandler {
     extensionManager?: ExtensionManager,
     codexActivityListProvider?: () => CodexActivityRecord[],
     loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>,
+    agentHistorySource?: AgentHistorySource,
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
@@ -378,6 +382,16 @@ export class WsHandler {
     this.layoutStore = layoutStore
     this.extensionManager = extensionManager
     this.loadSessionHistoryFn = loadSessionHistoryFn
+    this.agentHistorySource = agentHistorySource ?? (this.sdkBridge
+      ? createAgentHistorySource({
+        loadSessionHistory: loadSessionHistoryFn ?? loadSessionHistory,
+        getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getSession(sdkSessionId),
+        getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findSessionByCliSessionId(timelineSessionId),
+        logDivergence: (details) => {
+          log.warn(details, 'FreshClaude restore snapshot history diverged')
+        },
+      })
+      : undefined)
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
@@ -943,6 +957,32 @@ export class WsHandler {
       terminalId: params.terminalId,
       timestamp: nowIso(),
     })
+  }
+
+  private async sendSdkSessionSnapshot(
+    ws: LiveWebSocket,
+    opts: {
+      sessionId: string
+      status: SdkSessionStatus
+      historyQueryId: string
+      liveSession?: SdkSessionState
+      resolvedHistory?: Awaited<ReturnType<AgentHistorySource['resolve']>>
+    },
+  ) {
+    const resolved = opts.resolvedHistory ?? await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
+    this.send(ws, {
+      type: 'sdk.session.snapshot',
+      sessionId: opts.sessionId,
+      latestTurnId: resolved && resolved.messages.length > 0 ? `turn-${resolved.messages.length - 1}` : null,
+      status: opts.status,
+      ...(resolved?.timelineSessionId ? { timelineSessionId: resolved.timelineSessionId } : {}),
+      ...(resolved ? { revision: resolved.revision } : {}),
+      ...(opts.liveSession ? {
+        streamingActive: opts.liveSession.streamingActive,
+        streamingText: opts.liveSession.streamingText,
+      } : {}),
+    } satisfies SdkServerMessage)
+    return resolved
   }
 
   /**
@@ -1746,32 +1786,12 @@ export class WsHandler {
           // Send sdk.created FIRST so the client creates the Redux session
           // before any buffered messages (sdk.session.init, sdk.error) arrive.
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
-
-          // When resuming a previous Claude Code session, load chat history
-          // from the .jsonl file on disk so the UI can display past messages.
-          // Sent before sdk.session.init so history is loaded before the UI
-          // becomes interactive, preventing user messages from being overwritten.
-          if (m.resumeSessionId) {
-            try {
-              const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
-              const messages = await loadFn(m.resumeSessionId)
-              this.send(ws, {
-                type: 'sdk.session.snapshot',
-                sessionId: session.sessionId,
-                latestTurnId: messages && messages.length > 0 ? `turn-${messages.length - 1}` : null,
-                status: session.status,
-              })
-            } catch (err) {
-              log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
-            }
-          } else {
-            this.send(ws, {
-              type: 'sdk.session.snapshot',
-              sessionId: session.sessionId,
-              latestTurnId: null,
-              status: session.status,
-            })
-          }
+          await this.sendSdkSessionSnapshot(ws, {
+            sessionId: session.sessionId,
+            status: session.status,
+            historyQueryId: session.sessionId,
+            liveSession: session,
+          })
 
           // Send preliminary sdk.session.init so the client can start interacting.
           // The SDK subprocess only emits system/init after the first user message,
@@ -1925,29 +1945,20 @@ export class WsHandler {
         }
         const session = this.sdkBridge.getSession(m.sessionId)
         if (!session) {
-          if (isValidClaudeSessionId(m.sessionId)) {
-            try {
-              const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
-              const historicalMessages = await loadFn(m.sessionId)
-              if (historicalMessages !== null) {
-                this.send(ws, {
-                  type: 'sdk.session.snapshot',
-                  sessionId: m.sessionId,
-                  latestTurnId: historicalMessages.length > 0
-                    ? `turn-${historicalMessages.length - 1}`
-                    : null,
-                  status: 'idle',
-                })
-                this.send(ws, {
-                  type: 'sdk.status',
-                  sessionId: m.sessionId,
-                  status: 'idle',
-                })
-                return
-              }
-            } catch (err) {
-              log.warn({ err, sessionId: m.sessionId }, 'Failed to load durable Claude history for attach')
-            }
+          const resolved = await this.agentHistorySource?.resolve(m.sessionId) ?? null
+          if (resolved) {
+            await this.sendSdkSessionSnapshot(ws, {
+              sessionId: m.sessionId,
+              status: 'idle',
+              historyQueryId: m.sessionId,
+              resolvedHistory: resolved,
+            })
+            this.send(ws, {
+              type: 'sdk.status',
+              sessionId: m.sessionId,
+              status: 'idle',
+            })
+            return
           }
           // Send sdk.error (not generic error) so the client's SDK message handler
           // can identify the lost session and trigger immediate recovery.
@@ -1972,26 +1983,11 @@ export class WsHandler {
           }
         }
 
-        // Send history replay. For resumed sessions, use the .jsonl file when it
-        // has more messages than in-memory (covers the post-restart case where
-        // in-memory is empty). For active sessions, in-memory is more current.
-        let historyMessages: ChatMessage[] = session.messages
-        if (session.resumeSessionId) {
-          try {
-            const loadFn = this.loadSessionHistoryFn ?? loadSessionHistory
-            const jsonlMessages = await loadFn(session.resumeSessionId)
-            if (jsonlMessages && jsonlMessages.length > session.messages.length) {
-              historyMessages = jsonlMessages
-            }
-          } catch (err) {
-            log.warn({ err, resumeSessionId: session.resumeSessionId }, 'Failed to load .jsonl history for attach')
-          }
-        }
-        this.send(ws, {
-          type: 'sdk.session.snapshot',
+        await this.sendSdkSessionSnapshot(ws, {
           sessionId: m.sessionId,
-          latestTurnId: historyMessages.length > 0 ? `turn-${historyMessages.length - 1}` : null,
           status: session.status,
+          historyQueryId: session.sessionId,
+          liveSession: session,
         })
 
         // Send current status

@@ -212,6 +212,34 @@ describe('SdkBridge', () => {
       expect(streamMsg.parentToolUseId).toBe('tool-1')
     })
 
+    it('tracks stream snapshot state for reconnect restore', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_start' },
+        session_id: 'cli-123',
+        uuid: 'uuid-1',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'par' },
+        },
+        session_id: 'cli-123',
+        uuid: 'uuid-2',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)).toMatchObject({
+        streamingActive: true,
+        streamingText: 'par',
+      })
+    })
+
     it('sets status to idle on result', async () => {
       mockKeepStreamOpen = true
       mockMessages.push({

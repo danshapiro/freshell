@@ -24,6 +24,8 @@ function makeLiveSession(
     status: 'running',
     createdAt: 1,
     messages: overrides.messages,
+    streamingActive: false,
+    streamingText: '',
     pendingPermissions: new Map(),
     pendingQuestions: new Map(),
     costUsd: 0,

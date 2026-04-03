@@ -78,6 +78,8 @@ export interface SdkSessionState {
   status: SdkSessionStatus
   createdAt: number
   messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string }>
+  streamingActive: boolean
+  streamingText: string
   pendingPermissions: Map<string, {
     toolName: string
     input: Record<string, unknown>

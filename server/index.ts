@@ -316,6 +316,7 @@ async function main() {
     extensionManager,
     () => codexActivity.tracker.list(),
     loadSessionHistoryWithCache,
+    agentHistorySource,
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)

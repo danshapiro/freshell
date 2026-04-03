@@ -29,6 +29,14 @@ vi.mock('../../../server/session-history-loader.js', async () => {
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 
+function makeMessage(role: 'user' | 'assistant', text: string, timestamp?: string) {
+  return {
+    role,
+    content: [{ type: 'text' as const, text }],
+    ...(timestamp ? { timestamp } : {}),
+  }
+}
+
 describe('WS Handler SDK Integration', () => {
   let originalAuthToken: string | undefined
 
@@ -229,12 +237,20 @@ describe('WS Handler SDK Integration', () => {
     let handler: WsHandler
     let registry: TerminalRegistry
     let mockSdkBridge: any
+    let mockHistorySource: { resolve: ReturnType<typeof vi.fn> }
 
     beforeEach(async () => {
       server = http.createServer()
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
       registry = new TerminalRegistry()
       loadSessionHistoryMock.mockReset()
+      mockHistorySource = {
+        resolve: vi.fn().mockResolvedValue({
+          liveSessionId: 'sdk-sess-1',
+          revision: 1,
+          messages: [makeMessage('user', 'hello', '2026-01-01T00:00:00Z')],
+        }),
+      }
 
       mockSdkBridge = {
         createSession: vi.fn().mockReturnValue({ sessionId: 'sdk-sess-1', status: 'starting', messages: [] }),
@@ -247,7 +263,12 @@ describe('WS Handler SDK Integration', () => {
           sessionId: 'sdk-sess-1',
           status: 'idle',
           messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+          streamingActive: false,
+          streamingText: '',
+          pendingPermissions: new Map(),
+          pendingQuestions: new Map(),
         }),
+        findSessionByCliSessionId: vi.fn(),
       }
 
       handler = new WsHandler(
@@ -256,6 +277,15 @@ describe('WS Handler SDK Integration', () => {
         undefined, // codingCliManager
         mockSdkBridge,
         undefined, // sessionRepairService
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        mockHistorySource,
       )
     })
 
@@ -473,7 +503,11 @@ describe('WS Handler SDK Integration', () => {
     })
 
     it('routes sdk.attach and returns snapshot + status without sdk.history', async () => {
-      loadSessionHistoryMock.mockResolvedValue(null)
+      mockHistorySource.resolve.mockResolvedValue({
+        liveSessionId: 'sdk-sess-1',
+        revision: 1,
+        messages: [makeMessage('user', 'hello', '2026-01-01T00:00:00Z')],
+      })
       const ws = await connectAndAuth()
       try {
         const messages: any[] = []
@@ -511,7 +545,71 @@ describe('WS Handler SDK Integration', () => {
         expect(statusMsg.status).toBe('idle')
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockSdkBridge.getSession).toHaveBeenCalledWith('sdk-sess-1')
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
         expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('sdk.attach snapshot includes canonical timelineSessionId, revision, and stream snapshot', async () => {
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-sess-1',
+        resumeSessionId: 'cli-sess-1',
+        status: 'running',
+        messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockHistorySource.resolve.mockResolvedValue({
+        liveSessionId: 'sdk-sess-1',
+        timelineSessionId: 'cli-sess-1',
+        revision: 123,
+        messages: [
+          makeMessage('user', 'older prompt', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
+          makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
+        ],
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
+              count += 1
+              if (count >= 2) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-sess-1',
+        }))
+
+        await collectDone
+
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-sess-1',
+          timelineSessionId: 'cli-sess-1',
+          revision: 123,
+          latestTurnId: 'turn-2',
+          status: 'running',
+          streamingActive: true,
+          streamingText: 'partial reply',
+        }))
       } finally {
         ws.close()
       }
@@ -520,18 +618,14 @@ describe('WS Handler SDK Integration', () => {
     it('hydrates sdk.attach from durable Claude history when no live SDK session exists', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
       mockSdkBridge.getSession.mockReturnValue(undefined)
-      loadSessionHistoryMock.mockResolvedValue([
-        {
-          role: 'user',
-          content: [{ type: 'text', text: 'Earlier question' }],
-          timestamp: '2026-03-10T10:00:00.000Z',
-        },
-        {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Earlier answer' }],
-          timestamp: '2026-03-10T10:00:01.000Z',
-        },
-      ])
+      mockHistorySource.resolve.mockResolvedValue({
+        timelineSessionId: durableSessionId,
+        revision: 123,
+        messages: [
+          makeMessage('user', 'Earlier question', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'Earlier answer', '2026-03-10T10:00:01.000Z'),
+        ],
+      })
 
       const ws = await connectAndAuth()
       try {
@@ -567,6 +661,8 @@ describe('WS Handler SDK Integration', () => {
           sessionId: durableSessionId,
           latestTurnId: 'turn-1',
           status: 'idle',
+          timelineSessionId: durableSessionId,
+          revision: 123,
         })
         expect(statusMsg).toEqual({
           type: 'sdk.status',
@@ -575,7 +671,7 @@ describe('WS Handler SDK Integration', () => {
         })
         expect(messages.some((m) => m.type === 'sdk.error')).toBe(false)
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
-        expect(loadSessionHistoryMock).toHaveBeenCalledWith(durableSessionId)
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith(durableSessionId, expect.any(Function))
       } finally {
         ws.close()
@@ -584,18 +680,15 @@ describe('WS Handler SDK Integration', () => {
 
     it('for resumed sdk.create sends sdk.created, then sdk.session.snapshot, then sdk.session.init', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
-      loadSessionHistoryMock.mockResolvedValue([
-        {
-          role: 'user',
-          content: [{ type: 'text', text: 'Earlier question' }],
-          timestamp: '2026-03-10T10:00:00.000Z',
-        },
-        {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Earlier answer' }],
-          timestamp: '2026-03-10T10:00:01.000Z',
-        },
-      ])
+      mockHistorySource.resolve.mockResolvedValue({
+        liveSessionId: 'sdk-sess-1',
+        timelineSessionId: durableSessionId,
+        revision: 123,
+        messages: [
+          makeMessage('user', 'Earlier question', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'Earlier answer', '2026-03-10T10:00:01.000Z'),
+        ],
+      })
 
       const ws = await connectAndAuth()
       try {
@@ -632,10 +725,42 @@ describe('WS Handler SDK Integration', () => {
           'sdk.session.init',
         ])
         expect(messages[1]).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
           sessionId: 'sdk-sess-1',
+          timelineSessionId: durableSessionId,
           latestTurnId: 'turn-1',
         }))
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('for named resume sdk.create resolves snapshot history by the live SDK session id and leaves timelineSessionId undefined', async () => {
+      mockSdkBridge.createSession.mockResolvedValue({
+        sessionId: 'sdk-sess-named',
+        resumeSessionId: 'worktree-hotfix',
+        status: 'starting',
+        messages: [],
+      })
+      mockHistorySource.resolve.mockResolvedValue({
+        liveSessionId: 'sdk-sess-named',
+        revision: 1,
+        messages: [makeMessage('user', 'live only', '2026-03-10T10:00:00.000Z')],
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const snapshot = await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-named',
+          resumeSessionId: 'worktree-hotfix',
+        }, 'sdk.session.snapshot')
+
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-named')
+        expect(mockHistorySource.resolve).not.toHaveBeenCalledWith('worktree-hotfix')
+        expect(snapshot.timelineSessionId).toBeUndefined()
       } finally {
         ws.close()
       }
@@ -643,7 +768,7 @@ describe('WS Handler SDK Integration', () => {
 
     it('returns sdk.error for sdk.attach with unknown session', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
-      loadSessionHistoryMock.mockResolvedValue(null)
+      mockHistorySource.resolve.mockResolvedValue(null)
       const ws = await connectAndAuth()
       try {
         const response = await sendAndWaitForResponse(ws, {

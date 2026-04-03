@@ -88,7 +88,7 @@ function waitForMessage(ws: WebSocket, filter: (data: any) => boolean): Promise<
   })
 }
 
-describe('WsHandler loadSessionHistory DI', () => {
+describe('WsHandler agent history source DI', () => {
   let originalAuthToken: string | undefined
   let server: http.Server
   let handler: WsHandler
@@ -117,14 +117,20 @@ describe('WsHandler loadSessionHistory DI', () => {
     }
   })
 
-  it('sdk.create with resumeSessionId calls injected loadSessionHistory', async () => {
-    const injectedFn = vi.fn().mockResolvedValue([
-      {
-        role: 'user',
-        content: [{ type: 'text', text: 'Hello from injected' }],
-        timestamp: '2026-01-01T00:00:01Z',
-      },
-    ])
+  it('sdk.create with resumeSessionId calls injected history source', async () => {
+    const injectedHistorySource = {
+      resolve: vi.fn().mockResolvedValue({
+        liveSessionId: 'sdk-sess-1',
+        revision: 1,
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'Hello from injected' }],
+            timestamp: '2026-01-01T00:00:01Z',
+          },
+        ],
+      }),
+    }
 
     const mockSdkBridge = {
       createSession: vi.fn().mockReturnValue({
@@ -134,9 +140,12 @@ describe('WsHandler loadSessionHistory DI', () => {
         model: 'claude-sonnet-4-20250514',
         cwd: '/tmp',
         resumeSessionId: 'resume-sess-1',
+        streamingActive: false,
+        streamingText: '',
       }),
       subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
       getSession: vi.fn(),
+      findSessionByCliSessionId: vi.fn(),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -160,7 +169,8 @@ describe('WsHandler loadSessionHistory DI', () => {
       undefined, // layoutStore
       undefined, // extensionManager
       undefined, // codexActivityListProvider
-      injectedFn, // loadSessionHistoryFn
+      undefined,
+      injectedHistorySource,
     )
 
     const ws = await connectAndAuth(server)
@@ -174,25 +184,32 @@ describe('WsHandler loadSessionHistory DI', () => {
 
     await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
 
-    expect(injectedFn).toHaveBeenCalledWith('resume-sess-1')
+    expect(injectedHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
     expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
 
     ws.close()
   })
 
-  it('sdk.attach for durable session calls injected loadSessionHistory', async () => {
-    const injectedFn = vi.fn().mockResolvedValue([
-      {
-        role: 'user',
-        content: [{ type: 'text', text: 'Historical message' }],
-        timestamp: '2026-01-01T00:00:01Z',
-      },
-    ])
+  it('sdk.attach for durable session calls injected history source', async () => {
+    const injectedHistorySource = {
+      resolve: vi.fn().mockResolvedValue({
+        timelineSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+        revision: 1,
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'Historical message' }],
+            timestamp: '2026-01-01T00:00:01Z',
+          },
+        ],
+      }),
+    }
 
     const mockSdkBridge = {
       createSession: vi.fn(),
       subscribe: vi.fn(),
       getSession: vi.fn().mockReturnValue(null),
+      findSessionByCliSessionId: vi.fn(),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -216,7 +233,8 @@ describe('WsHandler loadSessionHistory DI', () => {
       undefined,
       undefined,
       undefined,
-      injectedFn,
+      undefined,
+      injectedHistorySource,
     )
 
     const ws = await connectAndAuth(server)
@@ -230,25 +248,32 @@ describe('WsHandler loadSessionHistory DI', () => {
 
     await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
 
-    expect(injectedFn).toHaveBeenCalledWith(sessionId)
+    expect(injectedHistorySource.resolve).toHaveBeenCalledWith(sessionId)
     expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
 
     ws.close()
   })
 
-  it('multiple attaches to same session: loadSessionHistory called per attach', async () => {
-    const injectedFn = vi.fn().mockResolvedValue([
-      {
-        role: 'user',
-        content: [{ type: 'text', text: 'Message' }],
-        timestamp: '2026-01-01T00:00:01Z',
-      },
-    ])
+  it('multiple attaches to same session: injected history source resolves per attach', async () => {
+    const injectedHistorySource = {
+      resolve: vi.fn().mockResolvedValue({
+        timelineSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+        revision: 1,
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'text', text: 'Message' }],
+            timestamp: '2026-01-01T00:00:01Z',
+          },
+        ],
+      }),
+    }
 
     const mockSdkBridge = {
       createSession: vi.fn(),
       subscribe: vi.fn(),
       getSession: vi.fn().mockReturnValue(null),
+      findSessionByCliSessionId: vi.fn(),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -272,7 +297,8 @@ describe('WsHandler loadSessionHistory DI', () => {
       undefined,
       undefined,
       undefined,
-      injectedFn,
+      undefined,
+      injectedHistorySource,
     )
 
     const ws = await connectAndAuth(server)
@@ -284,7 +310,7 @@ describe('WsHandler loadSessionHistory DI', () => {
     ws.send(JSON.stringify({ type: 'sdk.attach', sessionId }))
     await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
 
-    expect(injectedFn).toHaveBeenCalledTimes(2)
+    expect(injectedHistorySource.resolve).toHaveBeenCalledTimes(2)
     expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
 
     ws.close()
