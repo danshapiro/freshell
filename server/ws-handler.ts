@@ -2010,9 +2010,6 @@ export class WsHandler {
           return
         }
 
-        // Subscribe this client to session events if not already
-        const bufferReplayed = this.subscribeClientToSdkSession(ws, state, m.sessionId, liveSession.sessionId)
-
         await this.sendSdkSessionSnapshot(ws, {
           sessionId: m.sessionId,
           status: liveSession.status,
@@ -2027,6 +2024,10 @@ export class WsHandler {
           sessionId: m.sessionId,
           status: liveSession.status,
         })
+
+        // Subscribe after the authoritative snapshot/status so any buffered
+        // replayed messages cannot outrun restore hydration on attach.
+        const bufferReplayed = this.subscribeClientToSdkSession(ws, state, m.sessionId, liveSession.sessionId)
 
         // Replay pending permissions and questions for re-attaching clients.
         // Skip if subscribe() already replayed the buffer (first subscriber),

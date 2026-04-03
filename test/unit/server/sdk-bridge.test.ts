@@ -102,6 +102,37 @@ describe('SdkBridge', () => {
       expect(bridge.getSession('nonexistent')).toBeUndefined()
     })
 
+    it('finds a session by cliSessionId after init', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.findSessionByCliSessionId('cli-123')?.sessionId).toBe(session.sessionId)
+    })
+
+    it('finds a session by resumeSessionId before the SDK init arrives', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.length = 0
+
+      const session = await bridge.createSession({
+        cwd: '/tmp',
+        resumeSessionId: '00000000-0000-4000-8000-000000000241',
+      })
+
+      expect(bridge.findSessionByCliSessionId('00000000-0000-4000-8000-000000000241')?.sessionId).toBe(session.sessionId)
+    })
+
     it('kills a session', async () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
       const killed = bridge.killSession(session.sessionId)

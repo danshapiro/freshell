@@ -108,6 +108,10 @@ function messagesMatch(left: ChatMessage, right: ChatMessage): boolean {
   return sameMessageCore(left, right) && timestampsPlausiblySame(left.timestamp, right.timestamp)
 }
 
+function messagesCompatibleForSharedHistory(left: ChatMessage, right: ChatMessage): boolean {
+  return sameMessageCore(left, right) && !timestampsMateriallyDifferent(left.timestamp, right.timestamp)
+}
+
 function isResumedDeltaSession(session: SdkSessionState): boolean {
   return typeof session.resumeSessionId === 'string' && session.resumeSessionId.length > 0
 }
@@ -121,7 +125,7 @@ function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState
 
 function isPrefix(prefix: ChatMessage[], full: ChatMessage[]): boolean {
   if (prefix.length > full.length) return false
-  return prefix.every((message, index) => messagesMatch(message, full[index]!))
+  return prefix.every((message, index) => messagesCompatibleForSharedHistory(message, full[index]!))
 }
 
 function mergeResumedDeltaHistory(
@@ -134,7 +138,13 @@ function mergeResumedDeltaHistory(
   for (let overlap = maxOverlap; overlap >= 1; overlap -= 1) {
     const durableTail = durableMessages.slice(durableMessages.length - overlap)
     const liveHead = liveMessages.slice(0, overlap)
-    if (durableTail.every((message, index) => messagesMatch(message, liveHead[index]!))) {
+    const overlapMatches = durableTail.every((message, index) => {
+      const other = liveHead[index]!
+      return overlap === 1
+        ? messagesMatch(message, other)
+        : messagesCompatibleForSharedHistory(message, other)
+    })
+    if (overlapMatches) {
       return [...durableMessages, ...liveMessages.slice(overlap)]
     }
   }
