@@ -398,4 +398,15 @@ describe('agent timeline history source', () => {
       revision: Date.parse('2026-03-10T10:00:01.000Z'),
     })
   })
+
+  it('still throws when durable history loading fails and no live session exists', async () => {
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockRejectedValue(new Error('jsonl read failed')),
+      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(undefined),
+      getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
+      logDivergence: vi.fn(),
+    })
+
+    await expect(source.resolve('00000000-0000-4000-8000-000000000125')).rejects.toThrow('jsonl read failed')
+  })
 })

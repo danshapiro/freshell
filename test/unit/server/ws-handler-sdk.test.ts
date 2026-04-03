@@ -949,7 +949,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('falls back to a live-only snapshot when sdk.create durable history resolution fails', async () => {
+    it('returns sdk.error instead of fabricating a live-only snapshot when sdk.create history resolution fails unexpectedly', async () => {
       mockSdkBridge.createSession.mockResolvedValue({
         sessionId: 'sdk-sess-live-only',
         status: 'running',
@@ -971,14 +971,13 @@ describe('WS Handler SDK Integration', () => {
               parsed.type === 'sdk.created'
               || parsed.type === 'sdk.session.snapshot'
               || parsed.type === 'sdk.session.init'
-              || parsed.type === 'error'
+              || parsed.type === 'sdk.error'
             ) {
               messages.push(parsed)
             }
             if (
               messages.some((message) => message.type === 'sdk.created')
-              && messages.some((message) => message.type === 'sdk.session.snapshot')
-              && messages.some((message) => message.type === 'sdk.session.init')
+              && messages.some((message) => message.type === 'sdk.error')
             ) {
               ws.off('message', onMessage)
               resolve()
@@ -994,15 +993,71 @@ describe('WS Handler SDK Integration', () => {
 
         await collected
 
-        expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
-          type: 'sdk.session.snapshot',
+        expect(messages.find((message) => message.type === 'sdk.created')).toEqual(expect.objectContaining({
+          type: 'sdk.created',
           sessionId: 'sdk-sess-live-only',
-          latestTurnId: 'turn-0',
-          status: 'running',
-          streamingActive: true,
-          streamingText: 'partial reply',
         }))
-        expect(messages.some((message) => message.type === 'error')).toBe(false)
+        expect(messages.find((message) => message.type === 'sdk.error')).toEqual({
+          type: 'sdk.error',
+          sessionId: 'sdk-sess-live-only',
+          code: 'INTERNAL_ERROR',
+          message: 'Failed to restore SDK session history',
+        })
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns sdk.error instead of fabricating a live-only snapshot when live sdk.attach history resolution fails unexpectedly', async () => {
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-sess-live-attach',
+        status: 'running',
+        messages: [makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockHistorySource.resolve.mockRejectedValue(new Error('jsonl read failed'))
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collected = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (
+              parsed.type === 'sdk.session.snapshot'
+              || parsed.type === 'sdk.status'
+              || parsed.type === 'sdk.error'
+            ) {
+              messages.push(parsed)
+            }
+            if (messages.some((message) => message.type === 'sdk.error')) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-sess-live-attach',
+        }))
+
+        await collected
+
+        expect(messages).toContainEqual({
+          type: 'sdk.error',
+          sessionId: 'sdk-sess-live-attach',
+          code: 'INTERNAL_ERROR',
+          message: 'Failed to restore SDK session history',
+        })
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.status')).toBe(false)
       } finally {
         ws.close()
       }

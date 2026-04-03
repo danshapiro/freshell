@@ -10,6 +10,21 @@
 
 ---
 
+## Root Cause Analysis
+
+- The branch initially treated "durable history resolution threw" as if it were another expected restore-data variant and added a handler-local live-only snapshot fallback in `WsHandler`.
+- That diagnosis was too loose. The production durable loader path already collapses ordinary file-read, stat, missing-file, and cache-miss conditions to `null`; those are not exceptions that require a second restore path.
+- The actual architectural flaw was contract ambiguity at the shared history boundary:
+  - `AgentHistorySource` was introduced to be the one place that reconciles durable Claude JSONL state with live SDK state.
+  - `WsHandler` still kept its own emergency snapshot-construction logic when `resolve()` rejected.
+  - Tests then modeled `resolve()` rejection as if it were a normal durable-read scenario, which reinforced the idea that both layers owned restore degradation.
+- The corrected contract is:
+  - `AgentHistorySource` owns all recoverable restore degradation, including "durable history load failed but a live session still exists", which degrades to the live transcript there.
+  - `WsHandler` does not fabricate history. If the shared resolver itself still rejects, that is an internal error and must surface as `sdk.error`, not as a second restore path.
+- This means the primary path is now actually hardened rather than shadowed:
+  - normal durable-read problems are absorbed inside the shared resolver
+  - unexpected resolver failure is translated once at the protocol boundary
+
 ## Restore Contract
 
 - A resumed FreshClaude session has two distinct history sources:
@@ -29,6 +44,7 @@
 - When `content_block_stop` arrives, set `streamingActive = false` but preserve `streamingText` until the terminal `assistant` or `result` message arrives. This preserves visible partial output across reconnect and restore without falsely labeling a quiet gap as active streaming.
 - Divergent live-vs-durable histories are a real boundary. Log them with enough context to diagnose the source (`sdk session id`, `timeline session id`, live mode, live count, durable count). Do not silently weave contradictory middles together.
 - Overlap removal for resumed-delta merges must be conservative. Never drop an ambiguous repeated single-message turn just because the text matches; use any available timestamp evidence to distinguish a true durable/live overlap from a legitimately repeated prompt.
+- Recoverable durable-history read failures belong to `AgentHistorySource`, not `WsHandler`. If a live session exists, the resolver may degrade to live-only there. If the resolver itself rejects, `WsHandler` must emit `sdk.error` rather than fabricate a local snapshot.
 
 ### Streaming-State Decision Note
 
@@ -52,7 +68,7 @@ Adjudicated on 2026-04-03 by an independent reviewer with no prior thread contex
 - Modify: `server/sdk-bridge.ts`
   Responsibility: track stream snapshot state and expose lookup by durable Claude session ID.
 - Modify: `server/ws-handler.ts`
-  Responsibility: send authoritative `sdk.session.snapshot` payloads from the shared history source for `sdk.create` and `sdk.attach`, without falling back to the legacy raw loader seam.
+  Responsibility: send authoritative `sdk.session.snapshot` payloads from the shared history source for `sdk.create` and `sdk.attach`, and translate unexpected resolver failure to `sdk.error` instead of fabricating local restore state.
 - Modify: `shared/ws-protocol.ts`
   Responsibility: define the richer `sdk.session.snapshot` server-to-client contract.
 - Modify: `src/lib/api.ts`

@@ -2,6 +2,14 @@
 
 The transcript does not add a separate testing strategy beyond "comprehensive audit and fix." Reconciled against the implementation plan, that still holds: the change surface is the existing FreshClaude restore flow over WebSocket snapshots, HTTP timeline reads, persisted pane/tab state, and indexed Claude metadata. No external services, paid APIs, or new infrastructure are required. The only adjustment is emphasis: because the implementation centralizes restore truth in a shared server history source, the plan must be led by rendered reload/create/attach scenarios and only use unit tests to pin merge and store contracts underneath them.
 
+Root-cause note:
+
+- The restore bug class here is not "JSONL reads commonly throw and need a handler fallback." Ordinary durable-history lookup failures already collapse to empty/missing results in the loader layer.
+- The real failure was architectural drift: `WsHandler` still fabricated a local live-only snapshot when the shared history resolver rejected, so two layers appeared to own restore degradation.
+- Tests and reviews should therefore enforce the corrected split:
+  - `AgentHistorySource` owns recoverable durable/live degradation.
+  - `WsHandler` translates unexpected resolver rejection into `sdk.error` and does not invent replacement history.
+
 ## Harness requirements
 
 No new harnesses need to be built. The existing harnesses already cover the required surfaces.
@@ -84,8 +92,8 @@ No new harnesses need to be built. The existing harnesses already cover the requ
    - **Harness:** `server-ws-integration`
    - **Preconditions:** `WsHandler` runs on a real in-process WebSocket server with injected `SdkBridge` and shared history source; cases include fresh create, resumed create, live attach, durable-only attach after restart, and named resume targets that are not valid Claude UUIDs.
    - **Actions:** Send `sdk.create` and `sdk.attach` messages for each case; capture outbound WS messages in order.
-   - **Expected outcome:** Per the `Restore Contract` ("`timelineSessionId` is optional and never an SDK session id," "named resume targets stay live-only until Claude reveals the durable UUID," "`sdk.attach` with stale SDK ids still errors"), the handler emits `sdk.created -> sdk.session.snapshot -> sdk.session.init` in order for create, emits `sdk.session.snapshot` plus `sdk.status` for attach, populates `timelineSessionId`, `revision`, and stream snapshot fields only when justified, queries restore history by live SDK id for named resumes, and returns `INVALID_SESSION_ID` for stale unresolvable SDK ids.
-   - **Interactions:** `WsHandler`, `SdkBridge`, shared history source, WebSocket protocol contract, durable-history fallback.
+   - **Expected outcome:** Per the `Restore Contract` ("`timelineSessionId` is optional and never an SDK session id," "named resume targets stay live-only until Claude reveals the durable UUID," "`sdk.attach` with stale SDK ids still errors"), the handler emits `sdk.created -> sdk.session.snapshot -> sdk.session.init` in order for create, emits `sdk.session.snapshot` plus `sdk.status` for attach, populates `timelineSessionId`, `revision`, and stream snapshot fields only when justified, queries restore history by live SDK id for named resumes, returns `INVALID_SESSION_ID` for stale unresolvable SDK ids, and emits `sdk.error` rather than fabricating a local snapshot if the shared resolver itself rejects unexpectedly.
+   - **Interactions:** `WsHandler`, `SdkBridge`, shared history source, WebSocket protocol contract, resolver-owned degradation boundary.
 
 9. **Name:** The timeline HTTP route and service preserve canonical session identity and inline-body pass-through
    - **Type:** integration
@@ -102,7 +110,7 @@ No new harnesses need to be built. The existing harnesses already cover the requ
     - **Harness:** `server-unit-di`
     - **Preconditions:** The history source receives combinations of durable backlog only, fresh live full transcript, resumed live delta, overlapping durable/live tails, ambiguous repeated prompts with distinct timestamps, and named resume strings that are not valid Claude UUIDs.
     - **Actions:** Resolve history for each case via the shared history source; inspect merged messages, resolved ids, revision, and divergence logging hooks.
-    - **Expected outcome:** Per the `Restore Contract` bullets on resumed delta semantics, conservative overlap removal, named-resume handling, and divergence logging, the resolver appends live delta onto durable backlog for resumed sessions, prefers the fuller non-conflicting transcript for fresh sessions, keeps ambiguous repeated prompts when timestamp evidence says they are distinct turns, never sets `timelineSessionId` to an SDK id or named resume string, and logs real conflicts instead of silently weaving contradictory middles together.
+    - **Expected outcome:** Per the `Restore Contract` bullets on resumed delta semantics, conservative overlap removal, named-resume handling, and divergence logging, the resolver appends live delta onto durable backlog for resumed sessions, prefers the fuller non-conflicting transcript for fresh sessions, keeps ambiguous repeated prompts when timestamp evidence says they are distinct turns, never sets `timelineSessionId` to an SDK id or named resume string, degrades to live-only only inside the resolver when durable load fails but a live session still exists, and otherwise lets unexpected failure propagate for boundary translation instead of hiding it as alternate history.
     - **Interactions:** durable JSONL loader seam, live session lookup by SDK and durable id, divergence logger.
 
 11. **Name:** The client store and API contract request inline bodies once, keep canonical ids, and avoid redundant newest-turn fetches

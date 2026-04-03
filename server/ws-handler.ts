@@ -15,12 +15,12 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import { createAgentHistorySource, type AgentHistorySource, type ResolvedAgentHistory } from './agent-timeline/history-source.js'
+import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
 import type { CodexActivityRecord, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
-import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
+import { loadSessionHistory } from './session-history-loader.js'
 import type { SdkSessionState } from './sdk-bridge-types.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
@@ -119,31 +119,6 @@ const CLOSE_CODES = {
 
 function nowIso() {
   return new Date().toISOString()
-}
-
-function toSnapshotRevision(messages: ChatMessage[]): number {
-  return messages.reduce((maxRevision, message, index) => {
-    if (!message.timestamp) return Math.max(maxRevision, index + 1)
-    const timestamp = Date.parse(message.timestamp)
-    if (!Number.isFinite(timestamp)) return Math.max(maxRevision, index + 1)
-    return Math.max(maxRevision, timestamp)
-  }, 0)
-}
-
-function resolveSnapshotTimelineSessionId(queryId: string, liveSession?: SdkSessionState): string | undefined {
-  if (isValidClaudeSessionId(liveSession?.cliSessionId)) return liveSession.cliSessionId
-  if (isValidClaudeSessionId(liveSession?.resumeSessionId)) return liveSession.resumeSessionId
-  if (isValidClaudeSessionId(queryId)) return queryId
-  return undefined
-}
-
-function buildLiveOnlyResolvedHistory(queryId: string, liveSession: SdkSessionState): ResolvedAgentHistory {
-  return {
-    liveSessionId: liveSession.sessionId,
-    timelineSessionId: resolveSnapshotTimelineSessionId(queryId, liveSession),
-    messages: liveSession.messages,
-    revision: toSnapshotRevision(liveSession.messages),
-  }
 }
 
 function isMobileUserAgent(userAgent: string | undefined): boolean {
@@ -995,18 +970,7 @@ export class WsHandler {
   ) {
     let resolved = opts.resolvedHistory ?? null
     if (!resolved) {
-      try {
-        resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
-      } catch (error) {
-        if (!opts.liveSession) throw error
-        log.warn({
-          err: error instanceof Error ? error : new Error(String(error)),
-          historyQueryId: opts.historyQueryId,
-          sessionId: opts.sessionId,
-          liveSessionId: opts.liveSession.sessionId,
-        }, 'Failed to resolve durable SDK session history; falling back to live session snapshot')
-        resolved = buildLiveOnlyResolvedHistory(opts.historyQueryId, opts.liveSession)
-      }
+      resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
     }
     this.send(ws, {
       type: 'sdk.session.snapshot',
@@ -1021,6 +985,19 @@ export class WsHandler {
       } : {}),
     } satisfies SdkServerMessage)
     return resolved
+  }
+
+  private sendSdkRestoreError(ws: LiveWebSocket, sessionId: string, error: unknown) {
+    log.warn({
+      err: error instanceof Error ? error : new Error(String(error)),
+      sessionId,
+    }, 'sdk restore history resolution failed')
+    this.send(ws, {
+      type: 'sdk.error',
+      sessionId,
+      code: 'INTERNAL_ERROR',
+      message: 'Failed to restore SDK session history',
+    } as SdkServerMessage)
   }
 
   private resolveSdkSessionTarget(state: ClientState, clientSessionId: string): string {
@@ -1859,12 +1836,17 @@ export class WsHandler {
           // Send sdk.created FIRST so the client creates the Redux session
           // before any buffered messages (sdk.session.init, sdk.error) arrive.
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
-          await this.sendSdkSessionSnapshot(ws, {
-            sessionId: session.sessionId,
-            status: session.status,
-            historyQueryId: session.sessionId,
-            liveSession: session,
-          })
+          try {
+            await this.sendSdkSessionSnapshot(ws, {
+              sessionId: session.sessionId,
+              status: session.status,
+              historyQueryId: session.sessionId,
+              liveSession: session,
+            })
+          } catch (err) {
+            this.sendSdkRestoreError(ws, session.sessionId, err)
+            return
+          }
 
           // Send preliminary sdk.session.init so the client can start interacting.
           // The SDK subprocess only emits system/init after the first user message,
@@ -2020,13 +2002,7 @@ export class WsHandler {
           try {
             resolved = await this.agentHistorySource?.resolve(m.sessionId) ?? null
           } catch (err) {
-            log.warn({ err, sessionId: m.sessionId }, 'sdk.attach history resolution failed')
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: 'INTERNAL_ERROR',
-              message: 'Failed to restore SDK session history',
-            } as SdkServerMessage)
+            this.sendSdkRestoreError(ws, m.sessionId, err)
             return
           }
         }
@@ -2058,13 +2034,18 @@ export class WsHandler {
           return
         }
 
-        await this.sendSdkSessionSnapshot(ws, {
-          sessionId: m.sessionId,
-          status: liveSession.status,
-          historyQueryId: m.sessionId,
-          liveSession,
-          ...(resolved ? { resolvedHistory: resolved } : {}),
-        })
+        try {
+          await this.sendSdkSessionSnapshot(ws, {
+            sessionId: m.sessionId,
+            status: liveSession.status,
+            historyQueryId: m.sessionId,
+            liveSession,
+            ...(resolved ? { resolvedHistory: resolved } : {}),
+          })
+        } catch (err) {
+          this.sendSdkRestoreError(ws, m.sessionId, err)
+          return
+        }
 
         // Send current status
         this.send(ws, {
