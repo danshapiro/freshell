@@ -142,17 +142,24 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
-function createStore(terminalId: string) {
+function createStore(options: {
+  requestId: string
+  terminalId?: string
+  status?: 'creating' | 'running'
+}) {
+  const terminalId = options.terminalId
+  const status = options.status ?? (terminalId ? 'running' : 'creating')
   const paneContent: TerminalPaneContent = {
     kind: 'terminal',
-    createRequestId: `req-${terminalId}`,
-    status: 'running',
+    createRequestId: options.requestId,
+    status,
     mode: 'opencode',
     shell: 'system',
-    terminalId,
+    ...(terminalId ? { terminalId } : {}),
   }
 
-  const layout: PaneNode = { type: 'leaf', id: `pane-${terminalId}`, content: paneContent }
+  const stableId = terminalId ?? options.requestId
+  const layout: PaneNode = { type: 'leaf', id: `pane-${stableId}`, content: paneContent }
 
   return configureStore({
     reducer: {
@@ -165,18 +172,18 @@ function createStore(terminalId: string) {
     preloadedState: {
       tabs: {
         tabs: [{
-          id: `tab-${terminalId}`,
+          id: `tab-${stableId}`,
           mode: 'opencode',
-          status: 'running',
+          status,
           title: 'OpenCode',
-          createRequestId: `req-${terminalId}`,
-          terminalId,
+          createRequestId: options.requestId,
+          ...(terminalId ? { terminalId } : {}),
         }],
-        activeTabId: `tab-${terminalId}`,
+        activeTabId: `tab-${stableId}`,
       },
       panes: {
-        layouts: { [`tab-${terminalId}`]: layout },
-        activePane: { [`tab-${terminalId}`]: `pane-${terminalId}` },
+        layouts: { [`tab-${stableId}`]: layout },
+        activePane: { [`tab-${stableId}`]: `pane-${stableId}` },
         paneTitles: {},
       },
       settings: { settings: defaultSettings, status: 'loaded' },
@@ -235,6 +242,56 @@ function emitCapturedPostReplyFrames(
   })
 }
 
+async function renderCreatedTerminal(terminalId: string) {
+  const requestId = `req-${terminalId}`
+  const store = createStore({ requestId })
+  const stableId = requestId
+
+  render(
+    <Provider store={store}>
+      <TerminalView
+        tabId={`tab-${stableId}`}
+        paneId={`pane-${stableId}`}
+        paneContent={store.getState().panes.layouts[`tab-${stableId}`]!.content as TerminalPaneContent}
+        hidden={false}
+      />
+    </Provider>,
+  )
+
+  await waitFor(() => {
+    expect(lastSent('terminal.create')).toMatchObject({
+      type: 'terminal.create',
+      requestId,
+      mode: 'opencode',
+    })
+  })
+
+  wsHarness.send.mockClear()
+
+  wsHarness.emit({
+    type: 'terminal.created',
+    requestId,
+    terminalId,
+    createdAt: Date.now(),
+  })
+
+  await waitFor(() => {
+    expect(lastSent('terminal.attach', terminalId)).toMatchObject({
+      type: 'terminal.attach',
+      terminalId,
+      attachRequestId: expect.any(String),
+    })
+  })
+
+  const attach = lastSent('terminal.attach', terminalId)
+
+  return {
+    store,
+    attach,
+    terminalId,
+  }
+}
+
 describe('opencode startup probes (e2e)', () => {
   beforeEach(() => {
     wsHarness.reset()
@@ -264,28 +321,7 @@ describe('opencode startup probes (e2e)', () => {
 
   it('replies to live startup probes before writing the first captured post-reply output', async () => {
     const terminalId = 'term-opencode-live'
-    const store = createStore(terminalId)
-
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId={`tab-${terminalId}`}
-          paneId={`pane-${terminalId}`}
-          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
-          hidden={false}
-        />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        attachRequestId: expect.any(String),
-      })
-    })
-
-    const attach = lastSent('terminal.attach', terminalId)
+    const { attach } = await renderCreatedTerminal(terminalId)
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
@@ -342,28 +378,7 @@ describe('opencode startup probes (e2e)', () => {
 
   it('strips historical startup probes during replay without sending late replies', async () => {
     const terminalId = 'term-opencode-replay'
-    const store = createStore(terminalId)
-
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId={`tab-${terminalId}`}
-          paneId={`pane-${terminalId}`}
-          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
-          hidden={false}
-        />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        attachRequestId: expect.any(String),
-      })
-    })
-
-    const attach = lastSent('terminal.attach', terminalId)
+    const { attach } = await renderCreatedTerminal(terminalId)
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
@@ -407,29 +422,8 @@ describe('opencode startup probes (e2e)', () => {
 
   it('does not complete a replay-fragment startup probe from the first live frame', async () => {
     const terminalId = 'term-opencode-replay-live-boundary'
-    const store = createStore(terminalId)
     const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES
-
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId={`tab-${terminalId}`}
-          paneId={`pane-${terminalId}`}
-          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
-          hidden={false}
-        />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        attachRequestId: expect.any(String),
-      })
-    })
-
-    const attach = lastSent('terminal.attach', terminalId)
+    const { attach } = await renderCreatedTerminal(terminalId)
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
@@ -475,31 +469,59 @@ describe('opencode startup probes (e2e)', () => {
     })
   })
 
-  it('buffers a split live startup probe and replies exactly once when it completes', async () => {
-    const terminalId = 'term-opencode-split-live'
-    const store = createStore(terminalId)
-    const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES
+  it('discards replay fragments that end before the final startup-probe bytes', async () => {
+    const terminalId = 'term-opencode-replay-early-fragment'
+    const { attach } = await renderCreatedTerminal(terminalId)
+    const replayFragment = OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, -2)
+    const liveRemainder = OPEN_CODE_STARTUP_PROBE_FRAME.slice(replayFragment.length)
 
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId={`tab-${terminalId}`}
-          paneId={`pane-${terminalId}`}
-          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
-          hidden={false}
-        />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        attachRequestId: expect.any(String),
-      })
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 1,
+      replayFromSeq: 1,
+      replayToSeq: 1,
+      attachRequestId: attach.attachRequestId,
     })
 
-    const attach = lastSent('terminal.attach', terminalId)
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: replayFragment,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([])
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 2,
+      seqEnd: 4,
+      data: `${liveRemainder}${OPEN_CODE_STARTUP_POST_REPLY_FRAMES[0] ?? ''}`,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0]!.write).toHaveBeenCalled()
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([
+      { kind: 'write', data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+    ])
+  })
+
+  it('buffers a split live startup probe and replies exactly once when it completes', async () => {
+    const terminalId = 'term-opencode-split-live'
+    const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES
+    const { attach } = await renderCreatedTerminal(terminalId)
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
@@ -553,28 +575,7 @@ describe('opencode startup probes (e2e)', () => {
 
   it('answers a complete startup probe on the first accepted post-replay live frame', async () => {
     const terminalId = 'term-opencode-first-live-after-replay'
-    const store = createStore(terminalId)
-
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId={`tab-${terminalId}`}
-          paneId={`pane-${terminalId}`}
-          paneContent={store.getState().panes.layouts[`tab-${terminalId}`]!.content as TerminalPaneContent}
-          hidden={false}
-        />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(lastSent('terminal.attach', terminalId)).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        attachRequestId: expect.any(String),
-      })
-    })
-
-    const attach = lastSent('terminal.attach', terminalId)
+    const { attach } = await renderCreatedTerminal(terminalId)
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,

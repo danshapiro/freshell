@@ -87,8 +87,7 @@ export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
-const STARTUP_PROBE_OSC11_PREFIX = '\u001b]11;?'
-const STARTUP_PROBE_OSC11_TERMINATOR = '\u0007'
+const STARTUP_PROBE_OSC11_QUERY = '\u001b]11;?\u0007'
 
 function isClaudeTurnSubmit(data: string): boolean {
   return data.includes('\r') || data.includes('\n')
@@ -277,7 +276,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
-  const startupProbeReplayDiscardPrefixRef = useRef<string | null>(null)
+  const startupProbeReplayDiscardRemainderRef = useRef<string | null>(null)
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
@@ -860,12 +859,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
     if (opts?.discardReplayRemainder) {
-      startupProbeReplayDiscardPrefixRef.current =
-        startupProbeStateRef.current.pending === STARTUP_PROBE_OSC11_PREFIX
-          ? STARTUP_PROBE_OSC11_TERMINATOR
+      const pendingProbe = startupProbeStateRef.current.pending
+      startupProbeReplayDiscardRemainderRef.current =
+        pendingProbe
+        && pendingProbe !== STARTUP_PROBE_OSC11_QUERY
+        && STARTUP_PROBE_OSC11_QUERY.startsWith(pendingProbe)
+          ? STARTUP_PROBE_OSC11_QUERY.slice(pendingProbe.length)
           : null
     } else {
-      startupProbeReplayDiscardPrefixRef.current = null
+      startupProbeReplayDiscardRemainderRef.current = null
     }
     startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
@@ -1816,11 +1818,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (enteringFreshLiveOutput) {
             resetStartupProbeParser({ discardReplayRemainder: true })
           }
-          if (startupProbeReplayDiscardPrefixRef.current) {
-            const prefix = startupProbeReplayDiscardPrefixRef.current
-            startupProbeReplayDiscardPrefixRef.current = null
-            if (raw.startsWith(prefix)) {
-              raw = raw.slice(prefix.length)
+          if (startupProbeReplayDiscardRemainderRef.current) {
+            const remainder = startupProbeReplayDiscardRemainderRef.current
+            let consumedChars = 0
+            while (
+              consumedChars < raw.length
+              && consumedChars < remainder.length
+              && raw[consumedChars] === remainder[consumedChars]
+            ) {
+              consumedChars += 1
+            }
+            if (consumedChars > 0) {
+              raw = raw.slice(consumedChars)
+              startupProbeReplayDiscardRemainderRef.current =
+                consumedChars === remainder.length
+                  ? null
+                  : remainder.slice(consumedChars)
+            } else {
+              startupProbeReplayDiscardRemainderRef.current = null
             }
           }
           handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
