@@ -60,6 +60,16 @@ Execution risks this plan must avoid:
   - Attach/replay regression using the shared fixture frames, including replay/live boundary handling.
 - Modify: `test/e2e/directory-picker-flow.test.tsx`
   - Boundary regression for the real picker handoff into an `opencode` terminal pane with the confirmed cwd.
+- Modify: `src/components/TabsView.tsx`
+  - Verification-only accessibility cleanup required so Task 4 Step 3's repo-wide lint gate passes without unrelated a11y errors in this worktree.
+- Modify: `src/components/Sidebar.tsx`
+  - Verification-only dead-code cleanup required so Task 4 Step 3's repo-wide lint gate passes without unrelated unused-variable errors in this worktree.
+- Modify: `src/components/context-menu/ContextMenuProvider.tsx`
+  - Verification-only dead-code cleanup required so Task 4 Step 3's repo-wide lint gate passes without unrelated unused-variable errors in this worktree.
+- Modify: `src/store/persistMiddleware.ts`
+  - Verification-only dead-import cleanup required so Task 4 Step 3's repo-wide lint gate passes without unrelated unused-import errors in this worktree.
+- Modify: `test/unit/client/components/TabsView.test.tsx`
+  - Keep the `TabsView` accessibility assertion aligned with the required lint-gate cleanup above.
 
 ## Protocol Scope
 

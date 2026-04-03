@@ -77,6 +77,16 @@ describe('terminal-startup-probes', () => {
     expect(result.replies).toEqual([])
   })
 
+  it('passes OSC 11 queries through unchanged when they are embedded in ordinary output', () => {
+    const state = createTerminalStartupProbeState()
+    const input = `before${OPEN_CODE_STARTUP_PROBE_FRAME}after`
+
+    const result = extractTerminalStartupProbes(input, state, COLORS)
+
+    expect(result.cleaned).toBe(input)
+    expect(result.replies).toEqual([])
+  })
+
   it('preserves incomplete unknown escape traffic until the frame completes', () => {
     const state = createTerminalStartupProbeState()
 

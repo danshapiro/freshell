@@ -4,6 +4,7 @@ const C1_ST = '\u009c'
 
 export type TerminalStartupProbeState = {
   pending: string
+  armed: boolean
 }
 
 export type TerminalStartupProbeColors = {
@@ -24,7 +25,7 @@ type StringSequenceTerminator = {
 }
 
 export function createTerminalStartupProbeState(): TerminalStartupProbeState {
-  return { pending: '' }
+  return { pending: '', armed: true }
 }
 
 function findStringSequenceTerminator(data: string, from: number): StringSequenceTerminator | null {
@@ -91,11 +92,13 @@ export function extractTerminalStartupProbes(
   const replies: string[] = []
   let cleaned = ''
   let i = 0
+  let armed = parserState.armed
   parserState.pending = ''
 
   while (i < input.length) {
     const ch = input[i]
     if (ch !== ESC) {
+      armed = false
       cleaned += ch
       i += 1
       continue
@@ -108,6 +111,7 @@ export function extractTerminalStartupProbes(
 
     const introducer = input[i + 1]
     if (introducer !== ']' && introducer !== 'P' && introducer !== '_') {
+      armed = false
       cleaned += ch
       i += 1
       continue
@@ -122,19 +126,23 @@ export function extractTerminalStartupProbes(
     const sequence = input.slice(i, terminator.end)
     const content = input.slice(i + 2, terminator.start)
 
-    if (introducer === ']' && content === '11;?' && terminator.terminator === BEL) {
+    if (armed && i === 0 && introducer === ']' && content === '11;?' && terminator.terminator === BEL) {
       const reply = buildOsc11BackgroundReply(colors.background)
       if (reply) {
         replies.push(reply)
       } else {
         cleaned += sequence
       }
+      armed = false
     } else {
       cleaned += sequence
+      armed = false
     }
 
     i = terminator.end
   }
+
+  parserState.armed = armed
 
   return { cleaned, replies }
 }

@@ -376,6 +376,65 @@ describe('opencode startup probes (e2e)', () => {
     ])
   })
 
+  it('passes later standalone OSC 11 queries through unchanged after startup completes', async () => {
+    const terminalId = 'term-opencode-runtime-osc11'
+    const { attach } = await renderCreatedTerminal(terminalId)
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 0,
+      replayFromSeq: 1,
+      replayToSeq: 0,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
+      attachRequestId: attach.attachRequestId,
+    })
+    emitCapturedPostReplyFrames(terminalId, attach.attachRequestId, 1)
+
+    await waitFor(() => {
+      expect(writeEvents().map((event) => event.data).join('')).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 5,
+      seqEnd: 5,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(writeEvents().map((event) => event.data)).toEqual([
+        ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
+        OPEN_CODE_STARTUP_PROBE_FRAME,
+      ])
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+    expect(ioEvents).toEqual([
+      ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
+      ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
+      { kind: 'write' as const, data: OPEN_CODE_STARTUP_PROBE_FRAME },
+    ])
+  })
+
   it('strips historical startup probes during replay without sending late replies', async () => {
     const terminalId = 'term-opencode-replay'
     const { attach } = await renderCreatedTerminal(terminalId)

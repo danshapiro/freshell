@@ -166,7 +166,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
     kind: 'terminal',
     createRequestId: 'req-osc52',
     status: 'running',
-    mode: 'codex',
+    mode: 'opencode',
     shell: 'system',
     terminalId,
   }
@@ -185,9 +185,9 @@ function createStore(policy: 'ask' | 'always' | 'never') {
       tabs: {
         tabs: [{
           id: tabId,
-          mode: 'codex',
+          mode: 'opencode',
           status: 'running',
-          title: 'Codex',
+          title: 'OpenCode',
           terminalId,
           createRequestId: 'req-osc52',
         }],
