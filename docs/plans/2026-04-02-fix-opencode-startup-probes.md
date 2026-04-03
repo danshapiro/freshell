@@ -70,9 +70,40 @@ If the capture shows only an OSC color query, implement only that. If it shows a
 
 - [ ] **Step 1: Identify the exact failing probe bytes and encode them once**
 
-Source the probe contract from the real failing OpenCode repro before writing parser logic. Use one of these acceptable sources:
-- an existing captured failing session artifact already present in the workspace
-- a reproducible rerun against the current failing OpenCode version that records the raw startup bytes
+Source the probe contract from the real failing OpenCode repro before writing parser logic. Do not guess from release notes or terminal lore.
+
+Preferred capture path: record the first startup bytes from `opencode` in a raw PTY that does not have Freshell’s client-side reply shims yet. Use a one-off command so the capture is reproducible without adding temporary repo files:
+
+```bash
+node --input-type=module <<'EOF'
+import pty from 'node-pty'
+
+const child = pty.spawn('opencode', [], {
+  name: 'xterm-256color',
+  cols: 80,
+  rows: 24,
+  cwd: process.cwd(),
+  env: process.env,
+})
+
+let captured = ''
+const timeout = setTimeout(() => {
+  process.stdout.write(JSON.stringify(captured))
+  child.kill()
+}, 1500)
+
+child.onData((chunk) => {
+  captured += chunk
+  if (captured.length >= 4096) {
+    clearTimeout(timeout)
+    process.stdout.write(JSON.stringify(captured))
+    child.kill()
+  }
+})
+EOF
+```
+
+If that harness does not reproduce the same stuck bootstrap bytes, fall back to the existing failing Freshell repro and capture the raw `terminal.output.data` payloads from the websocket message stream for the first hung frame sequence. In either case, save the exact captured bytes into the shared fixture and note the capture source in a short comment.
 
 Create `test/helpers/opencode-startup-probes.ts` exporting:
 
@@ -87,7 +118,7 @@ export const OPEN_CODE_STARTUP_EXPECTED_CLEANED = '...visible text with probes r
 Rules:
 - Record bytes exactly as captured, including ESC/BEL/ST delimiters.
 - If the capture proves there is no APC probe, do not export APC expectations.
-- Add a short comment naming where the bytes came from so future debugging can reproduce the fixture source.
+- Add a short comment naming the exact capture source so future debugging can reproduce the fixture source.
 
 - [ ] **Step 2: Write the failing tests against the shared contract**
 
@@ -357,25 +388,35 @@ npm run test:status
 
 Expected: no conflicting holder that requires waiting. If another holder is active, wait rather than interrupt it.
 
-- [ ] **Step 3: Run the required broad suite**
+- [ ] **Step 3: Run lint before the broad suite**
 
 Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="opencode startup probe fix" npm test
+npm run lint
 ```
 
 Expected: PASS.
 
-- [ ] **Step 4: If broad verification reveals a real defect, fix it before proceeding**
+- [ ] **Step 4: Run the required broad verification**
+
+Run:
+
+```bash
+FRESHELL_TEST_SUMMARY="opencode startup probe fix" npm run check
+```
+
+Expected: PASS with typecheck plus the coordinated full test suite green.
+
+- [ ] **Step 5: If broad verification reveals a real defect, fix it before proceeding**
 
 If any valid check fails:
 - diagnose the actual defect
 - update code and/or tests without weakening coverage
-- re-run the focused stack and `npm test`
+- re-run the focused stack, `npm run lint`, and `FRESHELL_TEST_SUMMARY="opencode startup probe fix" npm run check`
 - make an additional commit only if this step required real file changes
 
-- [ ] **Step 5: Optional manual repro for extra confidence**
+- [ ] **Step 6: Optional manual repro for extra confidence**
 
 Only after automated checks are green, optionally confirm the original user path in a worktree-local server:
 
