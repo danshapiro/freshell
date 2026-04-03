@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make FreshClaude restore deterministic and complete across reloads, remounts, reconnects, and server restarts, so the first visible restored frame matches the latest recoverable session state instead of a partial or stale subset.
+**Goal:** Make FreshClaude restore deterministic and complete across reloads, remounts, reconnects, and server restarts, so the first visible restored frame and its linked pane metadata both match the latest recoverable session state instead of a partial or stale subset.
 
-**Architecture:** Move restore-source selection to the server and make it canonical. A shared agent-history source will resolve live SDK session state against durable Claude JSONL history, `sdk.session.snapshot` will carry the authoritative timeline identity plus live-stream metadata, and the client's first visible timeline fetch will request inline bodies so restore lands in one coherent window instead of a summary-only shell with ad hoc follow-up fetches.
+**Architecture:** Move restore-source selection to the server and make it canonical. A shared agent-history source will resolve live SDK session state against durable Claude JSONL history, `sdk.session.snapshot` will carry the authoritative timeline identity plus live-stream metadata, and the client will consume that canonical identity everywhere restore depends on a durable Claude session ID: the first visible timeline fetch, header/runtime metadata lookups, and busy-session key projection.
 
 **Tech Stack:** TypeScript, React 18, Redux Toolkit, Express, WebSocket (`ws`), Anthropic Claude Agent SDK, Vitest, Testing Library
 
@@ -14,6 +14,7 @@
 
 - A visible FreshClaude pane must restore from one authoritative history source. The UI cannot guess whether live SDK state or durable Claude JSONL is fresher.
 - The client must never infer timeline identity from a mix of `resumeSessionId`, `cliSessionId`, and `sessionId`. The server must provide the canonical restore ID.
+- Any client consumer that needs the durable Claude identity during restore must use that canonical `timelineSessionId` when it exists. Header/runtime metadata and busy-session projections cannot keep guessing from `cliSessionId` or persisted `resumeSessionId` alone.
 - The first visible restore page must arrive with bodies inline. The current "summaries first, then fetch the newest body separately" path is why restore looks partial even when the server has enough data.
 - Live reconnects must restore the latest committed turns even when durable JSONL lags behind in-memory SDK state.
 - Mid-stream reconnects must restore enough state to show that work is still in progress; otherwise the UI regresses to "Running..." with missing output.
@@ -49,6 +50,10 @@
   Responsibility: pass richer snapshot payloads into Redux unchanged.
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
   Responsibility: consume the authoritative timeline identity and render a complete restored first page.
+- Modify: `src/components/panes/PaneContainer.tsx`
+  Responsibility: resolve FreshClaude runtime metadata from the canonical timeline identity before `sdk.session.init` backfills `cliSessionId`.
+- Modify: `src/lib/pane-activity.ts`
+  Responsibility: derive restored FreshClaude busy-session keys from the canonical timeline identity.
 - Create: `test/unit/server/agent-timeline-history-source.test.ts`
   Responsibility: pin merge rules and identity resolution.
 - Modify: `test/unit/server/agent-timeline/service.test.ts`
@@ -73,8 +78,14 @@
   Responsibility: verify user-visible reload restore is complete.
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx`
   Responsibility: verify remount restore stays complete after tree restructuring.
+- Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
+  Responsibility: verify restored FreshClaude runtime metadata uses canonical timeline identity before `cliSessionId` exists.
+- Modify: `test/unit/client/lib/pane-activity.test.ts`
+  Responsibility: verify busy-session keys use canonical timeline identity during restore gaps.
 - Create: `test/e2e/agent-chat-restore-flow.test.tsx`
   Responsibility: pin the real visible restore flow from websocket snapshot through timeline hydration.
+- Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
+  Responsibility: verify pane header metadata restores when only canonical timeline identity is known.
 
 ## Strategy Gate
 
@@ -773,9 +784,198 @@ git add src/components/agent-chat/AgentChatView.tsx test/unit/client/components/
 git commit -m "fix: complete freshclaude visible restore flow"
 ```
 
+### Task 5: Canonical Identity For Metadata And Activity
+
+**Files:**
+- Modify: `src/components/panes/PaneContainer.tsx`
+- Modify: `src/lib/pane-activity.ts`
+- Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
+- Modify: `test/unit/client/lib/pane-activity.test.ts`
+- Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
+
+- [ ] **Step 1: Identify or write the failing tests**
+
+Extend `test/unit/client/components/panes/PaneContainer.test.tsx` with a restore-gap case:
+
+```tsx
+it('uses timelineSessionId for FreshClaude runtime metadata before sdk.session.init arrives', () => {
+  const node: PaneNode = {
+    type: 'leaf',
+    id: 'pane-fresh',
+    content: {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-fresh',
+      sessionId: 'sdk-session-1',
+      status: 'idle',
+    },
+  }
+
+  const store = createStore(
+    {
+      layouts: { 'tab-1': node },
+      activePane: { 'tab-1': 'pane-fresh' },
+    },
+    {},
+    {
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            makeClaudeIndexedSession({ sessionId: 'claude-session-1', sessionType: 'freshclaude' }),
+          ],
+        },
+      ],
+    },
+    {
+      sessions: {
+        'sdk-session-1': {
+          sessionId: 'sdk-session-1',
+          timelineSessionId: 'claude-session-1',
+          status: 'idle',
+          messages: [],
+          timelineItems: [],
+          timelineBodies: {},
+          streamingText: '',
+          streamingActive: false,
+          pendingPermissions: {},
+          pendingQuestions: {},
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+        },
+      },
+      pendingCreates: {},
+      availableModels: [],
+    },
+  )
+
+  renderWithStore(store, node)
+  expect(screen.getByText(/25%/)).toBeInTheDocument()
+})
+```
+
+Extend `test/unit/client/lib/pane-activity.test.ts` with:
+
+```ts
+it('collects FreshClaude busy session keys from timelineSessionId during restore gaps', () => {
+  const busySessionKeys = collectBusySessionKeys({
+    tabs: [
+      {
+        id: 'tab-fresh',
+        title: 'Fresh',
+        createRequestId: 'req-fresh',
+        status: 'running',
+        mode: 'shell',
+        shell: 'system',
+        createdAt: 1,
+      },
+    ],
+    paneLayouts: {
+      'tab-fresh': {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-fresh',
+          sessionId: 'sdk-1',
+          status: 'running',
+        },
+      },
+    },
+    codexActivityByTerminalId: {},
+    paneRuntimeActivityByPaneId: {},
+    agentChatSessions: {
+      'sdk-1': {
+        sessionId: 'sdk-1',
+        timelineSessionId: 'claude-session-1',
+        status: 'running',
+        messages: [],
+        timelineItems: [],
+        timelineBodies: {},
+        streamingText: '',
+        streamingActive: true,
+        pendingPermissions: {},
+        pendingQuestions: {},
+        totalCostUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+      },
+    },
+  })
+
+  expect(busySessionKeys).toEqual(['claude:claude-session-1'])
+})
+```
+
+Extend `test/e2e/pane-header-runtime-meta-flow.test.tsx` so the restored FreshClaude header path still resolves indexed Claude metadata when the restored Redux session has `timelineSessionId: 'claude-session-1'` but no `cliSessionId` and the pane content has no `resumeSessionId`.
+
+- [ ] **Step 2: Run the focused metadata/activity tests to verify they fail**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+```
+
+Expected: FAIL because restored FreshClaude metadata and busy-session projections still depend on `cliSessionId` or persisted `resumeSessionId`, not the canonical timeline identity.
+
+- [ ] **Step 3: Write the minimal implementation**
+
+Update `src/components/panes/PaneContainer.tsx`:
+
+```ts
+const indexedSessionId = session?.timelineSessionId
+  ?? session?.cliSessionId
+  ?? content.resumeSessionId
+```
+
+Update `src/lib/pane-activity.ts`:
+
+```ts
+const sessionId = session?.timelineSessionId
+  ?? session?.cliSessionId
+  ?? content.resumeSessionId
+```
+
+Keep `timelineSessionId` as the preferred restored identity only for FreshClaude/Claude-index lookups. Do not change Codex exact-match semantics or terminal session-key rules.
+
+- [ ] **Step 4: Run the focused metadata/activity tests to verify they pass**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Refactor and verify**
+
+Run the restore regressions that now share canonical identity:
+
+```bash
+npm run test:vitest -- test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/agent-chat-restore-flow.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/agent-timeline-history-source.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/sdk-bridge.test.ts
+npm run test:integration -- --run test/integration/server/agent-timeline-router.test.ts
+npm run lint
+FRESHELL_TEST_SUMMARY="freshclaude restore audit" npm run check
+```
+
+Expected: all PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/components/panes/PaneContainer.tsx src/lib/pane-activity.ts test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/lib/pane-activity.test.ts test/e2e/pane-header-runtime-meta-flow.test.tsx
+git commit -m "fix: restore freshclaude metadata from canonical timeline identity"
+```
+
 ## Notes For Execution
 
 - Preserve the existing `historyLoaded` contract. The new snapshot fields enrich restore; they do not change the rule that a resumed session stays in restore mode until durable or canonical history is known.
+- Once `timelineSessionId` exists in Redux, every FreshClaude consumer that needs the durable Claude identity must prefer it over `cliSessionId` and persisted `resumeSessionId`. Do not leave per-component precedence rules drifting apart.
 - When histories diverge, log the conflict with enough detail to diagnose the source (`sdk session id`, `timeline session id`, live count, durable count). Do not try to weave mismatched lists together.
 - Keep the existing session-lost recovery path intact. This plan improves restore completeness, but it does not change the stale-session recovery model already covered by `sdk.error` with `INVALID_SESSION_ID`.
 - If any broader suite fails outside this feature area, stop and fix the failure before merging. The repo rules for main-branch safety still apply.
