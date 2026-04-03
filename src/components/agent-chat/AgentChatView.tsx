@@ -3,6 +3,7 @@ import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
+import { updateTab } from '@/store/tabsSlice'
 import {
   addUserMessage,
   clearPendingCreate,
@@ -25,8 +26,11 @@ import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage } from '@/store/agentChatTypes'
 import { setSessionMetadata } from '@/lib/api'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { sessionMetadataKey } from '@/lib/session-metadata'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import type { Tab } from '@/store/types'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -79,12 +83,21 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const session = useAppSelector(
     (s) => sessionId ? s.agentChat.sessions[sessionId] : undefined,
   )
+  const currentTab = useAppSelector((s) => (
+    (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
+  ))
   const availableModels = useAppSelector((s) => s.agentChat.availableModels)
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const surfaceVisibleMarkedRef = useRef(false)
-  const timelineSessionId = paneContent.resumeSessionId ?? session?.cliSessionId ?? paneContent.sessionId
+  const sessionRef = useRef(session)
+  sessionRef.current = session
+  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
+    ? paneContent.resumeSessionId
+    : undefined
+  const timelineSessionId = session?.timelineSessionId ?? session?.cliSessionId ?? persistedTimelineSessionId
+  const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
   // Playwright can opt a pane into state-only mode so chrome activity tests
   // don't race the live SDK attach/create lifecycle.
   const suppressNetworkEffects = typeof window !== 'undefined'
@@ -109,12 +122,16 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
   const triggerRecovery = useCallback(() => {
     const newRequestId = nanoid()
+    const resumeSessionId = sessionRef.current?.timelineSessionId
+      ?? sessionRef.current?.cliSessionId
+      ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
+        resumeSessionId,
         createRequestId: newRequestId,
         status: 'creating' as const,
       },
@@ -174,20 +191,70 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }))
   }, [sessionStatus, paneContent.status, session?.lost, tabId, paneId, dispatch])
 
-  // Persist cliSessionId as resumeSessionId so we can resume the Claude Code session
-  // after a server restart (pane content survives in localStorage, Redux state does not).
-  // Uses mergePaneContent to avoid stale-ref overwrites when multiple effects fire together.
-  const cliSessionId = session?.cliSessionId
+  // Persist the canonical durable Claude ID as soon as the server knows it so later
+  // reload/recovery paths do not depend on sdk.session.init arriving first.
+  const durableResumeSessionId = session?.timelineSessionId ?? session?.cliSessionId
   useEffect(() => {
-    if (!cliSessionId) return
-    if (paneContentRef.current.resumeSessionId !== cliSessionId) {
+    if (!durableResumeSessionId) return
+    if (paneContentRef.current.resumeSessionId !== durableResumeSessionId) {
       dispatch(mergePaneContent({
         tabId,
         paneId,
-        updates: { resumeSessionId: cliSessionId },
+        updates: { resumeSessionId: durableResumeSessionId },
       }))
     }
-  }, [cliSessionId, tabId, paneId, dispatch])
+
+    const metadataProvider = providerConfig?.codingCliProvider
+      ?? currentTab?.codingCliProvider
+      ?? (currentTab?.mode !== 'shell' ? currentTab.mode : undefined)
+    if (!currentTab) return
+
+    const updates: Partial<Tab> = {}
+    if (currentTab.resumeSessionId !== durableResumeSessionId) {
+      updates.resumeSessionId = durableResumeSessionId
+    }
+
+    if (metadataProvider) {
+      const existing = currentTab.sessionMetadataByKey ?? {}
+      const nextKey = sessionMetadataKey(metadataProvider, durableResumeSessionId)
+      const priorIds = new Set<string>([
+        currentTab.resumeSessionId,
+        paneContentRef.current.resumeSessionId,
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0))
+      const carriedMetadata = Array.from(priorIds)
+        .map((sessionId) => existing[sessionMetadataKey(metadataProvider, sessionId)])
+        .reduce<Record<string, unknown>>(
+          (acc, metadata) => (metadata ? { ...acc, ...metadata } : acc),
+          {},
+        )
+      const nextSessionMetadataByKey = { ...existing }
+
+      for (const priorId of priorIds) {
+        const priorKey = sessionMetadataKey(metadataProvider, priorId)
+        if (priorKey !== nextKey) {
+          delete nextSessionMetadataByKey[priorKey]
+        }
+      }
+
+      nextSessionMetadataByKey[nextKey] = {
+        ...carriedMetadata,
+        ...(existing[nextKey] ?? {}),
+        sessionType: paneContent.provider,
+      }
+
+      const currentJson = JSON.stringify(existing)
+      const nextJson = JSON.stringify(nextSessionMetadataByKey)
+      if (currentJson !== nextJson) {
+        updates.sessionMetadataByKey = nextSessionMetadataByKey
+      }
+    }
+
+    if (Object.keys(updates).length === 0) return
+    dispatch(updateTab({
+      id: currentTab.id,
+      updates,
+    }))
+  }, [currentTab, dispatch, durableResumeSessionId, paneContent.provider, paneId, providerConfig?.codingCliProvider, tabId])
 
   // Tag this Claude Code session as belonging to this agent-chat provider.
   // Fires once when cliSessionId first becomes available (including resumes).
@@ -195,20 +262,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!cliSessionId) return
-    if (taggedSessionRef.current === cliSessionId) return
-    taggedSessionRef.current = cliSessionId
+    if (!durableResumeSessionId) return
+    if (taggedSessionRef.current === durableResumeSessionId) return
+    taggedSessionRef.current = durableResumeSessionId
 
     if (providerConfig?.codingCliProvider) {
       setSessionMetadata(
         providerConfig.codingCliProvider,
-        cliSessionId,
+        durableResumeSessionId,
         paneContent.provider,
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [cliSessionId, providerConfig?.codingCliProvider, paneContent.provider, suppressNetworkEffects])
+  }, [durableResumeSessionId, providerConfig?.codingCliProvider, paneContent.provider, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -269,7 +336,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId || !timelineSessionId) return
+    if (!paneContent.sessionId || !restoreHistoryQueryId) return
     if (hidden) return
     if (activePaneId && activePaneId !== paneId) return
     if (session?.latestTurnId === undefined) return
@@ -277,7 +344,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
     const promise = dispatch(loadAgentTimelineWindow({
       sessionId: paneContent.sessionId,
-      timelineSessionId,
+      timelineSessionId: restoreHistoryQueryId,
       requestKey: `${tabId}:${paneId}`,
     }))
     return () => {
@@ -289,11 +356,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     hidden,
     paneContent.sessionId,
     paneId,
+    restoreHistoryQueryId,
     session?.historyLoaded,
     session?.latestTurnId,
     suppressNetworkEffects,
     tabId,
-    timelineSessionId,
   ])
 
   // Smart auto-scroll: only scroll if user is already at/near the bottom
@@ -591,7 +658,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 if (!paneContent.sessionId) return
                 void dispatch(loadAgentTurnBody({
                   sessionId: paneContent.sessionId,
-                  timelineSessionId,
+                  timelineSessionId: restoreHistoryQueryId,
                   turnId: item.turnId,
                 }))
               }}

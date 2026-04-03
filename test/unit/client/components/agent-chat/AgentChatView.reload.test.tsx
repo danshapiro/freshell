@@ -14,6 +14,7 @@ import agentChatReducer, {
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -54,6 +55,17 @@ function makeStore() {
   })
 }
 
+function makeStoreWithTabs() {
+  return configureStore({
+    reducer: {
+      agentChat: agentChatReducer,
+      panes: panesReducer,
+      settings: settingsReducer,
+      tabs: tabsReducer,
+    },
+  })
+}
+
 const RELOAD_PANE: AgentChatPaneContent = {
   kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
@@ -63,6 +75,7 @@ const RELOAD_PANE: AgentChatPaneContent = {
 
 describe('AgentChatView reload/restore behavior', () => {
   beforeEach(() => {
+    localStorage.clear()
     getAgentTimelinePage.mockReset()
     getAgentTurnBody.mockReset()
     setSessionMetadata.mockReset()
@@ -72,6 +85,7 @@ describe('AgentChatView reload/restore behavior', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    localStorage.clear()
     delete window.__FRESHELL_TEST_HARNESS__
   })
 
@@ -382,8 +396,9 @@ describe('AgentChatView reload/restore behavior', () => {
   })
 
   it('uses the persisted resumeSessionId for visible timeline hydration', async () => {
+    const durableSessionId = '11111111-1111-1111-1111-111111111111'
     getAgentTimelinePage.mockResolvedValue({
-      sessionId: 'cli-session-1',
+      sessionId: durableSessionId,
       items: [],
       nextCursor: null,
       revision: 1,
@@ -401,18 +416,139 @@ describe('AgentChatView reload/restore behavior', () => {
         <AgentChatView
           tabId="t1"
           paneId="p1"
-          paneContent={{ ...RELOAD_PANE, resumeSessionId: 'cli-session-1' }}
+          paneContent={{ ...RELOAD_PANE, resumeSessionId: durableSessionId }}
         />
       </Provider>,
     )
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-session-1',
-        expect.objectContaining({ priority: 'visible' }),
+        durableSessionId,
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
+  })
+
+  it('uses timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
+    getAgentTimelinePage.mockResolvedValue({ sessionId: 'cli-sess-1', items: [], nextCursor: null, revision: 1 })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 2,
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sess-reload-1' }} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'cli-sess-1',
+        expect.objectContaining({ includeBodies: true }),
+        expect.anything(),
+      )
+    })
+  })
+
+  it('keeps the live-only restore fallback on the SDK session id until a durable timelineSessionId exists', async () => {
+    getAgentTimelinePage.mockResolvedValue({ sessionId: 'sdk-sess-1', items: [], nextCursor: null, revision: 1 })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sdk-sess-1' }} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'sdk-sess-1',
+        expect.objectContaining({ includeBodies: true }),
+        expect.anything(),
+      )
+    })
+  })
+
+  it('persists timelineSessionId into pane content and tab fallback metadata before sdk.session.init arrives', () => {
+    const store = makeStoreWithTabs()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-1',
+      sessionId: 'sdk-sess-1',
+      status: 'starting',
+    } satisfies AgentChatPaneContent
+    store.dispatch(addTab({
+      id: 't1',
+      title: 'FreshClaude Tab',
+      mode: 'claude',
+      codingCliProvider: 'claude',
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        'claude:named-resume': {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Continue from the old tab',
+        },
+      },
+    }))
+    store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-sess-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: 'cli-session-abc-123',
+        revision: 2,
+      }))
+    })
+
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.resumeSessionId).toBe('cli-session-abc-123')
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
+    expect(tab?.resumeSessionId).toBe('cli-session-abc-123')
+    expect(tab?.sessionMetadataByKey?.['claude:cli-session-abc-123']).toEqual(expect.objectContaining({
+      sessionType: 'freshclaude',
+      firstUserMessage: 'Continue from the old tab',
+    }))
+  })
+
+  it('shows a restored partial assistant stream after reconnect', () => {
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-1',
+      latestTurnId: 'turn-2',
+      status: 'running',
+      timelineSessionId: 'cli-sess-1',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sdk-sess-1' }} />
+      </Provider>,
+    )
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
   })
 
   it('does not issue an HTTP timeline fetch when snapshot proves the resumed session is empty', async () => {

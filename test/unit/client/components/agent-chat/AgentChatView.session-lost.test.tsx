@@ -3,7 +3,7 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
-import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
+import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
@@ -118,6 +118,51 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
     )
     expect(createCalls).toHaveLength(1)
     expect(createCalls[0][0].resumeSessionId).toBe('cli-session-to-resume')
+  })
+
+  it('recovers with timelineSessionId from sdk.session.snapshot even when the session is marked lost before sdk.session.init', async () => {
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-stale',
+      sessionId: 'sdk-stale-1',
+      status: 'idle',
+      resumeSessionId: 'named-resume',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: 'cli-session-abc-123',
+        revision: 2,
+      }))
+      store.dispatch(markSessionLost({ sessionId: 'sdk-stale-1' }))
+    })
+
+    await waitFor(() => {
+      const createCalls = wsSend.mock.calls.filter((call: any[]) => call[0]?.type === 'sdk.create')
+      expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe('cli-session-abc-123')
+    })
   })
 })
 

@@ -62,7 +62,7 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
   return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
 }
 
-describe('agent chat resume history flow', () => {
+describe('agent chat restore flow', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
@@ -71,7 +71,22 @@ describe('agent chat resume history flow', () => {
     setSessionMetadata.mockClear()
   })
 
-  it('hydrates durable history after sdk.created for a resumed create', async () => {
+  it('restores a reloaded pane from sdk.session.snapshot, persists timelineSessionId, and shows the first page without a newest-turn refetch', async () => {
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-reload',
+      sessionId: 'sdk-sess-1',
+      status: 'idle',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-session-1',
       items: [
@@ -91,25 +106,12 @@ describe('agent chat resume history flow', () => {
           turnId: 'turn-2',
           message: {
             role: 'assistant',
-            content: [{ type: 'text', text: 'Hydrated from durable history' }],
+            content: [{ type: 'text', text: 'Hydrated from restore flow' }],
             timestamp: '2026-03-10T10:01:00.000Z',
           },
         },
       },
     })
-
-    const store = makeStore()
-    store.dispatch(initLayout({
-      tabId: 't1',
-      paneId: 'p1',
-      content: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
-        createRequestId: 'req-resume',
-        status: 'creating',
-        resumeSessionId: 'cli-session-1',
-      },
-    }))
 
     render(
       <Provider store={store}>
@@ -117,18 +119,7 @@ describe('agent chat resume history flow', () => {
       </Provider>,
     )
 
-    expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'sdk.create',
-      requestId: 'req-resume',
-      resumeSessionId: 'cli-session-1',
-    }))
-
     act(() => {
-      handleSdkMessage(store.dispatch, {
-        type: 'sdk.created',
-        requestId: 'req-resume',
-        sessionId: 'sdk-sess-1',
-      })
       handleSdkMessage(store.dispatch, {
         type: 'sdk.session.snapshot',
         sessionId: 'sdk-sess-1',
@@ -138,17 +129,19 @@ describe('agent chat resume history flow', () => {
       })
     })
 
-    expect(screen.getByText(/restoring session/i)).toBeInTheDocument()
-
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-session-1',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        expect.objectContaining({ includeBodies: true }),
+        expect.anything(),
       )
     })
+
     expect(getAgentTurnBody).not.toHaveBeenCalled()
-    expect(await screen.findByText('Hydrated from durable history')).toBeInTheDocument()
-    expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
+    expect(await screen.findByText('Hydrated from restore flow')).toBeInTheDocument()
+
+    const root = store.getState().panes.layouts.t1
+    const leaf = root && findLeaf(root, 'p1')
+    expect(leaf?.content.kind === 'agent-chat' ? leaf.content.resumeSessionId : undefined).toBe('cli-session-1')
   })
 })
