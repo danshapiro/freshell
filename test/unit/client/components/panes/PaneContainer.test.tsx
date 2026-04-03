@@ -1964,6 +1964,105 @@ describe('PaneContainer', () => {
       expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
     })
 
+    it('prefers timelineSessionId over a stale resumeSessionId before cliSessionId exists', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-fresh',
+          sessionId: 'sdk-session-1',
+          resumeSessionId: 'resume-session-stale',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'timeline-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell',
+                  gitBranch: 'main',
+                  isDirty: true,
+                  lastActivityAt: 2,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'resume-session-stale',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/other',
+                  gitBranch: 'stale',
+                  isDirty: false,
+                  lastActivityAt: 1,
+                  tokenUsage: {
+                    inputTokens: 1,
+                    outputTokens: 1,
+                    cachedTokens: 0,
+                    totalTokens: 2,
+                    contextTokens: 2,
+                    compactThresholdTokens: 20,
+                    compactPercent: 10,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {
+            'sdk-session-1': {
+              sessionId: 'sdk-session-1',
+              timelineSessionId: 'timeline-session-1',
+              status: 'idle',
+              messages: [],
+              streamingText: '',
+              streamingActive: false,
+              pendingPermissions: {},
+              pendingQuestions: {},
+              totalCostUsd: 0,
+              totalInputTokens: 0,
+              totalOutputTokens: 0,
+            },
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 15/60(25% full)',
+      )
+      expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+    })
+
     it('falls back to resumeSessionId for FreshClaude panes before sdk.session.init arrives', () => {
       const node: PaneNode = {
         type: 'leaf',

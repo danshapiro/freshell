@@ -134,7 +134,7 @@ function resolveFreshClaudeRuntimeMeta(
   if (content.provider !== 'freshclaude') return undefined
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const indexedSessionId = session?.cliSessionId ?? content.resumeSessionId
+  const indexedSessionId = session?.timelineSessionId ?? session?.cliSessionId ?? content.resumeSessionId
   if (!provider || !indexedSessionId) return undefined
 
   const indexed = findIndexedSessionById(indexedProjects, provider, indexedSessionId)

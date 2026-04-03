@@ -43,7 +43,7 @@ function resolveAgentChatSessionKey(
   }
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const sessionId = session?.cliSessionId ?? content.resumeSessionId
+  const sessionId = session?.timelineSessionId ?? session?.cliSessionId ?? content.resumeSessionId
   if (!provider || !sessionId) return undefined
 
   return `${provider}:${sessionId}`
