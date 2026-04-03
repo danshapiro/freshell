@@ -6,7 +6,9 @@ import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import tabsReducer from '@/store/tabsSlice'
 import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
+import type { Tab } from '@/store/types'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 
 beforeAll(() => {
@@ -35,12 +37,32 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-function makeStore() {
+function makeStore(tabOverrides: Partial<Tab> = {}) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
       settings: settingsReducer,
+      tabs: tabsReducer,
+    },
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 't1',
+            createRequestId: 't1',
+            title: 'FreshClaude Tab',
+            mode: 'claude',
+            shell: 'system',
+            status: 'running',
+            createdAt: 1,
+            codingCliProvider: 'claude',
+            ...tabOverrides,
+          },
+        ],
+        activeTabId: 't1',
+        renameRequestTabId: null,
+      },
     },
   })
 }
@@ -71,8 +93,16 @@ describe('agent chat restore flow', () => {
     setSessionMetadata.mockClear()
   })
 
-  it('restores a reloaded pane from sdk.session.snapshot, persists timelineSessionId, and shows the first page without a newest-turn refetch', async () => {
-    const store = makeStore()
+  it('restores a reloaded pane from sdk.session.snapshot, persists the durable id into pane and tab state, and shows partial output without a blank running gap', async () => {
+    const store = makeStore({
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        'claude:named-resume': {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Continue from the old tab',
+        },
+      },
+    })
     const pane = {
       kind: 'agent-chat',
       provider: 'freshclaude',
@@ -124,24 +154,40 @@ describe('agent chat restore flow', () => {
         type: 'sdk.session.snapshot',
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
-        status: 'idle',
+        status: 'running',
         timelineSessionId: 'cli-session-1',
+        revision: 2,
+        streamingActive: true,
+        streamingText: 'partial reply',
       })
     })
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Claude is thinking')).not.toBeInTheDocument()
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-session-1',
-        expect.objectContaining({ includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.anything(),
       )
     })
 
     expect(getAgentTurnBody).not.toHaveBeenCalled()
     expect(await screen.findByText('Hydrated from restore flow')).toBeInTheDocument()
+    expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
 
-    const root = store.getState().panes.layouts.t1
-    const leaf = root && findLeaf(root, 'p1')
-    expect(leaf?.content.kind === 'agent-chat' ? leaf.content.resumeSessionId : undefined).toBe('cli-session-1')
+    await waitFor(() => {
+      const root = store.getState().panes.layouts.t1
+      const leaf = root && findLeaf(root, 'p1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.resumeSessionId : undefined).toBe('cli-session-1')
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
+      expect(tab?.resumeSessionId).toBe('cli-session-1')
+      expect(tab?.sessionMetadataByKey?.['claude:cli-session-1']).toEqual(expect.objectContaining({
+        sessionType: 'freshclaude',
+        firstUserMessage: 'Continue from the old tab',
+      }))
+    })
   })
 })

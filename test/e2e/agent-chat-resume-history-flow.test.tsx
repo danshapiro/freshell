@@ -76,23 +76,71 @@ describe('agent chat resume history flow', () => {
       sessionId: 'cli-session-1',
       items: [
         {
-          turnId: 'turn-2',
+          turnId: 'turn-older-user',
+          sessionId: 'cli-session-1',
+          role: 'user',
+          summary: 'Older question',
+          timestamp: '2026-03-10T10:00:00.000Z',
+        },
+        {
+          turnId: 'turn-older-assistant',
           sessionId: 'cli-session-1',
           role: 'assistant',
-          summary: 'Recent summary',
+          summary: 'Older answer',
+          timestamp: '2026-03-10T10:00:20.000Z',
+        },
+        {
+          turnId: 'turn-new-user',
+          sessionId: 'cli-session-1',
+          role: 'user',
+          summary: 'New prompt',
           timestamp: '2026-03-10T10:01:00.000Z',
+        },
+        {
+          turnId: 'turn-new-assistant',
+          sessionId: 'cli-session-1',
+          role: 'assistant',
+          summary: 'New reply',
+          timestamp: '2026-03-10T10:01:20.000Z',
         },
       ],
       nextCursor: null,
-      revision: 2,
+      revision: 4,
       bodies: {
-        'turn-2': {
+        'turn-older-user': {
           sessionId: 'cli-session-1',
-          turnId: 'turn-2',
+          turnId: 'turn-older-user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'Older durable question' }],
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
+        },
+        'turn-older-assistant': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-older-assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Older durable answer' }],
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+        },
+        'turn-new-user': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-new-user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'New live prompt' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
+        'turn-new-assistant': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-new-assistant',
           message: {
             role: 'assistant',
             content: [{ type: 'text', text: 'Hydrated from durable history' }],
-            timestamp: '2026-03-10T10:01:00.000Z',
+            timestamp: '2026-03-10T10:01:20.000Z',
           },
         },
       },
@@ -148,7 +196,17 @@ describe('agent chat resume history flow', () => {
       )
     })
     expect(getAgentTurnBody).not.toHaveBeenCalled()
-    expect(await screen.findByText('Hydrated from durable history')).toBeInTheDocument()
+
+    await waitFor(() => {
+      const renderedMessages = screen.getAllByRole('article')
+        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+      expect(renderedMessages).toEqual([
+        'Older durable question',
+        'Older durable answer',
+        'New live prompt',
+        'Hydrated from durable history',
+      ])
+    })
     expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
   })
 })

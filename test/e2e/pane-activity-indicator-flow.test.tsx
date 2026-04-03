@@ -2,20 +2,14 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, within, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import Sidebar from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import PaneContainer from '@/components/panes/PaneContainer'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
-import sessionActivityReducer from '@/store/sessionActivitySlice'
-import extensionsReducer from '@/store/extensionsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
 import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
-import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
 import paneRuntimeActivityReducer, {
   clearPaneRuntimeActivity,
@@ -176,159 +170,6 @@ function getVisibleSinglePaneTab() {
   return screen.getByLabelText('Activity Pane')
 }
 
-function renderSidebarActivityHarness(options: {
-  pane: AgentChatPaneContent
-  agentChat: AgentChatState
-}) {
-  const tab: Tab = {
-    id: 'tab-sidebar-activity',
-    createRequestId: 'req-sidebar-tab',
-    title: 'Sidebar Activity Tab',
-    status: 'running',
-    mode: 'claude',
-    shell: 'system',
-    resumeSessionId: options.pane.resumeSessionId,
-    createdAt: 1,
-  }
-
-  const layout: PaneNode = {
-    type: 'leaf',
-    id: 'pane-sidebar-activity',
-    content: options.pane,
-  }
-
-  const projects = [
-    {
-      projectPath: '/home/user/code/freshell',
-      sessions: [
-        {
-          provider: 'claude',
-          sessionType: 'freshclaude',
-          sessionId: 'canonical-session-1',
-          title: 'Canonical FreshClaude',
-          projectPath: '/home/user/code/freshell',
-          cwd: '/home/user/code/freshell',
-          lastActivityAt: 2,
-        },
-        {
-          provider: 'claude',
-          sessionType: 'freshclaude',
-          sessionId: 'stale-resume',
-          title: 'Stale FreshClaude',
-          projectPath: '/home/user/code/freshell',
-          cwd: '/home/user/code/freshell/other',
-          lastActivityAt: 1,
-        },
-      ],
-    },
-  ]
-
-  const store = configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      settings: settingsReducer,
-      connection: connectionReducer,
-      sessions: sessionsReducer,
-      sessionActivity: sessionActivityReducer,
-      extensions: extensionsReducer,
-      turnCompletion: turnCompletionReducer,
-      codexActivity: codexActivityReducer,
-      terminalDirectory: terminalDirectoryReducer,
-      agentChat: agentChatReducer,
-      paneRuntimeActivity: paneRuntimeActivityReducer,
-    },
-    middleware: (getDefaultMiddleware) =>
-      getDefaultMiddleware({
-        serializableCheck: {
-          ignoredPaths: ['sessions.expandedProjects'],
-        },
-      }),
-    preloadedState: {
-      tabs: {
-        tabs: [tab],
-        activeTabId: tab.id,
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts: { [tab.id]: layout },
-        activePane: { [tab.id]: layout.id },
-        paneTitles: { [tab.id]: { [layout.id]: 'Sidebar Activity Pane' } },
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-        refreshRequestsByPane: {},
-      },
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: null,
-      },
-      connection: {
-        status: 'connected',
-        platform: null,
-        availableClis: {},
-      },
-      sessions: {
-        projects,
-        expandedProjects: new Set<string>(),
-        wsSnapshotReceived: false,
-        windows: {
-          sidebar: {
-            projects,
-            lastLoadedAt: 1,
-            totalSessions: 2,
-            hasMore: false,
-            loading: false,
-          },
-        },
-      },
-      sessionActivity: {
-        sessions: {},
-      },
-      extensions: {
-        entries: [],
-      },
-      turnCompletion: {
-        seq: 0,
-        lastEvent: null,
-        pendingEvents: [],
-        attentionByTab: {},
-        attentionByPane: {},
-      },
-      codexActivity: {
-        byTerminalId: {},
-        lastSnapshotSeq: 0,
-        liveMutationSeqByTerminalId: {},
-        removedMutationSeqByTerminalId: {},
-      },
-      terminalDirectory: {
-        windows: {
-          sidebar: {
-            items: [],
-            nextCursor: null,
-            revision: 1,
-          },
-        },
-        searches: {},
-      },
-      agentChat: options.agentChat,
-      paneRuntimeActivity: {
-        byPaneId: {},
-      },
-    },
-  })
-
-  render(
-    <Provider store={store}>
-      <Sidebar view="sessions" onNavigate={vi.fn()} />
-    </Provider>,
-  )
-
-  return { store }
-}
-
 describe('pane activity indicator flow (e2e)', () => {
   afterEach(() => {
     cleanup()
@@ -470,7 +311,7 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
-  it('restores the sidebar activity indicator from timelineSessionId when only the canonical durable id is known', () => {
+  it('restores pane and tab activity from timelineSessionId when only the canonical durable id is known', () => {
     const pane: AgentChatPaneContent = {
       kind: 'agent-chat',
       provider: 'freshclaude',
@@ -480,7 +321,7 @@ describe('pane activity indicator flow (e2e)', () => {
       status: 'running',
     }
 
-    const { store } = renderSidebarActivityHarness({
+    const { store } = renderHarness({
       pane,
       agentChat: {
         sessions: {
@@ -510,17 +351,15 @@ describe('pane activity indicator flow (e2e)', () => {
       },
     })
 
-    const canonicalButton = screen.getByRole('button', { name: /Canonical FreshClaude/i })
-    const staleButton = screen.getByRole('button', { name: /Stale FreshClaude/i })
-
-    expect(canonicalButton.querySelector('.text-blue-500')).toBeFalsy()
-    expect(staleButton.querySelector('.text-blue-500')).toBeFalsy()
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
       store.dispatch(removePermission({ sessionId: 'sdk-restore-1', requestId: 'perm-1' }))
     })
 
-    expect(canonicalButton.querySelector('.text-blue-500')).toBeTruthy()
-    expect(staleButton.querySelector('.text-blue-500')).toBeFalsy()
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 })
