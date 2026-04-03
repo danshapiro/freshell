@@ -240,6 +240,40 @@ describe('SdkBridge', () => {
       })
     })
 
+    it('preserves partial streaming text after content_block_stop until the final assistant message arrives', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_start' },
+        session_id: 'cli-123',
+        uuid: 'uuid-1',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'partial reply' },
+        },
+        session_id: 'cli-123',
+        uuid: 'uuid-2',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_stop' },
+        session_id: 'cli-123',
+        uuid: 'uuid-3',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)).toMatchObject({
+        streamingActive: false,
+        streamingText: 'partial reply',
+      })
+    })
+
     it('sets status to idle on result', async () => {
       mockKeepStreamOpen = true
       mockMessages.push({

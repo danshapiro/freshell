@@ -3,8 +3,6 @@ import type { SdkSessionState } from '../sdk-bridge-types.js'
 import type { ChatMessage } from '../session-history-loader.js'
 import type { ContentBlock } from '../../shared/ws-protocol.js'
 
-const SAME_EVENT_TIMESTAMP_WINDOW_MS = 60_000
-
 export type ResolvedAgentHistory = {
   liveSessionId?: string
   timelineSessionId?: string
@@ -98,14 +96,17 @@ function timestampsPlausiblySame(left?: string, right?: string): boolean {
   if (leftParsed == null || rightParsed == null) {
     return left === undefined || right === undefined || left === right
   }
-  return Math.abs(leftParsed - rightParsed) <= SAME_EVENT_TIMESTAMP_WINDOW_MS
+  return leftParsed === rightParsed
 }
 
 function timestampsMateriallyDifferent(left?: string, right?: string): boolean {
   const leftParsed = parseTimestamp(left)
   const rightParsed = parseTimestamp(right)
-  if (leftParsed == null || rightParsed == null) return false
-  return Math.abs(leftParsed - rightParsed) > SAME_EVENT_TIMESTAMP_WINDOW_MS
+  if (leftParsed != null && rightParsed != null) {
+    return leftParsed !== rightParsed
+  }
+  if (left == null || right == null) return false
+  return left !== right
 }
 
 function messagesMatch(left: ChatMessage, right: ChatMessage): boolean {

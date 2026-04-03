@@ -525,15 +525,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     session?.streamingText ?? '',
     session?.streamingActive ?? false,
   )
+  const streamingPreviewText = session?.streamingActive
+    ? debouncedStreamingText
+    : (session?.streamingText ?? '')
 
   // Memoize the content array so React.memo on MessageBubble works.
   // Without this, a new array reference is created every render, defeating memo.
   const streamingContent = useMemo(
-    () => debouncedStreamingText
-      ? [{ type: 'text' as const, text: debouncedStreamingText }]
+    () => streamingPreviewText
+      ? [{ type: 'text' as const, text: streamingPreviewText }]
       : [],
-    [debouncedStreamingText],
+    [streamingPreviewText],
   )
+  const hasStreamingPreview = streamingContent.length > 0
+  const shouldRenderStreamingPreview = hasStreamingPreview && session?.status === 'running'
 
   // Build render items: pair adjacent user→assistant into turns, everything else standalone.
   const RECENT_TURNS_FULL = 3
@@ -728,7 +733,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           })
         })()}
 
-        {session?.streamingActive && streamingContent.length > 0 && (
+        {shouldRenderStreamingPreview && (
           <MessageBubble
             speaker="assistant"
             content={streamingContent}
@@ -747,6 +752,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             flash during brief SDK gaps (content_block_stop → sdk.assistant). */}
         {session?.status === 'running' &&
           !session.streamingActive &&
+          !hasStreamingPreview &&
           messages.length > 0 &&
           messages[messages.length - 1].role === 'user' && (
           <ThinkingIndicator />

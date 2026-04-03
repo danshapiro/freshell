@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
+  addUserMessage,
   registerPendingCreate,
   sessionCreated,
   sessionInit,
@@ -549,6 +550,34 @@ describe('AgentChatView reload/restore behavior', () => {
     )
 
     expect(screen.getByText('partial reply')).toBeInTheDocument()
+  })
+
+  it('keeps restored partial assistant output visible after content_block_stop before the final assistant message arrives', () => {
+    vi.useFakeTimers()
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sdk-sess-2' }))
+    store.dispatch(addUserMessage({ sessionId: 'sdk-sess-2', text: 'continue' }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-2',
+      latestTurnId: 'turn-3',
+      status: 'running',
+      timelineSessionId: 'cli-sess-2',
+      streamingActive: false,
+      streamingText: 'partial reply',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sdk-sess-2' }} />
+      </Provider>,
+    )
+
+    act(() => { vi.advanceTimersByTime(250) })
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Claude is thinking')).not.toBeInTheDocument()
+
+    vi.useRealTimers()
   })
 
   it('does not issue an HTTP timeline fetch when snapshot proves the resumed session is empty', async () => {

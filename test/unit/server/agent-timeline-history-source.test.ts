@@ -118,6 +118,31 @@ describe('agent timeline history source', () => {
     ])
   })
 
+  it('keeps a repeated single-message prompt when the timestamps differ by seconds', async () => {
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+      ]),
+      getLiveSessionBySdkSessionId: vi.fn().mockReturnValue(makeLiveSession({
+        sessionId: 'sdk-seconds-apart',
+        resumeSessionId: '00000000-0000-4000-8000-000000000031',
+        messages: [
+          makeMessage('user', 'continue', '2026-03-10T10:00:30.000Z'),
+          makeMessage('assistant', 'new reply', '2026-03-10T10:00:35.000Z'),
+        ],
+      })),
+      getLiveSessionByCliSessionId: vi.fn(),
+      logDivergence: vi.fn(),
+    })
+
+    const resolved = await source.resolve('sdk-seconds-apart')
+    expect(resolved?.messages).toEqual([
+      makeMessage('user', 'continue', '2026-03-10T10:00:00.000Z'),
+      makeMessage('user', 'continue', '2026-03-10T10:00:30.000Z'),
+      makeMessage('assistant', 'new reply', '2026-03-10T10:00:35.000Z'),
+    ])
+  })
+
   it('prefers the live full transcript when a fresh session has outrun durable JSONL', async () => {
     const source = createAgentHistorySource({
       loadSessionHistory: vi.fn().mockResolvedValue([

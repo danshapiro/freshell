@@ -285,6 +285,7 @@ type ClientState = {
   codingCliSubscriptions: Map<string, () => void>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
+  sdkSessionTargets: Map<string, string>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
@@ -771,6 +772,7 @@ export class WsHandler {
       codingCliSubscriptions: new Map(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
+      sdkSessionTargets: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
     }
@@ -983,6 +985,40 @@ export class WsHandler {
       } : {}),
     } satisfies SdkServerMessage)
     return resolved
+  }
+
+  private resolveSdkSessionTarget(state: ClientState, clientSessionId: string): string {
+    return state.sdkSessionTargets.get(clientSessionId) ?? clientSessionId
+  }
+
+  private rewriteSdkMessageSessionId(msg: SdkServerMessage, clientSessionId: string): SdkServerMessage {
+    if (!('sessionId' in msg) || typeof msg.sessionId !== 'string' || msg.sessionId === clientSessionId) {
+      return msg
+    }
+    return {
+      ...msg,
+      sessionId: clientSessionId,
+    } satisfies SdkServerMessage
+  }
+
+  private subscribeClientToSdkSession(
+    ws: LiveWebSocket,
+    state: ClientState,
+    clientSessionId: string,
+    targetSessionId: string,
+  ): boolean {
+    state.sdkSessionTargets.set(clientSessionId, targetSessionId)
+    if (state.sdkSubscriptions.has(clientSessionId) || !this.sdkBridge) {
+      return false
+    }
+
+    const sub = this.sdkBridge.subscribe(targetSessionId, (msg: SdkServerMessage) => {
+      this.safeSend(ws, this.rewriteSdkMessageSessionId(msg, clientSessionId))
+    })
+    if (!sub) return false
+
+    state.sdkSubscriptions.set(clientSessionId, sub.off)
+    return sub.replayed
   }
 
   /**
@@ -1782,6 +1818,7 @@ export class WsHandler {
             plugins: m.plugins,
           })
           state.sdkSessions.add(session.sessionId)
+          state.sdkSessionTargets.set(session.sessionId, session.sessionId)
 
           // Send sdk.created FIRST so the client creates the Redux session
           // before any buffered messages (sdk.session.init, sdk.error) arrive.
@@ -1807,10 +1844,7 @@ export class WsHandler {
           })
 
           // Subscribe this client to session events (replays buffered messages)
-          const sub = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
-            this.safeSend(ws, msg)
-          })
-          if (sub) state.sdkSubscriptions.set(session.sessionId, sub.off)
+          this.subscribeClientToSdkSession(ws, state, session.sessionId, session.sessionId)
 
           if (m.cwd?.trim()) {
             void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
@@ -1833,7 +1867,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        const ok = this.sdkBridge.sendUserMessage(m.sessionId, m.text, m.images)
+        const ok = this.sdkBridge.sendUserMessage(this.resolveSdkSessionTarget(state, m.sessionId), m.text, m.images)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
         }
@@ -1856,7 +1890,7 @@ export class WsHandler {
               ...(m.updatedPermissions && { updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] }),
             }
           : { behavior: 'deny', message: m.message || 'Denied by user', ...(m.interrupt !== undefined && { interrupt: m.interrupt }) }
-        const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
+        const ok = this.sdkBridge.respondPermission(this.resolveSdkSessionTarget(state, m.sessionId), m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
         }
@@ -1872,7 +1906,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        const ok = this.sdkBridge.respondQuestion(m.sessionId, m.requestId, m.answers)
+        const ok = this.sdkBridge.respondQuestion(this.resolveSdkSessionTarget(state, m.sessionId), m.requestId, m.answers)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session or question not found' })
         }
@@ -1888,7 +1922,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        this.sdkBridge.interrupt(m.sessionId)
+        this.sdkBridge.interrupt(this.resolveSdkSessionTarget(state, m.sessionId))
         return
       }
 
@@ -1901,8 +1935,9 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        const killed = this.sdkBridge.killSession(m.sessionId)
+        const killed = this.sdkBridge.killSession(this.resolveSdkSessionTarget(state, m.sessionId))
         state.sdkSessions.delete(m.sessionId)
+        state.sdkSessionTargets.delete(m.sessionId)
         const off = state.sdkSubscriptions.get(m.sessionId)
         if (off) {
           off()
@@ -1921,7 +1956,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        this.sdkBridge.setModel(m.sessionId, m.model)
+        this.sdkBridge.setModel(this.resolveSdkSessionTarget(state, m.sessionId), m.model)
         return
       }
 
@@ -1934,7 +1969,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        this.sdkBridge.setPermissionMode(m.sessionId, m.permissionMode)
+        this.sdkBridge.setPermissionMode(this.resolveSdkSessionTarget(state, m.sessionId), m.permissionMode)
         return
       }
 
@@ -1943,9 +1978,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
           return
         }
-        const session = this.sdkBridge.getSession(m.sessionId)
-        if (!session) {
-          const resolved = await this.agentHistorySource?.resolve(m.sessionId) ?? null
+        const directSession = this.sdkBridge.getSession(m.sessionId)
+        const resolved = !directSession
+          ? await this.agentHistorySource?.resolve(m.sessionId) ?? null
+          : null
+        const liveSession = directSession
+          ?? (resolved?.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
+        if (!liveSession) {
           if (resolved) {
             await this.sendSdkSessionSnapshot(ws, {
               sessionId: m.sessionId,
@@ -1972,37 +2011,29 @@ export class WsHandler {
         }
 
         // Subscribe this client to session events if not already
-        let bufferReplayed = false
-        if (!state.sdkSubscriptions.has(m.sessionId)) {
-          const sub = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
-            this.safeSend(ws, msg)
-          })
-          if (sub) {
-            state.sdkSubscriptions.set(m.sessionId, sub.off)
-            bufferReplayed = sub.replayed
-          }
-        }
+        const bufferReplayed = this.subscribeClientToSdkSession(ws, state, m.sessionId, liveSession.sessionId)
 
         await this.sendSdkSessionSnapshot(ws, {
           sessionId: m.sessionId,
-          status: session.status,
-          historyQueryId: session.sessionId,
-          liveSession: session,
+          status: liveSession.status,
+          historyQueryId: m.sessionId,
+          liveSession,
+          ...(resolved ? { resolvedHistory: resolved } : {}),
         })
 
         // Send current status
         this.send(ws, {
           type: 'sdk.status',
           sessionId: m.sessionId,
-          status: session.status,
+          status: liveSession.status,
         })
 
         // Replay pending permissions and questions for re-attaching clients.
         // Skip if subscribe() already replayed the buffer (first subscriber),
         // since buffered messages already include these requests.
         if (!bufferReplayed) {
-          if (session.pendingPermissions) {
-            for (const [requestId, perm] of session.pendingPermissions) {
+          if (liveSession.pendingPermissions) {
+            for (const [requestId, perm] of liveSession.pendingPermissions) {
               this.send(ws, {
                 type: 'sdk.permission.request',
                 sessionId: m.sessionId,
@@ -2017,8 +2048,8 @@ export class WsHandler {
             }
           }
 
-          if (session.pendingQuestions) {
-            for (const [requestId, q] of session.pendingQuestions) {
+          if (liveSession.pendingQuestions) {
+            for (const [requestId, q] of liveSession.pendingQuestions) {
               this.send(ws, {
                 type: 'sdk.question.request',
                 sessionId: m.sessionId,
