@@ -296,18 +296,25 @@ function TabCard({
   const actionLabel = isLocal && isOpen ? 'Jump' : 'Pull'
 
   return (
-    <button
-      type="button"
+    <article
       className={cn(
-        'group relative w-full rounded-md border p-3 text-left transition-all cursor-default select-none',
+        'group relative rounded-md border p-3 transition-all cursor-default select-none',
         'hover:shadow-sm',
         isOpen
           ? 'border-border/60 border-l-2 border-l-emerald-500/70 hover:border-border hover:bg-muted/40'
           : 'border-border/40 border-l-2 border-l-muted-foreground/20 opacity-70 hover:opacity-90 hover:bg-muted/30',
       )}
       onContextMenu={onContextMenu}
+      role="button"
+      tabIndex={0}
       aria-label={`${record.displayDeviceLabel}: ${record.tabName}`}
       onClick={onAction}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onAction()
+        }
+      }}
     >
       {showDevice && (
         <div className="text-2xs text-muted-foreground/60 truncate mb-0.5 uppercase tracking-wide">
@@ -363,7 +370,7 @@ function TabCard({
           <ExternalLink className="h-2.5 w-2.5" />
         </span>
       </div>
-    </button>
+    </article>
   )
 }
 

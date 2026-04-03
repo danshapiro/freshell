@@ -5,8 +5,8 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
-import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
-import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw, parsePersistedTabsRaw, parsePersistedPanesRaw } from './persistedState.js'
+import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
