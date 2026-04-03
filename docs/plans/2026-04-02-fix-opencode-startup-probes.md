@@ -4,7 +4,7 @@
 
 **Goal:** Restore OpenCode startup inside Freshell by handling the exact terminal startup probes that current OpenCode emits during bootstrap, without regressing existing terminal protocol behavior.
 
-**Architecture:** Keep the existing CSI request-mode bypass exactly as-is; it solves a separate compatibility contract and should not be reworked unless new failing tests prove it is wrong. Add a small incremental non-CSI startup-probe parser on the client side, feed it the real captured OpenCode bootstrap bytes, and send only truthful replies for the exact probe forms proven by that capture. Reuse one shared fixture across pure-parser, `TerminalView`, and attach/replay regression tests so the fix stays narrow and protocol-accurate.
+**Architecture:** Keep the existing CSI request-mode bypass exactly as-is; it solves a separate compatibility contract and should not be reworked unless new failing tests prove it is wrong. Add a small incremental non-CSI startup-probe parser on the client side, feed it the real captured OpenCode bootstrap bytes, and send only truthful replies for the exact probe forms proven by that capture. Strip recognized probes from both live and replayed output, but emit synthetic replies only for live startup traffic so attach replay stays visually clean without injecting late control input back into the PTY. Reuse one shared fixture across pure-parser, `TerminalView`, and attach/replay regression tests so the fix stays narrow and protocol-accurate.
 
 **Tech Stack:** React 18, TypeScript, xterm.js, Vitest, Testing Library, Freshell websocket terminal protocol
 
@@ -27,6 +27,7 @@ Execution risks this plan must avoid:
 - Do not invent reply formats from memory. First capture the exact bytes, then encode the exact contract in shared fixtures and tests.
 - Do not assume kitty/APC handling is required unless the capture proves OpenCode emitted an APC probe that matters.
 - Do not claim support for a terminal feature Freshell does not actually implement. Unsupported replies must be explicit and truthful.
+- Do not emit synthetic replies while processing replayed attach history or stale attach generations. Replay needs cleanup, not new PTY input.
 - Do not rely on manual QA for completion. Manual repro is optional supporting evidence after automated checks are green.
 
 ## User-Visible Behavior And Invariants
@@ -34,6 +35,7 @@ Execution risks this plan must avoid:
 - Selecting a directory for an `opencode` pane must lead to a visible OpenCode UI instead of a blank hanging pane.
 - Recognized startup probe bytes must not be written into visible terminal output or retained in replayed scrollback.
 - For a frame that contains recognized startup probes plus visible text, Freshell must send probe replies before writing the cleaned visible text to xterm.
+- Replayed startup bytes during attach hydration must be stripped from visible output but must not generate fresh `terminal.input` traffic.
 - Partial recognized probe sequences split across websocket frames must be buffered and completed correctly.
 - Unknown, malformed, or unrelated OSC/APC traffic must pass through unchanged.
 - Existing CSI request-mode replies must continue to work exactly as they do today.
@@ -59,7 +61,7 @@ Execution risks this plan must avoid:
 - **Add only if capture proves it:** non-CSI startup probe forms emitted by the failing OpenCode session.
 - **Preserve:** unrelated OSC/APC/DCS traffic untouched.
 
-If the capture shows only an OSC color query, implement only that. If it shows an APC or other non-CSI probe that requires a reply, implement exactly that form and no more.
+If the capture shows only an OSC color query, implement only that. If it shows an APC or other non-CSI probe that requires a reply, implement exactly that form and no more. If a captured form appears only in replay coverage and does not require a live reply, strip it without inventing a reply.
 
 ## Task 1: Freeze The Real OpenCode Probe Contract
 
@@ -72,7 +74,9 @@ If the capture shows only an OSC color query, implement only that. If it shows a
 
 Source the probe contract from the real failing OpenCode repro before writing parser logic. Do not guess from release notes or terminal lore.
 
-Preferred capture path: record the first startup bytes from `opencode` in a raw PTY that does not have Freshell’s client-side reply shims yet. Use a one-off command so the capture is reproducible without adding temporary repo files:
+Preferred capture path: capture the first hung `terminal.output.data` websocket frames from the real failing Freshell session, because that is the exact client-side contract this fix must process. Save the raw bytes exactly as delivered to `handleTerminalOutput`, including frame boundaries for at least one split-sequence case. Use a one-off local logging patch or devtools capture during repro, but do not keep temporary instrumentation in the repo.
+
+Fallback capture path if the websocket capture is unavailable: record the first startup bytes from `opencode` in a raw PTY that does not have Freshell’s client-side reply shims yet. Use a one-off command so the capture is reproducible without adding temporary repo files:
 
 ```bash
 node --input-type=module <<'EOF'
@@ -103,7 +107,7 @@ child.onData((chunk) => {
 EOF
 ```
 
-If that harness does not reproduce the same stuck bootstrap bytes, fall back to the existing failing Freshell repro and capture the raw `terminal.output.data` payloads from the websocket message stream for the first hung frame sequence. In either case, save the exact captured bytes into the shared fixture and note the capture source in a short comment.
+If the raw-PTY harness does not reproduce the same stuck bootstrap bytes, do not guess; use the failing Freshell websocket capture instead. In either case, save the exact captured bytes into the shared fixture and note the capture source in a short comment.
 
 Create `test/helpers/opencode-startup-probes.ts` exporting:
 
@@ -145,6 +149,8 @@ Assert:
 Use a deterministic mocked terminal theme in this file so any color-query reply bytes are stable and explicit.
 
 Create `test/e2e/opencode-startup-probes.test.tsx` using the existing attach/replay harness style from `test/e2e/terminal-create-attach-ordering.test.tsx`. Replay the shared fixture, including a split-frame variant, then visible OpenCode text. Assert that visible text renders and reply traffic is emitted.
+- For the live-startup path, assert reply traffic is emitted before visible text is written.
+- For the attach-replay path, assert the same historical bytes are stripped from visible output but no fresh reply traffic is emitted during replay hydration.
 
 - [ ] **Step 3: Run the new tests to verify the contract is red**
 
@@ -292,9 +298,10 @@ Expected: FAIL because `TerminalView` does not yet strip the captured startup pr
 Update `src/components/TerminalView.tsx`:
 - add `startupProbeStateRef` alongside `osc52ParserRef` and `turnCompleteSignalStateRef`
 - reset `startupProbeStateRef` in the same lifecycle effect that resets the other parser states
-- derive reply colors from `getTerminalTheme(settings.terminal.theme, settings.theme)`
+- derive reply colors from the same resolved theme object that is applied to xterm
 - call `extractTerminalStartupProbes()` before `extractOsc52Events()` and `extractTurnCompleteSignals()`
-- send each reply through the existing `sendInput()` path
+- thread an explicit `allowReplies` flag from the output-frame handling path so live frames can reply and replay hydration frames can only strip
+- send each permitted reply through the existing `sendInput()` path
 - keep `registerTerminalRequestModeBypass(term, sendInput)` unchanged
 
 Intended output flow:
@@ -306,8 +313,10 @@ const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, 
   cursor: resolvedTheme.cursor,
 })
 
-for (const reply of startup.replies) {
-  sendInput(reply)
+if (allowReplies) {
+  for (const reply of startup.replies) {
+    sendInput(reply)
+  }
 }
 
 const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
@@ -322,6 +331,7 @@ Keep the implementation narrow:
 - do not special-case OpenCode by mode if the captured probe handling is safe for all terminals
 - do not move protocol logic to the server
 - do not reorder OSC52 or turn-complete handling after visible writes
+- do not send replies for replay hydration or stale attach output just because the parser recognized a probe
 
 - [ ] **Step 4: Run the integration tests to verify they pass**
 
