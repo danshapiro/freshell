@@ -4,7 +4,7 @@
 
 **Goal:** Restore OpenCode startup inside Freshell by handling the exact terminal startup probes that current OpenCode emits during bootstrap, without regressing existing terminal protocol behavior.
 
-**Architecture:** Keep the existing CSI request-mode bypass exactly as-is; it solves a separate compatibility contract and should not be reworked unless new failing tests prove it is wrong. Add a small incremental non-CSI startup-probe parser on the client side, but drive it from the exact failing websocket `terminal.output` frame sequence instead of a reconstructed combined payload: the real contract starts with a probe-only frame and continues with later post-reply frames, plus a synthetic split-frame variant only for buffering coverage. Strip recognized probes from both live and replayed output, emit synthetic replies only for live frames outside replay, and reset parser state whenever an attach generation starts or replay completes so replay fragments cannot leak into later live traffic. Reuse one shared frame fixture across the pure-parser, `TerminalView`, and attach/replay regression tests so the fix stays narrow and protocol-accurate, while keeping the picker handoff as a separate boundary regression.
+**Architecture:** Keep the existing CSI request-mode bypass exactly as-is; it solves a separate compatibility contract and should not be reworked unless new failing tests prove it is wrong. Add a small incremental non-CSI startup-probe parser on the client side, but drive it from the exact failing websocket `terminal.output` frame sequence instead of a reconstructed combined payload: the real contract starts with a probe-only frame and continues with later post-reply frames, plus a synthetic split-frame variant only for buffering coverage. Strip recognized probes from both live and replayed output, emit synthetic replies only for live frames outside replay, apply the startup-probe preprocessor regardless of terminal mode, and reset parser state whenever an attach generation starts or replay completes, including replay completion announced by `terminal.output.gap`, so replay fragments cannot leak into later live traffic. Reuse one shared frame fixture across the pure-parser, `TerminalView`, and attach/replay regression tests so the fix stays narrow and protocol-accurate, while keeping the picker handoff as a separate boundary regression.
 
 **Tech Stack:** React 18, TypeScript, xterm.js, Vitest, Testing Library, Freshell websocket terminal protocol
 
@@ -39,10 +39,11 @@ Execution risks this plan must avoid:
 - For the captured live startup sequence, Freshell must send truthful replies for the standalone probe frame before writing any later captured post-reply output to xterm.
 - If a live frame completes a split recognized probe and also carries later output, Freshell must send the reply before writing the cleaned remainder of that same frame.
 - Replayed startup bytes during attach hydration must be stripped from visible output but must not generate fresh `terminal.input` traffic.
-- Pending recognized probe fragments from replay hydration must be discarded before the first accepted live frame, and pending probe state must reset across attach generations.
+- Pending recognized probe fragments from replay hydration must be discarded before the first accepted live frame, including when replay completion is announced by `terminal.output.gap`, and pending probe state must reset across attach generations.
 - Partial recognized probe sequences split across websocket frames must be buffered and completed correctly.
 - Unknown, malformed, or unrelated OSC/APC traffic must pass through unchanged.
 - Existing CSI request-mode replies must continue to work exactly as they do today.
+- Identical captured startup-probe bytes must be handled the same way regardless of pane mode; the helper's startup-only contract, not an `opencode`-only gate, defines the safe scope.
 
 ## File Structure
 
@@ -55,9 +56,9 @@ Execution risks this plan must avoid:
 - Create: `test/unit/client/lib/terminal-startup-probes.test.ts`
   - Pure parser coverage for the shared fixture contract, partial-frame buffering, and passthrough behavior.
 - Modify: `test/unit/client/components/TerminalView.osc52.test.tsx`
-  - Extend the existing terminal-output preprocessing harness to assert startup-probe replies, probe-only-frame handling, cleaned writes, reply-before-write ordering, and preserved OSC52 behavior with deterministic terminal theme colors.
+  - Extend the existing terminal-output preprocessing harness to assert startup-probe replies, probe-only-frame handling, cleaned writes, reply-before-write ordering, preserved OSC52 behavior, and mode-agnostic handling with deterministic terminal theme colors.
 - Create: `test/e2e/opencode-startup-probes.test.tsx`
-  - Attach/replay regression using the shared fixture frames, including replay/live boundary handling.
+  - Attach/replay regression using the shared fixture frames, including replay/live boundary handling and replay completion via `terminal.output.gap`.
 - Modify: `test/e2e/directory-picker-flow.test.tsx`
   - Boundary regression for the real picker handoff into an `opencode` terminal pane with the confirmed cwd.
 - Modify: `src/components/TabsView.tsx`
@@ -128,11 +129,13 @@ it('preserves incomplete unknown escape traffic until the frame completes', () =
 Extend `test/unit/client/components/TerminalView.osc52.test.tsx` so the startup path follows the real websocket contract:
 - first emit `OPEN_CODE_STARTUP_PROBE_FRAME` by itself and assert that it generates replies but no write
 - then emit one or more `OPEN_CODE_STARTUP_POST_REPLY_FRAMES`, with an OSC52 sequence in a later frame
+- run the same startup-probe assertions for at least one non-`opencode` terminal mode so a `mode === 'opencode'` gate cannot satisfy the tests
 
 Assert:
 - `ws.send` includes the expected `terminal.input` reply messages
 - xterm `write()` receives only `OPEN_CODE_STARTUP_EXPECTED_CLEANED`
 - the reply messages are sent before the first cleaned post-reply write
+- the same reply-before-write behavior occurs in both the `opencode` case and the non-`opencode` case
 - existing OSC52 policy behavior still works
 
 Use a deterministic mocked terminal theme in this file so any color-query reply bytes are stable and explicit.
@@ -140,7 +143,8 @@ Use a deterministic mocked terminal theme in this file so any color-query reply 
 Create `test/e2e/opencode-startup-probes.test.tsx` using the existing attach/replay harness style from `test/e2e/terminal-create-attach-ordering.test.tsx`. Cover the real multi-frame startup contract plus the boundary cases that can regress it:
 - live startup: emit `OPEN_CODE_STARTUP_PROBE_FRAME`, assert replies and no writes, then emit `OPEN_CODE_STARTUP_POST_REPLY_FRAMES` and assert the cleaned writes
 - replay startup: emit the same historical frames during replay hydration and assert they are stripped from visible output without fresh reply traffic
-- replay/live boundary: prove a replay fragment cannot be completed by the first live frame, but a complete recognized probe on the first accepted post-replay live frame still replies normally
+- replay/live boundary on `terminal.output`: prove a replay fragment cannot be completed by the first live frame, but a complete recognized probe on the first accepted post-replay live frame still replies normally
+- replay/live boundary on `terminal.output.gap`: emit only a replay fragment, complete replay with a gap message, then prove the first accepted live frame discards the stale fragment instead of completing it
 - split live startup: prove a live split probe buffers until completion and replies exactly once
 
 - [ ] **Step 3: Run the new tests to verify the contract is red**
@@ -156,7 +160,7 @@ npm run test:vitest -- --run \
 
 Expected:
 - the new pure parser test fails because the implementation module does not exist yet
-- the `TerminalView` and attach/replay tests fail because startup probes are still written through, replay/live boundaries are not handled correctly, and no replies are sent
+- the `TerminalView` and attach/replay tests fail because startup probes are still written through, replay/live boundaries are not handled correctly, the gap-completion boundary leaks stale probe fragments, the path is still mode-gated, and no replies are sent
 
 - [ ] **Step 4: Commit the frozen failing contract**
 
@@ -290,9 +294,10 @@ Update `src/components/TerminalView.tsx`:
 - add `startupProbeStateRef` alongside `osc52ParserRef` and `turnCompleteSignalStateRef`
 - reset `startupProbeStateRef` in the same lifecycle effect that resets the other parser states, at the start of each attach generation, and again when replay completes so replay fragments cannot leak into later live frames
 - derive reply colors from the same resolved theme object that is applied to xterm
-- call `extractTerminalStartupProbes()` before `extractOsc52Events()` and `extractTurnCompleteSignals()`
+- call `extractTerminalStartupProbes()` before `extractOsc52Events()` and `extractTurnCompleteSignals()` for every terminal mode; rely on the helper's startup-only contract rather than a `mode === 'opencode'` gate
 - thread an explicit `allowReplies` flag from the output-frame handling path so live frames can reply and replay hydration frames can only strip
 - send each permitted reply through the existing `sendInput()` path
+- when replay completion is detected on `terminal.output.gap`, call the same discard-remainder reset path used for replay completion on `terminal.output` so a replay-carried probe prefix cannot leak into the next live frame
 - keep `registerTerminalRequestModeBypass(term, sendInput)` unchanged
 
 Intended output flow:
@@ -319,11 +324,11 @@ const { cleaned, count } = extractTurnCompleteSignals(
 ```
 
 Keep the implementation narrow:
-- do not special-case OpenCode by mode if the captured probe handling is safe for all terminals
+- do not keep or add a `mode === 'opencode'` gate around startup-probe extraction unless a new failing test proves the captured handling is unsafe outside OpenCode
 - do not move protocol logic to the server
 - do not reorder OSC52 or turn-complete handling after visible writes
 - do not send replies for replay hydration or stale attach output just because the parser recognized a probe
-- do not let replay-carried pending probe bytes complete on the first accepted live frame after replay; reset the parser before that transition
+- do not let replay-carried pending probe bytes complete on the first accepted live frame after replay, including when replay completion was announced by `terminal.output.gap`; use discard-before-live semantics for both completion paths
 
 - [ ] **Step 4: Run the integration tests to verify they pass**
 
@@ -494,4 +499,5 @@ kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid
 - Preserve existing request-mode behavior unless a new failing test proves a defect there.
 - Do not pin OpenCode versions, do not add server-side OpenCode fallbacks, and do not fake support for unsupported terminal features.
 - If the capture proves only one probe form matters, keep the implementation limited to that one form.
-- Reset the startup-probe parser whenever replay or attach-generation state changes; otherwise a replay fragment can be completed incorrectly by the next live frame.
+- Apply the startup-probe extractor independent of pane mode; the helper's own startup-only semantics are the scope limiter.
+- Reset the startup-probe parser whenever replay or attach-generation state changes, and use discard-remainder reset when replay completes on either `terminal.output` or `terminal.output.gap`; otherwise a replay fragment can be completed incorrectly by the next live frame.

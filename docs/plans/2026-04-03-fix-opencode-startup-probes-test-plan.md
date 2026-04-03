@@ -3,7 +3,7 @@
 ## Strategy Reconciliation
 No strategy changes requiring user approval are needed.
 
-The approved strategy still holds: the strongest evidence remains the real `TerminalView` create/attach/output path, with the pure startup-probe parser covered only as supporting proof. The material adjustment is narrower and stays within the agreed cost and scope: the repo already contains a first-pass startup-probe helper and tests, but they still rely in places on a raw-PTY-derived fixture note and on synthetic `OPEN_CODE_STARTUP_PROBE_FRAME + OPEN_CODE_STARTUP_VISIBLE_TEXT` combined payloads. The implementation plan and latest investigation require the acceptance contract to be the real multi-frame websocket `terminal.output` sequence instead.
+The approved strategy still holds: the strongest evidence remains the real `TerminalView` create/attach/output path, with the pure startup-probe parser covered only as supporting proof. The material adjustment is narrower and stays within the agreed cost and scope: the repo already contains a first-pass startup-probe helper and tests, but the remaining review blockers show two acceptance gaps still are not encoded tightly enough. First, the `TerminalView` acceptance surface must prove startup-probe stripping is mode-agnostic, because the pure helper is already startup-armed and passes later standalone OSC 11 queries through unchanged. Second, the attach/replay acceptance surface must prove that replay completion announced by `terminal.output.gap` discards any buffered startup-probe fragment before the first live frame. The implementation plan and latest investigation still require the acceptance contract to be the real multi-frame websocket `terminal.output` sequence rather than invented combined payloads.
 
 That means this plan reuses and extends the existing `test/e2e/opencode-startup-probes.test.tsx`, `test/unit/client/components/TerminalView.osc52.test.tsx`, and `test/unit/client/lib/terminal-startup-probes.test.ts` suites rather than creating parallel coverage. The shared helper must become a websocket-frame-first fixture, and the existing scenario tests must assert per-frame reply/no-write behavior before any later post-reply output is written. No paid services, browser automation, or broader infrastructure are needed.
 
@@ -17,6 +17,7 @@ Task 4 Step 3 in the implementation plan still requires the repo-wide `npm run l
 - `S5 Picker handoff contract`: [PaneContainer.tsx](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/src/components/panes/PaneContainer.tsx) and [directory-picker-flow.test.tsx](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/e2e/directory-picker-flow.test.tsx) define the user entry path from provider selection and directory confirmation to `TerminalPaneContent.initialCwd`.
 - `S6 Frozen websocket capture contract`: update [opencode-startup-probes.ts](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/helpers/opencode-startup-probes.ts) so it records the exact captured websocket startup frame sequence, the split-frame variant, the expected cleaned output, the expected truthful replies, and a short capture-source note. Any convenience joined text constant must be derived from `OPEN_CODE_STARTUP_POST_REPLY_FRAMES`, not the other way around.
 - `S7 Existing acceptance surfaces`: [opencode-startup-probes.test.tsx](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/e2e/opencode-startup-probes.test.tsx), [TerminalView.osc52.test.tsx](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/unit/client/components/TerminalView.osc52.test.tsx), [terminal-startup-probes.test.ts](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/unit/client/lib/terminal-startup-probes.test.ts), and [directory-picker-flow.test.tsx](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/e2e/directory-picker-flow.test.tsx) are the suites to extend or rerun. Once their expectations reflect `S6`, they become the acceptance gates for this fix.
+- `S8 Generic safety proof for removing the mode gate`: [terminal-startup-probes.ts](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/src/lib/terminal-startup-probes.ts) and [terminal-startup-probes.test.ts](/home/user/code/freshell/.worktrees/trycycle-fix-opencode-startup-probes-20260402/test/unit/client/lib/terminal-startup-probes.test.ts) already show the helper only recognizes the captured OSC 11 query while it remains startup-armed, and that embedded or later standalone OSC 11 traffic is passed through unchanged. That makes a `mode === 'opencode'` gate unnecessary unless new evidence disproves this contract.
 
 ## Action Space
 - Select `opencode` in the pane picker.
@@ -26,9 +27,10 @@ Task 4 Step 3 in the implementation plan still requires the repo-wide `npm run l
 - Send `terminal.attach` and receive `terminal.attach.ready`.
 - Process a live `terminal.output` frame containing only the captured startup probe.
 - Process the later live `terminal.output` frames that carry the post-reply startup bytes in captured order.
+- Process the captured startup probe through the same `TerminalView` output-preprocessing path in a non-`opencode` terminal mode.
 - Process a recognized startup probe split across websocket frames.
 - Process replay hydration frames containing historical startup probe bytes.
-- Cross the replay-to-live boundary without completing a replay fragment on the first accepted live frame.
+- Cross the replay-to-live boundary without completing a replay fragment on the first accepted live frame, including when replay completion is announced by `terminal.output.gap`.
 - Send synthetic `terminal.input` replies only for live recognized startup probes.
 - Continue OSC52 and turn-complete processing after startup-probe stripping.
 - Preserve existing CSI request-mode replies unchanged.
@@ -39,8 +41,8 @@ Harness work happens first because every high-value check depends on the frozen 
 | Harness | What it does | What it exposes | Estimated complexity | Tests that depend on it |
 | --- | --- | --- | --- | --- |
 | `H1 Shared websocket startup-probe fixture` | Replaces the current raw-PTY/synthetic helper assumptions with the exact websocket startup frame sequence, split-frame variant, expected cleaned output, expected replies, and a short capture-source note in one module. | Typed constants for `OPEN_CODE_STARTUP_PROBE_FRAME`, `OPEN_CODE_STARTUP_POST_REPLY_FRAMES`, `OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES`, `OPEN_CODE_STARTUP_EXPECTED_REPLIES`, and `OPEN_CODE_STARTUP_EXPECTED_CLEANED`, plus any derived convenience join. | Low | 1, 2, 3, 4, 5, 6, 8, 9 |
-| `H2 TerminalView output-preprocessing harness` | Extends `test/unit/client/components/TerminalView.osc52.test.tsx` with deterministic theme colors, mocked websocket send capture, xterm write capture, and frame-by-frame `terminal.output` injection. | Assertions against outgoing `terminal.input`, xterm `write()`, clipboard/prompt side effects, and send-before-write ordering. | Medium | 6, 10 |
-| `H3 Attach/replay startup scenario harness` | Extends `test/e2e/opencode-startup-probes.test.tsx` using the existing `terminal.created -> terminal.attach -> terminal.attach.ready -> terminal.output` path. | End-to-end create/attach/replay sequencing with frame-by-frame startup output injection, visible xterm writes, and outgoing reply traffic across live, replay, split-frame, and replay/live-boundary cases. | Medium | 1, 2, 3, 4, 5 |
+| `H2 TerminalView output-preprocessing harness` | Extends `test/unit/client/components/TerminalView.osc52.test.tsx` with deterministic theme colors, mocked websocket send capture, xterm write capture, frame-by-frame `terminal.output` injection, and a way to render the same output path in both `opencode` and a non-`opencode` mode. | Assertions against outgoing `terminal.input`, xterm `write()`, clipboard/prompt side effects, and send-before-write ordering across multiple pane modes. | Medium | 6, 10 |
+| `H3 Attach/replay startup scenario harness` | Extends `test/e2e/opencode-startup-probes.test.tsx` using the existing `terminal.created -> terminal.attach -> terminal.attach.ready -> terminal.output` path plus explicit `terminal.output.gap` replay completion. | End-to-end create/attach/replay sequencing with frame-by-frame startup output injection, visible xterm writes, and outgoing reply traffic across live, replay, split-frame, replay/live-boundary, and replay-completes-on-gap cases. | Medium | 1, 2, 3, 4, 5 |
 | `H4 OpenCode picker handoff harness` | Reuses the existing directory-picker flow to exercise the user entry path into an `opencode` terminal pane. | User-level provider selection, directory confirmation, resulting pane content, and persisted provider cwd patch. | Low | 7 |
 
 ## Test Plan
@@ -62,14 +64,14 @@ Harness work happens first because every high-value check depends on the frozen 
    **Expected outcome:** Replay writes contain only the cleaned historical startup text with probe bytes removed. No `terminal.input` reply traffic is emitted while replay hydration is in progress. Once replay completes, later live visible output still renders normally. Source of truth: `S1`, `S2`, `S3`, `S6`, `S7`.
    **Interactions:** Attach/replay sequencing, replay-window tracking, stale attach filtering, websocket reply path, xterm write queue.
 
-3. **Name:** A replay-carried startup-probe fragment is discarded before the first accepted live frame.
+3. **Name:** A replay-carried startup-probe fragment is discarded before the first accepted live frame when replay completes on `terminal.output.gap`.
    **Type:** boundary
    **Disposition:** extend
    **Harness:** `H3`
-   **Preconditions:** Replay hydration ends after delivering only the first fragment from `OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES`; the first accepted live frame begins with the second fragment and continues with captured startup output.
-   **Actions:** Emit the first split fragment during replay. Complete replay. Emit the first accepted live frame with the remaining bytes plus captured startup output.
-   **Expected outcome:** No synthetic `terminal.input` reply is emitted for the replay-carried fragment. The live visible output still writes once with the replay fragment discarded rather than completed across the boundary. Source of truth: `S2`, `S3`, `S6`, `S7`.
-   **Interactions:** Startup-probe parser pending state, replay-completion reset, websocket reply path, xterm write queue.
+   **Preconditions:** Replay hydration has delivered only the first fragment from `OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES`; replay completion will be announced by `terminal.output.gap` rather than by a final replay `terminal.output` frame; the first accepted live frame begins with the second fragment and continues with captured startup output.
+   **Actions:** Emit the first split fragment during replay. Emit a `terminal.output.gap` message that closes the replay window. Then emit the first accepted live frame with the remaining bytes plus captured startup output.
+   **Expected outcome:** No synthetic `terminal.input` reply is emitted for the replay-carried fragment. The first live visible output writes only the cleaned post-reply startup bytes, with the replay fragment discarded rather than completed across the gap boundary. Source of truth: `S2`, `S3`, `S6`, `S7`.
+   **Interactions:** Startup-probe parser pending state, replay-completion reset on `terminal.output.gap`, websocket reply path, xterm write queue.
 
 4. **Name:** The first accepted live frame after replay still replies to a complete startup probe.
    **Type:** boundary
@@ -89,14 +91,14 @@ Harness work happens first because every high-value check depends on the frozen 
    **Expected outcome:** After the first frame there is no visible write and no reply traffic. After the second frame completes the probe, the exact expected reply sequence is sent once and the cleaned startup output is written once, with no duplicate replies or raw probe bytes. Source of truth: `S2`, `S3`, `S6`, `S7`.
    **Interactions:** Startup-probe parser buffering, attach live output path, websocket reply path, xterm write queue.
 
-6. **Name:** Startup-probe stripping in `TerminalView` preserves same-path OSC52 clipboard behavior.
+6. **Name:** Startup-probe stripping in `TerminalView` is mode-agnostic and preserves same-path OSC52 clipboard behavior.
    **Type:** integration
    **Disposition:** extend
    **Harness:** `H2`
-   **Preconditions:** `TerminalView` is rendered with deterministic theme colors and a known OSC52 policy; `H1` supplies the captured probe-only frame and post-reply frames; an OSC52 clipboard sequence is appended to a later post-reply frame on the same output path.
-   **Actions:** Emit `OPEN_CODE_STARTUP_PROBE_FRAME`, then emit the captured `OPEN_CODE_STARTUP_POST_REPLY_FRAMES` in order with the OSC52 payload attached to a later frame.
-   **Expected outcome:** `ws.send` includes the exact startup-probe replies before the first cleaned write; xterm `write()` never receives raw startup-probe bytes; OSC52 still copies or prompts according to the selected policy. Source of truth: `S2`, `S4`, `S6`, `S7`.
-   **Interactions:** Startup-probe parser, OSC52 parser, clipboard side effects, theme-derived reply bytes, xterm write scheduling.
+   **Preconditions:** `TerminalView` is rendered with deterministic theme colors and a known OSC52 policy once as `mode: 'opencode'` and once as a non-`opencode` terminal mode such as `shell`; `H1` supplies the captured probe-only frame and post-reply frames; an OSC52 clipboard sequence is appended to a later post-reply frame on the same output path.
+   **Actions:** For each mode, emit `OPEN_CODE_STARTUP_PROBE_FRAME`, then emit the captured `OPEN_CODE_STARTUP_POST_REPLY_FRAMES` in order with the OSC52 payload attached to a later frame.
+   **Expected outcome:** In both modes, `ws.send` includes the exact startup-probe replies before the first cleaned write; xterm `write()` never receives raw startup-probe bytes; OSC52 still copies or prompts according to the selected policy. Source of truth: `S2`, `S4`, `S6`, `S7`, `S8`.
+   **Interactions:** Startup-probe parser, pane mode selection, OSC52 parser, clipboard side effects, theme-derived reply bytes, xterm write scheduling.
 
 7. **Name:** Selecting OpenCode in the directory picker launches a terminal pane with the confirmed cwd.
    **Type:** regression
@@ -137,8 +139,9 @@ Harness work happens first because every high-value check depends on the frozen 
 ## Coverage Summary
 Covered:
 - The actual failure surface after directory confirmation: live `terminal.output` handling in `TerminalView`, including reply-before-write ordering and visible startup rendering.
-- Replay hydration semantics for historical startup bytes, including replay/live reset behavior.
+- Replay hydration semantics for historical startup bytes, including replay/live reset behavior and replay completion via `terminal.output.gap`.
 - Split-frame buffering across websocket boundaries.
+- Mode-agnostic startup-probe handling at the `TerminalView` output-preprocessing layer.
 - Coexistence with adjacent preprocessing behavior, especially OSC52, request-mode bypass, and turn-complete parsing.
 - The user entry path from picker selection to `opencode` terminal pane creation.
 - The exact parser contract driven by the frozen websocket fixture.
