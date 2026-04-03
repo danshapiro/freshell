@@ -191,7 +191,7 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-resume'].historyLoaded).toBe(false)
   })
 
-  it('ends restore mode immediately when snapshot says there is no backlog', () => {
+  it('keeps a named-resume create restoring when a pre-init snapshot has no latest turn yet', () => {
     let state = agentChatReducer(initial, registerPendingCreate({
       requestId: 'resume-empty',
       expectsHistoryHydration: true,
@@ -203,10 +203,37 @@ describe('agentChatSlice', () => {
     state = agentChatReducer(state, sessionSnapshotReceived({
       sessionId: 'sdk-empty',
       latestTurnId: null,
-      status: 'idle',
+      status: 'starting',
     }))
 
-    expect(state.sessions['sdk-empty'].historyLoaded).toBe(true)
+    expect(state.sessions['sdk-empty'].historyLoaded).toBe(false)
+
+    state = agentChatReducer(state, sessionInit({
+      sessionId: 'sdk-empty',
+      cliSessionId: '00000000-0000-4000-8000-000000000555',
+    }))
+
+    expect(state.sessions['sdk-empty'].historyLoaded).toBe(false)
+    expect(state.sessions['sdk-empty'].cliSessionId).toBe('00000000-0000-4000-8000-000000000555')
+  })
+
+  it('ends restore mode immediately when an empty snapshot already knows the durable session id', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'resume-empty-durable',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'resume-empty-durable',
+      sessionId: 'sdk-empty-durable',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-empty-durable',
+      latestTurnId: null,
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000556',
+    }))
+
+    expect(state.sessions['sdk-empty-durable'].historyLoaded).toBe(true)
   })
 
   it('sets historyLoaded when the initial timeline window is empty', () => {

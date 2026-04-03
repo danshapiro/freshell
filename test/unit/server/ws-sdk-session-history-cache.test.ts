@@ -169,7 +169,6 @@ describe('WsHandler agent history source DI', () => {
       undefined, // layoutStore
       undefined, // extensionManager
       undefined, // codexActivityListProvider
-      undefined,
       injectedHistorySource,
     )
 
@@ -225,7 +224,6 @@ describe('WsHandler agent history source DI', () => {
       registry,
       undefined,
       mockSdkBridge as any,
-      undefined,
       undefined,
       undefined,
       undefined,
@@ -297,7 +295,6 @@ describe('WsHandler agent history source DI', () => {
       undefined,
       undefined,
       undefined,
-      undefined,
       injectedHistorySource,
     )
 
@@ -312,6 +309,77 @@ describe('WsHandler agent history source DI', () => {
 
     expect(injectedHistorySource.resolve).toHaveBeenCalledTimes(2)
     expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
+
+    ws.close()
+  })
+
+  it('sdk.create without an injected history source falls back through the module-backed shared history source', async () => {
+    moduleLoadSessionHistoryMock.mockResolvedValue([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'Hello from module loader' }],
+        timestamp: '2026-01-01T00:00:01Z',
+      },
+    ])
+
+    const mockSdkBridge = {
+      getSession: vi.fn().mockImplementation((sessionId: string) => (
+        sessionId === 'sdk-sess-module'
+          ? {
+              sessionId: 'sdk-sess-module',
+              status: 'starting',
+              messages: [],
+              model: 'claude-sonnet-4-20250514',
+              cwd: '/tmp',
+              resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+              streamingActive: false,
+              streamingText: '',
+              pendingPermissions: new Map(),
+              pendingQuestions: new Map(),
+            }
+          : undefined
+      )),
+      createSession: vi.fn().mockReturnValue({
+        sessionId: 'sdk-sess-module',
+        status: 'starting',
+        messages: [],
+        model: 'claude-sonnet-4-20250514',
+        cwd: '/tmp',
+        resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+        streamingActive: false,
+        streamingText: '',
+      }),
+      subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
+      findSessionByCliSessionId: vi.fn(),
+      killSession: vi.fn(),
+      sendUserMessage: vi.fn(),
+      respondPermission: vi.fn(),
+      respondQuestion: vi.fn(),
+      interrupt: vi.fn(),
+      setModel: vi.fn(),
+      setPermissionMode: vi.fn(),
+      close: vi.fn(),
+    }
+
+    handler = new WsHandler(
+      server,
+      registry,
+      undefined,
+      mockSdkBridge as any,
+    )
+
+    const ws = await connectAndAuth(server)
+
+    ws.send(JSON.stringify({
+      type: 'sdk.create',
+      requestId: 'req-module',
+      cwd: '/tmp',
+      resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
+    }))
+
+    await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
+
+    expect(moduleLoadSessionHistoryMock).toHaveBeenCalledWith('01234567-89ab-cdef-0123-456789abcdef')
 
     ws.close()
   })

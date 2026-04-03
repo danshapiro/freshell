@@ -687,7 +687,7 @@ describe('AgentChatView reload/restore behavior', () => {
     vi.useRealTimers()
   })
 
-  it('does not issue an HTTP timeline fetch when snapshot proves the resumed session is empty', async () => {
+  it('waits for the durable Claude id before hydrating a named-resume session whose pre-init snapshot is empty', async () => {
     const store = makeStore()
     store.dispatch(registerPendingCreate({
       requestId: 'req-empty',
@@ -700,8 +700,14 @@ describe('AgentChatView reload/restore behavior', () => {
     store.dispatch(sessionSnapshotReceived({
       sessionId: 'sdk-empty',
       latestTurnId: null,
-      status: 'idle',
+      status: 'starting',
     }))
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: '00000000-0000-4000-8000-000000000555',
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
 
     render(
       <Provider store={store}>
@@ -713,8 +719,8 @@ describe('AgentChatView reload/restore behavior', () => {
             provider: 'freshclaude',
             createRequestId: 'req-empty',
             sessionId: 'sdk-empty',
-            status: 'idle',
-            resumeSessionId: 'cli-empty',
+            status: 'starting',
+            resumeSessionId: 'named-resume',
           }}
         />
       </Provider>,
@@ -725,7 +731,27 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     expect(getAgentTimelinePage).not.toHaveBeenCalled()
-    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
+    expect(screen.getByText(/restoring/i)).toBeInTheDocument()
+
+    act(() => {
+      store.dispatch(sessionInit({
+        sessionId: 'sdk-empty',
+        cliSessionId: '00000000-0000-4000-8000-000000000555',
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        '00000000-0000-4000-8000-000000000555',
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    expect(getAgentTimelinePage).not.toHaveBeenCalledWith(
+      'sdk-empty',
+      expect.anything(),
+      expect.anything(),
+    )
   })
 
   it('stays in restoring state when sdk.status arrives before the first timeline window (race condition)', () => {

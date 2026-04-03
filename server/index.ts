@@ -315,7 +315,6 @@ async function main() {
     layoutStore,
     extensionManager,
     () => codexActivity.tracker.list(),
-    loadSessionHistoryWithCache,
     agentHistorySource,
   )
   attachProxyUpgradeHandler(server)

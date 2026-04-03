@@ -358,7 +358,6 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
-  private loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>
   private agentHistorySource?: AgentHistorySource
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
@@ -395,7 +394,6 @@ export class WsHandler {
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
     codexActivityListProvider?: () => CodexActivityRecord[],
-    loadSessionHistoryFn?: (sessionId: string) => Promise<ChatMessage[] | null>,
     agentHistorySource?: AgentHistorySource,
   ) {
     this.config = readWsHandlerConfig()
@@ -407,10 +405,9 @@ export class WsHandler {
     this.tabsRegistryStore = tabsRegistryStore
     this.layoutStore = layoutStore
     this.extensionManager = extensionManager
-    this.loadSessionHistoryFn = loadSessionHistoryFn
     this.agentHistorySource = agentHistorySource ?? (this.sdkBridge
       ? createAgentHistorySource({
-        loadSessionHistory: loadSessionHistoryFn ?? loadSessionHistory,
+        loadSessionHistory,
         getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getSession(sdkSessionId),
         getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findSessionByCliSessionId(timelineSessionId),
         logDivergence: (details) => {

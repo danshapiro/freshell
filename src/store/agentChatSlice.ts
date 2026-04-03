@@ -59,6 +59,7 @@ const agentChatSlice = createSlice({
       // Fresh creates have no history to load, but resumed creates stay in
       // restore mode until snapshot/timeline data establishes durable history.
       session.historyLoaded = !expectsHistoryHydration
+      session.awaitingDurableHistory = expectsHistoryHydration
       state.pendingCreates[requestId] = {
         sessionId,
         expectsHistoryHydration,
@@ -77,6 +78,9 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
+      if (action.payload.cliSessionId) {
+        session.awaitingDurableHistory = false
+      }
       if (session.status === 'creating' || session.status === 'starting') {
         session.status = 'connected'
       }
@@ -99,7 +103,13 @@ const agentChatSlice = createSlice({
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
       if (action.payload.latestTurnId === null) {
-        session.historyLoaded = true
+        const hasDurableHistoryIdentity = Boolean(session.timelineSessionId || session.cliSessionId)
+        if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
+          session.historyLoaded = true
+          session.awaitingDurableHistory = false
+        }
+      } else {
+        session.awaitingDurableHistory = false
       }
     },
 
@@ -257,6 +267,7 @@ const agentChatSlice = createSlice({
       session.nextTimelineCursor = action.payload.nextCursor
       session.timelineLoading = false
       session.timelineError = undefined
+      session.awaitingDurableHistory = false
       session.historyLoaded = true
     },
 
@@ -287,6 +298,7 @@ const agentChatSlice = createSlice({
      *  and trigger immediate recovery without waiting for the 5-second timeout. */
     markSessionLost(state, action: PayloadAction<{ sessionId: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      session.awaitingDurableHistory = false
       session.lost = true
       session.historyLoaded = true
     },

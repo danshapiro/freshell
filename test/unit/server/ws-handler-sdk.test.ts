@@ -284,7 +284,6 @@ describe('WS Handler SDK Integration', () => {
         undefined,
         undefined,
         undefined,
-        undefined,
         mockHistorySource,
       )
     })

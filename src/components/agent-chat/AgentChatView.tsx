@@ -98,6 +98,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     : undefined
   const timelineSessionId = session?.timelineSessionId ?? session?.cliSessionId ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const waitingForDurableHistoryIdentity = Boolean(
+    session?.awaitingDurableHistory
+      && session.latestTurnId === null
+      && !timelineSessionId,
+  )
   // Playwright can opt a pane into state-only mode so chrome activity tests
   // don't race the live SDK attach/create lifecycle.
   const suppressNetworkEffects = typeof window !== 'undefined'
@@ -344,6 +349,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (activePaneId && activePaneId !== paneId) return
     if (session?.latestTurnId === undefined) return
     if (session?.historyLoaded) return
+    if (waitingForDurableHistoryIdentity) return
 
     const promise = dispatch(loadAgentTimelineWindow({
       sessionId: paneContent.sessionId,
@@ -362,6 +368,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     restoreHistoryQueryId,
     session?.historyLoaded,
     session?.latestTurnId,
+    waitingForDurableHistoryIdentity,
     suppressNetworkEffects,
     tabId,
   ])
