@@ -772,7 +772,7 @@ async function main() {
     await portForwardManager.closeAll()
 
     // 8. Stop session indexer
-    codingCliIndexer.stop()
+    await codingCliIndexer.stop()
 
     // 8b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()

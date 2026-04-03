@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
+import chokidar from 'chokidar'
 import type { CodingCliProvider } from '../../../../server/coding-cli/provider'
 import { CodingCliSessionIndexer } from '../../../../server/coding-cli/session-indexer'
 import { configStore } from '../../../../server/config-store'
@@ -9,6 +10,33 @@ import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
 import { codexProvider } from '../../../../server/coding-cli/providers/codex'
+
+vi.mock('chokidar', async () => {
+  const { EventEmitter } = await import('events')
+
+  type MockWatcher = EventEmitter & {
+    close: ReturnType<typeof vi.fn<() => Promise<void>>>
+    on: ReturnType<typeof vi.fn>
+  }
+
+  const watch = vi.fn(() => {
+    const emitter = new EventEmitter()
+    const addListener = emitter.on.bind(emitter)
+    const watcher = emitter as MockWatcher
+    watcher.close = vi.fn(async () => {
+      emitter.removeAllListeners()
+    })
+    watcher.on = vi.fn((event: string, handler: (...args: any[]) => void) => {
+      addListener(event, handler)
+      return watcher
+    })
+    return watcher
+  })
+
+  return {
+    default: { watch },
+  }
+})
 
 vi.mock('../../../../server/config-store', () => ({
   configStore: {
@@ -25,6 +53,7 @@ type MakeProviderOptions = {
   displayName?: string
   homeDir?: string
   getSessionGlob?: CodingCliProvider['getSessionGlob']
+  getSessionWatchBases?: CodingCliProvider['getSessionWatchBases']
   listSessionsDirect?: CodingCliProvider['listSessionsDirect']
   listSessionFiles?: CodingCliProvider['listSessionFiles']
   parseSessionFile?: CodingCliProvider['parseSessionFile']
@@ -59,6 +88,7 @@ function makeProvider(files: string[], options: MakeProviderOptions = {}): Codin
     resolveProjectPath: options.resolveProjectPath ?? (async (_filePath, meta) => meta.cwd || 'unknown'),
     extractSessionId: options.extractSessionId ?? ((filePath) => path.basename(filePath, '.jsonl')),
     getSessionRoots: options.getSessionRoots ?? (() => [path.join(homeDir, 'sessions')]),
+    getSessionWatchBases: options.getSessionWatchBases,
     getCommand: () => 'claude',
     getStreamArgs: () => [],
     getResumeArgs: () => [],
@@ -309,6 +339,54 @@ describe('CodingCliSessionIndexer', () => {
     await indexer.refresh()
 
     expect(indexer.getProjects()).toHaveLength(0)
+  })
+
+  it('only starts watchers for enabled providers', async () => {
+    const codexHome = path.join(tempDir, '.codex')
+    const claudeHome = path.join(tempDir, '.claude')
+    await fsp.mkdir(codexHome, { recursive: true })
+    await fsp.mkdir(claudeHome, { recursive: true })
+    await fsp.mkdir(path.join(codexHome, 'sessions'), { recursive: true })
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const codexGetSessionGlob = vi.fn(() => path.join(codexHome, 'sessions', '**', '*.jsonl'))
+    const codexGetSessionRoots = vi.fn(() => [path.join(codexHome, 'sessions')])
+    const claudeGetSessionGlob = vi.fn(() => path.join(claudeHome, 'projects', '**', '*.jsonl'))
+    const claudeGetSessionRoots = vi.fn(() => [path.join(claudeHome, 'projects')])
+
+    const codexTestProvider = makeProvider([], {
+      name: 'codex',
+      homeDir: codexHome,
+      getSessionGlob: codexGetSessionGlob,
+      getSessionRoots: codexGetSessionRoots,
+    })
+    const claudeTestProvider = makeProvider([], {
+      name: 'claude',
+      homeDir: claudeHome,
+      getSessionGlob: claudeGetSessionGlob,
+      getSessionRoots: claudeGetSessionRoots,
+    })
+
+    const indexer = new CodingCliSessionIndexer([codexTestProvider, claudeTestProvider], { fullScanIntervalMs: 0 })
+    await indexer.start()
+
+    try {
+      expect(codexGetSessionGlob).toHaveBeenCalled()
+      expect(codexGetSessionRoots).toHaveBeenCalled()
+      expect(claudeGetSessionGlob).not.toHaveBeenCalled()
+      expect(claudeGetSessionRoots).not.toHaveBeenCalled()
+    } finally {
+      await indexer.stop()
+    }
   })
 
   it('skips sessions without cwd metadata', async () => {
@@ -1271,13 +1349,13 @@ describe('CodingCliSessionIndexer', () => {
         // No sessions initially
         expect(indexer.getProjects()).toHaveLength(0)
 
-        // Give chokidar a moment to initialize its root watcher
-        await new Promise((r) => setTimeout(r, 200))
-
         // Create the root directory and add a session file
         await fsp.mkdir(sessionsDir, { recursive: true })
         const sessionFile = path.join(sessionsDir, 'test-session.jsonl')
         await fsp.writeFile(sessionFile, JSON.stringify({ cwd: '/project/a', title: 'Late Session' }) + '\n')
+        ;((indexer as unknown as {
+          rootWatcher: { emit: (event: string, payload: unknown) => boolean } | null
+        }).rootWatcher)?.emit('addDir', sessionsDir)
 
         // Wait for the root watcher to detect the directory and trigger a refresh
         await vi.waitFor(
@@ -1289,7 +1367,7 @@ describe('CodingCliSessionIndexer', () => {
 
         expect(indexer.getProjects()[0].sessions[0].title).toBe('Late Session')
       } finally {
-        indexer.stop()
+        await indexer.stop()
       }
     })
 
@@ -1305,6 +1383,7 @@ describe('CodingCliSessionIndexer', () => {
         homeDir: opencodeDir,
         getSessionGlob: () => dbPath,
         getSessionRoots: () => [dbPath],
+        getSessionWatchBases: () => [dataHome],
         listSessionFiles: async () => [],
         listSessionsDirect: async () => {
           try {
@@ -1340,10 +1419,11 @@ describe('CodingCliSessionIndexer', () => {
       try {
         expect(indexer.getProjects()).toHaveLength(0)
 
-        await new Promise((r) => setTimeout(r, 200))
-
         await fsp.mkdir(opencodeDir, { recursive: true })
         await fsp.writeFile(dbPath, 'stub')
+        ;((indexer as unknown as {
+          rootWatcher: { emit: (event: string, payload: unknown) => boolean } | null
+        }).rootWatcher)?.emit('add', dbPath)
 
         await vi.waitFor(
           () => {
@@ -1363,13 +1443,12 @@ describe('CodingCliSessionIndexer', () => {
           { timeout: 5000, interval: 100 },
         )
       } finally {
-        indexer.stop()
+        await indexer.stop()
       }
     })
 
-    it('falls back to periodic full scans when the root watcher degrades', async () => {
+    it('does not broaden late-root watching beyond the declared watch base', async () => {
       const providerHome = path.join(tempDir, '.codex')
-      await fsp.mkdir(providerHome, { recursive: true })
       const sessionsDir = path.join(providerHome, 'sessions')
 
       const provider = makeProvider([], {
@@ -1377,6 +1456,7 @@ describe('CodingCliSessionIndexer', () => {
         displayName: 'Codex',
         homeDir: providerHome,
         getSessionRoots: () => [sessionsDir],
+        getSessionWatchBases: () => [providerHome],
         listSessionFiles: async () => {
           try {
             const entries = await fsp.readdir(sessionsDir)
@@ -1400,10 +1480,9 @@ describe('CodingCliSessionIndexer', () => {
       })
 
       const indexer = new CodingCliSessionIndexer([provider], {
-        debounceMs: 20,
+        debounceMs: 50,
         throttleMs: 0,
         fullScanIntervalMs: 0,
-        rootFallbackScanIntervalMs: 25,
       })
       await indexer.start()
 
@@ -1413,24 +1492,72 @@ describe('CodingCliSessionIndexer', () => {
         const rootWatcher = (indexer as unknown as {
           rootWatcher: { emit: (event: string, payload: unknown) => boolean } | null
         }).rootWatcher
-        expect(rootWatcher).not.toBeNull()
-        rootWatcher?.emit('error', new Error('EMFILE: too many open files'))
+        expect(rootWatcher).toBeNull()
 
+        await new Promise((r) => setTimeout(r, 200))
         await fsp.mkdir(sessionsDir, { recursive: true })
-        const sessionFile = path.join(sessionsDir, 'fallback-session.jsonl')
-        await fsp.writeFile(sessionFile, JSON.stringify({ cwd: '/project/a', title: 'Fallback Session' }) + '\n')
+        const sessionFile = path.join(sessionsDir, 'late-session.jsonl')
+        await fsp.writeFile(sessionFile, JSON.stringify({ cwd: '/project/a', title: 'Late Session' }) + '\n')
 
-        await vi.waitFor(
-          () => {
-            expect(indexer.getProjects()).toHaveLength(1)
-          },
-          { timeout: 1000, interval: 50 },
-        )
-
-        expect(indexer.getProjects()[0].sessions[0].title).toBe('Fallback Session')
+        await new Promise((r) => setTimeout(r, 300))
+        expect(indexer.getProjects()).toHaveLength(0)
       } finally {
-        indexer.stop()
+        await indexer.stop()
       }
+    })
+
+    it('stop() waits for watcher shutdown', async () => {
+      const providerHome = path.join(tempDir, '.codex')
+      const sessionsDir = path.join(providerHome, 'sessions')
+      await fsp.mkdir(providerHome, { recursive: true })
+
+      const provider = makeProvider([], {
+        name: 'codex',
+        homeDir: providerHome,
+        getSessionRoots: () => [sessionsDir],
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {},
+        settings: {
+          codingCli: {
+            enabledProviders: ['codex'],
+            providers: {},
+          },
+        },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], { debounceMs: 50, throttleMs: 0 })
+      await indexer.start()
+
+      const internals = indexer as unknown as {
+        watcher: { close: () => Promise<void> } | null
+        rootWatcher: { close: () => Promise<void> } | null
+      }
+
+      expect(internals.watcher).not.toBeNull()
+      expect(internals.rootWatcher).not.toBeNull()
+
+      const watcherClose = createDeferred<void>()
+      const rootWatcherClose = createDeferred<void>()
+      vi.spyOn(internals.watcher!, 'close').mockReturnValue(watcherClose.promise)
+      vi.spyOn(internals.rootWatcher!, 'close').mockReturnValue(rootWatcherClose.promise)
+
+      let resolved = false
+      const stopPromise = indexer.stop().then(() => {
+        resolved = true
+      })
+
+      await Promise.resolve()
+      expect(resolved).toBe(false)
+
+      watcherClose.resolve()
+      await Promise.resolve()
+      expect(resolved).toBe(false)
+
+      rootWatcherClose.resolve()
+      await stopPromise
+      expect(resolved).toBe(true)
     })
 
     it('stop() cleans up root watcher', async () => {
@@ -1459,11 +1586,15 @@ describe('CodingCliSessionIndexer', () => {
       await indexer.start()
 
       // stop() should not throw and should clean up watchers
-      indexer.stop()
+      const rootWatcher = (indexer as unknown as {
+        rootWatcher: { emit: (event: string, payload: unknown) => boolean } | null
+      }).rootWatcher
+      await indexer.stop()
 
       // Creating the directory after stop should NOT trigger refresh
       await fsp.mkdir(sessionsDir, { recursive: true })
-      await new Promise((r) => setTimeout(r, 200))
+      rootWatcher?.emit('addDir', sessionsDir)
+      await new Promise((r) => setTimeout(r, 50))
       expect(indexer.getProjects()).toHaveLength(0)
     })
   })
@@ -1496,7 +1627,7 @@ describe('CodingCliSessionIndexer', () => {
         // Should have triggered at least one additional full scan
         expect(listSessionFiles.mock.calls.length).toBeGreaterThan(callsAfterStart)
 
-        indexer.stop()
+        await indexer.stop()
       } finally {
         vi.useRealTimers()
       }
@@ -1523,7 +1654,7 @@ describe('CodingCliSessionIndexer', () => {
         await indexer.start()
         const callsAfterStart = listSessionFiles.mock.calls.length
 
-        indexer.stop()
+        await indexer.stop()
 
         // Advance past the interval - should NOT trigger since stopped
         await vi.advanceTimersByTimeAsync(10000)
@@ -1539,7 +1670,7 @@ describe('CodingCliSessionIndexer', () => {
       const indexer = new CodingCliSessionIndexer([provider])
       // The default is an internal detail, but we can verify via the class
       expect((indexer as any).fullScanIntervalMs).toBe(10 * 60 * 1000)
-      indexer.stop()
+      await indexer.stop()
     })
   })
 
@@ -1578,7 +1709,7 @@ describe('CodingCliSessionIndexer', () => {
         await vi.advanceTimersByTimeAsync(1)
         expect(refreshSpy).toHaveBeenCalledTimes(1)
 
-        indexer.stop()
+        await indexer.stop()
       } finally {
         vi.useRealTimers()
       }
@@ -1612,7 +1743,7 @@ describe('CodingCliSessionIndexer', () => {
         await vi.advanceTimersByTimeAsync(1)
         expect(refreshSpy).toHaveBeenCalledTimes(1)
 
-        indexer.stop()
+        await indexer.stop()
       } finally {
         vi.useRealTimers()
       }
@@ -1647,7 +1778,7 @@ describe('CodingCliSessionIndexer', () => {
         await vi.advanceTimersByTimeAsync(1)
         expect(refreshSpy).toHaveBeenCalledTimes(1)
 
-        indexer.stop()
+        await indexer.stop()
       } finally {
         vi.useRealTimers()
       }

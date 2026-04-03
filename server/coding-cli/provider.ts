@@ -20,6 +20,7 @@ export interface CodingCliProvider {
   listSessionsDirect?(): Promise<CodingCliSession[]>
   getSessionGlob(): string
   getSessionRoots(): string[]
+  getSessionWatchBases?(): string[]
   listSessionFiles(): Promise<string[]>
   parseSessionFile(content: string, filePath: string): Promise<ParsedSessionMeta>
   resolveProjectPath(filePath: string, meta: ParsedSessionMeta): Promise<string>
