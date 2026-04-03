@@ -13,6 +13,11 @@ import {
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+import {
+  OPEN_CODE_STARTUP_EXPECTED_CLEANED,
+  OPEN_CODE_STARTUP_EXPECTED_REPLIES,
+  OPEN_CODE_STARTUP_PROBE_FRAME,
+} from '@test/helpers/opencode-startup-probes'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -29,6 +34,12 @@ const clipboardMocks = vi.hoisted(() => ({
 const apiMocks = vi.hoisted(() => ({
   patch: vi.fn().mockResolvedValue({}),
 }))
+
+const terminalTheme = {
+  foreground: '#aabbcc',
+  background: '#112233',
+  cursor: '#ddeeff',
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -51,7 +62,7 @@ vi.mock('@/lib/api', () => ({
 }))
 
 vi.mock('@/lib/terminal-themes', () => ({
-  getTerminalTheme: () => ({}),
+  getTerminalTheme: () => terminalTheme,
 }))
 
 vi.mock('@/components/terminal/terminal-runtime', () => ({
@@ -73,6 +84,7 @@ vi.mock('lucide-react', () => ({
 
 const terminalInstances: any[] = []
 const latestAttachRequestIdByTerminal = new Map<string, string>()
+const ioEvents: Array<{ kind: 'send' | 'write', type?: string, data: string }> = []
 
 function withCurrentAttachRequestId(msg: any) {
   if (
@@ -93,7 +105,9 @@ vi.mock('@xterm/xterm', () => {
     rows = 24
     open = vi.fn()
     loadAddon = vi.fn()
-    write = vi.fn()
+    write = vi.fn((data: string) => {
+      ioEvents.push({ kind: 'write', data: String(data) })
+    })
     writeln = vi.fn()
     clear = vi.fn()
     dispose = vi.fn()
@@ -198,8 +212,12 @@ describe('TerminalView OSC52 policy handling', () => {
   beforeEach(() => {
     terminalInstances.length = 0
     latestAttachRequestIdByTerminal.clear()
+    ioEvents.length = 0
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
+      if (msg?.type === 'terminal.input' && typeof msg?.data === 'string') {
+        ioEvents.push({ kind: 'send', type: msg.type, data: msg.data })
+      }
       if (
         msg?.type === 'terminal.attach'
         && typeof msg?.terminalId === 'string'
@@ -247,6 +265,43 @@ describe('TerminalView OSC52 policy handling', () => {
     })
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
+  })
+
+  it('strips startup probes, sends replies before writing visible output, and preserves OSC52 handling', async () => {
+    const { terminalId } = await renderView('always')
+    wsMocks.send.mockClear()
+    ioEvents.length = 0
+
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}${OSC52_COPY}`,
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0].write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, undefined)
+    })
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
+    expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
+
+    const inputMessages = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.input')
+    expect(inputMessages).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+
+    expect(ioEvents).toEqual([
+      ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
+      { kind: 'write' as const, data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+    ])
   })
 
   it('never policy does not copy and does not prompt', async () => {
