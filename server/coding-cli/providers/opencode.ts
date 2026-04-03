@@ -106,6 +106,10 @@ export class OpencodeProvider implements CodingCliProvider {
     return [this.getDatabasePath()]
   }
 
+  getSessionWatchBases(): string[] {
+    return [path.dirname(this.homeDir)]
+  }
+
   async listSessionFiles(): Promise<string[]> {
     return []
   }

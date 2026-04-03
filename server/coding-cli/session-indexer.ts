@@ -87,19 +87,30 @@ export async function scanFileForUserTextMessages(filePath: string): Promise<boo
   return false
 }
 
-function findNearestExistingAncestor(targetPath: string): string {
-  let current = normalizeFilePath(targetPath)
-  let parent = path.dirname(current)
-  while (current !== parent) {
+function isPathWithin(basePath: string, targetPath: string): boolean {
+  const relative = path.relative(basePath, targetPath)
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+function findNearestExistingAncestorWithin(targetPath: string, floorPath: string): string | null {
+  const normalizedTarget = normalizeFilePath(targetPath)
+  const normalizedFloor = normalizeFilePath(floorPath)
+  if (!isPathWithin(normalizedFloor, normalizedTarget)) return null
+
+  let current = normalizedTarget
+  while (true) {
     try {
       if (fs.existsSync(current)) return current
     } catch {
       // Ignore filesystem errors while walking upward.
     }
+
+    if (current === normalizedFloor) return null
+
+    const parent = path.dirname(current)
+    if (parent === current) return null
     current = parent
-    parent = path.dirname(current)
   }
-  return current
 }
 
 /**
@@ -321,6 +332,8 @@ export class CodingCliSessionIndexer {
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
   private dirtyProviders = new Set<CodingCliProviderName>()
+  private enabledProviderNames = new Set<CodingCliProviderName>()
+  private watchedProviderKey = ''
 
   constructor(
     private providers: CodingCliProvider[],
@@ -337,7 +350,19 @@ export class CodingCliSessionIndexer {
     this.needsFullScan = true
     await this.refresh()
     this.initialized = true
-    const globs = this.providers.map((p) => p.getSessionGlob())
+    await this.reconfigureWatchers()
+
+    // Periodic safety full-scan to catch anything the file watchers might miss.
+    if (this.fullScanIntervalMs > 0) {
+      this.fullScanTimer = setInterval(() => {
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }, this.fullScanIntervalMs)
+    }
+  }
+
+  private startSessionWatcher(providers: CodingCliProvider[]) {
+    const globs = providers.map((p) => p.getSessionGlob())
     logger.info({ globs, debounceMs: this.debounceMs, throttleMs: this.throttleMs }, 'Starting coding CLI sessions watcher')
 
     this.watcher = chokidar.watch(globs, {
@@ -363,56 +388,114 @@ export class CodingCliSessionIndexer {
     // When a provider root (e.g. ~/.codex/sessions) doesn't exist at startup, chokidar's
     // glob watcher silently ignores it. This root watcher detects when the directory
     // appears and triggers a full rescan.
-    this.startRootWatcher()
-
-    // Periodic safety full-scan to catch anything the file watchers might miss.
-    if (this.fullScanIntervalMs > 0) {
-      this.fullScanTimer = setInterval(() => {
-        this.needsFullScan = true
-        this.scheduleRefresh()
-      }, this.fullScanIntervalMs)
-    }
   }
 
-  stop() {
-    this.watcher?.close().catch(() => {})
+  async stop() {
+    const watcher = this.watcher
+    const rootWatcher = this.rootWatcher
     this.watcher = null
-    this.rootWatcher?.close().catch(() => {})
     this.rootWatcher = null
+    this.watchedProviderKey = ''
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
     if (this.fullScanTimer) clearInterval(this.fullScanTimer)
     this.fullScanTimer = null
+
+    await Promise.all([
+      watcher?.close().catch(() => {}),
+      rootWatcher?.close().catch(() => {}),
+    ])
   }
 
-  private startRootWatcher() {
-    const rootSet = new Set<string>()
-    for (const provider of this.providers) {
+  private providerHasExistingSessionRoot(provider: CodingCliProvider): boolean {
+    return provider.getSessionRoots().some((root) => {
+      try {
+        return fs.existsSync(root)
+      } catch {
+        return false
+      }
+    })
+  }
+
+  private async reconfigureWatchers() {
+    const providers = this.providers.filter((provider) => this.enabledProviderNames.has(provider.name))
+    const watcherKey = providers
+      .map((provider) => `${provider.name}:${this.providerHasExistingSessionRoot(provider) ? 1 : 0}`)
+      .sort()
+      .join(',')
+    if (watcherKey === this.watchedProviderKey) return
+
+    const watcher = this.watcher
+    const rootWatcher = this.rootWatcher
+    this.watcher = null
+    this.rootWatcher = null
+    this.watchedProviderKey = watcherKey
+
+    await Promise.all([
+      watcher?.close().catch(() => {}),
+      rootWatcher?.close().catch(() => {}),
+    ])
+
+    if (providers.length === 0) return
+
+    this.startSessionWatcher(providers.filter((provider) => this.providerHasExistingSessionRoot(provider)))
+    this.startRootWatcher(providers)
+  }
+
+  private startRootWatcher(providers: CodingCliProvider[]) {
+    const rootConfigs: Array<{
+      provider: CodingCliProviderName
+      root: string
+      watchBases: string[]
+    }> = []
+    for (const provider of providers) {
+      const watchBases = (provider.getSessionWatchBases?.() ?? [provider.homeDir]).map(normalizeFilePath)
       for (const root of provider.getSessionRoots()) {
-        rootSet.add(normalizeFilePath(root))
+        rootConfigs.push({
+          provider: provider.name,
+          root: normalizeFilePath(root),
+          watchBases,
+        })
       }
     }
 
-    if (rootSet.size === 0) return
+    if (rootConfigs.length === 0) return
 
-    // Watch the nearest existing ancestor of each root so we still detect late
-    // root creation when one or more intermediate directories do not exist yet.
     const watchRoots = new Set<string>()
     let maxDepth = 0
-    for (const root of rootSet) {
-      const ancestor = findNearestExistingAncestor(root)
+    for (const { provider, root, watchBases } of rootConfigs) {
+      const matchingBases = watchBases
+        .filter((base) => isPathWithin(base, root))
+        .sort((a, b) => b.length - a.length)
+
+      let ancestor: string | null = null
+      for (const base of matchingBases) {
+        ancestor = findNearestExistingAncestorWithin(root, base)
+        if (ancestor) break
+      }
+
+      if (!ancestor) {
+        logger.warn(
+          { provider, root, watchBases },
+          'Skipping late-root watcher because no safe existing ancestor is available',
+        )
+        continue
+      }
+
       watchRoots.add(ancestor)
       const relative = path.relative(ancestor, root)
       const depth = relative ? relative.split(path.sep).filter(Boolean).length : 0
       maxDepth = Math.max(maxDepth, depth)
     }
 
+    if (watchRoots.size === 0) return
+
     this.rootWatcher = chokidar.watch(Array.from(watchRoots), {
       ignoreInitial: true,
       depth: Math.max(0, maxDepth),
     })
 
-    const roots = Array.from(rootSet)
+    const roots = rootConfigs.map(({ root }) => root)
     const affectsWatchedRoot = (entryPath: string) => {
       const normalized = normalizeFilePath(entryPath)
       return roots.some((root) => {
@@ -425,6 +508,9 @@ export class CodingCliSessionIndexer {
     this.rootWatcher.on('addDir', (dirPath) => {
       if (affectsWatchedRoot(dirPath)) {
         logger.info({ dirPath }, 'Provider session root created, scheduling full scan')
+        void this.reconfigureWatchers().catch((err) =>
+          logger.warn({ err }, 'Failed to reconfigure coding CLI watchers after root creation')
+        )
         this.needsFullScan = true
         this.scheduleRefresh()
       }
@@ -433,6 +519,9 @@ export class CodingCliSessionIndexer {
     this.rootWatcher.on('unlinkDir', (dirPath) => {
       if (affectsWatchedRoot(dirPath)) {
         logger.info({ dirPath }, 'Provider session root removed, scheduling full scan')
+        void this.reconfigureWatchers().catch((err) =>
+          logger.warn({ err }, 'Failed to reconfigure coding CLI watchers after root removal')
+        )
         this.needsFullScan = true
         this.scheduleRefresh()
       }
@@ -441,6 +530,9 @@ export class CodingCliSessionIndexer {
     this.rootWatcher.on('add', (filePath) => {
       if (affectsWatchedRoot(filePath)) {
         logger.info({ filePath }, 'Provider session root file created, scheduling full scan')
+        void this.reconfigureWatchers().catch((err) =>
+          logger.warn({ err }, 'Failed to reconfigure coding CLI watchers after root file creation')
+        )
         this.needsFullScan = true
         this.scheduleRefresh()
       }
@@ -449,6 +541,9 @@ export class CodingCliSessionIndexer {
     this.rootWatcher.on('unlink', (filePath) => {
       if (affectsWatchedRoot(filePath)) {
         logger.info({ filePath }, 'Provider session root file removed, scheduling full scan')
+        void this.reconfigureWatchers().catch((err) =>
+          logger.warn({ err }, 'Failed to reconfigure coding CLI watchers after root file removal')
+        )
         this.needsFullScan = true
         this.scheduleRefresh()
       }
@@ -1056,10 +1151,14 @@ export class CodingCliSessionIndexer {
     ])
     const enabledProviders = cfg.settings?.codingCli?.enabledProviders
     const enabledSet = new Set(enabledProviders ?? this.providers.map((p) => p.name))
+    this.enabledProviderNames = enabledSet
     const enabledKey = Array.from(enabledSet).sort().join(',')
     if (enabledKey !== this.lastEnabledKey) {
       this.lastEnabledKey = enabledKey
       this.needsFullScan = true
+      if (this.initialized) {
+        await this.reconfigureWatchers()
+      }
     }
 
     let fileCount = 0

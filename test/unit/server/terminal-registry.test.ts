@@ -2481,6 +2481,30 @@ describe('TerminalRegistry', () => {
       )
     })
 
+    it('wraps restore launch ENOENT errors with a user-friendly provider message', async () => {
+      const pty = await import('node-pty')
+      vi.mocked(pty.spawn).mockImplementationOnce(() => {
+        const err = new Error('spawn opencode ENOENT') as Error & { code?: string }
+        err.code = 'ENOENT'
+        throw err
+      })
+
+      let thrown: unknown
+      try {
+        registry.create({
+          mode: 'opencode',
+          cwd: '/home/user/project',
+          resumeSessionId: 'session-opencode',
+        })
+      } catch (err) {
+        thrown = err
+      }
+
+      expect(thrown).toBeInstanceOf(Error)
+      expect((thrown as Error).message).toContain('Could not restore OpenCode')
+      expect((thrown as Error).message).toContain('OPENCODE_CMD')
+    })
+
     it('terminal record stores mcpCwd from normalized buildSpawnSpec cwd', () => {
       // The terminal record should store the normalized cwd (from buildSpawnSpec)
       // separately from the raw cwd, so cleanup uses the same path as injection.

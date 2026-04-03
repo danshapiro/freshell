@@ -529,6 +529,10 @@ export const claudeProvider: CodingCliProvider = {
     return [path.join(this.homeDir, 'projects')]
   },
 
+  getSessionWatchBases() {
+    return [this.homeDir]
+  },
+
   async listSessionFiles() {
     const projectsDir = path.join(this.homeDir, 'projects')
     let projectDirs: string[] = []

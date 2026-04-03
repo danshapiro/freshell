@@ -137,6 +137,13 @@ type DeferredAttachState = {
   pendingSinceSeq: number
 }
 
+type LaunchAttemptState = {
+  requestId: string
+  terminalId?: string
+  restore: boolean
+  attachReady: boolean
+}
+
 type SentViewport = {
   terminalId: string
   cols: number
@@ -314,6 +321,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     cols: number
     rows: number
   } | null>(null)
+  const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
     terminalId: string
     cols: number
@@ -1627,6 +1635,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
       const resumeId = getResumeSessionIdFromRef(contentRef)
+      launchAttemptRef.current = {
+        requestId,
+        restore,
+        attachReady: false,
+      }
       if (handledCreatedMessageRef.current?.requestId === requestId) {
         handledCreatedMessageRef.current = null
       }
@@ -1671,6 +1684,33 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     async function ensure() {
       clearRateLimitRetry()
       // Connection is owned by App.tsx; messages will queue until ready
+
+      const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
+        clearRateLimitRetry()
+        setIsAttaching(false)
+        currentAttachRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+        }
+        dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+        if (terminalId) {
+          clearTerminalCursor(terminalId)
+          forgetSentViewport(terminalId)
+        }
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        launchAttemptRef.current = null
+        applySeqState(createAttachSeqState())
+        updateContent({ terminalId: undefined, status: 'error' })
+        const currentTab = tabRef.current
+        if (currentTab) {
+          dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
+        }
+        const prefix = restore ? '[Restore failed]' : '[Launch failed]'
+        term.writeln(`\r\n${prefix} ${message}\r\n`)
+      }
 
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current
@@ -1801,6 +1841,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
+          if (launchAttemptRef.current?.terminalId === tid) {
+            launchAttemptRef.current = {
+              ...launchAttemptRef.current,
+              attachReady: true,
+            }
+          }
+
           const nextSeqState = onAttachReady(seqStateRef.current, {
             headSeq: msg.headSeq,
             replayFromSeq: msg.replayFromSeq,
@@ -1834,6 +1881,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           handledCreatedMessageRef.current = {
             requestId: reqId,
             terminalId: newId,
+          }
+          const pendingLaunch = launchAttemptRef.current
+          launchAttemptRef.current = {
+            requestId: reqId,
+            terminalId: newId,
+            restore: pendingLaunch?.requestId === reqId ? pendingLaunch.restore : false,
+            attachReady: false,
           }
           currentAttachRef.current = null
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
@@ -1869,6 +1923,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          const launchAttempt = launchAttemptRef.current
+          const exitedDuringLaunch = launchAttempt?.terminalId === tid && !launchAttempt.attachReady
+          if (exitedDuringLaunch) {
+            const exitSuffix = typeof msg.exitCode === 'number' ? ` (exit ${msg.exitCode})` : ''
+            const message = launchAttempt.restore
+              ? `The restored terminal exited before it finished starting${exitSuffix}. Fix the underlying CLI or working directory, then refresh to retry.`
+              : `The terminal exited before it finished starting${exitSuffix}. Fix the underlying CLI or working directory, then retry.`
+            failLaunch(message, launchAttempt.restore, tid)
+            return
+          }
+
+          launchAttemptRef.current = null
           currentAttachRef.current = null
           deferredAttachStateRef.current = {
             mode: 'none',
@@ -1946,16 +2012,28 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               return
             }
           }
+          const launchAttempt = launchAttemptRef.current?.requestId === reqId
+            ? launchAttemptRef.current
+            : null
+          launchAttemptRef.current = null
           clearRateLimitRetry()
           setIsAttaching(false)
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           updateContent({ status: 'error' })
-          term.writeln(`\r\n[Error] ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          const currentTab = tabRef.current
+          if (currentTab) {
+            dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
+          }
+          const prefix = launchAttempt
+            ? (launchAttempt.restore ? '[Restore failed]' : '[Launch failed]')
+            : '[Error]'
+          term.writeln(`\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
+          const launchAttempt = launchAttemptRef.current
           if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
@@ -1969,6 +2047,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             if (current?.status === 'exited') {
               term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
             }
+            return
+          }
+          const failedDuringLaunch = Boolean(
+            launchAttempt
+            && currentTerminalId
+            && launchAttempt.terminalId === currentTerminalId
+            && launchAttempt.terminalId === msg.terminalId
+            && !launchAttempt.attachReady
+          )
+          if (failedDuringLaunch) {
+            failLaunch(msg.message || 'The terminal failed before it finished starting.', launchAttempt!.restore, currentTerminalId)
             return
           }
           // Only auto-reconnect if terminal hasn't already exited.

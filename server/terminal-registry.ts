@@ -268,6 +268,44 @@ function getModeLabel(mode: TerminalMode): string {
   return label || mode.charAt(0).toUpperCase() + mode.slice(1)
 }
 
+function getModeCommandOverrideEnvVar(mode: TerminalMode): string | undefined {
+  if (mode === 'shell') return undefined
+  return codingCliCommands.get(mode)?.envVar
+}
+
+function wrapTerminalSpawnError(
+  err: unknown,
+  opts: {
+    mode: TerminalMode
+    file: string
+    resumeSessionId?: string
+  },
+): Error {
+  const base = err instanceof Error ? err : new Error(String(err))
+  const baseWithCode = base as Error & { code?: string; cause?: unknown }
+  const label = getModeLabel(opts.mode)
+  const action = opts.resumeSessionId ? `Could not restore ${label}` : `Could not start ${label}`
+  const envVar = getModeCommandOverrideEnvVar(opts.mode)
+
+  let message = base.message || 'Failed to spawn terminal'
+  if (baseWithCode.code === 'ENOENT') {
+    const common =
+      `"${opts.file}" could not be started because the executable or working directory was not found on the server.`
+    if (envVar) {
+      message = `${action}: ${common} Reinstall it or set ${envVar} to the correct executable.`
+    } else {
+      message = `${action}: ${common} Check that the executable exists and the working directory is valid.`
+    }
+  } else if (message && !message.startsWith(`${action}:`)) {
+    message = `${action}: ${message}`
+  }
+
+  const wrapped = new Error(message) as Error & { code?: string; cause?: unknown }
+  wrapped.code = baseWithCode.code
+  wrapped.cause = base
+  return wrapped
+}
+
 type PendingSnapshotQueue = {
   chunks: string[]
   queuedChars: number
@@ -1084,7 +1122,11 @@ export class TerminalRegistry extends EventEmitter {
       // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
       // (which may be undefined for WSL cmd/powershell paths).
       cleanupMcpConfig(terminalId, opts.mode, mcpCwd)
-      throw err
+      throw wrapTerminalSpawnError(err, {
+        mode: opts.mode,
+        file,
+        resumeSessionId: resumeForSpawn,
+      })
     }
     endSpawnTimer({ cwd: procCwd })
 

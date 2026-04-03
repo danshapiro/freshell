@@ -652,6 +652,34 @@ describe('WebSocket edge cases', () => {
 
       close()
     })
+
+    it('explains when a terminal already exited before attach completes', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      const terminalId = await createTerminal(ws, 'attach-startup-failure')
+      const record = registry.get(terminalId)
+      expect(record).toBeTruthy()
+      record.buffer.append('\u001b[31mexecvp(3) failed.: No such file or directory\u001b[0m\n')
+      registry.simulateExit(terminalId, 1)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+      }))
+
+      const error = await waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID' && m.terminalId === terminalId,
+      )
+
+      expect(error.message).toContain('is no longer running')
+      expect(error.message).toContain('execvp(3) failed.: No such file or directory')
+
+      close()
+    })
   })
 
   describe('Partial message handling', () => {

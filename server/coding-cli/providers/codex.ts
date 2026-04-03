@@ -462,6 +462,10 @@ export const codexProvider: CodingCliProvider = {
     return [path.join(this.homeDir, 'sessions')]
   },
 
+  getSessionWatchBases() {
+    return [this.homeDir]
+  },
+
   async listSessionFiles() {
     const sessionsDir = path.join(this.homeDir, 'sessions')
     return walkJsonlFiles(sessionsDir)
