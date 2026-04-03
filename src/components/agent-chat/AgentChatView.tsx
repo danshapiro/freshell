@@ -204,10 +204,10 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       }))
     }
 
-    const metadataProvider = providerConfig?.codingCliProvider
-      ?? currentTab?.codingCliProvider
-      ?? (currentTab?.mode !== 'shell' ? currentTab.mode : undefined)
     if (!currentTab) return
+    const metadataProvider = providerConfig?.codingCliProvider
+      ?? currentTab.codingCliProvider
+      ?? (currentTab.mode !== 'shell' ? currentTab.mode : undefined)
 
     const updates: Partial<Tab> = {}
     if (currentTab.resumeSessionId !== durableResumeSessionId) {
