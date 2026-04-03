@@ -213,6 +213,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (currentTab.resumeSessionId !== durableResumeSessionId) {
       updates.resumeSessionId = durableResumeSessionId
     }
+    if (metadataProvider && currentTab.codingCliProvider !== metadataProvider) {
+      updates.codingCliProvider = metadataProvider
+    }
 
     if (metadataProvider) {
       const existing = currentTab.sessionMetadataByKey ?? {}

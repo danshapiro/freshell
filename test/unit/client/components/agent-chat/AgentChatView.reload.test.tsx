@@ -558,6 +558,55 @@ describe('AgentChatView reload/restore behavior', () => {
     }))
   })
 
+  it('persists codingCliProvider into shell-tab fallback metadata when timelineSessionId becomes durable', () => {
+    const store = makeStoreWithTabs()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-shell',
+      sessionId: 'sdk-shell-1',
+      status: 'starting',
+    } satisfies AgentChatPaneContent
+    store.dispatch(addTab({
+      id: 't-shell',
+      title: 'Shell Host Tab',
+      mode: 'shell',
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        'claude:named-resume': {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Continue from shell fallback',
+        },
+      },
+    }))
+    store.dispatch(initLayout({ tabId: 't-shell', paneId: 'p1', content: pane }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t-shell" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-shell-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: 'cli-shell-abc-123',
+        revision: 2,
+      }))
+    })
+
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.resumeSessionId).toBe('cli-shell-abc-123')
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-shell')
+    expect(tab?.resumeSessionId).toBe('cli-shell-abc-123')
+    expect(tab?.codingCliProvider).toBe('claude')
+    expect(tab?.sessionMetadataByKey?.['claude:cli-shell-abc-123']).toEqual(expect.objectContaining({
+      sessionType: 'freshclaude',
+      firstUserMessage: 'Continue from shell fallback',
+    }))
+  })
+
   it('shows a restored partial assistant stream after reconnect', () => {
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
@@ -576,6 +625,38 @@ describe('AgentChatView reload/restore behavior', () => {
     )
 
     expect(screen.getByText('partial reply')).toBeInTheDocument()
+  })
+
+  it('keeps restored partial assistant stream visible when sdk.session.init arrives after a running snapshot', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-running', sessionId: 'sdk-sess-running' }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-running',
+      latestTurnId: 'turn-2',
+      status: 'running',
+      timelineSessionId: 'cli-sess-running',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={{ ...RELOAD_PANE, sessionId: 'sdk-sess-running' }} />
+      </Provider>,
+    )
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
+
+    act(() => {
+      store.dispatch(sessionInit({
+        sessionId: 'sdk-sess-running',
+        cliSessionId: 'cli-sess-running',
+        model: 'claude-opus-4-6',
+      }))
+    })
+
+    expect(screen.getByText('partial reply')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Claude is thinking')).not.toBeInTheDocument()
   })
 
   it('keeps restored partial assistant output visible after content_block_stop before the final assistant message arrives', () => {

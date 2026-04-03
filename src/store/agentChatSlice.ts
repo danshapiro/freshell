@@ -77,7 +77,9 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      session.status = 'connected'
+      if (session.status === 'creating' || session.status === 'starting') {
+        session.status = 'connected'
+      }
     },
 
     sessionSnapshotReceived(state, action: PayloadAction<{

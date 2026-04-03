@@ -251,6 +251,33 @@ describe('agentChatSlice', () => {
     })
   })
 
+  it('does not let sessionInit downgrade a running snapshot back to connected', () => {
+    let state = agentChatReducer(initial, sessionCreated({
+      requestId: 'req-running',
+      sessionId: 'sdk-running',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-running',
+      latestTurnId: 'turn-4',
+      status: 'running',
+      timelineSessionId: 'cli-running',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+    state = agentChatReducer(state, sessionInit({
+      sessionId: 'sdk-running',
+      cliSessionId: 'cli-running',
+      model: 'claude-opus-4-6',
+    }))
+
+    expect(state.sessions['sdk-running']).toMatchObject({
+      status: 'running',
+      cliSessionId: 'cli-running',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    })
+  })
+
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',

@@ -823,7 +823,9 @@ describe('WS Handler SDK Integration', () => {
           sessionId: durableSessionId,
           status: 'running',
         })
-        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(liveSession.sessionId, expect.any(Function))
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(liveSession.sessionId, expect.any(Function))
+        })
 
         const forwardedUpdate = new Promise<any>((resolve) => {
           const onMessage = (data: WebSocket.RawData) => {

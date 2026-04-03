@@ -25,6 +25,7 @@ vi.mock('@/components/SessionView', () => ({
 interface TabConfig {
   id: string
   mode: string
+  codingCliProvider?: string
   codingCliSessionId?: string
   resumeSessionId?: string
   sessionMetadataByKey?: Record<string, unknown>
@@ -55,6 +56,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           mode: t.mode as any,
           status: 'running' as const,
           title: 'Test',
+          codingCliProvider: t.codingCliProvider as any,
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
           sessionMetadataByKey: t.sessionMetadataByKey,
@@ -166,6 +168,39 @@ describe('TabContent', () => {
             kind: 'agent-chat',
             provider: 'freshclaude',
             resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+          }),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it('restores agent-chat default content for shell-mode no-layout tabs using persisted codingCliProvider metadata', () => {
+      const store = createStore([
+        {
+          id: 'tab-1',
+          mode: 'shell',
+          codingCliProvider: 'claude',
+          resumeSessionId: '550e8400-e29b-41d4-a716-446655440001',
+          sessionMetadataByKey: {
+            'claude:550e8400-e29b-41d4-a716-446655440001': {
+              sessionType: 'freshclaude',
+            },
+          },
+        },
+      ])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: '550e8400-e29b-41d4-a716-446655440001',
           }),
         }),
         expect.anything(),
