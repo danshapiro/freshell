@@ -87,6 +87,8 @@ export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
+const STARTUP_PROBE_OSC11_PREFIX = '\u001b]11;?'
+const STARTUP_PROBE_OSC11_TERMINATOR = '\u0007'
 
 function isClaudeTurnSubmit(data: string): boolean {
   return data.includes('\r') || data.includes('\n')
@@ -275,6 +277,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
+  const startupProbeReplayDiscardPrefixRef = useRef<string | null>(null)
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
@@ -855,7 +858,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
 
-  const resetStartupProbeParser = useCallback(() => {
+  const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
+    if (opts?.discardReplayRemainder) {
+      startupProbeReplayDiscardPrefixRef.current =
+        startupProbeStateRef.current.pending === STARTUP_PROBE_OSC11_PREFIX
+          ? STARTUP_PROBE_OSC11_TERMINATOR
+          : null
+    } else {
+      startupProbeReplayDiscardPrefixRef.current = null
+    }
     startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
 
@@ -1793,13 +1804,25 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
           }
-          const raw = msg.data || ''
+          let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           const frameOverlapsReplay = Boolean(
             previousSeqState.pendingReplay
             && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
             && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
           )
+          const enteringFreshLiveOutput = !frameOverlapsReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          if (enteringFreshLiveOutput) {
+            resetStartupProbeParser({ discardReplayRemainder: true })
+          }
+          if (startupProbeReplayDiscardPrefixRef.current) {
+            const prefix = startupProbeReplayDiscardPrefixRef.current
+            startupProbeReplayDiscardPrefixRef.current = null
+            if (raw.startsWith(prefix)) {
+              raw = raw.slice(prefix.length)
+            }
+          }
           handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0
@@ -1819,7 +1842,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnFrame) {
-            resetStartupProbeParser()
+            if (frameOverlapsReplay) {
+              resetStartupProbeParser({ discardReplayRemainder: true })
+            }
             setIsAttaching(false)
             markAttachComplete()
           }

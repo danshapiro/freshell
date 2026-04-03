@@ -10,7 +10,6 @@ import {
   OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
   OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES,
-  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const COLORS = {
@@ -39,6 +38,7 @@ describe('terminal-startup-probes', () => {
   it('buffers the shared split startup-probe fixture across frames', () => {
     const state = createTerminalStartupProbeState()
     const [firstFrame, secondFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES
+    const [firstPostReplyFrame = ''] = OPEN_CODE_STARTUP_POST_REPLY_FRAMES
 
     const first = extractTerminalStartupProbes(
       firstFrame,
@@ -49,7 +49,7 @@ describe('terminal-startup-probes', () => {
     expect(first.replies).toEqual([])
 
     const second = extractTerminalStartupProbes(
-      `${secondFrame}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      `${secondFrame}${firstPostReplyFrame}`,
       state,
       COLORS,
     )

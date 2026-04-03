@@ -13,9 +13,9 @@ import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
+  OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
   OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES,
-  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const terminalTheme = {
@@ -198,6 +198,43 @@ function lastSent(type: string, terminalId?: string) {
   })
 }
 
+function writeEvents() {
+  return ioEvents.filter((event) => event.kind === 'write')
+}
+
+function postReplySeqRange(index: number, afterProbeSeqEnd: number) {
+  if (index === 0) {
+    return {
+      seqStart: afterProbeSeqEnd + 1,
+      seqEnd: afterProbeSeqEnd + 3,
+    }
+  }
+
+  const seq = afterProbeSeqEnd + 3 + index
+  return { seqStart: seq, seqEnd: seq }
+}
+
+function emitCapturedPostReplyFrames(
+  terminalId: string,
+  attachRequestId: string,
+  afterProbeSeqEnd: number,
+  opts?: {
+    prependFirstFrame?: string
+  },
+) {
+  OPEN_CODE_STARTUP_POST_REPLY_FRAMES.forEach((frame, index) => {
+    const range = postReplySeqRange(index, afterProbeSeqEnd)
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: range.seqStart,
+      seqEnd: range.seqEnd,
+      data: `${index === 0 ? opts?.prependFirstFrame ?? '' : ''}${frame}`,
+      attachRequestId,
+    })
+  })
+}
+
 describe('opencode startup probes (e2e)', () => {
   beforeEach(() => {
     wsHarness.reset()
@@ -266,12 +303,27 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
       attachRequestId: attach.attachRequestId,
     })
 
+    expect(terminalInstances[0]!.write).not.toHaveBeenCalled()
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+    expect(ioEvents).toEqual([
+      ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
+    ])
+
+    emitCapturedPostReplyFrames(terminalId, attach.attachRequestId, 1)
+
     await waitFor(() => {
-      expect(terminalInstances[0]!.write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, undefined)
+      expect(writeEvents().map((event) => event.data).join('')).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
     })
 
     const inputMessages = sentMessages().filter((msg) => msg?.type === 'terminal.input')
@@ -284,14 +336,13 @@ describe('opencode startup probes (e2e)', () => {
     )
     expect(ioEvents).toEqual([
       ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
-      { kind: 'write' as const, data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+      ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
     ])
   })
 
   it('strips historical startup probes during replay without sending late replies', async () => {
     const terminalId = 'term-opencode-replay'
     const store = createStore(terminalId)
-    const [firstSplitFrame, secondSplitFrame] = OPEN_CODE_STARTUP_PROBE_SPLIT_FRAMES
 
     render(
       <Provider store={store}>
@@ -316,9 +367,9 @@ describe('opencode startup probes (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
-      headSeq: 2,
+      headSeq: 4,
       replayFromSeq: 1,
-      replayToSeq: 2,
+      replayToSeq: 4,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -330,22 +381,15 @@ describe('opencode startup probes (e2e)', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: firstSplitFrame,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
       attachRequestId: attach.attachRequestId,
     })
+    emitCapturedPostReplyFrames(terminalId, attach.attachRequestId, 1)
     wsHarness.emit({
       type: 'terminal.output',
       terminalId,
-      seqStart: 2,
-      seqEnd: 2,
-      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
-      attachRequestId: attach.attachRequestId,
-    })
-    wsHarness.emit({
-      type: 'terminal.output',
-      terminalId,
-      seqStart: 3,
-      seqEnd: 3,
+      seqStart: 5,
+      seqEnd: 5,
       data: 'live tail',
       attachRequestId: attach.attachRequestId,
     })
@@ -356,7 +400,7 @@ describe('opencode startup probes (e2e)', () => {
 
     expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
     expect(ioEvents).toEqual([
-      { kind: 'write', data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+      ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
       { kind: 'write', data: 'live tail' },
     ])
   })
@@ -414,8 +458,8 @@ describe('opencode startup probes (e2e)', () => {
       type: 'terminal.output',
       terminalId,
       seqStart: 2,
-      seqEnd: 2,
-      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_EXPECTED_CLEANED}`,
+      seqEnd: 4,
+      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_POST_REPLY_FRAMES[0] ?? ''}`,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -427,7 +471,7 @@ describe('opencode startup probes (e2e)', () => {
     expect(ioEvents).toHaveLength(1)
     expect(ioEvents[0]).toEqual({
       kind: 'write',
-      data: expect.stringContaining(OPEN_CODE_STARTUP_EXPECTED_CLEANED),
+      data: OPEN_CODE_STARTUP_EXPECTED_CLEANED,
     })
   })
 
@@ -484,8 +528,8 @@ describe('opencode startup probes (e2e)', () => {
       type: 'terminal.output',
       terminalId,
       seqStart: 2,
-      seqEnd: 2,
-      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      seqEnd: 4,
+      data: `${secondSplitFrame}${OPEN_CODE_STARTUP_POST_REPLY_FRAMES[0] ?? ''}`,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -503,7 +547,7 @@ describe('opencode startup probes (e2e)', () => {
     )
     expect(ioEvents).toEqual([
       ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
-      { kind: 'write' as const, data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+      { kind: 'write' as const, data: OPEN_CODE_STARTUP_POST_REPLY_FRAMES[0] ?? '' },
     ])
   })
 
@@ -534,9 +578,9 @@ describe('opencode startup probes (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId,
-      headSeq: 2,
+      headSeq: 4,
       replayFromSeq: 1,
-      replayToSeq: 2,
+      replayToSeq: 4,
       attachRequestId: attach.attachRequestId,
     })
 
@@ -546,14 +590,26 @@ describe('opencode startup probes (e2e)', () => {
     wsHarness.emit({
       type: 'terminal.output',
       terminalId,
-      seqStart: 3,
-      seqEnd: 3,
-      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}`,
+      seqStart: 5,
+      seqEnd: 5,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
       attachRequestId: attach.attachRequestId,
     })
 
+    expect(terminalInstances[0]!.write).not.toHaveBeenCalled()
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+
+    emitCapturedPostReplyFrames(terminalId, attach.attachRequestId, 5)
+
     await waitFor(() => {
-      expect(terminalInstances[0]!.write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, undefined)
+      expect(writeEvents().map((event) => event.data).join('')).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
     })
 
     const inputMessages = sentMessages().filter((msg) => msg?.type === 'terminal.input')
@@ -566,7 +622,7 @@ describe('opencode startup probes (e2e)', () => {
     )
     expect(ioEvents).toEqual([
       ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
-      { kind: 'write' as const, data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+      ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
     ])
   })
 })

@@ -16,8 +16,8 @@ import {
 import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
+  OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
   OPEN_CODE_STARTUP_PROBE_FRAME,
-  OPEN_CODE_STARTUP_VISIBLE_TEXT,
 } from '@test/helpers/opencode-startup-probes'
 
 const wsMocks = vi.hoisted(() => ({
@@ -257,6 +257,18 @@ describe('TerminalView OSC52 policy handling', () => {
     return { store, terminalId }
   }
 
+  function writeEvents() {
+    return ioEvents.filter((event) => event.kind === 'write')
+  }
+
+  function postReplySeqRange(index: number) {
+    if (index === 0) {
+      return { seqStart: 2, seqEnd: 4 }
+    }
+    const seq = index + 4
+    return { seqStart: seq, seqEnd: seq }
+  }
+
   it('always policy copies silently without prompt', async () => {
     const { terminalId } = await renderView('always')
     messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
@@ -278,11 +290,38 @@ describe('TerminalView OSC52 policy handling', () => {
       terminalId,
       seqStart: 1,
       seqEnd: 1,
-      data: `${OPEN_CODE_STARTUP_PROBE_FRAME}${OPEN_CODE_STARTUP_VISIBLE_TEXT}${OSC52_COPY}`,
+      data: OPEN_CODE_STARTUP_PROBE_FRAME,
+    })
+
+    expect(terminalInstances[0].write).not.toHaveBeenCalled()
+
+    const probeInputMessages = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.input')
+    expect(probeInputMessages).toEqual(
+      OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({
+        type: 'terminal.input',
+        terminalId,
+        data,
+      })),
+    )
+    expect(ioEvents).toEqual([
+      ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
+    ])
+
+    OPEN_CODE_STARTUP_POST_REPLY_FRAMES.forEach((frame, index) => {
+      const range = postReplySeqRange(index)
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: range.seqStart,
+        seqEnd: range.seqEnd,
+        data: `${frame}${index === OPEN_CODE_STARTUP_POST_REPLY_FRAMES.length - 1 ? OSC52_COPY : ''}`,
+      })
     })
 
     await waitFor(() => {
-      expect(terminalInstances[0].write).toHaveBeenCalledWith(OPEN_CODE_STARTUP_EXPECTED_CLEANED, undefined)
+      expect(writeEvents().map((event) => event.data).join('')).toBe(OPEN_CODE_STARTUP_EXPECTED_CLEANED)
     })
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
@@ -301,7 +340,7 @@ describe('TerminalView OSC52 policy handling', () => {
 
     expect(ioEvents).toEqual([
       ...OPEN_CODE_STARTUP_EXPECTED_REPLIES.map((data) => ({ kind: 'send' as const, type: 'terminal.input', data })),
-      { kind: 'write' as const, data: OPEN_CODE_STARTUP_EXPECTED_CLEANED },
+      ...OPEN_CODE_STARTUP_POST_REPLY_FRAMES.map((data) => ({ kind: 'write' as const, data })),
     ])
   })
 
