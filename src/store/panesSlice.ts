@@ -7,9 +7,40 @@ import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/p
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
+import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 
 const log = createLogger('PanesSlice')
+
+function buildPreservedSessionRef(
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  preservedResumeSessionId?: string,
+) {
+  if (!preservedResumeSessionId) {
+    return localContent.sessionRef
+  }
+
+  if (localContent.kind === 'terminal') {
+    if (localContent.mode === 'shell') {
+      return undefined
+    }
+    return {
+      ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+      provider: localContent.mode,
+      sessionId: preservedResumeSessionId,
+    }
+  }
+
+  if (!isValidClaudeSessionId(preservedResumeSessionId)) {
+    return undefined
+  }
+
+  return {
+    ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+    provider: 'claude' as const,
+    sessionId: preservedResumeSessionId,
+  }
+}
 
 /**
  * Normalize pane content to the full persisted/runtime shape.
@@ -427,7 +458,14 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
           local.content.resumeSessionId &&
           incoming.content.resumeSessionId !== local.content.resumeSessionId
         ) {
-          return { ...incoming, content: { ...incoming.content, resumeSessionId: local.content.resumeSessionId } }
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
         }
       } else if (local.content.status === 'creating') {
         // Different createRequestId and local is reconnecting: local just
@@ -442,6 +480,21 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
     if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
       if (incoming.content.createRequestId === local.content.createRequestId) {
+        if (
+          shouldPreserveLocalCanonicalResumeSessionId(
+            local.content.resumeSessionId,
+            incoming.content.resumeSessionId,
+          )
+        ) {
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
+        }
         // Preserve local sessionId if incoming doesn't have it yet
         if (local.content.sessionId && !incoming.content.sessionId) {
           return { ...incoming, content: local.content }

@@ -62,6 +62,38 @@ function findLeafContentById(node: unknown, paneId: string): any | undefined {
   return visit(node)
 }
 
+function buildCanonicalClaudeSessionRef(localContent: any, localResumeSessionId: string): {
+  provider: 'claude'
+  sessionId: string
+  serverInstanceId?: string
+} | undefined {
+  const explicit = localContent?.sessionRef
+  if (
+    explicit
+    && typeof explicit === 'object'
+    && explicit.provider === 'claude'
+    && explicit.sessionId === localResumeSessionId
+  ) {
+    return {
+      provider: 'claude',
+      sessionId: localResumeSessionId,
+      ...(typeof explicit.serverInstanceId === 'string' ? { serverInstanceId: explicit.serverInstanceId } : {}),
+    }
+  }
+
+  if (
+    localContent?.kind === 'agent-chat'
+    || (localContent?.kind === 'terminal' && localContent?.mode === 'claude')
+  ) {
+    return {
+      provider: 'claude',
+      sessionId: localResumeSessionId,
+    }
+  }
+
+  return undefined
+}
+
 function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: unknown): unknown {
   const visit = (candidate: any): any => {
     if (!candidate || typeof candidate !== 'object') return candidate
@@ -73,11 +105,13 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
         (candidate.content?.kind === 'terminal' || candidate.content?.kind === 'agent-chat')
         && shouldPreserveLocalCanonicalResumeSessionId(localResumeSessionId, remoteResumeSessionId)
       ) {
+        const preservedSessionRef = buildCanonicalClaudeSessionRef(localContent, localResumeSessionId)
         return {
           ...candidate,
           content: {
             ...candidate.content,
             resumeSessionId: localResumeSessionId,
+            sessionRef: preservedSessionRef,
           },
         }
       }

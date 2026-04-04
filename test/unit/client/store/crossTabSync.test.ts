@@ -800,6 +800,7 @@ describe('crossTabSync', () => {
 
   it('rejects stale rebroadcast layout that would overwrite a newer canonical durable id', () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const staleSessionRefId = '00000000-0000-4000-8000-000000000111'
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },
     })
@@ -836,6 +837,10 @@ describe('crossTabSync', () => {
             createRequestId: 'req-1',
             status: 'idle',
             resumeSessionId: canonicalSessionId,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: canonicalSessionId,
+            },
           },
         } as any,
       },
@@ -877,6 +882,10 @@ describe('crossTabSync', () => {
               createRequestId: 'req-1',
               status: 'idle',
               resumeSessionId: canonicalSessionId,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: canonicalSessionId,
+              },
             },
           },
         },
@@ -923,6 +932,10 @@ describe('crossTabSync', () => {
               createRequestId: 'req-1',
               status: 'idle',
               resumeSessionId: 'named-resume',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: staleSessionRefId,
+              },
             },
           },
         },
@@ -937,6 +950,10 @@ describe('crossTabSync', () => {
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
+    expect(paneContent.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
 
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
     expect(tab?.resumeSessionId).toBe(canonicalSessionId)

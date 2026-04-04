@@ -37,6 +37,8 @@ vi.mock('nanoid', () => ({
 
 describe('panesSlice', () => {
   let initialState: PanesState
+  const localClaudeSessionId = '550e8400-e29b-41d4-a716-446655440000'
+  const remoteClaudeSessionId = '550e8400-e29b-41d4-a716-446655440001'
 
   beforeEach(() => {
     initialState = {
@@ -1936,7 +1938,11 @@ describe('panesSlice', () => {
               mode: 'claude',
               createRequestId: 'req-1',
               status: 'creating',
-              resumeSessionId: 'session-A',
+              resumeSessionId: localClaudeSessionId,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: localClaudeSessionId,
+              },
             },
           } as any,
         },
@@ -1956,7 +1962,11 @@ describe('panesSlice', () => {
               createRequestId: 'req-1',
               status: 'running',
               terminalId: 'remote-t1',
-              resumeSessionId: 'session-B',
+              resumeSessionId: 'named-resume',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: remoteClaudeSessionId,
+              },
             },
           } as any,
         },
@@ -1967,7 +1977,11 @@ describe('panesSlice', () => {
       const state = panesReducer(localState, hydratePanes(incoming))
       const content = (state.layouts['tab-1'] as any).content
 
-      expect(content.resumeSessionId).toBe('session-A')
+      expect(content.resumeSessionId).toBe(localClaudeSessionId)
+      expect(content.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: localClaudeSessionId,
+      })
     })
 
     it('preserves local resumeSessionId inside split pane trees', () => {
