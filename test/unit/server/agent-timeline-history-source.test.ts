@@ -99,9 +99,14 @@ describe('agent timeline history source', () => {
       getLiveSessionBySdkSessionId: vi.fn((queryId: string) => (
         queryId === liveSession.sessionId ? liveSession : undefined
       )),
-      getLiveSessionByCliSessionId: vi.fn((queryId: string) => (
-        queryId === liveSession.resumeSessionId ? liveSession : undefined
-      )),
+      getLiveSessionByCliSessionId: vi.fn().mockReturnValue(undefined),
+    })
+
+    await expect(source.resolve('sdk-gone')).resolves.toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-gone',
+      timelineSessionId: 'named-only',
     })
 
     await expect(source.resolve('named-only')).resolves.toMatchObject({

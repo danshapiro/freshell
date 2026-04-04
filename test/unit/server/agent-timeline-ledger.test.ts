@@ -73,10 +73,9 @@ describe('restore ledger manager', () => {
     const manager = createRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
-      getLiveSessionByCliSessionId: (queryId) => {
-        if (queryId === liveSession.resumeSessionId || queryId === liveSession.cliSessionId) return liveSession
-        return undefined
-      },
+      getLiveSessionByCliSessionId: (queryId) => (
+        queryId === liveSession.cliSessionId ? liveSession : undefined
+      ),
     })
 
     const liveOnly = await manager.resolve('sdk-live')
@@ -88,6 +87,16 @@ describe('restore ledger manager', () => {
     })
     if (liveOnly.kind !== 'resolved') throw new Error('expected resolved')
     const initialRevision = liveOnly.revision
+
+    const namedAliasLiveOnly = await manager.resolve('named-resume-token')
+    expect(namedAliasLiveOnly).toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-live',
+      timelineSessionId: 'named-resume-token',
+    })
+    if (namedAliasLiveOnly.kind !== 'resolved') throw new Error('expected resolved')
+    expect(namedAliasLiveOnly.revision).toBe(initialRevision)
 
     liveSession.cliSessionId = '00000000-0000-4000-8000-000000000123'
     liveSession.messages.push(makeMessage('assistant', 'new live reply', { messageId: 'live-assistant-2' }))
@@ -102,6 +111,22 @@ describe('restore ledger manager', () => {
     if (merged.kind !== 'resolved') throw new Error('expected resolved')
     expect(merged.revision).toBeGreaterThan(initialRevision)
     expect(merged.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-user-1',
+      'durable-assistant-1',
+      'live-user-1',
+      'live-assistant-2',
+    ])
+
+    const namedAliasMerged = await manager.resolve('named-resume-token')
+    expect(namedAliasMerged).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-live',
+      timelineSessionId: '00000000-0000-4000-8000-000000000123',
+    })
+    if (namedAliasMerged.kind !== 'resolved') throw new Error('expected resolved')
+    expect(namedAliasMerged.revision).toBe(merged.revision)
+    expect(namedAliasMerged.turns.map((turn) => turn.messageId)).toEqual([
       'durable-user-1',
       'durable-assistant-1',
       'live-user-1',
@@ -261,7 +286,14 @@ describe('restore ledger manager', () => {
     const manager = createRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
-      getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.resumeSessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: () => undefined,
+    })
+
+    await expect(manager.resolve('sdk-gone')).resolves.toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-gone',
+      timelineSessionId: 'named-only',
     })
 
     const beforeTeardown = await manager.resolve('named-only')

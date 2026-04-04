@@ -251,6 +251,7 @@ function createStore(options?: {
 
 describe('open tab session sidebar visibility (e2e)', () => {
   beforeEach(() => {
+    vi.useRealTimers()
     cleanup()
     vi.clearAllMocks()
     wsHandlers.clear()
@@ -283,6 +284,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     _resetSessionWindowThunkState()
     cleanup()
   })

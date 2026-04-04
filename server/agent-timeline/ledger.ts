@@ -474,15 +474,12 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     return ledger.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
   }
 
-  async function rebuildAfterLiveAuthorityEnded(queryId: string, ledger: LedgerRecord): Promise<RestoreResolution> {
-    const durableSessionId = isCanonicalDurableSessionId(queryId)
-      ? queryId
-      : Array.from(ledger.durableAliases).find((alias) => isCanonicalDurableSessionId(alias))
-    dropLedger(ledger)
-    if (!durableSessionId) {
-      return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
-    }
-    return buildDurableOnlyResolution(queryId, durableSessionId)
+  function findBoundLiveSession(ledger: LedgerRecord): SdkSessionState | undefined {
+    const liveSessionId = ledger.resolution?.liveSessionId
+    if (!liveSessionId || tombstonedLiveAliases.has(liveSessionId)) return undefined
+    const liveSession = deps.getLiveSessionBySdkSessionId(liveSessionId)
+    if (!liveSession || tombstonedLiveAliases.has(liveSession.sessionId)) return undefined
+    return liveSession
   }
 
   async function syncLiveSession(liveSession: SdkSessionState): Promise<LedgerRecord> {
@@ -520,23 +517,25 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
 
     async resolve(queryId: string, options?: AgentHistoryResolveOptions): Promise<RestoreResolution> {
       try {
+        const existing = findLedgerRecord([queryId])
         const liveSessionCandidate = options?.liveSessionOverride ?? (
-        tombstonedLiveAliases.has(queryId)
-          ? undefined
-          : deps.getLiveSessionBySdkSessionId(queryId) ?? deps.getLiveSessionByCliSessionId(queryId)
+          tombstonedLiveAliases.has(queryId)
+            ? undefined
+            : deps.getLiveSessionBySdkSessionId(queryId)
+              ?? deps.getLiveSessionByCliSessionId(queryId)
+              ?? (existing ? findBoundLiveSession(existing) : undefined)
         )
         const liveSession = liveSessionCandidate && tombstonedLiveAliases.has(liveSessionCandidate.sessionId)
-        ? undefined
-        : liveSessionCandidate
+          ? undefined
+          : liveSessionCandidate
         if (liveSession) {
           const ledger = await syncLiveSession(liveSession)
           return ledger.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
         }
 
-        const existing = findLedgerRecord([queryId])
         if (existing) {
           if (existing.liveAliases.size > 0) {
-            return rebuildAfterLiveAuthorityEnded(queryId, existing)
+            return existing.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
           }
           const durableSessionId = isCanonicalDurableSessionId(queryId)
             ? queryId
