@@ -498,6 +498,46 @@ describe('restore ledger manager', () => {
     expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-alpha'])
   })
 
+  it('reconciles a single compatible runtime live turn with its durable canonical turn after backlog promotion', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000998'
+    const liveSession = makeSession({
+      sessionId: 'sdk-direct-runtime',
+      cliSessionId: canonicalSessionId,
+      messages: [makeMessage('user', 'alpha', { messageId: 'live:sdk-direct-runtime:0' })],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([
+          makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
+        ])
+        .mockResolvedValue([
+          makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
+        ]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const first = await manager.resolve('sdk-direct-runtime')
+    expect(first).toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-direct-runtime',
+      timelineSessionId: canonicalSessionId,
+    })
+
+    const resolved = await manager.resolve('sdk-direct-runtime')
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-direct-runtime',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-alpha'])
+  })
+
   it('bumps the ledger revision when a canonical turn changes under a stable message id', async () => {
     const liveSession = makeSession({
       sessionId: 'sdk-revision',

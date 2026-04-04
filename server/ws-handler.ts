@@ -969,7 +969,7 @@ export class WsHandler {
     if (!resolved) {
       resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
     }
-    if (resolved?.kind === 'fatal') {
+    if (resolved?.kind === 'fatal' || resolved?.kind === 'missing') {
       return resolved
     }
     const resolvedHistory = resolved?.kind === 'resolved' ? resolved : null
@@ -1910,17 +1910,22 @@ export class WsHandler {
           const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId, {
             liveSessionOverride: replayState.session,
           }) ?? null
-          const fatalRestore = resolvedHistory && typeof resolvedHistory === 'object' && (resolvedHistory as { kind?: unknown }).kind === 'fatal'
-            ? resolvedHistory as unknown as { code: string; message: string }
+          const failedRestore = resolvedHistory && typeof resolvedHistory === 'object' && (
+            (resolvedHistory as { kind?: unknown }).kind === 'fatal'
+            || (resolvedHistory as { kind?: unknown }).kind === 'missing'
+          )
+            ? resolvedHistory as unknown as { kind: 'fatal' | 'missing'; code: string; message?: string }
             : null
-          if (fatalRestore) {
+          if (failedRestore) {
             releaseCreateSubscription()
             releaseCreateSubscription = undefined
             this.sdkBridge.killSession(session.sessionId)
             this.teardownSdkRestoreState(session.sessionId, false)
             this.sendSdkCreateFailed(ws, m.requestId, {
-              code: fatalRestore.code,
-              message: fatalRestore.message,
+              code: failedRestore.code,
+              message: failedRestore.kind === 'missing'
+                ? 'SDK session history not found'
+                : (failedRestore.message ?? 'Failed to restore SDK session history'),
               retryable: true,
             })
             return
@@ -2175,6 +2180,15 @@ export class WsHandler {
               sessionId: m.sessionId,
               code: snapshotResult.code,
               message: snapshotResult.message,
+            } as SdkServerMessage)
+            return
+          }
+          if (snapshotResult?.kind === 'missing') {
+            this.send(ws, {
+              type: 'sdk.error',
+              sessionId: m.sessionId,
+              code: 'RESTORE_NOT_FOUND',
+              message: 'SDK session history not found',
             } as SdkServerMessage)
             return
           }

@@ -444,6 +444,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       liveSession?: SdkSessionState
       timelineSessionId?: string
       queryId: string
+      captureCompatibilityCandidates?: boolean
     },
   ): void {
     const durableTurns = buildCanonicalTurns(ledger.durableMessages, 'durable')
@@ -494,7 +495,10 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ledger.signature = signature
     ledger.resolution = resolved
     ledger.compatibilityCandidateIds = resolved.readiness === 'live_only'
-      && !isCanonicalDurableSessionId(params.timelineSessionId)
+      && (
+        !isCanonicalDurableSessionId(params.timelineSessionId)
+        || params.captureCompatibilityCandidates === true
+      )
       ? deriveCompatibilityCandidateIds(liveTurns)
       : new Set(ledger.compatibilityCandidateIds)
   }
@@ -552,6 +556,9 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       liveSession,
       timelineSessionId,
       queryId: liveSession.sessionId,
+      captureCompatibilityCandidates: !options?.refreshDurableHistory
+        || !isCanonicalDurableSessionId(timelineSessionId)
+        || ledger.resolution?.readiness === 'live_only',
     })
 
     bindAliases(ledger, {
@@ -565,6 +572,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         liveSession,
         timelineSessionId,
         queryId: liveSession.sessionId,
+        captureCompatibilityCandidates: ledger.durableMessages.length === 0,
       })
       bindAliases(ledger, {
         liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],

@@ -736,7 +736,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('sdk.attach snapshot still includes a revision when live restore resolution is temporarily missing', async () => {
+    it('returns sdk.error instead of fabricating a revision-0 snapshot when live sdk.attach restore resolution is missing', async () => {
       mockSdkBridge.getSession.mockReturnValue({
         sessionId: 'sdk-sess-1',
         status: 'running',
@@ -755,16 +755,12 @@ describe('WS Handler SDK Integration', () => {
       try {
         const messages: any[] = []
         const collectDone = new Promise<void>((resolve) => {
-          let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
             messages.push(parsed)
-            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
-              count += 1
-              if (count >= 2) {
-                ws.off('message', onMessage)
-                resolve()
-              }
+            if (parsed.type === 'sdk.error') {
+              ws.off('message', onMessage)
+              resolve()
             }
           }
           ws.on('message', onMessage)
@@ -777,15 +773,15 @@ describe('WS Handler SDK Integration', () => {
 
         await collectDone
 
-        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
-          type: 'sdk.session.snapshot',
+        expect(messages.find((m) => m.type === 'sdk.error')).toEqual({
+          type: 'sdk.error',
           sessionId: 'sdk-sess-1',
-          latestTurnId: null,
-          status: 'running',
-          revision: 0,
-          streamingActive: true,
-          streamingText: 'partial reply',
-        }))
+          code: 'RESTORE_NOT_FOUND',
+          message: 'SDK session history not found',
+        })
+        expect(messages.some((m) => m.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((m) => m.type === 'sdk.status')).toBe(false)
+        expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
       } finally {
         ws.close()
       }
@@ -1507,6 +1503,67 @@ describe('WS Handler SDK Integration', () => {
         expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-live-only')
         expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-live-only', { recoverable: false })
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns sdk.create.failed instead of leaking a usable session when sdk.create restore resolution is missing', async () => {
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-create-missing',
+        status: 'running',
+        messages: [makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }))
+      mockHistorySource.resolve.mockResolvedValue({
+        kind: 'missing',
+        code: 'RESTORE_NOT_FOUND',
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collected = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (
+              parsed.type === 'sdk.created'
+              || parsed.type === 'sdk.session.snapshot'
+              || parsed.type === 'sdk.session.init'
+              || parsed.type === 'sdk.create.failed'
+            ) {
+              messages.push(parsed)
+            }
+            if (messages.some((message) => message.type === 'sdk.create.failed')) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-create-missing',
+        }))
+
+        await collected
+
+        expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
+        expect(messages.find((message) => message.type === 'sdk.create.failed')).toEqual({
+          type: 'sdk.create.failed',
+          requestId: 'req-create-missing',
+          code: 'RESTORE_NOT_FOUND',
+          message: 'SDK session history not found',
+          retryable: true,
+        })
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-create-missing')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-create-missing', { recoverable: false })
       } finally {
         ws.close()
       }
