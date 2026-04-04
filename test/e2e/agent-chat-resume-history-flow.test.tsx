@@ -393,7 +393,7 @@ describe('agent chat resume history flow', () => {
     expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
   })
 
-  it('restores a persisted pane through the canonical durable id after restart when the sdk session id is stale', async () => {
+  it('restores a persisted pane through the canonical durable id after restart when the sdk session id is stale, then immediately recovers', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000778'
     getAgentTimelinePage.mockResolvedValue({
       sessionId: canonicalSessionId,
@@ -493,7 +493,26 @@ describe('agent chat resume history flow', () => {
       ])
     })
 
+    wsSend.mockClear()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.error',
+        sessionId: 'sdk-stale-778',
+        code: 'INVALID_SESSION_ID',
+        message: 'SDK session not found',
+      })
+    })
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        resumeSessionId: canonicalSessionId,
+      }))
+    })
+
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
     expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionId : undefined).toBeUndefined()
   })
 })

@@ -860,7 +860,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('hydrates sdk.attach from durable Claude history when no live SDK session exists', async () => {
+    it('hydrates sdk.attach from durable Claude history when no live SDK session exists, then marks it lost for recovery', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
       mockSdkBridge.getLiveSession.mockReturnValue(undefined)
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
@@ -877,16 +877,15 @@ describe('WS Handler SDK Integration', () => {
       try {
         const messages: any[] = []
         const collectDone = new Promise<void>((resolve) => {
-          let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
             messages.push(parsed)
-            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
-              count += 1
-              if (count >= 2) {
-                ws.off('message', onMessage)
-                resolve()
-              }
+            if (
+              messages.some((message) => message.type === 'sdk.session.snapshot')
+              && messages.some((message) => message.type === 'sdk.error')
+            ) {
+              ws.off('message', onMessage)
+              resolve()
             }
           }
           ws.on('message', onMessage)
@@ -900,7 +899,7 @@ describe('WS Handler SDK Integration', () => {
         await collectDone
 
         const snapshotMsg = messages.find((m) => m.type === 'sdk.session.snapshot')
-        const statusMsg = messages.find((m) => m.type === 'sdk.status')
+        const errorMsg = messages.find((m) => m.type === 'sdk.error')
 
         expect(snapshotMsg).toEqual({
           type: 'sdk.session.snapshot',
@@ -910,12 +909,13 @@ describe('WS Handler SDK Integration', () => {
           timelineSessionId: durableSessionId,
           revision: 123,
         })
-        expect(statusMsg).toEqual({
-          type: 'sdk.status',
+        expect(errorMsg).toEqual({
+          type: 'sdk.error',
           sessionId: durableSessionId,
-          status: 'idle',
+          code: 'INVALID_SESSION_ID',
+          message: 'SDK session not found',
         })
-        expect(messages.some((m) => m.type === 'sdk.error')).toBe(false)
+        expect(messages.some((m) => m.type === 'sdk.status')).toBe(false)
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith(durableSessionId, expect.any(Function))
@@ -924,7 +924,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('hydrates sdk.attach through the canonical durable resumeSessionId when the persisted sdk session id is stale', async () => {
+    it('hydrates sdk.attach through the canonical durable resumeSessionId when the persisted sdk session id is stale and then marks it lost for recovery', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000321'
       mockSdkBridge.getLiveSession.mockReturnValue(undefined)
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
@@ -941,16 +941,15 @@ describe('WS Handler SDK Integration', () => {
       try {
         const messages: any[] = []
         const collectDone = new Promise<void>((resolve) => {
-          let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
             messages.push(parsed)
-            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
-              count += 1
-              if (count >= 2) {
-                ws.off('message', onMessage)
-                resolve()
-              }
+            if (
+              messages.some((message) => message.type === 'sdk.session.snapshot')
+              && messages.some((message) => message.type === 'sdk.error')
+            ) {
+              ws.off('message', onMessage)
+              resolve()
             }
           }
           ws.on('message', onMessage)
@@ -972,12 +971,13 @@ describe('WS Handler SDK Integration', () => {
           timelineSessionId: durableSessionId,
           revision: 42,
         })
-        expect(messages.find((m) => m.type === 'sdk.status')).toEqual({
-          type: 'sdk.status',
+        expect(messages.find((m) => m.type === 'sdk.error')).toEqual({
+          type: 'sdk.error',
           sessionId: 'sdk-stale-321',
-          status: 'idle',
+          code: 'INVALID_SESSION_ID',
+          message: 'SDK session not found',
         })
-        expect(messages.some((m) => m.type === 'sdk.error')).toBe(false)
+        expect(messages.some((m) => m.type === 'sdk.status')).toBe(false)
         expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith('sdk-stale-321', expect.any(Function))
       } finally {
@@ -985,7 +985,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('rebuilds sdk.attach from durable history when only ended in-memory SDK state remains', async () => {
+    it('rebuilds sdk.attach from durable history when only ended in-memory SDK state remains, then marks it lost for recovery', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000243'
       mockSdkBridge.getSession.mockReturnValue({
         sessionId: 'sdk-ended-1',
@@ -1012,16 +1012,15 @@ describe('WS Handler SDK Integration', () => {
       try {
         const messages: any[] = []
         const collectDone = new Promise<void>((resolve) => {
-          let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
             messages.push(parsed)
-            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
-              count += 1
-              if (count >= 2) {
-                ws.off('message', onMessage)
-                resolve()
-              }
+            if (
+              messages.some((message) => message.type === 'sdk.session.snapshot')
+              && messages.some((message) => message.type === 'sdk.error')
+            ) {
+              ws.off('message', onMessage)
+              resolve()
             }
           }
           ws.on('message', onMessage)
@@ -1042,11 +1041,13 @@ describe('WS Handler SDK Integration', () => {
           timelineSessionId: durableSessionId,
           revision: 7,
         })
-        expect(messages.find((m) => m.type === 'sdk.status')).toEqual({
-          type: 'sdk.status',
+        expect(messages.find((m) => m.type === 'sdk.error')).toEqual({
+          type: 'sdk.error',
           sessionId: 'sdk-ended-1',
-          status: 'idle',
+          code: 'INVALID_SESSION_ID',
+          message: 'SDK session not found',
         })
+        expect(messages.some((m) => m.type === 'sdk.status')).toBe(false)
         expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-ended-1')
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith('sdk-ended-1', expect.any(Function))
       } finally {

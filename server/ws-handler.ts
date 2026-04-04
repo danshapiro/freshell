@@ -2142,11 +2142,15 @@ export class WsHandler {
               historyQueryId,
               resolvedHistory: resolved,
             })
+            // Durable-only restore can recover transcript state, but there is no live
+            // SDK target left to own follow-up sends. Surface the restored history and
+            // then immediately trigger the client's lost-session recovery path.
             this.send(ws, {
-              type: 'sdk.status',
+              type: 'sdk.error',
               sessionId: m.sessionId,
-              status: 'idle',
-            })
+              code: 'INVALID_SESSION_ID',
+              message: 'SDK session not found',
+            } as SdkServerMessage)
             return
           }
           if (resolved?.kind === 'missing') {

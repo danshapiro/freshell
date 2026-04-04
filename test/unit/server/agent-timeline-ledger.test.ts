@@ -209,7 +209,7 @@ describe('restore ledger manager', () => {
 
     const third = await manager.resolve('sdk-authority')
 
-    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(loadSessionHistory).toHaveBeenCalledTimes(3)
     expect(third).toMatchObject({
       kind: 'resolved',
       readiness: 'merged',
@@ -223,6 +223,62 @@ describe('restore ledger manager', () => {
       'live-user-1',
       'live-assistant-2',
     ])
+  })
+
+  it('refreshes a non-empty durable backlog while the live ledger remains authoritative', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000555'
+    const liveSession = makeSession({
+      sessionId: 'sdk-live-refresh',
+      cliSessionId: canonicalSessionId,
+      messages: [
+        makeMessage('user', 'live prompt', { messageId: 'live-1' }),
+      ],
+    })
+    const firstDurableBacklog = [
+      makeMessage('user', 'durable one', { messageId: 'durable-1' }),
+    ]
+    const secondDurableBacklog = [
+      makeMessage('user', 'durable one', { messageId: 'durable-1' }),
+      makeMessage('assistant', 'durable two', { messageId: 'durable-2' }),
+    ]
+    const loadSessionHistory = vi.fn()
+      .mockResolvedValueOnce(firstDurableBacklog)
+      .mockResolvedValueOnce(secondDurableBacklog)
+      .mockResolvedValue(secondDurableBacklog)
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const first = await manager.resolve('sdk-live-refresh')
+    const second = await manager.resolve('sdk-live-refresh')
+
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(first).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-live-refresh',
+      timelineSessionId: canonicalSessionId,
+    })
+    expect(second).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-live-refresh',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (first.kind !== 'resolved' || second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(first.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-1',
+      'live-1',
+    ])
+    expect(second.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-1',
+      'durable-2',
+      'live-1',
+    ])
+    expect(second.revision).toBeGreaterThan(first.revision)
   })
 
   it('keeps synthesized durable ids stable across equivalent JSONL rewrites and preserves upstream ids', async () => {

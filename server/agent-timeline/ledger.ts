@@ -428,14 +428,10 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
   }
 
   function shouldRefreshDurableHistory(
-    ledger: LedgerRecord,
+    _ledger: LedgerRecord,
     timelineSessionId: string | undefined,
   ): timelineSessionId is string {
     return isCanonicalDurableSessionId(timelineSessionId)
-      && (
-        ledger.durableTimelineSessionId !== timelineSessionId
-        || ledger.durableMessages.length === 0
-      )
   }
 
   function updateResolution(
