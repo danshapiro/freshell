@@ -1106,6 +1106,117 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('reuses the live SDK session when sdk.attach resolves the canonical durable id through the live cli-session alias lookup', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000244'
+      const liveSession = {
+        sessionId: 'sdk-live-244',
+        cliSessionId: durableSessionId,
+        status: 'running',
+        messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+      let subscriptionListener: ((msg: any) => void) | undefined
+
+      mockSdkBridge.getLiveSession.mockReturnValue(undefined)
+      mockSdkBridge.findLiveSessionByCliSessionId.mockImplementation((sessionId: string) => (
+        sessionId === durableSessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.sendUserMessage.mockImplementation((sessionId: string) => sessionId === liveSession.sessionId)
+      mockSdkBridge.subscribe.mockImplementation((sessionId: string, listener: (msg: any) => void) => {
+        subscriptionListener = listener
+        return { off: () => {}, replayed: false }
+      })
+      mockHistorySource.resolve.mockResolvedValue({
+        ...makeResolvedHistory({
+          queryId: durableSessionId,
+          timelineSessionId: durableSessionId,
+          revision: 125,
+          messages: [
+            makeMessage('user', 'older prompt', '2026-03-10T10:00:00.000Z'),
+            makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
+            makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
+          ],
+        }),
+        liveSessionId: undefined,
+        readiness: 'merged' as const,
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectedAttach = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            const snapshotReceived = messages.some((m) => m.type === 'sdk.session.snapshot')
+            const statusReceived = messages.some((m) => m.type === 'sdk.status')
+            if (snapshotReceived && statusReceived) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: durableSessionId,
+        }))
+
+        await collectedAttach
+
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
+          sessionId: durableSessionId,
+          status: 'running',
+          timelineSessionId: durableSessionId,
+          revision: 125,
+          streamingActive: true,
+          streamingText: 'partial reply',
+        }))
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.findLiveSessionByCliSessionId).toHaveBeenCalledWith(durableSessionId)
+          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(liveSession.sessionId, expect.any(Function))
+        })
+
+        const forwardedUpdate = new Promise<any>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (parsed.type === 'sdk.status' && parsed.status === 'running') {
+              ws.off('message', onMessage)
+              resolve(parsed)
+            }
+          }
+          ws.on('message', onMessage)
+        })
+        subscriptionListener?.({
+          type: 'sdk.status',
+          sessionId: liveSession.sessionId,
+          status: 'running',
+        })
+        await expect(forwardedUpdate).resolves.toEqual({
+          type: 'sdk.status',
+          sessionId: durableSessionId,
+          status: 'running',
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.send',
+          sessionId: durableSessionId,
+          text: 'continue working',
+        }))
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(liveSession.sessionId, 'continue working', undefined)
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
     it('keeps the canonical durable attach alias routable even when subscribe cannot establish live stream bookkeeping', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000243'
       const liveSession = {

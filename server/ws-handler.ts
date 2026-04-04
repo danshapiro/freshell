@@ -2110,8 +2110,12 @@ export class WsHandler {
             return
           }
         }
+        const liveSessionAlias = resolved?.kind === 'resolved'
+          ? resolved.timelineSessionId ?? m.sessionId
+          : m.sessionId
         const liveSession = directSession
           ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getLiveSession(resolved.liveSessionId) : undefined)
+          ?? this.sdkBridge.findLiveSessionByCliSessionId?.(liveSessionAlias)
         if (!liveSession) {
           if (resolved?.kind === 'fatal') {
             this.send(ws, {
