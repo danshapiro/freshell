@@ -412,6 +412,75 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
+  it('clears stale hydrated timeline content and waits for a fresh snapshot before rereading after a stale restore retry', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-sess-1',
+      items: [],
+      nextCursor: null,
+      revision: 13,
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 12,
+    }))
+    store.dispatch(timelinePageReceived({
+      sessionId: 'sess-reload-1',
+      items: [
+        {
+          turnId: 'turn-2',
+          sessionId: 'cli-sess-1',
+          role: 'assistant',
+          summary: 'Old stale summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+      bodies: {
+        'turn-2': {
+          sessionId: 'cli-sess-1',
+          turnId: 'turn-2',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Old hydrated body' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Old hydrated body')).toBeInTheDocument()
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+
+    act(() => {
+      store.dispatch(restoreRetryRequested({
+        sessionId: 'sess-reload-1',
+        code: 'RESTORE_STALE_REVISION',
+      }))
+    })
+
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+    })
+
+    expect(screen.getByText('Restoring session...')).toBeInTheDocument()
+    expect(screen.queryByText('Old hydrated body')).not.toBeInTheDocument()
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+  })
+
   it('allows a later stale restore cycle in the same pane to issue its own retry attach after hydration succeeds', async () => {
     getAgentTimelinePage.mockRejectedValueOnce({
       status: 409,

@@ -44,6 +44,20 @@ function isStaleRevisionError(error: unknown): error is {
   return candidate.status === 409 && candidate.details?.code === 'RESTORE_STALE_REVISION'
 }
 
+function requestStaleRestoreRetry(
+  sessionId: string,
+  dispatch: AppDispatch,
+  getState: () => RootState,
+): boolean {
+  const retryCount = getState().agentChat.sessions[sessionId]?.restoreRetryCount ?? 0
+  if (retryCount >= 1) return false
+  dispatch(restoreRetryRequested({
+    sessionId,
+    code: 'RESTORE_STALE_REVISION',
+  }))
+  return true
+}
+
 export const loadAgentTurnBody = createAsyncThunk<
   void,
   LoadAgentTurnBodyArgs,
@@ -52,12 +66,28 @@ export const loadAgentTurnBody = createAsyncThunk<
   'agentChat/loadTurnBody',
   async ({ sessionId, timelineSessionId, turnId }, { dispatch, signal, getState }) => {
     const revision = getState().agentChat.sessions[sessionId]?.timelineRevision
-    const turn = await getAgentTurnBody(timelineSessionId ?? sessionId, turnId, { revision, signal })
-    dispatch(turnBodyReceived({
-      sessionId,
-      turnId,
-      message: turn.message,
-    }))
+    try {
+      const turn = await getAgentTurnBody(timelineSessionId ?? sessionId, turnId, { revision, signal })
+      dispatch(turnBodyReceived({
+        sessionId,
+        turnId,
+        message: turn.message,
+      }))
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw error
+      }
+
+      if (isStaleRevisionError(error) && requestStaleRestoreRetry(sessionId, dispatch, getState)) {
+        return
+      }
+
+      dispatch(timelineLoadFailed({
+        sessionId,
+        message: error instanceof Error ? error.message : 'Timeline request failed',
+      }))
+      throw error
+    }
   },
 )
 
@@ -118,12 +148,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       }
 
       if (isStaleRevisionError(error)) {
-        const retryCount = getState().agentChat.sessions[sessionId]?.restoreRetryCount ?? 0
-        if (retryCount < 1) {
-          dispatch(restoreRetryRequested({
-            sessionId,
-            code: 'RESTORE_STALE_REVISION',
-          }))
+        if (requestStaleRestoreRetry(sessionId, dispatch, getState)) {
           return
         }
       }

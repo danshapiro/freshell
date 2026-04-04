@@ -39,6 +39,17 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
   return state.sessions[sessionId]
 }
 
+function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): void {
+  session.latestTurnId = undefined
+  session.timelineItems = []
+  session.timelineBodies = {}
+  session.nextTimelineCursor = undefined
+  session.timelineRevision = undefined
+  session.timelineLoading = false
+  session.timelineError = undefined
+  session.historyLoaded = false
+}
+
 const agentChatSlice = createSlice({
   name: 'agentChat',
   initialState,
@@ -331,10 +342,9 @@ const agentChatSlice = createSlice({
 
     restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      resetHydratedTimelineStateForRestoreRetry(session)
       session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
       session.restoreFailureCode = action.payload.code
-      session.timelineLoading = false
-      session.timelineError = undefined
     },
 
     createFailed(state, action: PayloadAction<{ requestId: string } & PendingCreateFailure>) {
