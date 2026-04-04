@@ -1,6 +1,7 @@
 import path from 'path'
 import { EventEmitter } from 'events'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { createAgentHistorySource } from '../../../server/agent-timeline/history-source.js'
 
 // Mock the SDK's query function
 const mockMessages: any[] = []
@@ -902,6 +903,65 @@ describe('SdkBridge', () => {
   })
 
   describe('stream end cleanup', () => {
+    it('falls back to durable-only restore after a stream ends naturally and the session is no longer live', async () => {
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: '00000000-0000-4000-8000-000000000123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+      mockMessages.push({
+        type: 'result',
+        subtype: 'success',
+        duration_ms: 100,
+        duration_api_ms: 80,
+        is_error: false,
+        num_turns: 1,
+        total_cost_usd: 0.01,
+        usage: { input_tokens: 100, output_tokens: 50 },
+        session_id: '00000000-0000-4000-8000-000000000123',
+        uuid: 'test-uuid',
+      })
+
+      const loadSessionHistory = vi.fn().mockResolvedValue([
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: 'durable prompt' }],
+          timestamp: '2026-04-03T00:00:00.000Z',
+          messageId: 'durable-msg-1',
+        },
+      ])
+      let bridgeWithHistory!: SdkBridge
+      const historySource = createAgentHistorySource({
+        loadSessionHistory,
+        getLiveSessionBySdkSessionId: (id) => bridgeWithHistory.getLiveSession(id),
+        getLiveSessionByCliSessionId: (id) => bridgeWithHistory.findLiveSessionByCliSessionId(id),
+      })
+      bridgeWithHistory = new SdkBridge(historySource)
+
+      const session = await bridgeWithHistory.createSession({ cwd: '/tmp' })
+      bridgeWithHistory.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 150))
+
+      expect(bridgeWithHistory.getLiveSession(session.sessionId)).toBeUndefined()
+
+      const resolved = await historySource.resolve('00000000-0000-4000-8000-000000000123')
+      expect(resolved).toMatchObject({
+        kind: 'resolved',
+        readiness: 'durable_only',
+        liveSessionId: undefined,
+        timelineSessionId: '00000000-0000-4000-8000-000000000123',
+      })
+      if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+      expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+      expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-msg-1'])
+
+      bridgeWithHistory.close()
+    })
+
     it('cleans up process on natural stream end so sendUserMessage returns false', async () => {
       mockMessages.push({
         type: 'system',

@@ -455,10 +455,10 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         ? 'durable_only'
         : 'live_only'
 
-    const stableQueryId = ledger.resolution?.queryId
-      ?? params.liveSession?.sessionId
-      ?? params.timelineSessionId
+    const stableQueryId = params.liveSession?.sessionId
       ?? params.queryId
+      ?? params.timelineSessionId
+      ?? ledger.resolution?.queryId
 
     const nextResolution: ResolvedRestore = {
       kind: 'resolved',
@@ -585,13 +585,13 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         }
 
         if (existing) {
-          if (existing.liveAliases.size > 0) {
-            return existing.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
-          }
           const durableSessionId = isCanonicalDurableSessionId(queryId)
             ? queryId
             : Array.from(existing.durableAliases).find((alias) => isCanonicalDurableSessionId(alias))
           if (!durableSessionId) {
+            if (existing.liveAliases.size > 0) {
+              return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+            }
             return existing.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
           }
           return buildDurableOnlyResolution(queryId, durableSessionId)

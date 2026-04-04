@@ -313,6 +313,54 @@ describe('restore ledger manager', () => {
     expect(afterTeardown).toEqual({ kind: 'missing', code: 'RESTORE_NOT_FOUND' })
   })
 
+  it('rebuilds durable-only history once a previously live canonical session is no longer live', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000123'
+    let liveAvailable = true
+    const liveSession = makeSession({
+      sessionId: 'sdk-live',
+      cliSessionId: canonicalSessionId,
+      resumeSessionId: 'named-token',
+      messages: [makeMessage('user', 'live prompt', { messageId: 'live-msg-1' })],
+    })
+    const loadSessionHistory = vi.fn().mockResolvedValue([
+      makeMessage('user', 'durable prompt', { messageId: 'durable-msg-1' }),
+    ])
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: (id) => (
+        liveAvailable && id === liveSession.sessionId ? liveSession : undefined
+      ),
+      getLiveSessionByCliSessionId: (id) => (
+        liveAvailable && (id === liveSession.cliSessionId || id === liveSession.resumeSessionId)
+          ? liveSession
+          : undefined
+      ),
+    })
+
+    const first = await manager.resolve('sdk-live')
+    expect(first).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-live',
+      timelineSessionId: canonicalSessionId,
+    })
+    expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+
+    liveAvailable = false
+
+    const second = await manager.resolve(canonicalSessionId)
+    expect(second).toMatchObject({
+      kind: 'resolved',
+      readiness: 'durable_only',
+      liveSessionId: undefined,
+      timelineSessionId: canonicalSessionId,
+    })
+    if (second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(second.turns.map((turn) => turn.messageId)).toEqual(['durable-msg-1'])
+  })
+
   it('upgrades idless live turns to the authoritative durable ids without duplicating the conversation', async () => {
     const livePrompt = makeMessage('user', 'draft prompt')
     const durablePrompt = makeMessage('user', 'draft prompt', { messageId: 'durable-upstream-1' })
