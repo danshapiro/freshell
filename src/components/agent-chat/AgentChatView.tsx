@@ -110,6 +110,14 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const attachPayload = useMemo(() => {
+    if (!paneContent.sessionId) return null
+    return {
+      type: 'sdk.attach' as const,
+      sessionId: paneContent.sessionId,
+      ...(canonicalDurableSessionId ? { resumeSessionId: canonicalDurableSessionId } : {}),
+    }
+  }, [canonicalDurableSessionId, paneContent.sessionId])
   const waitingForDurableHistoryIdentity = Boolean(
     session?.awaitingDurableHistory
       && session.latestTurnId === null
@@ -169,11 +177,14 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       staleRetryAttachKeyRef.current = null
       return
     }
-    const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}`
+    const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}:${attachPayload?.resumeSessionId ?? ''}`
     if (staleRetryAttachKeyRef.current === retryKey) return
     staleRetryAttachKeyRef.current = retryKey
-    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
+    if (attachPayload) {
+      ws.send(attachPayload)
+    }
   }, [
+    attachPayload,
     paneContent.sessionId,
     session?.restoreFailureCode,
     session?.restoreRetryCount,
@@ -192,11 +203,14 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       snapshotRefreshAttachKeyRef.current = null
       return
     }
-    const refreshKey = `${paneContent.sessionId}:${snapshotRefreshRequestId}`
+    const refreshKey = `${paneContent.sessionId}:${snapshotRefreshRequestId}:${attachPayload?.resumeSessionId ?? ''}`
     if (snapshotRefreshAttachKeyRef.current === refreshKey) return
     snapshotRefreshAttachKeyRef.current = refreshKey
-    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
+    if (attachPayload) {
+      ws.send(attachPayload)
+    }
   }, [
+    attachPayload,
     paneContent.sessionId,
     session?.snapshotRefreshRequestId,
     suppressNetworkEffects,
@@ -350,22 +364,22 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Attach to existing session on mount (e.g. after page refresh with persisted pane)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId || attachSentRef.current) return
+    if (!attachPayload || attachSentRef.current) return
     // Only attach if we didn't just create this session ourselves
     if (createSentRef.current) return
 
     attachSentRef.current = true
-    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
-  }, [paneContent.sessionId, suppressNetworkEffects, ws])
+    ws.send(attachPayload)
+  }, [attachPayload, suppressNetworkEffects, ws])
 
   // Re-attach on WS reconnect so server re-subscribes this client
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId) return
+    if (!attachPayload) return
     return ws.onReconnect(() => {
-      ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId! })
+      ws.send(attachPayload)
     })
-  }, [paneContent.sessionId, suppressNetworkEffects, ws])
+  }, [attachPayload, suppressNetworkEffects, ws])
 
   useEffect(() => {
     if (suppressNetworkEffects) return

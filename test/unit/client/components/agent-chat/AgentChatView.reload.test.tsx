@@ -127,6 +127,11 @@ const RELOAD_PANE: AgentChatPaneContent = {
   status: 'idle',
 }
 
+const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
+  ...RELOAD_PANE,
+  resumeSessionId: '00000000-0000-4000-8000-000000000321',
+}
+
 describe('AgentChatView reload/restore behavior', () => {
   beforeEach(() => {
     localStorage.clear()
@@ -154,6 +159,25 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(wsSend).toHaveBeenCalledWith({
       type: 'sdk.attach',
       sessionId: 'sess-reload-1',
+    })
+  })
+
+  it('includes the canonical durable resumeSessionId when attaching a persisted pane on mount', () => {
+    const store = makeStore()
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={RELOAD_PANE_WITH_CANONICAL_RESUME}
+        />
+      </Provider>,
+    )
+
+    expect(wsSend).toHaveBeenCalledWith({
+      type: 'sdk.attach',
+      sessionId: 'sess-reload-1',
+      resumeSessionId: '00000000-0000-4000-8000-000000000321',
     })
   })
 
@@ -1014,6 +1038,7 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(attachCalls[1]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sdk-meta-upgrade-1',
+        resumeSessionId: canonicalSessionId,
       })
     })
     expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)

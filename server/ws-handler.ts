@@ -2100,19 +2100,20 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
           return
         }
+        const historyQueryId = m.resumeSessionId ?? m.sessionId
         const directSession = this.sdkBridge.getLiveSession(m.sessionId)
         let resolved: Awaited<ReturnType<AgentHistorySource['resolve']>> | null = null
         if (!directSession) {
           try {
-            resolved = await this.agentHistorySource?.resolve(m.sessionId) ?? null
+            resolved = await this.agentHistorySource?.resolve(historyQueryId) ?? null
           } catch (err) {
             this.sendSdkRestoreError(ws, m.sessionId, err)
             return
           }
         }
         const liveSessionAlias = resolved?.kind === 'resolved'
-          ? resolved.timelineSessionId ?? m.sessionId
-          : m.sessionId
+          ? resolved.timelineSessionId ?? historyQueryId
+          : historyQueryId
         const liveSession = directSession
           ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getLiveSession(resolved.liveSessionId) : undefined)
           ?? this.sdkBridge.findLiveSessionByCliSessionId?.(liveSessionAlias)
@@ -2130,7 +2131,7 @@ export class WsHandler {
             await this.sendSdkSessionSnapshot(ws, {
               sessionId: m.sessionId,
               status: 'idle',
-              historyQueryId: m.sessionId,
+              historyQueryId,
               resolvedHistory: resolved,
             })
             this.send(ws, {
@@ -2164,7 +2165,7 @@ export class WsHandler {
           const snapshotResult = await this.sendSdkSessionSnapshot(ws, {
             sessionId: m.sessionId,
             status: liveSession.status,
-            historyQueryId: m.sessionId,
+            historyQueryId,
             liveSession,
             ...(resolved ? { resolvedHistory: resolved } : {}),
           })

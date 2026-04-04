@@ -328,6 +328,7 @@ export const SdkKillSchema = z.object({
 export const SdkAttachSchema = z.object({
   type: z.literal('sdk.attach'),
   sessionId: z.string().min(1),
+  resumeSessionId: z.string().min(1).optional(),
 })
 
 export const SdkSetModelSchema = z.object({

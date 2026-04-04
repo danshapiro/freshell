@@ -262,8 +262,12 @@ describe('WS Handler SDK Integration', () => {
       const result = SdkAttachSchema.safeParse({
         type: 'sdk.attach',
         sessionId: 'sess-1',
+        resumeSessionId: '00000000-0000-4000-8000-000000000321',
       })
       expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.resumeSessionId).toBe('00000000-0000-4000-8000-000000000321')
+      }
     })
 
     it('rejects sdk.attach with empty sessionId', () => {
@@ -919,6 +923,67 @@ describe('WS Handler SDK Integration', () => {
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith(durableSessionId, expect.any(Function))
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('hydrates sdk.attach through the canonical durable resumeSessionId when the persisted sdk session id is stale', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000321'
+      mockSdkBridge.getLiveSession.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: durableSessionId,
+        timelineSessionId: durableSessionId,
+        revision: 42,
+        messages: [
+          makeMessage('user', 'Recovered durable question', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'Recovered durable answer', '2026-03-10T10:00:20.000Z'),
+        ],
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
+              count += 1
+              if (count >= 2) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-stale-321',
+          resumeSessionId: durableSessionId,
+        }))
+
+        await collectDone
+
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-stale-321',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: durableSessionId,
+          revision: 42,
+        })
+        expect(messages.find((m) => m.type === 'sdk.status')).toEqual({
+          type: 'sdk.status',
+          sessionId: 'sdk-stale-321',
+          status: 'idle',
+        })
+        expect(messages.some((m) => m.type === 'sdk.error')).toBe(false)
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
+        expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith('sdk-stale-321', expect.any(Function))
       } finally {
         ws.close()
       }

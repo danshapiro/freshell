@@ -354,6 +354,7 @@ describe('agent chat resume history flow', () => {
       expect(attachCalls[0]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sdk-live-only',
+        resumeSessionId: canonicalSessionId,
       })
     })
     expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
@@ -385,6 +386,110 @@ describe('agent chat resume history flow', () => {
         'Older durable question',
         'Older durable answer',
         'Live-only full body',
+      ])
+    })
+
+    const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+  })
+
+  it('restores a persisted pane through the canonical durable id after restart when the sdk session id is stale', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000778'
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: canonicalSessionId,
+      items: [
+        {
+          turnId: 'turn-durable-1',
+          sessionId: canonicalSessionId,
+          role: 'user',
+          summary: 'Recovered durable question',
+          timestamp: '2026-03-10T10:00:00.000Z',
+        },
+        {
+          turnId: 'turn-durable-2',
+          sessionId: canonicalSessionId,
+          role: 'assistant',
+          summary: 'Recovered durable answer',
+          timestamp: '2026-03-10T10:00:20.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 5,
+      bodies: {
+        'turn-durable-1': {
+          sessionId: canonicalSessionId,
+          turnId: 'turn-durable-1',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'Recovered durable question' }],
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
+        },
+        'turn-durable-2': {
+          sessionId: canonicalSessionId,
+          turnId: 'turn-durable-2',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Recovered durable answer' }],
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+        },
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-restart',
+        sessionId: 'sdk-stale-778',
+        resumeSessionId: canonicalSessionId,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith({
+        type: 'sdk.attach',
+        sessionId: 'sdk-stale-778',
+        resumeSessionId: canonicalSessionId,
+      })
+    })
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-stale-778',
+        latestTurnId: 'turn-durable-2',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 5,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        canonicalSessionId,
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 5 }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+
+    await waitFor(() => {
+      const renderedMessages = screen.getAllByRole('article')
+        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+      expect(renderedMessages).toEqual([
+        'Recovered durable question',
+        'Recovered durable answer',
       ])
     })
 
