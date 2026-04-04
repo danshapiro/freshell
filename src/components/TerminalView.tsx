@@ -906,9 +906,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       startupProbeReplayDiscardStateRef.current = {
         remainder,
       }
-      if (pendingProbe && !remainder) {
-        return
-      }
     } else {
       startupProbeReplayDiscardStateRef.current = { remainder: null }
     }

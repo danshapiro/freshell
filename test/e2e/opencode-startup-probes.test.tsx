@@ -752,7 +752,7 @@ describe('opencode startup probes (e2e)', () => {
     expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
   })
 
-  it('preserves replay-carried non-startup OSC fragments into the first live frame', async () => {
+  it('drops replay-carried non-startup OSC fragments at the replay boundary', async () => {
     const terminalId = 'term-opencode-replay-gap-non-startup-osc'
     const { attach } = await renderCreatedTerminal(terminalId)
     const replayFragment = 'prefix\u001b]0;Window title'
@@ -804,7 +804,7 @@ describe('opencode startup probes (e2e)', () => {
     await waitFor(() => {
       expect(writeEvents()).toEqual([
         { kind: 'write', data: 'prefix' },
-        { kind: 'write', data: '\u001b]0;Window title\u0007after' },
+        { kind: 'write', data: '\u0007after' },
       ])
     })
 
