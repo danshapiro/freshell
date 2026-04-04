@@ -103,7 +103,6 @@ const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
-  buffered: string
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
@@ -112,36 +111,29 @@ function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): numbe
 
 function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
   const remainder = state.remainder
+  state.remainder = null
   if (!remainder) {
-    state.buffered = ''
     return raw
   }
 
-  let matched = state.buffered
-  let index = 0
+  let matched = 0
   while (
-    index < raw.length
-    && matched.length < remainder.length
-    && raw[index] === remainder[matched.length]
+    matched < raw.length
+    && matched < remainder.length
+    && raw[matched] === remainder[matched]
   ) {
-    matched += raw[index]
-    index += 1
+    matched += 1
   }
 
-  if (matched.length === remainder.length) {
-    state.remainder = null
-    state.buffered = ''
-    return raw.slice(index)
+  if (matched === remainder.length) {
+    return raw.slice(matched)
   }
 
-  if (index < raw.length) {
-    state.remainder = null
-    state.buffered = ''
-    return `${matched}${raw.slice(index)}`
+  if (matched === raw.length) {
+    return ''
   }
 
-  state.buffered = matched
-  return ''
+  return raw
 }
 
 function getStartupProbeReplayRemainder(pending: string): string | null {
@@ -326,7 +318,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
     remainder: null,
-    buffered: '',
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
@@ -914,13 +905,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       const remainder = getStartupProbeReplayRemainder(pendingProbe)
       startupProbeReplayDiscardStateRef.current = {
         remainder,
-        buffered: '',
       }
       if (pendingProbe && !remainder) {
         return
       }
     } else {
-      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
+      startupProbeReplayDiscardStateRef.current = { remainder: null }
     }
     startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])

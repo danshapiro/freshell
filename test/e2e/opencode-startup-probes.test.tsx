@@ -686,6 +686,72 @@ describe('opencode startup probes (e2e)', () => {
     ])
   })
 
+  it('does not keep stale startup-probe cleanup active across multiple live frames', async () => {
+    const terminalId = 'term-opencode-replay-gap-split-stale-remainder'
+    const { attach } = await renderCreatedTerminal(terminalId)
+    const replayFragment = OPEN_CODE_STARTUP_PROBE_FRAME.slice(0, -2)
+    const [firstLiveFrame, secondLiveFrame] = OPEN_CODE_STARTUP_PROBE_FRAME.slice(replayFragment.length).split('')
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId,
+      headSeq: 2,
+      replayFromSeq: 1,
+      replayToSeq: 2,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.send.mockClear()
+    ioEvents.length = 0
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: replayFragment,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output.gap',
+      terminalId,
+      fromSeq: 2,
+      toSeq: 2,
+      reason: 'replay_budget_exceeded',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: firstLiveFrame ?? '',
+      attachRequestId: attach.attachRequestId,
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+    expect(ioEvents).toEqual([])
+
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 4,
+      seqEnd: 4,
+      data: `${secondLiveFrame ?? ''}hello`,
+      attachRequestId: attach.attachRequestId,
+    })
+
+    await waitFor(() => {
+      expect(writeEvents()).toEqual([
+        { kind: 'write', data: `${secondLiveFrame ?? ''}hello` },
+      ])
+    })
+
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.input')).toEqual([])
+  })
+
   it('preserves replay-carried non-startup OSC fragments into the first live frame', async () => {
     const terminalId = 'term-opencode-replay-gap-non-startup-osc'
     const { attach } = await renderCreatedTerminal(terminalId)
