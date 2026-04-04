@@ -395,7 +395,19 @@ Update callers in `configure()` and `initializeFromStartup()`:
 await this.refreshLanIps()
 ```
 
-Keep `ensureLanIps()` unchanged — it uses the sync `detectLanIps()` via the constructor's one-time init path.
+Update `ensureLanIps()` to inline the sync `detectLanIps()` call. It currently delegates to `this.refreshLanIps()`, which is now async — calling it without `await` would silently drop the promise and leave `lanIps` unset. The constructor cannot be async, so `ensureLanIps` must stay sync. Inline the sync call:
+```typescript
+private ensureLanIps(): void {
+  if (!this.lanIpsInitialized) {
+    try {
+      this.lanIps = detectLanIps()
+    } catch {
+      this.lanIps = []
+    }
+    this.lanIpsInitialized = true
+  }
+}
+```
 
 - [ ] **Step 6: Update `server/index.ts`**
 
