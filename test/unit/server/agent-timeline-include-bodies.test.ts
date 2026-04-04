@@ -222,6 +222,7 @@ describe('agent timeline includeBodies', () => {
     const turn = await service.getTurnBody({
       sessionId: 'sdk-sess-1',
       turnId: page.items[0].turnId,
+      revision: page.revision,
     })
 
     expect(turn).not.toBeNull()

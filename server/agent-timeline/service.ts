@@ -177,8 +177,11 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
     },
 
     async getTurnBody({ sessionId, turnId, revision }) {
+      if (revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const timeline = await loadTimeline(sessionId)
-      if (revision != null && revision !== timeline.revision) {
+      if (revision !== timeline.revision) {
         throw new RestoreStaleRevisionError(revision, timeline.revision)
       }
       const match = timeline.records.find((record) => record.turnId === turnId)

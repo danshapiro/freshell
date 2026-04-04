@@ -118,12 +118,28 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
     expect(AgentTimelineTurnBodyQuerySchema.parse({ revision: '7' })).toEqual({ revision: 7 })
 
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/turns/turn-2')
+      .get('/api/agent-sessions/agent-session-1/turns/turn-2?revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
     expect(res.body.turnId).toBe('turn-2')
     expect(res.body.message.content[0].text).toBe('full turn body')
+    expect(getTurnBody).toHaveBeenCalledWith({
+      sessionId: 'agent-session-1',
+      turnId: 'turn-2',
+      revision: 7,
+    })
+  })
+
+  it('rejects unpinned turn-body reads that omit restore revision', async () => {
+    expect(AgentTimelineTurnBodyQuerySchema.safeParse({})).toMatchObject({ success: false })
+
+    const res = await request(app)
+      .get('/api/agent-sessions/agent-session-1/turns/turn-2')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+    expect(getTurnBody).not.toHaveBeenCalled()
   })
 
   it('fails cleanly on invalid timeline queries', async () => {
@@ -186,7 +202,7 @@ describe('agent timeline router with the real service', () => {
     expect(timelineResponse.body.bodies[timelineResponse.body.items[0].turnId].sessionId).toBe(canonicalSessionId)
 
     const turnResponse = await request(app)
-      .get(`/api/agent-sessions/sdk-session-321/turns/${timelineResponse.body.items[0].turnId}`)
+      .get(`/api/agent-sessions/sdk-session-321/turns/${timelineResponse.body.items[0].turnId}?revision=123`)
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(turnResponse.status).toBe(200)

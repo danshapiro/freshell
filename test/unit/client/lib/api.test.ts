@@ -108,7 +108,7 @@ describe('visible-first read-model helpers', () => {
       .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', body: [] }))
 
     await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20 }, { signal })
-    await getAgentTurnBody('session-1', 'turn-1', { signal })
+    await getAgentTurnBody('session-1', 'turn-1', { revision: 7, signal })
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
@@ -120,12 +120,21 @@ describe('visible-first read-model helpers', () => {
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/agent-sessions/session-1/turns/turn-1',
+      '/api/agent-sessions/session-1/turns/turn-1?revision=7',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
       }),
     )
+  })
+
+  it('rejects turn-body requests that omit the pinned restore revision', async () => {
+    await expect(getAgentTurnBody('session-1', 'turn-1', { signal: new AbortController().signal }))
+      .rejects
+      .toMatchObject({
+        name: 'ZodError',
+      })
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
   it('serializes includeBodies=true for the first visible agent timeline request', async () => {

@@ -243,6 +243,13 @@ describe('agentChatThunks', () => {
     }))
 
     const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-3',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-3',
+      revision: 12,
+    }))
     await store.dispatch(loadAgentTurnBody({
       sessionId: 'sess-3',
       timelineSessionId: 'cli-sess-3',
@@ -252,7 +259,7 @@ describe('agentChatThunks', () => {
     expect(getAgentTurnBody).toHaveBeenCalledWith(
       'cli-sess-3',
       'turn-7',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ signal: expect.any(AbortSignal), revision: 12 }),
     )
     expect(store.getState().agentChat.sessions['sess-3'].timelineBodies['turn-7']).toEqual(
       expect.objectContaining({

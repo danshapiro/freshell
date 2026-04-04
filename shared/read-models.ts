@@ -85,7 +85,7 @@ export const AgentTimelinePageQuerySchema = z.object({
 })
 
 export const AgentTimelineTurnBodyQuerySchema = z.object({
-  revision: z.coerce.number().int().nonnegative().optional(),
+  revision: z.coerce.number().int().nonnegative(),
 })
 
 export const RestoreStaleRevisionResponseSchema = z.object({

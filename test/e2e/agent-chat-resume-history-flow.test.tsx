@@ -256,11 +256,11 @@ describe('agent chat resume history flow', () => {
             timestamp: '2026-03-10T10:00:20.000Z',
           },
           {
-            turnId: 'turn-live-1',
+            turnId: 'turn-live-2',
             sessionId: canonicalSessionId,
             role: 'assistant',
-            summary: 'Live delta',
-            timestamp: '2026-03-10T10:01:20.000Z',
+            summary: 'Post-watermark live delta',
+            timestamp: '2026-03-10T10:01:40.000Z',
           },
         ],
         nextCursor: null,
@@ -284,13 +284,13 @@ describe('agent chat resume history flow', () => {
               timestamp: '2026-03-10T10:00:20.000Z',
             },
           },
-          'turn-live-1': {
+          'turn-live-2': {
             sessionId: canonicalSessionId,
-            turnId: 'turn-live-1',
+            turnId: 'turn-live-2',
             message: {
               role: 'assistant',
-              content: [{ type: 'text', text: 'Live-only full body' }],
-              timestamp: '2026-03-10T10:01:20.000Z',
+              content: [{ type: 'text', text: 'Post-watermark live delta' }],
+              timestamp: '2026-03-10T10:01:40.000Z',
             },
           },
         },
@@ -342,6 +342,15 @@ describe('agent chat resume history flow', () => {
 
     act(() => {
       handleSdkMessage(store.dispatch, {
+        type: 'sdk.assistant',
+        sessionId: 'sdk-live-only',
+        content: [{ type: 'text', text: 'Post-watermark live delta' }],
+      })
+    })
+    expect(screen.getByText('Post-watermark live delta')).toBeInTheDocument()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
         type: 'sdk.session.metadata',
         sessionId: 'sdk-live-only',
         cliSessionId: canonicalSessionId,
@@ -364,7 +373,7 @@ describe('agent chat resume history flow', () => {
       handleSdkMessage(store.dispatch, {
         type: 'sdk.session.snapshot',
         sessionId: 'sdk-live-only',
-        latestTurnId: 'turn-live-1',
+        latestTurnId: 'turn-live-2',
         status: 'idle',
         timelineSessionId: canonicalSessionId,
         revision: 2,
@@ -385,9 +394,11 @@ describe('agent chat resume history flow', () => {
       expect(renderedMessages).toEqual([
         'Older durable question',
         'Older durable answer',
-        'Live-only full body',
+        'Post-watermark live delta',
       ])
     })
+    expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
     expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)

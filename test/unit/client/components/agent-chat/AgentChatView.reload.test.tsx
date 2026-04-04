@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
+  addAssistantMessage,
   addUserMessage,
   registerPendingCreate,
   restoreRetryRequested,
@@ -948,13 +949,13 @@ describe('AgentChatView reload/restore behavior', () => {
             summary: 'Durable backlog answer',
           },
           {
-            turnId: 'turn-live-1',
-            messageId: 'message-live-1',
+            turnId: 'turn-live-2',
+            messageId: 'message-live-2',
             ordinal: 2,
             source: 'live',
             sessionId: canonicalSessionId,
             role: 'assistant',
-            summary: 'Live delta summary',
+            summary: 'Post-watermark live delta',
           },
         ],
         bodies: {
@@ -980,15 +981,15 @@ describe('AgentChatView reload/restore behavior', () => {
               content: [{ type: 'text', text: 'Durable backlog answer body' }],
             },
           },
-          'turn-live-1': {
-            turnId: 'turn-live-1',
-            messageId: 'message-live-1',
+          'turn-live-2': {
+            turnId: 'turn-live-2',
+            messageId: 'message-live-2',
             ordinal: 2,
             source: 'live',
             sessionId: canonicalSessionId,
             message: {
               role: 'assistant',
-              content: [{ type: 'text', text: 'Live-only full body' }],
+              content: [{ type: 'text', text: 'Post-watermark live delta' }],
             },
           },
         },
@@ -1052,6 +1053,14 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     act(() => {
+      store.dispatch(addAssistantMessage({
+        sessionId: 'sdk-meta-upgrade-1',
+        content: [{ type: 'text', text: 'Post-watermark live delta' }],
+      }))
+    })
+    expect(screen.getByText('Post-watermark live delta')).toBeInTheDocument()
+
+    act(() => {
       store.dispatch(sessionMetadataReceived({
         sessionId: 'sdk-meta-upgrade-1',
         cliSessionId: canonicalSessionId,
@@ -1073,7 +1082,7 @@ describe('AgentChatView reload/restore behavior', () => {
     act(() => {
       store.dispatch(sessionSnapshotReceived({
         sessionId: 'sdk-meta-upgrade-1',
-        latestTurnId: 'turn-live-1',
+        latestTurnId: 'turn-live-2',
         status: 'idle',
         timelineSessionId: canonicalSessionId,
         revision: 2,
@@ -1096,8 +1105,10 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(session?.timelineRevision).toBe(2)
       expect(screen.getByText('Durable backlog prompt body')).toBeInTheDocument()
       expect(screen.getByText('Durable backlog answer body')).toBeInTheDocument()
-      expect(screen.getByText('Live-only full body')).toBeInTheDocument()
+      expect(screen.getByText('Post-watermark live delta')).toBeInTheDocument()
     })
+    expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
     expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')

@@ -63,10 +63,16 @@ function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState):
   session.timelineLoading = false
   session.timelineError = undefined
   session.historyLoaded = false
+  session.messages = []
+  session.streamingText = ''
+  session.streamingActive = false
 }
 
 function requestFreshSnapshotRefresh(session: ChatSessionState): void {
   resetHydratedTimelineStateForRestoreRetry(session)
+  session.messages = []
+  session.streamingText = ''
+  session.streamingActive = false
   session.snapshotRefreshRequestId = (session.snapshotRefreshRequestId ?? 0) + 1
 }
 

@@ -106,6 +106,7 @@ describe('agent timeline service', () => {
     const turn = await service.getTurnBody({
       sessionId: 'agent-session-2',
       turnId: page.items[0]!.turnId,
+      revision: page.revision,
     })
 
     expect(turn).toMatchObject({
@@ -146,6 +147,7 @@ describe('agent timeline service', () => {
     const turn = await service.getTurnBody({
       sessionId: 'sdk-1',
       turnId: page.items[0]!.turnId,
+      revision: page.revision,
     })
 
     expect(turn?.sessionId).toBe('00000000-0000-4000-8000-000000000001')
@@ -251,5 +253,21 @@ describe('agent timeline service', () => {
       requestedRevision: 12,
       actualRevision: 13,
     })
+  })
+
+  it('rejects turn-body reads that omit the accepted restore revision', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
+          revision: 13,
+        }),
+      },
+    })
+
+    await expect(service.getTurnBody({
+      sessionId: 'sdk-1',
+      turnId: 'turn:sdk-1-2',
+    } as any)).rejects.toThrow('Restore revision is required')
   })
 })

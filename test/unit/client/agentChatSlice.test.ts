@@ -129,6 +129,56 @@ describe('agentChatSlice', () => {
     expect(state.sessions['s1'].messages[0].role).toBe('assistant')
   })
 
+  it('clears live-only message state when requesting a fresh canonical snapshot refresh', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req',
+      sessionId: 'sdk-live',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live',
+      latestTurnId: 'turn-live-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live',
+      items: [
+        makeTimelineItem('turn-live-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          source: 'live',
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+      bodies: {
+        'turn-live-1': makeTimelineTurn('turn-live-1', 'assistant', 'Live-only full body', {
+          sessionId: 'named-resume',
+          source: 'live',
+        }),
+      },
+    }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 'sdk-live',
+      content: [{ type: 'text', text: 'Post-watermark live delta' }],
+    }))
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-live',
+      cliSessionId: '00000000-0000-4000-8000-000000000321',
+    }))
+
+    const session = state.sessions['sdk-live']
+    expect(session.historyLoaded).toBe(false)
+    expect(session.timelineItems).toEqual([])
+    expect(session.messages).toEqual([])
+    expect(session.snapshotRefreshRequestId).toBe(1)
+  })
+
   it('tracks streaming text', () => {
     let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
     state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))

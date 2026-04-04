@@ -218,19 +218,14 @@ export async function getAgentTimelinePage(
 export async function getAgentTurnBody(
   sessionId: string,
   turnId: string,
-  queryOrOptions: ApiRequestOptions | (AgentTimelineTurnBodyQuery & { signal?: AbortSignal }) = {},
-  maybeOptions: ApiRequestOptions = {},
+  query: AgentTimelineTurnBodyQuery & { signal?: AbortSignal },
+  options: ApiRequestOptions = {},
 ): Promise<any> {
-  const query = 'revision' in queryOrOptions || 'signal' in queryOrOptions
-    ? AgentTimelineTurnBodyQuerySchema.parse(queryOrOptions)
-    : {}
-  const options = ('revision' in queryOrOptions)
-    ? maybeOptions
-    : queryOrOptions as ApiRequestOptions
-  const signal = ('signal' in queryOrOptions ? queryOrOptions.signal : undefined) ?? options.signal
+  const parsed = AgentTimelineTurnBodyQuerySchema.parse(query)
+  const signal = query.signal ?? options.signal
   return api.get(
     `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
-      ['revision', query.revision],
+      ['revision', parsed.revision],
     ])}`,
     { ...options, signal },
   )

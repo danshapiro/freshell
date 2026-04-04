@@ -66,6 +66,14 @@ export const loadAgentTurnBody = createAsyncThunk<
   'agentChat/loadTurnBody',
   async ({ sessionId, timelineSessionId, turnId }, { dispatch, signal, getState }) => {
     const revision = getState().agentChat.sessions[sessionId]?.timelineRevision
+    if (revision == null) {
+      const error = new Error('Restore revision required')
+      dispatch(timelineLoadFailed({
+        sessionId,
+        message: error.message,
+      }))
+      throw error
+    }
     try {
       const turn = await getAgentTurnBody(timelineSessionId ?? sessionId, turnId, { revision, signal })
       dispatch(turnBodyReceived({
