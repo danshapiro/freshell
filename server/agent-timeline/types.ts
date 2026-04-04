@@ -2,9 +2,11 @@ import type { ChatMessage } from '../session-history-loader.js'
 import type { CanonicalTurn } from './ledger.js'
 import type {
   AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
+  AgentTimelineTurnBodyQuery as SharedAgentTimelineTurnBodyQuery,
 } from '../../shared/read-models.js'
 
 export type AgentTimelinePageQuery = SharedAgentTimelinePageQuery
+export type AgentTimelineTurnBodyQuery = SharedAgentTimelineTurnBodyQuery
 
 export type AgentTimelineItem = {
   turnId: string

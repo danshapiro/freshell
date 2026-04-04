@@ -4,6 +4,10 @@ import request from 'supertest'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAgentTimelineRouter } from '../../../server/agent-timeline/router.js'
 import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
+import {
+  AgentTimelineTurnBodyQuerySchema,
+  RestoreStaleRevisionResponseSchema,
+} from '../../../shared/read-models.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
@@ -111,6 +115,8 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
   })
 
   it('hydrates turn bodies on demand', async () => {
+    expect(AgentTimelineTurnBodyQuerySchema.parse({ revision: '7' })).toEqual({ revision: 7 })
+
     const res = await request(app)
       .get('/api/agent-sessions/agent-session-1/turns/turn-2')
       .set('x-auth-token', TEST_AUTH_TOKEN)
@@ -215,7 +221,7 @@ describe('agent timeline router with the real service', () => {
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(staleTimeline.status).toBe(409)
-    expect(staleTimeline.body).toEqual({
+    expect(RestoreStaleRevisionResponseSchema.parse(staleTimeline.body)).toEqual({
       error: 'Stale restore revision',
       code: 'RESTORE_STALE_REVISION',
       currentRevision: 13,
@@ -226,7 +232,7 @@ describe('agent timeline router with the real service', () => {
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(staleTurn.status).toBe(409)
-    expect(staleTurn.body).toEqual({
+    expect(RestoreStaleRevisionResponseSchema.parse(staleTurn.body)).toEqual({
       error: 'Stale restore revision',
       code: 'RESTORE_STALE_REVISION',
       currentRevision: 13,

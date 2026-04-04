@@ -6,6 +6,7 @@ import type {
   AgentTimelineItem,
   AgentTimelinePage,
   AgentTimelinePageQuery,
+  AgentTimelineTurnBodyQuery,
   AgentTimelineTurn,
 } from './types.js'
 
@@ -21,7 +22,7 @@ type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
 
 export type AgentTimelineService = {
   getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
-  getTurnBody: (query: { sessionId: string; turnId: string; revision?: number; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
+  getTurnBody: (query: AgentTimelineTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
 }
 
 export type AgentTimelineServiceDeps = {

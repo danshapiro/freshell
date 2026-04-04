@@ -131,6 +131,24 @@ describe('extractChatMessagesFromJsonl', () => {
     expect(originalMessages[0].messageId).toBeDefined()
     expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
   })
+
+  it('preserves parent/reference ancestry and distinguishes synthesized ids across different durable chains', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-a","referenceId":"ref-a"},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-b","referenceId":"ref-b"},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.parentId).toBe('parent-a')
+    expect(messages[0]?.referenceId).toBe('ref-a')
+    expect(messages[1]?.parentId).toBe('parent-b')
+    expect(messages[1]?.referenceId).toBe('ref-b')
+    expect(messages[0]?.messageId).toBeDefined()
+    expect(messages[1]?.messageId).toBeDefined()
+    expect(messages[0]?.messageId).not.toBe(messages[1]?.messageId)
+  })
 })
 
 describe('loadSessionHistory', () => {

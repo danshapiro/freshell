@@ -84,6 +84,16 @@ export const AgentTimelinePageQuerySchema = z.object({
   ]).optional(),
 })
 
+export const AgentTimelineTurnBodyQuerySchema = z.object({
+  revision: z.coerce.number().int().nonnegative().optional(),
+})
+
+export const RestoreStaleRevisionResponseSchema = z.object({
+  error: z.string().min(1),
+  code: z.literal('RESTORE_STALE_REVISION'),
+  currentRevision: z.number().int().nonnegative(),
+})
+
 export const TerminalScrollbackQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.number().int().positive().max(200).optional(),
@@ -102,5 +112,7 @@ export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
 export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
 export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>
+export type AgentTimelineTurnBodyQuery = z.infer<typeof AgentTimelineTurnBodyQuerySchema>
+export type RestoreStaleRevisionResponse = z.infer<typeof RestoreStaleRevisionResponseSchema>
 export type TerminalScrollbackQuery = z.infer<typeof TerminalScrollbackQuerySchema>
 export type TerminalSearchQuery = z.infer<typeof TerminalSearchQuerySchema>

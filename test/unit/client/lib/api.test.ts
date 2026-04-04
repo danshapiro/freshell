@@ -14,6 +14,8 @@ import {
   setSessionMetadata,
 } from '@/lib/api'
 import {
+  AgentTimelineTurnBodyQuerySchema,
+  RestoreStaleRevisionResponseSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
 } from '@shared/read-models'
@@ -170,6 +172,19 @@ describe('visible-first read-model helpers', () => {
         headers: expect.any(Headers),
       }),
     )
+  })
+
+  it('shares the turn-body revision query and stale-revision error contracts from read-models', () => {
+    expect(AgentTimelineTurnBodyQuerySchema.parse({ revision: '13' })).toEqual({ revision: 13 })
+    expect(RestoreStaleRevisionResponseSchema.parse({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })).toEqual({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })
   })
 
   it('terminal view helpers target only viewport, scrollback, and search routes while forwarding AbortSignal', async () => {

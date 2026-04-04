@@ -122,15 +122,22 @@ function fingerprintBlock(block: ChatMessage['content'][number]): unknown {
   }
 }
 
-export function createDurableMessageFingerprint(message: Pick<ChatMessage, 'role' | 'content' | 'model'>): string {
+export function createDurableMessageFingerprint(
+  message: Pick<ChatMessage, 'role' | 'content' | 'model' | 'parentId' | 'referenceId'>,
+): string {
   return stableStringify({
     role: message.role,
     content: message.content.map(fingerprintBlock),
     ...(message.model ? { model: message.model } : {}),
+    ...(message.parentId ? { parentId: message.parentId } : {}),
+    ...(message.referenceId ? { referenceId: message.referenceId } : {}),
   })
 }
 
-export function synthesizeDeterministicMessageId(message: Pick<ChatMessage, 'role' | 'content' | 'model'>, occurrenceIndex: number): string {
+export function synthesizeDeterministicMessageId(
+  message: Pick<ChatMessage, 'role' | 'content' | 'model' | 'parentId' | 'referenceId'>,
+  occurrenceIndex: number,
+): string {
   const fingerprint = createDurableMessageFingerprint(message)
   const digest = createHash('sha256').update(fingerprint).digest('hex').slice(0, 16)
   return `durable:${digest}:${occurrenceIndex}`
@@ -366,6 +373,14 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ledger.durableAliases.clear()
   }
 
+  function clearLiveAliases(ledger: LedgerRecord): void {
+    for (const alias of ledger.liveAliases) {
+      ledger.aliases.delete(alias)
+      ledgerIdByAlias.delete(alias)
+    }
+    ledger.liveAliases.clear()
+  }
+
   function dropLedger(ledger: LedgerRecord): void {
     clearLedgerAliases(ledger)
     ledgers.delete(ledger.ledgerId)
@@ -492,6 +507,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       dropLedger(ledger)
       return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
     }
+    clearLiveAliases(ledger)
     updateResolution(ledger, {
       queryId,
       timelineSessionId,
@@ -588,6 +604,13 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
           const durableSessionId = isCanonicalDurableSessionId(queryId)
             ? queryId
             : Array.from(existing.durableAliases).find((alias) => isCanonicalDurableSessionId(alias))
+          if (!isCanonicalDurableSessionId(queryId) && existing.liveAliases.has(queryId)) {
+            clearLiveAliases(existing)
+            if (existing.durableAliases.size === 0) {
+              dropLedger(existing)
+            }
+            return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+          }
           if (!durableSessionId) {
             if (existing.liveAliases.size > 0) {
               return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }

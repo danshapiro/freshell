@@ -15,6 +15,8 @@ export interface ChatMessage {
   content: ContentBlock[]
   timestamp?: string
   model?: string
+  parentId?: string
+  referenceId?: string
   messageId?: string
 }
 
@@ -33,6 +35,15 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
   const lines = content.split(/\r?\n/).filter(Boolean)
   const messages: ChatMessage[] = []
   const fingerprintOccurrences = new Map<string, number>()
+
+  function pickOptionalString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        return value
+      }
+    }
+    return undefined
+  }
 
   for (const line of lines) {
     let obj: any
@@ -55,6 +66,8 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
         role,
         content: [{ type: 'text', text: msg }],
         ...(timestamp ? { timestamp } : {}),
+        ...(pickOptionalString(obj.parentId, obj.parent_id) ? { parentId: pickOptionalString(obj.parentId, obj.parent_id) } : {}),
+        ...(pickOptionalString(obj.referenceId, obj.reference_id) ? { referenceId: pickOptionalString(obj.referenceId, obj.reference_id) } : {}),
       }
       const fingerprint = createDurableMessageFingerprint(nextMessage)
       const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
@@ -68,6 +81,12 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
         content: msg.content as ContentBlock[],
         ...(timestamp ? { timestamp } : {}),
         ...(msg.model ? { model: msg.model } : {}),
+        ...(pickOptionalString(msg.parentId, msg.parent_id, obj.parentId, obj.parent_id) ? {
+          parentId: pickOptionalString(msg.parentId, msg.parent_id, obj.parentId, obj.parent_id),
+        } : {}),
+        ...(pickOptionalString(msg.referenceId, msg.reference_id, obj.referenceId, obj.reference_id) ? {
+          referenceId: pickOptionalString(msg.referenceId, msg.reference_id, obj.referenceId, obj.reference_id),
+        } : {}),
         ...(typeof msg.id === 'string' && msg.id.trim().length > 0 ? { messageId: msg.id } : {}),
       }
       if (!nextMessage.messageId) {

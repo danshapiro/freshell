@@ -1,6 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
-import { createRestoreLedgerManager } from '../../../server/agent-timeline/ledger.js'
+import {
+  createDurableMessageFingerprint,
+  createRestoreLedgerManager,
+} from '../../../server/agent-timeline/ledger.js'
 import type { SdkSessionState } from '../../../server/sdk-bridge-types.js'
 import type { ChatMessage } from '../../../server/session-history-loader.js'
 
@@ -254,6 +257,24 @@ describe('restore ledger manager', () => {
     expect(second.turns[1]?.messageId).toBe('upstream-assistant-id')
   })
 
+  it('includes upstream parent/reference ids in durable fingerprints when present', () => {
+    const baseMessage = {
+      role: 'assistant' as const,
+      content: [{ type: 'text' as const, text: 'same reply' }],
+      model: 'claude',
+    }
+
+    expect(createDurableMessageFingerprint({
+      ...baseMessage,
+      parentId: 'parent-a',
+      referenceId: 'ref-a',
+    })).not.toBe(createDurableMessageFingerprint({
+      ...baseMessage,
+      parentId: 'parent-b',
+      referenceId: 'ref-b',
+    }))
+  })
+
   it('rebuilds durable-only state from JSONL on repeated reads and bumps the revision when the transcript changes', async () => {
     const timelineSessionId = '00000000-0000-4000-8000-000000000998'
     const firstDurable = [
@@ -359,6 +380,52 @@ describe('restore ledger manager', () => {
     if (second.kind !== 'resolved') throw new Error('expected resolved')
     expect(loadSessionHistory).toHaveBeenCalledTimes(2)
     expect(second.turns.map((turn) => turn.messageId)).toEqual(['durable-msg-1'])
+  })
+
+  it('stops resolving a stale named alias once canonical durable identity remains without a live session', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    let liveAvailable = true
+    const liveSession = makeSession({
+      sessionId: 'sdk-1',
+      cliSessionId: canonicalSessionId,
+      resumeSessionId: 'named-resume',
+      messages: [makeMessage('user', 'hello')],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn(async (sessionId: string) => (
+        sessionId === canonicalSessionId
+          ? [makeMessage('user', 'hello', { messageId: 'durable-hello' })]
+          : null
+      )),
+      getLiveSessionBySdkSessionId: (id) => (
+        liveAvailable && id === liveSession.sessionId ? liveSession : undefined
+      ),
+      getLiveSessionByCliSessionId: (id) => (
+        liveAvailable && (id === liveSession.cliSessionId || id === liveSession.resumeSessionId)
+          ? liveSession
+          : undefined
+      ),
+    })
+
+    await expect(manager.resolve('sdk-1')).resolves.toMatchObject({
+      kind: 'resolved',
+      liveSessionId: 'sdk-1',
+      timelineSessionId: canonicalSessionId,
+    })
+
+    liveAvailable = false
+
+    await expect(manager.resolve('named-resume')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
+    })
+    await expect(manager.resolve(canonicalSessionId)).resolves.toMatchObject({
+      kind: 'resolved',
+      readiness: 'durable_only',
+      liveSessionId: undefined,
+      timelineSessionId: canonicalSessionId,
+    })
   })
 
   it('upgrades idless live turns to the authoritative durable ids without duplicating the conversation', async () => {

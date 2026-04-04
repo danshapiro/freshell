@@ -1,6 +1,9 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
+import {
+  AgentTimelinePageQuerySchema,
+  AgentTimelineTurnBodyQuerySchema,
+} from '../../shared/read-models.js'
 import { RestoreResolutionError, RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
@@ -18,10 +21,6 @@ export type AgentTimelineRouterDeps = {
 const TurnParamsSchema = z.object({
   sessionId: z.string().min(1),
   turnId: z.string().min(1),
-})
-
-const TurnQuerySchema = z.object({
-  revision: z.coerce.number().int().nonnegative().optional(),
 })
 
 export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router {
@@ -97,7 +96,7 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
 
   router.get('/agent-sessions/:sessionId/turns/:turnId', async (req, res) => {
     const params = TurnParamsSchema.safeParse(req.params)
-    const query = TurnQuerySchema.safeParse({
+    const query = AgentTimelineTurnBodyQuerySchema.safeParse({
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
     })
     if (!params.success || !query.success) {

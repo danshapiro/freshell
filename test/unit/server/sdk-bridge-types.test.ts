@@ -5,6 +5,10 @@ import {
 import type {
   SDKMessage,
   PermissionResult,
+  SdkCreatedSession,
+  SdkReplayGate,
+  SdkReplayState,
+  SdkServerMessage,
   SdkSessionState,
 } from '../../../server/sdk-bridge-types.js'
 
@@ -94,6 +98,52 @@ describe('SDK Protocol Types', () => {
       }
       pending.resolve(result)
       expect(resolveFn).toHaveBeenCalledWith(result)
+    })
+  })
+
+  describe('transactional restore boundary types', () => {
+    it('captures replay state with a watermark and session snapshot', () => {
+      const state: SdkSessionState = {
+        sessionId: 'test',
+        status: 'connected',
+        createdAt: Date.now(),
+        messages: [],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+        costUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+      }
+      const replayState: SdkReplayState = {
+        watermark: 7,
+        session: state,
+      }
+      const replayGate: SdkReplayGate = {
+        capture: vi.fn(() => replayState),
+      }
+      const session: SdkCreatedSession = {
+        ...state,
+        replayGate,
+      }
+
+      expect(session.replayGate.capture()).toEqual(replayState)
+      expect(replayGate.capture).toHaveBeenCalledTimes(1)
+    })
+
+    it('types sdk.create.failed as a request-scoped restore failure message', () => {
+      const message: Extract<SdkServerMessage, { type: 'sdk.create.failed' }> = {
+        type: 'sdk.create.failed',
+        requestId: 'req-1',
+        code: 'RESTORE_INTERNAL',
+        message: 'Restore failed',
+        retryable: true,
+      }
+
+      expect(message.requestId).toBe('req-1')
+      expect(message.code).toBe('RESTORE_INTERNAL')
+      expect(message.retryable).toBe(true)
     })
   })
 
