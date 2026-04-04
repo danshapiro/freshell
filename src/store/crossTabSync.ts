@@ -98,10 +98,13 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
   return visit(remoteNode)
 }
 
-function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string, previousRaw?: string) {
+function dispatchHydrateLayoutFromPersisted(
+  store: StoreLike,
+  raw: string,
+  localLayoutPersistedAt?: number,
+) {
   const parsed = parsePersistedLayoutRaw(raw)
   if (!parsed) return
-  const previousParsed = previousRaw ? parsePersistedLayoutRaw(previousRaw) : null
   const state = store.getState()
   const localLayouts = (state?.panes?.layouts || {}) as Record<string, unknown>
   const protectedLayouts = Object.fromEntries(
@@ -122,7 +125,7 @@ function dispatchHydrateLayoutFromPersisted(store: StoreLike, raw: string, previ
     meta: {
       skipPersist: true,
       source: 'cross-tab',
-      localLayoutPersistedAt: previousParsed?.persistedAt,
+      localLayoutPersistedAt,
       remoteLayoutPersistedAt: parsed.persistedAt,
     },
   })
@@ -214,9 +217,10 @@ function handleIncomingRaw(
   key: string,
   raw: string,
   previousRaw?: string,
+  localLayoutPersistedAt?: number,
 ) {
   if (key === LAYOUT_STORAGE_KEY) {
-    dispatchHydrateLayoutFromPersisted(store, raw, previousRaw)
+    dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
   }
@@ -228,10 +232,22 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Storage events and BroadcastChannel can both deliver the same persisted payload.
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
+  let currentLocalLayoutPersistedAt: number | undefined
   for (const key of [LAYOUT_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
+      if (key === LAYOUT_STORAGE_KEY) {
+        const parsed = parsePersistedLayoutRaw(existingRaw)
+        currentLocalLayoutPersistedAt = parsed?.persistedAt
+      }
+    }
+  }
+
+  const mergeAuthoritativeLayoutPersistedAt = (candidate?: number) => {
+    if (typeof candidate !== 'number') return
+    if (typeof currentLocalLayoutPersistedAt !== 'number' || candidate > currentLocalLayoutPersistedAt) {
+      currentLocalLayoutPersistedAt = candidate
     }
   }
 
@@ -244,7 +260,10 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const handleIncomingRawDeduped = (key: string, raw: string) => {
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
-    handleIncomingRaw(store, key, raw, previousRaw)
+    handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
+    if (key === LAYOUT_STORAGE_KEY) {
+      mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
+    }
   }
 
   // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
@@ -258,6 +277,9 @@ export function installCrossTabSync(store: StoreLike): () => void {
       return
     }
     lastProcessedRawByKey.set(msg.key, msg.raw)
+    if (msg.key === LAYOUT_STORAGE_KEY) {
+      currentLocalLayoutPersistedAt = parsePersistedLayoutRaw(msg.raw)?.persistedAt
+    }
   })
 
   const onStorage = (e: StorageEvent) => {
