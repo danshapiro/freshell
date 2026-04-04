@@ -708,6 +708,61 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('sdk.attach snapshot still includes a revision when live restore resolution is temporarily missing', async () => {
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-sess-1',
+        status: 'running',
+        messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockHistorySource.resolve.mockResolvedValue({
+        kind: 'missing',
+        code: 'RESTORE_NOT_FOUND',
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
+              count += 1
+              if (count >= 2) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-sess-1',
+        }))
+
+        await collectDone
+
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-sess-1',
+          latestTurnId: null,
+          status: 'running',
+          revision: 0,
+          streamingActive: true,
+          streamingText: 'partial reply',
+        }))
+      } finally {
+        ws.close()
+      }
+    })
+
     it('sends sdk.attach snapshot before replaying buffered SDK messages', async () => {
       mockSdkBridge.getSession.mockReturnValue({
         sessionId: 'sdk-sess-1',

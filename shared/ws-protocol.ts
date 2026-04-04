@@ -633,7 +633,7 @@ export type SdkServerMessage =
     latestTurnId: string | null
     status: SdkSessionStatus
     timelineSessionId?: string
-    revision?: number
+    revision: number
     streamingActive?: boolean
     streamingText?: string
   }

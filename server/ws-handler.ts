@@ -978,8 +978,8 @@ export class WsHandler {
       sessionId: opts.sessionId,
       latestTurnId: resolvedHistory?.latestTurnId ?? null,
       status: opts.status,
+      revision: resolvedHistory?.revision ?? 0,
       ...(resolvedHistory?.timelineSessionId ? { timelineSessionId: resolvedHistory.timelineSessionId } : {}),
-      ...(resolvedHistory ? { revision: resolvedHistory.revision } : {}),
       ...(opts.liveSession ? {
         streamingActive: opts.liveSession.streamingActive,
         streamingText: opts.liveSession.streamingText,
