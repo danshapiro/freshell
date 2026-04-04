@@ -285,6 +285,18 @@ describe('WS Handler SDK Integration', () => {
       mockSdkBridge = {
         createSession: vi.fn().mockReturnValue({ sessionId: 'sdk-sess-1', status: 'starting', messages: [] }),
         subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
+        captureReplayState: vi.fn().mockImplementation((sessionId: string) => ({
+          watermark: 0,
+          session: {
+            sessionId,
+            status: 'starting',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          },
+        })),
         sendUserMessage: vi.fn().mockReturnValue(true),
         respondPermission: vi.fn().mockReturnValue(true),
         interrupt: vi.fn().mockReturnValue(true),
@@ -990,7 +1002,11 @@ describe('WS Handler SDK Integration', () => {
           latestTurnId: 'turn-1',
         }))
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
-        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1', expect.objectContaining({
+          liveSessionOverride: expect.objectContaining({
+            sessionId: 'sdk-sess-1',
+          }),
+        }))
       } finally {
         ws.close()
       }
@@ -1018,8 +1034,12 @@ describe('WS Handler SDK Integration', () => {
           resumeSessionId: 'worktree-hotfix',
         }, 'sdk.session.snapshot')
 
-        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-named')
-        expect(mockHistorySource.resolve).not.toHaveBeenCalledWith('worktree-hotfix')
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-named', expect.objectContaining({
+          liveSessionOverride: expect.objectContaining({
+            sessionId: 'sdk-sess-named',
+          }),
+        }))
+        expect(mockHistorySource.resolve).not.toHaveBeenCalledWith('worktree-hotfix', expect.anything())
         expect(snapshot.timelineSessionId).toBeUndefined()
       } finally {
         ws.close()
@@ -1214,6 +1234,90 @@ describe('WS Handler SDK Integration', () => {
         // sdk.created MUST arrive before sdk.session.init
         expect(received[0].type).toBe('sdk.created')
         expect(received[1].type).toBe('sdk.session.init')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('replays only post-watermark events and converts buffered raw init into sdk.session.metadata during transactional create', async () => {
+      mockSdkBridge.captureReplayState.mockReturnValue({
+        watermark: 1,
+        session: {
+          sessionId: 'sdk-sess-1',
+          status: 'connected',
+          cliSessionId: 'cli-123',
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp',
+          tools: [{ name: 'Bash' }],
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+          streamingActive: false,
+          streamingText: '',
+          pendingPermissions: new Map(),
+          pendingQuestions: new Map(),
+        },
+      })
+      mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
+        listener({
+          type: 'sdk.session.init',
+          sessionId: 'sdk-sess-1',
+          cliSessionId: 'cli-123',
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp',
+          tools: [{ name: 'Bash' }],
+        }, { sequence: 1 })
+        listener({
+          type: 'sdk.stream',
+          sessionId: 'sdk-sess-1',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'after watermark' },
+          },
+        }, { sequence: 2 })
+        return { off: () => {}, replayed: true }
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const received: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.session.metadata'
+            || parsed.type === 'sdk.stream'
+          ) {
+            received.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-transactional-replay',
+          cwd: '/tmp',
+        }))
+
+        await vi.waitFor(() => expect(received.map((message) => message.type)).toEqual([
+          'sdk.created',
+          'sdk.session.snapshot',
+          'sdk.session.init',
+          'sdk.session.metadata',
+          'sdk.stream',
+        ]), { timeout: 3000 })
+
+        expect(received[3]).toMatchObject({
+          type: 'sdk.session.metadata',
+          cliSessionId: 'cli-123',
+          cwd: '/tmp',
+        })
+        expect(received[4]).toMatchObject({
+          type: 'sdk.stream',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'after watermark' },
+          },
+        })
       } finally {
         ws.close()
       }

@@ -77,7 +77,7 @@ export interface SdkSessionState {
   tools?: Array<{ name: string }>
   status: SdkSessionStatus
   createdAt: number
-  messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string }>
+  messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string; model?: string; messageId?: string }>
   streamingActive: boolean
   streamingText: string
   pendingPermissions: Map<string, {

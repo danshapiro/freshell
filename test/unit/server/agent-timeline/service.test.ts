@@ -173,6 +173,44 @@ describe('agent timeline service', () => {
     })).rejects.toThrow(/cursor/i)
   })
 
+  it('throws typed restore errors instead of fabricating empty timelines for missing sessions', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          kind: 'missing',
+          code: 'RESTORE_NOT_FOUND',
+        }),
+      },
+    })
+
+    await expect(service.getTimelinePage({
+      sessionId: 'missing-agent',
+      priority: 'visible',
+    })).rejects.toMatchObject({
+      code: 'RESTORE_NOT_FOUND',
+    })
+  })
+
+  it('throws typed fatal restore errors instead of fabricating empty timelines', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          kind: 'fatal',
+          code: 'RESTORE_UNAVAILABLE',
+          message: 'History store is unavailable',
+        }),
+      },
+    })
+
+    await expect(service.getTimelinePage({
+      sessionId: 'unavailable-agent',
+      priority: 'visible',
+    })).rejects.toMatchObject({
+      code: 'RESTORE_UNAVAILABLE',
+      message: 'History store is unavailable',
+    })
+  })
+
   it('rejects stale timeline-page revisions with the current ledger revision', async () => {
     const service = createAgentTimelineService({
       agentHistorySource: {

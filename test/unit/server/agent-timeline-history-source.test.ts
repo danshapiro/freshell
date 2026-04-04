@@ -46,7 +46,7 @@ describe('agent timeline history source', () => {
 
     await expect(source.resolve('missing-session')).resolves.toEqual({
       kind: 'missing',
-      queryId: 'missing-session',
+      code: 'RESTORE_NOT_FOUND',
     })
   })
 
@@ -113,7 +113,7 @@ describe('agent timeline history source', () => {
 
     await expect(source.resolve('named-only')).resolves.toEqual({
       kind: 'missing',
-      queryId: 'named-only',
+      code: 'RESTORE_NOT_FOUND',
     })
   })
 })

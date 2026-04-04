@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
-import { RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
+import { RestoreResolutionError, RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
 import {
@@ -23,6 +23,20 @@ const TurnParamsSchema = z.object({
 export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router {
   const router = Router()
   const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
+
+  function restoreResolutionStatus(code: RestoreResolutionError['code']): number {
+    switch (code) {
+      case 'RESTORE_NOT_FOUND':
+        return 404
+      case 'RESTORE_UNAVAILABLE':
+        return 503
+      case 'RESTORE_DIVERGED':
+        return 409
+      case 'RESTORE_INTERNAL':
+      default:
+        return 500
+    }
+  }
 
   router.get('/agent-sessions/:sessionId/timeline', async (req, res) => {
     const params = z.object({ sessionId: z.string().min(1) }).safeParse(req.params)
@@ -63,10 +77,16 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
         return
       }
       const message = error instanceof Error ? error.message : 'Agent timeline request failed'
-      const status = error instanceof RestoreStaleRevisionError ? 409 : /cursor/i.test(message) ? 400 : 500
+      const status = error instanceof RestoreStaleRevisionError
+        ? 409
+        : error instanceof RestoreResolutionError
+          ? restoreResolutionStatus(error.code)
+          : /cursor/i.test(message) ? 400 : 500
       const body = error instanceof RestoreStaleRevisionError
         ? { error: 'Stale restore revision', code: error.code, currentRevision: error.actualRevision }
-        : { error: message }
+        : error instanceof RestoreResolutionError
+          ? { error: message, code: error.code }
+          : { error: message }
       res.status(status).json(body)
     }
   })
@@ -87,10 +107,16 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
       res.json(turn)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Agent turn request failed'
-      const status = error instanceof RestoreStaleRevisionError ? 409 : 500
+      const status = error instanceof RestoreStaleRevisionError
+        ? 409
+        : error instanceof RestoreResolutionError
+          ? restoreResolutionStatus(error.code)
+          : 500
       const body = error instanceof RestoreStaleRevisionError
         ? { error: 'Stale restore revision', code: error.code, currentRevision: error.actualRevision }
-        : { error: message }
+        : error instanceof RestoreResolutionError
+          ? { error: message, code: error.code }
+          : { error: message }
       res.status(status).json(body)
     }
   })

@@ -1030,22 +1030,15 @@ export class WsHandler {
   private flushTransactionalCreateReplay(
     ws: LiveWebSocket,
     clientSessionId: string,
-    queuedMessages: SdkServerMessage[],
+    queuedMessages: Array<{ message: SdkServerMessage; sequence: number }>,
+    watermark: number,
   ): void {
-    const metadataMessages: SdkServerMessage[] = []
-    for (const message of queuedMessages) {
-      if (message.type === 'sdk.stream') {
-        continue
-      }
-      const transformed = this.transactionalCreateMessage(message, clientSessionId)
-      if (transformed.type === 'sdk.session.metadata') {
-        metadataMessages.push(transformed)
+    for (const queued of queuedMessages) {
+      const transformed = this.transactionalCreateMessage(queued.message, clientSessionId)
+      if (queued.sequence <= watermark && transformed.type !== 'sdk.session.metadata') {
         continue
       }
       this.safeSend(ws, transformed)
-    }
-    for (const metadata of metadataMessages) {
-      this.safeSend(ws, metadata)
     }
   }
 
@@ -1881,11 +1874,11 @@ export class WsHandler {
             effort: m.effort,
             plugins: m.plugins,
           })
-          const queuedMessages: SdkServerMessage[] = []
+          const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
           let createReadyForLiveForward = false
-          const createSubscription = this.sdkBridge.subscribe(session.sessionId, (message: SdkServerMessage) => {
+          const createSubscription = this.sdkBridge.subscribe(session.sessionId, (message: SdkServerMessage, meta?: { sequence: number }) => {
             if (!createReadyForLiveForward) {
-              queuedMessages.push(message)
+              queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
               return
             }
             this.safeSend(ws, this.transactionalCreateMessage(message, session!.sessionId))
@@ -1894,8 +1887,14 @@ export class WsHandler {
             throw new Error('SDK session subscription failed during create')
           }
           releaseCreateSubscription = createSubscription.off
+          const replayState = this.sdkBridge.captureReplayState?.(session.sessionId) ?? {
+            watermark: Number.MAX_SAFE_INTEGER,
+            session,
+          }
 
-          const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId) ?? null
+          const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId, {
+            liveSessionOverride: replayState.session,
+          }) ?? null
           const fatalRestore = resolvedHistory && typeof resolvedHistory === 'object' && (resolvedHistory as { kind?: unknown }).kind === 'fatal'
             ? resolvedHistory as unknown as { code: string; message: string }
             : null
@@ -1915,9 +1914,9 @@ export class WsHandler {
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
           await this.sendSdkSessionSnapshot(ws, {
             sessionId: session.sessionId,
-            status: session.status,
+            status: replayState.session.status,
             historyQueryId: session.sessionId,
-            liveSession: session,
+            liveSession: replayState.session,
             ...(resolvedHistory ? { resolvedHistory } : {}),
           })
 
@@ -1937,7 +1936,7 @@ export class WsHandler {
           state.sdkSessions.add(session.sessionId)
           state.sdkSessionTargets.set(session.sessionId, session.sessionId)
           state.sdkSubscriptions.set(session.sessionId, createSubscription.off)
-          this.flushTransactionalCreateReplay(ws, session.sessionId, queuedMessages)
+          this.flushTransactionalCreateReplay(ws, session.sessionId, queuedMessages, replayState.watermark)
           createReadyForLiveForward = true
 
           if (m.cwd?.trim()) {
@@ -2096,6 +2095,15 @@ export class WsHandler {
         const liveSession = directSession
           ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
         if (!liveSession) {
+          if (resolved?.kind === 'fatal') {
+            this.send(ws, {
+              type: 'sdk.error',
+              sessionId: m.sessionId,
+              code: resolved.code,
+              message: resolved.message,
+            } as SdkServerMessage)
+            return
+          }
           if (resolved?.kind === 'resolved') {
             await this.sendSdkSessionSnapshot(ws, {
               sessionId: m.sessionId,

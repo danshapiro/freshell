@@ -220,7 +220,12 @@ describe('WsHandler agent history source DI', () => {
 
     await waitForMessage(ws, (d) => d.type === 'sdk.session.snapshot')
 
-    expect(injectedHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
+    expect(injectedHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1', expect.objectContaining({
+      liveSessionOverride: expect.objectContaining({
+        sessionId: 'sdk-sess-1',
+        resumeSessionId: 'resume-sess-1',
+      }),
+    }))
     expect(moduleLoadSessionHistoryMock).not.toHaveBeenCalled()
 
     ws.close()

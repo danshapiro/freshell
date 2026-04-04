@@ -16,6 +16,7 @@ import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-ag
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
+import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
 import type {
   SdkSessionState,
   ContentBlock,
@@ -38,9 +39,10 @@ interface InputStreamHandle {
 interface SessionProcess {
   query: SdkQuery
   abortController: AbortController
-  browserListeners: Set<(msg: SdkServerMessage) => void>
+  browserListeners: Set<(msg: SdkServerMessage, meta?: { sequence: number }) => void>
   /** Buffer messages until the first subscriber attaches (prevents race condition) */
-  messageBuffer: SdkServerMessage[]
+  messageBuffer: Array<{ sequence: number; message: SdkServerMessage }>
+  nextSequence: number
   hasSubscribers: boolean
   inputStream: InputStreamHandle
 }
@@ -49,6 +51,36 @@ export class SdkBridge extends EventEmitter {
   private sessions = new Map<string, SdkSessionState>()
   private processes = new Map<string, SessionProcess>()
   private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
+
+  private cloneSessionState(state: SdkSessionState): SdkSessionState {
+    return {
+      ...state,
+      tools: state.tools ? state.tools.map((tool) => ({ ...tool })) : undefined,
+      messages: state.messages.map((message) => ({
+        ...message,
+        content: message.content.map((block) => ({ ...block })),
+      })),
+      pendingPermissions: new Map(state.pendingPermissions),
+      pendingQuestions: new Map(state.pendingQuestions),
+    }
+  }
+
+  private assignMessageId(
+    state: SdkSessionState,
+    message: { role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string; model?: string; messageId?: string },
+  ): string {
+    if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
+      return message.messageId
+    }
+    const fingerprint = createDurableMessageFingerprint(message)
+    let occurrenceIndex = 0
+    for (const existing of state.messages) {
+      if (createDurableMessageFingerprint(existing) === fingerprint) {
+        occurrenceIndex += 1
+      }
+    }
+    return synthesizeDeterministicMessageId(message, occurrenceIndex)
+  }
 
   async createSession(options: {
     cwd?: string
@@ -145,6 +177,7 @@ export class SdkBridge extends EventEmitter {
       abortController,
       browserListeners: new Set(),
       messageBuffer: [],
+      nextSequence: 1,
       hasSubscribers: false,
       inputStream,
     })
@@ -297,6 +330,14 @@ export class SdkBridge extends EventEmitter {
           role: 'assistant',
           content: blocks,
           timestamp: new Date().toISOString(),
+          messageId: this.assignMessageId(state, {
+            role: 'assistant',
+            content: blocks,
+            timestamp: new Date().toISOString(),
+            model: (aMsg.message as any)?.model,
+            messageId: typeof (aMsg.message as any)?.id === 'string' ? (aMsg.message as any).id : undefined,
+          }),
+          ...(typeof (aMsg.message as any)?.model === 'string' ? { model: (aMsg.message as any).model } : {}),
         })
         state.streamingActive = false
         state.streamingText = ''
@@ -529,7 +570,7 @@ export class SdkBridge extends EventEmitter {
     return true
   }
 
-  subscribe(sessionId: string, listener: (msg: SdkServerMessage) => void): { off: () => void; replayed: boolean } | null {
+  subscribe(sessionId: string, listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void): { off: () => void; replayed: boolean } | null {
     const sp = this.processes.get(sessionId)
     if (!sp) return null
     sp.browserListeners.add(listener)
@@ -539,8 +580,8 @@ export class SdkBridge extends EventEmitter {
     if (!sp.hasSubscribers) {
       sp.hasSubscribers = true
       replayed = true
-      for (const msg of sp.messageBuffer) {
-        try { listener(msg) } catch (err) {
+      for (const entry of sp.messageBuffer) {
+        try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
           log.warn({ err, sessionId }, 'Buffer replay error')
         }
       }
@@ -550,16 +591,33 @@ export class SdkBridge extends EventEmitter {
     return { off: () => { sp.browserListeners.delete(listener) }, replayed }
   }
 
+  captureReplayState(sessionId: string): { watermark: number; session: SdkSessionState } | null {
+    const sp = this.processes.get(sessionId)
+    const state = this.sessions.get(sessionId)
+    if (!sp || !state) return null
+    return {
+      watermark: sp.nextSequence - 1,
+      session: this.cloneSessionState(state),
+    }
+  }
+
   sendUserMessage(sessionId: string, text: string, images?: Array<{ mediaType: string; data: string }>): boolean {
     const sp = this.processes.get(sessionId)
     if (!sp) return false
 
     const state = this.sessions.get(sessionId)
     if (state) {
+      const timestamp = new Date().toISOString()
+      const content = [{ type: 'text', text } as ContentBlock]
       state.messages.push({
         role: 'user',
-        content: [{ type: 'text', text } as ContentBlock],
-        timestamp: new Date().toISOString(),
+        content,
+        timestamp,
+        messageId: this.assignMessageId(state, {
+          role: 'user',
+          content,
+          timestamp,
+        }),
       })
     }
 
@@ -673,15 +731,16 @@ export class SdkBridge extends EventEmitter {
   private broadcastToSession(sessionId: string, msg: SdkServerMessage): void {
     const sp = this.processes.get(sessionId)
     if (!sp) return
+    const sequence = sp.nextSequence++
 
     // Buffer messages until the first subscriber attaches
     if (!sp.hasSubscribers) {
-      sp.messageBuffer.push(msg)
+      sp.messageBuffer.push({ sequence, message: msg })
       return
     }
 
     for (const listener of sp.browserListeners) {
-      try { listener(msg) } catch (err) {
+      try { listener(msg, { sequence }) } catch (err) {
         log.warn({ err, sessionId }, 'Browser listener error')
       }
     }

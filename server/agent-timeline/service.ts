@@ -36,6 +36,15 @@ export class RestoreStaleRevisionError extends Error {
   }
 }
 
+export class RestoreResolutionError extends Error {
+  constructor(
+    public readonly code: 'RESTORE_NOT_FOUND' | 'RESTORE_UNAVAILABLE' | 'RESTORE_INTERNAL' | 'RESTORE_DIVERGED',
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
 function encodeCursor(payload: TimelineCursorPayload): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
@@ -108,13 +117,11 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
   }
 
   function buildResolvedTimeline(queryId: string, resolved: RestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
-    if (resolved.kind !== 'resolved') {
-      return {
-        sessionId: queryId,
-        latestTurnId: null,
-        revision: 0,
-        records: [],
-      }
+    if (resolved.kind === 'missing') {
+      throw new RestoreResolutionError(resolved.code, 'Restore session not found')
+    }
+    if (resolved.kind === 'fatal') {
+      throw new RestoreResolutionError(resolved.code, resolved.message)
     }
     const sessionId = resolved.timelineSessionId ?? queryId
     return {

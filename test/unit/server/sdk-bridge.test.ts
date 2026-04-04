@@ -133,6 +133,17 @@ describe('SdkBridge', () => {
       expect(bridge.findSessionByCliSessionId('00000000-0000-4000-8000-000000000241')?.sessionId).toBe(session.sessionId)
     })
 
+    it('assigns stable message ids to locally ingested user turns before any durable history exists', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+
+      expect(bridge.sendUserMessage(session.sessionId, 'hello world')).toBe(true)
+
+      const stored = bridge.getSession(session.sessionId)
+      expect(stored?.messages).toHaveLength(1)
+      expect(stored?.messages[0]?.messageId).toBeTruthy()
+    })
+
     it('kills a session', async () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
       const killed = bridge.killSession(session.sessionId)
@@ -192,6 +203,7 @@ describe('SdkBridge', () => {
 
       const assistantMsg = received.find(m => m.type === 'sdk.assistant')
       expect(assistantMsg).toBeDefined()
+      expect(bridge.getSession(session.sessionId)?.messages[0]?.messageId).toBeTruthy()
     })
 
     it('translates result to sdk.result with cost tracking', async () => {
