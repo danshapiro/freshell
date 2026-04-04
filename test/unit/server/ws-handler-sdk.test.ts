@@ -1911,6 +1911,109 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('does not lose post-watermark events that arrive during transactional create replay cutover', async () => {
+      let subscriptionListener: ((msg: any, meta?: { sequence: number }) => void) | undefined
+      let injectedStatus = false
+
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-cutover',
+        status: 'connected',
+        cliSessionId: 'cli-cutover',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: [],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+        replayGate: {
+          capture: vi.fn(() => ({
+            watermark: 1,
+            session: {
+              sessionId: 'sdk-sess-cutover',
+              status: 'connected',
+              cliSessionId: 'cli-cutover',
+              model: 'claude-sonnet-4-5-20250929',
+              cwd: '/tmp',
+              tools: [],
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+              streamingActive: false,
+              streamingText: '',
+              pendingPermissions: new Map(),
+              pendingQuestions: new Map(),
+            },
+          })),
+        },
+      }))
+      mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
+        subscriptionListener = listener
+        listener({
+          type: 'sdk.session.init',
+          sessionId: 'sdk-sess-cutover',
+          cliSessionId: 'cli-cutover',
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp',
+          tools: [],
+        }, { sequence: 1 })
+        listener({
+          type: 'sdk.stream',
+          sessionId: 'sdk-sess-cutover',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'queued replay event' },
+          },
+        }, { sequence: 2 })
+        return { off: () => {}, replayed: true }
+      })
+
+      const originalFlushTransactionalCreateReplay = (handler as any).flushTransactionalCreateReplay.bind(handler)
+      vi.spyOn(handler as any, 'flushTransactionalCreateReplay').mockImplementation((
+        ws: WebSocket,
+        clientSessionId: string,
+        queuedMessages: Array<{ message: any; sequence: number }>,
+        watermark: number,
+      ) => {
+        originalFlushTransactionalCreateReplay(ws, clientSessionId, queuedMessages, watermark)
+        if (injectedStatus) return
+        injectedStatus = true
+        subscriptionListener?.({
+          type: 'sdk.status',
+          sessionId: 'sdk-sess-cutover',
+          status: 'running',
+        }, { sequence: 3 })
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const received: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.session.metadata'
+            || parsed.type === 'sdk.stream'
+            || parsed.type === 'sdk.status'
+          ) {
+            received.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-cutover',
+          cwd: '/tmp',
+        }))
+
+        await vi.waitFor(() => {
+          expect(received.some((message) => message.type === 'sdk.status' && message.status === 'running')).toBe(true)
+        }, { timeout: 3000 })
+
+        expect(received.map((message) => message.type)).toContain('sdk.stream')
+        expect(received.map((message) => message.type)).toContain('sdk.status')
+      } finally {
+        ws.close()
+      }
+    })
+
     it('routes sdk.create with plugins to sdkBridge.createSession', async () => {
       const ws = await connectAndAuth()
       try {

@@ -1957,7 +1957,10 @@ export class WsHandler {
           state.sdkSessions.add(session.sessionId)
           state.sdkSessionTargets.set(session.sessionId, session.sessionId)
           state.sdkSubscriptions.set(session.sessionId, createSubscription.off)
-          this.flushTransactionalCreateReplay(ws, session.sessionId, queuedMessages, replayState.watermark)
+          while (queuedMessages.length > 0) {
+            const replayBatch = queuedMessages.splice(0, queuedMessages.length)
+            this.flushTransactionalCreateReplay(ws, session.sessionId, replayBatch, replayState.watermark)
+          }
           createReadyForLiveForward = true
 
           if (m.cwd?.trim()) {

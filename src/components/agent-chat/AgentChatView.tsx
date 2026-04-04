@@ -110,14 +110,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = getPreferredResumeSessionId(session)
+    ?? (
+      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
+        ? paneContent.resumeSessionId
+        : undefined
+    )
   const attachPayload = useMemo(() => {
     if (!paneContent.sessionId) return null
     return {
       type: 'sdk.attach' as const,
       sessionId: paneContent.sessionId,
-      ...(canonicalDurableSessionId ? { resumeSessionId: canonicalDurableSessionId } : {}),
+      ...(attachResumeSessionId ? { resumeSessionId: attachResumeSessionId } : {}),
     }
-  }, [canonicalDurableSessionId, paneContent.sessionId])
+  }, [attachResumeSessionId, paneContent.sessionId])
   const waitingForDurableHistoryIdentity = Boolean(
     session?.awaitingDurableHistory
       && session.latestTurnId === null
