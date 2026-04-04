@@ -324,6 +324,15 @@ describe('AgentChatView reload/restore behavior', () => {
   })
 
   it('restores from sdk.session.snapshot plus HTTP timeline fetch without waiting for sdk.history', async () => {
+    let resolveTurnBody: ((value: {
+      sessionId: string
+      turnId: string
+      message: {
+        role: 'assistant'
+        content: Array<{ type: 'text'; text: string }>
+        timestamp: string
+      }
+    }) => void) | null = null
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'sess-reload-1',
       items: [
@@ -338,15 +347,25 @@ describe('AgentChatView reload/restore behavior', () => {
       nextCursor: null,
       revision: 2,
     })
-    getAgentTurnBody.mockResolvedValue({
-      sessionId: 'sess-reload-1',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Hydrated from HTTP timeline' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
-      },
-    })
+    getAgentTurnBody.mockImplementation(
+      (_sessionId: string, _turnId: string, options?: { signal?: AbortSignal }) => (
+        new Promise((resolve, reject) => {
+          const signal = options?.signal
+          const abort = () => {
+            reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+          }
+          if (signal?.aborted) {
+            abort()
+            return
+          }
+          signal?.addEventListener('abort', abort, { once: true })
+          resolveTurnBody = (value) => {
+            signal?.removeEventListener('abort', abort)
+            resolve(value)
+          }
+        })
+      ),
+    )
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
@@ -373,6 +392,18 @@ describe('AgentChatView reload/restore behavior', () => {
       'turn-2',
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     )
+    await act(async () => {
+      resolveTurnBody?.({
+        sessionId: 'sess-reload-1',
+        turnId: 'turn-2',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Hydrated from HTTP timeline' }],
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      })
+      await Promise.resolve()
+    })
     expect(await screen.findByText('Hydrated from HTTP timeline')).toBeInTheDocument()
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
   })
