@@ -19,6 +19,7 @@ import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
 import type {
   SdkSessionState,
+  SdkCreatedSession,
   ContentBlock,
   SdkServerMessage,
   QuestionDefinition,
@@ -82,7 +83,7 @@ export class SdkBridge extends EventEmitter {
     permissionMode?: string
     effort?: 'low' | 'medium' | 'high' | 'max'
     plugins?: string[]
-  }): Promise<SdkSessionState> {
+  }): Promise<SdkCreatedSession> {
     const sessionId = nanoid()
     const state: SdkSessionState = {
       sessionId,
@@ -180,7 +181,19 @@ export class SdkBridge extends EventEmitter {
       log.error({ sessionId, err }, 'SDK stream error')
     })
 
-    return state
+    return Object.assign(state, {
+      replayGate: {
+        capture: () => {
+          const sp = this.processes.get(sessionId)
+          const currentState = this.sessions.get(sessionId)
+          if (!sp || !currentState) return null
+          return {
+            watermark: sp.nextSequence - 1,
+            session: this.cloneSessionState(currentState),
+          }
+        },
+      },
+    })
   }
 
   // Creates an async iterable that yields user messages written via sendUserMessage
@@ -597,16 +610,6 @@ export class SdkBridge extends EventEmitter {
     }
 
     return { off: () => { sp.browserListeners.delete(listener) }, replayed }
-  }
-
-  captureReplayState(sessionId: string): { watermark: number; session: SdkSessionState } | null {
-    const sp = this.processes.get(sessionId)
-    const state = this.sessions.get(sessionId)
-    if (!sp || !state) return null
-    return {
-      watermark: sp.nextSequence - 1,
-      session: this.cloneSessionState(state),
-    }
   }
 
   sendUserMessage(sessionId: string, text: string, images?: Array<{ mediaType: string; data: string }>): boolean {

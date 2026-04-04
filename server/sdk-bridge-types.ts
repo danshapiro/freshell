@@ -98,3 +98,16 @@ export interface SdkSessionState {
   totalInputTokens: number
   totalOutputTokens: number
 }
+
+export interface SdkReplayState {
+  watermark: number
+  session: SdkSessionState
+}
+
+export interface SdkReplayGate {
+  capture: () => SdkReplayState | null
+}
+
+export type SdkCreatedSession = SdkSessionState & {
+  replayGate: SdkReplayGate
+}

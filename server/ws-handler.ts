@@ -21,7 +21,7 @@ import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory } from './session-history-loader.js'
-import type { SdkSessionState } from './sdk-bridge-types.js'
+import type { SdkCreatedSession, SdkSessionState } from './sdk-bridge-types.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
@@ -1878,7 +1878,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled', requestId: m.requestId })
           return
         }
-        let session: SdkSessionState | undefined
+        let session: SdkCreatedSession | undefined
         let releaseCreateSubscription: (() => void) | undefined
         try {
           session = await this.sdkBridge.createSession({
@@ -1902,9 +1902,9 @@ export class WsHandler {
             throw new Error('SDK session subscription failed during create')
           }
           releaseCreateSubscription = createSubscription.off
-          const replayState = this.sdkBridge.captureReplayState?.(session.sessionId) ?? {
-            watermark: Number.MAX_SAFE_INTEGER,
-            session,
+          const replayState = session.replayGate.capture()
+          if (!replayState) {
+            throw new Error('SDK create replay gate unavailable')
           }
 
           const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId, {

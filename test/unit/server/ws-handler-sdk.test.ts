@@ -66,6 +66,30 @@ function makeResolvedHistory(options: {
   }
 }
 
+function makeCreatedSession(overrides: Record<string, any> = {}) {
+  const { replayGate, ...sessionOverrides } = overrides
+  const session = {
+    sessionId: 'sdk-sess-1',
+    status: 'starting',
+    messages: [],
+    streamingActive: false,
+    streamingText: '',
+    pendingPermissions: new Map(),
+    pendingQuestions: new Map(),
+    ...sessionOverrides,
+  }
+
+  return {
+    ...session,
+    replayGate: replayGate ?? {
+      capture: vi.fn(() => ({
+        watermark: 0,
+        session: { ...session },
+      })),
+    },
+  }
+}
+
 describe('WS Handler SDK Integration', () => {
   let originalAuthToken: string | undefined
 
@@ -287,7 +311,7 @@ describe('WS Handler SDK Integration', () => {
       }
 
       mockSdkBridge = {
-        createSession: vi.fn().mockReturnValue({ sessionId: 'sdk-sess-1', status: 'starting', messages: [] }),
+        createSession: vi.fn().mockReturnValue(makeCreatedSession()),
         subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
         captureReplayState: vi.fn().mockImplementation((sessionId: string) => ({
           watermark: 0,
@@ -1147,12 +1171,12 @@ describe('WS Handler SDK Integration', () => {
     })
 
     it('for named resume sdk.create resolves snapshot history by the live SDK session id and leaves timelineSessionId undefined', async () => {
-      mockSdkBridge.createSession.mockResolvedValue({
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
         sessionId: 'sdk-sess-named',
         resumeSessionId: 'worktree-hotfix',
         status: 'starting',
         messages: [],
-      })
+      }))
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
         queryId: 'sdk-sess-named',
         liveSessionId: 'sdk-sess-named',
@@ -1181,7 +1205,7 @@ describe('WS Handler SDK Integration', () => {
     })
 
     it('returns sdk.create.failed instead of fabricating a live-only snapshot when sdk.create history resolution fails unexpectedly', async () => {
-      mockSdkBridge.createSession.mockResolvedValue({
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
         sessionId: 'sdk-sess-live-only',
         status: 'running',
         messages: [makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z')],
@@ -1189,7 +1213,7 @@ describe('WS Handler SDK Integration', () => {
         streamingText: 'partial reply',
         pendingPermissions: new Map(),
         pendingQuestions: new Map(),
-      })
+      }))
       mockHistorySource.resolve.mockRejectedValue(new Error('jsonl read failed'))
 
       const ws = await connectAndAuth()
@@ -1233,6 +1257,54 @@ describe('WS Handler SDK Integration', () => {
         expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-live-only')
         expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-live-only', { recoverable: false })
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns sdk.create.failed when the transactional replay gate cannot capture create replay state', async () => {
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-gate-missing',
+        replayGate: {
+          capture: vi.fn(() => null),
+        },
+      }))
+      delete mockSdkBridge.captureReplayState
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.create.failed'
+          ) {
+            messages.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-gate-missing',
+        }))
+
+        await vi.waitFor(() => expect(messages.some((message) => message.type === 'sdk.create.failed')).toBe(true), { timeout: 3000 })
+
+        expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
+        expect(messages.find((message) => message.type === 'sdk.create.failed')).toEqual({
+          type: 'sdk.create.failed',
+          requestId: 'req-gate-missing',
+          code: 'RESTORE_INTERNAL',
+          message: 'SDK create replay gate unavailable',
+          retryable: true,
+        })
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-gate-missing')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-gate-missing', { recoverable: false })
       } finally {
         ws.close()
       }
@@ -1438,22 +1510,33 @@ describe('WS Handler SDK Integration', () => {
     })
 
     it('replays only post-watermark events and converts buffered raw init into sdk.session.metadata during transactional create', async () => {
-      mockSdkBridge.captureReplayState.mockReturnValue({
-        watermark: 1,
-        session: {
-          sessionId: 'sdk-sess-1',
-          status: 'connected',
-          cliSessionId: 'cli-123',
-          model: 'claude-sonnet-4-5-20250929',
-          cwd: '/tmp',
-          tools: [{ name: 'Bash' }],
-          messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
-          streamingActive: false,
-          streamingText: '',
-          pendingPermissions: new Map(),
-          pendingQuestions: new Map(),
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-1',
+        status: 'connected',
+        cliSessionId: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: [{ name: 'Bash' }],
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+        replayGate: {
+          capture: vi.fn(() => ({
+            watermark: 1,
+            session: {
+              sessionId: 'sdk-sess-1',
+              status: 'connected',
+              cliSessionId: 'cli-123',
+              model: 'claude-sonnet-4-5-20250929',
+              cwd: '/tmp',
+              tools: [{ name: 'Bash' }],
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+              streamingActive: false,
+              streamingText: '',
+              pendingPermissions: new Map(),
+              pendingQuestions: new Map(),
+            },
+          })),
         },
-      })
+      }))
       mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
         listener({
           type: 'sdk.session.init',
@@ -1643,13 +1726,13 @@ describe('WS Handler SDK Integration', () => {
       // but the UI waits for sdk.session.init before showing the chat input.
       // The ws-handler must send a preliminary sdk.session.init immediately
       // after sdk.created so the client can start interacting.
-      mockSdkBridge.createSession = vi.fn().mockReturnValue({
+      mockSdkBridge.createSession = vi.fn().mockReturnValue(makeCreatedSession({
         sessionId: 'sdk-sess-1',
         status: 'starting',
         model: 'claude-sonnet-4-5-20250929',
         cwd: '/tmp/project',
         messages: [],
-      })
+      }))
 
       const ws = await connectAndAuth()
       try {

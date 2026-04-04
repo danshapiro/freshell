@@ -59,6 +59,30 @@ function makeResolvedHistory(options: {
   }
 }
 
+function makeCreatedSession(overrides: Record<string, any> = {}) {
+  const { replayGate, ...sessionOverrides } = overrides
+  const session = {
+    sessionId: 'sdk-sess-1',
+    status: 'starting',
+    messages: [],
+    streamingActive: false,
+    streamingText: '',
+    pendingPermissions: new Map(),
+    pendingQuestions: new Map(),
+    ...sessionOverrides,
+  }
+
+  return {
+    ...session,
+    replayGate: replayGate ?? {
+      capture: vi.fn(() => ({
+        watermark: 0,
+        session: { ...session },
+      })),
+    },
+  }
+}
+
 function connectAndAuth(server: http.Server): Promise<WebSocket> {
   return new Promise<WebSocket>((resolve, reject) => {
     const addr = server.address()
@@ -156,7 +180,8 @@ describe('WsHandler agent history source DI', () => {
 
   it('sdk.create with resumeSessionId calls injected history source', async () => {
     const injectedHistorySource = {
-      resolve: vi.fn().mockResolvedValue({
+      resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-sess-1',
         liveSessionId: 'sdk-sess-1',
         revision: 1,
         messages: [
@@ -166,11 +191,12 @@ describe('WsHandler agent history source DI', () => {
             timestamp: '2026-01-01T00:00:01Z',
           },
         ],
-      }),
+      })),
+      teardownLiveSession: vi.fn(),
     }
 
     const mockSdkBridge = {
-      createSession: vi.fn().mockReturnValue({
+      createSession: vi.fn().mockReturnValue(makeCreatedSession({
         sessionId: 'sdk-sess-1',
         status: 'starting',
         messages: [],
@@ -179,7 +205,7 @@ describe('WsHandler agent history source DI', () => {
         resumeSessionId: 'resume-sess-1',
         streamingActive: false,
         streamingText: '',
-      }),
+      })),
       subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
       getSession: vi.fn(),
       getLiveSession: vi.fn().mockImplementation((sessionId: string) => mockSdkBridge.getSession(sessionId)),
@@ -248,6 +274,7 @@ describe('WsHandler agent history source DI', () => {
           },
         ],
       })),
+      teardownLiveSession: vi.fn(),
     }
 
     const mockSdkBridge = {
@@ -313,6 +340,7 @@ describe('WsHandler agent history source DI', () => {
           },
         ],
       })),
+      teardownLiveSession: vi.fn(),
     }
 
     const mockSdkBridge = {
@@ -392,7 +420,7 @@ describe('WsHandler agent history source DI', () => {
       getLiveSession: vi.fn().mockImplementation((sessionId: string) => (
         mockSdkBridge.getSession(sessionId)
       )),
-      createSession: vi.fn().mockReturnValue({
+      createSession: vi.fn().mockReturnValue(makeCreatedSession({
         sessionId: 'sdk-sess-module',
         status: 'starting',
         messages: [],
@@ -401,7 +429,7 @@ describe('WsHandler agent history source DI', () => {
         resumeSessionId: '01234567-89ab-cdef-0123-456789abcdef',
         streamingActive: false,
         streamingText: '',
-      }),
+      })),
       subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
       findSessionByCliSessionId: vi.fn(),
       findLiveSessionByCliSessionId: vi.fn().mockImplementation((timelineSessionId: string) => (
