@@ -144,6 +144,15 @@ function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplay
   return ''
 }
 
+function getStartupProbeReplayRemainder(pending: string): string | null {
+  if (!pending || pending === STARTUP_PROBE_OSC11_QUERY) {
+    return null
+  }
+  return STARTUP_PROBE_OSC11_QUERY.startsWith(pending)
+    ? STARTUP_PROBE_OSC11_QUERY.slice(pending.length)
+    : null
+}
+
 function deferTerminalPointerMutation(callback: () => void): void {
   // xterm link activation runs inside element-level mouse handlers while it may
   // still have document-level mouseup/move listeners in flight. Reparenting the
@@ -900,16 +909,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   }, [dispatch, tabId, paneId, ws])
 
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
+    const pendingProbe = startupProbeStateRef.current.pending
     if (opts?.discardReplayRemainder) {
-      const pendingProbe = startupProbeStateRef.current.pending
+      const remainder = getStartupProbeReplayRemainder(pendingProbe)
       startupProbeReplayDiscardStateRef.current = {
-        remainder:
-          pendingProbe
-          && pendingProbe !== STARTUP_PROBE_OSC11_QUERY
-          && STARTUP_PROBE_OSC11_QUERY.startsWith(pendingProbe)
-            ? STARTUP_PROBE_OSC11_QUERY.slice(pendingProbe.length)
-            : null,
+        remainder,
         buffered: '',
+      }
+      if (pendingProbe && !remainder) {
+        return
       }
     } else {
       startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
