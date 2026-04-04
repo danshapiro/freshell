@@ -15,9 +15,6 @@ type OpencodeSessionRow = {
   projectPath: string | null
 }
 
-type SqliteModule = Pick<typeof import('node:sqlite'), 'DatabaseSync'>
-type SqliteModuleLoader = () => Promise<SqliteModule>
-
 function defaultOpencodeDataHome(): string {
   if (process.env.XDG_DATA_HOME) {
     return path.join(process.env.XDG_DATA_HOME, 'opencode')
@@ -37,10 +34,7 @@ export class OpencodeProvider implements CodingCliProvider {
   readonly name = 'opencode' as const
   readonly displayName = 'OpenCode'
 
-  constructor(
-    readonly homeDir: string = defaultOpencodeDataHome(),
-    private readonly loadSqlite: SqliteModuleLoader = () => import('node:sqlite'),
-  ) {}
+  constructor(readonly homeDir: string = defaultOpencodeDataHome()) {}
 
   private getDatabasePath(): string {
     return path.join(this.homeDir, 'opencode.db')
@@ -54,9 +48,9 @@ export class OpencodeProvider implements CodingCliProvider {
       return []
     }
 
-    let sqlite: SqliteModule
+    let sqlite: typeof import('node:sqlite')
     try {
-      sqlite = await this.loadSqlite()
+      sqlite = await import('node:sqlite')
     } catch {
       logger.warn({ provider: this.name, nodeVersion: process.version }, 'node:sqlite unavailable — OpenCode sessions will not appear. Upgrade to Node 22.5+ to enable.')
       return []

@@ -669,15 +669,15 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         )}
 
         {timelineItems.map((item) => {
-          const message = timelineBodies[item.turnId]
-          if (message) {
+          const turn = timelineBodies[item.turnId]
+          if (turn) {
             return (
               <MessageBubble
                 key={`timeline-${item.turnId}`}
-                speaker={message.role}
-                content={message.content}
-                timestamp={message.timestamp}
-                model={message.model}
+                speaker={turn.message.role}
+                content={turn.message.content}
+                timestamp={turn.message.timestamp}
+                model={turn.message.model}
                 showThinking={paneContent.showThinking ?? defaultShowThinking}
                 showTools={paneContent.showTools ?? defaultShowTools}
                 showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}

@@ -61,6 +61,56 @@ function makeStore() {
   })
 }
 
+function makeTimelineItem(
+  turnId: string,
+  role: 'user' | 'assistant',
+  summary: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    sessionId: overrides.sessionId ?? 'cli-abc',
+    role,
+    summary,
+    ...(overrides.timestamp ? { timestamp: overrides.timestamp } : {}),
+  }
+}
+
+function makeTimelineTurn(
+  turnId: string,
+  role: 'user' | 'assistant',
+  text: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    sessionId: overrides.sessionId ?? 'cli-abc',
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    message: {
+      role,
+      content: [{ type: 'text' as const, text }],
+      timestamp: overrides.timestamp ?? '2026-03-10T10:01:00.000Z',
+    },
+  }
+}
+
 /** Walk the pane tree and find a leaf by ID */
 function findLeaf(node: PaneNode, paneId: string): Extract<PaneNode, { type: 'leaf' }> | null {
   if (node.type === 'leaf') return node.id === paneId ? node : null
@@ -299,26 +349,20 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-abc',
       items: [
-        {
-          turnId: 'turn-2',
+        makeTimelineItem('turn-2', 'assistant', 'Split-pane summary', {
           sessionId: 'cli-abc',
-          role: 'assistant',
-          summary: 'Split-pane summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 2,
       bodies: {
-        'turn-2': {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Hydrated split-pane turn', {
           sessionId: 'cli-abc',
-          turnId: 'turn-2',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'Hydrated split-pane turn' }],
-            timestamp: '2026-03-10T10:01:00.000Z',
-          },
-        },
+          ordinal: 2,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
       },
     })
 
@@ -600,39 +644,34 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-abc',
       items: [
-        {
-          turnId: 'turn-3',
+        makeTimelineItem('turn-3', 'assistant', 'Newest visible turn', {
           sessionId: 'cli-abc',
-          role: 'assistant',
-          summary: 'Newest visible turn',
+          ordinal: 3,
           timestamp: '2026-03-10T10:02:00.000Z',
-        },
-        {
-          turnId: 'turn-2',
+        }),
+        makeTimelineItem('turn-2', 'assistant', 'Older collapsed summary', {
           sessionId: 'cli-abc',
-          role: 'assistant',
-          summary: 'Older collapsed summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 2,
       bodies: {
-        'turn-3': {
+        'turn-3': makeTimelineTurn('turn-3', 'assistant', 'Newest visible turn body', {
           sessionId: 'cli-abc',
-          turnId: 'turn-3',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'Newest visible turn body' }],
-            timestamp: '2026-03-10T10:02:00.000Z',
-          },
-        },
+          ordinal: 3,
+          timestamp: '2026-03-10T10:02:00.000Z',
+        }),
       },
     })
     getAgentTurnBody.mockImplementation(async (_sessionId: string, turnId: string) => {
       return {
         sessionId: 'cli-abc',
-        turnId: 'turn-2',
+        turnId,
+        messageId: `message:${turnId}`,
+        ordinal: 2,
+        source: 'durable' as const,
         message: {
           role: 'assistant',
           content: [{ type: 'text', text: 'Expanded older turn body' }],

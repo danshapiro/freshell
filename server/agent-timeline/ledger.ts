@@ -42,15 +42,22 @@ type InternalTurn = CanonicalTurn & {
   syntheticMessageId: boolean
 }
 
+type ResolvedRestore = Extract<RestoreResolution, { kind: 'resolved' }>
+
 type LedgerRecord = {
   ledgerId: string
   revision: number
   signature: string
-  resolution: Extract<RestoreResolution, { kind: 'resolved' }>
+  resolution?: ResolvedRestore
   compatibilityCandidateIds: Set<string>
   aliases: Set<string>
   liveAliases: Set<string>
   durableAliases: Set<string>
+  liveSignature?: string
+  durableMessages: ChatMessage[]
+  durableTimelineSessionId?: string
+  durableLoaded: boolean
+  durablePending: boolean
 }
 
 function stableStringify(value: unknown): string {
@@ -313,10 +320,45 @@ function deriveCompatibilityCandidateIds(resolution: Extract<RestoreResolution, 
   )
 }
 
+function buildLiveSignature(liveSession: SdkSessionState, timelineSessionId?: string): string {
+  return stableStringify({
+    sessionId: liveSession.sessionId,
+    cliSessionId: liveSession.cliSessionId,
+    resumeSessionId: liveSession.resumeSessionId,
+    timelineSessionId,
+    messages: liveSession.messages.map((message) => ({
+      role: message.role,
+      messageId: message.messageId,
+      fingerprint: createDurableMessageFingerprint(message),
+    })),
+  })
+}
+
+function isCanonicalDurableSessionId(sessionId: string | undefined): sessionId is string {
+  return typeof sessionId === 'string' && isValidClaudeSessionId(sessionId)
+}
+
 export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
   const ledgers = new Map<string, LedgerRecord>()
   const ledgerIdByAlias = new Map<string, string>()
   const tombstonedLiveAliases = new Set<string>()
+
+  function createLedgerRecord(ledgerId: string): LedgerRecord {
+    const record: LedgerRecord = {
+      ledgerId,
+      revision: 0,
+      signature: '',
+      compatibilityCandidateIds: new Set<string>(),
+      aliases: new Set<string>(),
+      liveAliases: new Set<string>(),
+      durableAliases: new Set<string>(),
+      durableMessages: [],
+      durableLoaded: false,
+      durablePending: false,
+    }
+    ledgers.set(ledgerId, record)
+    return record
+  }
 
   function bindAliases(
     ledger: LedgerRecord,
@@ -337,6 +379,20 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     }
   }
 
+  function clearLedgerAliases(ledger: LedgerRecord): void {
+    for (const alias of ledger.aliases) {
+      ledgerIdByAlias.delete(alias)
+    }
+    ledger.aliases.clear()
+    ledger.liveAliases.clear()
+    ledger.durableAliases.clear()
+  }
+
+  function dropLedger(ledger: LedgerRecord): void {
+    clearLedgerAliases(ledger)
+    ledgers.delete(ledger.ledgerId)
+  }
+
   function findLedgerRecord(aliases: Array<string | undefined>): LedgerRecord | undefined {
     for (const alias of aliases) {
       if (!alias) continue
@@ -348,100 +404,193 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     return undefined
   }
 
+  async function hydrateDurableHistory(
+    ledger: LedgerRecord,
+    timelineSessionId: string | undefined,
+    options: { allowRetryOnPending: boolean },
+  ): Promise<void> {
+    if (!isCanonicalDurableSessionId(timelineSessionId)) return
+    const sameTarget = ledger.durableTimelineSessionId === timelineSessionId
+    if (sameTarget && ledger.durableLoaded && !(ledger.durablePending && options.allowRetryOnPending)) {
+      return
+    }
+
+    const durableMessages = (await deps.loadSessionHistory(timelineSessionId)) ?? []
+    ledger.durableMessages = durableMessages
+    ledger.durableTimelineSessionId = timelineSessionId
+    ledger.durableLoaded = true
+    ledger.durablePending = durableMessages.length === 0
+  }
+
+  function updateResolution(
+    ledger: LedgerRecord,
+    params: {
+      liveSession?: SdkSessionState
+      timelineSessionId?: string
+      queryId: string
+    },
+  ): void {
+    const durableTurns = buildCanonicalTurns(ledger.durableMessages, 'durable')
+    const liveTurns = buildCanonicalTurns(params.liveSession?.messages ?? [], 'live', {
+      liveSessionId: params.liveSession?.sessionId,
+    })
+    const mergedTurns = mergeTurns(durableTurns, liveTurns, ledger.compatibilityCandidateIds)
+    if (mergedTurns.kind === 'diverged') {
+      deps.logDivergence?.({
+        queryId: params.queryId,
+        reason: 'ambiguous-live-overlap',
+        liveSessionId: params.liveSession?.sessionId,
+        timelineSessionId: params.timelineSessionId,
+      })
+      throw {
+        code: 'RESTORE_DIVERGED',
+        message: 'Live restore state diverged from durable history',
+      }
+    }
+
+    const readiness: LedgerReadiness = durableTurns.length > 0 && liveTurns.length > 0
+      ? 'merged'
+      : durableTurns.length > 0
+        ? 'durable_only'
+        : 'live_only'
+
+    const stableQueryId = ledger.resolution?.queryId
+      ?? params.liveSession?.sessionId
+      ?? params.timelineSessionId
+      ?? params.queryId
+
+    const nextResolution: ResolvedRestore = {
+      kind: 'resolved',
+      queryId: stableQueryId,
+      liveSessionId: params.liveSession?.sessionId,
+      timelineSessionId: params.timelineSessionId,
+      readiness,
+      revision: 1,
+      latestTurnId: mergedTurns.turns.at(-1)?.turnId ?? null,
+      turns: mergedTurns.turns,
+    }
+
+    const signature = buildSignature(nextResolution)
+    const revision = ledger.signature === signature ? ledger.revision : ledger.revision + 1
+    const resolved = { ...nextResolution, revision }
+
+    ledger.revision = revision
+    ledger.signature = signature
+    ledger.resolution = resolved
+    ledger.compatibilityCandidateIds = resolved.readiness === 'live_only'
+      ? deriveCompatibilityCandidateIds(resolved)
+      : new Set(ledger.compatibilityCandidateIds)
+  }
+
+  async function buildDurableOnlyResolution(queryId: string, timelineSessionId: string): Promise<RestoreResolution> {
+    const existing = findLedgerRecord([timelineSessionId])
+    const ledger = existing ?? createLedgerRecord(timelineSessionId)
+    await hydrateDurableHistory(ledger, timelineSessionId, { allowRetryOnPending: true })
+    if (ledger.durableMessages.length === 0) {
+      if (!existing) ledgers.delete(ledger.ledgerId)
+      return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+    }
+    updateResolution(ledger, {
+      queryId,
+      timelineSessionId,
+    })
+    bindAliases(ledger, {
+      liveAliases: [],
+      durableAliases: [timelineSessionId],
+    })
+    return ledger.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+  }
+
+  async function rebuildAfterLiveAuthorityEnded(queryId: string, ledger: LedgerRecord): Promise<RestoreResolution> {
+    const durableSessionId = isCanonicalDurableSessionId(queryId)
+      ? queryId
+      : Array.from(ledger.durableAliases).find((alias) => isCanonicalDurableSessionId(alias))
+    dropLedger(ledger)
+    if (!durableSessionId) {
+      return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+    }
+    return buildDurableOnlyResolution(queryId, durableSessionId)
+  }
+
+  async function syncLiveSession(liveSession: SdkSessionState): Promise<LedgerRecord> {
+    const timelineSessionId = resolveTimelineSessionId(liveSession.sessionId, liveSession)
+    const liveSignature = buildLiveSignature(liveSession, timelineSessionId)
+    const existing = findLedgerRecord([
+      liveSession.sessionId,
+      liveSession.resumeSessionId,
+      timelineSessionId,
+    ])
+    const ledger = existing ?? createLedgerRecord(liveSession.sessionId)
+
+    const shouldRetryDurableHydrate = isCanonicalDurableSessionId(timelineSessionId) && (
+      ledger.durableTimelineSessionId !== timelineSessionId
+      || !ledger.durableLoaded
+      || (ledger.durablePending && ledger.liveSignature !== liveSignature)
+    )
+    if (shouldRetryDurableHydrate) {
+      await hydrateDurableHistory(ledger, timelineSessionId, {
+        allowRetryOnPending: ledger.liveSignature !== liveSignature,
+      })
+    }
+
+    const needsResolutionRefresh = ledger.liveSignature !== liveSignature
+      || ledger.resolution == null
+      || ledger.resolution.liveSessionId !== liveSession.sessionId
+      || ledger.resolution.timelineSessionId !== timelineSessionId
+      || (ledger.resolution.readiness === 'live_only' && ledger.durableMessages.length > 0)
+      || (ledger.resolution.readiness !== 'live_only' && ledger.durableMessages.length === 0 && isCanonicalDurableSessionId(timelineSessionId))
+    if (needsResolutionRefresh) {
+      updateResolution(ledger, {
+        liveSession,
+        timelineSessionId,
+        queryId: liveSession.sessionId,
+      })
+      ledger.liveSignature = liveSignature
+    }
+
+    bindAliases(ledger, {
+      liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],
+      durableAliases: [isCanonicalDurableSessionId(timelineSessionId) ? timelineSessionId : undefined],
+    })
+    return ledger
+  }
+
   return {
+    async syncLiveSession(liveSession: SdkSessionState): Promise<void> {
+      tombstonedLiveAliases.delete(liveSession.sessionId)
+      if (liveSession.resumeSessionId) tombstonedLiveAliases.delete(liveSession.resumeSessionId)
+      await syncLiveSession(liveSession)
+    },
+
     async resolve(queryId: string, options?: AgentHistoryResolveOptions): Promise<RestoreResolution> {
-      const liveSessionCandidate = options?.liveSessionOverride ?? (
+      try {
+        const liveSessionCandidate = options?.liveSessionOverride ?? (
         tombstonedLiveAliases.has(queryId)
           ? undefined
           : deps.getLiveSessionBySdkSessionId(queryId) ?? deps.getLiveSessionByCliSessionId(queryId)
-      )
-      const liveSession = liveSessionCandidate && tombstonedLiveAliases.has(liveSessionCandidate.sessionId)
+        )
+        const liveSession = liveSessionCandidate && tombstonedLiveAliases.has(liveSessionCandidate.sessionId)
         ? undefined
         : liveSessionCandidate
-      const timelineSessionId = resolveTimelineSessionId(queryId, liveSession)
-
-      let durableMessages: ChatMessage[] = []
-      if (timelineSessionId) {
-        try {
-          durableMessages = (await deps.loadSessionHistory(timelineSessionId)) ?? []
-        } catch (error) {
-          return mapFatalError(error)
+        if (liveSession) {
+          const ledger = await syncLiveSession(liveSession)
+          return ledger.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
         }
-      }
 
-      if (!liveSession && durableMessages.length === 0) {
-        return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
-      }
-
-      const liveAliases = [liveSession?.sessionId, liveSession?.resumeSessionId]
-      const durableAliases = [timelineSessionId]
-      const existing = findLedgerRecord([queryId, ...liveAliases, ...durableAliases])
-      const durableTurns = buildCanonicalTurns(durableMessages, 'durable')
-      const liveTurns = buildCanonicalTurns(liveSession?.messages ?? [], 'live', {
-        liveSessionId: liveSession?.sessionId,
-      })
-      const mergedTurns = mergeTurns(durableTurns, liveTurns, existing?.compatibilityCandidateIds)
-      if (mergedTurns.kind === 'diverged') {
-        deps.logDivergence?.({
-          queryId,
-          reason: 'ambiguous-live-overlap',
-          liveSessionId: liveSession?.sessionId,
-          timelineSessionId,
-        })
-        return {
-          kind: 'fatal',
-          code: 'RESTORE_DIVERGED',
-          message: 'Live restore state diverged from durable history',
+        const existing = findLedgerRecord([queryId])
+        if (existing) {
+          if (existing.liveAliases.size > 0) {
+            return rebuildAfterLiveAuthorityEnded(queryId, existing)
+          }
+          return existing.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
         }
+        if (!isCanonicalDurableSessionId(queryId)) {
+          return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
+        }
+        return buildDurableOnlyResolution(queryId, queryId)
+      } catch (error) {
+        return mapFatalError(error)
       }
-
-      const readiness: LedgerReadiness = durableTurns.length > 0 && liveTurns.length > 0
-        ? 'merged'
-        : durableTurns.length > 0
-          ? 'durable_only'
-          : 'live_only'
-
-      const nextResolution: Extract<RestoreResolution, { kind: 'resolved' }> = {
-        kind: 'resolved',
-        queryId,
-        liveSessionId: liveSession?.sessionId,
-        timelineSessionId,
-        readiness,
-        revision: 1,
-        latestTurnId: mergedTurns.turns.at(-1)?.turnId ?? null,
-        turns: mergedTurns.turns,
-      }
-
-      const signature = buildSignature(nextResolution)
-      const nextCompatibilityCandidateIds = nextResolution.readiness === 'live_only'
-        ? deriveCompatibilityCandidateIds(nextResolution)
-        : new Set(existing?.compatibilityCandidateIds ?? [])
-
-      if (existing) {
-        const revision = existing.signature === signature ? existing.revision : existing.revision + 1
-        const resolved = { ...nextResolution, revision }
-        existing.revision = revision
-        existing.signature = signature
-        existing.resolution = resolved
-        existing.compatibilityCandidateIds = nextCompatibilityCandidateIds
-        bindAliases(existing, { liveAliases, durableAliases })
-        return resolved
-      }
-
-      const ledgerId = liveSession?.sessionId ?? timelineSessionId ?? queryId
-      const record: LedgerRecord = {
-        ledgerId,
-        revision: 1,
-        signature,
-        resolution: nextResolution,
-        compatibilityCandidateIds: nextCompatibilityCandidateIds,
-        aliases: new Set<string>(),
-        liveAliases: new Set<string>(),
-        durableAliases: new Set<string>(),
-      }
-      ledgers.set(record.ledgerId, record)
-      bindAliases(record, { liveAliases, durableAliases })
-      return nextResolution
     },
 
     teardownLiveSession(sessionId: string, options: { recoverable: boolean }): void {
@@ -453,12 +602,8 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       if (!record) return
       for (const alias of record.liveAliases) {
         tombstonedLiveAliases.add(alias)
-        ledgerIdByAlias.delete(alias)
       }
-      for (const alias of record.durableAliases) {
-        ledgerIdByAlias.delete(alias)
-      }
-      ledgers.delete(ledgerId)
+      dropLedger(record)
     },
   }
 }

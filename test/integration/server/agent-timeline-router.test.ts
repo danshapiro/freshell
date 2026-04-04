@@ -233,6 +233,63 @@ describe('agent timeline router with the real service', () => {
     })
   })
 
+  it('round-trips a real service cursor without drifting off the accepted revision', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-session-777',
+          liveSessionId: 'sdk-session-777',
+          timelineSessionId: canonicalSessionId,
+          revision: 21,
+          messages: [
+            {
+              role: 'user',
+              timestamp: '2026-03-10T10:00:00.000Z',
+              content: [{ type: 'text', text: 'oldest prompt' }],
+            },
+            {
+              role: 'assistant',
+              timestamp: '2026-03-10T10:01:00.000Z',
+              content: [{ type: 'text', text: 'middle reply' }],
+            },
+            {
+              role: 'user',
+              timestamp: '2026-03-10T10:02:00.000Z',
+              content: [{ type: 'text', text: 'newest prompt' }],
+            },
+          ],
+        })),
+      },
+    })
+
+    const app = createAuthedApp(service)
+    const firstPage = await request(app)
+      .get('/api/agent-sessions/sdk-session-777/timeline?priority=visible&limit=2&revision=21')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(firstPage.status).toBe(200)
+    expect(firstPage.body.revision).toBe(21)
+    expect(firstPage.body.nextCursor).toEqual(expect.any(String))
+
+    const secondPage = await request(app)
+      .get(`/api/agent-sessions/sdk-session-777/timeline?priority=visible&cursor=${encodeURIComponent(firstPage.body.nextCursor)}&revision=21`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(secondPage.status).toBe(200)
+    expect(secondPage.body.revision).toBe(21)
+    expect(secondPage.body.nextCursor).toBeNull()
+    expect(secondPage.body.items).toEqual([
+      expect.objectContaining({
+        sessionId: canonicalSessionId,
+        turnId: 'turn-0',
+        messageId: 'message-0',
+        ordinal: 0,
+        source: 'durable',
+      }),
+    ])
+  })
+
   it('rejects malformed turn-body revisions with HTTP 400 instead of treating them as stale restore state', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000655'
     const service = createAgentTimelineService({

@@ -105,7 +105,7 @@ describe('TabsView', () => {
     expect(screen.getByLabelText(/Expand Recently closed/i)).toBeInTheDocument()
   })
 
-  it('renders tab cards as clickable buttons with aria-labels', () => {
+  it('renders tab cards as native buttons with aria-labels', () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -113,7 +113,7 @@ describe('TabsView', () => {
       </Provider>,
     )
 
-    const remoteCard = screen.getByRole('button', { name: 'remote-device: remote open' })
+    const remoteCard = screen.getByLabelText('remote-device: remote open')
     expect(remoteCard.tagName).toBe('BUTTON')
   })
 

@@ -70,8 +70,7 @@ export const loadAgentTurnBody = createAsyncThunk<
       const turn = await getAgentTurnBody(timelineSessionId ?? sessionId, turnId, { revision, signal })
       dispatch(turnBodyReceived({
         sessionId,
-        turnId,
-        message: turn.message,
+        turn,
       }))
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -139,8 +138,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       )
       dispatch(turnBodyReceived({
         sessionId,
-        turnId: newestTurn.turnId,
-        message: turn.message,
+        turn,
       }))
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {

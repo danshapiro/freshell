@@ -33,6 +33,51 @@ function makeChatMessage(role: 'user' | 'assistant', text: string) {
   }
 }
 
+function makeTimelineItem(
+  turnId: string,
+  role: 'user' | 'assistant',
+  summary: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    sessionId: overrides.sessionId ?? 'sess-timeline',
+    role,
+    summary,
+    ...(overrides.timestamp ? { timestamp: overrides.timestamp } : {}),
+  }
+}
+
+function makeTimelineTurn(
+  turnId: string,
+  role: 'user' | 'assistant',
+  text: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+  }> = {},
+) {
+  return {
+    sessionId: overrides.sessionId ?? 'sess-timeline',
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    message: makeChatMessage(role, text),
+  }
+}
+
 describe('agentChatSlice', () => {
   const initial = agentChatReducer(undefined, { type: 'init' })
 
@@ -380,13 +425,11 @@ describe('agentChatSlice', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',
       items: [
-        {
-          turnId: 'turn-2',
+        makeTimelineItem('turn-2', 'assistant', 'Latest summary', {
           sessionId: 'sess-timeline',
-          role: 'assistant',
-          summary: 'Latest summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: 'cursor-2',
       revision: 2,
@@ -403,18 +446,22 @@ describe('agentChatSlice', () => {
   it('stores hydrated turn bodies separately from live websocket messages', () => {
     const state = agentChatReducer(initial, turnBodyReceived({
       sessionId: 'sess-turn',
-      turnId: 'turn-7',
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: 'Hydrated older turn' }],
-        timestamp: '2026-03-10T09:55:00.000Z',
-      },
+      turn: makeTimelineTurn('turn-7', 'user', 'Hydrated older turn', {
+        sessionId: 'sess-turn',
+        messageId: 'message-7',
+        ordinal: 7,
+      }),
     }))
 
     expect(state.sessions['sess-turn'].messages).toEqual([])
     expect(state.sessions['sess-turn'].timelineBodies['turn-7']).toEqual(
       expect.objectContaining({
-        content: [{ type: 'text', text: 'Hydrated older turn' }],
+        messageId: 'message-7',
+        ordinal: 7,
+        source: 'durable',
+        message: expect.objectContaining({
+          content: [{ type: 'text', text: 'Hydrated older turn' }],
+        }),
       }),
     )
   })
@@ -422,54 +469,70 @@ describe('agentChatSlice', () => {
   it('hydrates inline page bodies and clears stale replace-mode bodies', () => {
     let state = agentChatReducer(initial, turnBodyReceived({
       sessionId: 'sdk-1',
-      turnId: 'stale-turn',
-      message: makeChatMessage('assistant', 'stale'),
+      turn: makeTimelineTurn('stale-turn', 'assistant', 'stale', {
+        sessionId: 'cli-1',
+      }),
     }))
 
     state = agentChatReducer(state, timelinePageReceived({
       sessionId: 'sdk-1',
-      items: [{ turnId: 'turn-2', sessionId: 'cli-1', role: 'assistant', summary: 'hello' }],
+      items: [makeTimelineItem('turn-2', 'assistant', 'hello', {
+        sessionId: 'cli-1',
+        messageId: 'message-2',
+        ordinal: 2,
+      })],
       nextCursor: null,
       revision: 12,
       replace: true,
       bodies: {
-        'turn-2': {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'hello', {
           sessionId: 'cli-1',
-          turnId: 'turn-2',
-          message: makeChatMessage('assistant', 'hello'),
-        },
+          messageId: 'message-2',
+          ordinal: 2,
+        }),
       },
     }))
 
-    expect(state.sessions['sdk-1'].timelineBodies['turn-2']).toEqual(makeChatMessage('assistant', 'hello'))
+    expect(state.sessions['sdk-1'].timelineItems).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-2',
+        messageId: 'message-2',
+        ordinal: 2,
+        source: 'durable',
+      }),
+    ])
+    expect(state.sessions['sdk-1'].timelineBodies['turn-2']).toEqual(expect.objectContaining({
+      turnId: 'turn-2',
+      messageId: 'message-2',
+      ordinal: 2,
+      source: 'durable',
+      message: makeChatMessage('assistant', 'hello'),
+    }))
     expect(state.sessions['sdk-1'].timelineBodies['stale-turn']).toBeUndefined()
   })
 
   it('preserves previously expanded bodies when appending an older timeline page', () => {
     let state = agentChatReducer(initial, turnBodyReceived({
       sessionId: 'sdk-1',
-      turnId: 'turn-newest',
-      message: makeChatMessage('assistant', 'newest full body'),
+      turn: makeTimelineTurn('turn-newest', 'assistant', 'newest full body', {
+        sessionId: 'cli-1',
+      }),
     }))
 
     state = agentChatReducer(state, timelinePageReceived({
       sessionId: 'sdk-1',
-      items: [{ turnId: 'turn-older', sessionId: 'cli-1', role: 'user', summary: 'older question' }],
+      items: [makeTimelineItem('turn-older', 'user', 'older question', { sessionId: 'cli-1' })],
       nextCursor: 'cursor-older',
       revision: 13,
       replace: false,
       bodies: {
-        'turn-older': {
-          sessionId: 'cli-1',
-          turnId: 'turn-older',
-          message: makeChatMessage('user', 'older full body'),
-        },
+        'turn-older': makeTimelineTurn('turn-older', 'user', 'older full body', { sessionId: 'cli-1' }),
       },
     }))
 
     expect(state.sessions['sdk-1'].timelineBodies).toEqual(expect.objectContaining({
-      'turn-newest': makeChatMessage('assistant', 'newest full body'),
-      'turn-older': makeChatMessage('user', 'older full body'),
+      'turn-newest': makeTimelineTurn('turn-newest', 'assistant', 'newest full body', { sessionId: 'cli-1' }),
+      'turn-older': makeTimelineTurn('turn-older', 'user', 'older full body', { sessionId: 'cli-1' }),
     }))
   })
 
@@ -477,13 +540,11 @@ describe('agentChatSlice', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'unknown-sess',
       items: [
-        {
-          turnId: 'turn-1',
+        makeTimelineItem('turn-1', 'user', 'hello', {
           sessionId: 'unknown-sess',
-          role: 'user',
-          summary: 'hello',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 1,

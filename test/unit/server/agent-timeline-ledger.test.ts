@@ -126,6 +126,54 @@ describe('restore ledger manager', () => {
     ])
   })
 
+  it('reuses one authoritative in-memory ledger while a live session exists', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000424'
+    const liveSession = makeSession({
+      sessionId: 'sdk-authority',
+      cliSessionId: canonicalSessionId,
+      messages: [
+        makeMessage('user', 'prompt', { messageId: 'live-user-1' }),
+      ],
+    })
+    const loadSessionHistory = vi.fn().mockResolvedValue([
+      makeMessage('assistant', 'older durable reply', { messageId: 'durable-assistant-1' }),
+    ])
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const first = await manager.resolve('sdk-authority')
+    const second = await manager.resolve(canonicalSessionId)
+
+    expect(first).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-authority',
+      timelineSessionId: canonicalSessionId,
+    })
+    expect(second).toEqual(first)
+    expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+
+    liveSession.messages.push(makeMessage('assistant', 'fresh live delta', { messageId: 'live-assistant-2' }))
+
+    const third = await manager.resolve('sdk-authority')
+
+    expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+    expect(third).toMatchObject({
+      kind: 'resolved',
+      revision: first.kind === 'resolved' ? first.revision + 1 : expect.any(Number),
+    })
+    if (third.kind !== 'resolved') throw new Error('expected resolved')
+    expect(third.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-assistant-1',
+      'live-user-1',
+      'live-assistant-2',
+    ])
+  })
+
   it('keeps synthesized durable ids stable across equivalent JSONL rewrites and preserves upstream ids', async () => {
     const firstDurable = [
       makeMessage('user', 'hello  \r\nworld', { timestamp: '2026-04-03T12:00:00.000Z' }),

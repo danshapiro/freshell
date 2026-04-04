@@ -27,6 +27,56 @@ function makeStore() {
   })
 }
 
+function makeTimelineItem(
+  turnId: string,
+  role: 'user' | 'assistant',
+  summary: string,
+  overrides: Partial<{
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    sessionId: string
+    timestamp: string
+  }> = {},
+) {
+  return {
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    sessionId: overrides.sessionId ?? 'sess-1',
+    role,
+    summary,
+    ...(overrides.timestamp ? { timestamp: overrides.timestamp } : {}),
+  }
+}
+
+function makeTimelineTurn(
+  turnId: string,
+  role: 'user' | 'assistant',
+  text: string,
+  overrides: Partial<{
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    sessionId: string
+    timestamp: string
+  }> = {},
+) {
+  return {
+    sessionId: overrides.sessionId ?? 'sess-1',
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    message: {
+      role,
+      content: [{ type: 'text', text }],
+      timestamp: overrides.timestamp ?? '2026-03-10T10:01:00.000Z',
+    },
+  }
+}
+
 describe('agentChatThunks', () => {
   beforeEach(() => {
     getAgentTimelinePage.mockReset()
@@ -38,21 +88,24 @@ describe('agentChatThunks', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'sess-1',
       items: [
-        { turnId: 'turn-2', sessionId: 'sess-1', role: 'assistant', summary: 'Latest summary', timestamp: '2026-03-10T10:01:00.000Z' },
-        { turnId: 'turn-1', sessionId: 'sess-1', role: 'user', summary: 'Older summary', timestamp: '2026-03-10T10:00:00.000Z' },
+        makeTimelineItem('turn-2', 'assistant', 'Latest summary', {
+          sessionId: 'sess-1',
+          ordinal: 1,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
+        makeTimelineItem('turn-1', 'user', 'Older summary', {
+          sessionId: 'sess-1',
+          ordinal: 0,
+          timestamp: '2026-03-10T10:00:00.000Z',
+        }),
       ],
       nextCursor: 'cursor-2',
       revision: 2,
     })
-    getAgentTurnBody.mockResolvedValue({
+    getAgentTurnBody.mockResolvedValue(makeTimelineTurn('turn-2', 'assistant', 'Latest full body', {
       sessionId: 'sess-1',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Latest full body' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
-      },
-    })
+      ordinal: 1,
+    }))
 
     const store = makeStore()
     await store.dispatch(loadAgentTimelineWindow({
@@ -79,7 +132,12 @@ describe('agentChatThunks', () => {
       expect.objectContaining({ turnId: 'turn-1', summary: 'Older summary' }),
     ])
     expect(session.timelineBodies['turn-2']).toEqual(expect.objectContaining({
-      content: [{ type: 'text', text: 'Latest full body' }],
+      messageId: 'message:turn-2',
+      ordinal: 1,
+      source: 'durable',
+      message: expect.objectContaining({
+        content: [{ type: 'text', text: 'Latest full body' }],
+      }),
     }))
     expect(session.nextTimelineCursor).toBe('cursor-2')
   })
@@ -87,19 +145,11 @@ describe('agentChatThunks', () => {
   it('requests includeBodies on the first visible page and skips getAgentTurnBody when the newest body is inline', async () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-sess-1',
-      items: [{ turnId: 'turn-2', sessionId: 'cli-sess-1', role: 'assistant', summary: 'Latest summary' }],
+      items: [makeTimelineItem('turn-2', 'assistant', 'Latest summary', { sessionId: 'cli-sess-1' })],
       nextCursor: null,
       revision: 2,
       bodies: {
-        'turn-2': {
-          sessionId: 'cli-sess-1',
-          turnId: 'turn-2',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'Latest full body' }],
-            timestamp: '2026-03-10T10:01:00.000Z',
-          },
-        },
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Latest full body', { sessionId: 'cli-sess-1' }),
       },
     })
 
@@ -122,7 +172,11 @@ describe('agentChatThunks', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-sess-1',
       items: [
-        { turnId: 'turn-older', sessionId: 'cli-sess-1', role: 'user', summary: 'Older summary', timestamp: '2026-03-10T09:59:00.000Z' },
+        makeTimelineItem('turn-older', 'user', 'Older summary', {
+          sessionId: 'cli-sess-1',
+          ordinal: 1,
+          timestamp: '2026-03-10T09:59:00.000Z',
+        }),
       ],
       nextCursor: null,
       revision: 3,
@@ -131,12 +185,7 @@ describe('agentChatThunks', () => {
     const store = makeStore()
     store.dispatch(turnBodyReceived({
       sessionId: 'sdk-sess-1',
-      turnId: 'turn-newest',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Newest full body' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
-      },
+      turn: makeTimelineTurn('turn-newest', 'assistant', 'Newest full body', { sessionId: 'cli-sess-1' }),
     }))
 
     await store.dispatch(loadAgentTimelineWindow({
@@ -152,7 +201,9 @@ describe('agentChatThunks', () => {
       expect.anything(),
     )
     expect(store.getState().agentChat.sessions['sdk-sess-1'].timelineBodies['turn-newest']).toEqual(expect.objectContaining({
-      content: [{ type: 'text', text: 'Newest full body' }],
+      message: expect.objectContaining({
+        content: [{ type: 'text', text: 'Newest full body' }],
+      }),
     }))
   })
 
@@ -185,15 +236,11 @@ describe('agentChatThunks', () => {
   })
 
   it('hydrates an older turn body on demand', async () => {
-    getAgentTurnBody.mockResolvedValue({
+    getAgentTurnBody.mockResolvedValue(makeTimelineTurn('turn-7', 'user', 'Older hydrated turn', {
       sessionId: 'sess-3',
-      turnId: 'turn-7',
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: 'Older hydrated turn' }],
-        timestamp: '2026-03-10T09:55:00.000Z',
-      },
-    })
+      ordinal: 7,
+      timestamp: '2026-03-10T09:55:00.000Z',
+    }))
 
     const store = makeStore()
     await store.dispatch(loadAgentTurnBody({
@@ -209,7 +256,9 @@ describe('agentChatThunks', () => {
     )
     expect(store.getState().agentChat.sessions['sess-3'].timelineBodies['turn-7']).toEqual(
       expect.objectContaining({
-        content: [{ type: 'text', text: 'Older hydrated turn' }],
+        message: expect.objectContaining({
+          content: [{ type: 'text', text: 'Older hydrated turn' }],
+        }),
       }),
     )
   })
@@ -235,12 +284,10 @@ describe('agentChatThunks', () => {
     }))
     store.dispatch(turnBodyReceived({
       sessionId: 'sdk-sess-3',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Stale hydrated body' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
-      },
+      turn: makeTimelineTurn('turn-2', 'assistant', 'Stale hydrated body', {
+        sessionId: 'cli-sess-3',
+        ordinal: 2,
+      }),
     }))
 
     await store.dispatch(loadAgentTurnBody({
@@ -267,20 +314,19 @@ describe('agentChatThunks', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-sess-1',
       items: [
-        { turnId: 'turn-2', sessionId: 'cli-sess-1', role: 'assistant', summary: 'Latest summary', timestamp: '2026-03-10T10:01:00.000Z' },
+        makeTimelineItem('turn-2', 'assistant', 'Latest summary', {
+          sessionId: 'cli-sess-1',
+          ordinal: 2,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
       ],
       nextCursor: null,
       revision: 13,
     })
-    getAgentTurnBody.mockResolvedValue({
+    getAgentTurnBody.mockResolvedValue(makeTimelineTurn('turn-2', 'assistant', 'Latest full body', {
       sessionId: 'cli-sess-1',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Latest full body' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
-      },
-    })
+      ordinal: 2,
+    }))
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
@@ -313,26 +359,20 @@ describe('agentChatThunks', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-sess-advancing',
       items: [
-        {
-          turnId: 'turn-9',
+        makeTimelineItem('turn-9', 'assistant', 'Latest summary', {
           sessionId: 'cli-sess-advancing',
-          role: 'assistant',
-          summary: 'Latest summary',
+          ordinal: 9,
           timestamp: '2026-03-10T10:03:00.000Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 13,
     })
-    getAgentTurnBody.mockResolvedValue({
+    getAgentTurnBody.mockResolvedValue(makeTimelineTurn('turn-9', 'assistant', 'Latest full body', {
       sessionId: 'cli-sess-advancing',
-      turnId: 'turn-9',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Latest full body' }],
-        timestamp: '2026-03-10T10:03:00.000Z',
-      },
-    })
+      ordinal: 9,
+      timestamp: '2026-03-10T10:03:00.000Z',
+    }))
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({

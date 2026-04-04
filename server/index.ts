@@ -189,7 +189,7 @@ async function main() {
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
 
-  const sdkBridge = new SdkBridge()
+  let sdkBridge: SdkBridge
 
   const extensionManager = new ExtensionManager()
   const userExtDir = path.join(freshellConfigDir, 'extensions')
@@ -281,6 +281,7 @@ async function main() {
     getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
   })
+  sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(

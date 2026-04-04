@@ -17,6 +17,7 @@ import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
+import type { AgentHistorySource } from './agent-timeline/history-source.js'
 import type {
   SdkSessionState,
   SdkCreatedSession,
@@ -53,6 +54,10 @@ export class SdkBridge extends EventEmitter {
   private processes = new Map<string, SessionProcess>()
   private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
 
+  constructor(private readonly agentHistorySource?: AgentHistorySource) {
+    super()
+  }
+
   private cloneSessionState(state: SdkSessionState): SdkSessionState {
     return {
       ...state,
@@ -74,6 +79,15 @@ export class SdkBridge extends EventEmitter {
       return message.messageId
     }
     return synthesizeLiveMessageId(state.sessionId, state.messages.length)
+  }
+
+  private syncRestoreLedger(state: SdkSessionState): void {
+    void this.agentHistorySource?.syncLiveSession?.(this.cloneSessionState(state)).catch((err) => {
+      log.warn({
+        err: err instanceof Error ? err : new Error(String(err)),
+        sessionId: state.sessionId,
+      }, 'Failed to sync restore ledger from SDK state')
+    })
   }
 
   async createSession(options: {
@@ -175,6 +189,8 @@ export class SdkBridge extends EventEmitter {
       hasSubscribers: false,
       inputStream,
     })
+
+    await this.agentHistorySource?.syncLiveSession?.(this.cloneSessionState(state))
 
     // Start consuming the message stream in the background
     this.consumeStream(sessionId, sdkQuery).catch((err) => {
@@ -297,6 +313,7 @@ export class SdkBridge extends EventEmitter {
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
           state.status = 'connected'
+          this.syncRestoreLedger(state)
           this.broadcastToSession(sessionId, {
             type: 'sdk.session.init',
             sessionId,
@@ -345,6 +362,7 @@ export class SdkBridge extends EventEmitter {
           }),
           ...(typeof (aMsg.message as any)?.model === 'string' ? { model: (aMsg.message as any).model } : {}),
         })
+        this.syncRestoreLedger(state)
         state.streamingActive = false
         state.streamingText = ''
         state.status = 'running'
@@ -630,6 +648,7 @@ export class SdkBridge extends EventEmitter {
           timestamp,
         }),
       })
+      this.syncRestoreLedger(state)
     }
 
     const content: any[] = [{ type: 'text', text }]

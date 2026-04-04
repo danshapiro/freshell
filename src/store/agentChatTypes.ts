@@ -24,6 +24,9 @@ export interface ChatMessage {
 
 export interface AgentTimelineItem {
   turnId: string
+  messageId: string
+  ordinal: number
+  source: 'durable' | 'live'
   sessionId: string
   role: ChatMessage['role']
   summary: string
@@ -33,6 +36,9 @@ export interface AgentTimelineItem {
 export interface AgentTimelineTurn {
   sessionId: string
   turnId: string
+  messageId: string
+  ordinal: number
+  source: 'durable' | 'live'
   message: ChatMessage
 }
 
@@ -79,7 +85,7 @@ export interface ChatSessionState {
   status: 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
   messages: ChatMessage[]
   timelineItems: AgentTimelineItem[]
-  timelineBodies: Record<string, ChatMessage>
+  timelineBodies: Record<string, AgentTimelineTurn>
   nextTimelineCursor?: string | null
   timelineLoading?: boolean
   timelineError?: string

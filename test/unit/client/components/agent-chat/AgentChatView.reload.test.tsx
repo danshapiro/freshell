@@ -70,6 +70,56 @@ function makeStoreWithTabs() {
   })
 }
 
+function makeTimelineItem(
+  turnId: string,
+  role: 'user' | 'assistant',
+  summary: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    sessionId: overrides.sessionId ?? 'sess-reload-1',
+    role,
+    summary,
+    ...(overrides.timestamp ? { timestamp: overrides.timestamp } : {}),
+  }
+}
+
+function makeTimelineTurn(
+  turnId: string,
+  role: 'user' | 'assistant',
+  text: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    sessionId: overrides.sessionId ?? 'sess-reload-1',
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    message: {
+      role,
+      content: [{ type: 'text' as const, text }],
+      timestamp: overrides.timestamp ?? '2026-01-01T00:00:01Z',
+    },
+  }
+}
+
 const RELOAD_PANE: AgentChatPaneContent = {
   kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
@@ -203,13 +253,11 @@ describe('AgentChatView reload/restore behavior', () => {
     store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
       items: [
-        {
-          turnId: 'turn-1',
+        makeTimelineItem('turn-1', 'assistant', 'Hello! How can I help?', {
           sessionId: 'sess-reload-1',
-          role: 'assistant',
-          summary: 'Hello! How can I help?',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 1,
@@ -217,12 +265,11 @@ describe('AgentChatView reload/restore behavior', () => {
     }))
     store.dispatch(turnBodyReceived({
       sessionId: 'sess-reload-1',
-      turnId: 'turn-1',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Hello! How can I help?' }],
+      turn: makeTimelineTurn('turn-1', 'assistant', 'Hello! How can I help?', {
+        sessionId: 'sess-reload-1',
+        ordinal: 1,
         timestamp: '2026-01-01T00:00:01Z',
-      },
+      }),
     }))
 
     // Force re-render to pick up store changes
@@ -327,6 +374,9 @@ describe('AgentChatView reload/restore behavior', () => {
     let resolveTurnBody: ((value: {
       sessionId: string
       turnId: string
+      messageId: string
+      ordinal: number
+      source: 'durable' | 'live'
       message: {
         role: 'assistant'
         content: Array<{ type: 'text'; text: string }>
@@ -336,13 +386,11 @@ describe('AgentChatView reload/restore behavior', () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'sess-reload-1',
       items: [
-        {
-          turnId: 'turn-2',
+        makeTimelineItem('turn-2', 'assistant', 'Recent summary', {
           sessionId: 'sess-reload-1',
-          role: 'assistant',
-          summary: 'Recent summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 2,
@@ -396,6 +444,9 @@ describe('AgentChatView reload/restore behavior', () => {
       resolveTurnBody?.({
         sessionId: 'sess-reload-1',
         turnId: 'turn-2',
+        messageId: 'message:turn-2',
+        ordinal: 2,
+        source: 'durable',
         message: {
           role: 'assistant',
           content: [{ type: 'text', text: 'Hydrated from HTTP timeline' }],
@@ -462,27 +513,21 @@ describe('AgentChatView reload/restore behavior', () => {
     store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
       items: [
-        {
-          turnId: 'turn-2',
+        makeTimelineItem('turn-2', 'assistant', 'Old stale summary', {
           sessionId: 'cli-sess-1',
-          role: 'assistant',
-          summary: 'Old stale summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 12,
       replace: true,
       bodies: {
-        'turn-2': {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Old hydrated body', {
           sessionId: 'cli-sess-1',
-          turnId: 'turn-2',
-          message: {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'Old hydrated body' }],
-            timestamp: '2026-03-10T10:01:00.000Z',
-          },
-        },
+          ordinal: 2,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
       },
     }))
 
@@ -1097,13 +1142,11 @@ describe('AgentChatView reload/restore behavior', () => {
     store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
       items: [
-        {
-          turnId: 'turn-1',
+        makeTimelineItem('turn-1', 'user', 'Hello', {
           sessionId: 'sess-reload-1',
-          role: 'user',
-          summary: 'Hello',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 1,
@@ -1111,12 +1154,11 @@ describe('AgentChatView reload/restore behavior', () => {
     }))
     store.dispatch(turnBodyReceived({
       sessionId: 'sess-reload-1',
-      turnId: 'turn-1',
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: 'Hello' }],
+      turn: makeTimelineTurn('turn-1', 'user', 'Hello', {
+        sessionId: 'sess-reload-1',
+        ordinal: 1,
         timestamp: '2026-01-01T00:00:00Z',
-      },
+      }),
     }))
 
     rerender(
@@ -1145,13 +1187,11 @@ describe('AgentChatView reload/restore behavior', () => {
       store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
         items: [
-          {
-            turnId: 'turn-1',
+          makeTimelineItem('turn-1', 'user', 'Reactive test message', {
             sessionId: 'sess-reload-1',
-            role: 'user',
-            summary: 'Reactive test message',
+            ordinal: 1,
             timestamp: '2026-01-01T00:00:00Z',
-          },
+          }),
         ],
         nextCursor: null,
         revision: 1,
@@ -1159,12 +1199,11 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
       store.dispatch(turnBodyReceived({
         sessionId: 'sess-reload-1',
-        turnId: 'turn-1',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: 'Reactive test message' }],
+        turn: makeTimelineTurn('turn-1', 'user', 'Reactive test message', {
+          sessionId: 'sess-reload-1',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       }))
     })
 
@@ -1187,13 +1226,11 @@ describe('AgentChatView reload/restore behavior', () => {
       store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
         items: [
-          {
-            turnId: 'turn-1',
+          makeTimelineItem('turn-1', 'user', 'Back-to-back test', {
             sessionId: 'sess-reload-1',
-            role: 'user',
-            summary: 'Back-to-back test',
+            ordinal: 1,
             timestamp: '2026-01-01T00:00:00Z',
-          },
+          }),
         ],
         nextCursor: null,
         revision: 1,
@@ -1201,12 +1238,11 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
       store.dispatch(turnBodyReceived({
         sessionId: 'sess-reload-1',
-        turnId: 'turn-1',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: 'Back-to-back test' }],
+        turn: makeTimelineTurn('turn-1', 'user', 'Back-to-back test', {
+          sessionId: 'sess-reload-1',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       }))
       store.dispatch(setSessionStatus({
         sessionId: 'sess-reload-1',
@@ -1234,13 +1270,11 @@ describe('AgentChatView reload/restore behavior', () => {
       store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
         items: [
-          {
-            turnId: 'turn-1',
+          makeTimelineItem('turn-1', 'user', 'Separate tick test', {
             sessionId: 'sess-reload-1',
-            role: 'user',
-            summary: 'Separate tick test',
+            ordinal: 1,
             timestamp: '2026-01-01T00:00:00Z',
-          },
+          }),
         ],
         nextCursor: null,
         revision: 1,
@@ -1248,12 +1282,11 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
       store.dispatch(turnBodyReceived({
         sessionId: 'sess-reload-1',
-        turnId: 'turn-1',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: 'Separate tick test' }],
+        turn: makeTimelineTurn('turn-1', 'user', 'Separate tick test', {
+          sessionId: 'sess-reload-1',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       }))
     })
 

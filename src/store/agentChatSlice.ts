@@ -290,9 +290,7 @@ const agentChatSlice = createSlice({
       bodies?: Record<string, AgentTimelineTurn>
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
-      const nextBodies = Object.fromEntries(
-        Object.entries(action.payload.bodies ?? {}).map(([turnId, turn]) => [turnId, turn.message]),
-      )
+      const nextBodies = action.payload.bodies ?? {}
       session.timelineItems = action.payload.replace === false
         ? [...session.timelineItems, ...action.payload.items]
         : action.payload.items
@@ -317,11 +315,10 @@ const agentChatSlice = createSlice({
 
     turnBodyReceived(state, action: PayloadAction<{
       sessionId: string
-      turnId: string
-      message: ChatMessage
+      turn: AgentTimelineTurn
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
-      session.timelineBodies[action.payload.turnId] = action.payload.message
+      session.timelineBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
     sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
