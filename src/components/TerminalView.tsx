@@ -52,6 +52,10 @@ import {
   type Osc52Event,
   type Osc52Policy,
 } from '@/lib/terminal-osc52'
+import {
+  createTerminalStartupProbeState,
+  extractTerminalStartupProbes,
+} from '@/lib/terminal-startup-probes'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
@@ -83,6 +87,7 @@ export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
+const STARTUP_PROBE_OSC11_QUERY = '\u001b]11;?\u0007'
 
 function isClaudeTurnSubmit(data: string): boolean {
   return data.includes('\r') || data.includes('\n')
@@ -96,8 +101,60 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
+type StartupProbeReplayDiscardState = {
+  remainder: string | null
+  buffered: string
+}
+
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
+
+function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
+  const remainder = state.remainder
+  if (!remainder) {
+    state.buffered = ''
+    return raw
+  }
+
+  let matched = state.buffered
+  let index = 0
+  while (
+    index < raw.length
+    && matched.length < remainder.length
+    && raw[index] === remainder[matched.length]
+  ) {
+    matched += raw[index]
+    index += 1
+  }
+
+  if (matched.length === remainder.length) {
+    state.remainder = null
+    state.buffered = ''
+    return raw.slice(index)
+  }
+
+  if (index < raw.length) {
+    state.remainder = null
+    state.buffered = ''
+    return `${matched}${raw.slice(index)}`
+  }
+
+  if (index === raw.length) {
+    state.buffered = matched
+    return ''
+  }
+
+  return raw
+}
+
+function getStartupProbeReplayRemainder(pending: string): string | null {
+  if (!pending || pending === STARTUP_PROBE_OSC11_QUERY) {
+    return null
+  }
+  return STARTUP_PROBE_OSC11_QUERY.startsWith(pending)
+    ? STARTUP_PROBE_OSC11_QUERY.slice(pending.length)
+    : null
 }
 
 function deferTerminalPointerMutation(callback: () => void): void {
@@ -270,7 +327,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
+  const startupProbeStateRef = useRef(createTerminalStartupProbeState())
+  const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
+    remainder: null,
+    buffered: '',
+  })
   const osc52ParserRef = useRef(createOsc52ParserState())
+  const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
   const pendingOsc52EventRef = useRef<Osc52Event | null>(null)
   const osc52QueueRef = useRef<Osc52Event[]>([])
@@ -825,8 +888,63 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
-    const osc = extractOsc52Events(raw, osc52ParserRef.current)
+  const sendInput = useCallback((data: string) => {
+    const tid = terminalIdRef.current
+    if (!tid) return
+    // In 'type' mode, clear attention when user sends input.
+    // In 'click' mode, attention is cleared by the notification hook on tab switch.
+    if (attentionDismissRef.current === 'type') {
+      if (hasAttentionRef.current) {
+        dispatch(clearTabAttention({ tabId }))
+      }
+      if (hasPaneAttentionRef.current) {
+        dispatch(clearPaneAttention({ paneId }))
+      }
+    }
+    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
+      turnCompletedSinceLastInputRef.current = false
+      dispatch(setPaneRuntimeActivity({
+        paneId: paneIdRef.current,
+        source: 'terminal',
+        phase: 'pending',
+      }))
+    }
+    ws.send({ type: 'terminal.input', terminalId: tid, data })
+  }, [dispatch, tabId, paneId, ws])
+
+  const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
+    const pendingProbe = startupProbeStateRef.current.pending
+    if (opts?.discardReplayRemainder) {
+      const remainder = getStartupProbeReplayRemainder(pendingProbe)
+      startupProbeReplayDiscardStateRef.current = {
+        remainder,
+        buffered: '',
+      }
+    } else {
+      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
+    }
+    startupProbeStateRef.current = createTerminalStartupProbeState()
+  }, [])
+
+  const handleTerminalOutput = useCallback((
+    raw: string,
+    mode: TerminalPaneContent['mode'],
+    tid: string | undefined,
+    allowReplies: boolean,
+  ) => {
+    const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
+      foreground: resolvedThemeRef.current.foreground,
+      background: resolvedThemeRef.current.background,
+      cursor: resolvedThemeRef.current.cursor,
+    })
+
+    if (allowReplies) {
+      for (const reply of startup.replies) {
+        sendInput(reply)
+      }
+    }
+
+    const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
     if (count > 0 && tid) {
@@ -863,31 +981,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     for (const event of osc.events) {
       handleOsc52Event(event)
     }
-  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, tabId])
-
-  const sendInput = useCallback((data: string) => {
-    const tid = terminalIdRef.current
-    if (!tid) return
-    // In 'type' mode, clear attention when user sends input.
-    // In 'click' mode, attention is cleared by the notification hook on tab switch.
-    if (attentionDismissRef.current === 'type') {
-      if (hasAttentionRef.current) {
-        dispatch(clearTabAttention({ tabId }))
-      }
-      if (hasPaneAttentionRef.current) {
-        dispatch(clearPaneAttention({ paneId }))
-      }
-    }
-    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
-      turnCompletedSinceLastInputRef.current = false
-      dispatch(setPaneRuntimeActivity({
-        paneId: paneIdRef.current,
-        source: 'terminal',
-        phase: 'pending',
-      }))
-    }
-    ws.send({ type: 'terminal.input', terminalId: tid, data })
-  }, [dispatch, tabId, paneId, ws])
+  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
     const terminalId = terminalIdRef.current
@@ -1029,6 +1123,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
 
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
+    resolvedThemeRef.current = resolvedTheme
     const term = new Terminal({
       allowProposedApi: true,
       convertEol: true,
@@ -1462,6 +1557,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
     const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
+    // Startup probes must not leak across attach generations.
+    resetStartupProbeParser()
+
     if (intent === 'viewport_hydrate') {
       if (opts?.clearViewportFirst) {
         try {
@@ -1506,7 +1604,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState])
+  }, [suppressNetworkEffects, ws, applySeqState, resetStartupProbeParser])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1543,6 +1641,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const term = termRef.current
     if (!term) return
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
+    resolvedThemeRef.current = resolvedTheme
     term.options.cursorBlink = settings.terminal.cursorBlink
     term.options.fontSize = settings.terminal.fontSize
     term.options.fontFamily = resolveTerminalFontFamily(settings.terminal.fontFamily)
@@ -1603,6 +1702,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!termCandidate) return
     const term = termCandidate
     turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
+    resetStartupProbeParser()
     osc52ParserRef.current = createOsc52ParserState()
     osc52QueueRef.current = []
     pendingOsc52EventRef.current = null
@@ -1760,9 +1860,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
           }
-          const raw = msg.data || ''
+          let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          handleTerminalOutput(raw, mode, tid)
+          const frameOverlapsReplay = Boolean(
+            previousSeqState.pendingReplay
+            && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
+            && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
+          )
+          const enteringFreshLiveOutput = !frameOverlapsReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          if (
+            enteringFreshLiveOutput
+            && !startupProbeReplayDiscardStateRef.current.remainder
+            && !startupProbeReplayDiscardStateRef.current.buffered
+          ) {
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
+          }
+          raw = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0
             && !terminalFirstOutputMarkedRef.current
@@ -1781,6 +1896,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnFrame) {
+            if (frameOverlapsReplay) {
+              resetStartupProbeParser({ discardReplayRemainder: true })
+            }
             setIsAttaching(false)
             markAttachComplete()
           }
@@ -1822,6 +1940,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
             setIsAttaching(false)
             markAttachComplete()
           }
@@ -2213,6 +2332,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     handleTerminalOutput,
     attachTerminal,
     markAttachComplete,
+    resetStartupProbeParser,
     runRefreshAttach,
   ])
 
