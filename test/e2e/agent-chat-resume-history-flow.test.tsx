@@ -210,33 +210,91 @@ describe('agent chat resume history flow', () => {
     expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
   })
 
-  it('waits for a live-only named resume to upgrade to the canonical durable id before hydrating backlog', async () => {
+  it('upgrades a live-only named resume in place to the canonical durable id after the first visible timeline read', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
-    getAgentTimelinePage.mockResolvedValue({
-      sessionId: canonicalSessionId,
-      items: [
-        {
-          turnId: 'turn-durable-1',
-          sessionId: canonicalSessionId,
-          role: 'assistant',
-          summary: 'Canonical durable answer',
-          timestamp: '2026-03-10T10:01:20.000Z',
-        },
-      ],
-      nextCursor: null,
-      revision: 7,
-      bodies: {
-        'turn-durable-1': {
-          sessionId: canonicalSessionId,
-          turnId: 'turn-durable-1',
-          message: {
+    getAgentTimelinePage
+      .mockResolvedValueOnce({
+        sessionId: 'named-resume',
+        items: [
+          {
+            turnId: 'turn-live-1',
+            sessionId: 'named-resume',
             role: 'assistant',
-            content: [{ type: 'text', text: 'Hydrated after canonical upgrade' }],
+            summary: 'Live-only reply',
             timestamp: '2026-03-10T10:01:20.000Z',
           },
+        ],
+        nextCursor: null,
+        revision: 1,
+        bodies: {
+          'turn-live-1': {
+            sessionId: 'named-resume',
+            turnId: 'turn-live-1',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Live-only full body' }],
+              timestamp: '2026-03-10T10:01:20.000Z',
+            },
+          },
         },
-      },
-    })
+      })
+      .mockResolvedValueOnce({
+        sessionId: canonicalSessionId,
+        items: [
+          {
+            turnId: 'turn-durable-1',
+            sessionId: canonicalSessionId,
+            role: 'user',
+            summary: 'Older durable question',
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
+          {
+            turnId: 'turn-durable-2',
+            sessionId: canonicalSessionId,
+            role: 'assistant',
+            summary: 'Older durable answer',
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+          {
+            turnId: 'turn-live-1',
+            sessionId: canonicalSessionId,
+            role: 'assistant',
+            summary: 'Live delta',
+            timestamp: '2026-03-10T10:01:20.000Z',
+          },
+        ],
+        nextCursor: null,
+        revision: 2,
+        bodies: {
+          'turn-durable-1': {
+            sessionId: canonicalSessionId,
+            turnId: 'turn-durable-1',
+            message: {
+              role: 'user',
+              content: [{ type: 'text', text: 'Older durable question' }],
+              timestamp: '2026-03-10T10:00:00.000Z',
+            },
+          },
+          'turn-durable-2': {
+            sessionId: canonicalSessionId,
+            turnId: 'turn-durable-2',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Older durable answer' }],
+              timestamp: '2026-03-10T10:00:20.000Z',
+            },
+          },
+          'turn-live-1': {
+            sessionId: canonicalSessionId,
+            turnId: 'turn-live-1',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Live-only full body' }],
+              timestamp: '2026-03-10T10:01:20.000Z',
+            },
+          },
+        },
+      })
 
     const store = makeStore()
     store.dispatch(initLayout({
@@ -266,16 +324,21 @@ describe('agent chat resume history flow', () => {
       handleSdkMessage(store.dispatch, {
         type: 'sdk.session.snapshot',
         sessionId: 'sdk-live-only',
-        latestTurnId: null,
-        status: 'starting',
+        latestTurnId: 'turn-live-1',
+        status: 'idle',
+        timelineSessionId: 'named-resume',
+        revision: 1,
       })
     })
 
-    await act(async () => {
-      await Promise.resolve()
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'named-resume',
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 1 }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
     })
-
-    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+    expect(await screen.findByText('Live-only full body')).toBeInTheDocument()
 
     act(() => {
       handleSdkMessage(store.dispatch, {
@@ -286,13 +349,46 @@ describe('agent chat resume history flow', () => {
     })
 
     await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(1)
+      expect(attachCalls[0]?.[0]).toEqual({
+        type: 'sdk.attach',
+        sessionId: 'sdk-live-only',
+      })
+    })
+    expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-live-only',
+        latestTurnId: 'turn-live-1',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 2,
+      })
+    })
+
+    await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         canonicalSessionId,
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
 
-    expect(await screen.findByText('Hydrated after canonical upgrade')).toBeInTheDocument()
+    await waitFor(() => {
+      const renderedMessages = screen.getAllByRole('article')
+        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+      expect(renderedMessages).toEqual([
+        'Older durable question',
+        'Older durable answer',
+        'Live-only full body',
+      ])
+    })
+
+    const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
   })
 })

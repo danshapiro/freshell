@@ -878,15 +878,35 @@ describe('AgentChatView reload/restore behavior', () => {
       })
       .mockResolvedValueOnce({
         sessionId: canonicalSessionId,
-        items: [{
-          turnId: 'turn-durable-1',
-          messageId: 'message-durable-1',
-          ordinal: 0,
-          source: 'durable',
-          sessionId: canonicalSessionId,
-          role: 'assistant',
-          summary: 'Durable backlog summary',
-        }],
+        items: [
+          {
+            turnId: 'turn-durable-1',
+            messageId: 'message-durable-1',
+            ordinal: 0,
+            source: 'durable',
+            sessionId: canonicalSessionId,
+            role: 'user',
+            summary: 'Durable backlog prompt',
+          },
+          {
+            turnId: 'turn-durable-2',
+            messageId: 'message-durable-2',
+            ordinal: 1,
+            source: 'durable',
+            sessionId: canonicalSessionId,
+            role: 'assistant',
+            summary: 'Durable backlog answer',
+          },
+          {
+            turnId: 'turn-live-1',
+            messageId: 'message-live-1',
+            ordinal: 2,
+            source: 'live',
+            sessionId: canonicalSessionId,
+            role: 'assistant',
+            summary: 'Live delta summary',
+          },
+        ],
         bodies: {
           'turn-durable-1': {
             turnId: 'turn-durable-1',
@@ -895,8 +915,30 @@ describe('AgentChatView reload/restore behavior', () => {
             source: 'durable',
             sessionId: canonicalSessionId,
             message: {
+              role: 'user',
+              content: [{ type: 'text', text: 'Durable backlog prompt body' }],
+            },
+          },
+          'turn-durable-2': {
+            turnId: 'turn-durable-2',
+            messageId: 'message-durable-2',
+            ordinal: 1,
+            source: 'durable',
+            sessionId: canonicalSessionId,
+            message: {
               role: 'assistant',
-              content: [{ type: 'text', text: 'Durable backlog full body' }],
+              content: [{ type: 'text', text: 'Durable backlog answer body' }],
+            },
+          },
+          'turn-live-1': {
+            turnId: 'turn-live-1',
+            messageId: 'message-live-1',
+            ordinal: 2,
+            source: 'live',
+            sessionId: canonicalSessionId,
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Live-only full body' }],
             },
           },
         },
@@ -967,21 +1009,43 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+      expect(attachCalls[1]?.[0]).toEqual({
+        type: 'sdk.attach',
+        sessionId: 'sdk-meta-upgrade-1',
+      })
+    })
+    expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-meta-upgrade-1',
+        latestTurnId: 'turn-live-1',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 2,
+      }))
+    })
+
+    await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledTimes(2)
     })
     expect(getAgentTimelinePage).toHaveBeenNthCalledWith(
       2,
       canonicalSessionId,
-      expect.objectContaining({ includeBodies: true }),
+      expect.objectContaining({ includeBodies: true, revision: 2 }),
       expect.anything(),
     )
-    expect(getAgentTimelinePage.mock.calls[1]?.[1]).not.toHaveProperty('revision')
 
     await waitFor(() => {
       const session = store.getState().agentChat.sessions['sdk-meta-upgrade-1']
       expect(session?.historyLoaded).toBe(true)
       expect(session?.timelineRevision).toBe(2)
-      expect(screen.getByText('Durable backlog full body')).toBeInTheDocument()
+      expect(screen.getByText('Durable backlog prompt body')).toBeInTheDocument()
+      expect(screen.getByText('Durable backlog answer body')).toBeInTheDocument()
+      expect(screen.getByText('Live-only full body')).toBeInTheDocument()
     })
 
     expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)

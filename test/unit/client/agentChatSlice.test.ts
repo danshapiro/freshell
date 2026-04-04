@@ -421,7 +421,7 @@ describe('agentChatSlice', () => {
     })
   })
 
-  it('restarts hydration when a canonical durable id arrives after a completed live-only restore', () => {
+  it('requests a fresh snapshot when a canonical durable id arrives after a completed live-only restore', () => {
     let state = agentChatReducer(initial, registerPendingCreate({
       requestId: 'req-upgrade',
       expectsHistoryHydration: true,
@@ -464,13 +464,64 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-live']).toMatchObject({
       historyLoaded: false,
       timelineSessionId: '00000000-0000-4000-8000-000000000321',
-      latestTurnId: 'turn-1',
+      latestTurnId: undefined,
       restoreRetryCount: 0,
     })
     expect(state.sessions['sdk-live'].timelineRevision).toBeUndefined()
+    expect((state.sessions['sdk-live'] as any).snapshotRefreshRequestId).toBe(1)
     expect(state.sessions['sdk-live'].timelineItems).toEqual([])
     expect(state.sessions['sdk-live'].timelineBodies).toEqual({})
     expect(state.sessions['sdk-live'].nextTimelineCursor).toBeUndefined()
+  })
+
+  it('restarts hydration from the new snapshot revision when a canonical snapshot upgrades a completed live-only restore', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-snapshot-upgrade',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-snapshot-upgrade',
+      sessionId: 'sdk-live-snapshot',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live-snapshot',
+      latestTurnId: 'turn-live-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live-snapshot',
+      items: [
+        makeTimelineItem('turn-live-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          ordinal: 0,
+          source: 'live',
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live-snapshot',
+      latestTurnId: 'turn-merged-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000322',
+      revision: 2,
+    }))
+
+    expect(state.sessions['sdk-live-snapshot']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000322',
+      timelineRevision: 2,
+      latestTurnId: 'turn-merged-2',
+    })
+    expect((state.sessions['sdk-live-snapshot'] as any).snapshotRefreshRequestId).toBeUndefined()
+    expect(state.sessions['sdk-live-snapshot'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-live-snapshot'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-live-snapshot'].nextTimelineCursor).toBeUndefined()
   })
 
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {

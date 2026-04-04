@@ -108,6 +108,8 @@ export interface ChatSessionState {
   restoreRetryCount?: number
   /** Last restore-specific failure code surfaced during hydration. */
   restoreFailureCode?: string
+  /** Monotonic key for requesting one fresh sdk.attach snapshot refresh before hydration resumes. */
+  snapshotRefreshRequestId?: number
 }
 
 export interface PendingAgentCreate {

@@ -71,6 +71,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
   const staleRetryAttachKeyRef = useRef<string | null>(null)
+  const snapshotRefreshAttachKeyRef = useRef<string | null>(null)
   const composerRef = useRef<ChatComposerHandle>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -176,6 +177,28 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     paneContent.sessionId,
     session?.restoreFailureCode,
     session?.restoreRetryCount,
+    suppressNetworkEffects,
+    ws,
+  ])
+
+  useEffect(() => {
+    if (suppressNetworkEffects) return
+    if (!paneContent.sessionId) {
+      snapshotRefreshAttachKeyRef.current = null
+      return
+    }
+    const snapshotRefreshRequestId = session?.snapshotRefreshRequestId
+    if (!snapshotRefreshRequestId) {
+      snapshotRefreshAttachKeyRef.current = null
+      return
+    }
+    const refreshKey = `${paneContent.sessionId}:${snapshotRefreshRequestId}`
+    if (snapshotRefreshAttachKeyRef.current === refreshKey) return
+    snapshotRefreshAttachKeyRef.current = refreshKey
+    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
+  }, [
+    paneContent.sessionId,
+    session?.snapshotRefreshRequestId,
     suppressNetworkEffects,
     ws,
   ])

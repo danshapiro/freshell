@@ -39,6 +39,12 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
   return state.sessions[sessionId]
 }
 
+function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'timelineSessionId'>): string | undefined {
+  return (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
+    ?? session.timelineSessionId
+    ?? session.cliSessionId
+}
+
 function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): void {
   session.latestTurnId = undefined
   session.timelineItems = []
@@ -54,10 +60,14 @@ function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState):
   session.timelineItems = []
   session.timelineBodies = {}
   session.nextTimelineCursor = undefined
-  session.timelineRevision = undefined
   session.timelineLoading = false
   session.timelineError = undefined
   session.historyLoaded = false
+}
+
+function requestFreshSnapshotRefresh(session: ChatSessionState): void {
+  resetHydratedTimelineStateForRestoreRetry(session)
+  session.snapshotRefreshRequestId = (session.snapshotRefreshRequestId ?? 0) + 1
 }
 
 const agentChatSlice = createSlice({
@@ -121,25 +131,20 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       const nextCliSessionId = action.payload.cliSessionId ?? session.cliSessionId
-      const previousRestoreQueryId = (
-        (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
-        ?? session.timelineSessionId
-        ?? session.cliSessionId
-      )
-      const nextRestoreQueryId = (
-        (isValidClaudeSessionId(nextCliSessionId) ? nextCliSessionId : undefined)
-        ?? session.timelineSessionId
-        ?? nextCliSessionId
-      )
-      const shouldRestartHydration = Boolean(
+      const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextRestoreQueryId = getRestoreQueryId({
+        cliSessionId: nextCliSessionId,
+        timelineSessionId: session.timelineSessionId,
+      })
+      const shouldRequestFreshSnapshot = Boolean(
         session.historyLoaded
           && isValidClaudeSessionId(nextCliSessionId)
           && nextRestoreQueryId
           && previousRestoreQueryId !== nextRestoreQueryId,
       )
 
-      if (shouldRestartHydration) {
-        resetHydratedTimelineStateForDurableUpgrade(session)
+      if (shouldRequestFreshSnapshot) {
+        requestFreshSnapshotRefresh(session)
         session.restoreRetryCount = 0
         session.restoreFailureCode = undefined
       }
@@ -164,6 +169,26 @@ const agentChatSlice = createSlice({
       streamingText?: string
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextRestoreQueryId = getRestoreQueryId({
+        cliSessionId: session.cliSessionId,
+        timelineSessionId: action.payload.timelineSessionId ?? session.timelineSessionId,
+      })
+      const shouldRestartHydration = Boolean(
+        session.historyLoaded
+          && (
+            (nextRestoreQueryId && previousRestoreQueryId && nextRestoreQueryId !== previousRestoreQueryId)
+            || (
+              action.payload.revision != null
+              && session.timelineRevision != null
+              && action.payload.revision !== session.timelineRevision
+            )
+          ),
+      )
+      if (shouldRestartHydration) {
+        resetHydratedTimelineStateForDurableUpgrade(session)
+      }
+
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
       session.timelineSessionId = action.payload.timelineSessionId
@@ -171,6 +196,7 @@ const agentChatSlice = createSlice({
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
+      session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
         const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
           || isValidClaudeSessionId(session.cliSessionId)
@@ -376,6 +402,7 @@ const agentChatSlice = createSlice({
     restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       resetHydratedTimelineStateForRestoreRetry(session)
+      session.snapshotRefreshRequestId = undefined
       session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
       session.restoreFailureCode = action.payload.code
     },
