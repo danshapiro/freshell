@@ -1,5 +1,7 @@
 # FreshClaude Restore Audit And Completeness Fix Implementation Plan
 
+> Superseded on April 3, 2026 by `2026-04-03-freshclaude-robust-restore-redesign.md`. Use the April 3 redesign as the authoritative restore direction because it removes split ownership and fallback-style restore semantics.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use @trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make FreshClaude restore complete and deterministic across reloads, remounts, reconnects, and server restarts by restoring one canonical history, preserving the durable Claude identity as soon as the server knows it, and rendering the first visible restored page with full bodies and in-progress stream state.

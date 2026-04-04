@@ -190,4 +190,84 @@ describe('agent chat restore flow', () => {
       }))
     })
   })
+
+  it('retries stale-revision restore once, then surfaces a visible failure on the second stale response', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000888'
+    const makeStaleRevisionError = (currentRevision: number) => Object.assign(
+      new Error('Stale restore revision'),
+      {
+        status: 409,
+        details: {
+          code: 'RESTORE_STALE_REVISION',
+          currentRevision,
+        },
+      },
+    )
+
+    getAgentTimelinePage
+      .mockRejectedValueOnce(makeStaleRevisionError(13))
+      .mockRejectedValueOnce(makeStaleRevisionError(14))
+
+    const store = makeStore({
+      resumeSessionId: canonicalSessionId,
+      sessionMetadataByKey: {
+        [`claude:${canonicalSessionId}`]: {
+          sessionType: 'freshclaude',
+        },
+      },
+    })
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-stale',
+      sessionId: 'sdk-stale-1',
+      status: 'idle',
+      resumeSessionId: canonicalSessionId,
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 12,
+      })
+    })
+
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+    })
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: canonicalSessionId,
+        revision: 13,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledTimes(2)
+    })
+
+    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
+  })
 })

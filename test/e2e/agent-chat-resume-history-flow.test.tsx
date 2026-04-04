@@ -209,4 +209,90 @@ describe('agent chat resume history flow', () => {
     })
     expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
   })
+
+  it('waits for a live-only named resume to upgrade to the canonical durable id before hydrating backlog', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: canonicalSessionId,
+      items: [
+        {
+          turnId: 'turn-durable-1',
+          sessionId: canonicalSessionId,
+          role: 'assistant',
+          summary: 'Canonical durable answer',
+          timestamp: '2026-03-10T10:01:20.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 7,
+      bodies: {
+        'turn-durable-1': {
+          sessionId: canonicalSessionId,
+          turnId: 'turn-durable-1',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hydrated after canonical upgrade' }],
+            timestamp: '2026-03-10T10:01:20.000Z',
+          },
+        },
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-live-only',
+        status: 'creating',
+        resumeSessionId: 'named-resume',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.created',
+        requestId: 'req-live-only',
+        sessionId: 'sdk-live-only',
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-live-only',
+        latestTurnId: null,
+        status: 'starting',
+      })
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.metadata',
+        sessionId: 'sdk-live-only',
+        cliSessionId: canonicalSessionId,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        canonicalSessionId,
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+
+    expect(await screen.findByText('Hydrated after canonical upgrade')).toBeInTheDocument()
+  })
 })

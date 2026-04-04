@@ -22,6 +22,43 @@ vi.mock('../../../server/session-history-loader.js', async () => {
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 
+function makeResolvedHistory(options: {
+  queryId?: string
+  liveSessionId?: string
+  timelineSessionId?: string
+  revision?: number
+  messages: Array<{
+    role: 'user' | 'assistant'
+    content: Array<{ type: 'text'; text: string }>
+    timestamp: string
+  }>
+}) {
+  const queryId = options.queryId ?? options.liveSessionId ?? options.timelineSessionId ?? 'sdk-sess-1'
+  return {
+    kind: 'resolved' as const,
+    queryId,
+    liveSessionId: options.liveSessionId,
+    timelineSessionId: options.timelineSessionId,
+    readiness: options.liveSessionId && options.timelineSessionId
+      ? 'merged' as const
+      : options.timelineSessionId
+        ? 'durable_only' as const
+        : 'live_only' as const,
+    revision: options.revision ?? 1,
+    latestTurnId: options.messages.length > 0 ? `turn-${options.messages.length - 1}` : null,
+    turns: options.messages.map((message, index) => ({
+      turnId: `turn-${index}`,
+      messageId: `message-${index}`,
+      ordinal: index,
+      source: options.timelineSessionId ? 'durable' as const : 'live' as const,
+      message: {
+        ...message,
+        messageId: `message-${index}`,
+      },
+    })),
+  }
+}
+
 function connectAndAuth(server: http.Server): Promise<WebSocket> {
   return new Promise<WebSocket>((resolve, reject) => {
     const addr = server.address()
@@ -191,7 +228,7 @@ describe('WsHandler agent history source DI', () => {
 
   it('sdk.attach for durable session calls injected history source', async () => {
     const injectedHistorySource = {
-      resolve: vi.fn().mockResolvedValue({
+      resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
         timelineSessionId: '01234567-89ab-cdef-0123-456789abcdef',
         revision: 1,
         messages: [
@@ -201,7 +238,7 @@ describe('WsHandler agent history source DI', () => {
             timestamp: '2026-01-01T00:00:01Z',
           },
         ],
-      }),
+      })),
     }
 
     const mockSdkBridge = {
@@ -254,7 +291,7 @@ describe('WsHandler agent history source DI', () => {
 
   it('multiple attaches to same session: injected history source resolves per attach', async () => {
     const injectedHistorySource = {
-      resolve: vi.fn().mockResolvedValue({
+      resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
         timelineSessionId: '01234567-89ab-cdef-0123-456789abcdef',
         revision: 1,
         messages: [
@@ -264,7 +301,7 @@ describe('WsHandler agent history source DI', () => {
             timestamp: '2026-01-01T00:00:01Z',
           },
         ],
-      }),
+      })),
     }
 
     const mockSdkBridge = {

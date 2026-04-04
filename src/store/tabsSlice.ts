@@ -254,7 +254,8 @@ export const tabsSlice = createSlice({
         state.activeTabId = state.tabs[nextIndex]?.id ?? state.tabs[0].id
       }
     },
-    hydrateTabs: (state, action: PayloadAction<TabsState, string, HydrateTabsMeta>) => {
+    hydrateTabs: (state, action: PayloadAction<TabsState>) => {
+      const meta = (action as PayloadAction<TabsState, string, HydrateTabsMeta | undefined>).meta
       const remoteTabs = (action.payload.tabs || []).map(migrateTabFields)
       const remoteTombstones: Tombstone[] = Array.isArray(action.payload.tombstones) ? action.payload.tombstones : []
 
@@ -277,7 +278,7 @@ export const tabsSlice = createSlice({
         seen.add(remoteTab.id)
         const localTab = localById.get(remoteTab.id)
         if (localTab) {
-          const winningTab = pickHydratedTabWinner(localTab, remoteTab, action.meta)
+          const winningTab = pickHydratedTabWinner(localTab, remoteTab, meta)
           merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, winningTab))
         } else {
           merged.push(remoteTab)

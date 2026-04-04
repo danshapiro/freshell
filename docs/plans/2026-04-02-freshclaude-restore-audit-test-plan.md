@@ -1,5 +1,7 @@
 # FreshClaude Restore Audit Test Plan
 
+> Superseded on April 3, 2026 by `2026-04-03-freshclaude-robust-restore-redesign-test-plan.md`. Use the April 3 redesign test plan as the authoritative restore direction because it removes split ownership and fallback-style restore semantics.
+
 The transcript does not add a separate testing strategy beyond "comprehensive audit and fix." Reconciled against the implementation plan, that still holds: the change surface is the existing FreshClaude restore flow over WebSocket snapshots, HTTP timeline reads, persisted pane/tab state, and indexed Claude metadata. No external services, paid APIs, or new infrastructure are required. The only adjustment is emphasis: because the implementation centralizes restore truth in a shared server history source, the plan must be led by rendered reload/create/attach scenarios and only use unit tests to pin merge and store contracts underneath them.
 
 Root-cause note:

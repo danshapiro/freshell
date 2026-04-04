@@ -30,6 +30,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import type { Tab } from '@/store/types'
 import { buildAgentChatPersistedIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
@@ -373,6 +374,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     restoreHistoryQueryId,
     session?.historyLoaded,
     session?.latestTurnId,
+    session?.timelineRevision,
     waitingForDurableHistoryIdentity,
     suppressNetworkEffects,
     tabId,

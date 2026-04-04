@@ -86,4 +86,34 @@ describe('agent timeline history source', () => {
       { turnId: 'turn:live-2', messageId: 'live-2', ordinal: 1 },
     ])
   })
+
+  it('tears down unrecoverable live aliases so stale in-memory authority cannot outlive the session', async () => {
+    const liveSession = makeLiveSession({
+      sessionId: 'sdk-gone',
+      resumeSessionId: 'named-only',
+      messages: [makeMessage('user', 'ephemeral', { messageId: 'live-msg-1' })],
+    })
+
+    const source = createAgentHistorySource({
+      loadSessionHistory: vi.fn().mockResolvedValue(null),
+      getLiveSessionBySdkSessionId: vi.fn((queryId: string) => (
+        queryId === liveSession.sessionId ? liveSession : undefined
+      )),
+      getLiveSessionByCliSessionId: vi.fn((queryId: string) => (
+        queryId === liveSession.resumeSessionId ? liveSession : undefined
+      )),
+    })
+
+    await expect(source.resolve('named-only')).resolves.toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+    })
+
+    source.teardownLiveSession('sdk-gone', { recoverable: false })
+
+    await expect(source.resolve('named-only')).resolves.toEqual({
+      kind: 'missing',
+      queryId: 'named-only',
+    })
+  })
 })

@@ -21,6 +21,37 @@ const mockMessages = [
   },
 ]
 
+function makeResolvedHistory(options: {
+  liveSessionId?: string
+  timelineSessionId?: string
+  revision?: number
+  messages: typeof mockMessages
+}) {
+  return {
+    kind: 'resolved' as const,
+    queryId: options.liveSessionId ?? options.timelineSessionId ?? 'sess-1',
+    liveSessionId: options.liveSessionId,
+    timelineSessionId: options.timelineSessionId,
+    readiness: options.liveSessionId && options.timelineSessionId
+      ? 'merged' as const
+      : options.timelineSessionId
+        ? 'durable_only' as const
+        : 'live_only' as const,
+    revision: options.revision ?? Date.parse('2026-03-10T10:02:00.000Z'),
+    latestTurnId: options.messages.length > 0 ? `turn-${options.messages.length - 1}` : null,
+    turns: options.messages.map((message, index) => ({
+      turnId: `turn-${index}`,
+      messageId: `message-${index}`,
+      ordinal: index,
+      source: options.timelineSessionId ? 'durable' as const : 'live' as const,
+      message: {
+        ...message,
+        messageId: `message-${index}`,
+      },
+    })),
+  }
+}
+
 describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
   it('accepts boolean true from client code', () => {
     const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible' })
@@ -59,11 +90,10 @@ describe('agent timeline includeBodies', () => {
   it('includeBodies=false (default): no bodies field in response', async () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
           messages: mockMessages,
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
-        }),
+        })),
       },
     })
 
@@ -79,12 +109,11 @@ describe('agent timeline includeBodies', () => {
   it('includeBodies=true: bodies map includes all page items', async () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sdk-sess-1',
           timelineSessionId: '00000000-0000-4000-8000-000000000010',
           messages: mockMessages,
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
-        }),
+        })),
       },
     })
 
@@ -111,11 +140,10 @@ describe('agent timeline includeBodies', () => {
   it('bodies map keys match item turnIds', async () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
           messages: mockMessages,
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
-        }),
+        })),
       },
     })
 
@@ -139,11 +167,11 @@ describe('agent timeline includeBodies', () => {
 
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sess-1',
-          messages: fiveMessages,
           revision: Date.parse('2026-03-10T10:04:00.000Z'),
-        }),
+          messages: fiveMessages,
+        })),
       },
     })
 
@@ -178,12 +206,11 @@ describe('agent timeline includeBodies', () => {
   it('getTurnBody still works independently (backward compatible)', async () => {
     const service = createAgentTimelineService({
       agentHistorySource: {
-        resolve: vi.fn().mockResolvedValue({
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
           liveSessionId: 'sdk-sess-1',
           timelineSessionId: '00000000-0000-4000-8000-000000000011',
           messages: mockMessages,
-          revision: Date.parse('2026-03-10T10:02:00.000Z'),
-        }),
+        })),
       },
     })
 
