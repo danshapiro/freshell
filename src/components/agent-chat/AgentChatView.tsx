@@ -116,17 +116,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
   // HTTP timeline window (even if it is empty).
-  // Times out after 5s to handle stale sessionIds from server restarts.
   const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
-  const [restoreTimedOut, setRestoreTimedOut] = useState(false)
-  useEffect(() => {
-    if (!isRestoring) {
-      setRestoreTimedOut(false)
-      return
-    }
-    const timer = setTimeout(() => setRestoreTimedOut(true), 5_000)
-    return () => clearTimeout(timer)
-  }, [isRestoring])
 
   // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
@@ -151,7 +141,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [tabId, paneId, dispatch])
 
   // Immediate recovery when server confirms session is gone (markSessionLost sets
-  // session.lost = true). This avoids the 5-second timeout for known-dead sessions.
+  // session.lost = true).
   const sessionLost = !!session?.lost
   useEffect(() => {
     if (suppressNetworkEffects) return
@@ -175,14 +165,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     suppressNetworkEffects,
     ws,
   ])
-
-  // Fallback: auto-recover when restore times out (e.g. server restarted, error was
-  // not routed through sdk.error). Safety net for the immediate recovery above.
-  useEffect(() => {
-    if (suppressNetworkEffects) return
-    if (!restoreTimedOut || !isRestoring) return
-    triggerRecovery()
-  }, [restoreTimedOut, isRestoring, suppressNetworkEffects, triggerRecovery])
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -645,9 +627,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
       <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto overflow-x-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
-        {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav).
-             Falls back to welcome screen after timeout (e.g. server restarted, session lost). */}
-        {isRestoring && !restoreTimedOut && (
+        {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav). */}
+        {isRestoring && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p>Restoring session...</p>
           </div>
@@ -667,8 +648,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           </div>
         )}
 
-        {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
-        {!session?.messages.length && timelineItems.length === 0 && (!isRestoring || restoreTimedOut) && paneContent.status !== 'create-failed' && (
+        {/* Welcome: no sessionId or the current session is empty after restore completed. */}
+        {!session?.messages.length && timelineItems.length === 0 && !isRestoring && paneContent.status !== 'create-failed' && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>

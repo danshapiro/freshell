@@ -1001,6 +1001,10 @@ export class WsHandler {
     } as SdkServerMessage)
   }
 
+  private teardownSdkRestoreState(sessionId: string, recoverable: boolean): void {
+    this.agentHistorySource?.teardownLiveSession(sessionId, { recoverable })
+  }
+
   private sendSdkCreateFailed(
     ws: LiveWebSocket,
     requestId: string,
@@ -1905,6 +1909,7 @@ export class WsHandler {
             releaseCreateSubscription()
             releaseCreateSubscription = undefined
             this.sdkBridge.killSession(session.sessionId)
+            this.teardownSdkRestoreState(session.sessionId, false)
             this.sendSdkCreateFailed(ws, m.requestId, {
               code: fatalRestore.code,
               message: fatalRestore.message,
@@ -1955,6 +1960,7 @@ export class WsHandler {
           }
           if (session?.sessionId) {
             this.sdkBridge.killSession(session.sessionId)
+            this.teardownSdkRestoreState(session.sessionId, false)
           }
           this.sendSdkCreateFailed(ws, m.requestId, {
             code: 'RESTORE_INTERNAL',
@@ -2043,6 +2049,7 @@ export class WsHandler {
           return
         }
         const killed = this.sdkBridge.killSession(this.resolveSdkSessionTarget(state, m.sessionId))
+        this.teardownSdkRestoreState(m.sessionId, false)
         state.sdkSessions.delete(m.sessionId)
         state.sdkSessionTargets.delete(m.sessionId)
         const off = state.sdkSubscriptions.get(m.sessionId)
@@ -2121,8 +2128,17 @@ export class WsHandler {
             })
             return
           }
-          // Send sdk.error (not generic error) so the client's SDK message handler
-          // can identify the lost session and trigger immediate recovery.
+          if (resolved?.kind === 'missing') {
+            this.send(ws, {
+              type: 'sdk.error',
+              sessionId: m.sessionId,
+              code: 'RESTORE_NOT_FOUND',
+              message: 'SDK session history not found',
+            } as SdkServerMessage)
+            return
+          }
+          // INVALID_SESSION_ID is reserved for the case where a known live session
+          // disappeared and the client should trigger lost-session recovery.
           this.send(ws, {
             type: 'sdk.error',
             sessionId: m.sessionId,

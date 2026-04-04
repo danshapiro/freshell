@@ -1028,7 +1028,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Separate tick test')).toBeInTheDocument()
   })
 
-  it('falls back to welcome screen after restore timeout (stale sessionId)', () => {
+  it('keeps the restore UI visible instead of falling back to welcome when restore is slow', () => {
     vi.useFakeTimers()
     const store = makeStore()
     render(
@@ -1041,12 +1041,11 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
     expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
-    // Advance past the 5-second timeout
+    // Advance past the legacy 5-second timeout window.
     act(() => { vi.advanceTimersByTime(5_000) })
 
-    // Should fall back to welcome screen
-    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
-    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
+    expect(screen.getByText(/restoring/i)).toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
     vi.useRealTimers()
   })
@@ -1108,7 +1107,7 @@ describe('AgentChatView server-restart recovery', () => {
     expect(content?.resumeSessionId).toBe('cli-session-abc-123')
   })
 
-  it('auto-resets pane on restore timeout to create a new session', () => {
+  it('does not reset the pane or send sdk.create when restore remains pending past the legacy timeout window', () => {
     vi.useFakeTimers()
     const store = makeStore()
     const pane: AgentChatPaneContent = {
@@ -1131,36 +1130,54 @@ describe('AgentChatView server-restart recovery', () => {
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // Advance past the 5-second timeout
+    wsSend.mockClear()
+
+    // Advance past the legacy 5-second timeout window.
     act(() => { vi.advanceTimersByTime(5_000) })
 
-    // Pane content should be reset for creating a new session
     const content = getPaneContent(store, 't1', 'p1')
     expect(content).toBeDefined()
-    expect(content!.sessionId).toBeUndefined()
-    expect(content!.status).toBe('creating')
-    expect(content!.createRequestId).not.toBe('req-stale')
-    // resumeSessionId should be preserved so the new session resumes the old CLI session
+    expect(content!.sessionId).toBe('dead-session-id')
+    expect(content!.status).toBe('idle')
+    expect(content!.createRequestId).toBe('req-stale')
     expect(content!.resumeSessionId).toBe('cli-session-to-resume')
+    const createCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.create',
+    )
+    expect(createCalls).toHaveLength(0)
+    expect(screen.getByText(/restoring/i)).toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
   })
 
-  it('sends sdk.create with resumeSessionId after recovery reset', () => {
-    vi.useFakeTimers()
+  it('surfaces a visible stale restore failure after the second stale response without resetting the pane', async () => {
+    const makeStaleRevisionError = (currentRevision: number) => Object.assign(
+      new Error('Stale restore revision'),
+      {
+        status: 409,
+        details: {
+          code: 'RESTORE_STALE_REVISION',
+          currentRevision,
+        },
+      },
+    )
+    getAgentTimelinePage
+      .mockRejectedValueOnce(makeStaleRevisionError(13))
+      .mockRejectedValueOnce(makeStaleRevisionError(14))
+
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'agent-chat',
+      provider: 'freshclaude',
       createRequestId: 'req-stale',
-      sessionId: 'dead-session-id',
+      sessionId: 'sdk-stale-1',
       status: 'idle',
-      resumeSessionId: 'cli-session-to-resume',
+      resumeSessionId: '00000000-0000-4000-8000-000000000888',
     }
 
     store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
 
-    // Wrapper that reads pane content from the store via useSelector, simulating the real parent.
-    // Re-renders when the store changes (unlike getPaneContent which is a plain function).
     function Wrapper() {
-      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
       const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
         ? root.content
         : undefined
@@ -1174,16 +1191,40 @@ describe('AgentChatView server-restart recovery', () => {
       </Provider>,
     )
 
-    wsSend.mockClear()
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: '00000000-0000-4000-8000-000000000888',
+        revision: 12,
+      }))
+    })
 
-    // Advance past timeout to trigger recovery
-    act(() => { vi.advanceTimersByTime(5_000) })
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+    })
 
-    // Should have sent sdk.create with the resumeSessionId
-    const createCalls = wsSend.mock.calls.filter(
-      (c: any[]) => c[0]?.type === 'sdk.create',
-    )
-    expect(createCalls).toHaveLength(1)
-    expect(createCalls[0][0].resumeSessionId).toBe('cli-session-to-resume')
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: '00000000-0000-4000-8000-000000000888',
+        revision: 13,
+      }))
+    })
+
+    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
+
+    const content = getPaneContent(store, 't1', 'p1')
+    expect(content).toBeDefined()
+    expect(content!.sessionId).toBe('sdk-stale-1')
+    expect(content!.status).toBe('idle')
+
+    const createCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
+    expect(createCalls).toHaveLength(0)
   })
 })

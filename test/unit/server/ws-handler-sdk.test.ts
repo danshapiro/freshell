@@ -266,7 +266,10 @@ describe('WS Handler SDK Integration', () => {
     let handler: WsHandler
     let registry: TerminalRegistry
     let mockSdkBridge: any
-    let mockHistorySource: { resolve: ReturnType<typeof vi.fn> }
+    let mockHistorySource: {
+      resolve: ReturnType<typeof vi.fn>
+      teardownLiveSession: ReturnType<typeof vi.fn>
+    }
 
     beforeEach(async () => {
       server = http.createServer()
@@ -280,6 +283,7 @@ describe('WS Handler SDK Integration', () => {
           revision: 1,
           messages: [makeMessage('user', 'hello', '2026-01-01T00:00:00Z')],
         })),
+        teardownLiveSession: vi.fn(),
       }
 
       mockSdkBridge = {
@@ -464,6 +468,7 @@ describe('WS Handler SDK Integration', () => {
         })
         expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-1')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-1', { recoverable: false })
       } finally {
         ws.close()
       }
@@ -578,6 +583,7 @@ describe('WS Handler SDK Integration', () => {
         expect(response.sessionId).toBe('sdk-sess-1')
         expect(response.success).toBe(true)
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-1')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-1', { recoverable: false })
       } finally {
         ws.close()
       }
@@ -1098,6 +1104,7 @@ describe('WS Handler SDK Integration', () => {
         expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
         expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-live-only')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-live-only', { recoverable: false })
       } finally {
         ws.close()
       }
@@ -1235,9 +1242,12 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('returns sdk.error for sdk.attach with unknown session', async () => {
+    it('returns sdk.error with RESTORE_NOT_FOUND for sdk.attach when durable restore state is missing', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
-      mockHistorySource.resolve.mockResolvedValue(null)
+      mockHistorySource.resolve.mockResolvedValue({
+        kind: 'missing',
+        code: 'RESTORE_NOT_FOUND',
+      })
       const ws = await connectAndAuth()
       try {
         const response = await sendAndWaitForResponse(ws, {
@@ -1245,9 +1255,12 @@ describe('WS Handler SDK Integration', () => {
           sessionId: 'nonexistent',
         }, 'sdk.error')
 
-        expect(response.type).toBe('sdk.error')
-        expect(response.code).toBe('INVALID_SESSION_ID')
-        expect(response.sessionId).toBe('nonexistent')
+        expect(response).toEqual({
+          type: 'sdk.error',
+          sessionId: 'nonexistent',
+          code: 'RESTORE_NOT_FOUND',
+          message: 'SDK session history not found',
+        })
       } finally {
         ws.close()
       }

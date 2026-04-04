@@ -308,15 +308,14 @@ const agentChatSlice = createSlice({
     },
 
     sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
-      const session = state.sessions[action.payload.sessionId]
-      if (!session) return
+      const session = ensureSession(state, action.payload.sessionId)
       session.lastError = action.payload.message
     },
 
     /** Mark a session as lost (server confirmed it no longer exists).
      *  Creates the session entry if needed (e.g. after page refresh where Redux
      *  was empty) and sets flags that enable AgentChatView to detect the loss
-     *  and trigger immediate recovery without waiting for the 5-second timeout. */
+     *  and trigger immediate recovery. */
     markSessionLost(state, action: PayloadAction<{ sessionId: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.awaitingDurableHistory = false

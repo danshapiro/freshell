@@ -181,8 +181,7 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
     case 'sdk.error':
       if (msg.code === 'INVALID_SESSION_ID') {
         // Session is gone on the server (e.g. server restarted). Mark it as lost
-        // so AgentChatView can detect this and trigger immediate recovery instead
-        // of waiting for the 5-second timeout.
+        // so AgentChatView can detect this and trigger immediate recovery.
         dispatch(markSessionLost({ sessionId: msg.sessionId as string }))
       } else {
         dispatch(sessionError({
