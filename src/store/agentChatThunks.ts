@@ -135,7 +135,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       const turn = await getAgentTurnBody(
         timelineSessionId ?? sessionId,
         newestTurn.turnId,
-        { revision, signal: controller.signal },
+        { revision: page.revision, signal: controller.signal },
       )
       dispatch(turnBodyReceived({
         sessionId,

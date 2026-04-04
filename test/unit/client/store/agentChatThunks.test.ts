@@ -309,6 +309,58 @@ describe('agentChatThunks', () => {
     )
   })
 
+  it('pins the fallback newest-turn body fetch to the accepted page revision when the page advances restore state', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-sess-advancing',
+      items: [
+        {
+          turnId: 'turn-9',
+          sessionId: 'cli-sess-advancing',
+          role: 'assistant',
+          summary: 'Latest summary',
+          timestamp: '2026-03-10T10:03:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 13,
+    })
+    getAgentTurnBody.mockResolvedValue({
+      sessionId: 'cli-sess-advancing',
+      turnId: 'turn-9',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Latest full body' }],
+        timestamp: '2026-03-10T10:03:00.000Z',
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-advancing',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-advancing',
+      revision: 12,
+    }))
+
+    await store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-advancing',
+      timelineSessionId: 'cli-sess-advancing',
+      requestKey: 'tab-1:pane-advancing',
+    }))
+
+    expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      'cli-sess-advancing',
+      expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 12 }),
+      expect.anything(),
+    )
+    expect(getAgentTurnBody).toHaveBeenCalledWith(
+      'cli-sess-advancing',
+      'turn-9',
+      expect.objectContaining({ signal: expect.any(AbortSignal), revision: 13 }),
+    )
+  })
+
   it('bookkeeps one stale-revision retry request instead of mixing stale data into state', async () => {
     const staleError = {
       status: 409,
