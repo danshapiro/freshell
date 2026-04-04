@@ -421,6 +421,58 @@ describe('agentChatSlice', () => {
     })
   })
 
+  it('restarts hydration when a canonical durable id arrives after a completed live-only restore', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-upgrade',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-upgrade',
+      sessionId: 'sdk-live',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live',
+      items: [
+        makeTimelineItem('turn-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          ordinal: 0,
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+
+    expect(state.sessions['sdk-live']).toMatchObject({
+      historyLoaded: true,
+      timelineSessionId: 'named-resume',
+      timelineRevision: 1,
+    })
+
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-live',
+      cliSessionId: '00000000-0000-4000-8000-000000000321',
+    }))
+
+    expect(state.sessions['sdk-live']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000321',
+      timelineRevision: 1,
+      latestTurnId: 'turn-1',
+      restoreRetryCount: 0,
+    })
+    expect(state.sessions['sdk-live'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-live'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-live'].nextTimelineCursor).toBeUndefined()
+  })
+
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',
@@ -441,6 +493,29 @@ describe('agentChatSlice', () => {
       expect.objectContaining({ turnId: 'turn-2', summary: 'Latest summary' }),
     ])
     expect(state.sessions['sess-timeline'].nextTimelineCursor).toBe('cursor-2')
+  })
+
+  it('clears a stale streaming preview when the final assistant message is committed', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'req-stream', sessionId: 'sdk-stream' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 'sdk-stream', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 'sdk-stream', text: 'partial reply' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 'sdk-stream', active: false }))
+
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 'sdk-stream',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
+
+    expect(state.sessions['sdk-stream']).toMatchObject({
+      status: 'running',
+      streamingActive: false,
+      streamingText: '',
+    })
+    expect(state.sessions['sdk-stream'].messages).toHaveLength(1)
+    expect(state.sessions['sdk-stream'].messages[0]).toEqual(expect.objectContaining({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
   })
 
   it('stores hydrated turn bodies separately from live websocket messages', () => {

@@ -7,6 +7,8 @@ import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
+  appendStreamDelta,
+  setStreaming,
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
@@ -185,6 +187,35 @@ describe('AgentChatView thinking indicator', () => {
     expect(screen.queryByLabelText('Claude is thinking')).not.toBeInTheDocument()
 
     vi.useRealTimers()
+  })
+})
+
+describe('AgentChatView streaming preview lifecycle', () => {
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+  })
+
+  it('removes the stale streaming preview once the final assistant message is committed', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(setStreaming({ sessionId: 'sess-1', active: true }))
+    store.dispatch(appendStreamDelta({ sessionId: 'sess-1', text: 'partial reply' }))
+    store.dispatch(setStreaming({ sessionId: 'sess-1', active: false }))
+    store.dispatch(addAssistantMessage({
+      sessionId: 'sess-1',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
+
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    expect(screen.getByText('final reply')).toBeInTheDocument()
+    expect(screen.queryByText('partial reply')).not.toBeInTheDocument()
   })
 })
 

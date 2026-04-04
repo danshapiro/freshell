@@ -241,7 +241,6 @@ function mergeTurns(
   const unmatchedLiveIndices: number[] = []
   const unmatchedLiveTurns: InternalTurn[] = []
   const potentialCompatibilityMatches: Array<{ liveIndex: number; durableIndex: number; turn: InternalTurn }> = []
-  let compatibilityUsed = false
 
   for (const [index, liveTurn] of liveTurns.entries()) {
     const exactMatch = durableById.get(liveTurn.messageId)
@@ -256,7 +255,6 @@ function mergeTurns(
       if (compatibilityCandidateIds?.has(liveTurn.messageId)) {
         matchedDurableIndices.push(compatibilityMatch)
         matchedLiveIndices.push(index)
-        compatibilityUsed = true
         continue
       }
       potentialCompatibilityMatches.push({
@@ -283,7 +281,6 @@ function mergeTurns(
     for (const match of potentialCompatibilityMatches) {
       matchedDurableIndices.push(match.durableIndex)
       matchedLiveIndices.push(match.liveIndex)
-      compatibilityUsed = true
     }
   } else {
     for (const match of potentialCompatibilityMatches) {
@@ -292,7 +289,7 @@ function mergeTurns(
     }
   }
 
-  if (compatibilityUsed && matchedDurableIndices.length > 0) {
+  if (matchedDurableIndices.length > 0) {
     const orderedDurableMatches = [...matchedDurableIndices].sort((left, right) => left - right)
     const expectedDurableStart = durableTurns.length - orderedDurableMatches.length
     const matchesDurableSuffix = orderedDurableMatches.every((value, index) => value === expectedDurableStart + index)

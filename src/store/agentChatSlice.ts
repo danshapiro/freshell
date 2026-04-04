@@ -50,6 +50,15 @@ function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): v
   session.historyLoaded = false
 }
 
+function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState): void {
+  session.timelineItems = []
+  session.timelineBodies = {}
+  session.nextTimelineCursor = undefined
+  session.timelineLoading = false
+  session.timelineError = undefined
+  session.historyLoaded = false
+}
+
 const agentChatSlice = createSlice({
   name: 'agentChat',
   initialState,
@@ -110,6 +119,30 @@ const agentChatSlice = createSlice({
       tools?: Array<{ name: string }>
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const nextCliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      const previousRestoreQueryId = (
+        (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
+        ?? session.timelineSessionId
+        ?? session.cliSessionId
+      )
+      const nextRestoreQueryId = (
+        (isValidClaudeSessionId(nextCliSessionId) ? nextCliSessionId : undefined)
+        ?? session.timelineSessionId
+        ?? nextCliSessionId
+      )
+      const shouldRestartHydration = Boolean(
+        session.historyLoaded
+          && isValidClaudeSessionId(nextCliSessionId)
+          && nextRestoreQueryId
+          && previousRestoreQueryId !== nextRestoreQueryId,
+      )
+
+      if (shouldRestartHydration) {
+        resetHydratedTimelineStateForDurableUpgrade(session)
+        session.restoreRetryCount = 0
+        session.restoreFailureCode = undefined
+      }
+
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
       if (isValidClaudeSessionId(action.payload.cliSessionId)) {
         session.timelineSessionId = action.payload.cliSessionId
@@ -170,6 +203,8 @@ const agentChatSlice = createSlice({
     }>) {
       const session = state.sessions[action.payload.sessionId]
       if (!session) return
+      session.streamingActive = false
+      session.streamingText = ''
       session.messages.push({
         role: 'assistant',
         content: action.payload.content,

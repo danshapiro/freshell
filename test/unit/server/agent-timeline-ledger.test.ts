@@ -507,4 +507,37 @@ describe('restore ledger manager', () => {
       reason: 'ambiguous-live-overlap',
     }))
   })
+
+  it('classifies interleaved exact-id overlap as RESTORE_DIVERGED instead of reordering the transcript', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000919'
+    const durablePrompt = makeMessage('user', 'alpha', { messageId: 'shared-alpha' })
+    const durableReply = makeMessage('assistant', 'omega', { messageId: 'shared-omega' })
+    const liveSession = makeSession({
+      sessionId: 'sdk-exact-diverge',
+      cliSessionId: canonicalSessionId,
+      messages: [
+        makeMessage('user', 'alpha', { messageId: 'shared-alpha' }),
+        makeMessage('assistant', 'interleaved live delta', { messageId: 'live-delta' }),
+        makeMessage('assistant', 'omega', { messageId: 'shared-omega' }),
+      ],
+    })
+    const logDivergence = vi.fn()
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue([durablePrompt, durableReply]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.cliSessionId ? liveSession : undefined),
+      logDivergence,
+    })
+
+    await expect(manager.resolve('sdk-exact-diverge')).resolves.toEqual({
+      kind: 'fatal',
+      code: 'RESTORE_DIVERGED',
+      message: 'Live restore state diverged from durable history',
+    })
+    expect(logDivergence).toHaveBeenCalledWith(expect.objectContaining({
+      queryId: 'sdk-exact-diverge',
+      reason: 'ambiguous-live-overlap',
+    }))
+  })
 })

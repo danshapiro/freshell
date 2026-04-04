@@ -849,10 +849,57 @@ describe('AgentChatView reload/restore behavior', () => {
   it('upgrades a named restore to the canonical durable id when sdk.session.metadata arrives after the snapshot', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
     getAgentTimelinePage
-      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({
+        sessionId: 'named-resume',
+        items: [{
+          turnId: 'turn-live-1',
+          messageId: 'message-live-1',
+          ordinal: 0,
+          source: 'live',
+          sessionId: 'named-resume',
+          role: 'assistant',
+          summary: 'Live-only summary',
+        }],
+        bodies: {
+          'turn-live-1': {
+            turnId: 'turn-live-1',
+            messageId: 'message-live-1',
+            ordinal: 0,
+            source: 'live',
+            sessionId: 'named-resume',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Live-only full body' }],
+            },
+          },
+        },
+        nextCursor: null,
+        revision: 1,
+      })
       .mockResolvedValueOnce({
         sessionId: canonicalSessionId,
-        items: [],
+        items: [{
+          turnId: 'turn-durable-1',
+          messageId: 'message-durable-1',
+          ordinal: 0,
+          source: 'durable',
+          sessionId: canonicalSessionId,
+          role: 'assistant',
+          summary: 'Durable backlog summary',
+        }],
+        bodies: {
+          'turn-durable-1': {
+            turnId: 'turn-durable-1',
+            messageId: 'message-durable-1',
+            ordinal: 0,
+            source: 'durable',
+            sessionId: canonicalSessionId,
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Durable backlog full body' }],
+            },
+          },
+        },
         nextCursor: null,
         revision: 2,
       })
@@ -905,6 +952,13 @@ describe('AgentChatView reload/restore behavior', () => {
       )
     })
 
+    await waitFor(() => {
+      const session = store.getState().agentChat.sessions['sdk-meta-upgrade-1']
+      expect(session?.historyLoaded).toBe(true)
+      expect(session?.timelineRevision).toBe(1)
+      expect(screen.getByText('Live-only full body')).toBeInTheDocument()
+    })
+
     act(() => {
       store.dispatch(sessionMetadataReceived({
         sessionId: 'sdk-meta-upgrade-1',
@@ -918,6 +972,13 @@ describe('AgentChatView reload/restore behavior', () => {
         expect.objectContaining({ includeBodies: true }),
         expect.anything(),
       )
+    })
+
+    await waitFor(() => {
+      const session = store.getState().agentChat.sessions['sdk-meta-upgrade-1']
+      expect(session?.historyLoaded).toBe(true)
+      expect(session?.timelineRevision).toBe(2)
+      expect(screen.getByText('Durable backlog full body')).toBeInTheDocument()
     })
 
     expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
