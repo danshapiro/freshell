@@ -6,6 +6,7 @@ import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
   addUserMessage,
   registerPendingCreate,
+  restoreRetryRequested,
   sessionCreated,
   sessionInit,
   sessionMetadataReceived,
@@ -405,6 +406,62 @@ describe('AgentChatView reload/restore behavior', () => {
       const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
       expect(attachCalls).toHaveLength(2)
       expect(attachCalls[1]?.[0]).toEqual({
+        type: 'sdk.attach',
+        sessionId: 'sess-reload-1',
+      })
+    })
+  })
+
+  it('allows a later stale restore cycle in the same pane to issue its own retry attach after hydration succeeds', async () => {
+    getAgentTimelinePage.mockRejectedValueOnce({
+      status: 409,
+      message: 'Stale restore revision',
+      details: {
+        code: 'RESTORE_STALE_REVISION',
+        currentRevision: 13,
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 12,
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(2)
+    })
+
+    act(() => {
+      store.dispatch(timelinePageReceived({
+        sessionId: 'sess-reload-1',
+        items: [],
+        nextCursor: null,
+        revision: 13,
+      }))
+    })
+
+    act(() => {
+      store.dispatch(restoreRetryRequested({
+        sessionId: 'sess-reload-1',
+        code: 'RESTORE_STALE_REVISION',
+      }))
+    })
+
+    await waitFor(() => {
+      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      expect(attachCalls).toHaveLength(3)
+      expect(attachCalls[2]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sess-reload-1',
       })

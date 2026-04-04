@@ -156,9 +156,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId) return
-    if (session?.restoreFailureCode !== 'RESTORE_STALE_REVISION') return
-    if ((session.restoreRetryCount ?? 0) !== 1) return
+    if (!paneContent.sessionId) {
+      staleRetryAttachKeyRef.current = null
+      return
+    }
+    if (session?.restoreFailureCode !== 'RESTORE_STALE_REVISION') {
+      staleRetryAttachKeyRef.current = null
+      return
+    }
+    if ((session.restoreRetryCount ?? 0) !== 1) {
+      staleRetryAttachKeyRef.current = null
+      return
+    }
     const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}`
     if (staleRetryAttachKeyRef.current === retryKey) return
     staleRetryAttachKeyRef.current = retryKey
