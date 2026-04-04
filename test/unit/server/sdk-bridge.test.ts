@@ -144,6 +144,33 @@ describe('SdkBridge', () => {
       expect(stored?.messages[0]?.messageId).toBeTruthy()
     })
 
+    it('assigns live-scoped ids to repeated local messages instead of reusing durable ids', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const liveState = bridge.getSession(session.sessionId)
+      expect(liveState).toBeDefined()
+      if (!liveState) throw new Error('expected live state')
+
+      const assignMessageId = (bridge as any).assignMessageId.bind(bridge) as (
+        state: typeof liveState,
+        message: { role: 'user'; content: Array<{ type: 'text'; text: string }>; timestamp: string },
+      ) => string
+      const message = {
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: 'hello' }],
+        timestamp: '2026-04-03T12:00:00.000Z',
+      }
+
+      const firstId = assignMessageId(liveState, message)
+      liveState.messages.push({ ...message, messageId: firstId })
+      const secondId = assignMessageId(liveState, message)
+
+      expect(firstId).toMatch(/^live:/)
+      expect(secondId).toMatch(/^live:/)
+      expect(firstId).not.toMatch(/^durable:/)
+      expect(secondId).not.toBe(firstId)
+    })
+
     it('kills a session', async () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
       const killed = bridge.killSession(session.sessionId)

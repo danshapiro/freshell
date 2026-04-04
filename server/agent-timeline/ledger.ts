@@ -46,6 +46,7 @@ type LedgerRecord = {
   revision: number
   signature: string
   resolution: Extract<RestoreResolution, { kind: 'resolved' }>
+  compatibilityCandidateIds: Set<string>
   aliases: Set<string>
   liveAliases: Set<string>
   durableAliases: Set<string>
@@ -126,6 +127,11 @@ export function synthesizeDeterministicMessageId(message: Pick<ChatMessage, 'rol
   return `durable:${digest}:${occurrenceIndex}`
 }
 
+export function synthesizeLiveMessageId(sessionId: string, ordinal: number): string {
+  const normalizedSessionId = sessionId.trim().length > 0 ? sessionId : 'session'
+  return `live:${normalizedSessionId}:${ordinal}`
+}
+
 function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState): string | undefined {
   if (isValidClaudeSessionId(liveSession?.cliSessionId)) return liveSession.cliSessionId
   if (typeof liveSession?.resumeSessionId === 'string' && liveSession.resumeSessionId.trim().length > 0) {
@@ -135,13 +141,21 @@ function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState
   return undefined
 }
 
-function buildCanonicalTurns(messages: ChatMessage[], source: CanonicalTurnSource): InternalTurn[] {
+function buildCanonicalTurns(
+  messages: ChatMessage[],
+  source: CanonicalTurnSource,
+  options?: { liveSessionId?: string },
+): InternalTurn[] {
   const occurrences = new Map<string, number>()
-  return messages.map((message) => {
+  return messages.map((message, index) => {
     const fingerprint = createDurableMessageFingerprint(message)
     const occurrenceIndex = occurrences.get(fingerprint) ?? 0
     occurrences.set(fingerprint, occurrenceIndex + 1)
-    const messageId = message.messageId ?? synthesizeDeterministicMessageId(message, occurrenceIndex)
+    const messageId = message.messageId ?? (
+      source === 'live'
+        ? synthesizeLiveMessageId(options?.liveSessionId ?? 'session', index)
+        : synthesizeDeterministicMessageId(message, occurrenceIndex)
+    )
     return {
       turnId: `turn:${messageId}`,
       messageId,
@@ -203,6 +217,7 @@ function normalizeOrdinals(turns: InternalTurn[]): CanonicalTurn[] {
 function mergeTurns(
   durableTurns: InternalTurn[],
   liveTurns: InternalTurn[],
+  compatibilityCandidateIds?: ReadonlySet<string>,
 ): { kind: 'ok'; turns: CanonicalTurn[] } | { kind: 'diverged' } {
   if (durableTurns.length === 0) return { kind: 'ok', turns: normalizeOrdinals(liveTurns) }
   if (liveTurns.length === 0) return { kind: 'ok', turns: normalizeOrdinals(durableTurns) }
@@ -218,6 +233,7 @@ function mergeTurns(
   const matchedLiveIndices: number[] = []
   const unmatchedLiveIndices: number[] = []
   const unmatchedLiveTurns: InternalTurn[] = []
+  const potentialCompatibilityMatches: Array<{ liveIndex: number; durableIndex: number; turn: InternalTurn }> = []
   let compatibilityUsed = false
 
   for (const [index, liveTurn] of liveTurns.entries()) {
@@ -230,14 +246,37 @@ function mergeTurns(
 
     const compatibilityMatch = durableByCompatibilityKey.get(liveTurn.compatibilityKey)
     if (compatibilityMatch != null) {
-      matchedDurableIndices.push(compatibilityMatch)
-      matchedLiveIndices.push(index)
-      compatibilityUsed = true
+      if (compatibilityCandidateIds?.has(liveTurn.messageId)) {
+        matchedDurableIndices.push(compatibilityMatch)
+        matchedLiveIndices.push(index)
+        compatibilityUsed = true
+        continue
+      }
+      potentialCompatibilityMatches.push({
+        liveIndex: index,
+        durableIndex: compatibilityMatch,
+        turn: liveTurn,
+      })
       continue
     }
 
     unmatchedLiveIndices.push(index)
     unmatchedLiveTurns.push(liveTurn)
+  }
+
+  const canPromoteImplicitCompatibility = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
+    && potentialCompatibilityMatches.length > 1
+  if (canPromoteImplicitCompatibility) {
+    for (const match of potentialCompatibilityMatches) {
+      matchedDurableIndices.push(match.durableIndex)
+      matchedLiveIndices.push(match.liveIndex)
+      compatibilityUsed = true
+    }
+  } else {
+    for (const match of potentialCompatibilityMatches) {
+      unmatchedLiveIndices.push(match.liveIndex)
+      unmatchedLiveTurns.push(match.turn)
+    }
   }
 
   if (compatibilityUsed && matchedDurableIndices.length > 0) {
@@ -252,6 +291,17 @@ function mergeTurns(
   }
 
   return { kind: 'ok', turns: normalizeOrdinals([...durableTurns, ...unmatchedLiveTurns]) }
+}
+
+function deriveCompatibilityCandidateIds(resolution: Extract<RestoreResolution, { kind: 'resolved' }>): Set<string> {
+  if (resolution.readiness !== 'live_only') {
+    return new Set<string>()
+  }
+  return new Set(
+    resolution.turns
+      .filter((turn) => turn.source === 'live')
+      .map((turn) => turn.messageId),
+  )
 }
 
 export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
@@ -311,9 +361,14 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         return { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
       }
 
+      const liveAliases = [liveSession?.sessionId, liveSession?.resumeSessionId]
+      const durableAliases = [timelineSessionId]
+      const existing = findLedgerRecord([queryId, ...liveAliases, ...durableAliases])
       const durableTurns = buildCanonicalTurns(durableMessages, 'durable')
-      const liveTurns = buildCanonicalTurns(liveSession?.messages ?? [], 'live')
-      const mergedTurns = mergeTurns(durableTurns, liveTurns)
+      const liveTurns = buildCanonicalTurns(liveSession?.messages ?? [], 'live', {
+        liveSessionId: liveSession?.sessionId,
+      })
+      const mergedTurns = mergeTurns(durableTurns, liveTurns, existing?.compatibilityCandidateIds)
       if (mergedTurns.kind === 'diverged') {
         deps.logDivergence?.({
           queryId,
@@ -345,10 +400,10 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         turns: mergedTurns.turns,
       }
 
-      const liveAliases = [liveSession?.sessionId, liveSession?.resumeSessionId]
-      const durableAliases = [timelineSessionId]
-      const existing = findLedgerRecord([queryId, ...liveAliases, ...durableAliases])
       const signature = buildSignature(nextResolution)
+      const nextCompatibilityCandidateIds = nextResolution.readiness === 'live_only'
+        ? deriveCompatibilityCandidateIds(nextResolution)
+        : new Set(existing?.compatibilityCandidateIds ?? [])
 
       if (existing) {
         const revision = existing.signature === signature ? existing.revision : existing.revision + 1
@@ -356,6 +411,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         existing.revision = revision
         existing.signature = signature
         existing.resolution = resolved
+        existing.compatibilityCandidateIds = nextCompatibilityCandidateIds
         bindAliases(existing, { liveAliases, durableAliases })
         return resolved
       }
@@ -366,6 +422,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         revision: 1,
         signature,
         resolution: nextResolution,
+        compatibilityCandidateIds: nextCompatibilityCandidateIds,
         aliases: new Set<string>(),
         liveAliases: new Set<string>(),
         durableAliases: new Set<string>(),

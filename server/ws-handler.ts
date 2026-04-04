@@ -969,6 +969,9 @@ export class WsHandler {
     if (!resolved) {
       resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
     }
+    if (resolved?.kind === 'fatal') {
+      return resolved
+    }
     const resolvedHistory = resolved?.kind === 'resolved' ? resolved : null
     this.send(ws, {
       type: 'sdk.session.snapshot',
@@ -993,7 +996,7 @@ export class WsHandler {
     this.send(ws, {
       type: 'sdk.error',
       sessionId,
-      code: 'INTERNAL_ERROR',
+      code: 'RESTORE_INTERNAL',
       message: 'Failed to restore SDK session history',
     } as SdkServerMessage)
   }
@@ -2130,13 +2133,22 @@ export class WsHandler {
         }
 
         try {
-          await this.sendSdkSessionSnapshot(ws, {
+          const snapshotResult = await this.sendSdkSessionSnapshot(ws, {
             sessionId: m.sessionId,
             status: liveSession.status,
             historyQueryId: m.sessionId,
             liveSession,
             ...(resolved ? { resolvedHistory: resolved } : {}),
           })
+          if (snapshotResult?.kind === 'fatal') {
+            this.send(ws, {
+              type: 'sdk.error',
+              sessionId: m.sessionId,
+              code: snapshotResult.code,
+              message: snapshotResult.message,
+            } as SdkServerMessage)
+            return
+          }
         } catch (err) {
           this.sendSdkRestoreError(ws, m.sessionId, err)
           return

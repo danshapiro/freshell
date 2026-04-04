@@ -219,6 +219,39 @@ describe('restore ledger manager', () => {
     expect(upgraded.turns.map((turn) => turn.messageId)).toEqual(['durable-upstream-1'])
   })
 
+  it('keeps repeated live content as a distinct turn when durable backlog already exists', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000555'
+    const liveSession = makeSession({
+      sessionId: 'sdk-repeat',
+      cliSessionId: canonicalSessionId,
+      messages: [
+        makeMessage('user', 'hello', { messageId: 'live:sdk-repeat:0' }),
+      ],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'hello', { messageId: 'durable-hello-0' }),
+      ]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const resolved = await manager.resolve('sdk-repeat')
+
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-repeat',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-hello-0',
+      'live:sdk-repeat:0',
+    ])
+  })
+
   it('classifies ambiguous compatibility overlap as RESTORE_DIVERGED instead of inventing alternate history', async () => {
     const durablePrompt = makeMessage('user', 'alpha', { messageId: 'durable-alpha' })
     const durableReply = makeMessage('assistant', 'omega', { messageId: 'durable-omega' })

@@ -232,4 +232,33 @@ describe('agent timeline router with the real service', () => {
       currentRevision: 13,
     })
   })
+
+  it('rejects malformed turn-body revisions with HTTP 400 instead of treating them as stale restore state', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000655'
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-session-655',
+          liveSessionId: 'sdk-session-655',
+          timelineSessionId: canonicalSessionId,
+          revision: 7,
+          messages: [
+            {
+              role: 'assistant',
+              timestamp: '2026-03-10T10:01:00.000Z',
+              content: [{ type: 'text', text: 'latest reply' }],
+            },
+          ],
+        })),
+      },
+    })
+
+    const app = createAuthedApp(service)
+    const response = await request(app)
+      .get('/api/agent-sessions/sdk-session-655/turns/turn-0?revision=abc')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(response.status).toBe(400)
+    expect(response.body.error).toBe('Invalid request')
+  })
 })

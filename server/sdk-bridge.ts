@@ -16,7 +16,7 @@ import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-ag
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
-import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
+import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
 import type {
   SdkSessionState,
   ContentBlock,
@@ -72,14 +72,7 @@ export class SdkBridge extends EventEmitter {
     if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
       return message.messageId
     }
-    const fingerprint = createDurableMessageFingerprint(message)
-    let occurrenceIndex = 0
-    for (const existing of state.messages) {
-      if (createDurableMessageFingerprint(existing) === fingerprint) {
-        occurrenceIndex += 1
-      }
-    }
-    return synthesizeDeterministicMessageId(message, occurrenceIndex)
+    return synthesizeLiveMessageId(state.sessionId, state.messages.length)
   }
 
   async createSession(options: {

@@ -1146,8 +1146,65 @@ describe('WS Handler SDK Integration', () => {
         expect(messages).toContainEqual({
           type: 'sdk.error',
           sessionId: 'sdk-sess-live-attach',
-          code: 'INTERNAL_ERROR',
+          code: 'RESTORE_INTERNAL',
           message: 'Failed to restore SDK session history',
+        })
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.status')).toBe(false)
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns sdk.error instead of fabricating a snapshot when live sdk.attach resolves to a fatal restore outcome', async () => {
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-sess-live-fatal',
+        status: 'running',
+        messages: [makeMessage('user', 'live prompt', '2026-03-10T10:00:00.000Z')],
+        streamingActive: true,
+        streamingText: 'partial reply',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockHistorySource.resolve.mockResolvedValue({
+        kind: 'fatal',
+        code: 'RESTORE_DIVERGED',
+        message: 'Live restore state diverged from durable history',
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collected = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (
+              parsed.type === 'sdk.session.snapshot'
+              || parsed.type === 'sdk.status'
+              || parsed.type === 'sdk.error'
+            ) {
+              messages.push(parsed)
+            }
+            if (messages.some((message) => message.type === 'sdk.error')) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-sess-live-fatal',
+        }))
+
+        await collected
+
+        expect(messages).toContainEqual({
+          type: 'sdk.error',
+          sessionId: 'sdk-sess-live-fatal',
+          code: 'RESTORE_DIVERGED',
+          message: 'Live restore state diverged from durable history',
         })
         expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
         expect(messages.some((message) => message.type === 'sdk.status')).toBe(false)
@@ -1170,7 +1227,7 @@ describe('WS Handler SDK Integration', () => {
         expect(response).toEqual({
           type: 'sdk.error',
           sessionId: 'sdk-missing-history',
-          code: 'INTERNAL_ERROR',
+          code: 'RESTORE_INTERNAL',
           message: 'Failed to restore SDK session history',
         })
       } finally {
