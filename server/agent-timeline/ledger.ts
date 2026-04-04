@@ -39,6 +39,7 @@ export type RestoreLedgerManagerDeps = {
 
 type InternalTurn = CanonicalTurn & {
   compatibilityKey: string
+  syntheticMessageId: boolean
 }
 
 type LedgerRecord = {
@@ -162,6 +163,7 @@ function buildCanonicalTurns(
       ordinal: 0,
       source,
       compatibilityKey: `${fingerprint}:${occurrenceIndex}`,
+      syntheticMessageId: message.messageId == null,
       message: {
         ...message,
         messageId,
@@ -179,6 +181,7 @@ function buildSignature(resolution: Extract<RestoreResolution, { kind: 'resolved
       turnId: turn.turnId,
       messageId: turn.messageId,
       source: turn.source,
+      fingerprint: createDurableMessageFingerprint(turn.message),
     })),
   })
 }
@@ -265,7 +268,13 @@ function mergeTurns(
   }
 
   const canPromoteImplicitCompatibility = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
-    && potentialCompatibilityMatches.length > 1
+    && (
+      potentialCompatibilityMatches.length > 1
+      || (
+        potentialCompatibilityMatches.length === 1
+        && potentialCompatibilityMatches[0]?.turn.syntheticMessageId === true
+      )
+    )
   if (canPromoteImplicitCompatibility) {
     for (const match of potentialCompatibilityMatches) {
       matchedDurableIndices.push(match.durableIndex)
@@ -341,11 +350,14 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
 
   return {
     async resolve(queryId: string, options?: AgentHistoryResolveOptions): Promise<RestoreResolution> {
-      const liveSession = options?.liveSessionOverride ?? (
+      const liveSessionCandidate = options?.liveSessionOverride ?? (
         tombstonedLiveAliases.has(queryId)
           ? undefined
           : deps.getLiveSessionBySdkSessionId(queryId) ?? deps.getLiveSessionByCliSessionId(queryId)
       )
+      const liveSession = liveSessionCandidate && tombstonedLiveAliases.has(liveSessionCandidate.sessionId)
+        ? undefined
+        : liveSessionCandidate
       const timelineSessionId = resolveTimelineSessionId(queryId, liveSession)
 
       let durableMessages: ChatMessage[] = []

@@ -234,9 +234,11 @@ describe('agentChatSlice', () => {
       sessionId: 'sdk-empty',
       latestTurnId: null,
       status: 'starting',
+      timelineSessionId: 'named-resume',
     }))
 
     expect(state.sessions['sdk-empty'].historyLoaded).toBe(false)
+    expect(state.sessions['sdk-empty'].awaitingDurableHistory).toBe(true)
 
     state = agentChatReducer(state, sessionInit({
       sessionId: 'sdk-empty',

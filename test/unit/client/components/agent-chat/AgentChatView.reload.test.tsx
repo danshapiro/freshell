@@ -869,6 +869,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-empty',
       latestTurnId: null,
       status: 'starting',
+      timelineSessionId: 'named-resume',
     }))
     getAgentTimelinePage.mockResolvedValue({
       sessionId: '00000000-0000-4000-8000-000000000555',

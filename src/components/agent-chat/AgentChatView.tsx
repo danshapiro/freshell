@@ -34,6 +34,7 @@ import type { Tab } from '@/store/types'
 import {
   buildAgentChatPersistedIdentityUpdate,
   flushPersistedLayoutNow,
+  getCanonicalDurableSessionId,
   getPreferredResumeSessionId,
 } from '@/store/persistControl'
 
@@ -105,12 +106,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
     ? paneContent.resumeSessionId
     : undefined
+  const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
   const waitingForDurableHistoryIdentity = Boolean(
     session?.awaitingDurableHistory
       && session.latestTurnId === null
-      && !timelineSessionId,
+      && !canonicalDurableSessionId,
   )
   // Playwright can opt a pane into state-only mode so chrome activity tests
   // don't race the live SDK attach/create lifecycle.

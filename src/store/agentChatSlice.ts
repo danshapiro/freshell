@@ -127,7 +127,8 @@ const agentChatSlice = createSlice({
       session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
       if (action.payload.latestTurnId === null) {
-        const hasDurableHistoryIdentity = Boolean(session.timelineSessionId || session.cliSessionId)
+        const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
+          || isValidClaudeSessionId(session.cliSessionId)
         if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
           session.historyLoaded = true
           session.awaitingDurableHistory = false

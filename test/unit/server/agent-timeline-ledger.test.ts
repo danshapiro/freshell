@@ -219,6 +219,63 @@ describe('restore ledger manager', () => {
     expect(upgraded.turns.map((turn) => turn.messageId)).toEqual(['durable-upstream-1'])
   })
 
+  it('reconciles a single compatible idless live turn with its durable canonical turn', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000999'
+    const liveSession = makeSession({
+      sessionId: 'sdk-direct',
+      cliSessionId: canonicalSessionId,
+      messages: [makeMessage('user', 'alpha')],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
+      ]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const resolved = await manager.resolve('sdk-direct')
+
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-direct',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-alpha'])
+  })
+
+  it('bumps the ledger revision when a canonical turn changes under a stable message id', async () => {
+    const liveSession = makeSession({
+      sessionId: 'sdk-revision',
+      messages: [
+        makeMessage('assistant', 'first', { messageId: 'live-msg-1' }),
+      ],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue(null),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: () => undefined,
+    })
+
+    const first = await manager.resolve('sdk-revision')
+    if (first.kind !== 'resolved') throw new Error('expected resolved')
+
+    liveSession.messages = [
+      makeMessage('assistant', 'second', { messageId: 'live-msg-1' }),
+    ]
+
+    const second = await manager.resolve('sdk-revision')
+
+    expect(second).toMatchObject({ kind: 'resolved' })
+    if (second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(second.revision).toBeGreaterThan(first.revision)
+    expect(second.turns[0]?.message.content[0]).toEqual({ type: 'text', text: 'second' })
+  })
+
   it('keeps repeated live content as a distinct turn when durable backlog already exists', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000555'
     const liveSession = makeSession({
@@ -250,6 +307,45 @@ describe('restore ledger manager', () => {
       'durable-hello-0',
       'live:sdk-repeat:0',
     ])
+  })
+
+  it('drops live authority for durable aliases after unrecoverable teardown', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000123'
+    const liveSession = makeSession({
+      sessionId: 'sdk-kill',
+      cliSessionId: canonicalSessionId,
+      resumeSessionId: 'named-token',
+      messages: [makeMessage('user', 'hello', { messageId: 'live-msg-1' })],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'hello', { messageId: 'durable-msg-1' }),
+      ]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const beforeTeardown = await manager.resolve('sdk-kill')
+    expect(beforeTeardown).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-kill',
+      timelineSessionId: canonicalSessionId,
+    })
+
+    manager.teardownLiveSession('sdk-kill', { recoverable: false })
+
+    const afterTeardown = await manager.resolve(canonicalSessionId)
+
+    expect(afterTeardown).toMatchObject({
+      kind: 'resolved',
+      readiness: 'durable_only',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (afterTeardown.kind !== 'resolved') throw new Error('expected resolved')
+    expect(afterTeardown.liveSessionId).toBeUndefined()
+    expect(afterTeardown.turns.map((turn) => turn.messageId)).toEqual(['durable-msg-1'])
   })
 
   it('classifies ambiguous compatibility overlap as RESTORE_DIVERGED instead of inventing alternate history', async () => {
