@@ -273,10 +273,8 @@ describe('Editor Pane Integration', () => {
 
     await selectEditorFromPicker(user)
 
-    // Should see the path input
-    await waitFor(() => {
-      expect(screen.getByPlaceholderText(/enter file path/i)).toBeInTheDocument()
-    })
+    // Should see the path input (EditorPane is lazy-loaded)
+    expect(await screen.findByPlaceholderText(/enter file path/i)).toBeInTheDocument()
   })
 
   it('loads file when path is entered', async () => {
@@ -316,7 +314,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await screen.findByPlaceholderText(/enter file path/i)
     await user.clear(input)
     await user.type(input, '/test.md{Enter}')
 
@@ -371,7 +369,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await screen.findByPlaceholderText(/enter file path/i)
     await user.clear(input)
     await user.type(input, '/code.ts{Enter}')
 
@@ -422,7 +420,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await screen.findByPlaceholderText(/enter file path/i)
     await user.clear(input)
     await user.type(input, '/readme.md{Enter}')
 
@@ -474,7 +472,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await screen.findByPlaceholderText(/enter file path/i)
     await user.clear(input)
     await user.type(input, '/readme.md{Enter}')
 
@@ -580,7 +578,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await screen.findByPlaceholderText(/enter file path/i)
     await user.clear(input)
     await user.type(input, '/nonexistent.ts{Enter}')
 

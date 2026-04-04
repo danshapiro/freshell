@@ -15,6 +15,7 @@ import { computeWslPortForwardingPlanAsync } from '../../../server/wsl-port-forw
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
   detectLanIps: vi.fn().mockReturnValue(['192.168.1.100']),
+  detectLanIpsAsync: vi.fn().mockResolvedValue(['192.168.1.100']),
 }))
 vi.mock('is-port-reachable', () => ({
   default: vi.fn().mockResolvedValue(true),

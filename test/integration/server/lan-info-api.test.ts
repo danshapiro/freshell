@@ -48,7 +48,7 @@ describe('LAN Info API', () => {
       wsHandler: {
         broadcast: () => {},
       },
-      detectLanIps: () => ['192.168.1.100', '10.0.0.50'],
+      detectLanIps: () => Promise.resolve(['192.168.1.100', '10.0.0.50']),
     }))
   })
 

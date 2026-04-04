@@ -1,4 +1,4 @@
-import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
+import { useRef, useCallback, useMemo, useState, useEffect, lazy, Suspense } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
@@ -7,7 +7,7 @@ import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
-import EditorPane from './EditorPane'
+const EditorPane = lazy(() => import('./EditorPane'))
 import AgentChatView from '../agent-chat/AgentChatView'
 import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
@@ -709,15 +709,17 @@ function renderContent(
   if (content.kind === 'editor') {
     return (
       <ErrorBoundary key={paneId} label="Editor">
-        <EditorPane
-          paneId={paneId}
-          tabId={tabId}
-          filePath={content.filePath}
-          language={content.language}
-          readOnly={content.readOnly}
-          content={content.content}
-          viewMode={content.viewMode}
-        />
+        <Suspense fallback={null}>
+          <EditorPane
+            paneId={paneId}
+            tabId={tabId}
+            filePath={content.filePath}
+            language={content.language}
+            readOnly={content.readOnly}
+            content={content.content}
+            viewMode={content.viewMode}
+          />
+        </Suspense>
       </ErrorBoundary>
     )
   }

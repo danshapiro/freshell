@@ -1,4 +1,4 @@
-import { createElement, useEffect, useMemo, useState } from 'react'
+import { createElement, memo, useEffect, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -471,7 +471,7 @@ function DeviceSection({
 /*  Main component                                                    */
 /* ------------------------------------------------------------------ */
 
-export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
+function TabsViewInner({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const ws = useMemo(() => getWsClient(), [])
@@ -805,3 +805,6 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     </div>
   )
 }
+
+const TabsView = memo(TabsViewInner)
+export default TabsView

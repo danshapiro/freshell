@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import fs from 'fs'
+import fsp from 'fs/promises'
 import path from 'path'
 import cookieParser from 'cookie-parser'
 import { timingSafeCompare } from './auth.js'
@@ -20,7 +20,7 @@ export function createLocalFileRouter(): Router {
       return res.status(401).json({ error: 'Unauthorized' })
     }
     next()
-  }, (req, res) => {
+  }, async (req, res) => {
     const filePath = req.query.path as string
     if (!filePath) {
       return res.status(400).json({ error: 'path query parameter required' })
@@ -28,16 +28,18 @@ export function createLocalFileRouter(): Router {
 
     const resolved = path.resolve(filePath)
 
-    if (!fs.existsSync(resolved)) {
-      return res.status(404).json({ error: 'File not found' })
+    try {
+      const stat = await fsp.stat(resolved)
+      if (stat.isDirectory()) {
+        return res.status(400).json({ error: 'Cannot serve directories' })
+      }
+      res.sendFile(resolved)
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return res.status(404).json({ error: 'File not found' })
+      }
+      return res.status(500).json({ error: err.message })
     }
-
-    const stat = fs.statSync(resolved)
-    if (stat.isDirectory()) {
-      return res.status(400).json({ error: 'Cannot serve directories' })
-    }
-
-    res.sendFile(resolved)
   })
 
   return router

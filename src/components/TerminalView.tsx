@@ -1,4 +1,5 @@
 import {
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -214,7 +215,7 @@ function resolveMobileToolbarInput(keyId: Exclude<MobileToolbarKeyId, 'ctrl'>, c
   throw new Error(`Unsupported mobile toolbar key: ${unreachableKey}`)
 }
 
-export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
+function TerminalViewInner({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
@@ -2404,3 +2405,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     </div>
   )
 }
+
+const TerminalView = memo(TerminalViewInner)
+export default TerminalView
