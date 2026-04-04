@@ -182,7 +182,11 @@ describe('WsHandler agent history source DI', () => {
       }),
       subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
       getSession: vi.fn(),
+      getLiveSession: vi.fn().mockImplementation((sessionId: string) => mockSdkBridge.getSession(sessionId)),
       findSessionByCliSessionId: vi.fn(),
+      findLiveSessionByCliSessionId: vi.fn().mockImplementation((timelineSessionId: string) => (
+        mockSdkBridge.findSessionByCliSessionId(timelineSessionId)
+      )),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -250,7 +254,9 @@ describe('WsHandler agent history source DI', () => {
       createSession: vi.fn(),
       subscribe: vi.fn(),
       getSession: vi.fn().mockReturnValue(null),
+      getLiveSession: vi.fn().mockReturnValue(null),
       findSessionByCliSessionId: vi.fn(),
+      findLiveSessionByCliSessionId: vi.fn(),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -313,7 +319,9 @@ describe('WsHandler agent history source DI', () => {
       createSession: vi.fn(),
       subscribe: vi.fn(),
       getSession: vi.fn().mockReturnValue(null),
+      getLiveSession: vi.fn().mockReturnValue(null),
       findSessionByCliSessionId: vi.fn(),
+      findLiveSessionByCliSessionId: vi.fn(),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),
@@ -381,6 +389,9 @@ describe('WsHandler agent history source DI', () => {
             }
           : undefined
       )),
+      getLiveSession: vi.fn().mockImplementation((sessionId: string) => (
+        mockSdkBridge.getSession(sessionId)
+      )),
       createSession: vi.fn().mockReturnValue({
         sessionId: 'sdk-sess-module',
         status: 'starting',
@@ -393,6 +404,9 @@ describe('WsHandler agent history source DI', () => {
       }),
       subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
       findSessionByCliSessionId: vi.fn(),
+      findLiveSessionByCliSessionId: vi.fn().mockImplementation((timelineSessionId: string) => (
+        mockSdkBridge.findSessionByCliSessionId(timelineSessionId)
+      )),
       killSession: vi.fn(),
       sendUserMessage: vi.fn(),
       respondPermission: vi.fn(),

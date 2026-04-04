@@ -889,6 +889,15 @@ describe('SdkBridge', () => {
   describe('stream end cleanup', () => {
     it('cleans up process on natural stream end so sendUserMessage returns false', async () => {
       mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+      mockMessages.push({
         type: 'result',
         subtype: 'success',
         duration_ms: 100,
@@ -906,8 +915,8 @@ describe('SdkBridge', () => {
       // Wait for stream to complete and cleanup to run
       await new Promise(resolve => setTimeout(resolve, 150))
 
-      // Session state still exists for display
-      expect(bridge.getSession(session.sessionId)).toBeDefined()
+      expect(bridge.getLiveSession(session.sessionId)).toBeUndefined()
+      expect(bridge.findLiveSessionByCliSessionId('cli-123')).toBeUndefined()
       expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
       // But process is gone — sendUserMessage returns false
       expect(bridge.sendUserMessage(session.sessionId, 'hello')).toBe(false)

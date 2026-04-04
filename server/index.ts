@@ -278,12 +278,8 @@ async function main() {
     })
   const agentHistorySource = createAgentHistorySource({
     loadSessionHistory: loadSessionHistoryWithCache,
-    getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getSession(sdkSessionId),
-    getLiveSessionByCliSessionId: (timelineSessionId) => (
-      sdkBridge.listSessions().find((session) => (
-        session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId
-      ))
-    ),
+    getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
+    getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
   })
 
   const server = http.createServer(app)

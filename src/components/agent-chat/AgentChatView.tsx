@@ -31,7 +31,11 @@ import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import type { Tab } from '@/store/types'
-import { buildAgentChatPersistedIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
+import {
+  buildAgentChatPersistedIdentityUpdate,
+  flushPersistedLayoutNow,
+  getPreferredResumeSessionId,
+} from '@/store/persistControl'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -101,7 +105,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
     ? paneContent.resumeSessionId
     : undefined
-  const timelineSessionId = session?.timelineSessionId ?? session?.cliSessionId ?? persistedTimelineSessionId
+  const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
   const waitingForDurableHistoryIdentity = Boolean(
     session?.awaitingDurableHistory
@@ -122,8 +126,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
   const triggerRecovery = useCallback(() => {
     const newRequestId = nanoid()
-    const resumeSessionId = sessionRef.current?.timelineSessionId
-      ?? sessionRef.current?.cliSessionId
+    const resumeSessionId = getPreferredResumeSessionId(sessionRef.current)
       ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
@@ -257,7 +260,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    const preferredResumeSessionId = session?.timelineSessionId ?? session?.cliSessionId
+    const preferredResumeSessionId = getPreferredResumeSessionId(session)
     if (!preferredResumeSessionId) return
     if (taggedSessionRef.current === preferredResumeSessionId) return
     taggedSessionRef.current = preferredResumeSessionId

@@ -8,6 +8,7 @@ import agentChatReducer, {
   registerPendingCreate,
   sessionCreated,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   setSessionStatus,
   timelinePageReceived,
@@ -640,6 +641,89 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(tab?.sessionMetadataByKey?.['claude:cli-shell-abc-123']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
+    }))
+  })
+
+  it('upgrades a named restore to the canonical durable id when sdk.session.metadata arrives after the snapshot', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    getAgentTimelinePage
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({
+        sessionId: canonicalSessionId,
+        items: [],
+        nextCursor: null,
+        revision: 2,
+      })
+
+    const store = makeStoreWithTabs()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-meta-upgrade',
+      sessionId: 'sdk-meta-upgrade-1',
+      status: 'idle',
+      resumeSessionId: 'named-resume',
+    } satisfies AgentChatPaneContent
+    store.dispatch(addTab({
+      id: 't-meta',
+      title: 'Metadata Upgrade Tab',
+      mode: 'claude',
+      codingCliProvider: 'claude',
+      resumeSessionId: 'named-resume',
+      sessionMetadataByKey: {
+        'claude:named-resume': {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Continue from metadata upgrade',
+        },
+      },
+    }))
+    store.dispatch(initLayout({ tabId: 't-meta', paneId: 'p1', content: pane }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t-meta" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-meta-upgrade-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: 'named-resume',
+        revision: 1,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'named-resume',
+        expect.objectContaining({ includeBodies: true }),
+        expect.anything(),
+      )
+    })
+
+    act(() => {
+      store.dispatch(sessionMetadataReceived({
+        sessionId: 'sdk-meta-upgrade-1',
+        cliSessionId: canonicalSessionId,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        canonicalSessionId,
+        expect.objectContaining({ includeBodies: true }),
+        expect.anything(),
+      )
+    })
+
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')
+    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000321']).toEqual(expect.objectContaining({
+      sessionType: 'freshclaude',
+      firstUserMessage: 'Continue from metadata upgrade',
     }))
   })
 

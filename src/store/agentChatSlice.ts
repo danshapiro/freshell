@@ -1,4 +1,5 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
   AgentChatState,
   AgentTimelineItem,
@@ -99,6 +100,10 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
+        session.timelineSessionId = action.payload.cliSessionId
+        session.awaitingDurableHistory = false
+      }
       session.model = action.payload.model ?? session.model
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools

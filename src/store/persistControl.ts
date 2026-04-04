@@ -10,12 +10,19 @@ export const flushPersistedLayoutNow = createAction('persist/flushNow')
 type SessionIdentityState = Pick<ChatSessionState, 'timelineSessionId' | 'cliSessionId'> | undefined
 
 export function getPreferredResumeSessionId(session: SessionIdentityState): string | undefined {
-  return session?.timelineSessionId ?? session?.cliSessionId
+  return getCanonicalDurableSessionId(session)
+    ?? session?.timelineSessionId
+    ?? session?.cliSessionId
 }
 
 export function getCanonicalDurableSessionId(session: SessionIdentityState): string | undefined {
-  const sessionId = getPreferredResumeSessionId(session)
-  return isValidClaudeSessionId(sessionId) ? sessionId : undefined
+  if (isValidClaudeSessionId(session?.cliSessionId)) {
+    return session.cliSessionId
+  }
+  if (isValidClaudeSessionId(session?.timelineSessionId)) {
+    return session.timelineSessionId
+  }
+  return undefined
 }
 
 export function preferCanonicalResumeSessionId(

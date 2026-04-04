@@ -44,6 +44,7 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { getPreferredResumeSessionId } from '@/store/persistControl'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -134,7 +135,7 @@ function resolveFreshClaudeRuntimeMeta(
   if (content.provider !== 'freshclaude') return undefined
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const indexedSessionId = session?.timelineSessionId ?? session?.cliSessionId ?? content.resumeSessionId
+  const indexedSessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
   if (!provider || !indexedSessionId) return undefined
 
   const indexed = findIndexedSessionById(indexedProjects, provider, indexedSessionId)

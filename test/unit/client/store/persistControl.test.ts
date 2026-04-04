@@ -9,7 +9,11 @@ import {
   resetPersistedLayoutCacheForTests,
   resetPersistedPanesCacheForTests,
 } from '@/store/persistMiddleware'
-import { flushPersistedLayoutNow } from '@/store/persistControl'
+import {
+  flushPersistedLayoutNow,
+  getCanonicalDurableSessionId,
+  getPreferredResumeSessionId,
+} from '@/store/persistControl'
 import tabsReducer, { addTab, updateTab } from '@/store/tabsSlice'
 
 describe('persistControl', () => {
@@ -69,5 +73,15 @@ describe('persistControl', () => {
     store.dispatch(setSessionStatus({ sessionId: 'sdk-1', status: 'idle' }))
 
     expect(setItemSpy).not.toHaveBeenCalled()
+  })
+
+  it('prefers a canonical durable cliSessionId over a named restore token', () => {
+    const session = {
+      timelineSessionId: 'named-resume',
+      cliSessionId: '00000000-0000-4000-8000-000000000321',
+    }
+
+    expect(getPreferredResumeSessionId(session)).toBe('00000000-0000-4000-8000-000000000321')
+    expect(getCanonicalDurableSessionId(session)).toBe('00000000-0000-4000-8000-000000000321')
   })
 })

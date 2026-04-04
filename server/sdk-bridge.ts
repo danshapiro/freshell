@@ -529,8 +529,23 @@ export class SdkBridge extends EventEmitter {
     return this.sessions.get(sessionId)
   }
 
+  getLiveSession(sessionId: string): SdkSessionState | undefined {
+    if (!this.processes.has(sessionId)) return undefined
+    return this.sessions.get(sessionId)
+  }
+
   findSessionByCliSessionId(timelineSessionId: string): SdkSessionState | undefined {
     for (const session of this.sessions.values()) {
+      if (session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId) {
+        return session
+      }
+    }
+    return undefined
+  }
+
+  findLiveSessionByCliSessionId(timelineSessionId: string): SdkSessionState | undefined {
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (!this.processes.has(sessionId)) continue
       if (session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId) {
         return session
       }

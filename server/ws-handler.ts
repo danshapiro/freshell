@@ -383,8 +383,8 @@ export class WsHandler {
     this.agentHistorySource = agentHistorySource ?? (this.sdkBridge
       ? createAgentHistorySource({
         loadSessionHistory,
-        getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getSession(sdkSessionId),
-        getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findSessionByCliSessionId(timelineSessionId),
+        getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getLiveSession(sdkSessionId),
+        getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findLiveSessionByCliSessionId(timelineSessionId),
       })
       : undefined)
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
@@ -1040,12 +1040,20 @@ export class WsHandler {
     queuedMessages: Array<{ message: SdkServerMessage; sequence: number }>,
     watermark: number,
   ): void {
+    const delayedMetadata: SdkServerMessage[] = []
     for (const queued of queuedMessages) {
       const transformed = this.transactionalCreateMessage(queued.message, clientSessionId)
-      if (queued.sequence <= watermark && transformed.type !== 'sdk.session.metadata') {
+      if (transformed.type === 'sdk.session.metadata') {
+        delayedMetadata.push(transformed)
+        continue
+      }
+      if (queued.sequence <= watermark) {
         continue
       }
       this.safeSend(ws, transformed)
+    }
+    for (const metadata of delayedMetadata) {
+      this.safeSend(ws, metadata)
     }
   }
 
@@ -2092,7 +2100,7 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
           return
         }
-        const directSession = this.sdkBridge.getSession(m.sessionId)
+        const directSession = this.sdkBridge.getLiveSession(m.sessionId)
         let resolved: Awaited<ReturnType<AgentHistorySource['resolve']>> | null = null
         if (!directSession) {
           try {
@@ -2103,7 +2111,7 @@ export class WsHandler {
           }
         }
         const liveSession = directSession
-          ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getSession(resolved.liveSessionId) : undefined)
+          ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getLiveSession(resolved.liveSessionId) : undefined)
         if (!liveSession) {
           if (resolved?.kind === 'fatal') {
             this.send(ws, {

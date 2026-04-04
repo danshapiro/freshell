@@ -314,7 +314,11 @@ describe('WS Handler SDK Integration', () => {
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
         }),
+        getLiveSession: vi.fn().mockImplementation((sessionId: string) => mockSdkBridge.getSession(sessionId)),
         findSessionByCliSessionId: vi.fn(),
+        findLiveSessionByCliSessionId: vi.fn().mockImplementation((timelineSessionId: string) => (
+          mockSdkBridge.findSessionByCliSessionId(timelineSessionId)
+        )),
       }
 
       handler = new WsHandler(
@@ -779,7 +783,7 @@ describe('WS Handler SDK Integration', () => {
 
     it('hydrates sdk.attach from durable Claude history when no live SDK session exists', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
-      mockSdkBridge.getSession.mockReturnValue(undefined)
+      mockSdkBridge.getLiveSession.mockReturnValue(undefined)
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
         queryId: durableSessionId,
         timelineSessionId: durableSessionId,
@@ -836,6 +840,75 @@ describe('WS Handler SDK Integration', () => {
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockHistorySource.resolve).toHaveBeenCalledWith(durableSessionId)
         expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith(durableSessionId, expect.any(Function))
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('rebuilds sdk.attach from durable history when only ended in-memory SDK state remains', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000243'
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-ended-1',
+        cliSessionId: durableSessionId,
+        status: 'idle',
+        messages: [makeMessage('assistant', 'stale in-memory reply', '2026-03-10T10:00:01.000Z')],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      })
+      mockSdkBridge.getLiveSession.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: 'sdk-ended-1',
+        timelineSessionId: durableSessionId,
+        revision: 7,
+        messages: [
+          makeMessage('user', 'Earlier question', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'Earlier durable answer', '2026-03-10T10:00:01.000Z'),
+        ],
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
+              count += 1
+              if (count >= 2) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-ended-1',
+        }))
+
+        await collectDone
+
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-ended-1',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: durableSessionId,
+          revision: 7,
+        })
+        expect(messages.find((m) => m.type === 'sdk.status')).toEqual({
+          type: 'sdk.status',
+          sessionId: 'sdk-ended-1',
+          status: 'idle',
+        })
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-ended-1')
+        expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith('sdk-ended-1', expect.any(Function))
       } finally {
         ws.close()
       }
@@ -1372,21 +1445,21 @@ describe('WS Handler SDK Integration', () => {
           'sdk.created',
           'sdk.session.snapshot',
           'sdk.session.init',
-          'sdk.session.metadata',
           'sdk.stream',
+          'sdk.session.metadata',
         ]), { timeout: 3000 })
 
         expect(received[3]).toMatchObject({
-          type: 'sdk.session.metadata',
-          cliSessionId: 'cli-123',
-          cwd: '/tmp',
-        })
-        expect(received[4]).toMatchObject({
           type: 'sdk.stream',
           event: {
             type: 'content_block_delta',
             delta: { type: 'text_delta', text: 'after watermark' },
           },
+        })
+        expect(received[4]).toMatchObject({
+          type: 'sdk.session.metadata',
+          cliSessionId: 'cli-123',
+          cwd: '/tmp',
         })
       } finally {
         ws.close()
