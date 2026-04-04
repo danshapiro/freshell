@@ -103,6 +103,7 @@ const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
+  buffered: string
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
@@ -111,25 +112,36 @@ function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): numbe
 
 function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
   const remainder = state.remainder
-  state.remainder = null
   if (!remainder) {
+    state.buffered = ''
     return raw
   }
 
-  let matched = 0
+  let matched = state.buffered
+  let index = 0
   while (
-    matched < raw.length
-    && matched < remainder.length
-    && raw[matched] === remainder[matched]
+    index < raw.length
+    && matched.length < remainder.length
+    && raw[index] === remainder[matched.length]
   ) {
-    matched += 1
+    matched += raw[index]
+    index += 1
   }
 
-  if (matched === remainder.length) {
-    return raw.slice(matched)
+  if (matched.length === remainder.length) {
+    state.remainder = null
+    state.buffered = ''
+    return raw.slice(index)
   }
 
-  if (matched === raw.length) {
+  if (index < raw.length) {
+    state.remainder = null
+    state.buffered = ''
+    return `${matched}${raw.slice(index)}`
+  }
+
+  if (index === raw.length) {
+    state.buffered = matched
     return ''
   }
 
@@ -318,6 +330,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const startupProbeStateRef = useRef(createTerminalStartupProbeState())
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
     remainder: null,
+    buffered: '',
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
@@ -905,9 +918,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       const remainder = getStartupProbeReplayRemainder(pendingProbe)
       startupProbeReplayDiscardStateRef.current = {
         remainder,
+        buffered: '',
       }
     } else {
-      startupProbeReplayDiscardStateRef.current = { remainder: null }
+      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
     }
     startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
@@ -1855,7 +1869,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           )
           const enteringFreshLiveOutput = !frameOverlapsReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          if (enteringFreshLiveOutput) {
+          if (
+            enteringFreshLiveOutput
+            && !startupProbeReplayDiscardStateRef.current.remainder
+            && !startupProbeReplayDiscardStateRef.current.buffered
+          ) {
             resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
           }
           raw = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
