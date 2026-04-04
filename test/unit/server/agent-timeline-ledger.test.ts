@@ -197,9 +197,16 @@ describe('restore ledger manager', () => {
       'live-user-1',
     ])
 
+    liveSession.messages.push(
+      makeMessage('assistant', 'late live delta', { messageId: 'live-assistant-2' }),
+    )
+    await manager.syncLiveSession(liveSession)
+
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+
     const third = await manager.resolve('sdk-authority')
 
-    expect(loadSessionHistory).toHaveBeenCalledTimes(3)
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
     expect(third).toMatchObject({
       kind: 'resolved',
       readiness: 'merged',
@@ -207,10 +214,11 @@ describe('restore ledger manager', () => {
       timelineSessionId: canonicalSessionId,
     })
     if (third.kind !== 'resolved') throw new Error('expected resolved')
-    expect(third.revision).toBe(second.revision)
+    expect(third.revision).toBeGreaterThan(second.revision)
     expect(third.turns.map((turn) => turn.messageId)).toEqual([
       'durable-assistant-1',
       'live-user-1',
+      'live-assistant-2',
     ])
   })
 

@@ -967,12 +967,15 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     await waitFor(() => {
-      expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        canonicalSessionId,
-        expect.objectContaining({ includeBodies: true }),
-        expect.anything(),
-      )
+      expect(getAgentTimelinePage).toHaveBeenCalledTimes(2)
     })
+    expect(getAgentTimelinePage).toHaveBeenNthCalledWith(
+      2,
+      canonicalSessionId,
+      expect.objectContaining({ includeBodies: true }),
+      expect.anything(),
+    )
+    expect(getAgentTimelinePage.mock.calls[1]?.[1]).not.toHaveProperty('revision')
 
     await waitFor(() => {
       const session = store.getState().agentChat.sessions['sdk-meta-upgrade-1']

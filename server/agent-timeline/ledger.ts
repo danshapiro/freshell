@@ -55,6 +55,10 @@ type LedgerRecord = {
   durableAliases: Set<string>
   durableMessages: ChatMessage[]
   durableTimelineSessionId?: string
+  pendingDurableHydration?: {
+    timelineSessionId: string
+    promise: Promise<void>
+  }
 }
 
 function stableStringify(value: unknown): string {
@@ -303,13 +307,9 @@ function mergeTurns(
   return { kind: 'ok', turns: normalizeOrdinals([...durableTurns, ...unmatchedLiveTurns]) }
 }
 
-function deriveCompatibilityCandidateIds(resolution: Extract<RestoreResolution, { kind: 'resolved' }>): Set<string> {
-  if (resolution.readiness !== 'live_only') {
-    return new Set<string>()
-  }
+function deriveCompatibilityCandidateIds(liveTurns: InternalTurn[]): Set<string> {
   return new Set(
-    resolution.turns
-      .filter((turn) => turn.source === 'live')
+    liveTurns
       .map((turn) => turn.messageId),
   )
 }
@@ -387,9 +387,40 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     timelineSessionId: string | undefined,
   ): Promise<void> {
     if (!isCanonicalDurableSessionId(timelineSessionId)) return
-    const durableMessages = (await deps.loadSessionHistory(timelineSessionId)) ?? []
-    ledger.durableMessages = durableMessages
-    ledger.durableTimelineSessionId = timelineSessionId
+    const pendingHydration = ledger.pendingDurableHydration
+    if (pendingHydration && pendingHydration.timelineSessionId === timelineSessionId) {
+      await pendingHydration.promise
+      return
+    }
+
+    const promise = (async () => {
+      const durableMessages = (await deps.loadSessionHistory(timelineSessionId)) ?? []
+      ledger.durableMessages = durableMessages
+      ledger.durableTimelineSessionId = timelineSessionId
+    })()
+    ledger.pendingDurableHydration = {
+      timelineSessionId,
+      promise,
+    }
+
+    try {
+      await promise
+    } finally {
+      if (ledger.pendingDurableHydration?.promise === promise) {
+        ledger.pendingDurableHydration = undefined
+      }
+    }
+  }
+
+  function shouldRefreshDurableHistory(
+    ledger: LedgerRecord,
+    timelineSessionId: string | undefined,
+  ): timelineSessionId is string {
+    return isCanonicalDurableSessionId(timelineSessionId)
+      && (
+        ledger.durableTimelineSessionId !== timelineSessionId
+        || ledger.durableMessages.length === 0
+      )
   }
 
   function updateResolution(
@@ -448,7 +479,8 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ledger.signature = signature
     ledger.resolution = resolved
     ledger.compatibilityCandidateIds = resolved.readiness === 'live_only'
-      ? deriveCompatibilityCandidateIds(resolved)
+      && !isCanonicalDurableSessionId(params.timelineSessionId)
+      ? deriveCompatibilityCandidateIds(liveTurns)
       : new Set(ledger.compatibilityCandidateIds)
   }
 
@@ -479,7 +511,10 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     return liveSession
   }
 
-  async function syncLiveSession(liveSession: SdkSessionState): Promise<LedgerRecord> {
+  async function syncLiveSession(
+    liveSession: SdkSessionState,
+    options?: { refreshDurableHistory?: boolean },
+  ): Promise<LedgerRecord> {
     const timelineSessionId = resolveTimelineSessionId(liveSession.sessionId, liveSession)
     const existing = findLedgerRecord([
       liveSession.sessionId,
@@ -488,8 +523,13 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ])
     const ledger = existing ?? createLedgerRecord(liveSession.sessionId)
 
-    if (isCanonicalDurableSessionId(timelineSessionId)) {
-      await hydrateDurableHistory(ledger, timelineSessionId)
+    if (
+      isCanonicalDurableSessionId(timelineSessionId)
+      && ledger.durableTimelineSessionId
+      && ledger.durableTimelineSessionId !== timelineSessionId
+    ) {
+      ledger.durableMessages = []
+      ledger.durableTimelineSessionId = undefined
     }
 
     updateResolution(ledger, {
@@ -502,6 +542,20 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],
       durableAliases: [isCanonicalDurableSessionId(timelineSessionId) ? timelineSessionId : undefined],
     })
+
+    if (options?.refreshDurableHistory && shouldRefreshDurableHistory(ledger, timelineSessionId)) {
+      await hydrateDurableHistory(ledger, timelineSessionId)
+      updateResolution(ledger, {
+        liveSession,
+        timelineSessionId,
+        queryId: liveSession.sessionId,
+      })
+      bindAliases(ledger, {
+        liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],
+        durableAliases: [timelineSessionId],
+      })
+    }
+
     return ledger
   }
 
@@ -509,7 +563,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     async syncLiveSession(liveSession: SdkSessionState): Promise<void> {
       tombstonedLiveAliases.delete(liveSession.sessionId)
       if (liveSession.resumeSessionId) tombstonedLiveAliases.delete(liveSession.resumeSessionId)
-      await syncLiveSession(liveSession)
+      await syncLiveSession(liveSession, { refreshDurableHistory: false })
     },
 
     async resolve(queryId: string, options?: AgentHistoryResolveOptions): Promise<RestoreResolution> {
@@ -526,7 +580,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
           ? undefined
           : liveSessionCandidate
         if (liveSession) {
-          const ledger = await syncLiveSession(liveSession)
+          const ledger = await syncLiveSession(liveSession, { refreshDurableHistory: true })
           return ledger.resolution ?? { kind: 'missing', code: 'RESTORE_NOT_FOUND' }
         }
 

@@ -1098,9 +1098,13 @@ describe('WS Handler SDK Integration', () => {
           text: 'continue working',
         }))
 
-        await new Promise((resolve) => setTimeout(resolve, 0))
-
-        expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(liveSession.sessionId, 'continue working', undefined)
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(
+            liveSession.sessionId,
+            'continue working',
+            undefined,
+          )
+        })
       } finally {
         ws.close()
       }

@@ -464,10 +464,10 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-live']).toMatchObject({
       historyLoaded: false,
       timelineSessionId: '00000000-0000-4000-8000-000000000321',
-      timelineRevision: 1,
       latestTurnId: 'turn-1',
       restoreRetryCount: 0,
     })
+    expect(state.sessions['sdk-live'].timelineRevision).toBeUndefined()
     expect(state.sessions['sdk-live'].timelineItems).toEqual([])
     expect(state.sessions['sdk-live'].timelineBodies).toEqual({})
     expect(state.sessions['sdk-live'].nextTimelineCursor).toBeUndefined()

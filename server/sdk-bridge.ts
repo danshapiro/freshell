@@ -82,7 +82,7 @@ export class SdkBridge extends EventEmitter {
   }
 
   private syncRestoreLedger(state: SdkSessionState): void {
-    void this.agentHistorySource?.syncLiveSession?.(this.cloneSessionState(state)).catch((err) => {
+    void this.agentHistorySource?.syncLiveSession?.(state).catch((err) => {
       log.warn({
         err: err instanceof Error ? err : new Error(String(err)),
         sessionId: state.sessionId,
@@ -190,7 +190,7 @@ export class SdkBridge extends EventEmitter {
       inputStream,
     })
 
-    await this.agentHistorySource?.syncLiveSession?.(this.cloneSessionState(state))
+    await this.agentHistorySource?.syncLiveSession?.(state)
 
     // Start consuming the message stream in the background
     this.consumeStream(sessionId, sdkQuery).catch((err) => {

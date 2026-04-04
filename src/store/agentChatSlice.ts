@@ -54,6 +54,7 @@ function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState):
   session.timelineItems = []
   session.timelineBodies = {}
   session.nextTimelineCursor = undefined
+  session.timelineRevision = undefined
   session.timelineLoading = false
   session.timelineError = undefined
   session.historyLoaded = false
