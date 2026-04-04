@@ -2178,6 +2178,12 @@ export class WsHandler {
           return
         }
 
+        // Treat a successful attach as ownership of the client-visible session id.
+        // Follow-up SDK commands must route through the resolved live target even if
+        // stream subscription bookkeeping is unavailable or deferred.
+        state.sdkSessions.add(m.sessionId)
+        state.sdkSessionTargets.set(m.sessionId, liveSession.sessionId)
+
         // Send current status
         this.send(ws, {
           type: 'sdk.status',

@@ -1106,6 +1106,76 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('keeps the canonical durable attach alias routable even when subscribe cannot establish live stream bookkeeping', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000243'
+      const liveSession = {
+        sessionId: 'sdk-live-243',
+        cliSessionId: durableSessionId,
+        status: 'running',
+        messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => {
+        if (sessionId === durableSessionId) return undefined
+        if (sessionId === liveSession.sessionId) return liveSession
+        return undefined
+      })
+      mockSdkBridge.sendUserMessage.mockImplementation((sessionId: string) => sessionId === liveSession.sessionId)
+      mockSdkBridge.subscribe.mockReturnValue(null)
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: durableSessionId,
+        liveSessionId: liveSession.sessionId,
+        timelineSessionId: durableSessionId,
+        revision: 124,
+        messages: [
+          makeMessage('user', 'older prompt', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
+          makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
+        ],
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const collectedAttach = new Promise<void>((resolve) => {
+          let snapshotReceived = false
+          let statusReceived = false
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            snapshotReceived ||= parsed.type === 'sdk.session.snapshot'
+            statusReceived ||= parsed.type === 'sdk.status'
+            if (snapshotReceived && statusReceived) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: durableSessionId,
+        }))
+
+        await collectedAttach
+
+        ws.send(JSON.stringify({
+          type: 'sdk.send',
+          sessionId: durableSessionId,
+          text: 'continue working',
+        }))
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(liveSession.sessionId, 'continue working', undefined)
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
     it('for resumed sdk.create sends sdk.created, then sdk.session.snapshot, then sdk.session.init', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000241'
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
