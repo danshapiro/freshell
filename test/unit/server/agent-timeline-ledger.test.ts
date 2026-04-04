@@ -126,7 +126,7 @@ describe('restore ledger manager', () => {
     ])
   })
 
-  it('reuses one authoritative in-memory ledger while a live session exists', async () => {
+  it('promotes late durable backlog while one authoritative live ledger serves both aliases', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000424'
     const liveSession = makeSession({
       sessionId: 'sdk-authority',
@@ -135,9 +135,13 @@ describe('restore ledger manager', () => {
         makeMessage('user', 'prompt', { messageId: 'live-user-1' }),
       ],
     })
-    const loadSessionHistory = vi.fn().mockResolvedValue([
+    const durableBacklog = [
       makeMessage('assistant', 'older durable reply', { messageId: 'durable-assistant-1' }),
-    ])
+    ]
+    const loadSessionHistory = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(durableBacklog)
+      .mockResolvedValue(durableBacklog)
 
     const manager = createRestoreLedgerManager({
       loadSessionHistory,
@@ -150,27 +154,38 @@ describe('restore ledger manager', () => {
 
     expect(first).toMatchObject({
       kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-authority',
+      timelineSessionId: canonicalSessionId,
+    })
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(second).toMatchObject({
+      kind: 'resolved',
       readiness: 'merged',
       liveSessionId: 'sdk-authority',
       timelineSessionId: canonicalSessionId,
     })
-    expect(second).toEqual(first)
-    expect(loadSessionHistory).toHaveBeenCalledTimes(1)
-
-    liveSession.messages.push(makeMessage('assistant', 'fresh live delta', { messageId: 'live-assistant-2' }))
+    if (first.kind !== 'resolved' || second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(second.revision).toBeGreaterThan(first.revision)
+    expect(second.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-assistant-1',
+      'live-user-1',
+    ])
 
     const third = await manager.resolve('sdk-authority')
 
-    expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+    expect(loadSessionHistory).toHaveBeenCalledTimes(3)
     expect(third).toMatchObject({
       kind: 'resolved',
-      revision: first.kind === 'resolved' ? first.revision + 1 : expect.any(Number),
+      readiness: 'merged',
+      liveSessionId: 'sdk-authority',
+      timelineSessionId: canonicalSessionId,
     })
     if (third.kind !== 'resolved') throw new Error('expected resolved')
+    expect(third.revision).toBe(second.revision)
     expect(third.turns.map((turn) => turn.messageId)).toEqual([
       'durable-assistant-1',
       'live-user-1',
-      'live-assistant-2',
     ])
   })
 
@@ -183,11 +198,12 @@ describe('restore ledger manager', () => {
       makeMessage('user', 'hello  \nworld', { timestamp: '2026-04-03T18:00:00.000Z' }),
       makeMessage('assistant', 'reply', { messageId: 'upstream-assistant-id' }),
     ]
+    const loadSessionHistory = vi.fn()
+      .mockResolvedValueOnce(firstDurable)
+      .mockResolvedValueOnce(rewrittenDurable)
 
     const manager = createRestoreLedgerManager({
-      loadSessionHistory: vi.fn()
-        .mockResolvedValueOnce(firstDurable)
-        .mockResolvedValueOnce(rewrittenDurable),
+      loadSessionHistory,
       getLiveSessionBySdkSessionId: () => undefined,
       getLiveSessionByCliSessionId: () => undefined,
     })
@@ -198,9 +214,41 @@ describe('restore ledger manager', () => {
     expect(first).toMatchObject({ kind: 'resolved', readiness: 'durable_only' })
     expect(second).toMatchObject({ kind: 'resolved', readiness: 'durable_only' })
     if (first.kind !== 'resolved' || second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(second.revision).toBe(first.revision)
     expect(first.turns[0]?.messageId).toBe(second.turns[0]?.messageId)
     expect(first.turns[1]?.messageId).toBe('upstream-assistant-id')
     expect(second.turns[1]?.messageId).toBe('upstream-assistant-id')
+  })
+
+  it('rebuilds durable-only state from JSONL on repeated reads and bumps the revision when the transcript changes', async () => {
+    const timelineSessionId = '00000000-0000-4000-8000-000000000998'
+    const firstDurable = [
+      makeMessage('user', 'first', { messageId: 'durable-1' }),
+    ]
+    const expandedDurable = [
+      ...firstDurable,
+      makeMessage('assistant', 'second', { messageId: 'durable-2' }),
+    ]
+    const loadSessionHistory = vi.fn()
+      .mockResolvedValueOnce(firstDurable)
+      .mockResolvedValueOnce(expandedDurable)
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: () => undefined,
+      getLiveSessionByCliSessionId: () => undefined,
+    })
+
+    const first = await manager.resolve(timelineSessionId)
+    const second = await manager.resolve(timelineSessionId)
+
+    expect(first).toMatchObject({ kind: 'resolved', readiness: 'durable_only' })
+    expect(second).toMatchObject({ kind: 'resolved', readiness: 'durable_only' })
+    if (first.kind !== 'resolved' || second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(loadSessionHistory).toHaveBeenCalledTimes(2)
+    expect(second.revision).toBeGreaterThan(first.revision)
+    expect(second.turns.map((turn) => turn.messageId)).toEqual(['durable-1', 'durable-2'])
   })
 
   it('removes unrecoverable live aliases so stale in-memory authority cannot outlive the session', async () => {
