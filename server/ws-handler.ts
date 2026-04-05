@@ -2051,10 +2051,6 @@ export class WsHandler {
             tools: [],
           })
 
-          const deliveredInteractiveRequests = {
-            permissionRequestIds: new Set<string>(),
-            questionRequestIds: new Set<string>(),
-          }
           this.replayPendingInteractiveRequests(
             ws,
             session.sessionId,

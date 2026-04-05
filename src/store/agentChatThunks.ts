@@ -44,6 +44,22 @@ function isStaleRevisionError(error: unknown): error is {
   return candidate.status === 409 && candidate.details?.code === 'RESTORE_STALE_REVISION'
 }
 
+function getTimelineErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message
+  }
+  if (
+    typeof error === 'object'
+    && error !== null
+    && 'message' in error
+    && typeof (error as { message?: unknown }).message === 'string'
+    && (error as { message: string }).message.trim().length > 0
+  ) {
+    return (error as { message: string }).message
+  }
+  return fallback
+}
+
 function requestStaleRestoreRetry(
   sessionId: string,
   dispatch: AppDispatch,
@@ -91,7 +107,7 @@ export const loadAgentTurnBody = createAsyncThunk<
 
       dispatch(timelineLoadFailed({
         sessionId,
-        message: error instanceof Error ? error.message : 'Timeline request failed',
+        message: getTimelineErrorMessage(error, 'Timeline request failed'),
       }))
       throw error
     }
@@ -169,7 +185,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
 
       dispatch(timelineLoadFailed({
         sessionId,
-        message: error instanceof Error ? error.message : 'Timeline request failed',
+        message: getTimelineErrorMessage(error, 'Timeline request failed'),
       }))
       throw error
     } finally {

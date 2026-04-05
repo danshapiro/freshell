@@ -2408,6 +2408,155 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('does not duplicate snapshot-time permission and question requests after transactional create switches to live forwarding', async () => {
+      let subscriptionListener: ((msg: any, meta?: { sequence: number }) => void) | undefined
+      const markDeliveredInteractiveRequest = vi.spyOn(handler as any, 'markDeliveredInteractiveRequest')
+      const pendingPermissions = new Map([
+        ['perm-1', {
+          toolName: 'Bash',
+          input: { command: 'rm -rf /tmp/demo' },
+          toolUseID: 'tool-1',
+          suggestions: [{ tool: 'Bash', permission: 'allow' }],
+          blockedPath: '/tmp/demo',
+          decisionReason: 'Needs approval',
+          resolve: vi.fn(),
+        }],
+      ])
+      const pendingQuestions = new Map([
+        ['question-1', {
+          originalInput: { questions: [] },
+          questions: [{
+            question: 'Proceed?',
+            header: 'Confirm',
+            options: [],
+            multiSelect: false,
+          }],
+          resolve: vi.fn(),
+        }],
+      ])
+
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-prompts-live',
+        status: 'connected',
+        cliSessionId: 'cli-prompts-live',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        replayGate: {
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-prompts-live',
+                status: 'connected',
+                cliSessionId: 'cli-prompts-live',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions,
+                pendingQuestions,
+              },
+              bufferedMessages: [],
+            })
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-prompts-live',
+                status: 'connected',
+                cliSessionId: 'cli-prompts-live',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions,
+                pendingQuestions,
+              },
+              bufferedMessages: [],
+            }),
+        },
+      }))
+      mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
+        subscriptionListener = listener
+        return { off: () => {}, replayed: false }
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const received: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.permission.request'
+            || parsed.type === 'sdk.question.request'
+          ) {
+            received.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-prompts-live',
+          resumeSessionId: 'cli-prompts-live',
+        }))
+
+        await vi.waitFor(() => {
+          expect(received.map((message) => message.type)).toEqual([
+            'sdk.created',
+            'sdk.session.snapshot',
+            'sdk.session.init',
+            'sdk.permission.request',
+            'sdk.question.request',
+          ])
+        }, { timeout: 3000 })
+        expect(subscriptionListener).toBeDefined()
+
+        subscriptionListener?.({
+          type: 'sdk.permission.request',
+          sessionId: 'sdk-sess-prompts-live',
+          requestId: 'perm-1',
+          subtype: 'can_use_tool',
+          tool: { name: 'Bash', input: { command: 'rm -rf /tmp/demo' } },
+          toolUseID: 'tool-1',
+          suggestions: [{ tool: 'Bash', permission: 'allow' }],
+          blockedPath: '/tmp/demo',
+          decisionReason: 'Needs approval',
+        }, { sequence: 3 })
+        subscriptionListener?.({
+          type: 'sdk.question.request',
+          sessionId: 'sdk-sess-prompts-live',
+          requestId: 'question-1',
+          questions: [{
+            question: 'Proceed?',
+            header: 'Confirm',
+            options: [],
+            multiSelect: false,
+          }],
+        }, { sequence: 4 })
+
+        await new Promise((resolve) => setTimeout(resolve, 0))
+
+        const permissionDeliveries = markDeliveredInteractiveRequest.mock.calls.filter(
+          ([message]) => message?.type === 'sdk.permission.request',
+        )
+        const questionDeliveries = markDeliveredInteractiveRequest.mock.calls.filter(
+          ([message]) => message?.type === 'sdk.question.request',
+        )
+        expect(permissionDeliveries).toHaveLength(2)
+        expect(questionDeliveries).toHaveLength(2)
+        expect(permissionDeliveries[1]?.[1]).toBe(permissionDeliveries[0]?.[1])
+        expect(questionDeliveries[1]?.[1]).toBe(questionDeliveries[0]?.[1])
+        expect(received.filter((message) => message.type === 'sdk.permission.request')).toHaveLength(1)
+        expect(received.filter((message) => message.type === 'sdk.question.request')).toHaveLength(1)
+      } finally {
+        ws.close()
+      }
+    })
+
     it('does not lose post-watermark events that arrive during transactional create replay cutover', async () => {
       let subscriptionListener: ((msg: any, meta?: { sequence: number }) => void) | undefined
       let injectedStatus = false

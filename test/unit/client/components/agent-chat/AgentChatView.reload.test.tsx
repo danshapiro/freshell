@@ -1620,16 +1620,14 @@ describe('AgentChatView server-restart recovery', () => {
   })
 
   it('surfaces a visible stale restore failure after the second stale response without resetting the pane', async () => {
-    const makeStaleRevisionError = (currentRevision: number) => Object.assign(
-      new Error('Stale restore revision'),
-      {
-        status: 409,
-        details: {
-          code: 'RESTORE_STALE_REVISION',
-          currentRevision,
-        },
+    const makeStaleRevisionError = (currentRevision: number) => ({
+      status: 409,
+      message: 'Stale restore revision',
+      details: {
+        code: 'RESTORE_STALE_REVISION',
+        currentRevision,
       },
-    )
+    })
     getAgentTimelinePage
       .mockRejectedValueOnce(makeStaleRevisionError(13))
       .mockRejectedValueOnce(makeStaleRevisionError(14))

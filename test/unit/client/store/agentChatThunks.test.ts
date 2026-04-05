@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import agentChatReducer, { sessionSnapshotReceived, turnBodyReceived } from '@/store/agentChatSlice'
+import agentChatReducer, {
+  restoreRetryRequested,
+  sessionSnapshotReceived,
+  turnBodyReceived,
+} from '@/store/agentChatSlice'
 import {
   loadAgentTimelineWindow,
   loadAgentTurnBody,
@@ -73,6 +77,17 @@ function makeTimelineTurn(
       role,
       content: [{ type: 'text', text }],
       timestamp: overrides.timestamp ?? '2026-03-10T10:01:00.000Z',
+    },
+  }
+}
+
+function makeStaleApiError(currentRevision: number) {
+  return {
+    status: 409,
+    message: 'Stale restore revision',
+    details: {
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision,
     },
   }
 }
@@ -325,14 +340,7 @@ describe('agentChatThunks', () => {
   })
 
   it('restarts restore instead of leaving stale turn-body hydration pinned to an old revision', async () => {
-    const staleError = {
-      status: 409,
-      message: 'Stale restore revision',
-      details: {
-        code: 'RESTORE_STALE_REVISION',
-        currentRevision: 13,
-      },
-    }
+    const staleError = makeStaleApiError(13)
     getAgentTurnBody.mockRejectedValue(staleError)
 
     const store = makeStore()
@@ -369,6 +377,40 @@ describe('agentChatThunks', () => {
     expect(session.latestTurnId).toBeUndefined()
     expect(session.restoreRetryCount).toBe(1)
     expect(session.restoreFailureCode).toBe('RESTORE_STALE_REVISION')
+  })
+
+  it('surfaces the real ApiError message after a second stale turn-body response', async () => {
+    getAgentTurnBody.mockRejectedValue(makeStaleApiError(14))
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-3b',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-3b',
+      revision: 13,
+    }))
+    store.dispatch(restoreRetryRequested({
+      sessionId: 'sdk-sess-3b',
+      code: 'RESTORE_STALE_REVISION',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-3b',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-3b',
+      revision: 14,
+    }))
+
+    await store.dispatch(loadAgentTurnBody({
+      sessionId: 'sdk-sess-3b',
+      timelineSessionId: 'cli-sess-3b',
+      turnId: 'turn-7',
+    }))
+
+    const session = store.getState().agentChat.sessions['sdk-sess-3b']
+    expect(session.restoreRetryCount).toBe(1)
+    expect(session.timelineError).toBe('Stale restore revision')
   })
 
   it('pins the snapshot revision onto timeline-page and turn-body restore reads', async () => {
@@ -463,14 +505,7 @@ describe('agentChatThunks', () => {
   })
 
   it('bookkeeps one stale-revision retry request instead of mixing stale data into state', async () => {
-    const staleError = {
-      status: 409,
-      message: 'Stale restore revision',
-      details: {
-        code: 'RESTORE_STALE_REVISION',
-        currentRevision: 13,
-      },
-    }
+    const staleError = makeStaleApiError(13)
     getAgentTimelinePage.mockRejectedValue(staleError)
 
     const store = makeStore()
@@ -492,5 +527,39 @@ describe('agentChatThunks', () => {
     expect(session.timelineItems).toEqual([])
     expect((session as any).restoreRetryCount).toBe(1)
     expect((session as any).restoreFailureCode).toBe('RESTORE_STALE_REVISION')
+  })
+
+  it('surfaces the real ApiError message after a second stale timeline response', async () => {
+    getAgentTimelinePage.mockRejectedValue(makeStaleApiError(14))
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-stale-final',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-stale-final',
+      revision: 13,
+    }))
+    store.dispatch(restoreRetryRequested({
+      sessionId: 'sdk-sess-stale-final',
+      code: 'RESTORE_STALE_REVISION',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-stale-final',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-stale-final',
+      revision: 14,
+    }))
+
+    await store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-stale-final',
+      timelineSessionId: 'cli-sess-stale-final',
+      requestKey: 'tab-1:pane-final',
+    }))
+
+    const session = store.getState().agentChat.sessions['sdk-sess-stale-final']
+    expect(session.restoreRetryCount).toBe(1)
+    expect(session.timelineError).toBe('Stale restore revision')
   })
 })
