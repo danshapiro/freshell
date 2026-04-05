@@ -19,7 +19,7 @@
 - All four TypeScript configs write `.tsbuildinfo` files to `node_modules/.cache`, and warm reruns are materially faster than cold runs.
 - Opening an editor pane loads Monaco lazily, shows an accessible loading state while the chunk resolves, and still produces a working editor in browser E2E.
 - Stable parent rerenders do not rerender `TabsView` or `TerminalView` when their props are unchanged.
-- `npm run build:client`, `npm run build:electron`, the targeted unit/integration/browser checks below, and `FRESHELL_TEST_SUMMARY="performance fixes" npm run check` all pass.
+- `npm run build:client`, `npm run build:electron`, `npm run lint`, the targeted unit/integration/browser checks below, and `FRESHELL_TEST_SUMMARY="performance fixes" npm run check` all pass.
 
 ## Strategy Gate
 
@@ -188,7 +188,13 @@ rg -n "computeWslPortForwardingPlan\\b|computeWslPortForwardingTeardownPlan\\b|g
 Expected: no runtime callers in `server/` outside `server/wsl-port-forward.ts`; remaining hits are the tests that still encode the old sync surface.
 
 Then update the tests so they describe the surviving async public contract:
-- remove sync export expectations from `test/integration/server/wsl-port-forward.test.ts`
+- in `test/integration/server/wsl-port-forward.test.ts`, assert the removed sync exports are absent from the module namespace:
+  `computeWslPortForwardingPlan`,
+  `computeWslPortForwardingTeardownPlan`,
+  `getWslIp`,
+  `getExistingPortProxyRules`,
+  `getExistingFirewallPorts`
+  while the async plan helpers and pure parser/script builders still exist
 - remove sync import references and sync-only assertions from `test/unit/server/wsl-port-forward.test.ts`
 - port any sync-only edge-case assertions onto `computeWslPortForwardingPlanAsync(...)` / `computeWslPortForwardingTeardownPlanAsync(...)`
 - remove dead sync mocks from `test/integration/server/network-api.test.ts`
@@ -200,7 +206,7 @@ cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
 npm run test:vitest -- run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
 ```
 
-Expected: FAIL because the code still exports the sync wrappers and the integration tests still see them.
+Expected: FAIL because the integration test now asserts that the dead sync exports are gone, but the code still exports them.
 
 - [ ] **Step 2: Remove the sync exec surface**
 
@@ -555,18 +561,19 @@ npm run test:e2e:chromium -- test/e2e-browser/specs/editor-pane.spec.ts
 
 Expected: PASS.
 
-- [ ] **Step 3: Re-run build and typecheck artifacts**
+- [ ] **Step 3: Re-run lint, build, and typecheck artifacts**
 
 Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
+npm run lint
 npm run typecheck
 npm run build:client
 npm run build:electron
 ```
 
-Expected: PASS, with the editor remaining split out of the main initial bundle and all four `.tsbuildinfo` files present in `node_modules/.cache`.
+Expected: PASS, with the editor remaining split out of the main initial bundle, all four `.tsbuildinfo` files present in `node_modules/.cache`, and no frontend lint regressions.
 
 - [ ] **Step 4: Run the coordinated broad gate**
 
@@ -582,4 +589,3 @@ Expected: PASS.
 - [ ] **Step 5: Commit the final verification state if anything changed**
 
 If any golden files, snapshots, or test fixtures changed legitimately during verification, commit them. Otherwise, do not create a no-op commit.
-
