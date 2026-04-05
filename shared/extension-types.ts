@@ -37,5 +37,9 @@ export interface ClientExtensionEntry {
     supportsSandbox?: boolean
     supportsResume?: boolean
     resumeCommandTemplate?: string[]  // e.g., ["claude", "--resume", "{{sessionId}}"]
+    terminalBehavior?: {
+      preferredRenderer?: 'canvas'
+      scrollInputPolicy?: 'native' | 'fallbackToCursorKeysWhenAltScreenMouseCapture'
+    }
   }
 }

@@ -184,4 +184,31 @@ describe('Extension system integration', () => {
     // Attempting to start a client extension as a server should fail
     await expect(mgr.startServer('my-client-ext')).rejects.toThrow(/not.*server/i)
   })
+
+  it('preserves cli terminal behavior hints in the client registry', async () => {
+    await writeExtension(extDir, 'opencode', {
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: 'OpenCode CLI agent',
+      category: 'cli',
+      cli: {
+        command: 'opencode',
+        resumeArgs: ['--session', '{{sessionId}}'],
+        terminalBehavior: {
+          preferredRenderer: 'canvas',
+          scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+        },
+      },
+    })
+
+    mgr.scan([extDir])
+
+    const clientEntries = mgr.toClientRegistry()
+    expect(clientEntries).toHaveLength(1)
+    expect(clientEntries[0]?.cli?.terminalBehavior).toEqual({
+      preferredRenderer: 'canvas',
+      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+    })
+  })
 })
