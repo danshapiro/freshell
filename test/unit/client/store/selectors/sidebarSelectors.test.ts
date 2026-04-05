@@ -463,6 +463,63 @@ describe('sidebarSelectors', () => {
         excludeFirstChatMustStart: true,
       })).toEqual([])
     })
+
+    it('merges open-tab fallback data into a matching server-backed titleless session', () => {
+      const sessionId = 'claude-current'
+      const items = buildSessionItems(
+        [makeProject([{ provider: 'claude', sessionId, title: undefined, lastActivityAt: 10 }])],
+        [{
+          id: 'tab-1',
+          title: 'Current Session',
+          mode: 'claude',
+          resumeSessionId: sessionId,
+          createdAt: 20_000,
+          sessionMetadataByKey: {
+            'claude:claude-current': {
+              sessionType: 'freshclaude',
+              firstUserMessage: 'IMPORTANT: internal trycycle task',
+              isSubagent: true,
+              isNonInteractive: true,
+            },
+          },
+        }] as any,
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                status: 'running',
+                createRequestId: 'req-1',
+                resumeSessionId: sessionId,
+                initialCwd: '/repo',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Current Session' } },
+        } as any,
+        emptyTerminals,
+        emptyActivity,
+      )
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId,
+          provider: 'claude',
+          title: 'Current Session',
+          hasTitle: true,
+          hasTab: true,
+          sessionType: 'freshclaude',
+          firstUserMessage: 'IMPORTANT: internal trycycle task',
+          isSubagent: true,
+          isNonInteractive: true,
+          isFallback: undefined,
+        }),
+      ])
+    })
   })
 
   describe('worktree grouping', () => {
