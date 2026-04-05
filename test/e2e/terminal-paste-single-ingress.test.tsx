@@ -58,6 +58,7 @@ vi.mock('@xterm/xterm', () => {
       onDataCb = cb
     })
     attachCustomKeyEventHandler = vi.fn((cb: (event: KeyboardEvent) => boolean) => {
+    attachCustomWheelEventHandler = vi.fn()
       keyHandler = cb
     })
     paste = vi.fn((text: string) => {
