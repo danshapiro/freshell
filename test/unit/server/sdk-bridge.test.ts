@@ -95,13 +95,14 @@ describe('SdkBridge', () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
 
       expect(session).toHaveProperty('replayGate')
-      expect((session as any).replayGate.capture()).toMatchObject({
+      expect((session as any).replayGate.drain()).toMatchObject({
         watermark: 0,
         session: expect.objectContaining({
           sessionId: session.sessionId,
           status: 'starting',
           cwd: '/tmp',
         }),
+        bufferedMessages: [],
       })
     })
 

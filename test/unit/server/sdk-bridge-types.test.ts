@@ -6,8 +6,9 @@ import type {
   SDKMessage,
   PermissionResult,
   SdkCreatedSession,
+  SdkReplayEntry,
   SdkReplayGate,
-  SdkReplayState,
+  SdkReplayDrain,
   SdkServerMessage,
   SdkSessionState,
 } from '../../../server/sdk-bridge-types.js'
@@ -102,7 +103,7 @@ describe('SDK Protocol Types', () => {
   })
 
   describe('transactional restore boundary types', () => {
-    it('captures replay state with a watermark and session snapshot', () => {
+    it('drains replay state with a watermark, session snapshot, and buffered early messages', () => {
       const state: SdkSessionState = {
         sessionId: 'test',
         status: 'connected',
@@ -116,20 +117,32 @@ describe('SDK Protocol Types', () => {
         totalInputTokens: 0,
         totalOutputTokens: 0,
       }
-      const replayState: SdkReplayState = {
+      const bufferedMessage: SdkReplayEntry = {
+        sequence: 7,
+        message: {
+          type: 'sdk.stream',
+          sessionId: 'test',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'hello' },
+          },
+        } satisfies SdkServerMessage,
+      }
+      const replayState: SdkReplayDrain = {
         watermark: 7,
         session: state,
+        bufferedMessages: [bufferedMessage],
       }
       const replayGate: SdkReplayGate = {
-        capture: vi.fn(() => replayState),
+        drain: vi.fn(() => replayState),
       }
       const session: SdkCreatedSession = {
         ...state,
         replayGate,
       }
 
-      expect(session.replayGate.capture()).toEqual(replayState)
-      expect(replayGate.capture).toHaveBeenCalledTimes(1)
+      expect(session.replayGate.drain()).toEqual(replayState)
+      expect(replayGate.drain).toHaveBeenCalledTimes(1)
     })
 
     it('types sdk.create.failed as a request-scoped restore failure message', () => {

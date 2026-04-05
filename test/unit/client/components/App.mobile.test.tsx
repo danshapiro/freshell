@@ -112,6 +112,24 @@ const defaultServerSettings = createDefaultServerSettings({
   loggingDebug: defaultSettings.logging.debug,
 })
 
+const configuredNetworkStatus = {
+  configured: true,
+  host: '127.0.0.1' as const,
+  port: 3344,
+  lanIps: [],
+  machineHostname: 'localhost',
+  firewall: {
+    platform: 'linux',
+    active: false,
+    portOpen: true,
+    commands: [],
+    configuring: false,
+  },
+  rebinding: false,
+  devMode: false,
+  accessUrl: 'http://127.0.0.1:3344',
+}
+
 function createSettingsState(options: {
   server?: ServerSettingsPatch
   local?: LocalSettingsPatch
@@ -194,6 +212,7 @@ describe('App Header - Mobile Touch Targets', () => {
         settings: defaultServerSettings,
         platform: { platform: 'linux' },
       })
+      if (url === '/api/network/status') return Promise.resolve(configuredNetworkStatus)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
@@ -250,6 +269,7 @@ describe('App Mobile - Sidebar Backdrop', () => {
         settings: defaultServerSettings,
         platform: { platform: 'linux' },
       })
+      if (url === '/api/network/status') return Promise.resolve(configuredNetworkStatus)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
@@ -425,6 +445,7 @@ describe('App Mobile - Header Pinning', () => {
         settings: defaultServerSettings,
         platform: { platform: 'linux' },
       })
+      if (url === '/api/network/status') return Promise.resolve(configuredNetworkStatus)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})

@@ -199,13 +199,15 @@ export class SdkBridge extends EventEmitter {
 
     return Object.assign(state, {
       replayGate: {
-        capture: () => {
+        drain: () => {
           const sp = this.processes.get(sessionId)
           const currentState = this.sessions.get(sessionId)
           if (!sp || !currentState) return null
+          const bufferedMessages = sp.messageBuffer.splice(0, sp.messageBuffer.length)
           return {
             watermark: sp.nextSequence - 1,
             session: this.cloneSessionState(currentState),
+            bufferedMessages,
           }
         },
       },
@@ -609,7 +611,11 @@ export class SdkBridge extends EventEmitter {
     return true
   }
 
-  subscribe(sessionId: string, listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void): { off: () => void; replayed: boolean } | null {
+  subscribe(
+    sessionId: string,
+    listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void,
+    options?: { skipReplayBuffer?: boolean },
+  ): { off: () => void; replayed: boolean } | null {
     const sp = this.processes.get(sessionId)
     if (!sp) return null
     sp.browserListeners.add(listener)
@@ -618,13 +624,15 @@ export class SdkBridge extends EventEmitter {
     let replayed = false
     if (!sp.hasSubscribers) {
       sp.hasSubscribers = true
-      replayed = true
-      for (const entry of sp.messageBuffer) {
-        try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
-          log.warn({ err, sessionId }, 'Buffer replay error')
+      if (!options?.skipReplayBuffer) {
+        replayed = true
+        for (const entry of sp.messageBuffer) {
+          try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
+            log.warn({ err, sessionId }, 'Buffer replay error')
+          }
         }
+        sp.messageBuffer.length = 0
       }
-      sp.messageBuffer.length = 0
     }
 
     return { off: () => { sp.browserListeners.delete(listener) }, replayed }

@@ -1037,12 +1037,79 @@ export class WsHandler {
     } satisfies SdkServerMessage
   }
 
+  private markDeliveredInteractiveRequest(
+    message: SdkServerMessage,
+    delivered: {
+      permissionRequestIds: Set<string>
+      questionRequestIds: Set<string>
+    },
+  ): boolean {
+    if (message.type === 'sdk.permission.request') {
+      if (delivered.permissionRequestIds.has(message.requestId)) {
+        return false
+      }
+      delivered.permissionRequestIds.add(message.requestId)
+    }
+    if (message.type === 'sdk.question.request') {
+      if (delivered.questionRequestIds.has(message.requestId)) {
+        return false
+      }
+      delivered.questionRequestIds.add(message.requestId)
+    }
+    return true
+  }
+
+  private replayPendingInteractiveRequests(
+    ws: LiveWebSocket,
+    clientSessionId: string,
+    session: Pick<SdkSessionState, 'pendingPermissions' | 'pendingQuestions'>,
+    delivered: {
+      permissionRequestIds: Set<string>
+      questionRequestIds: Set<string>
+    },
+  ): void {
+    for (const [requestId, perm] of session.pendingPermissions) {
+      const message = {
+        type: 'sdk.permission.request',
+        sessionId: clientSessionId,
+        requestId,
+        subtype: 'can_use_tool',
+        tool: { name: perm.toolName, input: perm.input },
+        toolUseID: perm.toolUseID,
+        suggestions: perm.suggestions,
+        blockedPath: perm.blockedPath,
+        decisionReason: perm.decisionReason,
+      } satisfies SdkServerMessage
+      if (!this.markDeliveredInteractiveRequest(message, delivered)) {
+        continue
+      }
+      this.safeSend(ws, message)
+    }
+
+    for (const [requestId, q] of session.pendingQuestions) {
+      const message = {
+        type: 'sdk.question.request',
+        sessionId: clientSessionId,
+        requestId,
+        questions: q.questions,
+      } satisfies SdkServerMessage
+      if (!this.markDeliveredInteractiveRequest(message, delivered)) {
+        continue
+      }
+      this.safeSend(ws, message)
+    }
+  }
+
   private flushTransactionalCreateReplay(
     ws: LiveWebSocket,
     clientSessionId: string,
     queuedMessages: Array<{ message: SdkServerMessage; sequence: number }>,
     watermark: number,
-  ): void {
+    delivered: {
+      permissionRequestIds: Set<string>
+      questionRequestIds: Set<string>
+    },
+  ): SdkServerMessage[] {
     const delayedMetadata: SdkServerMessage[] = []
     for (const queued of queuedMessages) {
       const transformed = this.transactionalCreateMessage(queued.message, clientSessionId)
@@ -1053,11 +1120,12 @@ export class WsHandler {
       if (queued.sequence <= watermark) {
         continue
       }
+      if (!this.markDeliveredInteractiveRequest(transformed, delivered)) {
+        continue
+      }
       this.safeSend(ws, transformed)
     }
-    for (const metadata of delayedMetadata) {
-      this.safeSend(ws, metadata)
-    }
+    return delayedMetadata
   }
 
   private resolveSdkSessionTarget(state: ClientState, clientSessionId: string): string {
@@ -1892,22 +1960,9 @@ export class WsHandler {
             effort: m.effort,
             plugins: m.plugins,
           })
-          const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
-          let createReadyForLiveForward = false
-          const createSubscription = this.sdkBridge.subscribe(session.sessionId, (message: SdkServerMessage, meta?: { sequence: number }) => {
-            if (!createReadyForLiveForward) {
-              queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
-              return
-            }
-            this.safeSend(ws, this.transactionalCreateMessage(message, session!.sessionId))
-          })
-          if (!createSubscription) {
-            throw new Error('SDK session subscription failed during create')
-          }
-          releaseCreateSubscription = createSubscription.off
-          const replayState = session.replayGate.capture()
+          const replayState = session.replayGate.drain()
           if (!replayState) {
-            throw new Error('SDK create replay gate unavailable')
+            throw new Error('SDK create replay drain unavailable')
           }
 
           const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId, {
@@ -1920,8 +1975,10 @@ export class WsHandler {
             ? resolvedHistory as unknown as { kind: 'fatal' | 'missing'; code: string; message?: string }
             : null
           if (failedRestore) {
-            releaseCreateSubscription()
-            releaseCreateSubscription = undefined
+            if (releaseCreateSubscription) {
+              releaseCreateSubscription()
+              releaseCreateSubscription = undefined
+            }
             this.sdkBridge.killSession(session.sessionId)
             this.teardownSdkRestoreState(session.sessionId, false)
             this.sendSdkCreateFailed(ws, m.requestId, {
@@ -1957,12 +2014,74 @@ export class WsHandler {
             tools: [],
           })
 
+          const deliveredInteractiveRequests = {
+            permissionRequestIds: new Set<string>(),
+            questionRequestIds: new Set<string>(),
+          }
+          this.replayPendingInteractiveRequests(
+            ws,
+            session.sessionId,
+            replayState.session,
+            deliveredInteractiveRequests,
+          )
+
+          const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
+          let createReadyForLiveForward = false
+          const createSubscription = this.sdkBridge.subscribe(
+            session.sessionId,
+            (message: SdkServerMessage, meta?: { sequence: number }) => {
+              if (!createReadyForLiveForward) {
+                queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
+                return
+              }
+              const transformed = this.transactionalCreateMessage(message, session!.sessionId)
+              if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
+                return
+              }
+              this.safeSend(ws, transformed)
+            },
+            { skipReplayBuffer: true },
+          )
+          if (!createSubscription) {
+            throw new Error('SDK session subscription failed during create')
+          }
+          releaseCreateSubscription = createSubscription.off
+
           state.sdkSessions.add(session.sessionId)
           state.sdkSessionTargets.set(session.sessionId, session.sessionId)
           state.sdkSubscriptions.set(session.sessionId, createSubscription.off)
+          const replayedDuringSnapshot = session.replayGate.drain()
+          if (!replayedDuringSnapshot) {
+            throw new Error('SDK create replay drain unavailable')
+          }
+          const delayedMetadata = [
+            ...this.flushTransactionalCreateReplay(
+              ws,
+              session.sessionId,
+              replayState.bufferedMessages,
+              replayState.watermark,
+              deliveredInteractiveRequests,
+            ),
+            ...this.flushTransactionalCreateReplay(
+              ws,
+              session.sessionId,
+              replayedDuringSnapshot.bufferedMessages,
+              replayState.watermark,
+              deliveredInteractiveRequests,
+            ),
+          ]
           while (queuedMessages.length > 0) {
             const replayBatch = queuedMessages.splice(0, queuedMessages.length)
-            this.flushTransactionalCreateReplay(ws, session.sessionId, replayBatch, replayState.watermark)
+            delayedMetadata.push(...this.flushTransactionalCreateReplay(
+              ws,
+              session.sessionId,
+              replayBatch,
+              replayState.watermark,
+              deliveredInteractiveRequests,
+            ))
+          }
+          for (const metadata of delayedMetadata) {
+            this.safeSend(ws, metadata)
           }
           createReadyForLiveForward = true
 
@@ -2228,32 +2347,10 @@ export class WsHandler {
         // Skip if subscribe() already replayed the buffer (first subscriber),
         // since buffered messages already include these requests.
         if (!bufferReplayed) {
-          if (liveSession.pendingPermissions) {
-            for (const [requestId, perm] of liveSession.pendingPermissions) {
-              this.send(ws, {
-                type: 'sdk.permission.request',
-                sessionId: m.sessionId,
-                requestId,
-                subtype: 'can_use_tool',
-                tool: { name: perm.toolName, input: perm.input },
-                toolUseID: perm.toolUseID,
-                suggestions: perm.suggestions,
-                blockedPath: perm.blockedPath,
-                decisionReason: perm.decisionReason,
-              } as SdkServerMessage)
-            }
-          }
-
-          if (liveSession.pendingQuestions) {
-            for (const [requestId, q] of liveSession.pendingQuestions) {
-              this.send(ws, {
-                type: 'sdk.question.request',
-                sessionId: m.sessionId,
-                requestId,
-                questions: q.questions,
-              } as SdkServerMessage)
-            }
-          }
+          this.replayPendingInteractiveRequests(ws, m.sessionId, liveSession, {
+            permissionRequestIds: new Set<string>(),
+            questionRequestIds: new Set<string>(),
+          })
         }
         return
       }

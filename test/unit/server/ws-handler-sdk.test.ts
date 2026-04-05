@@ -82,9 +82,10 @@ function makeCreatedSession(overrides: Record<string, any> = {}) {
   return {
     ...session,
     replayGate: replayGate ?? {
-      capture: vi.fn(() => ({
+      drain: vi.fn(() => ({
         watermark: 0,
         session: { ...session },
+        bufferedMessages: [],
       })),
     },
   }
@@ -459,7 +460,11 @@ describe('WS Handler SDK Integration', () => {
           model: undefined,
           permissionMode: undefined,
         })
-        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
+        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+          'sdk-sess-1',
+          expect.any(Function),
+          { skipReplayBuffer: true },
+        )
       } finally {
         ws.close()
       }
@@ -1685,11 +1690,11 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('returns sdk.create.failed when the transactional replay gate cannot capture create replay state', async () => {
+    it('returns sdk.create.failed when the transactional replay gate cannot drain create replay state', async () => {
       mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
         sessionId: 'sdk-sess-gate-missing',
         replayGate: {
-          capture: vi.fn(() => null),
+          drain: vi.fn(() => null),
         },
       }))
       delete mockSdkBridge.captureReplayState
@@ -1723,7 +1728,7 @@ describe('WS Handler SDK Integration', () => {
           type: 'sdk.create.failed',
           requestId: 'req-gate-missing',
           code: 'RESTORE_INTERNAL',
-          message: 'SDK create replay gate unavailable',
+          message: 'SDK create replay drain unavailable',
           retryable: true,
         })
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-gate-missing')
@@ -1889,28 +1894,70 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('sends sdk.created before replaying buffered session messages', async () => {
-      // Make createSession return a session, but make subscribe replay a buffered message
-      const subscribeFn = vi.fn().mockImplementation((_sessionId: string, listener: Function) => {
-        // Simulate buffer replay: the init message is sent synchronously during subscribe
-        listener({
-          type: 'sdk.session.init',
-          sessionId: 'sdk-sess-1',
-          cliSessionId: 'cli-123',
-          model: 'claude-sonnet-4-5-20250929',
-          cwd: '/tmp',
-          tools: [],
-        })
-        return { off: () => {}, replayed: true }
-      })
-      mockSdkBridge.subscribe = subscribeFn
+    it('sends sdk.created before replaying drained early session messages', async () => {
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-order',
+        status: 'connected',
+        cliSessionId: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        replayGate: {
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 1,
+              session: {
+                sessionId: 'sdk-sess-order',
+                status: 'connected',
+                cliSessionId: 'cli-123',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [{
+                sequence: 1,
+                message: {
+                  type: 'sdk.session.init',
+                  sessionId: 'sdk-sess-order',
+                  cliSessionId: 'cli-123',
+                  model: 'claude-sonnet-4-5-20250929',
+                  cwd: '/tmp',
+                  tools: [],
+                },
+              }],
+            })
+            .mockReturnValueOnce({
+              watermark: 1,
+              session: {
+                sessionId: 'sdk-sess-order',
+                status: 'connected',
+                cliSessionId: 'cli-123',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [],
+            }),
+        },
+      }))
 
       const ws = await connectAndAuth()
       try {
         const received: any[] = []
         ws.on('message', (data: WebSocket.RawData) => {
           const parsed = JSON.parse(data.toString())
-          if (parsed.type === 'sdk.created' || parsed.type === 'sdk.session.init') {
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.session.metadata'
+          ) {
             received.push(parsed)
           }
         })
@@ -1921,12 +1968,20 @@ describe('WS Handler SDK Integration', () => {
           cwd: '/tmp',
         }))
 
-        // Wait for both messages
-        await vi.waitFor(() => expect(received.length).toBeGreaterThanOrEqual(2), { timeout: 3000 })
+        await vi.waitFor(() => expect(received.map((message) => message.type)).toEqual([
+          'sdk.created',
+          'sdk.session.init',
+          'sdk.session.metadata',
+        ]), { timeout: 3000 })
 
-        // sdk.created MUST arrive before sdk.session.init
         expect(received[0].type).toBe('sdk.created')
         expect(received[1].type).toBe('sdk.session.init')
+        expect(received[2].type).toBe('sdk.session.metadata')
+        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+          'sdk-sess-order',
+          expect.any(Function),
+          { skipReplayBuffer: true },
+        )
       } finally {
         ws.close()
       }
@@ -1942,43 +1997,63 @@ describe('WS Handler SDK Integration', () => {
         tools: [{ name: 'Bash' }],
         messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
         replayGate: {
-          capture: vi.fn(() => ({
-            watermark: 1,
-            session: {
-              sessionId: 'sdk-sess-1',
-              status: 'connected',
-              cliSessionId: 'cli-123',
-              model: 'claude-sonnet-4-5-20250929',
-              cwd: '/tmp',
-              tools: [{ name: 'Bash' }],
-              messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
-              streamingActive: false,
-              streamingText: '',
-              pendingPermissions: new Map(),
-              pendingQuestions: new Map(),
-            },
-          })),
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 1,
+              session: {
+                sessionId: 'sdk-sess-1',
+                status: 'connected',
+                cliSessionId: 'cli-123',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                tools: [{ name: 'Bash' }],
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [{
+                sequence: 1,
+                message: {
+                  type: 'sdk.session.init',
+                  sessionId: 'sdk-sess-1',
+                  cliSessionId: 'cli-123',
+                  model: 'claude-sonnet-4-5-20250929',
+                  cwd: '/tmp',
+                  tools: [{ name: 'Bash' }],
+                },
+              }],
+            })
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-1',
+                status: 'connected',
+                cliSessionId: 'cli-123',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                tools: [{ name: 'Bash' }],
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [{
+                sequence: 2,
+                message: {
+                  type: 'sdk.stream',
+                  sessionId: 'sdk-sess-1',
+                  event: {
+                    type: 'content_block_delta',
+                    delta: { type: 'text_delta', text: 'after watermark' },
+                  },
+                },
+              }],
+            }),
         },
       }))
-      mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
-        listener({
-          type: 'sdk.session.init',
-          sessionId: 'sdk-sess-1',
-          cliSessionId: 'cli-123',
-          model: 'claude-sonnet-4-5-20250929',
-          cwd: '/tmp',
-          tools: [{ name: 'Bash' }],
-        }, { sequence: 1 })
-        listener({
-          type: 'sdk.stream',
-          sessionId: 'sdk-sess-1',
-          event: {
-            type: 'content_block_delta',
-            delta: { type: 'text_delta', text: 'after watermark' },
-          },
-        }, { sequence: 2 })
-        return { off: () => {}, replayed: true }
-      })
 
       const ws = await connectAndAuth()
       try {
@@ -2027,6 +2102,129 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('replays snapshot-time pending permission and question requests during transactional create', async () => {
+      const pendingPermissions = new Map([
+        ['perm-1', {
+          toolName: 'Bash',
+          input: { command: 'rm -rf /tmp/demo' },
+          toolUseID: 'tool-1',
+          suggestions: [{ tool: 'Bash', permission: 'allow' }],
+          blockedPath: '/tmp/demo',
+          decisionReason: 'Needs approval',
+          resolve: vi.fn(),
+        }],
+      ])
+      const pendingQuestions = new Map([
+        ['question-1', {
+          originalInput: { questions: [] },
+          questions: [{
+            question: 'Proceed?',
+            header: 'Confirm',
+            options: [],
+            multiSelect: false,
+          }],
+          resolve: vi.fn(),
+        }],
+      ])
+
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-prompts',
+        status: 'connected',
+        cliSessionId: 'cli-prompts',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        replayGate: {
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-prompts',
+                status: 'connected',
+                cliSessionId: 'cli-prompts',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions,
+                pendingQuestions,
+              },
+              bufferedMessages: [],
+            })
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-prompts',
+                status: 'connected',
+                cliSessionId: 'cli-prompts',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions,
+                pendingQuestions,
+              },
+              bufferedMessages: [],
+            }),
+        },
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const received: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.permission.request'
+            || parsed.type === 'sdk.question.request'
+          ) {
+            received.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-prompts',
+          resumeSessionId: 'cli-prompts',
+        }))
+
+        await vi.waitFor(() => {
+          expect(received.map((message) => message.type)).toEqual([
+            'sdk.created',
+            'sdk.session.snapshot',
+            'sdk.session.init',
+            'sdk.permission.request',
+            'sdk.question.request',
+          ])
+        }, { timeout: 3000 })
+
+        expect(received[3]).toMatchObject({
+          type: 'sdk.permission.request',
+          requestId: 'perm-1',
+          sessionId: 'sdk-sess-prompts',
+          tool: { name: 'Bash', input: { command: 'rm -rf /tmp/demo' } },
+          blockedPath: '/tmp/demo',
+        })
+        expect(received[4]).toMatchObject({
+          type: 'sdk.question.request',
+          requestId: 'question-1',
+          sessionId: 'sdk-sess-prompts',
+          questions: [{
+            question: 'Proceed?',
+            header: 'Confirm',
+            options: [],
+            multiSelect: false,
+          }],
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
     it('does not lose post-watermark events that arrive during transactional create replay cutover', async () => {
       let subscriptionListener: ((msg: any, meta?: { sequence: number }) => void) | undefined
       let injectedStatus = false
@@ -2040,43 +2238,66 @@ describe('WS Handler SDK Integration', () => {
         tools: [],
         messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
         replayGate: {
-          capture: vi.fn(() => ({
-            watermark: 1,
-            session: {
-              sessionId: 'sdk-sess-cutover',
-              status: 'connected',
-              cliSessionId: 'cli-cutover',
-              model: 'claude-sonnet-4-5-20250929',
-              cwd: '/tmp',
-              tools: [],
-              messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
-              streamingActive: false,
-              streamingText: '',
-              pendingPermissions: new Map(),
-              pendingQuestions: new Map(),
-            },
-          })),
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 1,
+              session: {
+                sessionId: 'sdk-sess-cutover',
+                status: 'connected',
+                cliSessionId: 'cli-cutover',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                tools: [],
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [{
+                sequence: 1,
+                message: {
+                  type: 'sdk.session.init',
+                  sessionId: 'sdk-sess-cutover',
+                  cliSessionId: 'cli-cutover',
+                  model: 'claude-sonnet-4-5-20250929',
+                  cwd: '/tmp',
+                  tools: [],
+                },
+              }],
+            })
+            .mockReturnValueOnce({
+              watermark: 2,
+              session: {
+                sessionId: 'sdk-sess-cutover',
+                status: 'connected',
+                cliSessionId: 'cli-cutover',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                tools: [],
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [{
+                sequence: 2,
+                message: {
+                  type: 'sdk.stream',
+                  sessionId: 'sdk-sess-cutover',
+                  event: {
+                    type: 'content_block_delta',
+                    delta: { type: 'text_delta', text: 'queued replay event' },
+                  },
+                },
+              }],
+            }),
         },
       }))
       mockSdkBridge.subscribe.mockImplementation((_sessionId: string, listener: (msg: any, meta?: { sequence: number }) => void) => {
         subscriptionListener = listener
-        listener({
-          type: 'sdk.session.init',
-          sessionId: 'sdk-sess-cutover',
-          cliSessionId: 'cli-cutover',
-          model: 'claude-sonnet-4-5-20250929',
-          cwd: '/tmp',
-          tools: [],
-        }, { sequence: 1 })
-        listener({
-          type: 'sdk.stream',
-          sessionId: 'sdk-sess-cutover',
-          event: {
-            type: 'content_block_delta',
-            delta: { type: 'text_delta', text: 'queued replay event' },
-          },
-        }, { sequence: 2 })
-        return { off: () => {}, replayed: true }
+        return { off: () => {}, replayed: false }
       })
 
       const originalFlushTransactionalCreateReplay = (handler as any).flushTransactionalCreateReplay.bind(handler)
@@ -2085,15 +2306,23 @@ describe('WS Handler SDK Integration', () => {
         clientSessionId: string,
         queuedMessages: Array<{ message: any; sequence: number }>,
         watermark: number,
+        delivered: { permissionRequestIds: Set<string>; questionRequestIds: Set<string> },
       ) => {
-        originalFlushTransactionalCreateReplay(ws, clientSessionId, queuedMessages, watermark)
-        if (injectedStatus) return
+        const delayedMetadata = originalFlushTransactionalCreateReplay(
+          ws,
+          clientSessionId,
+          queuedMessages,
+          watermark,
+          delivered,
+        )
+        if (injectedStatus) return delayedMetadata
         injectedStatus = true
         subscriptionListener?.({
           type: 'sdk.status',
           sessionId: 'sdk-sess-cutover',
           status: 'running',
         }, { sequence: 3 })
+        return delayedMetadata
       })
 
       const ws = await connectAndAuth()

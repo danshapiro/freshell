@@ -75,9 +75,10 @@ function makeCreatedSession(overrides: Record<string, any> = {}) {
   return {
     ...session,
     replayGate: replayGate ?? {
-      capture: vi.fn(() => ({
+      drain: vi.fn(() => ({
         watermark: 0,
         session: { ...session },
+        bufferedMessages: [],
       })),
     },
   }
