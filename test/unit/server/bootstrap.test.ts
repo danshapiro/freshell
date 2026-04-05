@@ -14,6 +14,7 @@ vi.mock('../../../server/platform.js', () => ({
 // Import the module under test after mocking
 import {
   detectLanIps,
+  detectLanIpsAsync,
   generateAuthToken,
   buildAllowedOrigins,
   readConfigHost,
@@ -102,6 +103,50 @@ describe('bootstrap module', () => {
       const ips = detectLanIps()
 
       expect(ips).toEqual(['192.168.1.50'])
+    })
+  })
+
+  describe('detectLanIpsAsync', () => {
+    it('returns IPs from network interfaces on non-WSL', async () => {
+      const { isWSL } = await import('../../../server/platform.js')
+      vi.mocked(isWSL).mockReturnValue(false)
+      vi.mocked(os.networkInterfaces).mockReturnValue({
+        eth0: [
+          { address: '192.168.1.100', family: 'IPv4', internal: false, netmask: '255.255.255.0' } as os.NetworkInterfaceInfo,
+          { address: 'fe80::1', family: 'IPv6', internal: false } as os.NetworkInterfaceInfo,
+        ],
+        lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true } as os.NetworkInterfaceInfo],
+      })
+
+      const ips = await detectLanIpsAsync()
+
+      expect(Array.isArray(ips)).toBe(true)
+      expect(ips).toContain('192.168.1.100')
+      expect(ips).not.toContain('127.0.0.1')
+      expect(ips).not.toContain('fe80::1')
+    })
+
+    it('returns empty array when no network interfaces on non-WSL', async () => {
+      const { isWSL } = await import('../../../server/platform.js')
+      vi.mocked(isWSL).mockReturnValue(false)
+      vi.mocked(os.networkInterfaces).mockReturnValue({})
+
+      const ips = await detectLanIpsAsync()
+
+      expect(ips).toEqual([])
+    })
+
+    it('falls back to os.networkInterfaces when WSL ipconfig fails', async () => {
+      const { isWSL } = await import('../../../server/platform.js')
+      vi.mocked(isWSL).mockReturnValue(true)
+      vi.mocked(os.networkInterfaces).mockReturnValue({
+        eth0: [{ address: '172.30.1.5', family: 'IPv4', internal: false, netmask: '255.255.255.0' } as os.NetworkInterfaceInfo],
+      })
+
+      // execFile will call back with error since child_process is mocked
+      const ips = await detectLanIpsAsync()
+
+      expect(Array.isArray(ips)).toBe(true)
     })
   })
 

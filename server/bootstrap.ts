@@ -7,7 +7,7 @@
  * Usage: import './bootstrap.js' as the first import in server/index.ts
  */
 
-import { execSync } from 'child_process'
+import { execFile, execSync } from 'child_process'
 import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
@@ -33,30 +33,7 @@ function getWindowsHostIps(): string[] {
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
-    const ips: string[] = []
-    let inPhysicalAdapter = false
-
-    for (const line of output.split('\n')) {
-      const trimmed = line.trim()
-
-      // Detect adapter sections by looking for "adapter" keyword
-      // Physical adapters: "Ethernet adapter X:", "Wireless LAN adapter X:"
-      // Virtual adapters: contain vEthernet, WSL, Docker, VirtualBox, VMware
-      if (trimmed.match(/adapter/i) && trimmed.endsWith(':')) {
-        const isVirtual = /vEthernet|WSL|Docker|VirtualBox|VMware/i.test(trimmed)
-        inPhysicalAdapter = !isVirtual
-      }
-
-      // Extract IPv4 address if in a physical adapter section
-      if (inPhysicalAdapter) {
-        const ipv4Match = trimmed.match(/IPv4.*?:\s*(\d+\.\d+\.\d+\.\d+)/)
-        if (ipv4Match) {
-          ips.push(ipv4Match[1])
-        }
-      }
-    }
-
-    return ips
+    return parseIpconfigOutput(output)
   } catch {
     return []
   }
@@ -147,6 +124,85 @@ export function detectLanIps(): string[] {
   // Sort by LAN score (highest first)
   ips.sort((a, b) => scoreLanIp(b.address, b.netmask) - scoreLanIp(a.address, a.netmask))
 
+  return ips.map((ip) => ip.address)
+}
+
+/**
+ * Parse ipconfig.exe output to extract physical adapter IPv4 addresses.
+ * Shared by both sync and async Windows IP detection paths.
+ */
+function parseIpconfigOutput(output: string): string[] {
+  const ips: string[] = []
+  let inPhysicalAdapter = false
+
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim()
+
+    if (trimmed.match(/adapter/i) && trimmed.endsWith(':')) {
+      const isVirtual = /vEthernet|WSL|Docker|VirtualBox|VMware/i.test(trimmed)
+      inPhysicalAdapter = !isVirtual
+    }
+
+    if (inPhysicalAdapter) {
+      const ipv4Match = trimmed.match(/IPv4.*?:\s*(\d+\.\d+\.\d+\.\d+)/)
+      if (ipv4Match) {
+        ips.push(ipv4Match[1])
+      }
+    }
+  }
+
+  return ips
+}
+
+/**
+ * Get Windows host physical LAN IPs via ipconfig.exe (WSL2 only) -- async variant.
+ * Returns IPs from Ethernet/Wi-Fi adapters, excluding virtual adapters.
+ */
+function getWindowsHostIpsAsync(): Promise<string[]> {
+  return new Promise((resolve) => {
+    execFile('/mnt/c/Windows/System32/ipconfig.exe', [], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    }, (error, stdout) => {
+      if (error || !stdout) {
+        resolve([])
+        return
+      }
+
+      resolve(parseIpconfigOutput(stdout))
+    })
+  })
+}
+
+/**
+ * Async variant of detectLanIps.
+ * Uses execFile (non-blocking) instead of execSync for the ipconfig.exe call on WSL.
+ * The sync version is kept for the bootstrap-on-import path.
+ */
+export async function detectLanIpsAsync(): Promise<string[]> {
+  if (isWSL()) {
+    const windowsIps = await getWindowsHostIpsAsync()
+    if (windowsIps.length > 0) {
+      const scored = windowsIps.map((ip) => ({ address: ip, netmask: '255.255.255.0' }))
+      scored.sort((a, b) => scoreLanIp(b.address, b.netmask) - scoreLanIp(a.address, a.netmask))
+      return scored.map((ip) => ip.address)
+    }
+  }
+
+  // Non-WSL path or WSL fallback: use os.networkInterfaces() (no I/O, always fast)
+  const interfaces = os.networkInterfaces()
+  const ips: Array<{ address: string; netmask: string }> = []
+
+  for (const [, addrs] of Object.entries(interfaces)) {
+    if (!addrs) continue
+    for (const addr of addrs) {
+      if (addr.family === 'IPv4' && !addr.internal) {
+        ips.push({ address: addr.address, netmask: addr.netmask })
+      }
+    }
+  }
+
+  ips.sort((a, b) => scoreLanIp(b.address, b.netmask) - scoreLanIp(a.address, a.netmask))
   return ips.map((ip) => ip.address)
 }
 

@@ -197,9 +197,9 @@ function acquireLock(cwd: string): void {
             continue
           }
         } catch { /* stat failed, retry */ }
-        // Brief busy-wait for non-stale lock
-        const end = Date.now() + 100
-        while (Date.now() < end) { /* spin */ }
+        // Synchronous sleep without CPU burn (Atomics.wait blocks the thread
+        // for the specified duration without spinning)
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100)
         continue
       }
       throw err

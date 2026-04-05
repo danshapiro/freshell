@@ -311,6 +311,8 @@ export default function App() {
     dispatch(updateSettingsLocal({ sidebar: { width: newWidth } }))
   }, [sidebarWidth, dispatch])
 
+  const handleOpenTab = useCallback(() => setView('terminal'), [])
+
   const handleSidebarResizeEnd = useCallback(() => {}, [])
 
   const toggleSidebarCollapse = useCallback(() => {
@@ -1070,14 +1072,14 @@ export default function App() {
     if (view === 'overview') {
       return (
         <ErrorBoundary label="Panes">
-          <OverviewView onOpenTab={() => setView('terminal')} />
+          <OverviewView onOpenTab={handleOpenTab} />
         </ErrorBoundary>
       )
     }
     if (view === 'tabs') {
       return (
         <ErrorBoundary label="Tabs">
-          <TabsView onOpenTab={() => setView('terminal')} />
+          <TabsView onOpenTab={handleOpenTab} />
         </ErrorBoundary>
       )
     }

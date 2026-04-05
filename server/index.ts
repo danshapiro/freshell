@@ -1,4 +1,4 @@
-import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
+import { detectLanIps, detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
@@ -421,7 +421,7 @@ async function main() {
     networkManager,
     configStore,
     wsHandler,
-    detectLanIps,
+    detectLanIps: detectLanIpsAsync,
   }))
 
   app.use('/api', createPlatformRouter({
