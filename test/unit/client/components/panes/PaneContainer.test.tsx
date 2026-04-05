@@ -1207,7 +1207,7 @@ describe('PaneContainer', () => {
   })
 
   describe('rendering editor pane', () => {
-    it('renders a loading shell before resolving EditorPane for editor content', async () => {
+    it('renders EditorPane for editor content', () => {
       const editorContent: EditorPaneContent = {
         kind: 'editor',
         filePath: '/test.ts',
@@ -1233,9 +1233,7 @@ describe('PaneContainer', () => {
         store
       )
 
-      expect(screen.getByTestId('editor-pane-loading')).toBeInTheDocument()
-      expect(screen.getByRole('status')).toHaveTextContent('Loading editor...')
-      expect(await screen.findByTestId('monaco-mock')).toBeInTheDocument()
+      expect(screen.getByTestId('monaco-mock')).toBeInTheDocument()
     })
   })
 
