@@ -149,7 +149,7 @@ describe('Network API integration', () => {
       networkManager,
       configStore,
       wsHandler: { broadcast: mockBroadcast },
-      detectLanIps: () => ['192.168.1.100'],
+      detectLanIps: async () => ['192.168.1.100'],
     }))
 
     // Mount the real local-file router

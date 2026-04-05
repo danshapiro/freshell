@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { createNetworkRouter } from '../../../server/network-router.js'
@@ -8,9 +8,11 @@ const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
 describe('LAN Info API', () => {
   let app: Express
+  let detectLanIps: ReturnType<typeof vi.fn>
 
-  beforeAll(() => {
+  beforeEach(() => {
     process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+    detectLanIps = vi.fn().mockResolvedValue(['192.168.1.100', '10.0.0.50'])
 
     app = express()
     app.use(express.json())
@@ -48,11 +50,11 @@ describe('LAN Info API', () => {
       wsHandler: {
         broadcast: () => {},
       },
-      detectLanIps: () => ['192.168.1.100', '10.0.0.50'],
+      detectLanIps,
     }))
   })
 
-  afterAll(() => {
+  afterEach(() => {
     delete process.env.AUTH_TOKEN
   })
 
@@ -111,6 +113,17 @@ describe('LAN Info API', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
 
       expect(res.headers['content-type']).toMatch(/application\/json/)
+    })
+
+    it('returns a deterministic 500 when async LAN detection fails', async () => {
+      detectLanIps.mockRejectedValueOnce(new Error('lan detection failed'))
+
+      const res = await request(app)
+        .get('/api/lan-info')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(500)
+      expect(res.body).toEqual({ error: 'Failed to get LAN info' })
     })
   })
 })

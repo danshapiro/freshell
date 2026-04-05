@@ -5,7 +5,7 @@ import path from 'node:path'
 import { execFile } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import isPortReachable from 'is-port-reachable'
-import { detectLanIps } from './bootstrap.js'
+import { detectLanIps, detectLanIpsAsync } from './bootstrap.js'
 import { detectFirewall, firewallCommands, type FirewallInfo, type FirewallPlatform } from './firewall.js'
 import type { ConfigStore } from './config-store.js'
 import { logger } from './logger.js'
@@ -417,7 +417,7 @@ export class NetworkManager {
     await this.configStore.patchSettings({ network })
 
     this.firewallInfo = null
-    this.refreshLanIps()
+    await this.refreshLanIpsAsync()
     await this.rebuildAllowedOrigins()
 
     if (hostChanged && this.server.listening) {
@@ -442,7 +442,7 @@ export class NetworkManager {
     _effectiveHost: '127.0.0.1' | '0.0.0.0',
     _network: NetworkSettings,
   ): Promise<void> {
-    this.refreshLanIps()
+    await this.refreshLanIpsAsync()
     await this.rebuildAllowedOrigins()
   }
 
@@ -585,6 +585,15 @@ export class NetworkManager {
     } catch {
       this.lanIps = []
     }
+  }
+
+  private async refreshLanIpsAsync(): Promise<void> {
+    try {
+      this.lanIps = await detectLanIpsAsync()
+    } catch {
+      this.lanIps = []
+    }
+    this.lanIpsInitialized = true
   }
 
   private buildAllowedOrigins(network: NetworkSettings): string[] {
