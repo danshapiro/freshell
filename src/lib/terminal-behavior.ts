@@ -12,6 +12,12 @@ export type ScrollTranslationRuntime = {
   mouseTrackingMode: 'none' | 'x10' | 'vt200' | 'drag' | 'any'
 }
 
+const EXTENSION_BEHAVIOR_PROVIDERS = new Set(['opencode'])
+
+export function providerUsesExtensionTerminalBehavior(provider: string | undefined): boolean {
+  return typeof provider === 'string' && EXTENSION_BEHAVIOR_PROVIDERS.has(provider)
+}
+
 export function getProviderTerminalBehavior(
   provider: string | undefined,
   extensions: ClientExtensionEntry[],

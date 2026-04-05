@@ -4,6 +4,7 @@ import { Provider } from 'react-redux'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import TerminalView from '@/components/TerminalView'
+import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer, { setRegistry } from '@/store/extensionsSlice'
 import panesReducer from '@/store/panesSlice'
@@ -18,11 +19,25 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
 }))
 
+const apiMocks = vi.hoisted(() => ({
+  get: vi.fn(),
+}))
+
+const authMocks = vi.hoisted(() => ({
+  getAuthToken: vi.fn(() => undefined),
+}))
+
 let wheelHandler: ((event: WheelEvent) => boolean) | null = null
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
 }))
+
+vi.mock('@/lib/api', () => ({
+  api: apiMocks,
+}))
+
+vi.mock('@/lib/auth', () => authMocks)
 
 vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: () => ({}),
@@ -164,13 +179,45 @@ function createStore(
 describe('TerminalView wheel scroll input policy', () => {
   beforeEach(() => {
     wheelHandler = null
+    apiMocks.get.mockReset()
+    authMocks.getAuthToken.mockReset()
+    authMocks.getAuthToken.mockReturnValue(undefined)
+    resetEnsureExtensionsRegistryCacheForTests()
     wsMocks.send.mockClear()
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
   afterEach(() => {
     cleanup()
+    resetEnsureExtensionsRegistryCacheForTests()
     vi.unstubAllGlobals()
+  })
+
+  it('loads the extension registry for coding-cli panes before applying wheel translation', async () => {
+    authMocks.getAuthToken.mockReturnValue('token-test')
+    apiMocks.get.mockResolvedValue([opencodeExtensionWithBehaviorHint])
+    const { store, tabId, paneId, paneContent } = createStore('opencode', [], 'term-opencode')
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalled()
+      expect(wheelHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+
+    const event = new WheelEvent('wheel', { deltaY: 24, cancelable: true })
+    expect(wheelHandler?.(event)).toBe(false)
+    expect(wsMocks.send).toHaveBeenCalledWith({
+      type: 'terminal.input',
+      terminalId: 'term-opencode',
+      data: '\u001b[B',
+    })
   })
 
   it('translates wheel scrolling into cursor-key input for opted-in providers', async () => {
@@ -188,8 +235,16 @@ describe('TerminalView wheel scroll input policy', () => {
 
     wsMocks.send.mockClear()
 
-    const event = new WheelEvent('wheel', { deltaY: 24, cancelable: true })
+    const preventDefault = vi.fn()
+    const stopPropagation = vi.fn()
+    const event = {
+      deltaY: 24,
+      preventDefault,
+      stopPropagation,
+    } as unknown as WheelEvent
     expect(wheelHandler?.(event)).toBe(false)
+    expect(preventDefault).toHaveBeenCalledOnce()
+    expect(stopPropagation).toHaveBeenCalledOnce()
     expect(wsMocks.send).toHaveBeenCalledWith({
       type: 'terminal.input',
       terminalId: 'term-opencode',
@@ -198,6 +253,8 @@ describe('TerminalView wheel scroll input policy', () => {
   })
 
   it('keeps non-opted-in providers on native wheel behavior', async () => {
+    authMocks.getAuthToken.mockReturnValue('token-test')
+    apiMocks.get.mockImplementation(() => new Promise(() => {}))
     const { store, tabId, paneId, paneContent } = createStore('codex', [], 'term-codex')
 
     render(
@@ -207,13 +264,22 @@ describe('TerminalView wheel scroll input policy', () => {
     )
 
     await waitFor(() => {
+      expect(apiMocks.get).not.toHaveBeenCalled()
       expect(wheelHandler).not.toBeNull()
     })
 
     wsMocks.send.mockClear()
 
-    const event = new WheelEvent('wheel', { deltaY: 24, cancelable: true })
+    const preventDefault = vi.fn()
+    const stopPropagation = vi.fn()
+    const event = {
+      deltaY: 24,
+      preventDefault,
+      stopPropagation,
+    } as unknown as WheelEvent
     expect(wheelHandler?.(event)).toBe(true)
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(stopPropagation).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.input' }))
   })
 

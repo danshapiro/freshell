@@ -38,6 +38,7 @@ import {
   type AttachSeqState,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
@@ -80,6 +81,7 @@ import { createLogger } from '@/lib/client-logger'
 import {
   getProviderTerminalBehavior,
   prefersCanvasRenderer,
+  providerUsesExtensionTerminalBehavior,
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
@@ -366,10 +368,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
   const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)
+  const shouldResolveProviderBehavior = isTerminal && providerUsesExtensionTerminalBehavior(terminalContent?.mode)
+  const extensionRegistryReady = useEnsureExtensionsRegistry(shouldResolveProviderBehavior)
   const providerBehavior = useMemo(
     () => getProviderTerminalBehavior(terminalContent?.mode, extensions),
     [terminalContent?.mode, extensions],
   )
+  const shouldWaitForProviderBehavior = shouldResolveProviderBehavior && !extensionRegistryReady
   const terminalSearchState = useAppSelector((state) => {
     const terminalId = terminalContent?.terminalId
     if (!terminalId) return null
@@ -1146,6 +1151,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Init xterm once
   useEffect(() => {
     if (!isTerminal) return
+    if (shouldWaitForProviderBehavior) return
     if (!containerRef.current) return
     if (mountedRef.current && termRef.current) return
     mountedRef.current = true
@@ -1230,6 +1236,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         return true
       }
 
+      event.preventDefault()
+      event.stopPropagation()
       return false
     })
 
@@ -1474,7 +1482,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTerminal])
+  }, [isTerminal, providerBehavior.preferredRenderer, shouldWaitForProviderBehavior])
 
   // Ref for tab to avoid re-running effects when tab changes
   const tabRef = useRef(tab)

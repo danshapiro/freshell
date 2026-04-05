@@ -3,6 +3,7 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   getProviderTerminalBehavior,
   prefersCanvasRenderer,
+  providerUsesExtensionTerminalBehavior,
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
@@ -57,5 +58,11 @@ describe('terminal behavior', () => {
   it('maps canvas renderer preference without hard-coded provider checks', () => {
     expect(prefersCanvasRenderer('opencode', extensions)).toBe(true)
     expect(prefersCanvasRenderer('codex', extensions)).toBe(false)
+  })
+
+  it('only waits for extension-managed behavior on opted-in providers', () => {
+    expect(providerUsesExtensionTerminalBehavior('opencode')).toBe(true)
+    expect(providerUsesExtensionTerminalBehavior('codex')).toBe(false)
+    expect(providerUsesExtensionTerminalBehavior('claude')).toBe(false)
   })
 })
