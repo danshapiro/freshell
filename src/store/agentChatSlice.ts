@@ -356,6 +356,7 @@ const agentChatSlice = createSlice({
 
     timelinePageReceived(state, action: PayloadAction<{
       sessionId: string
+      timelineSessionId?: string
       items: AgentTimelineItem[]
       nextCursor: string | null
       revision: number
@@ -370,6 +371,9 @@ const agentChatSlice = createSlice({
       session.timelineBodies = action.payload.replace === false
         ? { ...session.timelineBodies, ...nextBodies }
         : nextBodies
+      if (action.payload.timelineSessionId) {
+        session.timelineSessionId = action.payload.timelineSessionId
+      }
       session.timelineRevision = action.payload.revision
       session.nextTimelineCursor = action.payload.nextCursor
       session.timelineLoading = false

@@ -164,6 +164,58 @@ describe('agentChatThunks', () => {
     expect(session.nextTimelineCursor).toBe('cursor-2')
   })
 
+  it('adopts a canonical durable id from the timeline page before fetching the fallback newest-turn body', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000779'
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: canonicalSessionId,
+      items: [
+        makeTimelineItem('turn-2', 'assistant', 'Latest summary', {
+          sessionId: canonicalSessionId,
+          ordinal: 1,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
+      ],
+      nextCursor: null,
+      revision: 2,
+    })
+    getAgentTurnBody.mockResolvedValue(makeTimelineTurn('turn-2', 'assistant', 'Latest full body', {
+      sessionId: canonicalSessionId,
+      ordinal: 1,
+    }))
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-page-upgrade',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 2,
+    }))
+
+    await store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-page-upgrade',
+      timelineSessionId: 'named-resume',
+      requestKey: 'tab-1:pane-page-upgrade',
+    }))
+
+    expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      'named-resume',
+      expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(getAgentTurnBody).toHaveBeenCalledWith(
+      canonicalSessionId,
+      'turn-2',
+      expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
+    )
+
+    expect(store.getState().agentChat.sessions['sdk-sess-page-upgrade']).toEqual(expect.objectContaining({
+      timelineSessionId: canonicalSessionId,
+      historyLoaded: true,
+      timelineRevision: 2,
+    }))
+  })
+
   it('requests includeBodies on the first visible page and skips getAgentTurnBody when the newest body is inline', async () => {
     getAgentTimelinePage.mockResolvedValue({
       sessionId: 'cli-sess-1',

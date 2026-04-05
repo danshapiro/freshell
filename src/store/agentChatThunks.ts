@@ -3,6 +3,7 @@ import {
   getAgentTimelinePage,
   getAgentTurnBody,
 } from '@/lib/api'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type { AppDispatch, RootState } from './store'
 import {
   restoreRetryRequested,
@@ -150,9 +151,14 @@ export const loadAgentTimelineWindow = createAsyncThunk<
         },
         { signal: controller.signal },
       )
+      const canonicalTimelineSessionId = isValidClaudeSessionId(page.sessionId)
+        ? page.sessionId
+        : undefined
+      const resolvedTimelineSessionId = canonicalTimelineSessionId ?? timelineSessionId ?? sessionId
 
       dispatch(timelinePageReceived({
         sessionId,
+        timelineSessionId: canonicalTimelineSessionId,
         items: page.items,
         nextCursor: page.nextCursor,
         revision: page.revision,
@@ -164,7 +170,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       if (!newestTurn || page.bodies?.[newestTurn.turnId]) return
 
       const turn = await getAgentTurnBody(
-        timelineSessionId ?? sessionId,
+        resolvedTimelineSessionId,
         newestTurn.turnId,
         { revision: page.revision, signal: controller.signal },
       )

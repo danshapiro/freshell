@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, act, waitFor, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { sessionMetadataKey } from '@/lib/session-metadata'
 
 beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
@@ -40,6 +42,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      tabs: tabsReducer,
       settings: settingsReducer,
     },
   })
@@ -211,8 +214,17 @@ describe('agent chat resume history flow', () => {
     expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
   })
 
-  it('upgrades a live-only named resume in place to the canonical durable id after the first visible timeline read', async () => {
+  it('upgrades a live-only named resume in place when a later timeline page exposes the canonical durable id', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    getAgentTurnBody.mockResolvedValue({
+      sessionId: canonicalSessionId,
+      turnId: 'turn-durable-1',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Older durable question' }],
+        timestamp: '2026-03-10T10:00:00.000Z',
+      },
+    })
     getAgentTimelinePage
       .mockResolvedValueOnce({
         sessionId: 'named-resume',
@@ -243,11 +255,11 @@ describe('agent chat resume history flow', () => {
         sessionId: canonicalSessionId,
         items: [
           {
-            turnId: 'turn-durable-1',
+            turnId: 'turn-live-2',
             sessionId: canonicalSessionId,
-            role: 'user',
-            summary: 'Older durable question',
-            timestamp: '2026-03-10T10:00:00.000Z',
+            role: 'assistant',
+            summary: 'Post-watermark live delta',
+            timestamp: '2026-03-10T10:01:40.000Z',
           },
           {
             turnId: 'turn-durable-2',
@@ -257,15 +269,63 @@ describe('agent chat resume history flow', () => {
             timestamp: '2026-03-10T10:00:20.000Z',
           },
           {
+            turnId: 'turn-durable-1',
+            sessionId: canonicalSessionId,
+            role: 'user',
+            summary: 'Older durable question',
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
+        ],
+        nextCursor: null,
+        revision: 2,
+        bodies: {
+          'turn-durable-2': {
+            sessionId: canonicalSessionId,
+            turnId: 'turn-durable-2',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Older durable answer' }],
+              timestamp: '2026-03-10T10:00:20.000Z',
+            },
+          },
+          'turn-live-2': {
+            sessionId: canonicalSessionId,
+            turnId: 'turn-live-2',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Post-watermark live delta' }],
+              timestamp: '2026-03-10T10:01:40.000Z',
+            },
+          },
+        },
+      })
+      .mockResolvedValueOnce({
+        sessionId: canonicalSessionId,
+        items: [
+          {
             turnId: 'turn-live-2',
             sessionId: canonicalSessionId,
             role: 'assistant',
             summary: 'Post-watermark live delta',
             timestamp: '2026-03-10T10:01:40.000Z',
           },
+          {
+            turnId: 'turn-durable-2',
+            sessionId: canonicalSessionId,
+            role: 'assistant',
+            summary: 'Older durable answer',
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+          {
+            turnId: 'turn-durable-1',
+            sessionId: canonicalSessionId,
+            role: 'user',
+            summary: 'Older durable question',
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
         ],
         nextCursor: null,
-        revision: 2,
+        revision: 3,
         bodies: {
           'turn-durable-1': {
             sessionId: canonicalSessionId,
@@ -298,6 +358,21 @@ describe('agent chat resume history flow', () => {
       })
 
     const store = makeStore()
+    store.dispatch(addTab({
+      id: 't1',
+      title: 'FreshClaude Tab',
+      mode: 'claude',
+      status: 'running',
+      createRequestId: 'req-live-only',
+      resumeSessionId: 'named-resume',
+      codingCliProvider: 'claude',
+      sessionMetadataByKey: {
+        [sessionMetadataKey('claude', 'named-resume')]: {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'Original named resume prompt',
+        },
+      },
+    }))
     store.dispatch(initLayout({
       tabId: 't1',
       paneId: 'p1',
@@ -352,23 +427,55 @@ describe('agent chat resume history flow', () => {
 
     act(() => {
       handleSdkMessage(store.dispatch, {
-        type: 'sdk.session.metadata',
+        type: 'sdk.session.snapshot',
         sessionId: 'sdk-live-only',
-        cliSessionId: canonicalSessionId,
+        latestTurnId: 'turn-live-2',
+        status: 'idle',
+        timelineSessionId: 'named-resume',
+        revision: 2,
       })
     })
 
     await waitFor(() => {
-      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
-      expect(attachCalls).toHaveLength(1)
-      expect(attachCalls[0]?.[0]).toEqual({
-        type: 'sdk.attach',
-        sessionId: 'sdk-live-only',
-        resumeSessionId: canonicalSessionId,
-      })
+      expect(getAgentTimelinePage).toHaveBeenNthCalledWith(
+        2,
+        'named-resume',
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
     })
-    expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
+
+    await waitFor(() => {
+      expect(screen.getByText('Post-watermark live delta')).toBeInTheDocument()
+      expect(screen.getByText('Older durable answer')).toBeInTheDocument()
+      expect(screen.getByText('Older durable question')).toBeInTheDocument()
+    })
     expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
+
+    const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
+    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionMetadataByKey).toEqual({
+      [sessionMetadataKey('claude', canonicalSessionId)]: {
+        sessionType: 'freshclaude',
+        firstUserMessage: 'Original named resume prompt',
+      },
+    })
+
+    const expandButtons = screen.getAllByLabelText('Expand turn')
+    fireEvent.click(expandButtons[0]!)
+    expect(getAgentTurnBody).toHaveBeenCalledWith(
+      canonicalSessionId,
+      'turn-durable-1',
+      expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
+    )
+    await waitFor(() => {
+      const renderedMessages = screen.getAllByRole('article')
+        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+      expect(renderedMessages).toContain('Older durable question')
+    })
 
     act(() => {
       handleSdkMessage(store.dispatch, {
@@ -377,32 +484,18 @@ describe('agent chat resume history flow', () => {
         latestTurnId: 'turn-live-2',
         status: 'idle',
         timelineSessionId: canonicalSessionId,
-        revision: 2,
+        revision: 3,
       })
     })
 
     await waitFor(() => {
-      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+      expect(getAgentTimelinePage).toHaveBeenNthCalledWith(
+        3,
         canonicalSessionId,
-        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 3 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
-
-    await waitFor(() => {
-      const renderedMessages = screen.getAllByRole('article')
-        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
-      expect(renderedMessages).toEqual([
-        'Older durable question',
-        'Older durable answer',
-        'Post-watermark live delta',
-      ])
-    })
-    expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
-    expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
-
-    const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
   })
 
   it('restores a persisted pane through the canonical durable id after restart when the sdk session id is stale, then immediately recovers', async () => {
