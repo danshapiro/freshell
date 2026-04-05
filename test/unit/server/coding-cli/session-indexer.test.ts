@@ -1939,6 +1939,170 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
+  it('extracts a lightweight title from a Codex response_item user message on cold start', async () => {
+    const files: string[] = []
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    const olderSessionId = 'older-codex-session'
+    const olderFile = path.join(tempDir, `${olderSessionId}.jsonl`)
+    await fsp.writeFile(olderFile, [
+      JSON.stringify({ type: 'session_meta', payload: { id: olderSessionId, cwd: '/project/older' } }),
+      JSON.stringify({
+        timestamp: new Date(2026, 0, 1).toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Investigate sidebar visibility' }],
+        },
+      }),
+    ].join('\n'))
+    files.push(olderFile)
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const olderSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === olderSessionId)
+
+    expect(olderSession?.title).toBe('Investigate sidebar visibility')
+  })
+
+  it('does not synthesize a lightweight title from older system-context user records', async () => {
+    const files: string[] = []
+    const systemOnlyId = 'system-only'
+    const fileA = path.join(tempDir, `${systemOnlyId}.jsonl`)
+    await fsp.writeFile(fileA, JSON.stringify({
+      sessionId: systemOnlyId,
+      cwd: '/project/a',
+      role: 'user',
+      content: '<environment_context>\n  <cwd>/project/a</cwd>\n</environment_context>',
+      timestamp: new Date(2026, 0, 1).toISOString(),
+    }) + '\n')
+    await fsp.utimes(fileA, new Date(2026, 0, 1), new Date(2026, 0, 1))
+    files.push(fileA)
+
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-system-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-system-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const systemOnlySession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === systemOnlyId)
+
+    expect(systemOnlySession?.title).toBeUndefined()
+  })
+
+  it('extracts lightweight Codex titles from IDE-context messages', async () => {
+    const ideSessionId = 'ide-context-session'
+    const ideFile = path.join(tempDir, `${ideSessionId}.jsonl`)
+    await fsp.writeFile(ideFile, [
+      JSON.stringify({ type: 'session_meta', payload: { id: ideSessionId, cwd: '/project/ide' } }),
+      JSON.stringify({
+        timestamp: new Date(2026, 0, 1).toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '# Context from my IDE setup:\n\n## My request for Codex:\nFix the authentication bug in the login form',
+          }],
+        },
+      }),
+    ].join('\n'))
+    await fsp.utimes(ideFile, new Date(2026, 0, 1), new Date(2026, 0, 1))
+
+    const files = [ideFile]
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-ide-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-ide-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const ideSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === ideSessionId)
+
+    expect(ideSession?.title).toBe('Fix the authentication bug in the login form')
+  })
+
   it('groups worktree sessions under the parent repo', async () => {
     // Set up a real git repo structure in tempDir
     const repoDir = path.join(tempDir, 'repo')

@@ -6,10 +6,11 @@ import chokidar from 'chokidar'
 import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
+import { extractTitleFromMessage } from '../title-utils.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
-import { resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
+import { extractFromIdeContext, isSystemContext, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -260,15 +261,35 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
           if (Number.isFinite(parsed)) createdAt = parsed
         }
         if (!title) {
-          const isUser = obj?.role === 'user' || obj?.type === 'user' || obj?.message?.role === 'user'
+          const nestedMessagePayload =
+            obj?.type === 'response_item' && obj?.payload?.type === 'message'
+              ? obj.payload
+              : undefined
+          const rawContent =
+            nestedMessagePayload?.content ??
+            obj?.message?.content ??
+            obj?.content
+          const isUser =
+            nestedMessagePayload?.role === 'user' ||
+            obj?.role === 'user' ||
+            obj?.type === 'user' ||
+            obj?.message?.role === 'user'
           if (isUser) {
-            const content = obj?.message?.content || obj?.content
-            const text = typeof content === 'string'
-              ? content
-              : Array.isArray(content)
-                ? content.filter((b: any) => typeof b?.text === 'string').map((b: any) => b.text).join(' ')
+            const rawText = typeof rawContent === 'string'
+              ? rawContent
+              : Array.isArray(rawContent)
+                ? rawContent
+                    .filter((part: any) => typeof part?.text === 'string')
+                    .map((part: any) => part.text)
+                    .join('\n')
                 : undefined
-            if (typeof text === 'string' && text.trim()) title = text.trim().slice(0, 200)
+
+            const ideRequest = rawText ? extractFromIdeContext(rawText) : undefined
+            const candidate = ideRequest
+              || (!isSystemContext(rawText ?? '') ? rawText?.replace(/<\/?image[^>]*>/g, '').trim() : '')
+            if (candidate) {
+              title = extractTitleFromMessage(candidate, 200)
+            }
           }
         }
         if (sessionId && cwd && title && createdAt) break
