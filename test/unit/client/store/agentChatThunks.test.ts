@@ -612,6 +612,8 @@ describe('agentChatThunks', () => {
 
     const session = store.getState().agentChat.sessions['sdk-sess-stale-final']
     expect(session.restoreRetryCount).toBe(1)
+    expect(session.historyLoaded).toBe(true)
+    expect(session.restoreFailureCode).toBe('RESTORE_STALE_REVISION')
     expect(session.timelineError).toBe('Stale restore revision')
   })
 })

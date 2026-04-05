@@ -61,6 +61,19 @@ function getTimelineErrorMessage(error: unknown, fallback: string): string {
   return fallback
 }
 
+function getRestoreFailureCode(error: unknown): string | undefined {
+  if (
+    typeof error === 'object'
+    && error !== null
+    && 'details' in error
+    && typeof (error as { details?: { code?: unknown } }).details?.code === 'string'
+  ) {
+    const code = (error as { details: { code: string } }).details.code
+    return code.startsWith('RESTORE_') ? code : undefined
+  }
+  return undefined
+}
+
 function requestStaleRestoreRetry(
   sessionId: string,
   dispatch: AppDispatch,
@@ -109,6 +122,7 @@ export const loadAgentTurnBody = createAsyncThunk<
       dispatch(timelineLoadFailed({
         sessionId,
         message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        code: getRestoreFailureCode(error),
       }))
       throw error
     }
@@ -192,6 +206,7 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       dispatch(timelineLoadFailed({
         sessionId,
         message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        code: getRestoreFailureCode(error),
       }))
       throw error
     } finally {

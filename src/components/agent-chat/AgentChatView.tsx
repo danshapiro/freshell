@@ -137,7 +137,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
   // HTTP timeline window (even if it is empty).
-  const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
+  const hasRestoreFailure = Boolean(
+    paneContent.sessionId
+      && session?.historyLoaded
+      && session?.restoreFailureCode
+      && session?.restoreFailureMessage,
+  )
+  const isRestoring = !!paneContent.sessionId && !session?.historyLoaded && !hasRestoreFailure
 
   // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
@@ -720,6 +726,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           </div>
         )}
 
+        {hasRestoreFailure && session?.restoreFailureMessage && (
+          <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
+            <p className="font-medium text-red-700 dark:text-red-300">Session restore failed</p>
+            <p className="mt-1 text-red-700/90 dark:text-red-200">{session.restoreFailureMessage}</p>
+          </div>
+        )}
+
         {paneContent.status === 'create-failed' && paneContent.createError && (
           <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
             <p className="font-medium text-red-700 dark:text-red-300">Session start failed</p>
@@ -735,7 +748,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         )}
 
         {/* Welcome: no sessionId or the current session is empty after restore completed. */}
-        {!session?.messages.length && timelineItems.length === 0 && !isRestoring && paneContent.status !== 'create-failed' && (
+        {!session?.messages.length && timelineItems.length === 0 && !isRestoring && !hasRestoreFailure && paneContent.status !== 'create-failed' && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
@@ -883,13 +896,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         ))}
 
         {/* Error display */}
-        {session?.lastError && (
+        {!hasRestoreFailure && session?.lastError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.lastError}
           </div>
         )}
 
-        {session?.timelineError && (
+        {!hasRestoreFailure && session?.timelineError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.timelineError}
           </div>

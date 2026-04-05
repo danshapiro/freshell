@@ -172,6 +172,9 @@ describe('handleSdkMessage — session-lost error handling', () => {
     const session = store.getState().agentChat.sessions['missing-session']
     expect(session).toBeDefined()
     expect(session.lastError).toBe('SDK session history not found')
+    expect(session.historyLoaded).toBe(true)
+    expect(session.restoreFailureCode).toBe('RESTORE_NOT_FOUND')
+    expect(session.restoreFailureMessage).toBe('SDK session history not found')
     expect(session.lost).toBeUndefined()
   })
 

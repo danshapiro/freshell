@@ -1756,7 +1756,9 @@ describe('AgentChatView server-restart recovery', () => {
       }))
     })
 
-    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
+    expect(await screen.findByText('Session restore failed')).toBeInTheDocument()
+    expect(screen.getByText('Stale restore revision')).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
     expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
     const content = getPaneContent(store, 't1', 'p1')
@@ -1766,6 +1768,51 @@ describe('AgentChatView server-restart recovery', () => {
 
     const createCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
     expect(createCalls).toHaveLength(0)
+  })
+
+  it('surfaces attach-time restore failures as a terminal restore state instead of staying in restore mode', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-attach-failure',
+      sessionId: 'sdk-missing-history',
+      status: 'idle',
+      resumeSessionId: 'named-resume',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    expect(screen.getByText('Restoring session...')).toBeInTheDocument()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.error',
+        sessionId: 'sdk-missing-history',
+        code: 'RESTORE_NOT_FOUND',
+        message: 'SDK session history not found',
+      })
+    })
+
+    expect(await screen.findByText('Session restore failed')).toBeInTheDocument()
+    expect(screen.getByText('SDK session history not found')).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
   })
 
   it('restarts hydration when a newer snapshot revision arrives with the same latestTurnId', async () => {

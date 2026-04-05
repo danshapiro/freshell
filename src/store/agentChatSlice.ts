@@ -45,6 +45,18 @@ function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'tim
     ?? session.cliSessionId
 }
 
+function isRestoreFailureCode(code?: string): code is string {
+  return typeof code === 'string' && code.startsWith('RESTORE_')
+}
+
+function markTerminalRestoreFailure(session: ChatSessionState, code: string, message: string): void {
+  session.awaitingDurableHistory = false
+  session.historyLoaded = true
+  session.timelineLoading = false
+  session.restoreFailureCode = code
+  session.restoreFailureMessage = message
+}
+
 function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): void {
   session.latestTurnId = undefined
   session.timelineItems = []
@@ -54,6 +66,7 @@ function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): v
   session.timelineLoading = false
   session.timelineError = undefined
   session.historyLoaded = false
+  session.restoreFailureMessage = undefined
 }
 
 function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState): void {
@@ -66,6 +79,7 @@ function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState):
   session.messages = []
   session.streamingText = ''
   session.streamingActive = false
+  session.restoreFailureMessage = undefined
 }
 
 function requestFreshSnapshotRefresh(session: ChatSessionState): void {
@@ -106,6 +120,7 @@ const agentChatSlice = createSlice({
       session.awaitingDurableHistory = expectsHistoryHydration
       session.restoreRetryCount = 0
       session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
       state.pendingCreates[requestId] = {
         sessionId,
         expectsHistoryHydration,
@@ -157,6 +172,7 @@ const agentChatSlice = createSlice({
         requestFreshSnapshotRefresh(session)
         session.restoreRetryCount = 0
         session.restoreFailureCode = undefined
+        session.restoreFailureMessage = undefined
       }
 
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
@@ -207,6 +223,7 @@ const agentChatSlice = createSlice({
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
       session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
         const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
@@ -382,12 +399,16 @@ const agentChatSlice = createSlice({
       session.historyLoaded = true
       session.restoreRetryCount = 0
       session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
     },
 
-    timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string }>) {
+    timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string; code?: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.timelineLoading = false
       session.timelineError = action.payload.message
+      if (isRestoreFailureCode(action.payload.code)) {
+        markTerminalRestoreFailure(session, action.payload.code, action.payload.message)
+      }
     },
 
     turnBodyReceived(state, action: PayloadAction<{
@@ -398,9 +419,12 @@ const agentChatSlice = createSlice({
       session.timelineBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
-    sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
+    sessionError(state, action: PayloadAction<{ sessionId: string; message: string; code?: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.lastError = action.payload.message
+      if (isRestoreFailureCode(action.payload.code)) {
+        markTerminalRestoreFailure(session, action.payload.code, action.payload.message)
+      }
     },
 
     /** Mark a session as lost (server confirmed it no longer exists).
@@ -426,6 +450,7 @@ const agentChatSlice = createSlice({
       session.snapshotRefreshRequestId = undefined
       session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
       session.restoreFailureCode = action.payload.code
+      session.restoreFailureMessage = undefined
     },
 
     createFailed(state, action: PayloadAction<{ requestId: string } & PendingCreateFailure>) {

@@ -108,6 +108,8 @@ export interface ChatSessionState {
   restoreRetryCount?: number
   /** Last restore-specific failure code surfaced during hydration. */
   restoreFailureCode?: string
+  /** User-visible restore failure message once restore has ended terminally. */
+  restoreFailureMessage?: string
   /** Monotonic key for requesting one fresh sdk.attach snapshot refresh before hydration resumes. */
   snapshotRefreshRequestId?: number
   /** Monotonic key for restarting visible restore hydration from a newer snapshot. */

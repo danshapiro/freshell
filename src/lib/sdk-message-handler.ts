@@ -186,6 +186,7 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       } else {
         dispatch(sessionError({
           sessionId: msg.sessionId as string,
+          code: msg.code as string | undefined,
           message: (msg.message as string) || (msg.error as string) || 'Unknown error',
         }))
       }

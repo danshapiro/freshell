@@ -268,6 +268,8 @@ describe('agent chat restore flow', () => {
       expect(getAgentTimelinePage).toHaveBeenCalledTimes(2)
     })
 
-    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
+    expect(await screen.findByText('Session restore failed')).toBeInTheDocument()
+    expect(screen.getByText('Stale restore revision')).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
   })
 })
