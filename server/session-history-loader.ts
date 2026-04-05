@@ -45,6 +45,12 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
     return undefined
   }
 
+  /** Check if content blocks contain only tool_use and tool_result blocks. */
+  const isToolOnly = (blocks: ContentBlock[]): boolean =>
+    blocks.length > 0 && blocks.every(
+      (b) => b.type === 'tool_use' || b.type === 'tool_result'
+    )
+
   for (const line of lines) {
     let obj: any
     try {
@@ -60,11 +66,15 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
     const timestamp = obj.timestamp as string | undefined
     const msg = obj.message
 
+    let newContent: ContentBlock[]
+    let newMessage: ChatMessage
+
     if (typeof msg === 'string') {
       // Simple/legacy format: message is a plain string
-      const nextMessage: ChatMessage = {
+      newContent = [{ type: 'text', text: msg }]
+      newMessage = {
         role,
-        content: [{ type: 'text', text: msg }],
+        content: newContent,
         ...(timestamp ? { timestamp } : {}),
         ...(pickOptionalString(obj.model) ? { model: pickOptionalString(obj.model) } : {}),
         ...(pickOptionalString(obj.parentId, obj.parent_id) ? { parentId: pickOptionalString(obj.parentId, obj.parent_id) } : {}),
@@ -73,18 +83,12 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
           messageId: pickOptionalString(obj.id, obj.messageId, obj.message_id),
         } : {}),
       }
-      if (!nextMessage.messageId) {
-        const fingerprint = createDurableMessageFingerprint(nextMessage)
-        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
-        fingerprintOccurrences.set(fingerprint, occurrence + 1)
-        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
-      }
-      messages.push(nextMessage)
     } else if (msg && typeof msg === 'object' && Array.isArray(msg.content)) {
       // Structured format: message is a ClaudeMessage object
-      const nextMessage: ChatMessage = {
+      newContent = msg.content as ContentBlock[]
+      newMessage = {
         role: msg.role || role,
-        content: msg.content as ContentBlock[],
+        content: newContent,
         ...(timestamp ? { timestamp } : {}),
         ...(msg.model ? { model: msg.model } : {}),
         ...(pickOptionalString(msg.parentId, msg.parent_id, obj.parentId, obj.parent_id) ? {
@@ -95,13 +99,30 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
         } : {}),
         ...(typeof msg.id === 'string' && msg.id.trim().length > 0 ? { messageId: msg.id } : {}),
       }
-      if (!nextMessage.messageId) {
-        const fingerprint = createDurableMessageFingerprint(nextMessage)
-        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
-        fingerprintOccurrences.set(fingerprint, occurrence + 1)
-        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
-      }
-      messages.push(nextMessage)
+    } else {
+      continue
+    }
+
+    // Generate deterministic messageId if not present
+    if (!newMessage.messageId) {
+      const fingerprint = createDurableMessageFingerprint(newMessage)
+      const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+      fingerprintOccurrences.set(fingerprint, occurrence + 1)
+      newMessage.messageId = synthesizeDeterministicMessageId(newMessage, occurrence)
+    }
+
+    // Coalesce consecutive tool-only assistant messages
+    const prevMessage = messages[messages.length - 1]
+    if (
+      prevMessage?.role === 'assistant' &&
+      newMessage.role === 'assistant' &&
+      isToolOnly(prevMessage.content) &&
+      isToolOnly(newMessage.content)
+    ) {
+      // Append content blocks to previous message
+      prevMessage.content = [...prevMessage.content, ...newMessage.content]
+    } else {
+      messages.push(newMessage)
     }
   }
 
