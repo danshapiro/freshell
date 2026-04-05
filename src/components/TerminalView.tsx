@@ -38,6 +38,7 @@ import {
   type AttachSeqState,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { setHoveredUrl, clearHoveredUrl } from '@/lib/terminal-hovered-url'
@@ -77,6 +78,13 @@ import type { PaneContent, PaneContentInput, PaneRefreshRequest, TerminalPaneCon
 import '@xterm/xterm/css/xterm.css'
 import { getHydrationQueue } from '@/lib/hydration-queue'
 import { createLogger } from '@/lib/client-logger'
+import {
+  getProviderTerminalBehavior,
+  prefersCanvasRenderer,
+  providerUsesExtensionTerminalBehavior,
+  scrollLinesToCursorKeys,
+  shouldTranslateScrollToCursorKeys,
+} from '@/lib/terminal-behavior'
 
 const log = createLogger('TerminalView')
 
@@ -359,6 +367,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)
+  const shouldResolveProviderBehavior = isTerminal && providerUsesExtensionTerminalBehavior(terminalContent?.mode)
+  const extensionRegistryReady = useEnsureExtensionsRegistry(shouldResolveProviderBehavior)
+  const providerBehavior = useMemo(
+    () => getProviderTerminalBehavior(terminalContent?.mode, extensions),
+    [terminalContent?.mode, extensions],
+  )
+  const shouldWaitForProviderBehavior = shouldResolveProviderBehavior && !extensionRegistryReady
   const terminalSearchState = useAppSelector((state) => {
     const terminalId = terminalContent?.terminalId
     if (!terminalId) return null
@@ -402,6 +418,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     pendingSinceSeq: 0,
   })
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
+  const providerBehaviorRef = useRef(providerBehavior)
   const refreshRequestRef = useRef<PaneRefreshRequest | null>(refreshRequest)
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const hasMountedRefreshEffectRef = useRef(false)
@@ -517,6 +534,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
+  providerBehaviorRef.current = providerBehavior
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
@@ -536,6 +554,47 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
+
+  const sendInput = useCallback((data: string) => {
+    const tid = terminalIdRef.current
+    if (!tid) return
+    // In 'type' mode, clear attention when user sends input.
+    // In 'click' mode, attention is cleared by the notification hook on tab switch.
+    if (attentionDismissRef.current === 'type') {
+      if (hasAttentionRef.current) {
+        dispatch(clearTabAttention({ tabId }))
+      }
+      if (hasPaneAttentionRef.current) {
+        dispatch(clearPaneAttention({ paneId }))
+      }
+    }
+    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
+      turnCompletedSinceLastInputRef.current = false
+      dispatch(setPaneRuntimeActivity({
+        paneId: paneIdRef.current,
+        source: 'terminal',
+        phase: 'pending',
+      }))
+    }
+    ws.send({ type: 'terminal.input', terminalId: tid, data })
+  }, [dispatch, tabId, paneId, ws])
+
+  const translateScrollLinesToInput = useCallback((term: Terminal, lines: number): boolean => {
+    if (!terminalIdRef.current || lines === 0) return false
+
+    const shouldTranslate = shouldTranslateScrollToCursorKeys({
+      scrollInputPolicy: providerBehaviorRef.current.scrollInputPolicy,
+      altBufferActive: term.buffer.active.type === 'alternate',
+      mouseTrackingMode: term.modes.mouseTrackingMode,
+    })
+    if (!shouldTranslate) return false
+
+    const sequence = scrollLinesToCursorKeys(lines, term.modes.applicationCursorKeysMode)
+    if (!sequence) return false
+
+    sendInput(sequence)
+    return true
+  }, [sendInput])
 
   useEffect(() => {
     if (!isMobile || typeof window === 'undefined' || !window.visualViewport) {
@@ -654,6 +713,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!isMobile || !touchActiveRef.current) return
     const touch = event.touches[0]
     if (!touch) return
+    const term = termRef.current
+    if (!term) return
 
     const deltaX = Math.abs(touch.clientX - touchStartXRef.current)
     const deltaYFromStart = Math.abs(touch.clientY - touchStartYRef.current)
@@ -672,10 +733,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
-      termRef.current?.scrollLines(lines)
+      if (!translateScrollLinesToInput(term, lines)) {
+        term.scrollLines(lines)
+      }
+
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE
     }
-  }, [clearLongPressTimer, isMobile])
+  }, [clearLongPressTimer, isMobile, translateScrollLinesToInput])
 
   const handleMobileTouchEnd = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
     if (!isMobile) return
@@ -888,30 +952,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const sendInput = useCallback((data: string) => {
-    const tid = terminalIdRef.current
-    if (!tid) return
-    // In 'type' mode, clear attention when user sends input.
-    // In 'click' mode, attention is cleared by the notification hook on tab switch.
-    if (attentionDismissRef.current === 'type') {
-      if (hasAttentionRef.current) {
-        dispatch(clearTabAttention({ tabId }))
-      }
-      if (hasPaneAttentionRef.current) {
-        dispatch(clearPaneAttention({ paneId }))
-      }
-    }
-    if (contentRef.current?.mode === 'claude' && isClaudeTurnSubmit(data)) {
-      turnCompletedSinceLastInputRef.current = false
-      dispatch(setPaneRuntimeActivity({
-        paneId: paneIdRef.current,
-        source: 'terminal',
-        phase: 'pending',
-      }))
-    }
-    ws.send({ type: 'terminal.input', terminalId: tid, data })
-  }, [dispatch, tabId, paneId, ws])
-
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
     const pendingProbe = startupProbeStateRef.current.pending
     if (opts?.discardReplayRemainder) {
@@ -1111,6 +1151,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Init xterm once
   useEffect(() => {
     if (!isTerminal) return
+    if (shouldWaitForProviderBehavior) return
     if (!containerRef.current) return
     if (mountedRef.current && termRef.current) return
     mountedRef.current = true
@@ -1161,11 +1202,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       },
     })
     const rendererMode = settings.terminal.renderer ?? 'auto'
-    // OpenCode paints a dense truecolor light surface that currently renders
-    // unreliably through xterm WebGL on Chrome/Windows. Keep auto mode on the
-    // safer canvas path for that provider unless the user explicitly forces WebGL.
     const enableWebgl = rendererMode === 'webgl'
-      || (rendererMode === 'auto' && paneContent.mode !== 'opencode')
+      || (rendererMode === 'auto' && !prefersCanvasRenderer(paneContent.mode, extensions))
     let runtime = createNoopRuntime()
     try {
       runtime = createTerminalRuntime({ terminal: term, enableWebgl })
@@ -1192,6 +1230,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     term.open(containerRef.current)
     const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput)
+    term.attachCustomWheelEventHandler((event) => {
+      const lines = event.deltaY < 0 ? -1 : event.deltaY > 0 ? 1 : 0
+      if (!translateScrollLinesToInput(term, lines)) {
+        return true
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+      return false
+    })
 
     // Register custom link provider for clickable local file paths
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
@@ -1434,7 +1482,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTerminal])
+  }, [isTerminal, providerBehavior.preferredRenderer, shouldWaitForProviderBehavior])
 
   // Ref for tab to avoid re-running effects when tab changes
   const tabRef = useRef(tab)

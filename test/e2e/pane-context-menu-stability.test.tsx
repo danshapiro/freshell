@@ -102,6 +102,7 @@ vi.mock('@xterm/xterm', () => {
     selectLines = vi.fn()
     paste = vi.fn()
     attachCustomKeyEventHandler = vi.fn()
+    attachCustomWheelEventHandler = vi.fn()
     getSelection = vi.fn(() => '')
     onData = vi.fn(() => ({ dispose: vi.fn() }))
     onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))

@@ -16,7 +16,11 @@
       "bypassPermissions": "{\"edit\":\"allow\",\"bash\":\"allow\"}"
     },
     "supportsPermissionMode": true,
-    "supportsModel": true
+    "supportsModel": true,
+    "terminalBehavior": {
+      "preferredRenderer": "canvas",
+      "scrollInputPolicy": "fallbackToCursorKeysWhenAltScreenMouseCapture"
+    }
   },
   "picker": {
     "group": "agents"
