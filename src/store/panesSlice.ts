@@ -2,6 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
@@ -1037,10 +1038,12 @@ export const panesSlice = createSlice({
       const root = state.layouts[tabId]
       if (!root) return
       let normalizedContentForTitle: PaneContent | null = null
+      let previousContentForTitle: PaneContent | null = null
 
       function updateContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             const nextContent = normalizePaneContent(content, node.content)
             normalizedContentForTitle = nextContent
             return { ...node, content: nextContent }
@@ -1060,7 +1063,12 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1075,10 +1083,12 @@ export const panesSlice = createSlice({
       const { tabId, paneId, updates } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      let previousContentForTitle: PaneContent | null = null
 
       function mergeContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             return {
               ...node,
               content: normalizePaneContent({ ...node.content, ...updates } as PaneContentInput | PaneContent, node.content),
@@ -1100,7 +1110,12 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)

@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getPaneDisplayTitle } from '@/lib/pane-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
   formatPaneRuntimeLabel,
@@ -208,12 +208,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
+    const currentTitle = getPaneDisplayTitle(node.content, paneTitles[node.id], extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, extensionEntries, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
@@ -367,7 +367,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Render a leaf pane
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
+    const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'

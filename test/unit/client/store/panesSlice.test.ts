@@ -2947,8 +2947,9 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-1']['pane-1']).toBe('User Title')
     })
 
-    it('updatePaneContent DOES overwrite title when paneTitleSetByUser is false/missing', () => {
+    it('updatePaneContent rewrites titles that still match the pane default', () => {
       const state = makeState(false)
+      state.paneTitles['tab-1']['pane-1'] = 'Shell'
       const result = panesReducer(state, updatePaneContent({
         tabId: 'tab-1',
         paneId: 'pane-1',
@@ -2957,6 +2958,36 @@ describe('panesSlice', () => {
 
       // Without extensions, derivePaneTitle capitalizes the provider name
       expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
+    })
+
+    it('updatePaneContent preserves runtime titles when they no longer match the pane default', () => {
+      const state = makeState(false)
+      state.paneTitles['tab-1']['pane-1'] = 'Release prep'
+      const result = panesReducer(state, updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'terminal',
+          createRequestId: 'req-1',
+          terminalId: 'term-1',
+          status: 'running',
+          mode: 'shell',
+        },
+      }))
+
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('Release prep')
+    })
+
+    it('mergePaneContent preserves runtime titles when they no longer match the pane default', () => {
+      const state = makeState(false)
+      state.paneTitles['tab-1']['pane-1'] = 'Release prep'
+      const result = panesReducer(state, mergePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        updates: { terminalId: 'term-1' },
+      }))
+
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('Release prep')
     })
 
     it('updatePaneTitle sets paneTitleSetByUser to true', () => {
