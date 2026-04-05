@@ -248,7 +248,7 @@ No approval required. The approved strategy still fits the implementation plan a
 
 21. Name: existing tab-registry and terminal behavior suites stay green after memoization and lazy-editor changes
     Type: regression
-    Disposition: existing suites kept green: `test/unit/client/components/TabsView.test.tsx`, `test/unit/client/components/TerminalView.visibility.test.tsx`, `test/unit/client/components/TerminalView.lifecycle.test.tsx`, `test/e2e/tabs-view-flow.test.tsx`
+    Disposition: existing suites kept green: `test/integration/client/editor-pane.test.tsx`, `test/unit/client/components/TabsView.test.tsx`, `test/unit/client/components/TerminalView.visibility.test.tsx`, `test/unit/client/components/TerminalView.lifecycle.test.tsx`, `test/e2e/tabs-view-flow.test.tsx`
     Harness: H3 and H5
     Preconditions: the memo and lazy-loading changes are landed.
     Actions: run the listed existing suites without relaxing assertions.
@@ -260,7 +260,7 @@ No approval required. The approved strategy still fits the implementation plan a
     Disposition: existing/extended suites run together
     Harness: H1 and H2
     Preconditions: the implementation for tasks 1 through 3 is landed in the worktree.
-    Actions: run `npm run test:vitest -- run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts`.
+    Actions: run `npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts`.
     Expected outcome: the focused server suite passes as the main red-to-green server acceptance gate. Sources: `Plan-T7`, `Plan-AC`, `Repo-scripts`.
     Interactions: Vitest coordinator path, server runtime modules, router integration tests, WSL planner mocks.
 
@@ -269,7 +269,7 @@ No approval required. The approved strategy still fits the implementation plan a
     Disposition: existing/extended suites run together
     Harness: H1, H3, H4, and H5
     Preconditions: the implementation for tasks 5 and 6 is landed in the worktree.
-    Actions: run `npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/components/TabsView.memo.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.memo.test.tsx test/e2e/tabs-view-flow.test.tsx`; then run `npm run test:e2e:chromium -- test/e2e-browser/specs/editor-pane.spec.ts`.
+    Actions: run `npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/integration/client/editor-pane.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/components/TabsView.memo.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.memo.test.tsx test/e2e/tabs-view-flow.test.tsx`; then run `npm run test:e2e:chromium -- test/e2e-browser/specs/editor-pane.spec.ts`.
     Expected outcome: the focused client/browser suite passes and preserves user-visible behavior while proving the lazy editor and memo boundaries. Sources: `Plan-T7`, `Plan-AC`, `Repo-scripts`.
     Interactions: Vitest jsdom suites, Playwright browser harness, lazy chunk loading, tab/terminal UI behavior.
 

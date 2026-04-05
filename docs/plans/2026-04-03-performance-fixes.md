@@ -79,6 +79,8 @@
   Responsibility: pane creation flow. Keep editor creation coverage green with lazy rendering.
 - `test/unit/client/components/panes/PaneLayout.test.tsx`
   Responsibility: pane-layout rendering. Update editor assertions/mocks for lazy rendering.
+- `test/integration/client/editor-pane.test.tsx`
+  Responsibility: direct editor-pane integration behavior. Update direct editor-layout assertions so they await the lazy editor boundary instead of assuming a synchronous toolbar mount.
 - `test/e2e-browser/specs/editor-pane.spec.ts`
   Responsibility: real browser editor flow. Assert editor pane opens, an extra JS chunk loads when opening it, and the loaded editor is screenshot-stable.
 - `test/unit/client/components/TabsView.memo.test.tsx`
@@ -121,7 +123,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: FAIL because `detectLanIpsAsync()` does not exist yet and `/api/lan-info` still expects a sync dependency.
@@ -151,7 +153,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.
@@ -203,7 +205,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: FAIL because the integration test now asserts that the dead sync exports are gone, but the code still exports them.
@@ -227,7 +229,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/wsl-port-forward.test.ts test/integration/server/wsl-port-forward.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.
@@ -382,6 +384,7 @@ git commit -m "perf: enable incremental typescript caches"
 - Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
 - Modify: `test/unit/client/components/panes/PaneContainer.createContent.test.tsx`
 - Modify: `test/unit/client/components/panes/PaneLayout.test.tsx`
+- Modify: `test/integration/client/editor-pane.test.tsx`
 - Modify: `test/e2e-browser/specs/editor-pane.spec.ts`
 
 - [ ] **Step 1: Add the failing lazy-editor tests**
@@ -394,6 +397,8 @@ Update the pane unit tests so editor rendering is async instead of synchronous:
   - update any editor assertions to use async queries so the lazy boundary is exercised
 - `test/unit/client/components/panes/PaneContainer.createContent.test.tsx`
   - keep editor-creation assertions green after the lazy boundary
+- `test/integration/client/editor-pane.test.tsx`
+  - update direct editor-layout assertions to await the toolbar or editor contents through the lazy boundary instead of using synchronous `getBy*` queries immediately after render
 
 In `test/e2e-browser/specs/editor-pane.spec.ts`, add a browser-level assertion that opening the editor causes at least one new `.js` asset request after the click, then wait for `[data-testid="editor-pane"]` and capture the editor-pane screenshot/assertion after load.
 
@@ -401,7 +406,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx
+npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/integration/client/editor-pane.test.tsx
 ```
 
 Expected: FAIL because the editor still renders eagerly and no loading shell exists.
@@ -432,7 +437,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx
+npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/integration/client/editor-pane.test.tsx
 npm run build:client
 find dist/client/assets -maxdepth 1 -type f | sort
 ```
@@ -544,7 +549,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts
+npm run test:vitest -- --config vitest.server.config.ts run test/unit/server/bootstrap.test.ts test/unit/server/network-manager.test.ts test/unit/server/wsl-port-forward.test.ts test/integration/server/lan-info-api.test.ts test/integration/server/local-file-router.test.ts test/integration/server/network-api.test.ts
 ```
 
 Expected: PASS.
@@ -555,7 +560,7 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/trycycle-performance-fixes-20260404
-npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/components/TabsView.memo.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.memo.test.tsx test/e2e/tabs-view-flow.test.tsx
+npm run test:vitest -- run test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/panes/PaneLayout.test.tsx test/integration/client/editor-pane.test.tsx test/unit/client/components/TabsView.test.tsx test/unit/client/components/TabsView.memo.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.memo.test.tsx test/e2e/tabs-view-flow.test.tsx
 npm run test:e2e:chromium -- test/e2e-browser/specs/editor-pane.spec.ts
 ```
 
