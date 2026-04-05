@@ -13,6 +13,11 @@ import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 const log = createLogger('PanesSlice')
 
+type HydratePanesMeta = {
+  localLayoutPersistedAt?: number
+  remoteLayoutPersistedAt?: number
+}
+
 function buildPreservedSessionRef(
   localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
   preservedResumeSessionId?: string,
@@ -129,6 +134,28 @@ function normalizePaneContent(
   }
   // Editor/picker content passes through unchanged
   return input
+}
+
+function shouldPreferLocalAgentChatPaneDuringHydration(
+  localContent: PaneContent,
+  incomingContent: PaneContent,
+  meta: HydratePanesMeta | undefined,
+): boolean {
+  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+    return false
+  }
+
+  const localLayoutPersistedAt = meta?.localLayoutPersistedAt
+  const remoteLayoutPersistedAt = meta?.remoteLayoutPersistedAt
+  if (
+    typeof localLayoutPersistedAt !== 'number'
+    || typeof remoteLayoutPersistedAt !== 'number'
+    || remoteLayoutPersistedAt >= localLayoutPersistedAt
+  ) {
+    return false
+  }
+
+  return isValidClaudeSessionId(localContent.resumeSessionId)
 }
 
 /**
@@ -433,7 +460,11 @@ function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
  * terminal assignments that are more advanced. A local terminal pane
  * with a terminalId beats an incoming pane without one (same createRequestId).
  */
-function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | null {
+function mergeTerminalState(
+  incoming: PaneNode,
+  local: PaneNode,
+  meta?: HydratePanesMeta,
+): PaneNode | null {
   const incomingValid = hasPaneTreeShape(incoming)
   const localValid = hasPaneTreeShape(local)
   if (!incomingValid) return localValid ? local : null
@@ -480,6 +511,9 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
     if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
+      if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
+        return local
+      }
       if (incoming.content.createRequestId === local.content.createRequestId) {
         if (
           shouldPreserveLocalCanonicalResumeSessionId(
@@ -528,8 +562,8 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     Array.isArray(incoming.children) && incoming.children.length === 2 &&
     Array.isArray(local.children) && local.children.length === 2
   ) {
-    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0])
-    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1])
+    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0], meta)
+    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1], meta)
     if (!mergedLeft || !mergedRight) {
       return local
     }
@@ -1248,6 +1282,7 @@ export const panesSlice = createSlice({
     },
 
     hydratePanes: (state, action: PayloadAction<PanesState>) => {
+      const meta = (action as PayloadAction<PanesState, string, HydratePanesMeta | undefined>).meta
       const incoming = action.payload
 
       // Merge layouts: preserve local terminal assignments that are more
@@ -1259,7 +1294,7 @@ export const panesSlice = createSlice({
         const localNode = state.layouts[tabId]
         const incomingHasShape = hasPaneTreeShape(incomingNode)
         const mergedNode = localNode
-          ? mergeTerminalState(incomingNode as PaneNode, localNode)
+          ? mergeTerminalState(incomingNode as PaneNode, localNode, meta)
           : (incomingHasShape ? incomingNode as PaneNode : null)
         const mergeUsedIncoming = mergedNode !== localNode
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
