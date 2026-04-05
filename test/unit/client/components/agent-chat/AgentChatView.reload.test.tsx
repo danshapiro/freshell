@@ -3,6 +3,7 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
+import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import agentChatReducer, {
   addAssistantMessage,
   addUserMessage,
@@ -254,6 +255,77 @@ describe('AgentChatView reload/restore behavior', () => {
       (c: any[]) => c[0]?.type === 'sdk.attach',
     )
     expect(attachCalls).toHaveLength(0)
+  })
+
+  it('shows sdk.create.failed retry UI without fabricating a session id and only retries on click', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-create-failed',
+      status: 'creating',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const createCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
+      expect(createCalls).toHaveLength(1)
+    })
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.create.failed',
+        requestId: 'req-create-failed',
+        code: 'RESTORE_INTERNAL',
+        message: 'Restore bootstrap failed',
+        retryable: true,
+      })
+    })
+
+    expect(await screen.findByText('Session start failed')).toBeInTheDocument()
+    expect(screen.getByText('Restore bootstrap failed')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+
+    const failedContent = getPaneContent(store, 't1', 'p1')
+    expect(failedContent).toBeDefined()
+    expect(failedContent!.sessionId).toBeUndefined()
+    expect(failedContent!.status).toBe('create-failed')
+
+    const createCallsAfterFailure = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
+    const attachCallsAfterFailure = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+    expect(createCallsAfterFailure).toHaveLength(1)
+    expect(attachCallsAfterFailure).toHaveLength(0)
+
+    act(() => {
+      screen.getByRole('button', { name: 'Retry' }).click()
+    })
+
+    await waitFor(() => {
+      const createCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
+      expect(createCalls).toHaveLength(2)
+    })
+
+    const retriedContent = getPaneContent(store, 't1', 'p1')
+    expect(retriedContent).toBeDefined()
+    expect(retriedContent!.sessionId).toBeUndefined()
+    expect(retriedContent!.status).toBe('starting')
+    expect((retriedContent as AgentChatPaneContent).createError).toBeUndefined()
   })
 
   it('shows loading state instead of welcome screen when sessionId is set but messages have not arrived', () => {

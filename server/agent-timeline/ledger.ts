@@ -232,6 +232,30 @@ function normalizeOrdinals(turns: InternalTurn[]): CanonicalTurn[] {
   }))
 }
 
+function isModeContinuationCompatibilityTurn(turn: InternalTurn): boolean {
+  return turn.syntheticMessageId || turn.messageId.startsWith('live:')
+}
+
+function collectCompatibilityCandidateIds(
+  liveTurns: InternalTurn[],
+  previousCandidateIds: ReadonlySet<string>,
+  options: { allowAll: boolean },
+): Set<string> {
+  const next = new Set<string>()
+  const modeAlreadyActive = previousCandidateIds.size > 0
+  for (const turn of liveTurns) {
+    if (
+      options.allowAll
+      || previousCandidateIds.has(turn.messageId)
+      || turn.syntheticMessageId
+      || (modeAlreadyActive && isModeContinuationCompatibilityTurn(turn))
+    ) {
+      next.add(turn.messageId)
+    }
+  }
+  return next
+}
+
 function mergeTurns(
   durableTurns: InternalTurn[],
   liveTurns: InternalTurn[],
@@ -252,26 +276,10 @@ function mergeTurns(
     }
   }
 
-  const durableIds = new Set(durableTurns.map((turn) => turn.messageId))
-  const durableFingerprints = new Set(durableTurns.map((turn) => turn.fingerprint))
-  const implicitCompatibilityCandidates = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
-    ? liveTurns.filter((turn) => !durableIds.has(turn.messageId) && durableFingerprints.has(turn.fingerprint))
-    : []
-  const allowImplicitCompatibility = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
-    && (
-      implicitCompatibilityCandidates.length > 1
-      || (
-        implicitCompatibilityCandidates.length === 1
-        && implicitCompatibilityCandidates[0]?.syntheticMessageId === true
-      )
-    )
-
   function turnsMatch(durableTurn: InternalTurn, liveTurn: InternalTurn): boolean {
     if (durableTurn.messageId === liveTurn.messageId) return true
-    const allowCompatibility = compatibilityCandidateIds?.size
-      ? compatibilityCandidateIds.has(liveTurn.messageId)
-      : allowImplicitCompatibility
-    return allowCompatibility && durableTurn.fingerprint === liveTurn.fingerprint
+    return compatibilityCandidateIds?.has(liveTurn.messageId) === true
+      && durableTurn.fingerprint === liveTurn.fingerprint
   }
 
   const maxOverlap = Math.min(durableTurns.length, liveTurns.length)
@@ -475,20 +483,23 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ledger.revision = revision
     ledger.signature = signature
     ledger.resolution = resolved
-    const shouldTrackCompatibilityCandidates = params.liveSession != null && (
+    const allowAllCompatibilityCandidates = params.liveSession != null && (
       (
         resolved.readiness === 'live_only'
         && (
           !isCanonicalDurableSessionId(params.timelineSessionId)
           || params.captureCompatibilityCandidates === true
+          || liveTurns.some((turn) => turn.syntheticMessageId)
         )
       )
       || ledger.compatibilityCandidateIds.size > 0
     )
-    ledger.compatibilityCandidateIds = shouldTrackCompatibilityCandidates
-      ? resolved.readiness === 'live_only'
-        ? new Set(liveTurns.map((turn) => turn.messageId))
-        : new Set(mergedTurns.unmatchedLiveMessageIds)
+    ledger.compatibilityCandidateIds = params.liveSession != null
+      ? collectCompatibilityCandidateIds(
+          liveTurns,
+          ledger.compatibilityCandidateIds,
+          { allowAll: allowAllCompatibilityCandidates },
+        )
       : new Set<string>()
   }
 

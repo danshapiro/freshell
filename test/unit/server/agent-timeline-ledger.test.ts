@@ -702,6 +702,43 @@ describe('restore ledger manager', () => {
     ])
   })
 
+  it('does not collapse stable-id histories by fingerprint overlap without an explicit compatibility path', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000557'
+    const liveSession = makeSession({
+      sessionId: 'sdk-stable-id-mismatch',
+      cliSessionId: canonicalSessionId,
+      messages: [
+        makeMessage('user', 'hello', { messageId: 'live-stable-hello' }),
+        makeMessage('assistant', 'world', { messageId: 'live-stable-world' }),
+      ],
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory: vi.fn().mockResolvedValue([
+        makeMessage('user', 'hello', { messageId: 'durable-stable-hello' }),
+        makeMessage('assistant', 'world', { messageId: 'durable-stable-world' }),
+      ]),
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
+    })
+
+    const resolved = await manager.resolve('sdk-stable-id-mismatch')
+
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-stable-id-mismatch',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-stable-hello',
+      'durable-stable-world',
+      'live-stable-hello',
+      'live-stable-world',
+    ])
+  })
+
   it('upgrades a repeated-content live-only suffix into the full durable backlog without false divergence', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000556'
     const liveSession = makeSession({
