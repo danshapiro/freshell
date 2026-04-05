@@ -88,7 +88,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
 
   it('serves recent-first timeline pages through the route family', async () => {
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
@@ -97,6 +97,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
     expect(getTimelinePage).toHaveBeenCalledWith({
       sessionId: 'agent-session-1',
       priority: 'visible',
+      revision: 7,
       cursor: undefined,
       limit: 20,
       signal: expect.any(AbortSignal),
@@ -105,13 +106,23 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
 
   it('passes includeBodies through the route family', async () => {
     await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&includeBodies=true')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&includeBodies=true&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(getTimelinePage).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'agent-session-1',
       includeBodies: true,
+      revision: 7,
     }))
+  })
+
+  it('rejects unpinned timeline reads that omit restore revision', async () => {
+    const res = await request(app)
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+    expect(getTimelinePage).not.toHaveBeenCalled()
   })
 
   it('hydrates turn bodies on demand', async () => {
@@ -144,7 +155,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
 
   it('fails cleanly on invalid timeline queries', async () => {
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=0')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=0&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(400)
@@ -192,7 +203,7 @@ describe('agent timeline router with the real service', () => {
 
     const app = createAuthedApp(service)
     const timelineResponse = await request(app)
-      .get('/api/agent-sessions/sdk-session-321/timeline?priority=visible&includeBodies=true')
+      .get('/api/agent-sessions/sdk-session-321/timeline?priority=visible&includeBodies=true&revision=123')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(timelineResponse.status).toBe(200)

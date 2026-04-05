@@ -136,12 +136,15 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
   return {
     async getTimelinePage(query) {
       throwIfAborted(query.signal)
+      if (query.revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const limit = Math.min(query.limit ?? DEFAULT_TIMELINE_LIMIT, MAX_TIMELINE_LIMIT)
       const cursor = query.cursor ? decodeCursor(query.cursor) : null
       const offset = cursor?.offset ?? 0
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
-      if (query.revision != null && query.revision !== timeline.revision) {
+      if (query.revision !== timeline.revision) {
         throw new RestoreStaleRevisionError(query.revision, timeline.revision)
       }
       if (cursor && cursor.revision !== timeline.revision) {

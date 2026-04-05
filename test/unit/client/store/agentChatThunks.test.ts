@@ -108,6 +108,13 @@ describe('agentChatThunks', () => {
     }))
 
     const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 2,
+    }))
     await store.dispatch(loadAgentTimelineWindow({
       sessionId: 'sess-1',
       timelineSessionId: 'cli-sess-1',
@@ -116,7 +123,7 @@ describe('agentChatThunks', () => {
 
     expect(getAgentTimelinePage).toHaveBeenCalledWith(
       'cli-sess-1',
-      expect.objectContaining({ priority: 'visible' }),
+      expect.objectContaining({ priority: 'visible', revision: 2 }),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     )
     expect(getAgentTurnBody).toHaveBeenCalledWith(
@@ -154,6 +161,13 @@ describe('agentChatThunks', () => {
     })
 
     const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 2,
+    }))
     await store.dispatch(loadAgentTimelineWindow({
       sessionId: 'sdk-sess-1',
       timelineSessionId: 'cli-sess-1',
@@ -162,7 +176,7 @@ describe('agentChatThunks', () => {
 
     expect(getAgentTimelinePage).toHaveBeenCalledWith(
       'cli-sess-1',
-      expect.objectContaining({ priority: 'visible', includeBodies: true }),
+      expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
       expect.anything(),
     )
     expect(getAgentTurnBody).not.toHaveBeenCalled()
@@ -183,6 +197,13 @@ describe('agentChatThunks', () => {
     })
 
     const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sdk-sess-1',
+      latestTurnId: 'turn-newest',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-1',
+      revision: 3,
+    }))
     store.dispatch(turnBodyReceived({
       sessionId: 'sdk-sess-1',
       turn: makeTimelineTurn('turn-newest', 'assistant', 'Newest full body', { sessionId: 'cli-sess-1' }),
@@ -197,7 +218,7 @@ describe('agentChatThunks', () => {
 
     expect(getAgentTimelinePage).toHaveBeenCalledWith(
       'cli-sess-1',
-      expect.objectContaining({ priority: 'visible', cursor: 'cursor-2' }),
+      expect.objectContaining({ priority: 'visible', cursor: 'cursor-2', revision: 3 }),
       expect.anything(),
     )
     expect(store.getState().agentChat.sessions['sdk-sess-1'].timelineBodies['turn-newest']).toEqual(expect.objectContaining({
@@ -218,6 +239,20 @@ describe('agentChatThunks', () => {
     })
 
     const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-2',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-2',
+      revision: 2,
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-3',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'cli-sess-3',
+      revision: 2,
+    }))
     const firstPromise = store.dispatch(loadAgentTimelineWindow({
       sessionId: 'sess-2',
       timelineSessionId: 'cli-sess-2',
@@ -232,7 +267,26 @@ describe('agentChatThunks', () => {
     await expect(firstPromise.unwrap()).rejects.toMatchObject({ name: 'AbortError' })
     secondPromise.abort()
     expect(capturedSignal?.aborted).toBe(true)
-    expect(store.getState().agentChat.sessions['sess-2']).toBeUndefined()
+    expect(store.getState().agentChat.sessions['sess-2']).toEqual(expect.objectContaining({
+      sessionId: 'sess-2',
+      timelineItems: [],
+      timelineRevision: 2,
+    }))
+  })
+
+  it('rejects timeline-page reads that omit the accepted restore revision', async () => {
+    const store = makeStore()
+
+    await expect(store.dispatch(loadAgentTimelineWindow({
+      sessionId: 'sdk-sess-missing-revision',
+      timelineSessionId: 'cli-sess-missing-revision',
+      requestKey: 'tab-1:pane-missing-revision',
+    })).unwrap()).rejects.toThrow('Restore revision required')
+
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+    expect(store.getState().agentChat.sessions['sdk-sess-missing-revision']).toEqual(expect.objectContaining({
+      timelineError: 'Restore revision required',
+    }))
   })
 
   it('hydrates an older turn body on demand', async () => {

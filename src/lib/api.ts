@@ -199,7 +199,7 @@ export async function getTerminalDirectoryPage(
 
 export async function getAgentTimelinePage(
   sessionId: string,
-  query: AgentTimelinePageQuery = {},
+  query: AgentTimelinePageQuery,
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const parsed = AgentTimelinePageQuerySchema.parse(query)

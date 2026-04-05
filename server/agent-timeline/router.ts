@@ -46,7 +46,7 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
     const query = AgentTimelinePageQuerySchema.safeParse({
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
-      revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
+      revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
       includeBodies: typeof req.query.includeBodies === 'string' ? req.query.includeBodies : undefined,
     })

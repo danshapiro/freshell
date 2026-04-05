@@ -114,13 +114,21 @@ export const loadAgentTimelineWindow = createAsyncThunk<
 
     dispatch(timelineLoadStarted({ sessionId }))
     const revision = getState().agentChat.sessions[sessionId]?.timelineRevision
+    if (revision == null) {
+      const error = new Error('Restore revision required')
+      dispatch(timelineLoadFailed({
+        sessionId,
+        message: error.message,
+      }))
+      throw error
+    }
 
     try {
       const page = await getAgentTimelinePage(
         timelineSessionId ?? sessionId,
         {
           priority: 'visible',
-          ...(revision != null ? { revision } : {}),
+          revision,
           ...(!cursor ? { includeBodies: true } : {}),
           ...(cursor ? { cursor } : {}),
         },

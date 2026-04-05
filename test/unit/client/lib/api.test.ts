@@ -107,12 +107,12 @@ describe('visible-first read-model helpers', () => {
       .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
       .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', body: [] }))
 
-    await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20 }, { signal })
+    await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20, revision: 7 }, { signal })
     await getAgentTurnBody('session-1', 'turn-1', { revision: 7, signal })
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/agent-sessions/session-1/timeline?cursor=page-2&limit=20',
+      '/api/agent-sessions/session-1/timeline?cursor=page-2&revision=7&limit=20',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -128,6 +128,15 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('rejects timeline requests that omit the pinned restore revision', async () => {
+    await expect(getAgentTimelinePage('session-1', { priority: 'visible' }, { signal: new AbortController().signal }))
+      .rejects
+      .toMatchObject({
+        name: 'ZodError',
+      })
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
   it('rejects turn-body requests that omit the pinned restore revision', async () => {
     await expect(getAgentTurnBody('session-1', 'turn-1', { signal: new AbortController().signal }))
       .rejects
@@ -141,10 +150,10 @@ describe('visible-first read-model helpers', () => {
     const signal = new AbortController().signal
     mockFetch.mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
 
-    await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true }, { signal })
+    await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true, revision: 11 }, { signal })
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/agent-sessions/session-1/timeline?priority=visible&includeBodies=true',
+      '/api/agent-sessions/session-1/timeline?priority=visible&revision=11&includeBodies=true',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),

@@ -343,6 +343,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       sessionId: 'sess-1',
       latestTurnId: 'turn-2',
       status: 'idle',
+      revision: 2,
     }))
     store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
 
@@ -386,7 +387,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-abc',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
@@ -689,6 +690,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       sessionId: 'sess-1',
       latestTurnId: 'turn-3',
       status: 'idle',
+      revision: 2,
     }))
     store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
 
@@ -708,7 +710,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-abc',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
@@ -723,7 +725,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       expect(getAgentTurnBody).toHaveBeenCalledWith(
         'cli-abc',
         'turn-2',
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
       )
     })
     expect(await screen.findByText('Expanded older turn body')).toBeInTheDocument()

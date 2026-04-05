@@ -61,7 +61,7 @@ describe('createReadModelRouteHarness', () => {
       query: 'alpha',
     })
 
-    const timeline = await harness.fetchJson('/api/agent-sessions/session-1/timeline?priority=background')
+    const timeline = await harness.fetchJson('/api/agent-sessions/session-1/timeline?priority=background&revision=11')
     expect(timeline.status).toBe(200)
     expect(timeline.body).toMatchObject({
       revision: 11,

@@ -76,7 +76,7 @@ export const TerminalDirectoryQuerySchema = z.object({
 export const AgentTimelinePageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
-  revision: z.number().int().nonnegative().optional(),
+  revision: z.coerce.number().int().nonnegative(),
   limit: z.number().int().positive().max(MAX_AGENT_TIMELINE_ITEMS).optional(),
   includeBodies: z.union([
     z.boolean(),

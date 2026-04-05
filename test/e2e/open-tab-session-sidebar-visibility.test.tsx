@@ -1069,6 +1069,9 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
 
     fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search plus' } })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350))
+    })
 
     await waitFor(() => {
       expect(searchSessions).toHaveBeenCalledTimes(2)

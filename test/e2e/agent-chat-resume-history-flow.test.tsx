@@ -183,6 +183,7 @@ describe('agent chat resume history flow', () => {
         latestTurnId: 'turn-2',
         status: 'idle',
         timelineSessionId: 'cli-session-1',
+        revision: 4,
       })
     })
 
@@ -191,7 +192,7 @@ describe('agent chat resume history flow', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-session-1',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 4 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })

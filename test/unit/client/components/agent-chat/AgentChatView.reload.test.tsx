@@ -469,6 +469,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
+      revision: 2,
     }))
 
     render(
@@ -480,14 +481,14 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'sess-reload-1',
-        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ priority: 'visible', revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
     expect(getAgentTurnBody).toHaveBeenCalledWith(
       'sess-reload-1',
       'turn-2',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
     )
     await act(async () => {
       resolveTurnBody?.({
@@ -676,6 +677,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
+      revision: 1,
     }))
 
     const { rerender } = render(
@@ -705,7 +707,7 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(getAgentTimelinePage).toHaveBeenCalledTimes(1)
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'sess-reload-1',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 1 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
@@ -726,6 +728,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
+      revision: 1,
     }))
 
     render(
@@ -741,7 +744,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         durableSessionId,
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 1 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
@@ -768,7 +771,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-sess-1',
-        expect.objectContaining({ includeBodies: true }),
+        expect.objectContaining({ includeBodies: true, revision: 2 }),
         expect.anything(),
       )
     })
@@ -782,6 +785,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-1',
       latestTurnId: 'turn-2',
       status: 'idle',
+      revision: 1,
     }))
 
     render(
@@ -793,7 +797,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'sdk-sess-1',
-        expect.objectContaining({ includeBodies: true }),
+        expect.objectContaining({ includeBodies: true, revision: 1 }),
         expect.anything(),
       )
     })
@@ -1040,7 +1044,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'named-resume',
-        expect.objectContaining({ includeBodies: true }),
+        expect.objectContaining({ includeBodies: true, revision: 1 }),
         expect.anything(),
       )
     })
@@ -1262,12 +1266,13 @@ describe('AgentChatView reload/restore behavior', () => {
       latestTurnId: null,
       status: 'starting',
       timelineSessionId: 'named-resume',
+      revision: 0,
     }))
     getAgentTimelinePage.mockResolvedValue({
       sessionId: '00000000-0000-4000-8000-000000000555',
       items: [],
       nextCursor: null,
-      revision: 1,
+      revision: 0,
     })
 
     render(
@@ -1304,7 +1309,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         '00000000-0000-4000-8000-000000000555',
-        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 0 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
