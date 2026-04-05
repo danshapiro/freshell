@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { PaneLayout } from './panes'
+import PaneLayout from './panes/PaneLayout'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'

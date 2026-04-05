@@ -13,8 +13,8 @@ const { mockPaneLayout } = vi.hoisted(() => ({
 }))
 
 // Mock PaneLayout to capture props
-vi.mock('@/components/panes', () => ({
-  PaneLayout: mockPaneLayout,
+vi.mock('@/components/panes/PaneLayout', () => ({
+  default: mockPaneLayout,
 }))
 
 // Mock SessionView
