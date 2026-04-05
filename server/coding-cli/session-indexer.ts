@@ -47,6 +47,19 @@ function maxDefined(a: number | undefined, b: number | undefined): number | unde
   return Math.max(a, b)
 }
 
+function normalizeTitle(title: string | undefined): string | undefined {
+  const trimmed = title?.trim()
+  return trimmed ? trimmed : undefined
+}
+
+function resolveSessionTitle(
+  parsedTitle: string | undefined,
+  previousTitle: string | undefined,
+  storedTitle: string | undefined,
+): string | undefined {
+  return normalizeTitle(parsedTitle) || normalizeTitle(previousTitle) || normalizeTitle(storedTitle)
+}
+
 // Byte pattern for a text user message (content is a string, not a tool_result array).
 const USER_TEXT_PATTERN = Buffer.from('"role":"user","content":"')
 
@@ -718,7 +731,12 @@ export class CodingCliSessionIndexer {
     }
   }
 
-  private async updateCacheEntry(provider: CodingCliProvider, filePath: string, cacheKey: string) {
+  private async updateCacheEntry(
+    provider: CodingCliProvider,
+    filePath: string,
+    cacheKey: string,
+    sessionMetadata: Record<string, SessionMetadataEntry>,
+  ) {
     let stat: Stats
     try {
       stat = await fsp.stat(filePath)
@@ -772,6 +790,10 @@ export class CodingCliSessionIndexer {
     const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
     const previous = cached?.lightweight ? undefined : cached?.baseSession
     const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
+    const metaKey = makeSessionKey(provider.name, sessionId)
+    const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
+    const parsedTitle = normalizeTitle(meta.title)
+    const resolvedTitle = resolveSessionTitle(parsedTitle, sameSession ? previous?.title : undefined, storedTitle)
     const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
     const createdAt = appendOnlyReparse
       ? minDefined(previous?.createdAt, meta.createdAt)
@@ -793,7 +815,7 @@ export class CodingCliSessionIndexer {
       lastActivityAt,
       createdAt,
       messageCount: meta.messageCount,
-      title: meta.title,
+      title: resolvedTitle,
       summary: meta.summary,
       ...(meta.firstUserMessage ? { firstUserMessage: meta.firstUserMessage } : {}),
       cwd: meta.cwd,
@@ -804,6 +826,10 @@ export class CodingCliSessionIndexer {
       isSubagent: meta.isSubagent || isSubagentSession(filePath) || undefined,
       isNonInteractive: meta.isNonInteractive || undefined,
       codexTaskEvents: meta.codexTaskEvents,
+    }
+
+    if (this.sessionMetadataStore && parsedTitle && parsedTitle !== storedTitle) {
+      await this.sessionMetadataStore.set(provider.name, sessionId, { derivedTitle: parsedTitle })
     }
 
     this.fileCache.set(cacheKey, {
@@ -1035,6 +1061,9 @@ export class CodingCliSessionIndexer {
       if (existing && existing.baseSession) continue
 
       const sessionId = meta.sessionId || provider.extractSessionId(meta.filePath)
+      const metaKey = makeSessionKey(provider.name, sessionId)
+      const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
+      const resolvedTitle = resolveSessionTitle(meta.title, existing?.baseSession?.title, storedTitle)
       const projectPath = meta.cwd ? await resolveGitRepoRoot(meta.cwd) : meta.cwd
       const baseSession: CodingCliSession = {
         provider: provider.name,
@@ -1042,7 +1071,7 @@ export class CodingCliSessionIndexer {
         projectPath,
         lastActivityAt: meta.lastActivityAt || meta.mtimeMs,
         createdAt: meta.createdAt,
-        title: meta.title,
+        title: resolvedTitle,
         cwd: meta.cwd,
         sourceFile: meta.filePath,
         isSubagent: isSubagentSession(meta.filePath) || undefined,
@@ -1081,6 +1110,7 @@ export class CodingCliSessionIndexer {
     filesByProvider: Map<CodingCliProvider, string[]>,
     enabledSet: Set<string>,
     seenCacheKeys: Set<string>,
+    sessionMetadata: Record<string, SessionMetadataEntry>,
   ): Promise<void> {
     // Collect all file-based entries for enrichment. Files the lightweight scan couldn't
     // parse (e.g. Codex with 14KB first lines) use file mtime as the recency estimate.
@@ -1128,7 +1158,7 @@ export class CodingCliSessionIndexer {
       if (INDEXER_DELAY_MS > 0) {
         await new Promise((r) => setTimeout(r, INDEXER_DELAY_MS))
       }
-      await this.updateCacheEntry(provider, filePath, cacheKey)
+      await this.updateCacheEntry(provider, filePath, cacheKey, sessionMetadata)
       enriched += 1
       if (enriched % REFRESH_YIELD_EVERY === 0) {
         await yieldToEventLoop()
@@ -1202,13 +1232,13 @@ export class CodingCliSessionIndexer {
         })
         fileCount += files.length
 
-        if (isColdStart) {
-          // Selective enrichment: only the most recent non-subagent sessions.
-          await this.enrichRecentSessions(
-            new Map([[provider, files]]), enabledSet, seenCacheKeys,
-          )
-          for (const f of files) seenCacheKeys.add(normalizeFilePath(f))
-        } else {
+      if (isColdStart) {
+        // Selective enrichment: only the most recent non-subagent sessions.
+        await this.enrichRecentSessions(
+          new Map([[provider, files]]), enabledSet, seenCacheKeys, sessionMetadata,
+        )
+        for (const f of files) seenCacheKeys.add(normalizeFilePath(f))
+      } else {
           // Warm rescan: process all files (cache hits skip unchanged files).
           for (const file of files) {
             processedEntries += 1
@@ -1217,7 +1247,7 @@ export class CodingCliSessionIndexer {
             }
             const cacheKey = normalizeFilePath(file)
             seenCacheKeys.add(cacheKey)
-            await this.updateCacheEntry(provider, file, cacheKey)
+            await this.updateCacheEntry(provider, file, cacheKey, sessionMetadata)
           }
         }
       }
@@ -1274,7 +1304,7 @@ export class CodingCliSessionIndexer {
           this.deleteCacheEntry(file)
           continue
         }
-        await this.updateCacheEntry(provider, file, file)
+        await this.updateCacheEntry(provider, file, file, sessionMetadata)
       }
     }
 

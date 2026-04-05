@@ -1786,7 +1786,9 @@ describe('CodingCliSessionIndexer', () => {
   })
 
   describe('sessionType merge from metadata store', () => {
-    function mockMetadataStore(entries: Record<string, { sessionType?: string }>): SessionMetadataStore {
+    function mockMetadataStore(
+      entries: Record<string, { sessionType?: string; derivedTitle?: string }>,
+    ): SessionMetadataStore {
       return {
         getAll: vi.fn().mockResolvedValue(entries),
         get: vi.fn(),
@@ -1836,6 +1838,104 @@ describe('CodingCliSessionIndexer', () => {
 
       const session = indexer.getProjects()[0]?.sessions[0]
       expect(session?.sessionType).toBeUndefined()
+    })
+
+    it('keeps an existing non-empty title when the same session reparses without one', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Original title' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Original title')
+    })
+
+    it('hydrates a cold-start lightweight row from metadata-store derivedTitle when parsing finds no title', async () => {
+      const files: string[] = []
+      const sessionId = 'older-codex-session'
+      const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      await fsp.utimes(fileA, new Date(2026, 0, 1), new Date(2026, 0, 1))
+      files.push(fileA)
+
+      for (let i = 0; i < 151; i += 1) {
+        const file = path.join(tempDir, `recent-${i}.jsonl`)
+        await fsp.writeFile(file, JSON.stringify({ cwd: `/project/${i}`, title: `Recent ${i}` }) + '\n')
+        files.push(file)
+      }
+
+      const provider = makeProvider(files, { name: 'codex' })
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('codex', sessionId)]: { derivedTitle: 'Sticky old title' },
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {},
+        settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+      await indexer.refresh()
+
+      const olderSession = indexer.getProjects()
+        .flatMap((group) => group.sessions)
+        .find((session) => session.sessionId === sessionId)
+
+      expect(olderSession?.title).toBe('Sticky old title')
+    })
+
+    it('persists a newly parsed non-empty title to the metadata store', async () => {
+      const fileA = path.join(tempDir, 'session-b.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Fresh title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({})
+      metadataStore.set = vi.fn().mockResolvedValue(undefined)
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+
+      expect(metadataStore.set).toHaveBeenCalledWith('claude', 'session-b', {
+        derivedTitle: 'Fresh title',
+      })
+    })
+
+    it('does not rewrite derivedTitle when the parsed title matches the stored title', async () => {
+      const fileA = path.join(tempDir, 'session-c.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Stable title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', 'session-c')]: { derivedTitle: 'Stable title' },
+      })
+      metadataStore.set = vi.fn().mockResolvedValue(undefined)
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+
+      expect(metadataStore.set).not.toHaveBeenCalled()
+    })
+
+    it('resolves title precedence as parsed title, then previous cached title, then stored derivedTitle', async () => {
+      const fileA = path.join(tempDir, 'session-d.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Parsed title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', 'session-d')]: { derivedTitle: 'Stored title' },
+      })
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Parsed title')
+
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Parsed title')
     })
   })
 
