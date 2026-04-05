@@ -66,13 +66,19 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
         role,
         content: [{ type: 'text', text: msg }],
         ...(timestamp ? { timestamp } : {}),
+        ...(pickOptionalString(obj.model) ? { model: pickOptionalString(obj.model) } : {}),
         ...(pickOptionalString(obj.parentId, obj.parent_id) ? { parentId: pickOptionalString(obj.parentId, obj.parent_id) } : {}),
         ...(pickOptionalString(obj.referenceId, obj.reference_id) ? { referenceId: pickOptionalString(obj.referenceId, obj.reference_id) } : {}),
+        ...(pickOptionalString(obj.id, obj.messageId, obj.message_id) ? {
+          messageId: pickOptionalString(obj.id, obj.messageId, obj.message_id),
+        } : {}),
       }
-      const fingerprint = createDurableMessageFingerprint(nextMessage)
-      const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
-      fingerprintOccurrences.set(fingerprint, occurrence + 1)
-      nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      if (!nextMessage.messageId) {
+        const fingerprint = createDurableMessageFingerprint(nextMessage)
+        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+        fingerprintOccurrences.set(fingerprint, occurrence + 1)
+        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      }
       messages.push(nextMessage)
     } else if (msg && typeof msg === 'object' && Array.isArray(msg.content)) {
       // Structured format: message is a ClaudeMessage object

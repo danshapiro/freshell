@@ -49,6 +49,40 @@ describe('extractChatMessagesFromJsonl', () => {
     })
   })
 
+  it('preserves authoritative top-level ids and model fields for legacy string-form records', () => {
+    const content = [
+      '{"type":"assistant","id":"upstream-top","model":"claude-opus-test","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hello' }],
+      timestamp: '2026-01-01T00:00:00Z',
+      model: 'claude-opus-test',
+      messageId: 'upstream-top',
+    })
+  })
+
+  it('includes top-level legacy model in synthesized deterministic ids', () => {
+    const modelA = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-a","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+    const modelB = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-b","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+
+    expect(modelA).toHaveLength(1)
+    expect(modelB).toHaveLength(1)
+    expect(modelA[0]?.model).toBe('model-a')
+    expect(modelB[0]?.model).toBe('model-b')
+    expect(modelA[0]?.messageId).toBeDefined()
+    expect(modelB[0]?.messageId).toBeDefined()
+    expect(modelA[0]?.messageId).not.toBe(modelB[0]?.messageId)
+  })
+
   it('preserves tool_use and tool_result content blocks', () => {
     const content = [
       '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
