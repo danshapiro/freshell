@@ -702,6 +702,58 @@ describe('restore ledger manager', () => {
     ])
   })
 
+  it('upgrades a repeated-content live-only suffix into the full durable backlog without false divergence', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000556'
+    const liveSession = makeSession({
+      sessionId: 'sdk-repeat-upgrade',
+      resumeSessionId: 'named-repeat-upgrade',
+      messages: [
+        makeMessage('user', 'hello'),
+      ],
+    })
+    const loadSessionHistory = vi.fn(async (sessionId: string) => {
+      if (sessionId === canonicalSessionId) {
+        return [
+          makeMessage('user', 'hello'),
+          makeMessage('user', 'hello'),
+        ]
+      }
+      return null
+    })
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
+      getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.cliSessionId ? liveSession : undefined),
+    })
+
+    const liveOnly = await manager.resolve('sdk-repeat-upgrade')
+    expect(liveOnly).toMatchObject({
+      kind: 'resolved',
+      readiness: 'live_only',
+      liveSessionId: 'sdk-repeat-upgrade',
+      timelineSessionId: 'named-repeat-upgrade',
+    })
+
+    liveSession.cliSessionId = canonicalSessionId
+
+    const upgraded = await manager.resolve('named-repeat-upgrade')
+
+    expect(upgraded).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-repeat-upgrade',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (upgraded.kind !== 'resolved') throw new Error('expected resolved')
+    expect(upgraded.turns).toHaveLength(2)
+    expect(upgraded.turns.map((turn) => turn.source)).toEqual(['durable', 'durable'])
+    expect(upgraded.turns.map((turn) => turn.message.content[0])).toEqual([
+      { type: 'text', text: 'hello' },
+      { type: 'text', text: 'hello' },
+    ])
+  })
+
   it('drops live authority for durable aliases after unrecoverable teardown', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000123'
     const liveSession = makeSession({

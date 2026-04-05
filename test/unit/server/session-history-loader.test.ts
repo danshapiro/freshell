@@ -132,6 +132,21 @@ describe('extractChatMessagesFromJsonl', () => {
     expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
   })
 
+  it('treats block-end newlines as trailing whitespace when synthesizing deterministic message ids', () => {
+    const original = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+    const rewritten = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello\\n"}]},"timestamp":"2026-01-02T00:00:01Z"}',
+    ].join('\n')
+
+    const originalMessages = extractChatMessagesFromJsonl(original)
+    const rewrittenMessages = extractChatMessagesFromJsonl(rewritten)
+
+    expect(originalMessages[0].messageId).toBeDefined()
+    expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
+  })
+
   it('preserves parent/reference ancestry and distinguishes synthesized ids across different durable chains', () => {
     const content = [
       '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-a","referenceId":"ref-a"},"timestamp":"2026-01-01T00:00:01Z"}',

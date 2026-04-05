@@ -38,7 +38,7 @@ export type RestoreLedgerManagerDeps = {
 }
 
 type InternalTurn = CanonicalTurn & {
-  compatibilityKey: string
+  fingerprint: string
   syntheticMessageId: boolean
 }
 
@@ -77,7 +77,7 @@ function normalizeText(value: string): string {
   return value
     .normalize('NFC')
     .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+$/g, '')
+    .trimEnd()
 }
 
 function normalizeStructuredContent(value: unknown): unknown {
@@ -177,7 +177,7 @@ function buildCanonicalTurns(
       messageId,
       ordinal: 0,
       source,
-      compatibilityKey: `${fingerprint}:${occurrenceIndex}`,
+      fingerprint,
       syntheticMessageId: message.messageId == null,
       message: {
         ...message,
@@ -236,102 +236,74 @@ function mergeTurns(
   durableTurns: InternalTurn[],
   liveTurns: InternalTurn[],
   compatibilityCandidateIds?: ReadonlySet<string>,
-): { kind: 'ok'; turns: CanonicalTurn[] } | { kind: 'diverged' } {
-  if (durableTurns.length === 0) return { kind: 'ok', turns: normalizeOrdinals(liveTurns) }
-  if (liveTurns.length === 0) return { kind: 'ok', turns: normalizeOrdinals(durableTurns) }
-
-  const durableById = new Map<string, number>()
-  const durableByCompatibilityKey = new Map<string, number>()
-  for (const [index, turn] of durableTurns.entries()) {
-    durableById.set(turn.messageId, index)
-    durableByCompatibilityKey.set(turn.compatibilityKey, index)
+): { kind: 'ok'; turns: CanonicalTurn[]; unmatchedLiveMessageIds: string[] } | { kind: 'diverged' } {
+  if (durableTurns.length === 0) {
+    return {
+      kind: 'ok',
+      turns: normalizeOrdinals(liveTurns),
+      unmatchedLiveMessageIds: liveTurns.map((turn) => turn.messageId),
+    }
+  }
+  if (liveTurns.length === 0) {
+    return {
+      kind: 'ok',
+      turns: normalizeOrdinals(durableTurns),
+      unmatchedLiveMessageIds: [],
+    }
   }
 
-  const matchedDurableIndices: number[] = []
-  const matchedLiveIndices: number[] = []
-  const unmatchedLiveIndices: number[] = []
-  const unmatchedLiveTurns: InternalTurn[] = []
-  const potentialCompatibilityMatches: Array<{ liveIndex: number; durableIndex: number; turn: InternalTurn }> = []
-
-  for (const [index, liveTurn] of liveTurns.entries()) {
-    const exactMatch = durableById.get(liveTurn.messageId)
-    if (exactMatch != null) {
-      matchedDurableIndices.push(exactMatch)
-      matchedLiveIndices.push(index)
-      continue
-    }
-
-    const compatibilityMatch = durableByCompatibilityKey.get(liveTurn.compatibilityKey)
-    if (compatibilityMatch != null) {
-      if (compatibilityCandidateIds?.has(liveTurn.messageId)) {
-        matchedDurableIndices.push(compatibilityMatch)
-        matchedLiveIndices.push(index)
-        continue
-      }
-      potentialCompatibilityMatches.push({
-        liveIndex: index,
-        durableIndex: compatibilityMatch,
-        turn: liveTurn,
-      })
-      continue
-    }
-
-    unmatchedLiveIndices.push(index)
-    unmatchedLiveTurns.push(liveTurn)
-  }
-
-  const canPromoteImplicitCompatibility = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
+  const durableIds = new Set(durableTurns.map((turn) => turn.messageId))
+  const durableFingerprints = new Set(durableTurns.map((turn) => turn.fingerprint))
+  const implicitCompatibilityCandidates = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
+    ? liveTurns.filter((turn) => !durableIds.has(turn.messageId) && durableFingerprints.has(turn.fingerprint))
+    : []
+  const allowImplicitCompatibility = (!compatibilityCandidateIds || compatibilityCandidateIds.size === 0)
     && (
-      potentialCompatibilityMatches.length > 1
+      implicitCompatibilityCandidates.length > 1
       || (
-        potentialCompatibilityMatches.length === 1
-        && potentialCompatibilityMatches[0]?.turn.syntheticMessageId === true
+        implicitCompatibilityCandidates.length === 1
+        && implicitCompatibilityCandidates[0]?.syntheticMessageId === true
       )
     )
-  if (canPromoteImplicitCompatibility) {
-    for (const match of potentialCompatibilityMatches) {
-      matchedDurableIndices.push(match.durableIndex)
-      matchedLiveIndices.push(match.liveIndex)
+
+  function turnsMatch(durableTurn: InternalTurn, liveTurn: InternalTurn): boolean {
+    if (durableTurn.messageId === liveTurn.messageId) return true
+    const allowCompatibility = compatibilityCandidateIds?.size
+      ? compatibilityCandidateIds.has(liveTurn.messageId)
+      : allowImplicitCompatibility
+    return allowCompatibility && durableTurn.fingerprint === liveTurn.fingerprint
+  }
+
+  const maxOverlap = Math.min(durableTurns.length, liveTurns.length)
+  let overlapCount = 0
+  for (let candidateOverlap = maxOverlap; candidateOverlap >= 1; candidateOverlap -= 1) {
+    let matches = true
+    for (let index = 0; index < candidateOverlap; index += 1) {
+      const durableTurn = durableTurns[durableTurns.length - candidateOverlap + index]
+      const liveTurn = liveTurns[index]
+      if (!durableTurn || !liveTurn || !turnsMatch(durableTurn, liveTurn)) {
+        matches = false
+        break
+      }
     }
-  } else {
-    for (const match of potentialCompatibilityMatches) {
-      unmatchedLiveIndices.push(match.liveIndex)
-      unmatchedLiveTurns.push(match.turn)
+    if (matches) {
+      overlapCount = candidateOverlap
+      break
     }
   }
 
-  if (matchedDurableIndices.length > 0) {
-    const orderedDurableMatches = [...matchedDurableIndices].sort((left, right) => left - right)
-    const expectedDurableStart = durableTurns.length - orderedDurableMatches.length
-    const matchesDurableSuffix = orderedDurableMatches.every((value, index) => value === expectedDurableStart + index)
-    const lastMatchedLiveIndex = Math.max(...matchedLiveIndices)
-    const hasInterleavedLiveDelta = unmatchedLiveIndices.some((index) => index < lastMatchedLiveIndex)
-    if (!matchesDurableSuffix || hasInterleavedLiveDelta) {
-      return { kind: 'diverged' }
-    }
+  const unmatchedDurablePrefix = durableTurns.slice(0, durableTurns.length - overlapCount)
+  const unmatchedLiveTurns = liveTurns.slice(overlapCount)
+  const hasInterleavedOverlap = unmatchedLiveTurns.some((liveTurn) => (
+    unmatchedDurablePrefix.some((durableTurn) => turnsMatch(durableTurn, liveTurn))
+  ))
+  if (hasInterleavedOverlap) return { kind: 'diverged' }
+
+  return {
+    kind: 'ok',
+    turns: normalizeOrdinals([...durableTurns, ...unmatchedLiveTurns]),
+    unmatchedLiveMessageIds: unmatchedLiveTurns.map((turn) => turn.messageId),
   }
-
-  return { kind: 'ok', turns: normalizeOrdinals([...durableTurns, ...unmatchedLiveTurns]) }
-}
-
-function deriveCompatibilityCandidateIds(liveTurns: InternalTurn[]): Set<string> {
-  return new Set(
-    liveTurns
-      .map((turn) => turn.messageId),
-  )
-}
-
-function refreshTrackedCompatibilityCandidateIds(
-  durableTurns: InternalTurn[],
-  liveTurns: InternalTurn[],
-  previousCandidateIds: ReadonlySet<string>,
-): Set<string> {
-  const durableCompatibilityKeys = new Set(durableTurns.map((turn) => turn.compatibilityKey))
-  return new Set(
-    liveTurns
-      .filter((turn) => previousCandidateIds.has(turn.messageId) || !durableCompatibilityKeys.has(turn.compatibilityKey))
-      .map((turn) => turn.messageId),
-  )
 }
 
 function isCanonicalDurableSessionId(sessionId: string | undefined): sessionId is string {
@@ -515,8 +487,8 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     )
     ledger.compatibilityCandidateIds = shouldTrackCompatibilityCandidates
       ? resolved.readiness === 'live_only'
-        ? deriveCompatibilityCandidateIds(liveTurns)
-        : refreshTrackedCompatibilityCandidateIds(durableTurns, liveTurns, ledger.compatibilityCandidateIds)
+        ? new Set(liveTurns.map((turn) => turn.messageId))
+        : new Set(mergedTurns.unmatchedLiveMessageIds)
       : new Set<string>()
   }
 
