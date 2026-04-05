@@ -21,6 +21,8 @@ import type { AgentHistorySource } from './agent-timeline/history-source.js'
 import type {
   SdkSessionState,
   SdkCreatedSession,
+  SdkReplayDrain,
+  SdkReplayState,
   ContentBlock,
   SdkServerMessage,
   QuestionDefinition,
@@ -88,6 +90,15 @@ export class SdkBridge extends EventEmitter {
         sessionId: state.sessionId,
       }, 'Failed to sync restore ledger from SDK state')
     })
+  }
+
+  private readReplayState(sessionId: string): { sp: SessionProcess; currentState: SdkSessionState } | null {
+    const sp = this.processes.get(sessionId)
+    const currentState = this.sessions.get(sessionId)
+    if (!sp || !currentState) {
+      return null
+    }
+    return { sp, currentState }
   }
 
   async createSession(options: {
@@ -200,9 +211,9 @@ export class SdkBridge extends EventEmitter {
     return Object.assign(state, {
       replayGate: {
         drain: () => {
-          const sp = this.processes.get(sessionId)
-          const currentState = this.sessions.get(sessionId)
-          if (!sp || !currentState) return null
+          const replayState = this.readReplayState(sessionId)
+          if (!replayState) return null
+          const { sp, currentState } = replayState
           const bufferedMessages = sp.messageBuffer.splice(0, sp.messageBuffer.length)
           return {
             watermark: sp.nextSequence - 1,
@@ -212,6 +223,28 @@ export class SdkBridge extends EventEmitter {
         },
       },
     })
+  }
+
+  captureReplayState(sessionId: string): SdkReplayState | null {
+    const replayState = this.readReplayState(sessionId)
+    if (!replayState) return null
+    const { sp, currentState } = replayState
+    return {
+      watermark: sp.nextSequence - 1,
+      session: this.cloneSessionState(currentState),
+    }
+  }
+
+  drainReplayBuffer(sessionId: string): SdkReplayDrain | null {
+    const replayState = this.readReplayState(sessionId)
+    if (!replayState) return null
+    const { sp, currentState } = replayState
+    const bufferedMessages = sp.messageBuffer.splice(0, sp.messageBuffer.length)
+    return {
+      watermark: sp.nextSequence - 1,
+      session: this.cloneSessionState(currentState),
+      bufferedMessages,
+    }
   }
 
   // Creates an async iterable that yields user messages written via sendUserMessage

@@ -318,9 +318,10 @@ describe('WS Handler SDK Integration', () => {
       mockSdkBridge = {
         createSession: vi.fn().mockReturnValue(makeCreatedSession()),
         subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
-        captureReplayState: vi.fn().mockImplementation((sessionId: string) => ({
-          watermark: 0,
-          session: {
+        captureReplayState: vi.fn().mockImplementation((sessionId: string) => {
+          const currentState = mockSdkBridge.getLiveSession(sessionId)
+            ?? mockSdkBridge.getSession(sessionId)
+            ?? {
             sessionId,
             status: 'starting',
             messages: [],
@@ -328,8 +329,38 @@ describe('WS Handler SDK Integration', () => {
             streamingText: '',
             pendingPermissions: new Map(),
             pendingQuestions: new Map(),
-          },
-        })),
+          }
+          return {
+            watermark: 0,
+            session: {
+              ...currentState,
+              pendingPermissions: currentState.pendingPermissions ?? new Map(),
+              pendingQuestions: currentState.pendingQuestions ?? new Map(),
+            },
+          }
+        }),
+        drainReplayBuffer: vi.fn().mockImplementation((sessionId: string) => {
+          const currentState = mockSdkBridge.getLiveSession(sessionId)
+            ?? mockSdkBridge.getSession(sessionId)
+            ?? {
+            sessionId,
+            status: 'starting',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          }
+          return {
+            watermark: 0,
+            session: {
+              ...currentState,
+              pendingPermissions: currentState.pendingPermissions ?? new Map(),
+              pendingQuestions: currentState.pendingQuestions ?? new Map(),
+            },
+            bufferedMessages: [],
+          }
+        }),
         sendUserMessage: vi.fn().mockReturnValue(true),
         respondPermission: vi.fn().mockReturnValue(true),
         interrupt: vi.fn().mockReturnValue(true),
@@ -678,7 +709,11 @@ describe('WS Handler SDK Integration', () => {
             }),
           }),
         )
-        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
+        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+          'sdk-sess-1',
+          expect.any(Function),
+          { skipReplayBuffer: true },
+        )
       } finally {
         ws.close()
       }
@@ -799,27 +834,63 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('sends sdk.attach snapshot before replaying buffered SDK messages', async () => {
-      mockSdkBridge.getSession.mockReturnValue({
+    it('does not replay buffered live output already represented in sdk.attach snapshot', async () => {
+      const liveSession = {
         sessionId: 'sdk-sess-1',
         resumeSessionId: 'cli-sess-1',
         status: 'running',
         messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
         streamingActive: true,
         streamingText: 'partial reply',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/project',
+        tools: [],
         pendingPermissions: new Map(),
         pendingQuestions: new Map(),
-      })
-      mockSdkBridge.subscribe.mockImplementation((sessionId: string, listener: (msg: any) => void) => {
-        listener({
-          type: 'sdk.session.init',
-          sessionId,
+      }
+      mockSdkBridge.getSession.mockReturnValue(liveSession)
+      mockSdkBridge.captureReplayState.mockReturnValue({
+        watermark: 7,
+        session: {
+          ...liveSession,
           cliSessionId: 'cli-sess-1',
-          model: 'claude-sonnet-4-5-20250929',
-          cwd: '/tmp/project',
-          tools: [],
-        })
-        return { off: () => {}, replayed: true }
+        },
+      })
+      mockSdkBridge.drainReplayBuffer.mockReturnValue({
+        watermark: 7,
+        session: {
+          ...liveSession,
+          cliSessionId: 'cli-sess-1',
+        },
+        bufferedMessages: [{
+          sequence: 7,
+          message: {
+            type: 'sdk.stream',
+            sessionId: 'sdk-sess-1',
+            event: {
+              type: 'content_block_delta',
+              delta: { type: 'text_delta', text: 'partial reply' },
+            },
+          },
+        }],
+      })
+      mockSdkBridge.subscribe.mockImplementation((sessionId: string, listener: (msg: any) => void, options?: { skipReplayBuffer?: boolean }) => {
+        if (!options?.skipReplayBuffer) {
+          listener({
+            type: 'sdk.stream',
+            sessionId,
+            event: {
+              type: 'content_block_delta',
+              delta: { type: 'text_delta', text: 'partial reply' },
+            },
+          })
+          listener({
+            type: 'sdk.assistant',
+            sessionId,
+            content: [{ type: 'text', text: 'partial reply' }],
+          })
+        }
+        return { off: () => {}, replayed: !options?.skipReplayBuffer }
       })
       mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
         queryId: 'sdk-sess-1',
@@ -836,26 +907,16 @@ describe('WS Handler SDK Integration', () => {
       const ws = await connectAndAuth()
       try {
         const messages: any[] = []
-        const collectDone = new Promise<void>((resolve) => {
-          const onMessage = (data: WebSocket.RawData) => {
-            const parsed = JSON.parse(data.toString())
-            if (
-              parsed.type === 'sdk.session.snapshot'
-              || parsed.type === 'sdk.status'
-              || parsed.type === 'sdk.session.init'
-            ) {
-              messages.push(parsed)
-            }
-            if (
-              messages.some((m) => m.type === 'sdk.session.snapshot')
-              && messages.some((m) => m.type === 'sdk.session.init')
-              && messages.some((m) => m.type === 'sdk.status')
-            ) {
-              ws.off('message', onMessage)
-              resolve()
-            }
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.status'
+            || parsed.type === 'sdk.stream'
+            || parsed.type === 'sdk.assistant'
+          ) {
+            messages.push(parsed)
           }
-          ws.on('message', onMessage)
         })
 
         ws.send(JSON.stringify({
@@ -863,10 +924,26 @@ describe('WS Handler SDK Integration', () => {
           sessionId: 'sdk-sess-1',
         }))
 
-        await collectDone
+        await vi.waitFor(() => expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toMatchObject({
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-sess-1',
+          streamingActive: true,
+          streamingText: 'partial reply',
+        }), { timeout: 3000 })
+        await vi.waitFor(() => expect(messages.find((message) => message.type === 'sdk.status')).toMatchObject({
+          type: 'sdk.status',
+          sessionId: 'sdk-sess-1',
+          status: 'running',
+        }), { timeout: 3000 })
+        await new Promise((resolve) => setTimeout(resolve, 20))
 
-        const orderedTypes = messages.map((message) => message.type)
-        expect(orderedTypes.indexOf('sdk.session.snapshot')).toBeLessThan(orderedTypes.indexOf('sdk.session.init'))
+        expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+          'sdk-sess-1',
+          expect.any(Function),
+          { skipReplayBuffer: true },
+        )
+        expect(messages.filter((message) => message.type === 'sdk.stream')).toEqual([])
+        expect(messages.filter((message) => message.type === 'sdk.assistant')).toEqual([])
       } finally {
         ws.close()
       }
@@ -1142,7 +1219,11 @@ describe('WS Handler SDK Integration', () => {
           status: 'running',
         })
         await vi.waitFor(() => {
-          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(liveSession.sessionId, expect.any(Function))
+          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+            liveSession.sessionId,
+            expect.any(Function),
+            { skipReplayBuffer: true },
+          )
         })
 
         const forwardedUpdate = new Promise<any>((resolve) => {
@@ -1198,7 +1279,9 @@ describe('WS Handler SDK Integration', () => {
       }
       let subscriptionListener: ((msg: any) => void) | undefined
 
-      mockSdkBridge.getLiveSession.mockReturnValue(undefined)
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
       mockSdkBridge.findLiveSessionByCliSessionId.mockImplementation((sessionId: string) => (
         sessionId === durableSessionId ? liveSession : undefined
       ))
@@ -1257,7 +1340,11 @@ describe('WS Handler SDK Integration', () => {
         }))
         await vi.waitFor(() => {
           expect(mockSdkBridge.findLiveSessionByCliSessionId).toHaveBeenCalledWith(durableSessionId)
-          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(liveSession.sessionId, expect.any(Function))
+          expect(mockSdkBridge.subscribe).toHaveBeenCalledWith(
+            liveSession.sessionId,
+            expect.any(Function),
+            { skipReplayBuffer: true },
+          )
         })
 
         const forwardedUpdate = new Promise<any>((resolve) => {
@@ -1733,6 +1820,102 @@ describe('WS Handler SDK Integration', () => {
         })
         expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-gate-missing')
         expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-gate-missing', { recoverable: false })
+
+        const unauthorized = await sendAndWaitForResponse(ws, {
+          type: 'sdk.send',
+          sessionId: 'sdk-sess-gate-missing',
+          text: 'should stay unauthorized after failed create',
+        }, 'error')
+
+        expect(unauthorized).toMatchObject({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+          message: 'Not subscribed to this SDK session',
+        })
+        expect(mockSdkBridge.sendUserMessage).not.toHaveBeenCalled()
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('does not expose sdk.created or subscribed session state when the late create replay drain fails during cutover', async () => {
+      mockSdkBridge.sendUserMessage.mockReturnValue(false)
+      mockSdkBridge.createSession.mockResolvedValue(makeCreatedSession({
+        sessionId: 'sdk-sess-late-drain',
+        status: 'connected',
+        cliSessionId: 'cli-late-drain',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        replayGate: {
+          drain: vi.fn()
+            .mockReturnValueOnce({
+              watermark: 1,
+              session: {
+                sessionId: 'sdk-sess-late-drain',
+                status: 'connected',
+                cliSessionId: 'cli-late-drain',
+                model: 'claude-sonnet-4-5-20250929',
+                cwd: '/tmp',
+                messages: [],
+                streamingActive: false,
+                streamingText: '',
+                pendingPermissions: new Map(),
+                pendingQuestions: new Map(),
+              },
+              bufferedMessages: [],
+            })
+            .mockReturnValueOnce(null),
+        },
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (
+            parsed.type === 'sdk.created'
+            || parsed.type === 'sdk.session.snapshot'
+            || parsed.type === 'sdk.session.init'
+            || parsed.type === 'sdk.create.failed'
+          ) {
+            messages.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-late-drain',
+          cwd: '/tmp',
+        }))
+
+        await vi.waitFor(() => expect(messages.some((message) => message.type === 'sdk.create.failed')).toBe(true), { timeout: 3000 })
+
+        expect(messages.some((message) => message.type === 'sdk.created')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.snapshot')).toBe(false)
+        expect(messages.some((message) => message.type === 'sdk.session.init')).toBe(false)
+        expect(messages.find((message) => message.type === 'sdk.create.failed')).toEqual({
+          type: 'sdk.create.failed',
+          requestId: 'req-late-drain',
+          code: 'RESTORE_INTERNAL',
+          message: 'SDK create replay drain unavailable',
+          retryable: true,
+        })
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith('sdk-sess-late-drain')
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith('sdk-sess-late-drain', { recoverable: false })
+
+        const unauthorized = await sendAndWaitForResponse(ws, {
+          type: 'sdk.send',
+          sessionId: 'sdk-sess-late-drain',
+          text: 'should stay unauthorized after failed cutover',
+        }, 'error')
+
+        expect(unauthorized).toMatchObject({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+          message: 'Not subscribed to this SDK session',
+        })
+        expect(mockSdkBridge.sendUserMessage).not.toHaveBeenCalled()
       } finally {
         ws.close()
       }

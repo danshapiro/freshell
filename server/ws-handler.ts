@@ -1142,24 +1142,27 @@ export class WsHandler {
     } satisfies SdkServerMessage
   }
 
-  private subscribeClientToSdkSession(
-    ws: LiveWebSocket,
+  private registerClientSdkSession(
     state: ClientState,
     clientSessionId: string,
     targetSessionId: string,
-  ): boolean {
+    off?: () => void,
+  ): void {
+    state.sdkSessions.add(clientSessionId)
     state.sdkSessionTargets.set(clientSessionId, targetSessionId)
-    if (state.sdkSubscriptions.has(clientSessionId) || !this.sdkBridge) {
-      return false
+    if (off) {
+      state.sdkSubscriptions.set(clientSessionId, off)
     }
+  }
 
-    const sub = this.sdkBridge.subscribe(targetSessionId, (msg: SdkServerMessage) => {
-      this.safeSend(ws, this.rewriteSdkMessageSessionId(msg, clientSessionId))
-    })
-    if (!sub) return false
-
-    state.sdkSubscriptions.set(clientSessionId, sub.off)
-    return sub.replayed
+  private clearClientSdkSession(state: ClientState, clientSessionId: string): void {
+    state.sdkSessions.delete(clientSessionId)
+    state.sdkSessionTargets.delete(clientSessionId)
+    const off = state.sdkSubscriptions.get(clientSessionId)
+    if (off) {
+      off()
+      state.sdkSubscriptions.delete(clientSessionId)
+    }
   }
 
   /**
@@ -1951,6 +1954,12 @@ export class WsHandler {
         }
         let session: SdkCreatedSession | undefined
         let releaseCreateSubscription: (() => void) | undefined
+        const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
+        let createReadyForLiveForward = false
+        const deliveredInteractiveRequests = {
+          permissionRequestIds: new Set<string>(),
+          questionRequestIds: new Set<string>(),
+        }
         try {
           session = await this.sdkBridge.createSession({
             cwd: m.cwd,
@@ -1962,6 +1971,31 @@ export class WsHandler {
           })
           const replayState = session.replayGate.drain()
           if (!replayState) {
+            throw new Error('SDK create replay drain unavailable')
+          }
+
+          const createSubscription = this.sdkBridge.subscribe(
+            session.sessionId,
+            (message: SdkServerMessage, meta?: { sequence: number }) => {
+              if (!createReadyForLiveForward) {
+                queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
+                return
+              }
+              const transformed = this.transactionalCreateMessage(message, session!.sessionId)
+              if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
+                return
+              }
+              this.safeSend(ws, transformed)
+            },
+            { skipReplayBuffer: true },
+          )
+          if (!createSubscription) {
+            throw new Error('SDK session subscription failed during create')
+          }
+          releaseCreateSubscription = createSubscription.off
+
+          const replayedDuringSnapshot = session.replayGate.drain()
+          if (!replayedDuringSnapshot) {
             throw new Error('SDK create replay drain unavailable')
           }
 
@@ -1990,6 +2024,9 @@ export class WsHandler {
             })
             return
           }
+
+          this.registerClientSdkSession(state, session.sessionId, session.sessionId, createSubscription.off)
+          releaseCreateSubscription = undefined
 
           // Send sdk.created only after coherent restore state exists.
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
@@ -2025,35 +2062,6 @@ export class WsHandler {
             deliveredInteractiveRequests,
           )
 
-          const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
-          let createReadyForLiveForward = false
-          const createSubscription = this.sdkBridge.subscribe(
-            session.sessionId,
-            (message: SdkServerMessage, meta?: { sequence: number }) => {
-              if (!createReadyForLiveForward) {
-                queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
-                return
-              }
-              const transformed = this.transactionalCreateMessage(message, session!.sessionId)
-              if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
-                return
-              }
-              this.safeSend(ws, transformed)
-            },
-            { skipReplayBuffer: true },
-          )
-          if (!createSubscription) {
-            throw new Error('SDK session subscription failed during create')
-          }
-          releaseCreateSubscription = createSubscription.off
-
-          state.sdkSessions.add(session.sessionId)
-          state.sdkSessionTargets.set(session.sessionId, session.sessionId)
-          state.sdkSubscriptions.set(session.sessionId, createSubscription.off)
-          const replayedDuringSnapshot = session.replayGate.drain()
-          if (!replayedDuringSnapshot) {
-            throw new Error('SDK create replay drain unavailable')
-          }
           const delayedMetadata = [
             ...this.flushTransactionalCreateReplay(
               ws,
@@ -2097,6 +2105,7 @@ export class WsHandler {
             releaseCreateSubscription = undefined
           }
           if (session?.sessionId) {
+            this.clearClientSdkSession(state, session.sessionId)
             this.sdkBridge.killSession(session.sessionId)
             this.teardownSdkRestoreState(session.sessionId, false)
           }
@@ -2188,13 +2197,7 @@ export class WsHandler {
         }
         const killed = this.sdkBridge.killSession(this.resolveSdkSessionTarget(state, m.sessionId))
         this.teardownSdkRestoreState(m.sessionId, false)
-        state.sdkSessions.delete(m.sessionId)
-        state.sdkSessionTargets.delete(m.sessionId)
-        const off = state.sdkSubscriptions.get(m.sessionId)
-        if (off) {
-          off()
-          state.sdkSubscriptions.delete(m.sessionId)
-        }
+        this.clearClientSdkSession(state, m.sessionId)
         this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
         return
       }
@@ -2295,15 +2298,57 @@ export class WsHandler {
           return
         }
 
+        const deliveredInteractiveRequests = {
+          permissionRequestIds: new Set<string>(),
+          questionRequestIds: new Set<string>(),
+        }
+        const queuedAttachMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
+        let attachReadyForLiveForward = false
+        let attachSubscriptionOff: (() => void) | undefined
+        const attachReplayState = this.sdkBridge.captureReplayState?.(liveSession.sessionId) ?? null
+        let attachReplayDrain: ReturnType<SdkBridge['drainReplayBuffer']> | null = null
+        if (attachReplayState) {
+          const attachSubscription = this.sdkBridge.subscribe(
+            liveSession.sessionId,
+            (message: SdkServerMessage, meta?: { sequence: number }) => {
+              if (!attachReadyForLiveForward) {
+                queuedAttachMessages.push({ message, sequence: meta?.sequence ?? 0 })
+                return
+              }
+              const transformed = this.transactionalCreateMessage(message, m.sessionId)
+              if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
+                return
+              }
+              this.safeSend(ws, transformed)
+            },
+            { skipReplayBuffer: true },
+          )
+          if (attachSubscription) {
+            attachSubscriptionOff = attachSubscription.off
+            attachReplayDrain = this.sdkBridge.drainReplayBuffer?.(liveSession.sessionId) ?? null
+            if (!attachReplayDrain) {
+              attachSubscription.off()
+              this.send(ws, {
+                type: 'sdk.error',
+                sessionId: m.sessionId,
+                code: 'INVALID_SESSION_ID',
+                message: 'SDK session not found',
+              } as SdkServerMessage)
+              return
+            }
+          }
+        }
+
         try {
           const snapshotResult = await this.sendSdkSessionSnapshot(ws, {
             sessionId: m.sessionId,
-            status: liveSession.status,
+            status: attachReplayState?.session.status ?? liveSession.status,
             historyQueryId,
-            liveSession,
+            liveSession: attachReplayState?.session ?? liveSession,
             ...(resolved ? { resolvedHistory: resolved } : {}),
           })
           if (snapshotResult?.kind === 'fatal') {
+            attachSubscriptionOff?.()
             this.send(ws, {
               type: 'sdk.error',
               sessionId: m.sessionId,
@@ -2313,6 +2358,7 @@ export class WsHandler {
             return
           }
           if (snapshotResult?.kind === 'missing') {
+            attachSubscriptionOff?.()
             this.send(ws, {
               type: 'sdk.error',
               sessionId: m.sessionId,
@@ -2322,6 +2368,7 @@ export class WsHandler {
             return
           }
         } catch (err) {
+          attachSubscriptionOff?.()
           this.sendSdkRestoreError(ws, m.sessionId, err)
           return
         }
@@ -2329,28 +2376,49 @@ export class WsHandler {
         // Treat a successful attach as ownership of the client-visible session id.
         // Follow-up SDK commands must route through the resolved live target even if
         // stream subscription bookkeeping is unavailable or deferred.
-        state.sdkSessions.add(m.sessionId)
-        state.sdkSessionTargets.set(m.sessionId, liveSession.sessionId)
+        this.clearClientSdkSession(state, m.sessionId)
+        this.registerClientSdkSession(state, m.sessionId, liveSession.sessionId, attachSubscriptionOff)
+        attachSubscriptionOff = undefined
 
         // Send current status
         this.send(ws, {
           type: 'sdk.status',
           sessionId: m.sessionId,
-          status: liveSession.status,
+          status: attachReplayState?.session.status ?? liveSession.status,
         })
 
-        // Subscribe after the authoritative snapshot/status so any buffered
-        // replayed messages cannot outrun restore hydration on attach.
-        const bufferReplayed = this.subscribeClientToSdkSession(ws, state, m.sessionId, liveSession.sessionId)
-
-        // Replay pending permissions and questions for re-attaching clients.
-        // Skip if subscribe() already replayed the buffer (first subscriber),
-        // since buffered messages already include these requests.
-        if (!bufferReplayed) {
-          this.replayPendingInteractiveRequests(ws, m.sessionId, liveSession, {
-            permissionRequestIds: new Set<string>(),
-            questionRequestIds: new Set<string>(),
-          })
+        if (attachReplayState && attachReplayDrain && state.sdkSubscriptions.has(m.sessionId)) {
+          this.replayPendingInteractiveRequests(
+            ws,
+            m.sessionId,
+            attachReplayState.session,
+            deliveredInteractiveRequests,
+          )
+          const delayedMetadata = [
+            ...this.flushTransactionalCreateReplay(
+              ws,
+              m.sessionId,
+              attachReplayDrain.bufferedMessages,
+              attachReplayState.watermark,
+              deliveredInteractiveRequests,
+            ),
+          ]
+          while (queuedAttachMessages.length > 0) {
+            const replayBatch = queuedAttachMessages.splice(0, queuedAttachMessages.length)
+            delayedMetadata.push(...this.flushTransactionalCreateReplay(
+              ws,
+              m.sessionId,
+              replayBatch,
+              attachReplayState.watermark,
+              deliveredInteractiveRequests,
+            ))
+          }
+          for (const metadata of delayedMetadata) {
+            this.safeSend(ws, metadata)
+          }
+          attachReadyForLiveForward = true
+        } else {
+          this.replayPendingInteractiveRequests(ws, m.sessionId, liveSession, deliveredInteractiveRequests)
         }
         return
       }
