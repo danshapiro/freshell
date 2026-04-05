@@ -80,7 +80,7 @@ export interface NetworkRouterDeps {
   wsHandler: {
     broadcast: (msg: any) => void
   }
-  detectLanIps: () => string[]
+  detectLanIps: () => Promise<string[]>
 }
 
 export function createNetworkRouter(deps: NetworkRouterDeps): Router {
@@ -409,8 +409,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
   }
 
-  router.get('/lan-info', (_req, res) => {
-    res.json({ ips: detectLanIps() })
+  router.get('/lan-info', async (_req, res) => {
+    try {
+      res.json({ ips: await detectLanIps() })
+    } catch (err) {
+      log.error({ err }, 'Failed to get LAN info')
+      res.status(500).json({ error: 'Failed to get LAN info' })
+    }
   })
 
   router.get('/network/status', async (_req, res) => {

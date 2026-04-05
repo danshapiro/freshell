@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import { execFile, execSync } from 'child_process'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
@@ -6,6 +7,14 @@ import path from 'path'
 // Mock fs and os modules before importing the module under test
 vi.mock('fs')
 vi.mock('os')
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process')
+  return {
+    ...actual,
+    execFile: vi.fn(),
+    execSync: vi.fn(),
+  }
+})
 // Mock platform module — WSL detection is now centralized in platform.ts
 vi.mock('../../../server/platform.js', () => ({
   isWSL: vi.fn(() => false),
@@ -14,6 +23,7 @@ vi.mock('../../../server/platform.js', () => ({
 // Import the module under test after mocking
 import {
   detectLanIps,
+  detectLanIpsAsync,
   generateAuthToken,
   buildAllowedOrigins,
   readConfigHost,
@@ -23,6 +33,7 @@ import {
   resolveProjectRoot,
   type BootstrapResult,
 } from '../../../server/bootstrap'
+import { isWSL } from '../../../server/platform.js'
 
 describe('bootstrap module', () => {
   beforeEach(() => {
@@ -102,6 +113,86 @@ describe('bootstrap module', () => {
       const ips = detectLanIps()
 
       expect(ips).toEqual(['192.168.1.50'])
+    })
+  })
+
+  describe('detectLanIpsAsync', () => {
+    it('returns ranked IPv4 non-loopback addresses outside WSL', async () => {
+      vi.mocked(isWSL).mockReturnValue(false)
+      vi.mocked(os.networkInterfaces).mockReturnValue({
+        eth0: [
+          {
+            address: '10.255.1.9',
+            family: 'IPv4',
+            internal: false,
+            netmask: '255.255.255.0',
+          } as os.NetworkInterfaceInfo,
+          {
+            address: '192.168.1.100',
+            family: 'IPv4',
+            internal: false,
+            netmask: '255.255.255.0',
+          } as os.NetworkInterfaceInfo,
+        ],
+        lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true } as os.NetworkInterfaceInfo],
+      })
+
+      await expect(detectLanIpsAsync()).resolves.toEqual(['192.168.1.100', '10.255.1.9'])
+      expect(execFile).not.toHaveBeenCalled()
+    })
+
+    it('prefers ranked Windows host IPs inside WSL when ipconfig succeeds', async () => {
+      vi.mocked(isWSL).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd, _args, _options, callback) => {
+        callback?.(
+          null,
+          `
+Windows IP Configuration
+
+Ethernet adapter Ethernet:
+
+   IPv4 Address. . . . . . . . . . . : 10.20.30.40
+
+Wireless LAN adapter Wi-Fi:
+
+   IPv4 Address. . . . . . . . . . . : 192.168.1.50
+
+Ethernet adapter vEthernet (WSL):
+
+   IPv4 Address. . . . . . . . . . . : 172.22.96.1
+          `,
+          '',
+        )
+        return {} as any
+      })
+
+      await expect(detectLanIpsAsync()).resolves.toEqual(['192.168.1.50', '10.20.30.40'])
+    })
+
+    it('falls back to native interface detection when WSL ipconfig fails', async () => {
+      vi.mocked(isWSL).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd, _args, _options, callback) => {
+        callback?.(new Error('ipconfig failed'), '', '')
+        return {} as any
+      })
+      vi.mocked(os.networkInterfaces).mockReturnValue({
+        eth0: [
+          {
+            address: '172.16.1.20',
+            family: 'IPv4',
+            internal: false,
+            netmask: '255.255.0.0',
+          } as os.NetworkInterfaceInfo,
+          {
+            address: '192.168.1.101',
+            family: 'IPv4',
+            internal: false,
+            netmask: '255.255.255.0',
+          } as os.NetworkInterfaceInfo,
+        ],
+      })
+
+      await expect(detectLanIpsAsync()).resolves.toEqual(['192.168.1.101', '172.16.1.20'])
     })
   })
 

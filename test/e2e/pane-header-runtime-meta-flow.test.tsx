@@ -768,4 +768,121 @@ describe('pane header runtime metadata flow (e2e)', () => {
       expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
     })
   })
+
+  it('restores FreshClaude pane header metadata from timelineSessionId before cliSessionId exists', async () => {
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'canonical-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell',
+              gitBranch: 'main',
+              isDirty: true,
+              lastActivityAt: 2,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 25,
+              },
+            },
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'stale-resume',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/other',
+              gitBranch: 'stale',
+              isDirty: false,
+              lastActivityAt: 1,
+              tokenUsage: {
+                inputTokens: 1,
+                outputTokens: 1,
+                cachedTokens: 0,
+                totalTokens: 2,
+                contextTokens: 2,
+                compactThresholdTokens: 20,
+                compactPercent: 10,
+              },
+            },
+          ],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: 'claude:stale-resume',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      activeTabId: 'tab-fresh',
+      freshClaudeTab: {
+        id: 'tab-fresh',
+        createRequestId: 'req-fresh',
+        title: 'FreshClaude Tab',
+        status: 'running',
+        mode: 'claude',
+        resumeSessionId: 'stale-resume',
+        createdAt: Date.now(),
+      },
+      freshClaudePane: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-fresh',
+        sessionId: 'sdk-session-restore',
+        resumeSessionId: 'stale-resume',
+        status: 'idle',
+      } satisfies AgentChatPaneContent,
+      agentChatState: {
+        sessions: {
+          'sdk-session-restore': {
+            sessionId: 'sdk-session-restore',
+            timelineSessionId: 'canonical-session-1',
+            status: 'idle',
+            messages: [],
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        availableModels: [],
+      } satisfies Partial<AgentChatState>,
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalled()
+    })
+
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+  })
 })

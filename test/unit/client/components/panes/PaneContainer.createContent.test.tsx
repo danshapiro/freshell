@@ -359,4 +359,27 @@ describe('createContentForType with ext: prefix', () => {
       }
     })
   })
+
+  it('creates editor content when the editor option is selected', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const editorButton = document.querySelector('[aria-label="Editor"]') as HTMLElement
+    expect(editorButton).not.toBeNull()
+    fireEvent.click(editorButton)
+    fireEvent.transitionEnd(getPickerContainer())
+
+    await waitFor(() => {
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('editor')
+    })
+  })
 })

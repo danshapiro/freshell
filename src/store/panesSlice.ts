@@ -7,9 +7,40 @@ import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/p
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
+import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 
 const log = createLogger('PanesSlice')
+
+function buildPreservedSessionRef(
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  preservedResumeSessionId?: string,
+) {
+  if (!preservedResumeSessionId) {
+    return localContent.sessionRef
+  }
+
+  if (localContent.kind === 'terminal') {
+    if (localContent.mode === 'shell') {
+      return undefined
+    }
+    return {
+      ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+      provider: localContent.mode,
+      sessionId: preservedResumeSessionId,
+    }
+  }
+
+  if (!isValidClaudeSessionId(preservedResumeSessionId)) {
+    return undefined
+  }
+
+  return {
+    ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+    provider: 'claude' as const,
+    sessionId: preservedResumeSessionId,
+  }
+}
 
 /**
  * Normalize pane content to the full persisted/runtime shape.
@@ -81,6 +112,7 @@ function normalizePaneContent(
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
+      createError: input.createError,
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,
@@ -426,7 +458,14 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
           local.content.resumeSessionId &&
           incoming.content.resumeSessionId !== local.content.resumeSessionId
         ) {
-          return { ...incoming, content: { ...incoming.content, resumeSessionId: local.content.resumeSessionId } }
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
         }
       } else if (local.content.status === 'creating') {
         // Different createRequestId and local is reconnecting: local just
@@ -441,6 +480,21 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
     if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
       if (incoming.content.createRequestId === local.content.createRequestId) {
+        if (
+          shouldPreserveLocalCanonicalResumeSessionId(
+            local.content.resumeSessionId,
+            incoming.content.resumeSessionId,
+          )
+        ) {
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
+        }
         // Preserve local sessionId if incoming doesn't have it yet
         if (local.content.sessionId && !incoming.content.sessionId) {
           return { ...incoming, content: local.content }
@@ -1052,6 +1106,40 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    restartAgentChatCreate: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const { tabId, paneId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function restartContent(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') {
+          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+            return node
+          }
+          return {
+            ...node,
+            content: normalizePaneContent({
+              ...node.content,
+              sessionId: undefined,
+              createRequestId: nanoid(),
+              status: 'creating',
+              createError: undefined,
+            }, node.content),
+          }
+        }
+        return {
+          ...node,
+          children: [restartContent(node.children[0]), restartContent(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = restartContent(root)
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
     requestPaneRefresh: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -1319,6 +1407,7 @@ export const {
   swapPanes,
   updatePaneContent,
   mergePaneContent,
+  restartAgentChatCreate,
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,

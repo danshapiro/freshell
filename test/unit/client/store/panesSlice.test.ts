@@ -22,6 +22,7 @@ import panesReducer, {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
+  restartAgentChatCreate,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -36,6 +37,8 @@ vi.mock('nanoid', () => ({
 
 describe('panesSlice', () => {
   let initialState: PanesState
+  const localClaudeSessionId = '550e8400-e29b-41d4-a716-446655440000'
+  const remoteClaudeSessionId = '550e8400-e29b-41d4-a716-446655440001'
 
   beforeEach(() => {
     initialState = {
@@ -334,6 +337,35 @@ describe('panesSlice', () => {
       if (leaf.content.kind === 'terminal') {
         // Non-UUID resume names are valid for Claude (named resume support)
         expect(leaf.content.resumeSessionId).toBe('not-a-uuid')
+      }
+    })
+  })
+
+  describe('restartAgentChatCreate', () => {
+    it('moves an agent-chat pane into stable create-failed state until an explicit retry restarts it', () => {
+      const state = panesReducer(
+        stateWithLeaf('pane-agent', {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-1',
+          status: 'create-failed' as any,
+          createError: {
+            code: 'RESTORE_INTERNAL',
+            message: 'boom',
+            retryable: true,
+          },
+        } as any),
+        restartAgentChatCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
+      )
+
+      const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(layout.content).toMatchObject({
+        kind: 'agent-chat',
+        status: 'creating',
+      })
+      if (layout.content.kind === 'agent-chat') {
+        expect((layout.content as any).createError).toBeUndefined()
+        expect(layout.content.createRequestId).not.toBe('req-1')
       }
     })
   })
@@ -1906,7 +1938,11 @@ describe('panesSlice', () => {
               mode: 'claude',
               createRequestId: 'req-1',
               status: 'creating',
-              resumeSessionId: 'session-A',
+              resumeSessionId: localClaudeSessionId,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: localClaudeSessionId,
+              },
             },
           } as any,
         },
@@ -1926,7 +1962,11 @@ describe('panesSlice', () => {
               createRequestId: 'req-1',
               status: 'running',
               terminalId: 'remote-t1',
-              resumeSessionId: 'session-B',
+              resumeSessionId: 'named-resume',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: remoteClaudeSessionId,
+              },
             },
           } as any,
         },
@@ -1937,7 +1977,11 @@ describe('panesSlice', () => {
       const state = panesReducer(localState, hydratePanes(incoming))
       const content = (state.layouts['tab-1'] as any).content
 
-      expect(content.resumeSessionId).toBe('session-A')
+      expect(content.resumeSessionId).toBe(localClaudeSessionId)
+      expect(content.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: localClaudeSessionId,
+      })
     })
 
     it('preserves local resumeSessionId inside split pane trees', () => {

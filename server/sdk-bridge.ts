@@ -16,8 +16,10 @@ import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-ag
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
+import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
 import type {
   SdkSessionState,
+  SdkCreatedSession,
   ContentBlock,
   SdkServerMessage,
   QuestionDefinition,
@@ -38,9 +40,10 @@ interface InputStreamHandle {
 interface SessionProcess {
   query: SdkQuery
   abortController: AbortController
-  browserListeners: Set<(msg: SdkServerMessage) => void>
+  browserListeners: Set<(msg: SdkServerMessage, meta?: { sequence: number }) => void>
   /** Buffer messages until the first subscriber attaches (prevents race condition) */
-  messageBuffer: SdkServerMessage[]
+  messageBuffer: Array<{ sequence: number; message: SdkServerMessage }>
+  nextSequence: number
   hasSubscribers: boolean
   inputStream: InputStreamHandle
 }
@@ -50,6 +53,29 @@ export class SdkBridge extends EventEmitter {
   private processes = new Map<string, SessionProcess>()
   private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
 
+  private cloneSessionState(state: SdkSessionState): SdkSessionState {
+    return {
+      ...state,
+      tools: state.tools ? state.tools.map((tool) => ({ ...tool })) : undefined,
+      messages: state.messages.map((message) => ({
+        ...message,
+        content: message.content.map((block) => ({ ...block })),
+      })),
+      pendingPermissions: new Map(state.pendingPermissions),
+      pendingQuestions: new Map(state.pendingQuestions),
+    }
+  }
+
+  private assignMessageId(
+    state: SdkSessionState,
+    message: { role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string; model?: string; messageId?: string },
+  ): string {
+    if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
+      return message.messageId
+    }
+    return synthesizeLiveMessageId(state.sessionId, state.messages.length)
+  }
+
   async createSession(options: {
     cwd?: string
     resumeSessionId?: string
@@ -57,7 +83,7 @@ export class SdkBridge extends EventEmitter {
     permissionMode?: string
     effort?: 'low' | 'medium' | 'high' | 'max'
     plugins?: string[]
-  }): Promise<SdkSessionState> {
+  }): Promise<SdkCreatedSession> {
     const sessionId = nanoid()
     const state: SdkSessionState = {
       sessionId,
@@ -68,6 +94,8 @@ export class SdkBridge extends EventEmitter {
       status: 'starting',
       createdAt: Date.now(),
       messages: [],
+      streamingActive: false,
+      streamingText: '',
       pendingPermissions: new Map(),
       pendingQuestions: new Map(),
       costUsd: 0,
@@ -143,6 +171,7 @@ export class SdkBridge extends EventEmitter {
       abortController,
       browserListeners: new Set(),
       messageBuffer: [],
+      nextSequence: 1,
       hasSubscribers: false,
       inputStream,
     })
@@ -152,7 +181,19 @@ export class SdkBridge extends EventEmitter {
       log.error({ sessionId, err }, 'SDK stream error')
     })
 
-    return state
+    return Object.assign(state, {
+      replayGate: {
+        capture: () => {
+          const sp = this.processes.get(sessionId)
+          const currentState = this.sessions.get(sessionId)
+          if (!sp || !currentState) return null
+          return {
+            watermark: sp.nextSequence - 1,
+            session: this.cloneSessionState(currentState),
+          }
+        },
+      },
+    })
   }
 
   // Creates an async iterable that yields user messages written via sendUserMessage
@@ -295,7 +336,17 @@ export class SdkBridge extends EventEmitter {
           role: 'assistant',
           content: blocks,
           timestamp: new Date().toISOString(),
+          messageId: this.assignMessageId(state, {
+            role: 'assistant',
+            content: blocks,
+            timestamp: new Date().toISOString(),
+            model: (aMsg.message as any)?.model,
+            messageId: typeof (aMsg.message as any)?.id === 'string' ? (aMsg.message as any).id : undefined,
+          }),
+          ...(typeof (aMsg.message as any)?.model === 'string' ? { model: (aMsg.message as any).model } : {}),
         })
+        state.streamingActive = false
+        state.streamingText = ''
         state.status = 'running'
         this.broadcastToSession(sessionId, {
           type: 'sdk.assistant',
@@ -313,6 +364,8 @@ export class SdkBridge extends EventEmitter {
           state.totalInputTokens += rMsg.usage.input_tokens ?? 0
           state.totalOutputTokens += rMsg.usage.output_tokens ?? 0
         }
+        state.streamingActive = false
+        state.streamingText = ''
         state.status = 'idle'
         // Extract usage fields to satisfy the Zod-inferred structural type (SDK's
         // NonNullableUsage is a mapped type that is structurally compatible but not directly
@@ -338,6 +391,17 @@ export class SdkBridge extends EventEmitter {
 
       case 'stream_event': {
         const sMsg = msg as SDKPartialAssistantMessage
+        if (sMsg.event?.type === 'content_block_start') {
+          state.streamingActive = true
+          state.streamingText = ''
+        }
+        if (sMsg.event?.type === 'content_block_delta' && sMsg.event.delta?.type === 'text_delta') {
+          state.streamingActive = true
+          state.streamingText += sMsg.event.delta.text
+        }
+        if (sMsg.event?.type === 'content_block_stop') {
+          state.streamingActive = false
+        }
         this.broadcastToSession(sessionId, {
           type: 'sdk.stream',
           sessionId,
@@ -478,6 +542,30 @@ export class SdkBridge extends EventEmitter {
     return this.sessions.get(sessionId)
   }
 
+  getLiveSession(sessionId: string): SdkSessionState | undefined {
+    if (!this.processes.has(sessionId)) return undefined
+    return this.sessions.get(sessionId)
+  }
+
+  findSessionByCliSessionId(timelineSessionId: string): SdkSessionState | undefined {
+    for (const session of this.sessions.values()) {
+      if (session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId) {
+        return session
+      }
+    }
+    return undefined
+  }
+
+  findLiveSessionByCliSessionId(timelineSessionId: string): SdkSessionState | undefined {
+    for (const [sessionId, session] of this.sessions.entries()) {
+      if (!this.processes.has(sessionId)) continue
+      if (session.cliSessionId === timelineSessionId || session.resumeSessionId === timelineSessionId) {
+        return session
+      }
+    }
+    return undefined
+  }
+
   listSessions(): SdkSessionState[] {
     return Array.from(this.sessions.values())
   }
@@ -503,7 +591,7 @@ export class SdkBridge extends EventEmitter {
     return true
   }
 
-  subscribe(sessionId: string, listener: (msg: SdkServerMessage) => void): { off: () => void; replayed: boolean } | null {
+  subscribe(sessionId: string, listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void): { off: () => void; replayed: boolean } | null {
     const sp = this.processes.get(sessionId)
     if (!sp) return null
     sp.browserListeners.add(listener)
@@ -513,8 +601,8 @@ export class SdkBridge extends EventEmitter {
     if (!sp.hasSubscribers) {
       sp.hasSubscribers = true
       replayed = true
-      for (const msg of sp.messageBuffer) {
-        try { listener(msg) } catch (err) {
+      for (const entry of sp.messageBuffer) {
+        try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
           log.warn({ err, sessionId }, 'Buffer replay error')
         }
       }
@@ -530,10 +618,17 @@ export class SdkBridge extends EventEmitter {
 
     const state = this.sessions.get(sessionId)
     if (state) {
+      const timestamp = new Date().toISOString()
+      const content = [{ type: 'text', text } as ContentBlock]
       state.messages.push({
         role: 'user',
-        content: [{ type: 'text', text } as ContentBlock],
-        timestamp: new Date().toISOString(),
+        content,
+        timestamp,
+        messageId: this.assignMessageId(state, {
+          role: 'user',
+          content,
+          timestamp,
+        }),
       })
     }
 
@@ -647,15 +742,16 @@ export class SdkBridge extends EventEmitter {
   private broadcastToSession(sessionId: string, msg: SdkServerMessage): void {
     const sp = this.processes.get(sessionId)
     if (!sp) return
+    const sequence = sp.nextSequence++
 
     // Buffer messages until the first subscriber attaches
     if (!sp.hasSubscribers) {
-      sp.messageBuffer.push(msg)
+      sp.messageBuffer.push({ sequence, message: msg })
       return
     }
 
     for (const listener of sp.browserListeners) {
-      try { listener(msg) } catch (err) {
+      try { listener(msg, { sequence }) } catch (err) {
         log.warn({ err, sessionId }, 'Browser listener error')
       }
     }

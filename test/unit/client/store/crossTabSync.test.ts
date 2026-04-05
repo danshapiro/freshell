@@ -14,6 +14,7 @@ import {
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
+import { sessionMetadataKey } from '@/lib/session-metadata'
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
@@ -795,5 +796,351 @@ describe('crossTabSync', () => {
     expect(store.getState().tabs.tabs.map((t: any) => t.id)).toEqual(['t1', 't2'])
     expect(store.getState().panes.layouts).toHaveProperty('t1')
     expect(store.getState().panes.layouts).toHaveProperty('t2')
+  })
+
+  it('rejects stale rebroadcast layout that would overwrite a newer canonical durable id', () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const staleSessionRefId = '00000000-0000-4000-8000-000000000111'
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{
+        id: 'tab-1',
+        createRequestId: 'tab-1',
+        title: 'Local canonical title',
+        status: 'running',
+        mode: 'claude',
+        createdAt: 1,
+        updatedAt: 100,
+        resumeSessionId: canonicalSessionId,
+        sessionMetadataByKey: {
+          [sessionMetadataKey('claude', canonicalSessionId)]: {
+            sessionType: 'freshclaude',
+            firstUserMessage: 'Continue locally',
+          },
+        },
+      }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+      tombstones: [],
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-1',
+            status: 'idle',
+            resumeSessionId: canonicalSessionId,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: canonicalSessionId,
+            },
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+    }))
+
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 200,
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Local canonical title',
+          status: 'running',
+          mode: 'claude',
+          createdAt: 1,
+          updatedAt: 100,
+          resumeSessionId: canonicalSessionId,
+          sessionMetadataByKey: {
+            [sessionMetadataKey('claude', canonicalSessionId)]: {
+              sessionType: 'freshclaude',
+              firstUserMessage: 'Continue locally',
+            },
+          },
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'freshclaude',
+              createRequestId: 'req-1',
+              status: 'idle',
+              resumeSessionId: canonicalSessionId,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: canonicalSessionId,
+              },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 150,
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Remote stale title',
+          status: 'running',
+          mode: 'claude',
+          createdAt: 1,
+          updatedAt: 999,
+          resumeSessionId: 'named-resume',
+          sessionMetadataByKey: {
+            [sessionMetadataKey('claude', 'named-resume')]: {
+              sessionType: 'freshclaude',
+              firstUserMessage: 'Remote stale resume',
+            },
+          },
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'freshclaude',
+              createRequestId: 'req-1',
+              status: 'idle',
+              resumeSessionId: 'named-resume',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: staleSessionRefId,
+              },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+
+    const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
+    expect(paneContent.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
+    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionMetadataByKey).toEqual(expect.objectContaining({
+      [sessionMetadataKey('claude', canonicalSessionId)]: expect.objectContaining({
+        sessionType: 'freshclaude',
+      }),
+    }))
+    expect(tab?.sessionMetadataByKey).not.toHaveProperty(sessionMetadataKey('claude', 'named-resume'))
+  })
+
+  it('keeps comparing remote layout hydration against the current authoritative local timestamp after a stale payload was already processed', () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydrateTabs({
+      tabs: [{
+        id: 'tab-1',
+        createRequestId: 'tab-1',
+        title: 'Local canonical title',
+        status: 'running',
+        mode: 'claude',
+        createdAt: 1,
+        updatedAt: 100,
+        resumeSessionId: canonicalSessionId,
+        sessionMetadataByKey: {
+          [sessionMetadataKey('claude', canonicalSessionId)]: {
+            sessionType: 'freshclaude',
+            firstUserMessage: 'Continue locally',
+          },
+        },
+      }],
+      activeTabId: 'tab-1',
+      renameRequestTabId: null,
+      tombstones: [],
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-1',
+            status: 'idle',
+            resumeSessionId: canonicalSessionId,
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+    }))
+
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 200,
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Local canonical title',
+          status: 'running',
+          mode: 'claude',
+          createdAt: 1,
+          updatedAt: 100,
+          resumeSessionId: canonicalSessionId,
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'freshclaude',
+              createRequestId: 'req-1',
+              status: 'idle',
+              resumeSessionId: canonicalSessionId,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: LAYOUT_STORAGE_KEY,
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 150,
+        tabs: {
+          activeTabId: 'tab-1',
+          tabs: [{
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Remote stale title 1',
+            status: 'running',
+            mode: 'claude',
+            createdAt: 1,
+            updatedAt: 999,
+            resumeSessionId: 'named-resume',
+          }],
+        },
+        panes: {
+          version: 6,
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-1',
+                status: 'idle',
+                resumeSessionId: 'named-resume',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    let tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
+    expect(tab?.title).toBe('Local canonical title')
+    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: LAYOUT_STORAGE_KEY,
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 175,
+        tabs: {
+          activeTabId: 'tab-1',
+          tabs: [{
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Remote stale title 2',
+            status: 'running',
+            mode: 'claude',
+            createdAt: 1,
+            updatedAt: 1000,
+            resumeSessionId: 'named-resume',
+          }],
+        },
+        panes: {
+          version: 6,
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-1',
+                status: 'idle',
+                resumeSessionId: 'named-resume',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
+    expect(tab?.title).toBe('Local canonical title')
+    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+
+    const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(paneContent.resumeSessionId).toBe(canonicalSessionId)
   })
 })

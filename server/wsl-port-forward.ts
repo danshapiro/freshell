@@ -1,5 +1,4 @@
-import { execFile, execSync } from 'child_process'
-import fs from 'node:fs'
+import { execFile } from 'child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -80,14 +79,6 @@ function parseManagedWslPorts(raw: string): Set<number> {
   }
 }
 
-function readManagedWslRemoteAccessPorts(): Set<number> {
-  try {
-    return parseManagedWslPorts(fs.readFileSync(getManagedWslPortsPath(), 'utf-8'))
-  } catch {
-    return new Set()
-  }
-}
-
 async function readManagedWslRemoteAccessPortsAsync(): Promise<Set<number>> {
   try {
     return parseManagedWslPorts(await fsp.readFile(getManagedWslPortsPath(), 'utf-8'))
@@ -147,47 +138,6 @@ export function parsePortProxyRules(output: string): Map<number, PortProxyRule> 
   return rules
 }
 
-/**
- * Get the current WSL2 IPv4 address.
- *
- * Strategy:
- * 1. Try to get IP from eth0 (WSL2's primary interface)
- * 2. Fall back to hostname -I (first non-Docker IPv4)
- *
- * This avoids selecting Docker bridge or VPN interfaces.
- */
-export function getWslIp(): string | null {
-  // Try eth0 first - this is WSL2's primary interface
-  try {
-    const eth0Output = execSync('ip -4 addr show eth0 2>/dev/null', {
-      encoding: 'utf-8',
-      timeout: 5000,
-    })
-    const eth0Match = eth0Output.match(/inet\s+([\d.]+)/)
-    if (eth0Match && IPV4_REGEX.test(eth0Match[1])) {
-      return eth0Match[1]
-    }
-  } catch {
-    // eth0 not available, fall through to hostname -I
-  }
-
-  // Fallback: use hostname -I, skipping Docker bridge (172.17.x.x)
-  try {
-    const output = execSync('hostname -I', { encoding: 'utf-8', timeout: 5000 })
-    const addresses = output.trim().split(/\s+/).filter(Boolean)
-
-    // Find first IPv4 address (skip IPv6 and Docker bridge 172.17.x.x)
-    for (const addr of addresses) {
-      if (IPV4_REGEX.test(addr) && !addr.startsWith('172.17.')) {
-        return addr
-      }
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-
 async function getWslIpAsync(): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync('ip', ['-4', 'addr', 'show', 'eth0'], {
@@ -217,22 +167,6 @@ async function getWslIpAsync(): Promise<string | null> {
     return null
   } catch {
     return null
-  }
-}
-
-/**
- * Query existing Windows port proxy rules.
- * Returns a Map of listenPort -> { connectAddress, connectPort }.
- */
-export function getExistingPortProxyRules(): Map<number, PortProxyRule> {
-  try {
-    const output = execSync(
-      `${NETSH_PATH} interface portproxy show v4tov4`,
-      { encoding: 'utf-8', timeout: 10000 }
-    )
-    return parsePortProxyRules(output)
-  } catch {
-    return new Map()
   }
 }
 
@@ -315,22 +249,6 @@ export function parseFirewallRulePorts(output: string): Set<number> {
     }
   }
   return ports
-}
-
-/**
- * Query the existing FreshellLANAccess Windows Firewall rule.
- * Returns a Set of port numbers allowed by the rule, or empty set if the rule doesn't exist.
- */
-export function getExistingFirewallPorts(): Set<number> {
-  try {
-    const output = execSync(
-      `${NETSH_PATH} advfirewall firewall show rule name=FreshellLANAccess`,
-      { encoding: 'utf-8', timeout: 10000 }
-    )
-    return parseFirewallRulePorts(output)
-  } catch {
-    return new Set()
-  }
 }
 
 async function getExistingFirewallPortsAsync(): Promise<Set<number> | null> {
@@ -582,39 +500,6 @@ function buildWslPortForwardingTeardownPlan(
   }
 }
 
-export function computeWslPortForwardingPlan(
-  requiredPorts: number[],
-  knownOwnedPorts: number[] = requiredPorts,
-): WslPortForwardingPlan {
-  if (!isWSL2()) {
-    return { status: 'not-wsl2' }
-  }
-  if (isWslPortForwardingDisabledByEnv()) {
-    return { status: 'disabled' }
-  }
-
-  const wslIp = getWslIp()
-  if (!wslIp) {
-    return {
-      status: 'error',
-      message: 'Failed to detect WSL2 IP address',
-    }
-  }
-
-  const existingRules = getExistingPortProxyRules()
-  const existingFirewallPorts = getExistingFirewallPorts()
-  const managedPorts = readManagedWslRemoteAccessPorts()
-
-  return buildWslPortForwardingPlan(
-    requiredPorts,
-    knownOwnedPorts,
-    wslIp,
-    existingRules,
-    existingFirewallPorts,
-    managedPorts,
-  )
-}
-
 export async function computeWslPortForwardingPlanAsync(
   requiredPorts: number[],
   knownOwnedPorts: number[] = requiredPorts,
@@ -651,30 +536,6 @@ export async function computeWslPortForwardingPlanAsync(
     requiredPorts,
     knownOwnedPorts,
     wslIp,
-    existingRules,
-    existingFirewallPorts,
-    managedPorts,
-  )
-}
-
-export function computeWslPortForwardingTeardownPlan(
-  requiredPorts: number[],
-  knownOwnedPorts: number[] = requiredPorts,
-): WslPortForwardingTeardownPlan {
-  if (!isWSL2()) {
-    return { status: 'not-wsl2' }
-  }
-  if (isWslPortForwardingDisabledByEnv()) {
-    return { status: 'disabled' }
-  }
-
-  const existingRules = getExistingPortProxyRules()
-  const existingFirewallPorts = getExistingFirewallPorts()
-  const managedPorts = readManagedWslRemoteAccessPorts()
-
-  return buildWslPortForwardingTeardownPlan(
-    requiredPorts,
-    knownOwnedPorts,
     existingRules,
     existingFirewallPorts,
     managedPorts,

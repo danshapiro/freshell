@@ -132,7 +132,12 @@ describe('executeAction -- tab actions', () => {
 })
 
 describe('executeAction -- pane actions', () => {
-  it('split-pane calls POST /api/panes/:id/split with direction', async () => {
+  it('split-pane resolves target and calls POST /api/panes/:id/split with direction', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('split-pane', { target: 'p1', direction: 'vertical' })
     expect(mockClient.post).toHaveBeenCalledWith(

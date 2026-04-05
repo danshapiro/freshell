@@ -73,6 +73,25 @@ describe('SDK Message Handler', () => {
     )
   })
 
+  it('handles sdk.create.failed as a request-scoped create failure', () => {
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.create.failed',
+      requestId: 'req-1',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledWith(
+      agentChatSlice.createFailed({
+        requestId: 'req-1',
+        code: 'RESTORE_INTERNAL',
+        message: 'boom',
+        retryable: true,
+      }),
+    )
+  })
+
   it('handles sdk.assistant', () => {
     const handled = handleSdkMessage(dispatch, {
       type: 'sdk.assistant',
@@ -122,7 +141,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      agentChatSlice.clearStreaming({ sessionId: 'sess-1' })
+      agentChatSlice.setStreaming({ sessionId: 'sess-1', active: false })
     )
   })
 

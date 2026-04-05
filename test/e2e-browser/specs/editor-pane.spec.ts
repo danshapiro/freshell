@@ -1,6 +1,50 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Editor Pane', () => {
+  async function getLoadedScriptUrls(page: any) {
+    return new Set(
+      await page.evaluate(() => (
+        performance.getEntriesByType('resource')
+          .map((entry) => entry.name)
+          .filter((name) => /\.js(?:\?|$)/.test(name))
+      ))
+    )
+  }
+
+  async function delayFirstNewScriptRequest(page: any) {
+    const loadedScriptUrls = await getLoadedScriptUrls(page)
+    let delayedUrl: string | null = null
+
+    const routeHandler = async (route: any) => {
+      const url = route.request().url()
+      if (!delayedUrl && !loadedScriptUrls.has(url)) {
+        delayedUrl = url
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      await route.continue()
+    }
+
+    await page.route('**/*.js*', routeHandler)
+
+    return {
+      delayedUrl: () => delayedUrl,
+      cleanup: async () => {
+        await page.unroute('**/*.js*', routeHandler)
+      },
+    }
+  }
+
+  async function waitForEditorPane(page: any, openEditor: () => Promise<unknown>) {
+    const loadingShell = page.locator('[data-testid="editor-pane-loading"]')
+    const editorPane = page.locator('[data-testid="editor-pane"]')
+
+    const openPromise = openEditor()
+    await expect(loadingShell).toBeVisible({ timeout: 10_000 })
+    await openPromise
+    await expect(editorPane).toBeVisible({ timeout: 15_000 })
+    await expect(loadingShell).toBeHidden({ timeout: 15_000 })
+  }
+
   // Helper: create an editor pane via context menu split + picker.
   // Context menu on terminal shows "Split horizontally" (role="menuitem").
   // PanePicker buttons have aria-label matching the label text.
@@ -12,10 +56,13 @@ test.describe('Editor Pane', () => {
     // The new pane shows the PanePicker; click "Editor" (aria-label="Editor")
     const editorButton = page.getByRole('button', { name: /^Editor$/i })
     await expect(editorButton).toBeVisible({ timeout: 10_000 })
-    await editorButton.click()
-
-    // Wait for the editor pane to render (has data-testid="editor-pane")
-    await page.locator('[data-testid="editor-pane"]').waitFor({ state: 'visible', timeout: 15_000 })
+    const delayedChunk = await delayFirstNewScriptRequest(page)
+    try {
+      await waitForEditorPane(page, () => editorButton.click())
+      expect(delayedChunk.delayedUrl()).toBeTruthy()
+    } finally {
+      await delayedChunk.cleanup()
+    }
   }
 
   test('opens editor pane via pane picker', async ({ freshellPage, page, harness, terminal }) => {
@@ -31,6 +78,43 @@ test.describe('Editor Pane', () => {
       c.type === 'leaf' && c.content?.kind === 'editor'
     )
     expect(hasEditor).toBe(true)
+  })
+
+  test('loads the editor lazily and requests a new JS asset after the click', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+
+    const loadedScriptUrls = await getLoadedScriptUrls(page)
+
+    const jsRequestsAfterClick: string[] = []
+    const requestListener = (request: any) => {
+      const url = request.url()
+      if (
+        (request.resourceType() === 'script' || /\.js(?:\?|$)/.test(url)) &&
+        !loadedScriptUrls.has(url)
+      ) {
+        jsRequestsAfterClick.push(url)
+      }
+    }
+
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+
+    const editorButton = page.getByRole('button', { name: /^Editor$/i })
+    await expect(editorButton).toBeVisible({ timeout: 10_000 })
+
+    page.on('request', requestListener)
+    const delayedChunk = await delayFirstNewScriptRequest(page)
+    try {
+      await waitForEditorPane(page, () => editorButton.click())
+
+      expect(delayedChunk.delayedUrl()).toBeTruthy()
+      expect(jsRequestsAfterClick.length).toBeGreaterThan(0)
+      await expect(page.locator('[data-testid="editor-pane"]')).toHaveScreenshot('editor-pane-loaded.png')
+    } finally {
+      await delayedChunk.cleanup()
+      page.off('request', requestListener)
+    }
   })
 
   test('editor pane has path input and open button', async ({ freshellPage, page, terminal }) => {

@@ -8,13 +8,14 @@ import {
   NetworkManager,
   persistManagedWindowsRemoteAccessPortsForServer,
 } from '../../../server/network-manager.js'
-import { detectLanIps } from '../../../server/bootstrap.js'
+import { detectLanIps, detectLanIpsAsync } from '../../../server/bootstrap.js'
 import { detectFirewall, firewallCommands } from '../../../server/firewall.js'
 import { computeWslPortForwardingPlanAsync } from '../../../server/wsl-port-forward.js'
 
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
   detectLanIps: vi.fn().mockReturnValue(['192.168.1.100']),
+  detectLanIpsAsync: vi.fn().mockResolvedValue(['192.168.1.100']),
 }))
 vi.mock('is-port-reachable', () => ({
   default: vi.fn().mockResolvedValue(true),
@@ -84,6 +85,10 @@ describe('NetworkManager', () => {
     delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     process.env.FRESHELL_HOME = tmpDir
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+    vi.mocked(detectLanIps).mockReset()
+    vi.mocked(detectLanIps).mockReturnValue(['192.168.1.100'])
+    vi.mocked(detectLanIpsAsync).mockReset()
+    vi.mocked(detectLanIpsAsync).mockResolvedValue(['192.168.1.100'])
     vi.mocked(computeWslPortForwardingPlanAsync).mockReset()
     vi.mocked(computeWslPortForwardingPlanAsync).mockResolvedValue({ status: 'noop', wslIp: '172.30.149.249' })
     vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
@@ -790,6 +795,98 @@ describe('NetworkManager', () => {
   })
 
   describe('initializeFromStartup', () => {
+    it('awaits async LAN refresh before configure rebuilds allowed origins', async () => {
+      process.env.ALLOWED_ORIGINS = 'http://stale-origin'
+      mockConfigStore = createMockConfigStore({
+        network: {
+          host: '127.0.0.1',
+          configured: false,
+        },
+      })
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+
+      let resolveLanIps: ((ips: string[]) => void) | undefined
+      vi.mocked(detectLanIpsAsync).mockReturnValue(new Promise((resolve) => {
+        resolveLanIps = resolve
+      }))
+
+      let settled = false
+      const configurePromise = manager.configure({
+        host: '0.0.0.0',
+        configured: true,
+      }).then(() => {
+        settled = true
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(settled).toBe(false)
+      expect(process.env.ALLOWED_ORIGINS).toBe('http://stale-origin')
+
+      resolveLanIps?.(['192.168.1.222'])
+      await configurePromise
+
+      const origins = process.env.ALLOWED_ORIGINS?.split(',') ?? []
+      expect(origins).toContain(`http://192.168.1.222:${testPort}`)
+    })
+
+    it('awaits async LAN refresh during startup initialization', async () => {
+      process.env.ALLOWED_ORIGINS = 'http://startup-stale-origin'
+      mockConfigStore = createMockConfigStore({
+        network: {
+          host: '0.0.0.0',
+          configured: true,
+        },
+      })
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+
+      let resolveLanIps: ((ips: string[]) => void) | undefined
+      vi.mocked(detectLanIpsAsync).mockReturnValue(new Promise((resolve) => {
+        resolveLanIps = resolve
+      }))
+
+      let settled = false
+      const initPromise = manager.initializeFromStartup('0.0.0.0', {
+        host: '0.0.0.0',
+        configured: true,
+      }).then(() => {
+        settled = true
+      })
+
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(settled).toBe(false)
+      expect(process.env.ALLOWED_ORIGINS).toBe('http://startup-stale-origin')
+
+      resolveLanIps?.(['192.168.1.223'])
+      await initPromise
+
+      const origins = process.env.ALLOWED_ORIGINS?.split(',') ?? []
+      expect(origins).toContain(`http://192.168.1.223:${testPort}`)
+    })
+
+    it('does not fall back to sync LAN refresh after async initialization completes', async () => {
+      mockConfigStore = createMockConfigStore({
+        network: {
+          host: '0.0.0.0',
+          configured: true,
+        },
+      })
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+      vi.mocked(detectLanIpsAsync).mockResolvedValue(['192.168.1.224'])
+      vi.mocked(detectLanIps).mockReturnValue(['10.0.0.9'])
+
+      await manager.initializeFromStartup('0.0.0.0', {
+        host: '0.0.0.0',
+        configured: true,
+      })
+
+      const status = await manager.getStatus()
+
+      expect(status.lanIps).toEqual(['192.168.1.224'])
+      expect(detectLanIps).not.toHaveBeenCalled()
+    })
+
     it('rebuilds ALLOWED_ORIGINS without persisting to config', async () => {
       manager = new NetworkManager(server, mockConfigStore, testPort)
 

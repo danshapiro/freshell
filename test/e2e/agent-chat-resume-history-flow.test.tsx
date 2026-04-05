@@ -76,23 +76,73 @@ describe('agent chat resume history flow', () => {
       sessionId: 'cli-session-1',
       items: [
         {
-          turnId: 'turn-2',
+          turnId: 'turn-older-user',
+          sessionId: 'cli-session-1',
+          role: 'user',
+          summary: 'Older question',
+          timestamp: '2026-03-10T10:00:00.000Z',
+        },
+        {
+          turnId: 'turn-older-assistant',
           sessionId: 'cli-session-1',
           role: 'assistant',
-          summary: 'Recent summary',
+          summary: 'Older answer',
+          timestamp: '2026-03-10T10:00:20.000Z',
+        },
+        {
+          turnId: 'turn-new-user',
+          sessionId: 'cli-session-1',
+          role: 'user',
+          summary: 'New prompt',
           timestamp: '2026-03-10T10:01:00.000Z',
+        },
+        {
+          turnId: 'turn-new-assistant',
+          sessionId: 'cli-session-1',
+          role: 'assistant',
+          summary: 'New reply',
+          timestamp: '2026-03-10T10:01:20.000Z',
         },
       ],
       nextCursor: null,
-      revision: 2,
-    })
-    getAgentTurnBody.mockResolvedValue({
-      sessionId: 'cli-session-1',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Hydrated from durable history' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
+      revision: 4,
+      bodies: {
+        'turn-older-user': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-older-user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'Older durable question' }],
+            timestamp: '2026-03-10T10:00:00.000Z',
+          },
+        },
+        'turn-older-assistant': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-older-assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Older durable answer' }],
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+        },
+        'turn-new-user': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-new-user',
+          message: {
+            role: 'user',
+            content: [{ type: 'text', text: 'New live prompt' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
+        'turn-new-assistant': {
+          sessionId: 'cli-session-1',
+          turnId: 'turn-new-assistant',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hydrated from durable history' }],
+            timestamp: '2026-03-10T10:01:20.000Z',
+          },
+        },
       },
     })
 
@@ -132,6 +182,7 @@ describe('agent chat resume history flow', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'idle',
+        timelineSessionId: 'cli-session-1',
       })
     })
 
@@ -140,16 +191,108 @@ describe('agent chat resume history flow', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-session-1',
-        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
-    expect(getAgentTurnBody).toHaveBeenCalledWith(
-      'cli-session-1',
-      'turn-2',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    )
-    expect(await screen.findByText('Hydrated from durable history')).toBeInTheDocument()
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
+
+    await waitFor(() => {
+      const renderedMessages = screen.getAllByRole('article')
+        .map((node) => node.textContent?.replace(/\s+/g, ' ').trim())
+      expect(renderedMessages).toEqual([
+        'Older durable question',
+        'Older durable answer',
+        'New live prompt',
+        'Hydrated from durable history',
+      ])
+    })
     expect(screen.queryByText(/restoring session/i)).not.toBeInTheDocument()
+  })
+
+  it('waits for a live-only named resume to upgrade to the canonical durable id before hydrating backlog', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: canonicalSessionId,
+      items: [
+        {
+          turnId: 'turn-durable-1',
+          sessionId: canonicalSessionId,
+          role: 'assistant',
+          summary: 'Canonical durable answer',
+          timestamp: '2026-03-10T10:01:20.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 7,
+      bodies: {
+        'turn-durable-1': {
+          sessionId: canonicalSessionId,
+          turnId: 'turn-durable-1',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hydrated after canonical upgrade' }],
+            timestamp: '2026-03-10T10:01:20.000Z',
+          },
+        },
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-live-only',
+        status: 'creating',
+        resumeSessionId: 'named-resume',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.created',
+        requestId: 'req-live-only',
+        sessionId: 'sdk-live-only',
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.snapshot',
+        sessionId: 'sdk-live-only',
+        latestTurnId: null,
+        status: 'starting',
+      })
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.metadata',
+        sessionId: 'sdk-live-only',
+        cliSessionId: canonicalSessionId,
+      })
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        canonicalSessionId,
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+
+    expect(await screen.findByText('Hydrated after canonical upgrade')).toBeInTheDocument()
   })
 })

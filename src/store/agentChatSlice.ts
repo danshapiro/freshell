@@ -1,16 +1,20 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
   AgentChatState,
   AgentTimelineItem,
+  AgentTimelineTurn,
   ChatContentBlock,
   ChatMessage,
   ChatSessionState,
+  PendingCreateFailure,
   QuestionDefinition,
 } from './agentChatTypes'
 
 const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
+  pendingCreateFailures: {},
   availableModels: [],
 }
 
@@ -33,6 +37,17 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
     }
   }
   return state.sessions[sessionId]
+}
+
+function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): void {
+  session.latestTurnId = undefined
+  session.timelineItems = []
+  session.timelineBodies = {}
+  session.nextTimelineCursor = undefined
+  session.timelineRevision = undefined
+  session.timelineLoading = false
+  session.timelineError = undefined
+  session.historyLoaded = false
 }
 
 const agentChatSlice = createSlice({
@@ -58,6 +73,9 @@ const agentChatSlice = createSlice({
       // Fresh creates have no history to load, but resumed creates stay in
       // restore mode until snapshot/timeline data establishes durable history.
       session.historyLoaded = !expectsHistoryHydration
+      session.awaitingDurableHistory = expectsHistoryHydration
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
       state.pendingCreates[requestId] = {
         sessionId,
         expectsHistoryHydration,
@@ -76,19 +94,58 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      session.status = 'connected'
+      if (action.payload.cliSessionId) {
+        session.awaitingDurableHistory = false
+      }
+      if (session.status === 'creating' || session.status === 'starting') {
+        session.status = 'connected'
+      }
+    },
+
+    sessionMetadataReceived(state, action: PayloadAction<{
+      sessionId: string
+      cliSessionId?: string
+      model?: string
+      cwd?: string
+      tools?: Array<{ name: string }>
+    }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
+        session.timelineSessionId = action.payload.cliSessionId
+        session.awaitingDurableHistory = false
+      }
+      session.model = action.payload.model ?? session.model
+      session.cwd = action.payload.cwd ?? session.cwd
+      session.tools = action.payload.tools ?? session.tools
     },
 
     sessionSnapshotReceived(state, action: PayloadAction<{
       sessionId: string
       latestTurnId: string | null
       status: ChatSessionState['status']
+      timelineSessionId?: string
+      revision?: number
+      streamingActive?: boolean
+      streamingText?: string
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
+      session.timelineSessionId = action.payload.timelineSessionId
+      session.timelineRevision = action.payload.revision
+      session.streamingActive = action.payload.streamingActive ?? false
+      session.streamingText = action.payload.streamingText ?? ''
+      session.restoreFailureCode = undefined
       if (action.payload.latestTurnId === null) {
-        session.historyLoaded = true
+        const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
+          || isValidClaudeSessionId(session.cliSessionId)
+        if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
+          session.historyLoaded = true
+          session.awaitingDurableHistory = false
+        }
+      } else {
+        session.awaitingDurableHistory = false
       }
     },
 
@@ -230,15 +287,26 @@ const agentChatSlice = createSlice({
       nextCursor: string | null
       revision: number
       replace?: boolean
+      bodies?: Record<string, AgentTimelineTurn>
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const nextBodies = Object.fromEntries(
+        Object.entries(action.payload.bodies ?? {}).map(([turnId, turn]) => [turnId, turn.message]),
+      )
       session.timelineItems = action.payload.replace === false
         ? [...session.timelineItems, ...action.payload.items]
         : action.payload.items
+      session.timelineBodies = action.payload.replace === false
+        ? { ...session.timelineBodies, ...nextBodies }
+        : nextBodies
+      session.timelineRevision = action.payload.revision
       session.nextTimelineCursor = action.payload.nextCursor
       session.timelineLoading = false
       session.timelineError = undefined
+      session.awaitingDurableHistory = false
       session.historyLoaded = true
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
     },
 
     timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string }>) {
@@ -257,19 +325,35 @@ const agentChatSlice = createSlice({
     },
 
     sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
-      const session = state.sessions[action.payload.sessionId]
-      if (!session) return
+      const session = ensureSession(state, action.payload.sessionId)
       session.lastError = action.payload.message
     },
 
     /** Mark a session as lost (server confirmed it no longer exists).
      *  Creates the session entry if needed (e.g. after page refresh where Redux
      *  was empty) and sets flags that enable AgentChatView to detect the loss
-     *  and trigger immediate recovery without waiting for the 5-second timeout. */
+     *  and trigger immediate recovery. */
     markSessionLost(state, action: PayloadAction<{ sessionId: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      session.awaitingDurableHistory = false
       session.lost = true
       session.historyLoaded = true
+    },
+
+    restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      resetHydratedTimelineStateForRestoreRetry(session)
+      session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
+      session.restoreFailureCode = action.payload.code
+    },
+
+    createFailed(state, action: PayloadAction<{ requestId: string } & PendingCreateFailure>) {
+      const { requestId, ...failure } = action.payload
+      state.pendingCreateFailures[requestId] = failure
+    },
+
+    clearPendingCreateFailure(state, action: PayloadAction<{ requestId: string }>) {
+      delete state.pendingCreateFailures[action.payload.requestId]
     },
 
     clearPendingCreate(state, action: PayloadAction<{ requestId: string }>) {
@@ -292,6 +376,7 @@ export const {
   registerPendingCreate,
   sessionCreated,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   addUserMessage,
   addAssistantMessage,
@@ -311,6 +396,9 @@ export const {
   turnBodyReceived,
   sessionError,
   markSessionLost,
+  restoreRetryRequested,
+  createFailed,
+  clearPendingCreateFailure,
   clearPendingCreate,
   removeSession,
   setAvailableModels,

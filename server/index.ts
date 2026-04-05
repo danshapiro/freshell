@@ -1,4 +1,4 @@
-import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
+import { detectLanIpsAsync } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
@@ -65,6 +65,7 @@ import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
+import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
@@ -275,6 +276,11 @@ async function main() {
       resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
       contentCache: sessionContentCache,
     })
+  const agentHistorySource = createAgentHistorySource({
+    loadSessionHistory: loadSessionHistoryWithCache,
+    getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
+    getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
+  })
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
@@ -302,7 +308,7 @@ async function main() {
     layoutStore,
     extensionManager,
     () => codexActivity.tracker.list(),
-    loadSessionHistoryWithCache,
+    agentHistorySource,
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
@@ -421,7 +427,7 @@ async function main() {
     networkManager,
     configStore,
     wsHandler,
-    detectLanIps,
+    detectLanIps: detectLanIpsAsync,
   }))
 
   app.use('/api', createPlatformRouter({
@@ -449,7 +455,7 @@ async function main() {
 
   app.use('/api', createAgentTimelineRouter({
     service: createAgentTimelineService({
-      loadSessionHistory: loadSessionHistoryWithCache,
+      agentHistorySource,
     }),
   }))
 

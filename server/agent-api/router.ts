@@ -586,7 +586,7 @@ export function createAgentApiRouter({
     const resolved = resolvePaneTarget(rawPaneId)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawPaneId
-    const direction = req.body?.direction || 'horizontal'
+    const direction = req.body?.direction || 'vertical'
     const wantsBrowser = !!req.body?.browser
     const wantsEditor = !!req.body?.editor
 

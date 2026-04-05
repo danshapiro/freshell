@@ -228,6 +228,9 @@ export default function App() {
     ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
     : null
   const authRequiredVisible = connectionLastError?.includes('Authentication failed') ?? false
+  const handleOpenTab = useCallback(() => {
+    setView('terminal')
+  }, [])
 
   useEffect(() => {
     if (!perfAuditEnabled || !perfAuditBridgeRef.current) return
@@ -1070,14 +1073,14 @@ export default function App() {
     if (view === 'overview') {
       return (
         <ErrorBoundary label="Panes">
-          <OverviewView onOpenTab={() => setView('terminal')} />
+          <OverviewView onOpenTab={handleOpenTab} />
         </ErrorBoundary>
       )
     }
     if (view === 'tabs') {
       return (
         <ErrorBoundary label="Tabs">
-          <TabsView onOpenTab={() => setView('terminal')} />
+          <TabsView onOpenTab={handleOpenTab} />
         </ErrorBoundary>
       )
     }

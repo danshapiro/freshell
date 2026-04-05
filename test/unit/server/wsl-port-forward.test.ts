@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { execFile, execSync } from 'child_process'
+import { execFile } from 'child_process'
 import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
@@ -12,20 +12,15 @@ vi.mock('../../../server/platform.js', () => ({
 import { isWSL2 } from '../../../server/platform.js'
 
 import {
-  computeWslPortForwardingPlan,
   computeWslPortForwardingPlanAsync,
-  getWslIp,
   parsePortProxyRules,
-  getExistingPortProxyRules,
   getRequiredPorts,
   needsPortForwardingUpdate,
   buildPortForwardingScript,
   parseFirewallRulePorts,
-  getExistingFirewallPorts,
   needsFirewallUpdate,
   buildFirewallOnlyScript,
   buildPortForwardingTeardownScript,
-  computeWslPortForwardingTeardownPlan,
   computeWslPortForwardingTeardownPlanAsync,
   persistManagedWslRemoteAccessPorts,
   type PortProxyRule
@@ -51,91 +46,6 @@ describe('wsl-port-forward', () => {
       process.env.HOME = originalHome
     }
     await fsp.rm(tempHome, { recursive: true, force: true })
-  })
-
-  describe('getWslIp', () => {
-    it('returns IP from eth0 interface when available', () => {
-      vi.mocked(execSync).mockReturnValueOnce(`
-2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
-    inet 172.30.149.249/20 brd 172.30.159.255 scope global eth0
-       valid_lft forever preferred_lft forever
-`)
-
-      const ip = getWslIp()
-
-      expect(ip).toBe('172.30.149.249')
-      expect(execSync).toHaveBeenCalledWith('ip -4 addr show eth0 2>/dev/null', expect.anything())
-    })
-
-    it('falls back to hostname -I when eth0 fails', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('172.30.149.249 10.0.0.5 \n')
-
-      const ip = getWslIp()
-
-      expect(ip).toBe('172.30.149.249')
-    })
-
-    it('skips IPv6 addresses in fallback', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('fe80::1 2001:db8::1 172.30.149.249 10.0.0.5\n')
-
-      const ip = getWslIp()
-
-      expect(ip).toBe('172.30.149.249')
-    })
-
-    it('skips Docker bridge IP (172.17.x.x) in fallback', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('172.17.0.1 172.30.149.249\n')
-
-      const ip = getWslIp()
-
-      expect(ip).toBe('172.30.149.249')
-    })
-
-    it('returns null when both eth0 and hostname -I fail', () => {
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('Command failed')
-      })
-
-      const ip = getWslIp()
-
-      expect(ip).toBeNull()
-    })
-
-    it('returns null when no IPv4 addresses found in fallback', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('fe80::1 2001:db8::1\n')
-
-      const ip = getWslIp()
-
-      expect(ip).toBeNull()
-    })
-
-    it('returns null when only Docker bridge IP found in fallback', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('172.17.0.1\n')
-
-      const ip = getWslIp()
-
-      expect(ip).toBeNull()
-    })
-
-    it('returns null when fallback output is empty', () => {
-      vi.mocked(execSync)
-        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
-        .mockReturnValueOnce('')
-
-      const ip = getWslIp()
-
-      expect(ip).toBeNull()
-    })
   })
 
   describe('parsePortProxyRules', () => {
@@ -186,36 +96,6 @@ Address         Port        Address         Port
 
       expect(rules.has(8080)).toBe(false)
       expect(rules.get(3001)).toEqual({ connectAddress: '172.30.149.249', connectPort: 3001 })
-    })
-  })
-
-  describe('getExistingPortProxyRules', () => {
-    it('calls netsh with absolute path and parses output', () => {
-      vi.mocked(execSync).mockReturnValue(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-
-      const rules = getExistingPortProxyRules()
-
-      expect(execSync).toHaveBeenCalledWith(
-        '/mnt/c/Windows/System32/netsh.exe interface portproxy show v4tov4',
-        expect.objectContaining({ encoding: 'utf-8' })
-      )
-      expect(rules.get(3001)).toEqual({ connectAddress: '172.30.149.249', connectPort: 3001 })
-    })
-
-    it('returns empty map when netsh fails', () => {
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('Command failed')
-      })
-
-      const rules = getExistingPortProxyRules()
-
-      expect(rules.size).toBe(0)
     })
   })
 
@@ -390,34 +270,6 @@ Enabled:                              Yes
     })
   })
 
-  describe('getExistingFirewallPorts', () => {
-    it('queries FreshellLANAccess rule and parses ports', () => {
-      vi.mocked(execSync).mockReturnValue(`
-Rule Name:                            FreshellLANAccess
-LocalPort:                            3001,5173
-Action:                               Allow
-`)
-
-      const ports = getExistingFirewallPorts()
-
-      expect(execSync).toHaveBeenCalledWith(
-        expect.stringContaining('advfirewall firewall show rule name=FreshellLANAccess'),
-        expect.objectContaining({ encoding: 'utf-8' })
-      )
-      expect(ports).toEqual(new Set([3001, 5173]))
-    })
-
-    it('returns empty set when rule does not exist', () => {
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('No rules match the specified criteria')
-      })
-
-      const ports = getExistingFirewallPorts()
-
-      expect(ports.size).toBe(0)
-    })
-  })
-
   describe('needsFirewallUpdate', () => {
     it('returns true when required port is missing from firewall', () => {
       const existing = new Set([5173])
@@ -473,195 +325,6 @@ Action:                               Allow
     })
   })
 
-  describe('computeWslPortForwardingPlan', () => {
-    it('returns not-wsl2 when not running in WSL2', () => {
-      vi.mocked(isWSL2).mockReturnValue(false)
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({ status: 'not-wsl2' })
-    })
-
-    it('returns error when WSL IP cannot be detected', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync).mockImplementation(() => {
-        throw new Error('Command failed')
-      })
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({
-        status: 'error',
-        message: 'Failed to detect WSL2 IP address',
-      })
-    })
-
-    it('returns noop when port forwarding and firewall are already correct', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001\n`)
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({
-        status: 'noop',
-        wslIp: '172.30.149.249',
-      })
-    })
-
-    it('returns noop when live Windows exposure is correct and only managed metadata is stale', async () => {
-      await persistManagedWslRemoteAccessPorts([5173])
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-        .mockReturnValueOnce('Rule Name: FreshellLANAccess\nLocalPort: 3001\n')
-
-      expect(computeWslPortForwardingPlan([3001], [3001])).toEqual({
-        status: 'noop',
-        wslIp: '172.30.149.249',
-      })
-    })
-
-    it('returns a firewall-only repair plan when only the firewall drifted', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3011\n`)
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({
-        status: 'ready',
-        wslIp: '172.30.149.249',
-        scriptKind: 'firewall-only',
-        script: expect.stringContaining('FreshellLANAccess'),
-      })
-    })
-
-    it('returns a full repair plan when portproxy rules are missing', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce('')
-        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001\n`)
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({
-        status: 'ready',
-        wslIp: '172.30.149.249',
-        scriptKind: 'full',
-        script: expect.stringContaining('portproxy add'),
-      })
-    })
-
-    it('returns a full repair plan when portproxy rules point at the wrong IP or port', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.250  4000
-`)
-        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001\n`)
-
-      expect(computeWslPortForwardingPlan([3001])).toEqual({
-        status: 'ready',
-        wslIp: '172.30.149.249',
-        scriptKind: 'full',
-        script: expect.stringContaining('connectaddress=172.30.149.249 connectport=3001'),
-      })
-    })
-
-    it('returns a full repair plan when stale old dev-mode API-port exposure remains after the single-port upgrade', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-0.0.0.0         5173        172.30.149.249  5173
-`)
-        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001,5173\n`)
-
-      const plan = computeWslPortForwardingPlan([5173])
-      expect(plan).toEqual({
-        status: 'ready',
-        wslIp: '172.30.149.249',
-        scriptKind: 'full',
-        script: expect.stringContaining('listenport=3001'),
-      })
-      if (plan.status === 'ready') {
-        expect(plan.script).toContain('listenport=3001')
-        expect(plan.script).toContain('listenport=5173')
-        expect(plan.script).not.toContain('connectport=3001')
-        expect(plan.script).toContain('connectport=5173')
-        expect(plan.script).toContain('localport=5173')
-        expect(plan.script).not.toContain('localport=3001,5173')
-      }
-    })
-
-    it('returns a full repair plan when stale legacy Freshell portproxy-only drift remains on an internal port', async () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
-        if (cmd === 'ip') {
-          cb?.(null, 'inet 172.30.149.249/20 scope global eth0\n', '')
-          return {} as any
-        }
-
-        if (args[0] === 'interface') {
-          cb?.(null, `
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-0.0.0.0         5173        172.30.149.249  5173
-0.0.0.0         8080        10.0.0.8       8080
-`, '')
-          return {} as any
-        }
-
-        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
-        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
-        return {} as any
-      })
-
-      const plan = await (computeWslPortForwardingPlanAsync as any)([5173], [3001, 5173])
-      expect(plan).toEqual({
-        status: 'ready',
-        wslIp: '172.30.149.249',
-        scriptKind: 'full',
-        script: expect.stringContaining('listenport=3001'),
-      })
-      if (plan.status === 'ready') {
-        expect(plan.script).toContain('listenport=3001')
-        expect(plan.script).toContain('listenport=5173')
-        expect(plan.script).not.toContain('listenport=8080')
-        expect(plan.script).not.toContain('connectport=3001')
-        expect(plan.script).toContain('connectport=5173')
-      }
-    })
-  })
-
   describe('buildPortForwardingTeardownScript', () => {
     it('removes relevant portproxy rules and the Freshell firewall rule', () => {
       const script = buildPortForwardingTeardownScript([3001, 5173])
@@ -673,52 +336,15 @@ Address         Port        Address         Port
     })
   })
 
-  describe('computeWslPortForwardingTeardownPlan', () => {
-    it('returns not-wsl2 when not running in WSL2', () => {
+  describe('computeWslPortForwardingTeardownPlanAsync', () => {
+    it('returns not-wsl2 when not running in WSL2', async () => {
       vi.mocked(isWSL2).mockReturnValue(false)
 
-      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({ status: 'not-wsl2' })
-    })
-
-    it('returns noop when no relevant Windows exposure remains', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-`)
-        .mockImplementationOnce(() => {
-          throw new Error('rule not found')
-        })
-
-      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({ status: 'noop' })
-    })
-
-    it('returns a teardown script when Freshell portproxy or firewall exposure still exists', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      vi.mocked(execSync)
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-        .mockReturnValueOnce(`
-Rule Name:                            FreshellLANAccess
-LocalPort:                            3001
-`)
-
-      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({
-        status: 'ready',
-        script: buildPortForwardingTeardownScript([3001]).replace(/\\\$/g, '$'),
+      await expect(computeWslPortForwardingTeardownPlanAsync([3001])).resolves.toEqual({
+        status: 'not-wsl2',
       })
     })
-  })
 
-  describe('computeWslPortForwardingTeardownPlanAsync', () => {
     it('tears down stale old forwarded ports retained in the Freshell firewall rule', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
       vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
@@ -848,6 +474,63 @@ Address         Port        Address         Port
   })
 
   describe('computeWslPortForwardingPlanAsync', () => {
+    it('returns not-wsl2 when not running in WSL2', async () => {
+      vi.mocked(isWSL2).mockReturnValue(false)
+
+      await expect(computeWslPortForwardingPlanAsync([3001])).resolves.toEqual({
+        status: 'not-wsl2',
+      })
+    })
+
+    it('returns an error when the WSL IP cannot be detected', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        cb?.(new Error('command failed'))
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingPlanAsync([3001])).resolves.toEqual({
+        status: 'error',
+        message: 'Failed to detect WSL2 IP address',
+      })
+    })
+
+    it('falls back to hostname -I and skips IPv6 and Docker bridge addresses', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'ip') {
+          cb?.(new Error('eth0 not found'))
+          return {} as any
+        }
+
+        if (cmd === 'hostname') {
+          cb?.(null, 'fe80::1 172.17.0.1 172.30.149.249 10.0.0.5\n', '')
+          return {} as any
+        }
+
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+`, '')
+          return {} as any
+        }
+
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingPlanAsync([3001])).resolves.toEqual({
+        status: 'ready',
+        wslIp: '172.30.149.249',
+        scriptKind: 'full',
+        script: expect.stringContaining('connectaddress=172.30.149.249 connectport=3001'),
+      })
+    })
+
     it('returns noop when live Windows exposure is correct and only managed metadata is stale', async () => {
       await persistManagedWslRemoteAccessPorts([5173])
       vi.mocked(isWSL2).mockReturnValue(true)
@@ -951,51 +634,7 @@ Address         Port        Address         Port
       delete process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD
     })
 
-    it('computeWslPortForwardingPlan returns disabled when env var is "1"', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
-
-      const plan = computeWslPortForwardingPlan([3001])
-
-      expect(plan).toEqual({ status: 'disabled' })
-    })
-
-    it('computeWslPortForwardingPlan returns disabled when env var is "True" (case-insensitive)', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'True'
-
-      const plan = computeWslPortForwardingPlan([3001])
-
-      expect(plan).toEqual({ status: 'disabled' })
-    })
-
-    it('computeWslPortForwardingPlan returns disabled when env var is "yes"', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'yes'
-
-      const plan = computeWslPortForwardingPlan([3001])
-
-      expect(plan).toEqual({ status: 'disabled' })
-    })
-
-    it('computeWslPortForwardingPlan proceeds normally when env var is unset', () => {
-      vi.mocked(isWSL2).mockReturnValue(false)
-
-      const plan = computeWslPortForwardingPlan([3001])
-
-      expect(plan).toEqual({ status: 'not-wsl2' })
-    })
-
-    it('computeWslPortForwardingPlan proceeds normally when env var is "0"', () => {
-      vi.mocked(isWSL2).mockReturnValue(false)
-      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '0'
-
-      const plan = computeWslPortForwardingPlan([3001])
-
-      expect(plan).toEqual({ status: 'not-wsl2' })
-    })
-
-    it('computeWslPortForwardingPlanAsync returns disabled when env var is set', async () => {
+    it('computeWslPortForwardingPlanAsync returns disabled when env var is "1"', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
       process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
 
@@ -1004,11 +643,20 @@ Address         Port        Address         Port
       expect(plan).toEqual({ status: 'disabled' })
     })
 
-    it('computeWslPortForwardingTeardownPlan returns disabled when env var is set', () => {
+    it('computeWslPortForwardingPlanAsync returns disabled when env var is "True" (case-insensitive)', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
-      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'True'
 
-      const plan = computeWslPortForwardingTeardownPlan([3001])
+      const plan = await computeWslPortForwardingPlanAsync([3001])
+
+      expect(plan).toEqual({ status: 'disabled' })
+    })
+
+    it('computeWslPortForwardingPlanAsync returns disabled when env var is "yes"', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.FRESHELL_DISABLE_WSL_PORT_FORWARD = 'yes'
+
+      const plan = await computeWslPortForwardingPlanAsync([3001])
 
       expect(plan).toEqual({ status: 'disabled' })
     })

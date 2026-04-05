@@ -142,4 +142,107 @@ describe('pane activity', () => {
       `claude:${freshSessionId}`,
     ])
   })
+
+  it('prefers timelineSessionId for busy freshclaude panes during restore gaps', () => {
+    const busySessionKeys = collectBusySessionKeys({
+      tabs: [
+        {
+          id: 'tab-fresh',
+          title: 'Fresh',
+          createRequestId: 'req-fresh',
+          status: 'running',
+          mode: 'shell',
+          shell: 'system',
+          createdAt: 1,
+        },
+      ],
+      paneLayouts: {
+        'tab-fresh': {
+          type: 'leaf',
+          id: 'pane-fresh',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-fresh',
+            sessionId: 'sdk-restore-1',
+            resumeSessionId: 'stale-resume',
+            status: 'running',
+          },
+        },
+      },
+      codexActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {
+        'sdk-restore-1': {
+          sessionId: 'sdk-restore-1',
+          timelineSessionId: 'canonical-session-1',
+          status: 'running',
+          messages: [],
+          timelineItems: [],
+          timelineBodies: {},
+          streamingText: '',
+          streamingActive: true,
+          pendingPermissions: {},
+          pendingQuestions: {},
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+        },
+      },
+    })
+
+    expect(busySessionKeys).toEqual(['claude:canonical-session-1'])
+  })
+
+  it('prefers a canonical cliSessionId over a named timelineSessionId for busy freshclaude panes', () => {
+    const busySessionKeys = collectBusySessionKeys({
+      tabs: [
+        {
+          id: 'tab-fresh',
+          title: 'Fresh',
+          createRequestId: 'req-fresh',
+          status: 'running',
+          mode: 'shell',
+          shell: 'system',
+          createdAt: 1,
+        },
+      ],
+      paneLayouts: {
+        'tab-fresh': {
+          type: 'leaf',
+          id: 'pane-fresh',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-fresh',
+            sessionId: 'sdk-restore-2',
+            resumeSessionId: 'stale-resume',
+            status: 'running',
+          },
+        },
+      },
+      codexActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {
+        'sdk-restore-2': {
+          sessionId: 'sdk-restore-2',
+          timelineSessionId: 'named-resume',
+          cliSessionId: '00000000-0000-4000-8000-000000000321',
+          status: 'running',
+          messages: [],
+          timelineItems: [],
+          timelineBodies: {},
+          streamingText: '',
+          streamingActive: true,
+          pendingPermissions: {},
+          pendingQuestions: {},
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+        },
+      },
+    })
+
+    expect(busySessionKeys).toEqual(['claude:00000000-0000-4000-8000-000000000321'])
+  })
 })

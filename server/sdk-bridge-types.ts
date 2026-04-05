@@ -77,7 +77,9 @@ export interface SdkSessionState {
   tools?: Array<{ name: string }>
   status: SdkSessionStatus
   createdAt: number
-  messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string }>
+  messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp: string; model?: string; messageId?: string }>
+  streamingActive: boolean
+  streamingText: string
   pendingPermissions: Map<string, {
     toolName: string
     input: Record<string, unknown>
@@ -95,4 +97,17 @@ export interface SdkSessionState {
   costUsd: number
   totalInputTokens: number
   totalOutputTokens: number
+}
+
+export interface SdkReplayState {
+  watermark: number
+  session: SdkSessionState
+}
+
+export interface SdkReplayGate {
+  capture: () => SdkReplayState | null
+}
+
+export type SdkCreatedSession = SdkSessionState & {
+  replayGate: SdkReplayGate
 }

@@ -92,6 +92,10 @@ describe('sdk-message-handler', () => {
       sessionId: 's1',
       latestTurnId: 'turn-9',
       status: 'idle',
+      timelineSessionId: 'cli-1',
+      revision: 2,
+      streamingActive: true,
+      streamingText: 'partial reply',
     })
 
     expect(handled).toBe(true)
@@ -101,6 +105,60 @@ describe('sdk-message-handler', () => {
       sessionId: 's1',
       latestTurnId: 'turn-9',
       status: 'idle',
+      timelineSessionId: 'cli-1',
+      revision: 2,
+      streamingActive: true,
+      streamingText: 'partial reply',
+    })
+  })
+
+  it('dispatches createFailed on sdk.create.failed without fabricating a session id', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.create.failed',
+      requestId: 'req-1',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/createFailed',
+      payload: {
+        requestId: 'req-1',
+        code: 'RESTORE_INTERNAL',
+        message: 'boom',
+        retryable: true,
+      },
+    })
+  })
+
+  it('dispatches sessionMetadataReceived on sdk.session.metadata', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.session.metadata',
+      sessionId: 's1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+      cwd: '/home/user',
+      tools: [{ name: 'Bash' }],
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/sessionMetadataReceived',
+      payload: {
+        sessionId: 's1',
+        cliSessionId: 'cli-abc',
+        model: 'claude-opus-4-6',
+        cwd: '/home/user',
+        tools: [{ name: 'Bash' }],
+      },
     })
   })
 
@@ -117,6 +175,26 @@ describe('sdk-message-handler', () => {
 
     expect(handled).toBe(true)
     expect(calls[0].type).toBe('agentChat/turnResult')
+  })
+
+  it('marks streaming inactive without clearing partial text on content_block_stop', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.stream',
+      sessionId: 's1',
+      event: { type: 'content_block_stop' },
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0]).toEqual({
+      type: 'agentChat/setStreaming',
+      payload: {
+        sessionId: 's1',
+        active: false,
+      },
+    })
   })
 
   it('returns false for unknown message types', () => {

@@ -309,14 +309,16 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       ],
       nextCursor: null,
       revision: 2,
-    })
-    getAgentTurnBody.mockResolvedValue({
-      sessionId: 'cli-abc',
-      turnId: 'turn-2',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'Hydrated split-pane turn' }],
-        timestamp: '2026-03-10T10:01:00.000Z',
+      bodies: {
+        'turn-2': {
+          sessionId: 'cli-abc',
+          turnId: 'turn-2',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Hydrated split-pane turn' }],
+            timestamp: '2026-03-10T10:01:00.000Z',
+          },
+        },
       },
     })
 
@@ -340,15 +342,11 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-abc',
-        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })
-    expect(getAgentTurnBody).toHaveBeenCalledWith(
-      'cli-abc',
-      'turn-2',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    )
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
     expect(await screen.findByText('Hydrated split-pane turn')).toBeInTheDocument()
   })
 
@@ -619,10 +617,8 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       ],
       nextCursor: null,
       revision: 2,
-    })
-    getAgentTurnBody.mockImplementation(async (_sessionId: string, turnId: string) => {
-      if (turnId === 'turn-3') {
-        return {
+      bodies: {
+        'turn-3': {
           sessionId: 'cli-abc',
           turnId: 'turn-3',
           message: {
@@ -630,9 +626,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
             content: [{ type: 'text', text: 'Newest visible turn body' }],
             timestamp: '2026-03-10T10:02:00.000Z',
           },
-        }
-      }
-
+        },
+      },
+    })
+    getAgentTurnBody.mockImplementation(async (_sessionId: string, turnId: string) => {
       return {
         sessionId: 'cli-abc',
         turnId: 'turn-2',
@@ -672,7 +669,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
         'cli-abc',
-        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
     })

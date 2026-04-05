@@ -126,6 +126,52 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('serializes includeBodies=true for the first visible agent timeline request', async () => {
+    const signal = new AbortController().signal
+    mockFetch.mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
+
+    await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true }, { signal })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/agent-sessions/session-1/timeline?priority=visible&includeBodies=true',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+  })
+
+  it('pins restore revision onto both agent timeline and turn-body requests', async () => {
+    const signal = new AbortController().signal
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
+      .mockResolvedValueOnce(mockJson({ turnId: 'turn-7', body: [] }))
+
+    await getAgentTimelinePage(
+      'session-1',
+      { priority: 'visible', revision: 13, includeBodies: true },
+      { signal },
+    )
+    await getAgentTurnBody('session-1', 'turn-7', { revision: 13, signal })
+
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/agent-sessions/session-1/timeline?priority=visible&revision=13&includeBodies=true',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/agent-sessions/session-1/turns/turn-7?revision=13',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+  })
+
   it('terminal view helpers target only viewport, scrollback, and search routes while forwarding AbortSignal', async () => {
     const signal = new AbortController().signal
     mockFetch

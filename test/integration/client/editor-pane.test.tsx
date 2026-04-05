@@ -183,6 +183,10 @@ async function selectEditorFromPicker(user: ReturnType<typeof userEvent.setup>) 
   fireEvent.transitionEnd(picker)
 }
 
+async function findEditorPathInput() {
+  return screen.findByPlaceholderText(/enter file path/i, {}, { timeout: 3_000 })
+}
+
 describe('Editor Pane Integration', () => {
   let store: ReturnType<typeof createTestStore>
   let fetchRouter: ReturnType<typeof createRoutedFetch>
@@ -274,9 +278,7 @@ describe('Editor Pane Integration', () => {
     await selectEditorFromPicker(user)
 
     // Should see the path input
-    await waitFor(() => {
-      expect(screen.getByPlaceholderText(/enter file path/i)).toBeInTheDocument()
-    })
+    expect(await findEditorPathInput()).toBeInTheDocument()
   })
 
   it('loads file when path is entered', async () => {
@@ -316,7 +318,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await findEditorPathInput()
     await user.clear(input)
     await user.type(input, '/test.md{Enter}')
 
@@ -371,7 +373,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await findEditorPathInput()
     await user.clear(input)
     await user.type(input, '/code.ts{Enter}')
 
@@ -422,7 +424,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await findEditorPathInput()
     await user.clear(input)
     await user.type(input, '/readme.md{Enter}')
 
@@ -474,7 +476,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await findEditorPathInput()
     await user.clear(input)
     await user.type(input, '/readme.md{Enter}')
 
@@ -580,7 +582,7 @@ describe('Editor Pane Integration', () => {
       </Provider>
     )
 
-    const input = screen.getByPlaceholderText(/enter file path/i)
+    const input = await findEditorPathInput()
     await user.clear(input)
     await user.type(input, '/nonexistent.ts{Enter}')
 

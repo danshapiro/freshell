@@ -30,6 +30,12 @@ export interface AgentTimelineItem {
   timestamp?: string
 }
 
+export interface AgentTimelineTurn {
+  sessionId: string
+  turnId: string
+  message: ChatMessage
+}
+
 export interface PermissionRequest {
   requestId: string
   subtype: string
@@ -56,9 +62,17 @@ export interface QuestionRequest {
   questions: QuestionDefinition[]
 }
 
+export interface PendingCreateFailure {
+  code: string
+  message: string
+  retryable?: boolean
+}
+
 export interface ChatSessionState {
   sessionId: string
   cliSessionId?: string
+  timelineSessionId?: string
+  timelineRevision?: number
   cwd?: string
   model?: string
   latestTurnId?: string | null
@@ -80,8 +94,14 @@ export interface ChatSessionState {
   lastError?: string
   /** True after a fresh create or the first timeline window establishes restore state. */
   historyLoaded?: boolean
+  /** True while a resumed create must wait for the durable Claude id before hydrating backlog. */
+  awaitingDurableHistory?: boolean
   /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
   lost?: boolean
+  /** Number of restore restarts already requested for stale-revision handling. */
+  restoreRetryCount?: number
+  /** Last restore-specific failure code surfaced during hydration. */
+  restoreFailureCode?: string
 }
 
 export interface PendingAgentCreate {
@@ -93,6 +113,8 @@ export interface AgentChatState {
   sessions: Record<string, ChatSessionState>
   /** Maps createRequestId -> sessionId for correlating sdk.created responses */
   pendingCreates: Record<string, PendingAgentCreate>
+  /** Request-scoped pre-session failures keyed by createRequestId. */
+  pendingCreateFailures: Record<string, PendingCreateFailure>
   /** Available models from SDK supportedModels() */
   availableModels: Array<{ value: string; displayName: string; description: string }>
 }

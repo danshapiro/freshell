@@ -1,4 +1,4 @@
-import { createElement, useEffect, useMemo, useState } from 'react'
+import { createElement, memo, useEffect, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -299,7 +299,7 @@ function TabCard({
     <button
       type="button"
       className={cn(
-        'group relative w-full rounded-md border p-3 text-left transition-all select-none',
+        'group relative w-full rounded-md border p-3 text-left transition-all cursor-default select-none',
         'hover:shadow-sm',
         isOpen
           ? 'border-border/60 border-l-2 border-l-emerald-500/70 hover:border-border hover:bg-muted/40'
@@ -310,14 +310,14 @@ function TabCard({
       onClick={onAction}
     >
       {showDevice && (
-        <span className="mb-0.5 block truncate text-2xs uppercase tracking-wide text-muted-foreground/60">
+        <div className="text-2xs text-muted-foreground/60 truncate mb-0.5 uppercase tracking-wide">
           {record.displayDeviceLabel}
-        </span>
+        </div>
       )}
 
-      <span className="block truncate pr-12 text-sm font-medium">{record.tabName}</span>
+      <div className="text-sm font-medium truncate pr-12">{record.tabName}</div>
 
-      <span className="mt-1.5 flex items-center gap-1.5 text-2xs text-muted-foreground">
+      <div className="mt-1.5 flex items-center gap-1.5 text-2xs text-muted-foreground">
         {paneKinds.map((kind) => {
           const Icon = paneKindIcon(kind)
           return (
@@ -342,9 +342,9 @@ function TabCard({
           &middot;
         </span>
         <span>{formatRelativeTime(timestamp, now)}</span>
-      </span>
+      </div>
 
-      <span
+      <div
         className={cn(
           'absolute top-2.5 right-2.5 opacity-0 group-hover:opacity-100',
           'transition-opacity pointer-events-none',
@@ -362,7 +362,7 @@ function TabCard({
           {actionLabel}
           <ExternalLink className="h-2.5 w-2.5" />
         </span>
-      </span>
+      </div>
     </button>
   )
 }
@@ -464,7 +464,7 @@ function DeviceSection({
 /*  Main component                                                    */
 /* ------------------------------------------------------------------ */
 
-export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
+function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const ws = useMemo(() => getWsClient(), [])
@@ -798,3 +798,8 @@ export default function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     </div>
   )
 }
+
+const MemoizedTabsView = memo(TabsView)
+MemoizedTabsView.displayName = 'TabsView'
+
+export default MemoizedTabsView
