@@ -321,6 +321,19 @@ function deriveCompatibilityCandidateIds(liveTurns: InternalTurn[]): Set<string>
   )
 }
 
+function refreshTrackedCompatibilityCandidateIds(
+  durableTurns: InternalTurn[],
+  liveTurns: InternalTurn[],
+  previousCandidateIds: ReadonlySet<string>,
+): Set<string> {
+  const durableCompatibilityKeys = new Set(durableTurns.map((turn) => turn.compatibilityKey))
+  return new Set(
+    liveTurns
+      .filter((turn) => previousCandidateIds.has(turn.messageId) || !durableCompatibilityKeys.has(turn.compatibilityKey))
+      .map((turn) => turn.messageId),
+  )
+}
+
 function isCanonicalDurableSessionId(sessionId: string | undefined): sessionId is string {
   return typeof sessionId === 'string' && isValidClaudeSessionId(sessionId)
 }
@@ -490,13 +503,21 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     ledger.revision = revision
     ledger.signature = signature
     ledger.resolution = resolved
-    ledger.compatibilityCandidateIds = resolved.readiness === 'live_only'
-      && (
-        !isCanonicalDurableSessionId(params.timelineSessionId)
-        || params.captureCompatibilityCandidates === true
+    const shouldTrackCompatibilityCandidates = params.liveSession != null && (
+      (
+        resolved.readiness === 'live_only'
+        && (
+          !isCanonicalDurableSessionId(params.timelineSessionId)
+          || params.captureCompatibilityCandidates === true
+        )
       )
-      ? deriveCompatibilityCandidateIds(liveTurns)
-      : new Set(ledger.compatibilityCandidateIds)
+      || ledger.compatibilityCandidateIds.size > 0
+    )
+    ledger.compatibilityCandidateIds = shouldTrackCompatibilityCandidates
+      ? resolved.readiness === 'live_only'
+        ? deriveCompatibilityCandidateIds(liveTurns)
+        : refreshTrackedCompatibilityCandidateIds(durableTurns, liveTurns, ledger.compatibilityCandidateIds)
+      : new Set<string>()
   }
 
   async function buildDurableOnlyResolution(queryId: string, timelineSessionId: string): Promise<RestoreResolution> {

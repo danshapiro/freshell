@@ -554,44 +554,90 @@ describe('restore ledger manager', () => {
     expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-alpha'])
   })
 
-  it('reconciles a single compatible runtime live turn with its durable canonical turn after backlog promotion', async () => {
+  it('reconciles later durable catch-up for runtime live deltas after backlog promotion', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000998'
     const liveSession = makeSession({
-      sessionId: 'sdk-direct-runtime',
+      sessionId: 'sdk-catchup',
       cliSessionId: canonicalSessionId,
-      messages: [makeMessage('user', 'alpha', { messageId: 'live:sdk-direct-runtime:0' })],
+      messages: [
+        makeMessage('user', 'alpha', { messageId: 'live:sdk-catchup:0' }),
+        makeMessage('assistant', 'beta', { messageId: 'live:sdk-catchup:1' }),
+      ],
     })
 
+    const durableAfterPromotion = [
+      makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
+      makeMessage('assistant', 'beta', { messageId: 'durable-beta' }),
+    ]
+    const durableAfterCatchup = [
+      ...durableAfterPromotion,
+      makeMessage('user', 'gamma', { messageId: 'durable-gamma' }),
+    ]
+    const loadSessionHistory = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(durableAfterPromotion)
+      .mockResolvedValueOnce(durableAfterPromotion)
+      .mockResolvedValueOnce(durableAfterCatchup)
+      .mockResolvedValue(durableAfterCatchup)
+
     const manager = createRestoreLedgerManager({
-      loadSessionHistory: vi.fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([
-          makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
-        ])
-        .mockResolvedValue([
-          makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
-        ]),
+      loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
     })
 
-    const first = await manager.resolve('sdk-direct-runtime')
+    const first = await manager.resolve('sdk-catchup')
     expect(first).toMatchObject({
       kind: 'resolved',
       readiness: 'live_only',
-      liveSessionId: 'sdk-direct-runtime',
+      liveSessionId: 'sdk-catchup',
       timelineSessionId: canonicalSessionId,
     })
 
-    const resolved = await manager.resolve('sdk-direct-runtime')
-    expect(resolved).toMatchObject({
+    const second = await manager.resolve('sdk-catchup')
+    expect(second).toMatchObject({
       kind: 'resolved',
       readiness: 'merged',
-      liveSessionId: 'sdk-direct-runtime',
+      liveSessionId: 'sdk-catchup',
       timelineSessionId: canonicalSessionId,
     })
-    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
-    expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-alpha'])
+    if (second.kind !== 'resolved') throw new Error('expected resolved')
+    expect(second.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-alpha',
+      'durable-beta',
+    ])
+
+    liveSession.messages.push(makeMessage('user', 'gamma', { messageId: 'live:sdk-catchup:2' }))
+    await manager.syncLiveSession(liveSession)
+
+    const third = await manager.resolve('sdk-catchup')
+    expect(third).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-catchup',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (third.kind !== 'resolved') throw new Error('expected resolved')
+    expect(third.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-alpha',
+      'durable-beta',
+      'live:sdk-catchup:2',
+    ])
+
+    const fourth = await manager.resolve('sdk-catchup')
+    expect(fourth).toMatchObject({
+      kind: 'resolved',
+      readiness: 'merged',
+      liveSessionId: 'sdk-catchup',
+      timelineSessionId: canonicalSessionId,
+    })
+    if (fourth.kind !== 'resolved') throw new Error('expected resolved')
+    expect(fourth.turns.map((turn) => turn.messageId)).toEqual([
+      'durable-alpha',
+      'durable-beta',
+      'durable-gamma',
+    ])
+    expect(fourth.revision).toBeGreaterThan(third.revision)
   })
 
   it('bumps the ledger revision when a canonical turn changes under a stable message id', async () => {
