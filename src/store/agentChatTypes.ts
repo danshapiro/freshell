@@ -102,7 +102,7 @@ export interface ChatSessionState {
   historyLoaded?: boolean
   /** True while a resumed create must wait for the durable Claude id before hydrating backlog. */
   awaitingDurableHistory?: boolean
-  /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
+  /** True when server reports session is gone (INVALID_SESSION_ID). Triggers recovery once restore handoff is safe. */
   lost?: boolean
   /** Number of restore restarts already requested for stale-revision handling. */
   restoreRetryCount?: number

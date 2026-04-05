@@ -402,12 +402,18 @@ const agentChatSlice = createSlice({
     /** Mark a session as lost (server confirmed it no longer exists).
      *  Creates the session entry if needed (e.g. after page refresh where Redux
      *  was empty) and sets flags that enable AgentChatView to detect the loss
-     *  and trigger immediate recovery. */
+     *  and trigger recovery. If restore hydration already has a pinned snapshot
+     *  but has not loaded the first timeline window yet, keep that hydration
+     *  pending so the rebuilt transcript can render before the pane detaches. */
     markSessionLost(state, action: PayloadAction<{ sessionId: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.awaitingDurableHistory = false
       session.lost = true
-      session.historyLoaded = true
+      const waitingForInitialRestoreWindow = (
+        session.latestTurnId !== undefined
+        && session.historyLoaded !== true
+      )
+      session.historyLoaded = waitingForInitialRestoreWindow ? false : true
     },
 
     restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {

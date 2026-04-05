@@ -160,14 +160,44 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     attachSentRef.current = false
   }, [tabId, paneId, dispatch])
 
-  // Immediate recovery when server confirms session is gone (markSessionLost sets
-  // session.lost = true).
+  // Recover once the server confirms the session is gone. If a pinned restore
+  // snapshot is still waiting on its first timeline window, let that hydrate
+  // first so the rebuilt transcript can render before the pane detaches.
   const sessionLost = !!session?.lost
+  const waitingForInitialRestoreWindow = (
+    sessionLost
+    && session?.latestTurnId !== undefined
+    && session?.historyLoaded === false
+  )
+  const shouldDeferLostRecoveryUntilAfterRestoreRender = (
+    sessionLost
+    && session?.latestTurnId !== undefined
+    && session?.historyLoaded === true
+  )
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!sessionLost || !paneContent.sessionId) return
+    if (waitingForInitialRestoreWindow) return
+    if (shouldDeferLostRecoveryUntilAfterRestoreRender) {
+      const sessionIdForRecovery = paneContent.sessionId
+      const timeoutId = window.setTimeout(() => {
+        if (paneContentRef.current.sessionId !== sessionIdForRecovery) return
+        if (!sessionRef.current?.lost) return
+        triggerRecovery()
+      }, 0)
+      return () => {
+        clearTimeout(timeoutId)
+      }
+    }
     triggerRecovery()
-  }, [sessionLost, paneContent.sessionId, suppressNetworkEffects, triggerRecovery])
+  }, [
+    shouldDeferLostRecoveryUntilAfterRestoreRender,
+    sessionLost,
+    paneContent.sessionId,
+    suppressNetworkEffects,
+    triggerRecovery,
+    waitingForInitialRestoreWindow,
+  ])
 
   useEffect(() => {
     if (suppressNetworkEffects) return

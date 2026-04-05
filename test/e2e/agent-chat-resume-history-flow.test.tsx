@@ -476,6 +476,7 @@ describe('agent chat resume history flow', () => {
         resumeSessionId: canonicalSessionId,
       })
     })
+    wsSend.mockClear()
 
     act(() => {
       handleSdkMessage(store.dispatch, {
@@ -485,6 +486,12 @@ describe('agent chat resume history flow', () => {
         status: 'idle',
         timelineSessionId: canonicalSessionId,
         revision: 5,
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.error',
+        sessionId: 'sdk-stale-778',
+        code: 'INVALID_SESSION_ID',
+        message: 'SDK session not found',
       })
     })
 
@@ -503,17 +510,6 @@ describe('agent chat resume history flow', () => {
         'Recovered durable question',
         'Recovered durable answer',
       ])
-    })
-
-    wsSend.mockClear()
-
-    act(() => {
-      handleSdkMessage(store.dispatch, {
-        type: 'sdk.error',
-        sessionId: 'sdk-stale-778',
-        code: 'INVALID_SESSION_ID',
-        message: 'SDK session not found',
-      })
     })
 
     await waitFor(() => {
