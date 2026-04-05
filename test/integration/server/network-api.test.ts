@@ -32,21 +32,11 @@ vi.mock('is-port-reachable', () => ({
 vi.mock('../../../server/wsl-port-forward.js', () => ({
   isWslPortForwardingDisabledByEnv: vi.fn().mockReturnValue(false),
   clearManagedWslRemoteAccessPorts: vi.fn().mockResolvedValue(undefined),
-  computeWslPortForwardingPlan: vi.fn().mockReturnValue({
-    status: 'ready',
-    wslIp: '172.24.0.2',
-    scriptKind: 'full',
-    script: '$null # mock script',
-  }),
   computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({
     status: 'ready',
     wslIp: '172.24.0.2',
     scriptKind: 'full',
     script: '$null # mock script',
-  }),
-  computeWslPortForwardingTeardownPlan: vi.fn().mockReturnValue({
-    status: 'ready',
-    script: '$null # mock teardown script',
   }),
   computeWslPortForwardingTeardownPlanAsync: vi.fn().mockResolvedValue({
     status: 'ready',
@@ -99,9 +89,7 @@ describe('Network API integration', () => {
     })
     vi.mocked(detectFirewall).mockReset()
     vi.mocked(isPortReachable).mockReset()
-    vi.mocked(wslModule.computeWslPortForwardingPlan).mockReset()
     vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockReset()
-    vi.mocked(wslModule.computeWslPortForwardingTeardownPlan).mockReset()
     vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockReset()
     vi.mocked(wslModule.persistManagedWslRemoteAccessPorts).mockReset()
     vi.mocked(wslModule.clearManagedWslRemoteAccessPorts).mockReset()
@@ -109,21 +97,11 @@ describe('Network API integration', () => {
     delete process.env.HOST
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
     vi.mocked(isPortReachable).mockResolvedValue(false)
-    vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
-      status: 'ready',
-      wslIp: '172.24.0.2',
-      scriptKind: 'full',
-      script: '$null # mock script',
-    })
     vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
       status: 'ready',
       wslIp: '172.24.0.2',
       scriptKind: 'full',
       script: '$null # mock script',
-    })
-    vi.mocked(wslModule.computeWslPortForwardingTeardownPlan).mockReturnValue({
-      status: 'ready',
-      script: '$null # mock teardown script',
     })
     vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
       status: 'ready',
