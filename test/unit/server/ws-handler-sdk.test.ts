@@ -665,7 +665,14 @@ describe('WS Handler SDK Integration', () => {
         expect(statusMsg.status).toBe('idle')
         expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockSdkBridge.getSession).toHaveBeenCalledWith('sdk-sess-1')
-        expect(mockHistorySource.resolve).toHaveBeenCalledWith('sdk-sess-1')
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith(
+          'sdk-sess-1',
+          expect.objectContaining({
+            liveSessionOverride: expect.objectContaining({
+              sessionId: 'sdk-sess-1',
+            }),
+          }),
+        )
         expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
       } finally {
         ws.close()
@@ -1277,6 +1284,114 @@ describe('WS Handler SDK Integration', () => {
 
         await vi.waitFor(() => {
           expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(liveSession.sessionId, 'continue working', undefined)
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('ignores a conflicting sdk.attach resumeSessionId once the direct live SDK session is identified', async () => {
+      const liveDurableSessionId = '00000000-0000-4000-8000-000000000246'
+      const conflictingResumeSessionId = '00000000-0000-4000-8000-000000000999'
+      const liveSession = {
+        sessionId: 'sdk-live-246',
+        cliSessionId: liveDurableSessionId,
+        status: 'running',
+        messages: [makeMessage('user', 'live prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: true,
+        streamingText: 'live partial',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.sendUserMessage.mockImplementation((sessionId: string) => sessionId === liveSession.sessionId)
+
+      mockHistorySource.resolve.mockImplementation(async (queryId: string, options?: { liveSessionOverride?: typeof liveSession }) => {
+        if (options?.liveSessionOverride?.sessionId === liveSession.sessionId) {
+          return makeResolvedHistory({
+            queryId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: liveDurableSessionId,
+            revision: 246,
+            messages: [
+              makeMessage('user', 'older prompt', '2026-03-10T10:00:00.000Z'),
+              makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
+              makeMessage('user', 'live prompt', '2026-03-10T10:02:00.000Z'),
+            ],
+          })
+        }
+        return makeResolvedHistory({
+          queryId,
+          timelineSessionId: conflictingResumeSessionId,
+          revision: 999,
+          messages: [
+            makeMessage('assistant', 'wrong hinted history', '2026-03-10T09:59:00.000Z'),
+          ],
+        })
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectedAttach = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            const snapshotReceived = messages.some((m) => m.type === 'sdk.session.snapshot')
+            const statusReceived = messages.some((m) => m.type === 'sdk.status')
+            if (snapshotReceived && statusReceived) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: liveSession.sessionId,
+          resumeSessionId: conflictingResumeSessionId,
+        }))
+
+        await collectedAttach
+
+        expect(mockHistorySource.resolve).toHaveBeenCalledWith(
+          conflictingResumeSessionId,
+          { liveSessionOverride: liveSession },
+        )
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')).toEqual(expect.objectContaining({
+          type: 'sdk.session.snapshot',
+          sessionId: liveSession.sessionId,
+          status: 'running',
+          timelineSessionId: liveDurableSessionId,
+          revision: 246,
+          streamingActive: true,
+          streamingText: 'live partial',
+        }))
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')?.latestTurnId).toBe('turn-2')
+        expect(messages.find((m) => m.type === 'sdk.status')).toEqual({
+          type: 'sdk.status',
+          sessionId: liveSession.sessionId,
+          status: 'running',
+        })
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')?.timelineSessionId).not.toBe(conflictingResumeSessionId)
+        expect(messages.find((m) => m.type === 'sdk.session.snapshot')?.revision).not.toBe(999)
+
+        ws.send(JSON.stringify({
+          type: 'sdk.send',
+          sessionId: liveSession.sessionId,
+          text: 'continue working',
+        }))
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(
+            liveSession.sessionId,
+            'continue working',
+            undefined,
+          )
         })
       } finally {
         ws.close()

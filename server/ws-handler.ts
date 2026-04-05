@@ -967,7 +967,10 @@ export class WsHandler {
   ) {
     let resolved = opts.resolvedHistory ?? null
     if (!resolved) {
-      resolved = await this.agentHistorySource?.resolve(opts.historyQueryId) ?? null
+      resolved = await this.agentHistorySource?.resolve(
+        opts.historyQueryId,
+        opts.liveSession ? { liveSessionOverride: opts.liveSession } : undefined,
+      ) ?? null
     }
     if (resolved?.kind === 'fatal' || resolved?.kind === 'missing') {
       return resolved
