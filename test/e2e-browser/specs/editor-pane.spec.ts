@@ -1,6 +1,18 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Editor Pane', () => {
+  async function waitForEditorPane(page: any) {
+    const loadingShell = page.locator('[data-testid="editor-pane-loading"]')
+    const editorPane = page.locator('[data-testid="editor-pane"]')
+
+    await Promise.race([
+      loadingShell.waitFor({ state: 'visible', timeout: 2_000 }).then(async () => {
+        await editorPane.waitFor({ state: 'visible', timeout: 15_000 })
+      }),
+      editorPane.waitFor({ state: 'visible', timeout: 15_000 }),
+    ])
+  }
+
   // Helper: create an editor pane via context menu split + picker.
   // Context menu on terminal shows "Split horizontally" (role="menuitem").
   // PanePicker buttons have aria-label matching the label text.
@@ -14,8 +26,7 @@ test.describe('Editor Pane', () => {
     await expect(editorButton).toBeVisible({ timeout: 10_000 })
     await editorButton.click()
 
-    // Wait for the editor pane to render (has data-testid="editor-pane")
-    await page.locator('[data-testid="editor-pane"]').waitFor({ state: 'visible', timeout: 15_000 })
+    await waitForEditorPane(page)
   }
 
   test('opens editor pane via pane picker', async ({ freshellPage, page, harness, terminal }) => {
@@ -31,6 +42,36 @@ test.describe('Editor Pane', () => {
       c.type === 'leaf' && c.content?.kind === 'editor'
     )
     expect(hasEditor).toBe(true)
+  })
+
+  test('loads the editor lazily and requests a new JS asset after the click', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+
+    const jsRequestsAfterClick: string[] = []
+    const requestListener = (request: any) => {
+      const url = request.url()
+      if (request.resourceType() === 'script' || /\.js(?:\?|$)/.test(url)) {
+        jsRequestsAfterClick.push(url)
+      }
+    }
+
+    page.on('request', requestListener)
+    try {
+      const termContainer = page.locator('.xterm').first()
+      await termContainer.click({ button: 'right' })
+      await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+
+      const editorButton = page.getByRole('button', { name: /^Editor$/i })
+      await expect(editorButton).toBeVisible({ timeout: 10_000 })
+      await editorButton.click()
+
+      await waitForEditorPane(page)
+
+      expect(jsRequestsAfterClick.length).toBeGreaterThan(0)
+      await expect(page.locator('[data-testid="editor-pane"]')).toHaveScreenshot('editor-pane-loaded.png')
+    } finally {
+      page.off('request', requestListener)
+    }
   })
 
   test('editor pane has path input and open button', async ({ freshellPage, page, terminal }) => {

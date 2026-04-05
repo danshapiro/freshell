@@ -115,11 +115,14 @@ vi.mock('@/components/panes/BrowserPane', () => ({
 }))
 
 // Mock EditorPane component to avoid fetch side effects in tests
-vi.mock('@/components/panes/EditorPane', () => ({
-  default: ({ paneId }: { paneId: string }) => (
-    <div data-testid={`editor-${paneId}`}>Editor</div>
-  ),
-}))
+vi.mock('@/components/panes/EditorPane', async () => {
+  await Promise.resolve()
+  return {
+    default: ({ paneId }: { paneId: string }) => (
+      <div data-testid={`editor-${paneId}`}>Editor</div>
+    ),
+  }
+})
 
 function createTerminalContent(): PaneContent {
   return {
@@ -297,6 +300,34 @@ describe('PaneLayout', () => {
 
       // Should render the terminal
       expect(screen.getByTestId(`terminal-${existingPaneId}`)).toBeInTheDocument()
+    })
+
+    it('renders an editor pane through the lazy boundary', async () => {
+      const existingPaneId = 'pane-editor'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: existingPaneId,
+            content: {
+              kind: 'editor',
+              filePath: '/tmp/test.md',
+              language: 'markdown',
+              content: '# hi',
+              readOnly: false,
+              viewMode: 'source',
+            },
+          },
+        },
+        activePane: { 'tab-1': existingPaneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store
+      )
+
+      expect(await screen.findByTestId(`editor-${existingPaneId}`)).toBeInTheDocument()
     })
 
     it('renders FloatingActionButton', async () => {
