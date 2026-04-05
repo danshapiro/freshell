@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { loadAgentTurnBody } from '@/store/agentChatThunks'
 import agentChatReducer, {
   addAssistantMessage,
   addUserMessage,
@@ -680,8 +681,8 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(getAgentTimelinePage).not.toHaveBeenCalled()
   })
 
-  it('allows a later stale restore cycle in the same pane to issue its own retry attach after hydration succeeds', async () => {
-    getAgentTimelinePage.mockRejectedValueOnce({
+  it('does not reattach or re-enter restoring when a later stale turn-body read fails after hydration succeeds', async () => {
+    getAgentTurnBody.mockRejectedValueOnce({
       status: 409,
       message: 'Stale restore revision',
       details: {
@@ -705,36 +706,46 @@ describe('AgentChatView reload/restore behavior', () => {
       </Provider>,
     )
 
-    await waitFor(() => {
-      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
-      expect(attachCalls).toHaveLength(2)
-    })
-
     act(() => {
       store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
-        items: [],
+        items: [
+          makeTimelineItem('turn-2', 'user', 'Hydrated summary', {
+            sessionId: 'cli-sess-1',
+            ordinal: 2,
+            timestamp: '2026-03-10T10:01:00.000Z',
+          }),
+        ],
         nextCursor: null,
-        revision: 13,
+        revision: 12,
+        replace: true,
+      }))
+      store.dispatch(turnBodyReceived({
+        sessionId: 'sess-reload-1',
+        turn: makeTimelineTurn('turn-2', 'user', 'Hydrated body', {
+          sessionId: 'cli-sess-1',
+          ordinal: 2,
+          timestamp: '2026-03-10T10:01:00.000Z',
+        }),
       }))
     })
 
-    act(() => {
-      store.dispatch(restoreRetryRequested({
+    expect(await screen.findByText('Hydrated body')).toBeInTheDocument()
+    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
+    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')).toHaveLength(1)
+
+    await act(async () => {
+      await store.dispatch(loadAgentTurnBody({
         sessionId: 'sess-reload-1',
-        code: 'RESTORE_STALE_REVISION',
+        timelineSessionId: 'cli-sess-1',
+        turnId: 'turn-7',
       }))
     })
 
-    await waitFor(() => {
-      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
-      expect(attachCalls).toHaveLength(3)
-      expect(attachCalls[2]?.[0]).toEqual({
-        type: 'sdk.attach',
-        sessionId: 'sess-reload-1',
-        resumeSessionId: 'cli-sess-1',
-      })
-    })
+    expect(screen.getByText('Hydrated body')).toBeInTheDocument()
+    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
+    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')).toHaveLength(1)
   })
 
   it('defers restored timeline hydration while hidden and fetches exactly once when the pane becomes visible', async () => {

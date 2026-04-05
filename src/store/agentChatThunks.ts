@@ -115,8 +115,12 @@ export const loadAgentTurnBody = createAsyncThunk<
         throw error
       }
 
-      if (isStaleRevisionError(error) && requestStaleRestoreRetry(sessionId, dispatch, getState)) {
-        return
+      if (isStaleRevisionError(error)) {
+        dispatch(timelineLoadFailed({
+          sessionId,
+          message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        }))
+        throw error
       }
 
       dispatch(timelineLoadFailed({

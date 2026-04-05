@@ -3,6 +3,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import agentChatReducer, {
   restoreRetryRequested,
   sessionSnapshotReceived,
+  timelinePageReceived,
   turnBodyReceived,
 } from '@/store/agentChatSlice'
 import {
@@ -391,7 +392,7 @@ describe('agentChatThunks', () => {
     )
   })
 
-  it('restarts restore instead of leaving stale turn-body hydration pinned to an old revision', async () => {
+  it('keeps hydrated timeline state intact when a later turn-body read returns RESTORE_STALE_REVISION', async () => {
     const staleError = makeStaleApiError(13)
     getAgentTurnBody.mockRejectedValue(staleError)
 
@@ -403,15 +404,26 @@ describe('agentChatThunks', () => {
       timelineSessionId: 'cli-sess-3',
       revision: 12,
     }))
-    store.dispatch(turnBodyReceived({
+    store.dispatch(timelinePageReceived({
       sessionId: 'sdk-sess-3',
-      turn: makeTimelineTurn('turn-2', 'assistant', 'Stale hydrated body', {
-        sessionId: 'cli-sess-3',
-        ordinal: 2,
-      }),
+      items: [
+        makeTimelineItem('turn-2', 'assistant', 'Hydrated summary', {
+          sessionId: 'cli-sess-3',
+          ordinal: 2,
+        }),
+      ],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+      bodies: {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Hydrated body', {
+          sessionId: 'cli-sess-3',
+          ordinal: 2,
+        }),
+      },
     }))
 
-    await store.dispatch(loadAgentTurnBody({
+    const action = await store.dispatch(loadAgentTurnBody({
       sessionId: 'sdk-sess-3',
       timelineSessionId: 'cli-sess-3',
       turnId: 'turn-7',
@@ -423,15 +435,24 @@ describe('agentChatThunks', () => {
       'turn-7',
       expect.objectContaining({ signal: expect.any(AbortSignal), revision: 12 }),
     )
-    expect(session.historyLoaded).toBe(false)
-    expect(session.timelineBodies).toEqual({})
-    expect(session.timelineRevision).toBeUndefined()
-    expect(session.latestTurnId).toBeUndefined()
-    expect(session.restoreRetryCount).toBe(1)
-    expect(session.restoreFailureCode).toBe('RESTORE_STALE_REVISION')
+    expect(action.type).toBe('agentChat/loadTurnBody/rejected')
+    expect(session.historyLoaded).toBe(true)
+    expect(session.timelineBodies).toEqual({
+      'turn-2': expect.objectContaining({
+        turnId: 'turn-2',
+        message: expect.objectContaining({
+          content: [{ type: 'text', text: 'Hydrated body' }],
+        }),
+      }),
+    })
+    expect(session.timelineRevision).toBe(12)
+    expect(session.latestTurnId).toBe('turn-2')
+    expect(session.restoreRetryCount).toBe(0)
+    expect(session.restoreFailureCode).toBeUndefined()
+    expect(session.timelineError).toBe('Stale restore revision')
   })
 
-  it('surfaces the real ApiError message after a second stale turn-body response', async () => {
+  it('surfaces a stale turn-body error without starting another restore cycle after a prior successful retry', async () => {
     getAgentTurnBody.mockRejectedValue(makeStaleApiError(14))
 
     const store = makeStore()
@@ -453,15 +474,37 @@ describe('agentChatThunks', () => {
       timelineSessionId: 'cli-sess-3b',
       revision: 14,
     }))
+    store.dispatch(timelinePageReceived({
+      sessionId: 'sdk-sess-3b',
+      items: [
+        makeTimelineItem('turn-2', 'assistant', 'Recovered summary', {
+          sessionId: 'cli-sess-3b',
+          ordinal: 2,
+        }),
+      ],
+      nextCursor: null,
+      revision: 14,
+      replace: true,
+      bodies: {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Recovered body', {
+          sessionId: 'cli-sess-3b',
+          ordinal: 2,
+        }),
+      },
+    }))
 
-    await store.dispatch(loadAgentTurnBody({
+    const action = await store.dispatch(loadAgentTurnBody({
       sessionId: 'sdk-sess-3b',
       timelineSessionId: 'cli-sess-3b',
       turnId: 'turn-7',
     }))
 
     const session = store.getState().agentChat.sessions['sdk-sess-3b']
-    expect(session.restoreRetryCount).toBe(1)
+    expect(action.type).toBe('agentChat/loadTurnBody/rejected')
+    expect(session.restoreRetryCount).toBe(0)
+    expect(session.historyLoaded).toBe(true)
+    expect(session.latestTurnId).toBe('turn-2')
+    expect(session.restoreFailureCode).toBeUndefined()
     expect(session.timelineError).toBe('Stale restore revision')
   })
 
