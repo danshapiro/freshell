@@ -3,7 +3,7 @@ import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
-import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
+import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
@@ -15,6 +15,8 @@ beforeAll(() => {
 })
 
 const wsSend = vi.fn()
+const getAgentTimelinePage = vi.fn()
+const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -22,6 +24,15 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: vi.fn(() => vi.fn()),
   }),
 }))
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
+    setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
+  }
+})
 
 function makeStore() {
   return configureStore({
@@ -53,6 +64,8 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    getAgentTimelinePage.mockReset()
+    setSessionMetadata.mockClear()
     vi.useRealTimers()
   })
 
@@ -118,6 +131,101 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
     )
     expect(createCalls).toHaveLength(1)
     expect(createCalls[0][0].resumeSessionId).toBe('cli-session-to-resume')
+  })
+
+  it('recovers with timelineSessionId from sdk.session.snapshot even when the session is marked lost before sdk.session.init', async () => {
+    let resolveTimelinePage: ((value: {
+      sessionId: string
+      items: Array<Record<string, unknown>>
+      nextCursor: null
+      revision: number
+      bodies: Record<string, unknown>
+    }) => void) | undefined
+    getAgentTimelinePage.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveTimelinePage = resolve
+    }))
+
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-stale',
+      sessionId: 'sdk-stale-1',
+      status: 'idle',
+      resumeSessionId: 'named-resume',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-stale-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: 'cli-session-abc-123',
+        revision: 2,
+      }))
+      store.dispatch(markSessionLost({ sessionId: 'sdk-stale-1' }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'cli-session-abc-123',
+        expect.objectContaining({ priority: 'visible', revision: 2, includeBodies: true }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+
+    expect(wsSend.mock.calls.some((call: any[]) => call[0]?.type === 'sdk.create')).toBe(false)
+
+    await act(async () => {
+      resolveTimelinePage?.({
+        sessionId: 'cli-session-abc-123',
+        items: [
+          {
+            turnId: 'turn-2',
+            sessionId: 'cli-session-abc-123',
+            role: 'assistant',
+            summary: 'Recovered answer',
+            timestamp: '2026-03-10T10:00:20.000Z',
+          },
+        ],
+        nextCursor: null,
+        revision: 2,
+        bodies: {
+          'turn-2': {
+            sessionId: 'cli-session-abc-123',
+            turnId: 'turn-2',
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Recovered durable answer' }],
+              timestamp: '2026-03-10T10:00:20.000Z',
+            },
+          },
+        },
+      })
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      const createCalls = wsSend.mock.calls.filter((call: any[]) => call[0]?.type === 'sdk.create')
+      expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe('cli-session-abc-123')
+    })
   })
 })
 

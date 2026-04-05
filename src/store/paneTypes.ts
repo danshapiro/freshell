@@ -67,7 +67,13 @@ export type PickerPaneContent = {
 }
 
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
-export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
+export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
+
+export type AgentChatCreateError = {
+  code: string
+  message: string
+  retryable?: boolean
+}
 
 /**
  * Agent chat pane — rich chat UI powered by a configurable provider.
@@ -88,6 +94,8 @@ export type AgentChatPaneContent = {
   sessionRef?: SessionLocator
   /** Working directory */
   initialCwd?: string
+  /** Request-scoped create failure promoted into pane-local visible state. */
+  createError?: AgentChatCreateError
   /** Model to use (default from provider config) */
   model?: string
   /** Permission mode (default from provider config) */

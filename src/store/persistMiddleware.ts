@@ -8,6 +8,7 @@ import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
+import { flushPersistedLayoutNow } from './persistControl'
 
 
 const log = createLogger('PanesPersist')
@@ -371,7 +372,6 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let tabsDirty = false
   let panesDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
-  const sessionPersistedAt = Date.now()
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
@@ -415,7 +415,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       const layoutPayload = {
-        persistedAt: sessionPersistedAt,
+        persistedAt: Date.now(),
         version: LAYOUT_SCHEMA_VERSION,
         tabs: {
           activeTabId: state.tabs.activeTabId,
@@ -455,6 +455,10 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     const result = next(action)
 
     const a = action as any
+    if (a?.type === flushPersistedLayoutNow.type) {
+      flushNow()
+      return result
+    }
     if (a?.meta?.skipPersist) {
       return result
     }

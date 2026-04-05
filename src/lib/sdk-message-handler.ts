@@ -3,11 +3,12 @@ import type { ChatContentBlock } from '@/store/agentChatTypes'
 import type { QuestionDefinition } from '@/store/agentChatTypes'
 import {
   sessionCreated,
+  createFailed,
   sessionInit,
+  sessionMetadataReceived,
   addAssistantMessage,
   setStreaming,
   appendStreamDelta,
-  clearStreaming,
   addPermissionRequest,
   removePermission,
   addQuestionRequest,
@@ -61,8 +62,27 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       return true
     }
 
+    case 'sdk.create.failed':
+      dispatch(createFailed({
+        requestId: msg.requestId as string,
+        code: msg.code as string,
+        message: msg.message as string,
+        retryable: msg.retryable as boolean | undefined,
+      }))
+      return true
+
     case 'sdk.session.init':
       dispatch(sessionInit({
+        sessionId: msg.sessionId as string,
+        cliSessionId: msg.cliSessionId as string | undefined,
+        model: msg.model as string | undefined,
+        cwd: msg.cwd as string | undefined,
+        tools: msg.tools as Array<{ name: string }> | undefined,
+      }))
+      return true
+
+    case 'sdk.session.metadata':
+      dispatch(sessionMetadataReceived({
         sessionId: msg.sessionId as string,
         cliSessionId: msg.cliSessionId as string | undefined,
         model: msg.model as string | undefined,
@@ -76,6 +96,10 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         sessionId: msg.sessionId as string,
         latestTurnId: (msg.latestTurnId as string | null | undefined) ?? null,
         status: msg.status as any,
+        timelineSessionId: msg.timelineSessionId as string | undefined,
+        revision: msg.revision as number | undefined,
+        streamingActive: msg.streamingActive as boolean | undefined,
+        streamingText: msg.streamingText as string | undefined,
       }))
       return true
 
@@ -102,7 +126,7 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         }
       }
       if (event?.type === 'content_block_stop') {
-        dispatch(clearStreaming({ sessionId: msg.sessionId as string }))
+        dispatch(setStreaming({ sessionId: msg.sessionId as string, active: false }))
       }
       return true
     }
@@ -157,12 +181,12 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
     case 'sdk.error':
       if (msg.code === 'INVALID_SESSION_ID') {
         // Session is gone on the server (e.g. server restarted). Mark it as lost
-        // so AgentChatView can detect this and trigger immediate recovery instead
-        // of waiting for the 5-second timeout.
+        // so AgentChatView can detect this and trigger immediate recovery.
         dispatch(markSessionLost({ sessionId: msg.sessionId as string }))
       } else {
         dispatch(sessionError({
           sessionId: msg.sessionId as string,
+          code: msg.code as string | undefined,
           message: (msg.message as string) || (msg.error as string) || 'Unknown error',
         }))
       }

@@ -2,7 +2,10 @@ import { describe, it, expect } from 'vitest'
 import agentChatReducer, {
   sessionCreated,
   registerPendingCreate,
+  createFailed,
+  clearPendingCreateFailure,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   addAssistantMessage,
   addUserMessage,
@@ -21,6 +24,59 @@ import agentChatReducer, {
   removeSession,
   setAvailableModels,
 } from '../../../src/store/agentChatSlice'
+
+function makeChatMessage(role: 'user' | 'assistant', text: string) {
+  return {
+    role,
+    content: [{ type: 'text' as const, text }],
+    timestamp: '2026-03-10T10:01:00.000Z',
+  }
+}
+
+function makeTimelineItem(
+  turnId: string,
+  role: 'user' | 'assistant',
+  summary: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+    timestamp: string
+  }> = {},
+) {
+  return {
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    sessionId: overrides.sessionId ?? 'sess-timeline',
+    role,
+    summary,
+    ...(overrides.timestamp ? { timestamp: overrides.timestamp } : {}),
+  }
+}
+
+function makeTimelineTurn(
+  turnId: string,
+  role: 'user' | 'assistant',
+  text: string,
+  overrides: Partial<{
+    sessionId: string
+    messageId: string
+    ordinal: number
+    source: 'durable' | 'live'
+  }> = {},
+) {
+  return {
+    sessionId: overrides.sessionId ?? 'sess-timeline',
+    turnId,
+    messageId: overrides.messageId ?? `message:${turnId}`,
+    ordinal: overrides.ordinal ?? 0,
+    source: overrides.source ?? 'durable',
+    message: makeChatMessage(role, text),
+  }
+}
 
 describe('agentChatSlice', () => {
   const initial = agentChatReducer(undefined, { type: 'init' })
@@ -73,6 +129,56 @@ describe('agentChatSlice', () => {
     expect(state.sessions['s1'].messages[0].role).toBe('assistant')
   })
 
+  it('clears live-only message state when requesting a fresh canonical snapshot refresh', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req',
+      sessionId: 'sdk-live',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live',
+      latestTurnId: 'turn-live-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live',
+      items: [
+        makeTimelineItem('turn-live-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          source: 'live',
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+      bodies: {
+        'turn-live-1': makeTimelineTurn('turn-live-1', 'assistant', 'Live-only full body', {
+          sessionId: 'named-resume',
+          source: 'live',
+        }),
+      },
+    }))
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 'sdk-live',
+      content: [{ type: 'text', text: 'Post-watermark live delta' }],
+    }))
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-live',
+      cliSessionId: '00000000-0000-4000-8000-000000000321',
+    }))
+
+    const session = state.sessions['sdk-live']
+    expect(session.historyLoaded).toBe(false)
+    expect(session.timelineItems).toEqual([])
+    expect(session.messages).toEqual([])
+    expect(session.snapshotRefreshRequestId).toBe(1)
+  })
+
   it('tracks streaming text', () => {
     let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
     state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
@@ -88,6 +194,15 @@ describe('agentChatSlice', () => {
     state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hello' }))
     state = agentChatReducer(state, clearStreaming({ sessionId: 's1' }))
     expect(state.sessions['s1'].streamingText).toBe('')
+    expect(state.sessions['s1'].streamingActive).toBe(false)
+  })
+
+  it('can mark streaming inactive without discarding the partial preview text', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hello' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: false }))
+    expect(state.sessions['s1'].streamingText).toBe('Hello')
     expect(state.sessions['s1'].streamingActive).toBe(false)
   })
 
@@ -148,6 +263,33 @@ describe('agentChatSlice', () => {
     })
   })
 
+  it('records request-scoped create failures by requestId', () => {
+    const state = agentChatReducer(initial, createFailed({
+      requestId: 'req-failed',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    }))
+
+    expect((state as any).pendingCreateFailures['req-failed']).toEqual({
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    })
+  })
+
+  it('clears request-scoped create failures independently of session state', () => {
+    let state = agentChatReducer(initial, createFailed({
+      requestId: 'req-failed',
+      code: 'RESTORE_INTERNAL',
+      message: 'boom',
+      retryable: true,
+    }))
+    state = agentChatReducer(state, clearPendingCreateFailure({ requestId: 'req-failed' }))
+
+    expect((state as any).pendingCreateFailures['req-failed']).toBeUndefined()
+  })
+
   it('marks a fresh create as history-loaded immediately', () => {
     let state = agentChatReducer(initial, registerPendingCreate({
       requestId: 'fresh-req',
@@ -174,7 +316,7 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-resume'].historyLoaded).toBe(false)
   })
 
-  it('ends restore mode immediately when snapshot says there is no backlog', () => {
+  it('keeps a named-resume create restoring when a pre-init snapshot has no latest turn yet', () => {
     let state = agentChatReducer(initial, registerPendingCreate({
       requestId: 'resume-empty',
       expectsHistoryHydration: true,
@@ -186,10 +328,39 @@ describe('agentChatSlice', () => {
     state = agentChatReducer(state, sessionSnapshotReceived({
       sessionId: 'sdk-empty',
       latestTurnId: null,
-      status: 'idle',
+      status: 'starting',
+      timelineSessionId: 'named-resume',
     }))
 
-    expect(state.sessions['sdk-empty'].historyLoaded).toBe(true)
+    expect(state.sessions['sdk-empty'].historyLoaded).toBe(false)
+    expect(state.sessions['sdk-empty'].awaitingDurableHistory).toBe(true)
+
+    state = agentChatReducer(state, sessionInit({
+      sessionId: 'sdk-empty',
+      cliSessionId: '00000000-0000-4000-8000-000000000555',
+    }))
+
+    expect(state.sessions['sdk-empty'].historyLoaded).toBe(false)
+    expect(state.sessions['sdk-empty'].cliSessionId).toBe('00000000-0000-4000-8000-000000000555')
+  })
+
+  it('ends restore mode immediately when an empty snapshot already knows the durable session id', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'resume-empty-durable',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'resume-empty-durable',
+      sessionId: 'sdk-empty-durable',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-empty-durable',
+      latestTurnId: null,
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000556',
+    }))
+
+    expect(state.sessions['sdk-empty-durable'].historyLoaded).toBe(true)
   })
 
   it('sets historyLoaded when the initial timeline window is empty', () => {
@@ -224,17 +395,244 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sess-snapshot'].historyLoaded).toBeUndefined()
   })
 
+  it('stores timelineSessionId, timelineRevision, and stream snapshot from sdk.session.snapshot', () => {
+    const state = agentChatReducer(initial, sessionSnapshotReceived({
+      sessionId: 'sdk-1',
+      latestTurnId: 'turn-2',
+      status: 'running',
+      timelineSessionId: 'cli-1',
+      revision: 12,
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+
+    expect(state.sessions['sdk-1']).toMatchObject({
+      timelineSessionId: 'cli-1',
+      timelineRevision: 12,
+      streamingActive: true,
+      streamingText: 'partial reply',
+    })
+  })
+
+  it('does not let sessionInit downgrade a running snapshot back to connected', () => {
+    let state = agentChatReducer(initial, sessionCreated({
+      requestId: 'req-running',
+      sessionId: 'sdk-running',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-running',
+      latestTurnId: 'turn-4',
+      status: 'running',
+      timelineSessionId: 'cli-running',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    }))
+    state = agentChatReducer(state, sessionInit({
+      sessionId: 'sdk-running',
+      cliSessionId: 'cli-running',
+      model: 'claude-opus-4-6',
+    }))
+
+    expect(state.sessions['sdk-running']).toMatchObject({
+      status: 'running',
+      cliSessionId: 'cli-running',
+      streamingActive: true,
+      streamingText: 'partial reply',
+    })
+  })
+
+  it('updates authoritative metadata without reusing the readiness transition', () => {
+    let state = agentChatReducer(initial, sessionCreated({
+      requestId: 'req-meta',
+      sessionId: 'sdk-meta',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-meta',
+      latestTurnId: 'turn-1',
+      status: 'running',
+      timelineSessionId: 'cli-meta',
+      revision: 5,
+    }))
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-meta',
+      cliSessionId: 'cli-meta',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp/project',
+      tools: [{ name: 'Bash' }],
+    }))
+
+    expect(state.sessions['sdk-meta']).toMatchObject({
+      status: 'running',
+      cliSessionId: 'cli-meta',
+      model: 'claude-sonnet-4-5-20250929',
+      cwd: '/tmp/project',
+      tools: [{ name: 'Bash' }],
+      timelineRevision: 5,
+    })
+  })
+
+  it('requests a fresh snapshot when a canonical durable id arrives after a completed live-only restore', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-upgrade',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-upgrade',
+      sessionId: 'sdk-live',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live',
+      items: [
+        makeTimelineItem('turn-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          ordinal: 0,
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+
+    expect(state.sessions['sdk-live']).toMatchObject({
+      historyLoaded: true,
+      timelineSessionId: 'named-resume',
+      timelineRevision: 1,
+    })
+
+    state = agentChatReducer(state, sessionMetadataReceived({
+      sessionId: 'sdk-live',
+      cliSessionId: '00000000-0000-4000-8000-000000000321',
+    }))
+
+    expect(state.sessions['sdk-live']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000321',
+      latestTurnId: undefined,
+      restoreRetryCount: 0,
+    })
+    expect(state.sessions['sdk-live'].timelineRevision).toBeUndefined()
+    expect((state.sessions['sdk-live'] as any).snapshotRefreshRequestId).toBe(1)
+    expect(state.sessions['sdk-live'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-live'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-live'].nextTimelineCursor).toBeUndefined()
+  })
+
+  it('restarts hydration from the new snapshot revision when a canonical snapshot upgrades a completed live-only restore', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-snapshot-upgrade',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-snapshot-upgrade',
+      sessionId: 'sdk-live-snapshot',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live-snapshot',
+      latestTurnId: 'turn-live-1',
+      status: 'idle',
+      timelineSessionId: 'named-resume',
+      revision: 1,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-live-snapshot',
+      items: [
+        makeTimelineItem('turn-live-1', 'assistant', 'Live-only summary', {
+          sessionId: 'named-resume',
+          ordinal: 0,
+          source: 'live',
+        }),
+      ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-live-snapshot',
+      latestTurnId: 'turn-merged-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000322',
+      revision: 2,
+    }))
+
+    expect(state.sessions['sdk-live-snapshot']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000322',
+      timelineRevision: 2,
+      latestTurnId: 'turn-merged-2',
+    })
+    expect((state.sessions['sdk-live-snapshot'] as any).snapshotRefreshRequestId).toBeUndefined()
+    expect(state.sessions['sdk-live-snapshot'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-live-snapshot'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-live-snapshot'].nextTimelineCursor).toBeUndefined()
+  })
+
+  it('marks a restore restart when a newer snapshot revision arrives with the same latestTurnId', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-revision-only',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-revision-only',
+      sessionId: 'sdk-revision-only',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-revision-only',
+      latestTurnId: 'turn-stable-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      revision: 12,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-revision-only',
+      items: [
+        makeTimelineItem('turn-stable-2', 'assistant', 'Revision 12 summary', {
+          sessionId: '00000000-0000-4000-8000-000000000654',
+          ordinal: 0,
+          source: 'durable',
+        }),
+      ],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+    }))
+
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-revision-only',
+      latestTurnId: 'turn-stable-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      revision: 13,
+    }))
+
+    expect(state.sessions['sdk-revision-only']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      timelineRevision: 13,
+      latestTurnId: 'turn-stable-2',
+      restoreHydrationRequestId: 1,
+    })
+    expect(state.sessions['sdk-revision-only'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-revision-only'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-revision-only'].nextTimelineCursor).toBeUndefined()
+  })
+
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',
       items: [
-        {
-          turnId: 'turn-2',
+        makeTimelineItem('turn-2', 'assistant', 'Latest summary', {
           sessionId: 'sess-timeline',
-          role: 'assistant',
-          summary: 'Latest summary',
+          ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
-        },
+        }),
       ],
       nextCursor: 'cursor-2',
       revision: 2,
@@ -248,36 +646,131 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sess-timeline'].nextTimelineCursor).toBe('cursor-2')
   })
 
+  it('clears a stale streaming preview when the final assistant message is committed', () => {
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'req-stream', sessionId: 'sdk-stream' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 'sdk-stream', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 'sdk-stream', text: 'partial reply' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 'sdk-stream', active: false }))
+
+    state = agentChatReducer(state, addAssistantMessage({
+      sessionId: 'sdk-stream',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
+
+    expect(state.sessions['sdk-stream']).toMatchObject({
+      status: 'running',
+      streamingActive: false,
+      streamingText: '',
+    })
+    expect(state.sessions['sdk-stream'].messages).toHaveLength(1)
+    expect(state.sessions['sdk-stream'].messages[0]).toEqual(expect.objectContaining({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
+  })
+
   it('stores hydrated turn bodies separately from live websocket messages', () => {
     const state = agentChatReducer(initial, turnBodyReceived({
       sessionId: 'sess-turn',
-      turnId: 'turn-7',
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: 'Hydrated older turn' }],
-        timestamp: '2026-03-10T09:55:00.000Z',
-      },
+      turn: makeTimelineTurn('turn-7', 'user', 'Hydrated older turn', {
+        sessionId: 'sess-turn',
+        messageId: 'message-7',
+        ordinal: 7,
+      }),
     }))
 
     expect(state.sessions['sess-turn'].messages).toEqual([])
     expect(state.sessions['sess-turn'].timelineBodies['turn-7']).toEqual(
       expect.objectContaining({
-        content: [{ type: 'text', text: 'Hydrated older turn' }],
+        messageId: 'message-7',
+        ordinal: 7,
+        source: 'durable',
+        message: expect.objectContaining({
+          content: [{ type: 'text', text: 'Hydrated older turn' }],
+        }),
       }),
     )
+  })
+
+  it('hydrates inline page bodies and clears stale replace-mode bodies', () => {
+    let state = agentChatReducer(initial, turnBodyReceived({
+      sessionId: 'sdk-1',
+      turn: makeTimelineTurn('stale-turn', 'assistant', 'stale', {
+        sessionId: 'cli-1',
+      }),
+    }))
+
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-1',
+      items: [makeTimelineItem('turn-2', 'assistant', 'hello', {
+        sessionId: 'cli-1',
+        messageId: 'message-2',
+        ordinal: 2,
+      })],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+      bodies: {
+        'turn-2': makeTimelineTurn('turn-2', 'assistant', 'hello', {
+          sessionId: 'cli-1',
+          messageId: 'message-2',
+          ordinal: 2,
+        }),
+      },
+    }))
+
+    expect(state.sessions['sdk-1'].timelineItems).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-2',
+        messageId: 'message-2',
+        ordinal: 2,
+        source: 'durable',
+      }),
+    ])
+    expect(state.sessions['sdk-1'].timelineBodies['turn-2']).toEqual(expect.objectContaining({
+      turnId: 'turn-2',
+      messageId: 'message-2',
+      ordinal: 2,
+      source: 'durable',
+      message: makeChatMessage('assistant', 'hello'),
+    }))
+    expect(state.sessions['sdk-1'].timelineBodies['stale-turn']).toBeUndefined()
+  })
+
+  it('preserves previously expanded bodies when appending an older timeline page', () => {
+    let state = agentChatReducer(initial, turnBodyReceived({
+      sessionId: 'sdk-1',
+      turn: makeTimelineTurn('turn-newest', 'assistant', 'newest full body', {
+        sessionId: 'cli-1',
+      }),
+    }))
+
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-1',
+      items: [makeTimelineItem('turn-older', 'user', 'older question', { sessionId: 'cli-1' })],
+      nextCursor: 'cursor-older',
+      revision: 13,
+      replace: false,
+      bodies: {
+        'turn-older': makeTimelineTurn('turn-older', 'user', 'older full body', { sessionId: 'cli-1' }),
+      },
+    }))
+
+    expect(state.sessions['sdk-1'].timelineBodies).toEqual(expect.objectContaining({
+      'turn-newest': makeTimelineTurn('turn-newest', 'assistant', 'newest full body', { sessionId: 'cli-1' }),
+      'turn-older': makeTimelineTurn('turn-older', 'user', 'older full body', { sessionId: 'cli-1' }),
+    }))
   })
 
   it('bootstraps session on timelinePageReceived for unknown sessionId', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'unknown-sess',
       items: [
-        {
-          turnId: 'turn-1',
+        makeTimelineItem('turn-1', 'user', 'hello', {
           sessionId: 'unknown-sess',
-          role: 'user',
-          summary: 'hello',
+          ordinal: 1,
           timestamp: '2026-01-01T00:00:00Z',
-        },
+        }),
       ],
       nextCursor: null,
       revision: 1,

@@ -1,9 +1,12 @@
 import { MAX_AGENT_TIMELINE_ITEMS } from '../../shared/read-models.js'
 import type { ChatMessage } from '../session-history-loader.js'
+import type { AgentHistorySource } from './history-source.js'
+import type { CanonicalTurn, RestoreResolution } from './ledger.js'
 import type {
   AgentTimelineItem,
   AgentTimelinePage,
   AgentTimelinePageQuery,
+  AgentTimelineTurnBodyQuery,
   AgentTimelineTurn,
 } from './types.js'
 
@@ -12,21 +15,35 @@ const MAX_TIMELINE_LIMIT = MAX_AGENT_TIMELINE_ITEMS
 
 type TimelineCursorPayload = {
   offset: number
+  revision: number
 }
 
-type TimelineMessageRecord = {
-  turnId: string
-  sessionId: string
-  message: ChatMessage
-}
+type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
 
 export type AgentTimelineService = {
   getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
-  getTurnBody: (query: { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
+  getTurnBody: (query: AgentTimelineTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
 }
 
 export type AgentTimelineServiceDeps = {
-  loadSessionHistory: (sessionId: string) => Promise<ChatMessage[] | null>
+  agentHistorySource: AgentHistorySource
+}
+
+export class RestoreStaleRevisionError extends Error {
+  code = 'RESTORE_STALE_REVISION' as const
+
+  constructor(public readonly requestedRevision: number, public readonly actualRevision: number) {
+    super('Restore revision is stale')
+  }
+}
+
+export class RestoreResolutionError extends Error {
+  constructor(
+    public readonly code: 'RESTORE_NOT_FOUND' | 'RESTORE_UNAVAILABLE' | 'RESTORE_INTERNAL' | 'RESTORE_DIVERGED',
+    message: string,
+  ) {
+    super(message)
+  }
 }
 
 function encodeCursor(payload: TimelineCursorPayload): string {
@@ -36,22 +53,20 @@ function encodeCursor(payload: TimelineCursorPayload): string {
 function decodeCursor(cursor: string): TimelineCursorPayload {
   try {
     const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<TimelineCursorPayload>
-    if (typeof parsed.offset !== 'number' || !Number.isInteger(parsed.offset) || parsed.offset < 0) {
+    if (
+      typeof parsed.offset !== 'number'
+      || !Number.isInteger(parsed.offset)
+      || parsed.offset < 0
+      || typeof parsed.revision !== 'number'
+      || !Number.isInteger(parsed.revision)
+      || parsed.revision < 0
+    ) {
       throw new Error('invalid')
     }
-    return { offset: parsed.offset }
+    return { offset: parsed.offset, revision: parsed.revision }
   } catch {
     throw new Error('Invalid agent-timeline cursor')
   }
-}
-
-function toRevision(messages: ChatMessage[]): number {
-  return messages.reduce((maxRevision, message, index) => {
-    if (!message.timestamp) return Math.max(maxRevision, index + 1)
-    const timestamp = Date.parse(message.timestamp)
-    if (!Number.isFinite(timestamp)) return Math.max(maxRevision, index + 1)
-    return Math.max(maxRevision, timestamp)
-  }, 0)
 }
 
 function summarizeMessage(message: ChatMessage): string {
@@ -68,12 +83,11 @@ function summarizeMessage(message: ChatMessage): string {
   return ''
 }
 
-function buildTimeline(messages: ChatMessage[], sessionId: string): TimelineMessageRecord[] {
-  return messages
-    .map((message, index) => ({
-      turnId: `turn-${index}`,
+function buildTimeline(turns: CanonicalTurn[], sessionId: string): TimelineMessageRecord[] {
+  return turns
+    .map((turn) => ({
+      ...turn,
       sessionId,
-      message,
     }))
     .reverse()
 }
@@ -81,6 +95,9 @@ function buildTimeline(messages: ChatMessage[], sessionId: string): TimelineMess
 function toTimelineItem(record: TimelineMessageRecord): AgentTimelineItem {
   return {
     turnId: record.turnId,
+    messageId: record.messageId,
+    ordinal: record.ordinal,
+    source: record.source,
     sessionId: record.sessionId,
     role: record.message.role,
     summary: summarizeMessage(record.message),
@@ -95,35 +112,64 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
     }
   }
 
-  async function loadTimeline(sessionId: string): Promise<TimelineMessageRecord[]> {
-    const messages = await deps.loadSessionHistory(sessionId)
-    return buildTimeline(messages ?? [], sessionId)
+  async function loadTimeline(queryId: string): Promise<{ sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] }> {
+    const resolved = await deps.agentHistorySource.resolve(queryId)
+    return buildResolvedTimeline(queryId, resolved)
+  }
+
+  function buildResolvedTimeline(queryId: string, resolved: RestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
+    if (resolved.kind === 'missing') {
+      throw new RestoreResolutionError(resolved.code, 'Restore session not found')
+    }
+    if (resolved.kind === 'fatal') {
+      throw new RestoreResolutionError(resolved.code, resolved.message)
+    }
+    const sessionId = resolved.timelineSessionId ?? queryId
+    return {
+      sessionId,
+      latestTurnId: resolved.latestTurnId,
+      revision: resolved.revision,
+      records: buildTimeline(resolved.turns, sessionId),
+    }
   }
 
   return {
     async getTimelinePage(query) {
       throwIfAborted(query.signal)
+      if (query.revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const limit = Math.min(query.limit ?? DEFAULT_TIMELINE_LIMIT, MAX_TIMELINE_LIMIT)
-      const offset = query.cursor ? decodeCursor(query.cursor).offset : 0
+      const cursor = query.cursor ? decodeCursor(query.cursor) : null
+      const offset = cursor?.offset ?? 0
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
-      const pageItems = timeline.slice(offset, offset + limit)
+      if (query.revision !== timeline.revision) {
+        throw new RestoreStaleRevisionError(query.revision, timeline.revision)
+      }
+      if (cursor && cursor.revision !== timeline.revision) {
+        throw new RestoreStaleRevisionError(cursor.revision, timeline.revision)
+      }
+      const pageItems = timeline.records.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
-      const fullMessages = timeline.map((record) => record.message).reverse()
 
       const result: AgentTimelinePage = {
-        sessionId: query.sessionId,
+        sessionId: timeline.sessionId,
+        latestTurnId: timeline.latestTurnId,
         items: pageItems.map(toTimelineItem),
-        nextCursor: nextOffset < timeline.length ? encodeCursor({ offset: nextOffset }) : null,
-        revision: toRevision(fullMessages),
+        nextCursor: nextOffset < timeline.records.length ? encodeCursor({ offset: nextOffset, revision: timeline.revision }) : null,
+        revision: timeline.revision,
       }
 
       if (query.includeBodies) {
         const bodies: Record<string, AgentTimelineTurn> = {}
         for (const record of pageItems) {
           bodies[record.turnId] = {
-            sessionId: query.sessionId,
+            sessionId: timeline.sessionId,
             turnId: record.turnId,
+            messageId: record.messageId,
+            ordinal: record.ordinal,
+            source: record.source,
             message: record.message,
           }
         }
@@ -133,14 +179,23 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
       return result
     },
 
-    async getTurnBody({ sessionId, turnId }) {
+    async getTurnBody({ sessionId, turnId, revision }) {
+      if (revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const timeline = await loadTimeline(sessionId)
-      const match = timeline.find((record) => record.turnId === turnId)
+      if (revision !== timeline.revision) {
+        throw new RestoreStaleRevisionError(revision, timeline.revision)
+      }
+      const match = timeline.records.find((record) => record.turnId === turnId)
       if (!match) return null
 
       return {
-        sessionId,
+        sessionId: timeline.sessionId,
         turnId,
+        messageId: match.messageId,
+        ordinal: match.ordinal,
+        source: match.source,
         message: match.message,
       }
     },

@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { AgentTimelinePageQuerySchema } from '../../../shared/read-models.js'
 import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
 
@@ -21,49 +21,86 @@ const mockMessages = [
   },
 ]
 
+function makeResolvedHistory(options: {
+  liveSessionId?: string
+  timelineSessionId?: string
+  revision?: number
+  messages: typeof mockMessages
+}) {
+  return {
+    kind: 'resolved' as const,
+    queryId: options.liveSessionId ?? options.timelineSessionId ?? 'sess-1',
+    liveSessionId: options.liveSessionId,
+    timelineSessionId: options.timelineSessionId,
+    readiness: options.liveSessionId && options.timelineSessionId
+      ? 'merged' as const
+      : options.timelineSessionId
+        ? 'durable_only' as const
+        : 'live_only' as const,
+    revision: options.revision ?? Date.parse('2026-03-10T10:02:00.000Z'),
+    latestTurnId: options.messages.length > 0 ? `turn-${options.messages.length - 1}` : null,
+    turns: options.messages.map((message, index) => ({
+      turnId: `turn-${index}`,
+      messageId: `message-${index}`,
+      ordinal: index,
+      source: options.timelineSessionId ? 'durable' as const : 'live' as const,
+      message: {
+        ...message,
+        messageId: `message-${index}`,
+      },
+    })),
+  }
+}
+
 describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
   it('accepts boolean true from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts boolean false from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('accepts string "true" from query parameters', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts string "false" from query parameters and parses to false', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('treats omitted includeBodies as undefined', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBeUndefined()
   })
 
   it('rejects invalid string values for includeBodies', () => {
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible' })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible', revision: 7 })).toThrow()
   })
 })
 
 describe('agent timeline includeBodies', () => {
   it('includeBodies=false (default): no bodies field in response', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          liveSessionId: 'sess-1',
+          messages: mockMessages,
+        })),
+      },
     })
 
     const page = await service.getTimelinePage({
       sessionId: 'sess-1',
       priority: 'visible',
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(page.items).toHaveLength(3)
@@ -72,22 +109,30 @@ describe('agent timeline includeBodies', () => {
 
   it('includeBodies=true: bodies map includes all page items', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          liveSessionId: 'sdk-sess-1',
+          timelineSessionId: '00000000-0000-4000-8000-000000000010',
+          messages: mockMessages,
+        })),
+      },
     })
 
     const page = await service.getTimelinePage({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       priority: 'visible',
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(page.items).toHaveLength(3)
     expect(page.bodies).toBeDefined()
     expect(Object.keys(page.bodies!)).toHaveLength(3)
+    expect(page.sessionId).toBe('00000000-0000-4000-8000-000000000010')
     for (const item of page.items) {
       const body = page.bodies![item.turnId]
       expect(body).toBeDefined()
-      expect(body.sessionId).toBe('sess-1')
+      expect(body.sessionId).toBe('00000000-0000-4000-8000-000000000010')
       expect(body.turnId).toBe(item.turnId)
       expect(body.message.content).toBeDefined()
       expect(body.message.content.length).toBeGreaterThan(0)
@@ -96,13 +141,19 @@ describe('agent timeline includeBodies', () => {
 
   it('bodies map keys match item turnIds', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          liveSessionId: 'sess-1',
+          messages: mockMessages,
+        })),
+      },
     })
 
     const page = await service.getTimelinePage({
       sessionId: 'sess-1',
       priority: 'visible',
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     const itemTurnIds = new Set(page.items.map((i) => i.turnId))
@@ -118,7 +169,13 @@ describe('agent timeline includeBodies', () => {
     }))
 
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(fiveMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          liveSessionId: 'sess-1',
+          revision: Date.parse('2026-03-10T10:04:00.000Z'),
+          messages: fiveMessages,
+        })),
+      },
     })
 
     const page1 = await service.getTimelinePage({
@@ -126,6 +183,7 @@ describe('agent timeline includeBodies', () => {
       priority: 'visible',
       limit: 2,
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:04:00.000Z'),
     })
 
     expect(page1.items).toHaveLength(2)
@@ -140,6 +198,7 @@ describe('agent timeline includeBodies', () => {
       cursor: page1.nextCursor!,
       limit: 2,
       includeBodies: true,
+      revision: page1.revision,
     })
 
     expect(page2.items).toHaveLength(2)
@@ -151,21 +210,29 @@ describe('agent timeline includeBodies', () => {
 
   it('getTurnBody still works independently (backward compatible)', async () => {
     const service = createAgentTimelineService({
-      loadSessionHistory: vi.fn().mockResolvedValue(mockMessages),
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          liveSessionId: 'sdk-sess-1',
+          timelineSessionId: '00000000-0000-4000-8000-000000000011',
+          messages: mockMessages,
+        })),
+      },
     })
 
     const page = await service.getTimelinePage({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       priority: 'visible',
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     const turn = await service.getTurnBody({
-      sessionId: 'sess-1',
+      sessionId: 'sdk-sess-1',
       turnId: page.items[0].turnId,
+      revision: page.revision,
     })
 
     expect(turn).not.toBeNull()
-    expect(turn!.sessionId).toBe('sess-1')
+    expect(turn!.sessionId).toBe('00000000-0000-4000-8000-000000000011')
     expect(turn!.turnId).toBe(page.items[0].turnId)
     expect(turn!.message.content).toHaveLength(1)
   })

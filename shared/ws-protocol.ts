@@ -328,6 +328,7 @@ export const SdkKillSchema = z.object({
 export const SdkAttachSchema = z.object({
   type: z.literal('sdk.attach'),
   sessionId: z.string().min(1),
+  resumeSessionId: z.string().min(1).optional(),
 })
 
 export const SdkSetModelSchema = z.object({
@@ -611,10 +612,34 @@ export type CodingCliWsMessage =
 // -- SDK server→client messages --
 
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
+export type SdkRestoreFailureCode =
+  | 'RESTORE_NOT_FOUND'
+  | 'RESTORE_UNAVAILABLE'
+  | 'RESTORE_INTERNAL'
+  | 'RESTORE_DIVERGED'
+  | 'RESTORE_STALE_REVISION'
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }
+  | {
+    type: 'sdk.create.failed'
+    requestId: string
+    code: SdkRestoreFailureCode
+    message: string
+    retryable?: boolean
+  }
+  | {
+    type: 'sdk.session.snapshot'
+    sessionId: string
+    latestTurnId: string | null
+    status: SdkSessionStatus
+    timelineSessionId?: string
+    revision: number
+    streamingActive?: boolean
+    streamingText?: string
+  }
   | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
   | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
   | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }

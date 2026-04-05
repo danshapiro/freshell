@@ -9,6 +9,7 @@ import type {
   TerminalPaneContent,
 } from '@/store/paneTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
+import { getPreferredResumeSessionId } from '@/store/persistControl'
 import type { Tab } from '@/store/types'
 import type { CodexActivityRecord } from '@shared/ws-protocol'
 
@@ -43,7 +44,7 @@ function resolveAgentChatSessionKey(
   }
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const sessionId = session?.cliSessionId ?? content.resumeSessionId
+  const sessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
   if (!provider || !sessionId) return undefined
 
   return `${provider}:${sessionId}`

@@ -16,12 +16,12 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages).toHaveLength(2)
-    expect(messages[0]).toEqual({
+    expect(messages[0]).toMatchObject({
       role: 'user',
       content: [{ type: 'text', text: 'Hello' }],
       timestamp: '2026-01-01T00:00:01Z',
     })
-    expect(messages[1]).toEqual({
+    expect(messages[1]).toMatchObject({
       role: 'assistant',
       content: [{ type: 'text', text: 'Hi there!' }],
       timestamp: '2026-01-01T00:00:02Z',
@@ -37,16 +37,50 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages).toHaveLength(2)
-    expect(messages[0]).toEqual({
+    expect(messages[0]).toMatchObject({
       role: 'user',
       content: [{ type: 'text', text: 'What is 2+2?' }],
       timestamp: '2026-01-01T00:00:01Z',
     })
-    expect(messages[1]).toEqual({
+    expect(messages[1]).toMatchObject({
       role: 'assistant',
       content: [{ type: 'text', text: '2+2 equals 4.' }],
       timestamp: '2026-01-01T00:00:02Z',
     })
+  })
+
+  it('preserves authoritative top-level ids and model fields for legacy string-form records', () => {
+    const content = [
+      '{"type":"assistant","id":"upstream-top","model":"claude-opus-test","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hello' }],
+      timestamp: '2026-01-01T00:00:00Z',
+      model: 'claude-opus-test',
+      messageId: 'upstream-top',
+    })
+  })
+
+  it('includes top-level legacy model in synthesized deterministic ids', () => {
+    const modelA = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-a","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+    const modelB = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-b","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+
+    expect(modelA).toHaveLength(1)
+    expect(modelB).toHaveLength(1)
+    expect(modelA[0]?.model).toBe('model-a')
+    expect(modelB[0]?.model).toBe('model-b')
+    expect(modelA[0]?.messageId).toBeDefined()
+    expect(modelB[0]?.messageId).toBeDefined()
+    expect(modelA[0]?.messageId).not.toBe(modelB[0]?.messageId)
   })
 
   it('preserves tool_use and tool_result content blocks', () => {
@@ -105,6 +139,64 @@ describe('extractChatMessagesFromJsonl', () => {
     const messages = extractChatMessagesFromJsonl(content)
 
     expect(messages[0].model).toBe('claude-opus-4-6')
+  })
+
+  it('preserves authoritative upstream message ids when present', () => {
+    const content = [
+      '{"type":"assistant","message":{"id":"upstream-msg-1","role":"assistant","content":[{"type":"text","text":"Hi"}],"model":"claude-opus-4-6"},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages[0].messageId).toBe('upstream-msg-1')
+  })
+
+  it('synthesizes deterministic message ids for idless equivalent rewrites', () => {
+    const original = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello  \\r\\nworld"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+    const rewritten = [
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello  \\nworld"}]},"timestamp":"2026-01-02T00:00:01Z"}',
+    ].join('\n')
+
+    const originalMessages = extractChatMessagesFromJsonl(original)
+    const rewrittenMessages = extractChatMessagesFromJsonl(rewritten)
+
+    expect(originalMessages[0].messageId).toBeDefined()
+    expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
+  })
+
+  it('treats block-end newlines as trailing whitespace when synthesizing deterministic message ids', () => {
+    const original = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+    const rewritten = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello\\n"}]},"timestamp":"2026-01-02T00:00:01Z"}',
+    ].join('\n')
+
+    const originalMessages = extractChatMessagesFromJsonl(original)
+    const rewrittenMessages = extractChatMessagesFromJsonl(rewritten)
+
+    expect(originalMessages[0].messageId).toBeDefined()
+    expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
+  })
+
+  it('preserves parent/reference ancestry and distinguishes synthesized ids across different durable chains', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-a","referenceId":"ref-a"},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-b","referenceId":"ref-b"},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.parentId).toBe('parent-a')
+    expect(messages[0]?.referenceId).toBe('ref-a')
+    expect(messages[1]?.parentId).toBe('parent-b')
+    expect(messages[1]?.referenceId).toBe('ref-b')
+    expect(messages[0]?.messageId).toBeDefined()
+    expect(messages[1]?.messageId).toBeDefined()
+    expect(messages[0]?.messageId).not.toBe(messages[1]?.messageId)
   })
 })
 

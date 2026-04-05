@@ -1,4 +1,4 @@
-import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
+import { Suspense, lazy, useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActivePane, resizePanes, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
@@ -7,7 +7,6 @@ import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
-import EditorPane from './EditorPane'
 import AgentChatView from '../agent-chat/AgentChatView'
 import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
@@ -21,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getPaneDisplayTitle } from '@/lib/pane-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
   formatPaneRuntimeLabel,
@@ -44,6 +43,7 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { getPreferredResumeSessionId } from '@/store/persistControl'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -55,6 +55,7 @@ const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecor
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
+const EditorPane = lazy(() => import('./EditorPane'))
 
 interface PaneContainerProps {
   tabId: string
@@ -134,7 +135,7 @@ function resolveFreshClaudeRuntimeMeta(
   if (content.provider !== 'freshclaude') return undefined
 
   const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const indexedSessionId = session?.cliSessionId ?? content.resumeSessionId
+  const indexedSessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
   if (!provider || !indexedSessionId) return undefined
 
   const indexed = findIndexedSessionById(indexedProjects, provider, indexedSessionId)
@@ -207,12 +208,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
+    const currentTitle = getPaneDisplayTitle(node.content, paneTitles[node.id], extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, extensionEntries, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
@@ -366,7 +367,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Render a leaf pane
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
+    const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'
@@ -709,15 +710,27 @@ function renderContent(
   if (content.kind === 'editor') {
     return (
       <ErrorBoundary key={paneId} label="Editor">
-        <EditorPane
-          paneId={paneId}
-          tabId={tabId}
-          filePath={content.filePath}
-          language={content.language}
-          readOnly={content.readOnly}
-          content={content.content}
-          viewMode={content.viewMode}
-        />
+        <Suspense fallback={(
+          <div
+            data-testid="editor-pane-loading"
+            role="status"
+            aria-live="polite"
+            className="flex h-full items-center justify-center text-sm text-muted-foreground"
+          >
+            Loading editor...
+          </div>
+        )}
+        >
+          <EditorPane
+            paneId={paneId}
+            tabId={tabId}
+            filePath={content.filePath}
+            language={content.language}
+            readOnly={content.readOnly}
+            content={content.content}
+            viewMode={content.viewMode}
+          />
+        </Suspense>
       </ErrorBoundary>
     )
   }

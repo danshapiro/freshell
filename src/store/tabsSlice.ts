@@ -21,6 +21,7 @@ import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
+import { mergeSessionMetadataForPreferredResumeId, preferCanonicalResumeSessionId } from './persistControl'
 
 
 const log = createLogger('TabsSlice')
@@ -35,6 +36,11 @@ export interface TabsState {
   renameRequestTabId: string | null
   // IDs of tabs that were explicitly closed. Prevents resurrection during cross-tab merge.
   tombstones: Tombstone[]
+}
+
+type HydrateTabsMeta = {
+  localLayoutPersistedAt?: number
+  remoteLayoutPersistedAt?: number
 }
 
 function migrateTabFields(t: Tab): Tab {
@@ -52,6 +58,69 @@ function migrateTabFields(t: Tab): Tab {
     shell: t.shell || 'system',
     lastInputAt: t.lastInputAt,
   }
+}
+
+function pickHydratedTabWinner(localTab: Tab, remoteTab: Tab, meta: HydrateTabsMeta | undefined): Tab {
+  const localLayoutPersistedAt = meta?.localLayoutPersistedAt
+  const remoteLayoutPersistedAt = meta?.remoteLayoutPersistedAt
+  if (typeof localLayoutPersistedAt === 'number' || typeof remoteLayoutPersistedAt === 'number') {
+    if ((remoteLayoutPersistedAt ?? Number.NEGATIVE_INFINITY) > (localLayoutPersistedAt ?? Number.NEGATIVE_INFINITY)) {
+      return remoteTab
+    }
+    if ((remoteLayoutPersistedAt ?? Number.NEGATIVE_INFINITY) < (localLayoutPersistedAt ?? Number.NEGATIVE_INFINITY)) {
+      return localTab
+    }
+  }
+
+  return (localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab
+}
+
+function protectCanonicalFallbackIdentity(localTab: Tab, remoteTab: Tab, mergedTab: Tab): Tab {
+  const preferredResumeSessionId = preferCanonicalResumeSessionId(
+    localTab.resumeSessionId,
+    remoteTab.resumeSessionId,
+    mergedTab.resumeSessionId,
+  )
+
+  let nextTab = mergedTab
+  if (preferredResumeSessionId && nextTab.resumeSessionId !== preferredResumeSessionId) {
+    nextTab = {
+      ...nextTab,
+      resumeSessionId: preferredResumeSessionId,
+    }
+  }
+
+  const metadataProvider =
+    nextTab.codingCliProvider
+    ?? remoteTab.codingCliProvider
+    ?? localTab.codingCliProvider
+    ?? (nextTab.mode !== 'shell' ? nextTab.mode : undefined)
+
+  if (metadataProvider && nextTab.codingCliProvider !== metadataProvider) {
+    nextTab = {
+      ...nextTab,
+      codingCliProvider: metadataProvider,
+    }
+  }
+
+  const nextSessionMetadataByKey = mergeSessionMetadataForPreferredResumeId({
+    localSessionMetadataByKey: localTab.sessionMetadataByKey,
+    remoteSessionMetadataByKey: remoteTab.sessionMetadataByKey,
+    existingSessionMetadataByKey: nextTab.sessionMetadataByKey,
+    provider: metadataProvider,
+    localResumeSessionId: localTab.resumeSessionId,
+    remoteResumeSessionId: remoteTab.resumeSessionId,
+    preferredResumeSessionId,
+  })
+
+  if (JSON.stringify(nextSessionMetadataByKey ?? {}) !== JSON.stringify(nextTab.sessionMetadataByKey ?? {})) {
+    nextTab = {
+      ...nextTab,
+      sessionMetadataByKey: nextSessionMetadataByKey,
+    }
+  }
+
+  return nextTab
 }
 
 // Load persisted tabs state directly at module initialization time
@@ -186,6 +255,7 @@ export const tabsSlice = createSlice({
       }
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
+      const meta = (action as PayloadAction<TabsState, string, HydrateTabsMeta | undefined>).meta
       const remoteTabs = (action.payload.tabs || []).map(migrateTabFields)
       const remoteTombstones: Tombstone[] = Array.isArray(action.payload.tombstones) ? action.payload.tombstones : []
 
@@ -208,8 +278,8 @@ export const tabsSlice = createSlice({
         seen.add(remoteTab.id)
         const localTab = localById.get(remoteTab.id)
         if (localTab) {
-          // Both sides have this tab — resolve by updatedAt (remote wins ties)
-          merged.push((localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab)
+          const winningTab = pickHydratedTabWinner(localTab, remoteTab, meta)
+          merged.push(protectCanonicalFallbackIdentity(localTab, remoteTab, winningTab))
         } else {
           merged.push(remoteTab)
         }

@@ -5,12 +5,14 @@ import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
 import {
   AgentTimelinePageQuerySchema,
+  AgentTimelineTurnBodyQuerySchema,
   SessionDirectoryPageSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
   TerminalScrollbackQuerySchema,
   TerminalSearchQuerySchema,
   type AgentTimelinePageQuery,
+  type AgentTimelineTurnBodyQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
@@ -197,7 +199,7 @@ export async function getTerminalDirectoryPage(
 
 export async function getAgentTimelinePage(
   sessionId: string,
-  query: AgentTimelinePageQuery = {},
+  query: AgentTimelinePageQuery,
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const parsed = AgentTimelinePageQuerySchema.parse(query)
@@ -205,7 +207,9 @@ export async function getAgentTimelinePage(
     `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
+      ['revision', parsed.revision],
       ['limit', parsed.limit],
+      ['includeBodies', parsed.includeBodies ? 'true' : undefined],
     ])}`,
     options,
   )
@@ -214,11 +218,16 @@ export async function getAgentTimelinePage(
 export async function getAgentTurnBody(
   sessionId: string,
   turnId: string,
+  query: AgentTimelineTurnBodyQuery & { signal?: AbortSignal },
   options: ApiRequestOptions = {},
 ): Promise<any> {
+  const parsed = AgentTimelineTurnBodyQuerySchema.parse(query)
+  const signal = query.signal ?? options.signal
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}`,
-    options,
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+      ['revision', parsed.revision],
+    ])}`,
+    { ...options, signal },
   )
 }
 

@@ -40,6 +40,14 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
+vi.mock('@/store/sessionsThunks', () => ({
+  fetchSessionWindow: () => ({ type: 'sessions/fetchWindow' }),
+}))
+
+vi.mock('@/components/NetworkQuickAccess', () => ({
+  default: () => null,
+}))
+
 vi.mock('@/components/TerminalView', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`terminal-${paneId}`}>terminal</div>,
 }))
@@ -301,5 +309,57 @@ describe('pane activity indicator flow (e2e)', () => {
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+  })
+
+  it('restores pane and tab activity from timelineSessionId when only the canonical durable id is known', () => {
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-agent',
+      sessionId: 'sdk-restore-1',
+      resumeSessionId: 'stale-resume',
+      status: 'running',
+    }
+
+    const { store } = renderHarness({
+      pane,
+      agentChat: {
+        sessions: {
+          'sdk-restore-1': {
+            sessionId: 'sdk-restore-1',
+            timelineSessionId: 'canonical-session-1',
+            status: 'running',
+            messages: [],
+            timelineItems: [],
+            timelineBodies: {},
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {
+              'perm-1': {
+                requestId: 'perm-1',
+                subtype: 'can_use_tool',
+              },
+            },
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        availableModels: [],
+      },
+    })
+
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+
+    act(() => {
+      store.dispatch(removePermission({ sessionId: 'sdk-restore-1', requestId: 'perm-1' }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 })

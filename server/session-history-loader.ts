@@ -8,12 +8,16 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { getClaudeHome } from './claude-home.js'
 import type { ContentBlock } from '../shared/ws-protocol.js'
+import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: ContentBlock[]
   timestamp?: string
   model?: string
+  parentId?: string
+  referenceId?: string
+  messageId?: string
 }
 
 export interface LoadSessionHistoryDeps {
@@ -30,6 +34,16 @@ export interface LoadSessionHistoryDeps {
 export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
   const lines = content.split(/\r?\n/).filter(Boolean)
   const messages: ChatMessage[] = []
+  const fingerprintOccurrences = new Map<string, number>()
+
+  function pickOptionalString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim().length > 0) {
+        return value
+      }
+    }
+    return undefined
+  }
 
   for (const line of lines) {
     let obj: any
@@ -48,19 +62,46 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
 
     if (typeof msg === 'string') {
       // Simple/legacy format: message is a plain string
-      messages.push({
+      const nextMessage: ChatMessage = {
         role,
         content: [{ type: 'text', text: msg }],
         ...(timestamp ? { timestamp } : {}),
-      })
+        ...(pickOptionalString(obj.model) ? { model: pickOptionalString(obj.model) } : {}),
+        ...(pickOptionalString(obj.parentId, obj.parent_id) ? { parentId: pickOptionalString(obj.parentId, obj.parent_id) } : {}),
+        ...(pickOptionalString(obj.referenceId, obj.reference_id) ? { referenceId: pickOptionalString(obj.referenceId, obj.reference_id) } : {}),
+        ...(pickOptionalString(obj.id, obj.messageId, obj.message_id) ? {
+          messageId: pickOptionalString(obj.id, obj.messageId, obj.message_id),
+        } : {}),
+      }
+      if (!nextMessage.messageId) {
+        const fingerprint = createDurableMessageFingerprint(nextMessage)
+        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+        fingerprintOccurrences.set(fingerprint, occurrence + 1)
+        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      }
+      messages.push(nextMessage)
     } else if (msg && typeof msg === 'object' && Array.isArray(msg.content)) {
       // Structured format: message is a ClaudeMessage object
-      messages.push({
+      const nextMessage: ChatMessage = {
         role: msg.role || role,
         content: msg.content as ContentBlock[],
         ...(timestamp ? { timestamp } : {}),
         ...(msg.model ? { model: msg.model } : {}),
-      })
+        ...(pickOptionalString(msg.parentId, msg.parent_id, obj.parentId, obj.parent_id) ? {
+          parentId: pickOptionalString(msg.parentId, msg.parent_id, obj.parentId, obj.parent_id),
+        } : {}),
+        ...(pickOptionalString(msg.referenceId, msg.reference_id, obj.referenceId, obj.reference_id) ? {
+          referenceId: pickOptionalString(msg.referenceId, msg.reference_id, obj.referenceId, obj.reference_id),
+        } : {}),
+        ...(typeof msg.id === 'string' && msg.id.trim().length > 0 ? { messageId: msg.id } : {}),
+      }
+      if (!nextMessage.messageId) {
+        const fingerprint = createDurableMessageFingerprint(nextMessage)
+        const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
+        fingerprintOccurrences.set(fingerprint, occurrence + 1)
+        nextMessage.messageId = synthesizeDeterministicMessageId(nextMessage, occurrence)
+      }
+      messages.push(nextMessage)
     }
   }
 

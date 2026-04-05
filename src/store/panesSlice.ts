@@ -2,14 +2,51 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
+import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 
 const log = createLogger('PanesSlice')
+
+type HydratePanesMeta = {
+  localLayoutPersistedAt?: number
+  remoteLayoutPersistedAt?: number
+}
+
+function buildPreservedSessionRef(
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  preservedResumeSessionId?: string,
+) {
+  if (!preservedResumeSessionId) {
+    return localContent.sessionRef
+  }
+
+  if (localContent.kind === 'terminal') {
+    if (localContent.mode === 'shell') {
+      return undefined
+    }
+    return {
+      ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+      provider: localContent.mode,
+      sessionId: preservedResumeSessionId,
+    }
+  }
+
+  if (!isValidClaudeSessionId(preservedResumeSessionId)) {
+    return undefined
+  }
+
+  return {
+    ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
+    provider: 'claude' as const,
+    sessionId: preservedResumeSessionId,
+  }
+}
 
 /**
  * Normalize pane content to the full persisted/runtime shape.
@@ -81,6 +118,7 @@ function normalizePaneContent(
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
+      createError: input.createError,
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,
@@ -96,6 +134,28 @@ function normalizePaneContent(
   }
   // Editor/picker content passes through unchanged
   return input
+}
+
+function shouldPreferLocalAgentChatPaneDuringHydration(
+  localContent: PaneContent,
+  incomingContent: PaneContent,
+  meta: HydratePanesMeta | undefined,
+): boolean {
+  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+    return false
+  }
+
+  const localLayoutPersistedAt = meta?.localLayoutPersistedAt
+  const remoteLayoutPersistedAt = meta?.remoteLayoutPersistedAt
+  if (
+    typeof localLayoutPersistedAt !== 'number'
+    || typeof remoteLayoutPersistedAt !== 'number'
+    || remoteLayoutPersistedAt >= localLayoutPersistedAt
+  ) {
+    return false
+  }
+
+  return isValidClaudeSessionId(localContent.resumeSessionId)
 }
 
 /**
@@ -400,7 +460,11 @@ function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
  * terminal assignments that are more advanced. A local terminal pane
  * with a terminalId beats an incoming pane without one (same createRequestId).
  */
-function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | null {
+function mergeTerminalState(
+  incoming: PaneNode,
+  local: PaneNode,
+  meta?: HydratePanesMeta,
+): PaneNode | null {
   const incomingValid = hasPaneTreeShape(incoming)
   const localValid = hasPaneTreeShape(local)
   if (!incomingValid) return localValid ? local : null
@@ -426,7 +490,14 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
           local.content.resumeSessionId &&
           incoming.content.resumeSessionId !== local.content.resumeSessionId
         ) {
-          return { ...incoming, content: { ...incoming.content, resumeSessionId: local.content.resumeSessionId } }
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
         }
       } else if (local.content.status === 'creating') {
         // Different createRequestId and local is reconnecting: local just
@@ -440,7 +511,25 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
     if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
+      if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
+        return local
+      }
       if (incoming.content.createRequestId === local.content.createRequestId) {
+        if (
+          shouldPreserveLocalCanonicalResumeSessionId(
+            local.content.resumeSessionId,
+            incoming.content.resumeSessionId,
+          )
+        ) {
+          return {
+            ...incoming,
+            content: {
+              ...incoming.content,
+              resumeSessionId: local.content.resumeSessionId,
+              sessionRef: buildPreservedSessionRef(local.content, local.content.resumeSessionId),
+            },
+          }
+        }
         // Preserve local sessionId if incoming doesn't have it yet
         if (local.content.sessionId && !incoming.content.sessionId) {
           return { ...incoming, content: local.content }
@@ -473,8 +562,8 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     Array.isArray(incoming.children) && incoming.children.length === 2 &&
     Array.isArray(local.children) && local.children.length === 2
   ) {
-    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0])
-    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1])
+    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0], meta)
+    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1], meta)
     if (!mergedLeft || !mergedRight) {
       return local
     }
@@ -983,10 +1072,12 @@ export const panesSlice = createSlice({
       const root = state.layouts[tabId]
       if (!root) return
       let normalizedContentForTitle: PaneContent | null = null
+      let previousContentForTitle: PaneContent | null = null
 
       function updateContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             const nextContent = normalizePaneContent(content, node.content)
             normalizedContentForTitle = nextContent
             return { ...node, content: nextContent }
@@ -1006,7 +1097,12 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1021,10 +1117,12 @@ export const panesSlice = createSlice({
       const { tabId, paneId, updates } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      let previousContentForTitle: PaneContent | null = null
 
       function mergeContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             return {
               ...node,
               content: normalizePaneContent({ ...node.content, ...updates } as PaneContentInput | PaneContent, node.content),
@@ -1046,9 +1144,48 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        }
       }
 
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
+    restartAgentChatCreate: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const { tabId, paneId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function restartContent(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') {
+          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+            return node
+          }
+          return {
+            ...node,
+            content: normalizePaneContent({
+              ...node.content,
+              sessionId: undefined,
+              createRequestId: nanoid(),
+              status: 'creating',
+              createError: undefined,
+            }, node.content),
+          }
+        }
+        return {
+          ...node,
+          children: [restartContent(node.children[0]), restartContent(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = restartContent(root)
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -1145,6 +1282,7 @@ export const panesSlice = createSlice({
     },
 
     hydratePanes: (state, action: PayloadAction<PanesState>) => {
+      const meta = (action as PayloadAction<PanesState, string, HydratePanesMeta | undefined>).meta
       const incoming = action.payload
 
       // Merge layouts: preserve local terminal assignments that are more
@@ -1156,7 +1294,7 @@ export const panesSlice = createSlice({
         const localNode = state.layouts[tabId]
         const incomingHasShape = hasPaneTreeShape(incomingNode)
         const mergedNode = localNode
-          ? mergeTerminalState(incomingNode as PaneNode, localNode)
+          ? mergeTerminalState(incomingNode as PaneNode, localNode, meta)
           : (incomingHasShape ? incomingNode as PaneNode : null)
         const mergeUsedIncoming = mergedNode !== localNode
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
@@ -1319,6 +1457,7 @@ export const {
   swapPanes,
   updatePaneContent,
   mergePaneContent,
+  restartAgentChatCreate,
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,

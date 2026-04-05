@@ -1,16 +1,20 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
   AgentChatState,
   AgentTimelineItem,
+  AgentTimelineTurn,
   ChatContentBlock,
   ChatMessage,
   ChatSessionState,
+  PendingCreateFailure,
   QuestionDefinition,
 } from './agentChatTypes'
 
 const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
+  pendingCreateFailures: {},
   availableModels: [],
 }
 
@@ -33,6 +37,61 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
     }
   }
   return state.sessions[sessionId]
+}
+
+function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'timelineSessionId'>): string | undefined {
+  return (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
+    ?? session.timelineSessionId
+    ?? session.cliSessionId
+}
+
+function isRestoreFailureCode(code?: string): code is string {
+  return typeof code === 'string' && code.startsWith('RESTORE_')
+}
+
+function markTerminalRestoreFailure(session: ChatSessionState, code: string, message: string): void {
+  session.awaitingDurableHistory = false
+  session.historyLoaded = true
+  session.timelineLoading = false
+  session.restoreFailureCode = code
+  session.restoreFailureMessage = message
+}
+
+function resetHydratedTimelineStateForRestoreRetry(session: ChatSessionState): void {
+  session.latestTurnId = undefined
+  session.timelineItems = []
+  session.timelineBodies = {}
+  session.nextTimelineCursor = undefined
+  session.timelineRevision = undefined
+  session.timelineLoading = false
+  session.timelineError = undefined
+  session.historyLoaded = false
+  session.restoreFailureMessage = undefined
+}
+
+function resetHydratedTimelineStateForDurableUpgrade(session: ChatSessionState): void {
+  session.timelineItems = []
+  session.timelineBodies = {}
+  session.nextTimelineCursor = undefined
+  session.timelineLoading = false
+  session.timelineError = undefined
+  session.historyLoaded = false
+  session.messages = []
+  session.streamingText = ''
+  session.streamingActive = false
+  session.restoreFailureMessage = undefined
+}
+
+function requestFreshSnapshotRefresh(session: ChatSessionState): void {
+  resetHydratedTimelineStateForRestoreRetry(session)
+  session.messages = []
+  session.streamingText = ''
+  session.streamingActive = false
+  session.snapshotRefreshRequestId = (session.snapshotRefreshRequestId ?? 0) + 1
+}
+
+function requestRestoreHydrationRestart(session: ChatSessionState): void {
+  session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
 }
 
 const agentChatSlice = createSlice({
@@ -58,6 +117,10 @@ const agentChatSlice = createSlice({
       // Fresh creates have no history to load, but resumed creates stay in
       // restore mode until snapshot/timeline data establishes durable history.
       session.historyLoaded = !expectsHistoryHydration
+      session.awaitingDurableHistory = expectsHistoryHydration
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
       state.pendingCreates[requestId] = {
         sessionId,
         expectsHistoryHydration,
@@ -76,19 +139,101 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      session.status = 'connected'
+      if (action.payload.cliSessionId) {
+        session.awaitingDurableHistory = false
+      }
+      if (session.status === 'creating' || session.status === 'starting') {
+        session.status = 'connected'
+      }
+    },
+
+    sessionMetadataReceived(state, action: PayloadAction<{
+      sessionId: string
+      cliSessionId?: string
+      model?: string
+      cwd?: string
+      tools?: Array<{ name: string }>
+    }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      const nextCliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextRestoreQueryId = getRestoreQueryId({
+        cliSessionId: nextCliSessionId,
+        timelineSessionId: session.timelineSessionId,
+      })
+      const shouldRequestFreshSnapshot = Boolean(
+        session.historyLoaded
+          && isValidClaudeSessionId(nextCliSessionId)
+          && nextRestoreQueryId
+          && previousRestoreQueryId !== nextRestoreQueryId,
+      )
+
+      if (shouldRequestFreshSnapshot) {
+        requestFreshSnapshotRefresh(session)
+        session.restoreRetryCount = 0
+        session.restoreFailureCode = undefined
+        session.restoreFailureMessage = undefined
+      }
+
+      session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
+      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
+        session.timelineSessionId = action.payload.cliSessionId
+        session.awaitingDurableHistory = false
+      }
+      session.model = action.payload.model ?? session.model
+      session.cwd = action.payload.cwd ?? session.cwd
+      session.tools = action.payload.tools ?? session.tools
     },
 
     sessionSnapshotReceived(state, action: PayloadAction<{
       sessionId: string
       latestTurnId: string | null
       status: ChatSessionState['status']
+      timelineSessionId?: string
+      revision?: number
+      streamingActive?: boolean
+      streamingText?: string
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextRestoreQueryId = getRestoreQueryId({
+        cliSessionId: session.cliSessionId,
+        timelineSessionId: action.payload.timelineSessionId ?? session.timelineSessionId,
+      })
+      const shouldRestartHydration = Boolean(
+        session.historyLoaded
+          && (
+            (nextRestoreQueryId && previousRestoreQueryId && nextRestoreQueryId !== previousRestoreQueryId)
+            || (
+              action.payload.revision != null
+              && session.timelineRevision != null
+              && action.payload.revision !== session.timelineRevision
+            )
+          ),
+      )
+      if (shouldRestartHydration) {
+        resetHydratedTimelineStateForDurableUpgrade(session)
+        requestRestoreHydrationRestart(session)
+      }
+
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
+      session.timelineSessionId = action.payload.timelineSessionId
+      session.timelineRevision = action.payload.revision
+      session.streamingActive = action.payload.streamingActive ?? false
+      session.streamingText = action.payload.streamingText ?? ''
+      session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
+      session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
-        session.historyLoaded = true
+        const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
+          || isValidClaudeSessionId(session.cliSessionId)
+        if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
+          session.historyLoaded = true
+          session.awaitingDurableHistory = false
+        }
+      } else {
+        session.awaitingDurableHistory = false
       }
     },
 
@@ -113,6 +258,8 @@ const agentChatSlice = createSlice({
     }>) {
       const session = state.sessions[action.payload.sessionId]
       if (!session) return
+      session.streamingActive = false
+      session.streamingText = ''
       session.messages.push({
         role: 'assistant',
         content: action.payload.content,
@@ -226,50 +373,93 @@ const agentChatSlice = createSlice({
 
     timelinePageReceived(state, action: PayloadAction<{
       sessionId: string
+      timelineSessionId?: string
       items: AgentTimelineItem[]
       nextCursor: string | null
       revision: number
       replace?: boolean
+      bodies?: Record<string, AgentTimelineTurn>
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      const nextBodies = action.payload.bodies ?? {}
       session.timelineItems = action.payload.replace === false
         ? [...session.timelineItems, ...action.payload.items]
         : action.payload.items
+      session.timelineBodies = action.payload.replace === false
+        ? { ...session.timelineBodies, ...nextBodies }
+        : nextBodies
+      if (action.payload.timelineSessionId) {
+        session.timelineSessionId = action.payload.timelineSessionId
+      }
+      session.timelineRevision = action.payload.revision
       session.nextTimelineCursor = action.payload.nextCursor
       session.timelineLoading = false
       session.timelineError = undefined
+      session.awaitingDurableHistory = false
       session.historyLoaded = true
+      session.restoreRetryCount = 0
+      session.restoreFailureCode = undefined
+      session.restoreFailureMessage = undefined
     },
 
-    timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string }>) {
+    timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string; code?: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
       session.timelineLoading = false
       session.timelineError = action.payload.message
+      if (isRestoreFailureCode(action.payload.code)) {
+        markTerminalRestoreFailure(session, action.payload.code, action.payload.message)
+      }
     },
 
     turnBodyReceived(state, action: PayloadAction<{
       sessionId: string
-      turnId: string
-      message: ChatMessage
+      turn: AgentTimelineTurn
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
-      session.timelineBodies[action.payload.turnId] = action.payload.message
+      session.timelineBodies[action.payload.turn.turnId] = action.payload.turn
     },
 
-    sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
-      const session = state.sessions[action.payload.sessionId]
-      if (!session) return
+    sessionError(state, action: PayloadAction<{ sessionId: string; message: string; code?: string }>) {
+      const session = ensureSession(state, action.payload.sessionId)
       session.lastError = action.payload.message
+      if (isRestoreFailureCode(action.payload.code)) {
+        markTerminalRestoreFailure(session, action.payload.code, action.payload.message)
+      }
     },
 
     /** Mark a session as lost (server confirmed it no longer exists).
      *  Creates the session entry if needed (e.g. after page refresh where Redux
      *  was empty) and sets flags that enable AgentChatView to detect the loss
-     *  and trigger immediate recovery without waiting for the 5-second timeout. */
+     *  and trigger recovery. If restore hydration already has a pinned snapshot
+     *  but has not loaded the first timeline window yet, keep that hydration
+     *  pending so the rebuilt transcript can render before the pane detaches. */
     markSessionLost(state, action: PayloadAction<{ sessionId: string }>) {
       const session = ensureSession(state, action.payload.sessionId)
+      session.awaitingDurableHistory = false
       session.lost = true
-      session.historyLoaded = true
+      const waitingForInitialRestoreWindow = (
+        session.latestTurnId !== undefined
+        && session.historyLoaded !== true
+      )
+      session.historyLoaded = waitingForInitialRestoreWindow ? false : true
+    },
+
+    restoreRetryRequested(state, action: PayloadAction<{ sessionId: string; code: string }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      resetHydratedTimelineStateForRestoreRetry(session)
+      session.snapshotRefreshRequestId = undefined
+      session.restoreRetryCount = (session.restoreRetryCount ?? 0) + 1
+      session.restoreFailureCode = action.payload.code
+      session.restoreFailureMessage = undefined
+    },
+
+    createFailed(state, action: PayloadAction<{ requestId: string } & PendingCreateFailure>) {
+      const { requestId, ...failure } = action.payload
+      state.pendingCreateFailures[requestId] = failure
+    },
+
+    clearPendingCreateFailure(state, action: PayloadAction<{ requestId: string }>) {
+      delete state.pendingCreateFailures[action.payload.requestId]
     },
 
     clearPendingCreate(state, action: PayloadAction<{ requestId: string }>) {
@@ -292,6 +482,7 @@ export const {
   registerPendingCreate,
   sessionCreated,
   sessionInit,
+  sessionMetadataReceived,
   sessionSnapshotReceived,
   addUserMessage,
   addAssistantMessage,
@@ -311,6 +502,9 @@ export const {
   turnBodyReceived,
   sessionError,
   markSessionLost,
+  restoreRetryRequested,
+  createFailed,
+  clearPendingCreateFailure,
   clearPendingCreate,
   removeSession,
   setAvailableModels,

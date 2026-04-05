@@ -1,6 +1,7 @@
 import path from 'path'
 import { EventEmitter } from 'events'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { createAgentHistorySource } from '../../../server/agent-timeline/history-source.js'
 
 // Mock the SDK's query function
 const mockMessages: any[] = []
@@ -89,6 +90,22 @@ describe('SdkBridge', () => {
       expect(session.cwd).toBe('/tmp')
     })
 
+    it('returns an explicit replay gate handle from createSession', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+
+      expect(session).toHaveProperty('replayGate')
+      expect((session as any).replayGate.drain()).toMatchObject({
+        watermark: 0,
+        session: expect.objectContaining({
+          sessionId: session.sessionId,
+          status: 'starting',
+          cwd: '/tmp',
+        }),
+        bufferedMessages: [],
+      })
+    })
+
     it('lists active sessions', async () => {
       mockKeepStreamOpen = true
       await bridge.createSession({ cwd: '/tmp' })
@@ -100,6 +117,75 @@ describe('SdkBridge', () => {
       const session = await bridge.createSession({ cwd: '/tmp' })
       expect(bridge.getSession(session.sessionId)).toBeDefined()
       expect(bridge.getSession('nonexistent')).toBeUndefined()
+    })
+
+    it('finds a session by cliSessionId after init', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.findSessionByCliSessionId('cli-123')?.sessionId).toBe(session.sessionId)
+    })
+
+    it('finds a session by resumeSessionId before the SDK init arrives', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.length = 0
+
+      const session = await bridge.createSession({
+        cwd: '/tmp',
+        resumeSessionId: '00000000-0000-4000-8000-000000000241',
+      })
+
+      expect(bridge.findSessionByCliSessionId('00000000-0000-4000-8000-000000000241')?.sessionId).toBe(session.sessionId)
+    })
+
+    it('assigns stable message ids to locally ingested user turns before any durable history exists', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+
+      expect(bridge.sendUserMessage(session.sessionId, 'hello world')).toBe(true)
+
+      const stored = bridge.getSession(session.sessionId)
+      expect(stored?.messages).toHaveLength(1)
+      expect(stored?.messages[0]?.messageId).toBeTruthy()
+    })
+
+    it('assigns live-scoped ids to repeated local messages instead of reusing durable ids', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const liveState = bridge.getSession(session.sessionId)
+      expect(liveState).toBeDefined()
+      if (!liveState) throw new Error('expected live state')
+
+      const assignMessageId = (bridge as any).assignMessageId.bind(bridge) as (
+        state: typeof liveState,
+        message: { role: 'user'; content: Array<{ type: 'text'; text: string }>; timestamp: string },
+      ) => string
+      const message = {
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: 'hello' }],
+        timestamp: '2026-04-03T12:00:00.000Z',
+      }
+
+      const firstId = assignMessageId(liveState, message)
+      liveState.messages.push({ ...message, messageId: firstId })
+      const secondId = assignMessageId(liveState, message)
+
+      expect(firstId).toMatch(/^live:/)
+      expect(secondId).toMatch(/^live:/)
+      expect(firstId).not.toMatch(/^durable:/)
+      expect(secondId).not.toBe(firstId)
     })
 
     it('kills a session', async () => {
@@ -161,6 +247,7 @@ describe('SdkBridge', () => {
 
       const assistantMsg = received.find(m => m.type === 'sdk.assistant')
       expect(assistantMsg).toBeDefined()
+      expect(bridge.getSession(session.sessionId)?.messages[0]?.messageId).toBeTruthy()
     })
 
     it('translates result to sdk.result with cost tracking', async () => {
@@ -210,6 +297,68 @@ describe('SdkBridge', () => {
       const streamMsg = received.find(m => m.type === 'sdk.stream')
       expect(streamMsg).toBeDefined()
       expect(streamMsg.parentToolUseId).toBe('tool-1')
+    })
+
+    it('tracks stream snapshot state for reconnect restore', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_start' },
+        session_id: 'cli-123',
+        uuid: 'uuid-1',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'par' },
+        },
+        session_id: 'cli-123',
+        uuid: 'uuid-2',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)).toMatchObject({
+        streamingActive: true,
+        streamingText: 'par',
+      })
+    })
+
+    it('preserves partial streaming text after content_block_stop until the final assistant message arrives', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_start' },
+        session_id: 'cli-123',
+        uuid: 'uuid-1',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'partial reply' },
+        },
+        session_id: 'cli-123',
+        uuid: 'uuid-2',
+      })
+      mockMessages.push({
+        type: 'stream_event',
+        event: { type: 'content_block_stop' },
+        session_id: 'cli-123',
+        uuid: 'uuid-3',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      expect(bridge.getSession(session.sessionId)).toMatchObject({
+        streamingActive: false,
+        streamingText: 'partial reply',
+      })
     })
 
     it('sets status to idle on result', async () => {
@@ -755,7 +904,75 @@ describe('SdkBridge', () => {
   })
 
   describe('stream end cleanup', () => {
+    it('falls back to durable-only restore after a stream ends naturally and the session is no longer live', async () => {
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: '00000000-0000-4000-8000-000000000123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+      mockMessages.push({
+        type: 'result',
+        subtype: 'success',
+        duration_ms: 100,
+        duration_api_ms: 80,
+        is_error: false,
+        num_turns: 1,
+        total_cost_usd: 0.01,
+        usage: { input_tokens: 100, output_tokens: 50 },
+        session_id: '00000000-0000-4000-8000-000000000123',
+        uuid: 'test-uuid',
+      })
+
+      const loadSessionHistory = vi.fn().mockResolvedValue([
+        {
+          role: 'user' as const,
+          content: [{ type: 'text' as const, text: 'durable prompt' }],
+          timestamp: '2026-04-03T00:00:00.000Z',
+          messageId: 'durable-msg-1',
+        },
+      ])
+      let bridgeWithHistory!: SdkBridge
+      const historySource = createAgentHistorySource({
+        loadSessionHistory,
+        getLiveSessionBySdkSessionId: (id) => bridgeWithHistory.getLiveSession(id),
+        getLiveSessionByCliSessionId: (id) => bridgeWithHistory.findLiveSessionByCliSessionId(id),
+      })
+      bridgeWithHistory = new SdkBridge(historySource)
+
+      const session = await bridgeWithHistory.createSession({ cwd: '/tmp' })
+      bridgeWithHistory.subscribe(session.sessionId, () => {})
+      await new Promise(resolve => setTimeout(resolve, 150))
+
+      expect(bridgeWithHistory.getLiveSession(session.sessionId)).toBeUndefined()
+
+      const resolved = await historySource.resolve('00000000-0000-4000-8000-000000000123')
+      expect(resolved).toMatchObject({
+        kind: 'resolved',
+        readiness: 'durable_only',
+        liveSessionId: undefined,
+        timelineSessionId: '00000000-0000-4000-8000-000000000123',
+      })
+      if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+      expect(loadSessionHistory).toHaveBeenCalledTimes(1)
+      expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-msg-1'])
+
+      bridgeWithHistory.close()
+    })
+
     it('cleans up process on natural stream end so sendUserMessage returns false', async () => {
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
       mockMessages.push({
         type: 'result',
         subtype: 'success',
@@ -774,8 +991,8 @@ describe('SdkBridge', () => {
       // Wait for stream to complete and cleanup to run
       await new Promise(resolve => setTimeout(resolve, 150))
 
-      // Session state still exists for display
-      expect(bridge.getSession(session.sessionId)).toBeDefined()
+      expect(bridge.getLiveSession(session.sessionId)).toBeUndefined()
+      expect(bridge.findLiveSessionByCliSessionId('cli-123')).toBeUndefined()
       expect(bridge.getSession(session.sessionId)?.status).toBe('idle')
       // But process is gone — sendUserMessage returns false
       expect(bridge.sendUserMessage(session.sessionId, 'hello')).toBe(false)
