@@ -1265,6 +1265,81 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('routes sdk.kill teardown through the resolved live SDK target after alias-based sdk.attach', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000243'
+      const liveSession = {
+        sessionId: 'sdk-live-243',
+        cliSessionId: durableSessionId,
+        status: 'running',
+        messages: [makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z')],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => {
+        if (sessionId === durableSessionId) return undefined
+        if (sessionId === liveSession.sessionId) return liveSession
+        return undefined
+      })
+      mockSdkBridge.subscribe.mockImplementation(() => ({ off: () => {}, replayed: false }))
+      mockHistorySource.resolve.mockResolvedValue(makeResolvedHistory({
+        queryId: durableSessionId,
+        liveSessionId: liveSession.sessionId,
+        timelineSessionId: durableSessionId,
+        revision: 124,
+        messages: [
+          makeMessage('user', 'older prompt', '2026-03-10T10:00:00.000Z'),
+          makeMessage('assistant', 'older reply', '2026-03-10T10:01:00.000Z'),
+          makeMessage('user', 'delta prompt', '2026-03-10T10:02:00.000Z'),
+        ],
+      }))
+
+      const ws = await connectAndAuth()
+      try {
+        const collectedAttach = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (parsed.type === 'sdk.status') {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: durableSessionId,
+        }))
+
+        await collectedAttach
+
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.kill',
+          sessionId: durableSessionId,
+        }, 'sdk.killed')
+
+        expect(response).toEqual({
+          type: 'sdk.killed',
+          sessionId: durableSessionId,
+          success: true,
+        })
+        expect(mockSdkBridge.killSession).toHaveBeenCalledWith(liveSession.sessionId)
+        expect(mockHistorySource.teardownLiveSession).toHaveBeenCalledWith(
+          liveSession.sessionId,
+          { recoverable: false },
+        )
+        expect(mockHistorySource.teardownLiveSession).not.toHaveBeenCalledWith(
+          durableSessionId,
+          { recoverable: false },
+        )
+      } finally {
+        ws.close()
+      }
+    })
+
     it('reuses the live SDK session when sdk.attach resolves the canonical durable id through the live cli-session alias lookup', async () => {
       const durableSessionId = '00000000-0000-4000-8000-000000000244'
       const liveSession = {

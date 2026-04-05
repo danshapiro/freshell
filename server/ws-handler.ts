@@ -2191,8 +2191,9 @@ export class WsHandler {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
           return
         }
-        const killed = this.sdkBridge.killSession(this.resolveSdkSessionTarget(state, m.sessionId))
-        this.teardownSdkRestoreState(m.sessionId, false)
+        const targetSessionId = this.resolveSdkSessionTarget(state, m.sessionId)
+        const killed = this.sdkBridge.killSession(targetSessionId)
+        this.teardownSdkRestoreState(targetSessionId, false)
         this.clearClientSdkSession(state, m.sessionId)
         this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
         return
