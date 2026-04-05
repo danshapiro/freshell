@@ -110,6 +110,8 @@ export interface ChatSessionState {
   restoreFailureCode?: string
   /** Monotonic key for requesting one fresh sdk.attach snapshot refresh before hydration resumes. */
   snapshotRefreshRequestId?: number
+  /** Monotonic key for restarting visible restore hydration from a newer snapshot. */
+  restoreHydrationRequestId?: number
 }
 
 export interface PendingAgentCreate {

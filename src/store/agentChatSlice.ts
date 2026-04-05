@@ -76,6 +76,10 @@ function requestFreshSnapshotRefresh(session: ChatSessionState): void {
   session.snapshotRefreshRequestId = (session.snapshotRefreshRequestId ?? 0) + 1
 }
 
+function requestRestoreHydrationRestart(session: ChatSessionState): void {
+  session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
+}
+
 const agentChatSlice = createSlice({
   name: 'agentChat',
   initialState,
@@ -193,6 +197,7 @@ const agentChatSlice = createSlice({
       )
       if (shouldRestartHydration) {
         resetHydratedTimelineStateForDurableUpgrade(session)
+        requestRestoreHydrationRestart(session)
       }
 
       session.latestTurnId = action.payload.latestTurnId

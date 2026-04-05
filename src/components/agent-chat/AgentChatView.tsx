@@ -411,6 +411,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     paneContent.sessionId,
     paneId,
     restoreHistoryQueryId,
+    session?.restoreHydrationRequestId,
     session?.latestTurnId,
     waitingForDurableHistoryIdentity,
     suppressNetworkEffects,

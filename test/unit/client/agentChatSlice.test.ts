@@ -574,6 +574,56 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sdk-live-snapshot'].nextTimelineCursor).toBeUndefined()
   })
 
+  it('marks a restore restart when a newer snapshot revision arrives with the same latestTurnId', () => {
+    let state = agentChatReducer(initial, registerPendingCreate({
+      requestId: 'req-revision-only',
+      expectsHistoryHydration: true,
+    }))
+    state = agentChatReducer(state, sessionCreated({
+      requestId: 'req-revision-only',
+      sessionId: 'sdk-revision-only',
+    }))
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-revision-only',
+      latestTurnId: 'turn-stable-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      revision: 12,
+    }))
+    state = agentChatReducer(state, timelinePageReceived({
+      sessionId: 'sdk-revision-only',
+      items: [
+        makeTimelineItem('turn-stable-2', 'assistant', 'Revision 12 summary', {
+          sessionId: '00000000-0000-4000-8000-000000000654',
+          ordinal: 0,
+          source: 'durable',
+        }),
+      ],
+      nextCursor: null,
+      revision: 12,
+      replace: true,
+    }))
+
+    state = agentChatReducer(state, sessionSnapshotReceived({
+      sessionId: 'sdk-revision-only',
+      latestTurnId: 'turn-stable-2',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      revision: 13,
+    }))
+
+    expect(state.sessions['sdk-revision-only']).toMatchObject({
+      historyLoaded: false,
+      timelineSessionId: '00000000-0000-4000-8000-000000000654',
+      timelineRevision: 13,
+      latestTurnId: 'turn-stable-2',
+      restoreHydrationRequestId: 1,
+    })
+    expect(state.sessions['sdk-revision-only'].timelineItems).toEqual([])
+    expect(state.sessions['sdk-revision-only'].timelineBodies).toEqual({})
+    expect(state.sessions['sdk-revision-only'].nextTimelineCursor).toBeUndefined()
+  })
+
   it('stores timeline summaries and marks history loaded once the first page arrives', () => {
     const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-timeline',

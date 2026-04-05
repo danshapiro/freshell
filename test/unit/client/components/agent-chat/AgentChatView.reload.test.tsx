@@ -1692,4 +1692,108 @@ describe('AgentChatView server-restart recovery', () => {
     const createCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')
     expect(createCalls).toHaveLength(0)
   })
+
+  it('restarts hydration when a newer snapshot revision arrives with the same latestTurnId', async () => {
+    getAgentTimelinePage
+      .mockResolvedValueOnce({
+        sessionId: '00000000-0000-4000-8000-000000000654',
+        items: [
+          makeTimelineItem('turn-2', 'assistant', 'Revision 12 summary', {
+            sessionId: '00000000-0000-4000-8000-000000000654',
+            ordinal: 0,
+            source: 'durable',
+          }),
+        ],
+        bodies: {
+          'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Revision 12 body', {
+            sessionId: '00000000-0000-4000-8000-000000000654',
+            ordinal: 0,
+            source: 'durable',
+          }),
+        },
+        nextCursor: null,
+        revision: 12,
+      })
+      .mockResolvedValueOnce({
+        sessionId: '00000000-0000-4000-8000-000000000654',
+        items: [
+          makeTimelineItem('turn-2', 'assistant', 'Revision 13 summary', {
+            sessionId: '00000000-0000-4000-8000-000000000654',
+            ordinal: 0,
+            source: 'durable',
+          }),
+        ],
+        bodies: {
+          'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Revision 13 body', {
+            sessionId: '00000000-0000-4000-8000-000000000654',
+            ordinal: 0,
+            source: 'durable',
+          }),
+        },
+        nextCursor: null,
+        revision: 13,
+      })
+
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-revision-refresh',
+      sessionId: 'sdk-revision-refresh-1',
+      status: 'idle',
+      resumeSessionId: '00000000-0000-4000-8000-000000000654',
+    }
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-revision-refresh-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: '00000000-0000-4000-8000-000000000654',
+        revision: 12,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalled()
+    })
+    expect(getAgentTimelinePage).toHaveBeenLastCalledWith(
+      '00000000-0000-4000-8000-000000000654',
+      expect.objectContaining({ includeBodies: true, revision: 12 }),
+      expect.anything(),
+    )
+    expect(await screen.findByText('Revision 12 body')).toBeInTheDocument()
+    const initialCallCount = getAgentTimelinePage.mock.calls.length
+
+    act(() => {
+      store.dispatch(sessionSnapshotReceived({
+        sessionId: 'sdk-revision-refresh-1',
+        latestTurnId: 'turn-2',
+        status: 'idle',
+        timelineSessionId: '00000000-0000-4000-8000-000000000654',
+        revision: 13,
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage.mock.calls.length).toBeGreaterThan(initialCallCount)
+    })
+    expect(getAgentTimelinePage).toHaveBeenLastCalledWith(
+      '00000000-0000-4000-8000-000000000654',
+      expect.objectContaining({ includeBodies: true, revision: 13 }),
+      expect.anything(),
+    )
+    expect(await screen.findByText('Revision 13 body')).toBeInTheDocument()
+    expect(screen.queryByText('Revision 12 body')).not.toBeInTheDocument()
+
+    const session = store.getState().agentChat.sessions['sdk-revision-refresh-1']
+    expect(session?.historyLoaded).toBe(true)
+    expect(session?.timelineRevision).toBe(13)
+  })
 })
