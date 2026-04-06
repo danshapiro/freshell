@@ -16,8 +16,14 @@ import type { SessionScanResult, SessionRepairResult } from './session-scanner/t
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
 import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
-import type { CodexActivityRecord, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
+import type {
+  CodexActivityRecord,
+  OpencodeActivityRecord,
+  SdkServerMessage,
+  SdkSessionStatus,
+} from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
+import { allocateLocalhostPort } from './local-port.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory } from './session-history-loader.js'
@@ -34,6 +40,9 @@ import {
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
   CodexActivityUpdatedSchema,
+  OpencodeActivityListResponseSchema,
+  OpencodeActivityListSchema,
+  OpencodeActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
   TerminalAttachSchema,
@@ -71,6 +80,21 @@ type WsHandlerConfig = {
   drainTimeoutMs: number
   terminalCreateRateLimit: number
   terminalCreateRateWindowMs: number
+}
+
+export type WsHandlerOptions = {
+  codingCliManager?: CodingCliSessionManager
+  sdkBridge?: SdkBridge
+  sessionRepairService?: SessionRepairService
+  handshakeSnapshotProvider?: HandshakeSnapshotProvider
+  terminalMetaListProvider?: () => TerminalMeta[]
+  tabsRegistryStore?: TabsRegistryStore
+  serverInstanceId?: string
+  layoutStore?: LayoutStore
+  extensionManager?: ExtensionManager
+  codexActivityListProvider?: () => CodexActivityRecord[]
+  agentHistorySource?: AgentHistorySource
+  opencodeActivityListProvider?: () => OpencodeActivityRecord[]
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -321,6 +345,9 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
 export class WsHandler {
   private readonly config: WsHandlerConfig
   private readonly authToken: string
+  private readonly registry: TerminalRegistry
+  private readonly codingCliManager?: CodingCliSessionManager
+  private readonly sdkBridge?: SdkBridge
   private wss: WebSocketServer
   private connections = new Set<LiveWebSocket>()
   private clientStates = new Map<LiveWebSocket, ClientState>()
@@ -330,6 +357,7 @@ export class WsHandler {
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
   private codexActivityListProvider?: () => CodexActivityRecord[]
+  private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
@@ -358,44 +386,39 @@ export class WsHandler {
 
   constructor(
     server: http.Server,
-    private registry: TerminalRegistry,
-    private codingCliManager?: CodingCliSessionManager,
-    private sdkBridge?: SdkBridge,
-    sessionRepairService?: SessionRepairService,
-    handshakeSnapshotProvider?: HandshakeSnapshotProvider,
-    terminalMetaListProvider?: () => TerminalMeta[],
-    tabsRegistryStore?: TabsRegistryStore,
-    serverInstanceId?: string,
-    layoutStore?: LayoutStore,
-    extensionManager?: ExtensionManager,
-    codexActivityListProvider?: () => CodexActivityRecord[],
-    agentHistorySource?: AgentHistorySource,
+    registry: TerminalRegistry,
+    options: WsHandlerOptions = {},
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
-    this.sessionRepairService = sessionRepairService
-    this.handshakeSnapshotProvider = handshakeSnapshotProvider
-    this.terminalMetaListProvider = terminalMetaListProvider
-    this.codexActivityListProvider = codexActivityListProvider
-    this.tabsRegistryStore = tabsRegistryStore
-    this.layoutStore = layoutStore
-    this.extensionManager = extensionManager
-    this.agentHistorySource = agentHistorySource ?? (this.sdkBridge
+    this.registry = registry
+    this.codingCliManager = options.codingCliManager
+    this.sdkBridge = options.sdkBridge
+    this.sessionRepairService = options.sessionRepairService
+    this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
+    this.terminalMetaListProvider = options.terminalMetaListProvider
+    this.codexActivityListProvider = options.codexActivityListProvider
+    this.opencodeActivityListProvider = options.opencodeActivityListProvider
+    this.tabsRegistryStore = options.tabsRegistryStore
+    this.layoutStore = options.layoutStore
+    this.extensionManager = options.extensionManager
+    this.agentHistorySource = options.agentHistorySource ?? (this.sdkBridge
       ? createAgentHistorySource({
         loadSessionHistory,
         getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getLiveSession(sdkSessionId),
         getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findLiveSessionByCliSessionId(timelineSessionId),
       })
       : undefined)
-    this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
-      ? serverInstanceId
+    this.serverInstanceId = options.serverInstanceId && options.serverInstanceId.trim().length > 0
+      ? options.serverInstanceId
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
     // Build the set of valid CLI provider/mode names from extensions
+    const extensionManager = this.extensionManager
     const canEnumerateCliExtensions = typeof extensionManager?.getAll === 'function'
-    const extensionModes = canEnumerateCliExtensions
+    const extensionModes = canEnumerateCliExtensions && extensionManager
       ? extensionManager.getAll()
           .filter(e => e.manifest.category === 'cli')
           .map(e => e.manifest.name)
@@ -454,6 +477,7 @@ export class WsHandler {
       TerminalResizeSchema,
       TerminalKillSchema,
       CodexActivityListSchema,
+      OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
       dynamicCodingCliCreateSchema,
@@ -1600,19 +1624,24 @@ export class WsHandler {
                 effectiveResumeSessionId,
               }, '[TRACE resumeSessionId] about to create terminal')
 
+              const spawnProviderSettings = providerSettings
+                ? {
+                    permissionMode: providerSettings.permissionMode,
+                    model: providerSettings.model,
+                    sandbox: providerSettings.sandbox,
+                    ...(m.mode === 'opencode'
+                      ? { opencodeServer: await allocateLocalhostPort() }
+                      : {}),
+                  }
+                : undefined
+
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                 cwd: m.cwd,
                 resumeSessionId: effectiveResumeSessionId,
                 envContext: { tabId: m.tabId, paneId: m.paneId },
-                providerSettings: providerSettings
-                  ? {
-                      permissionMode: providerSettings.permissionMode,
-                      model: providerSettings.model,
-                      sandbox: providerSettings.sandbox,
-                    }
-                  : undefined,
+                providerSettings: spawnProviderSettings,
               })
 
               if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
@@ -1754,6 +1783,26 @@ export class WsHandler {
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
             message: 'Codex activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
+      case 'opencode.activity.list': {
+        const terminals = this.opencodeActivityListProvider ? this.opencodeActivityListProvider() : []
+        const response = OpencodeActivityListResponseSchema.safeParse({
+          type: 'opencode.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid opencode.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'OpenCode activity unavailable',
             requestId: m.requestId,
           })
           return
@@ -2491,6 +2540,21 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid codex.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastOpencodeActivityUpdated(msg: { upsert?: OpencodeActivityRecord[]; remove?: string[] }): void {
+    const parsed = OpencodeActivityUpdatedSchema.safeParse({
+      type: 'opencode.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid opencode.activity.updated payload')
       return
     }
 

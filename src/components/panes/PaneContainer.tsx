@@ -51,6 +51,7 @@ const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
@@ -164,6 +165,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
+  )
+  const opencodeActivityByTerminalId = useAppSelector(
+    (s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID
   )
   const paneRuntimeActivityByPaneId = useAppSelector(
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
@@ -420,6 +424,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       tabMode: tab?.mode,
       isOnlyPane,
       codexActivityByTerminalId,
+      opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,
     }).isBusy

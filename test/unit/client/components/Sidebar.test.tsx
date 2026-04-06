@@ -15,6 +15,7 @@ import sessionsReducer, {
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
+import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -101,6 +102,7 @@ function createTestStore(options?: {
   sessionOpenMode?: 'tab' | 'split'
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
+  opencodeActivity?: Partial<OpencodeActivityState>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -142,6 +144,7 @@ function createTestStore(options?: {
       sessionActivity: sessionActivityReducer,
       extensions: extensionsReducer,
       codexActivity: codexActivityReducer,
+      opencodeActivity: opencodeActivityReducer,
       terminalDirectory: terminalDirectoryReducer,
     },
     middleware: (getDefault) =>
@@ -202,6 +205,13 @@ function createTestStore(options?: {
         liveMutationSeqByTerminalId: {},
         removedMutationSeqByTerminalId: {},
         ...(options?.codexActivity ?? {}),
+      },
+      opencodeActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
+        ...(options?.opencodeActivity ?? {}),
       },
       terminalDirectory: {
         windows: {
@@ -1155,6 +1165,91 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByRole('button', { name: /Multi terminal/ })
       expect(button.querySelector('.text-blue-500')).toBeTruthy()
       expect(button.querySelector('.text-success')).toBeFalsy()
+    })
+
+    it('shows blue for a busy opencode session when the exact terminal is active', async () => {
+      const now = Date.now()
+      const terminalId = 'term-opencode'
+      const busySessionId = sessionId('busy-opencode')
+      const idleSessionId = sessionId('idle-opencode')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySessionId,
+              projectPath: '/home/user/project',
+              lastActivityAt: now,
+              title: 'Busy opencode session',
+              cwd: '/home/user/project',
+              provider: 'opencode',
+            },
+            {
+              sessionId: idleSessionId,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 1000,
+              title: 'Idle opencode session',
+              cwd: '/home/user/project',
+              provider: 'opencode',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          terminalId,
+          resumeSessionId: busySessionId,
+          mode: 'opencode',
+        },
+        {
+          id: 'tab-2',
+          resumeSessionId: idleSessionId,
+          mode: 'opencode',
+        },
+      ]
+
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId,
+          title: 'OpenCode',
+          createdAt: now,
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+          resumeSessionId: busySessionId,
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        sortMode: 'activity',
+        opencodeActivity: {
+          byTerminalId: {
+            [terminalId]: {
+              terminalId,
+              sessionId: busySessionId,
+              phase: 'busy',
+              updatedAt: 10,
+            },
+          },
+        },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const busyButton = screen.getByRole('button', { name: /Busy opencode session/ })
+      expect(busyButton.querySelector('.text-blue-500')).toBeTruthy()
+      expect(busyButton.querySelector('.text-success')).toBeFalsy()
+
+      const idleButton = screen.getByRole('button', { name: /Idle opencode session/ })
+      expect(idleButton.querySelector('.text-success')).toBeTruthy()
+      expect(idleButton.querySelector('.text-blue-500')).toBeFalsy()
     })
   })
 
