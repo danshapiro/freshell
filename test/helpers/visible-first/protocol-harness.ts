@@ -225,10 +225,9 @@ export async function createProtocolHarness(options: ProtocolHarnessOptions = {}
   const handler = new WsHandler(
     server,
     registry as any,
-    undefined,
-    undefined,
-    undefined,
-    handshakeSnapshotProvider,
+    {
+      handshakeSnapshotProvider,
+    },
   )
   const { port } = await listen(server)
   const openClients = new Set<WebSocket>()

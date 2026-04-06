@@ -98,6 +98,7 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 500): Promise<void> {
 
 class FakeRegistry {
   detach() { return true }
+  list() { return [] }
 }
 
 const fakeExtensions = [
@@ -145,15 +146,9 @@ describe('ws extension registry', () => {
     new (WsHandler as any)(
       server,
       new FakeRegistry() as any,
-      undefined, // codingCliManager
-      undefined, // sdkBridge
-      undefined, // sessionRepairService
-      undefined, // handshakeSnapshotProvider
-      undefined, // terminalMetaListProvider
-      undefined, // tabsRegistryStore
-      undefined, // serverInstanceId
-      undefined, // layoutStore
-      new FakeExtensionManager() as any, // extensionManager
+      {
+        extensionManager: new FakeExtensionManager() as any,
+      },
     )
 
     const info = await listen(server)

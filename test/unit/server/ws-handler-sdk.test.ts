@@ -384,17 +384,10 @@ describe('WS Handler SDK Integration', () => {
       handler = new WsHandler(
         server,
         registry,
-        undefined, // codingCliManager
-        mockSdkBridge,
-        undefined, // sessionRepairService
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        mockHistorySource,
+        {
+          sdkBridge: mockSdkBridge,
+          agentHistorySource: mockHistorySource,
+        },
       )
     })
 

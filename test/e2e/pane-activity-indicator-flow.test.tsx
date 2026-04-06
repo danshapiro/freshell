@@ -9,6 +9,10 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
+import opencodeActivityReducer, {
+  removeOpencodeActivity,
+  upsertOpencodeActivity,
+} from '@/store/opencodeActivitySlice'
 import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
 import paneRuntimeActivityReducer, {
@@ -106,6 +110,7 @@ function renderHarness(options: RenderHarnessOptions) {
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
       codexActivity: codexActivityReducer,
+      opencodeActivity: opencodeActivityReducer,
       agentChat: agentChatReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
     },
@@ -138,6 +143,12 @@ function renderHarness(options: RenderHarnessOptions) {
         attentionByPane: {},
       },
       codexActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
+      },
+      opencodeActivity: {
         byTerminalId: {},
         lastSnapshotSeq: 0,
         liveMutationSeqByTerminalId: {},
@@ -305,6 +316,61 @@ describe('pane activity indicator flow (e2e)', () => {
 
     act(() => {
       store.dispatch(clearPaneRuntimeActivity({ paneId: 'pane-activity' }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+  })
+
+  it('shows OpenCode terminals blue only for exact terminal busy activity and clears on removal', () => {
+    const pane: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-opencode',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      terminalId: 'term-opencode',
+      resumeSessionId: 'session-opencode',
+    }
+
+    const { store } = renderHarness({
+      pane,
+      tab: {
+        mode: 'opencode',
+        terminalId: 'term-opencode',
+        resumeSessionId: 'session-opencode',
+      },
+    })
+
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+
+    act(() => {
+      store.dispatch(upsertOpencodeActivity({
+        terminals: [{ terminalId: 'term-foreign', phase: 'busy', updatedAt: 1 }],
+        mutationSeq: 1,
+      }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
+
+    act(() => {
+      store.dispatch(upsertOpencodeActivity({
+        terminals: [{ terminalId: 'term-opencode', phase: 'busy', updatedAt: 2 }],
+        mutationSeq: 2,
+      }))
+    })
+
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+
+    act(() => {
+      store.dispatch(removeOpencodeActivity({
+        terminalIds: ['term-opencode'],
+        mutationSeq: 3,
+      }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')

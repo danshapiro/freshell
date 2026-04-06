@@ -82,20 +82,20 @@ class FakeRegistry {
   findRunningClaudeTerminalBySession() { return undefined }
 }
 
-describe('ws codex activity protocol', () => {
+describe('ws opencode activity protocol', () => {
   let server: http.Server
   let port: number
   let wsHandler: any
   const sampleActivity = [{
-    terminalId: 'term-1',
-    sessionId: 'session-1',
+    terminalId: 'term-opencode-1',
+    sessionId: 'session-opencode-1',
     phase: 'busy',
     updatedAt: 1234,
   }]
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
-    process.env.AUTH_TOKEN = 'codex-activity-token'
+    process.env.AUTH_TOKEN = 'opencode-activity-token'
 
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => {
@@ -106,7 +106,7 @@ describe('ws codex activity protocol', () => {
       server,
       new FakeRegistry() as any,
       {
-        codexActivityListProvider: () => sampleActivity as any,
+        opencodeActivityListProvider: () => sampleActivity as any,
       },
     )
     port = await listen(server)
@@ -117,43 +117,43 @@ describe('ws codex activity protocol', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
-  it('returns codex.activity.list.response for codex.activity.list requests', async () => {
+  it('returns opencode.activity.list.response for opencode.activity.list requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'codex-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'opencode-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
-    ws.send(JSON.stringify({ type: 'codex.activity.list', requestId: 'req-codex-1' }))
+    ws.send(JSON.stringify({ type: 'opencode.activity.list', requestId: 'req-opencode-1' }))
     const response = await waitForMessage(
       ws,
-      (msg) => msg.type === 'codex.activity.list.response' && msg.requestId === 'req-codex-1',
+      (msg) => msg.type === 'opencode.activity.list.response' && msg.requestId === 'req-opencode-1',
     )
 
     expect(response.terminals).toEqual(sampleActivity)
     ws.close()
   })
 
-  it('broadcasts codex.activity.updated payloads', async () => {
+  it('broadcasts opencode.activity.updated payloads', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'codex-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'opencode-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
-    wsHandler.broadcastCodexActivityUpdated({
+    wsHandler.broadcastOpencodeActivityUpdated({
       upsert: sampleActivity as any,
       remove: [],
     })
 
-    const updated = await waitForMessage(ws, (msg) => msg.type === 'codex.activity.updated')
+    const updated = await waitForMessage(ws, (msg) => msg.type === 'opencode.activity.updated')
     expect(updated).toEqual({
-      type: 'codex.activity.updated',
+      type: 'opencode.activity.updated',
       upsert: sampleActivity,
       remove: [],
     })
     ws.close()
   })
 
-  it('does not broadcast codex.activity.updated payloads to unauthenticated sockets', async () => {
+  it('does not broadcast opencode.activity.updated payloads to unauthenticated sockets', async () => {
     const authenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     const unauthenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
@@ -162,22 +162,22 @@ describe('ws codex activity protocol', () => {
       new Promise<void>((resolve) => unauthenticated.on('open', () => resolve())),
     ])
 
-    authenticated.send(JSON.stringify({ type: 'hello', token: 'codex-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    authenticated.send(JSON.stringify({ type: 'hello', token: 'opencode-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(authenticated, (msg) => msg.type === 'ready')
 
-    wsHandler.broadcastCodexActivityUpdated({
+    wsHandler.broadcastOpencodeActivityUpdated({
       upsert: sampleActivity as any,
       remove: [],
     })
 
-    const updated = await waitForMessage(authenticated, (msg) => msg.type === 'codex.activity.updated')
+    const updated = await waitForMessage(authenticated, (msg) => msg.type === 'opencode.activity.updated')
     expect(updated).toEqual({
-      type: 'codex.activity.updated',
+      type: 'opencode.activity.updated',
       upsert: sampleActivity,
       remove: [],
     })
 
-    await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'codex.activity.updated')).resolves.toBeUndefined()
+    await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'opencode.activity.updated')).resolves.toBeUndefined()
 
     authenticated.close()
     unauthenticated.close()

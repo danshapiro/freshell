@@ -30,6 +30,19 @@ const SESSION_ID_SIX = '4b1c3d2e-5f6a-7b8c-9d0e-1f2a3b4c5d6e'
 const SESSION_ID_SEVEN = '5c2d4e6f-7a8b-9c0d-1e2f-3a4b5c6d7e8f'
 const SESSION_ID_EIGHT = '6d3e5f7a-8b9c-0d1e-2f3a-4b5c6d7e8f90'
 
+function withOpencodeServer<T extends { providerSettings?: Record<string, unknown> }>(options: T): T {
+  return {
+    ...options,
+    providerSettings: {
+      ...(options.providerSettings ?? {}),
+      opencodeServer: {
+        hostname: '127.0.0.1',
+        port: 41001,
+      },
+    },
+  }
+}
+
 function createMetadataService() {
   let now = 1_000
   return new TerminalMetadataService({
@@ -851,7 +864,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
-    const term = registry.create({ mode: 'opencode', cwd: '/home/user/project' })
+    const term = registry.create(withOpencodeServer({ mode: 'opencode', cwd: '/home/user/project' }))
 
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',

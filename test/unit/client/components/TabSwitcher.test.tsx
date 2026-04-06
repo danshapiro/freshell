@@ -7,6 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
+import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -56,7 +57,12 @@ function createLeafLayout(tab: Tab): PaneNode {
 function createStore(
   tabs: Tab[],
   activeTabId: string,
-  opts?: { codexActivity?: Partial<CodexActivityState>; includeCodexActivity?: boolean },
+  opts?: {
+    codexActivity?: Partial<CodexActivityState>
+    opencodeActivity?: Partial<OpencodeActivityState>
+    includeCodexActivity?: boolean
+    includeOpencodeActivity?: boolean
+  },
 ) {
   const layouts: Record<string, PaneNode> = {}
   const activePane: Record<string, string> = {}
@@ -72,6 +78,13 @@ function createStore(
     liveMutationSeqByTerminalId: {},
     removedMutationSeqByTerminalId: {},
   }
+  const includeOpencodeActivity = opts?.includeOpencodeActivity ?? true
+  const defaultOpencodeActivity: OpencodeActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  }
 
   const reducer = {
     tabs: tabsReducer,
@@ -80,6 +93,7 @@ function createStore(
     settings: settingsReducer,
     turnCompletion: turnCompletionReducer,
     ...(includeCodexActivity ? { codexActivity: codexActivityReducer } : {}),
+    ...(includeOpencodeActivity ? { opencodeActivity: opencodeActivityReducer } : {}),
   }
   const preloadedState: Record<string, unknown> = {
     tabs: {
@@ -111,6 +125,12 @@ function createStore(
     preloadedState.codexActivity = {
       ...defaultCodexActivity,
       ...(opts?.codexActivity ?? {}),
+    }
+  }
+  if (includeOpencodeActivity) {
+    preloadedState.opencodeActivity = {
+      ...defaultOpencodeActivity,
+      ...(opts?.opencodeActivity ?? {}),
     }
   }
 
@@ -406,6 +426,42 @@ describe('TabSwitcher', () => {
     expect(badge.className).toContain('bg-blue-500/15')
     expect(badge.className).toContain('text-blue-600')
     expect(badge.className).not.toContain('animate-pulse')
+  })
+
+  it('shows a busy badge only on tabs with exact busy opencode activity', async () => {
+    const { TabSwitcher } = await import('@/components/TabSwitcher')
+    const shellTab = createTab('tab-1', 'Shell')
+    const opencodeTab = createTab('tab-2', 'OpenCode', {
+      mode: 'opencode',
+      terminalId: 'term-opencode',
+    })
+    const store = createStore([shellTab, opencodeTab], 'tab-1', {
+      opencodeActivity: {
+        byTerminalId: {
+          'term-opencode': {
+            terminalId: 'term-opencode',
+            sessionId: 'session-opencode',
+            phase: 'busy',
+            updatedAt: 10,
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TabSwitcher onClose={() => {}} />
+      </Provider>
+    )
+
+    const shellCard = screen.getByRole('button', { name: /switch to shell/i })
+    const opencodeCard = screen.getByRole('button', { name: /switch to opencode/i })
+
+    expect(within(shellCard).queryByText('Busy')).not.toBeInTheDocument()
+    const badge = within(opencodeCard).getByTestId('tab-switcher-busy-badge-tab-2')
+    expect(badge).toHaveTextContent('Busy')
+    expect(badge.className).toContain('bg-blue-500/15')
+    expect(badge.className).toContain('text-blue-600')
   })
 
   it('does not warn about selector instability when codex activity state is absent', async () => {
