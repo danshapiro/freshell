@@ -1786,7 +1786,9 @@ describe('CodingCliSessionIndexer', () => {
   })
 
   describe('sessionType merge from metadata store', () => {
-    function mockMetadataStore(entries: Record<string, { sessionType?: string }>): SessionMetadataStore {
+    function mockMetadataStore(
+      entries: Record<string, { sessionType?: string; derivedTitle?: string }>,
+    ): SessionMetadataStore {
       return {
         getAll: vi.fn().mockResolvedValue(entries),
         get: vi.fn(),
@@ -1837,6 +1839,268 @@ describe('CodingCliSessionIndexer', () => {
       const session = indexer.getProjects()[0]?.sessions[0]
       expect(session?.sessionType).toBeUndefined()
     })
+
+    it('keeps an existing non-empty title when the same session reparses without one', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Original title' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Original title')
+    })
+
+    it('hydrates a cold-start lightweight row from metadata-store derivedTitle when parsing finds no title', async () => {
+      const files: string[] = []
+      const sessionId = 'older-codex-session'
+      const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      await fsp.utimes(fileA, new Date(2026, 0, 1), new Date(2026, 0, 1))
+      files.push(fileA)
+
+      for (let i = 0; i < 151; i += 1) {
+        const file = path.join(tempDir, `recent-${i}.jsonl`)
+        await fsp.writeFile(file, JSON.stringify({ cwd: `/project/${i}`, title: `Recent ${i}` }) + '\n')
+        files.push(file)
+      }
+
+      const provider = makeProvider(files, { name: 'codex' })
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('codex', sessionId)]: { derivedTitle: 'Sticky old title' },
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {},
+        settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+      await indexer.refresh()
+
+      const olderSession = indexer.getProjects()
+        .flatMap((group) => group.sessions)
+        .find((session) => session.sessionId === sessionId)
+
+      expect(olderSession?.title).toBe('Sticky old title')
+    })
+
+    it('persists a newly parsed non-empty title to the metadata store', async () => {
+      const fileA = path.join(tempDir, 'session-b.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Fresh title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({})
+      metadataStore.set = vi.fn().mockResolvedValue(undefined)
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+
+      expect(metadataStore.set).toHaveBeenCalledWith('claude', 'session-b', {
+        derivedTitle: 'Fresh title',
+      })
+    })
+
+    it('does not rewrite derivedTitle when the parsed title matches the stored title', async () => {
+      const fileA = path.join(tempDir, 'session-c.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Stable title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', 'session-c')]: { derivedTitle: 'Stable title' },
+      })
+      metadataStore.set = vi.fn().mockResolvedValue(undefined)
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+
+      expect(metadataStore.set).not.toHaveBeenCalled()
+    })
+
+    it('resolves title precedence as parsed title, then previous cached title, then stored derivedTitle', async () => {
+      const fileA = path.join(tempDir, 'session-d.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Parsed title' }) + '\n')
+
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', 'session-d')]: { derivedTitle: 'Stored title' },
+      })
+
+      const indexer = new CodingCliSessionIndexer([makeProvider([fileA])], {}, metadataStore)
+      await indexer.refresh()
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Parsed title')
+
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Parsed title')
+    })
+  })
+
+  it('extracts a lightweight title from a Codex response_item user message on cold start', async () => {
+    const files: string[] = []
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    const olderSessionId = 'older-codex-session'
+    const olderFile = path.join(tempDir, `${olderSessionId}.jsonl`)
+    await fsp.writeFile(olderFile, [
+      JSON.stringify({ type: 'session_meta', payload: { id: olderSessionId, cwd: '/project/older' } }),
+      JSON.stringify({
+        timestamp: new Date(2026, 0, 1).toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'Investigate sidebar visibility' }],
+        },
+      }),
+    ].join('\n'))
+    files.push(olderFile)
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const olderSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === olderSessionId)
+
+    expect(olderSession?.title).toBe('Investigate sidebar visibility')
+  })
+
+  it('does not synthesize a lightweight title from older system-context user records', async () => {
+    const files: string[] = []
+    const systemOnlyId = 'system-only'
+    const fileA = path.join(tempDir, `${systemOnlyId}.jsonl`)
+    await fsp.writeFile(fileA, JSON.stringify({
+      sessionId: systemOnlyId,
+      cwd: '/project/a',
+      role: 'user',
+      content: '<environment_context>\n  <cwd>/project/a</cwd>\n</environment_context>',
+      timestamp: new Date(2026, 0, 1).toISOString(),
+    }) + '\n')
+    await fsp.utimes(fileA, new Date(2026, 0, 1), new Date(2026, 0, 1))
+    files.push(fileA)
+
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-system-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-system-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const systemOnlySession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === systemOnlyId)
+
+    expect(systemOnlySession?.title).toBeUndefined()
+  })
+
+  it('extracts lightweight Codex titles from IDE-context messages', async () => {
+    const ideSessionId = 'ide-context-session'
+    const ideFile = path.join(tempDir, `${ideSessionId}.jsonl`)
+    await fsp.writeFile(ideFile, [
+      JSON.stringify({ type: 'session_meta', payload: { id: ideSessionId, cwd: '/project/ide' } }),
+      JSON.stringify({
+        timestamp: new Date(2026, 0, 1).toISOString(),
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{
+            type: 'input_text',
+            text: '# Context from my IDE setup:\n\n## My request for Codex:\nFix the authentication bug in the login form',
+          }],
+        },
+      }),
+    ].join('\n'))
+    await fsp.utimes(ideFile, new Date(2026, 0, 1), new Date(2026, 0, 1))
+
+    const files = [ideFile]
+    for (let i = 0; i < 151; i += 1) {
+      const file = path.join(tempDir, `recent-ide-${i}.jsonl`)
+      await fsp.writeFile(file, [
+        JSON.stringify({ type: 'session_meta', payload: { id: `recent-ide-${i}`, cwd: `/project/${i}` } }),
+        JSON.stringify({
+          timestamp: new Date(2026, 3, 5, 12, i).toISOString(),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `Recent task ${i}` }],
+          },
+        }),
+      ].join('\n'))
+      files.push(file)
+    }
+
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: { codingCli: { enabledProviders: ['codex'], providers: {} } },
+    })
+
+    const provider = makeProvider(files, {
+      name: 'codex',
+      parseSessionFile: codexProvider.parseSessionFile,
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider], { fullScanIntervalMs: 0 })
+    await indexer.refresh()
+
+    const ideSession = indexer.getProjects()
+      .flatMap((group) => group.sessions)
+      .find((session) => session.sessionId === ideSessionId)
+
+    expect(ideSession?.title).toBe('Fix the authentication bug in the login form')
   })
 
   it('groups worktree sessions under the parent repo', async () => {

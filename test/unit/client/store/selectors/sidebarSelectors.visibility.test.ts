@@ -324,6 +324,32 @@ describe('filterSessionItemsByVisibility', () => {
 
       expect(result.map((i) => i.id)).toEqual(['1'])
     })
+
+    it('keeps titleless sessions visible when they have an open tab', () => {
+      const result = filterSessionItemsByVisibility([
+        createSessionItem({ id: '1', title: 'deadbeef', hasTitle: false, hasTab: true }),
+      ], {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: true,
+      })
+
+      expect(result.map((item) => item.id)).toEqual(['1'])
+    })
+
+    it('keeps titleless sessions visible when they are running', () => {
+      const result = filterSessionItemsByVisibility([
+        createSessionItem({ id: '1', title: 'deadbeef', hasTitle: false, isRunning: true }),
+      ], {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: true,
+      })
+
+      expect(result.map((item) => item.id)).toEqual(['1'])
+    })
   })
 })
 
