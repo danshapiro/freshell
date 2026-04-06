@@ -13,6 +13,7 @@ import terminalDirectoryReducer from './terminalDirectorySlice'
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import codexActivityReducer from './codexActivitySlice'
+import opencodeActivityReducer from './opencodeActivitySlice'
 import agentChatReducer from './agentChatSlice'
 import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import { networkReducer } from './networkSlice'
@@ -45,6 +46,7 @@ export const store = configureStore({
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
     codexActivity: codexActivityReducer,
+    opencodeActivity: opencodeActivityReducer,
     agentChat: agentChatReducer,
     paneRuntimeActivity: paneRuntimeActivityReducer,
     network: networkReducer,

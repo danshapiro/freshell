@@ -70,6 +70,16 @@ vi.mock('../../../server/mcp/config-writer.js', () => ({
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
+const TEST_OPENCODE_SERVER = { hostname: '127.0.0.1' as const, port: 43123 }
+
+function withOpencodeServer(
+  settings: { permissionMode?: string; model?: string; sandbox?: string } = {},
+) {
+  return {
+    ...settings,
+    opencodeServer: TEST_OPENCODE_SERVER,
+  }
+}
 
 function expectCodexMcpArgs(args: string[]) {
   // Bell notification still present
@@ -971,11 +981,29 @@ describe('buildSpawnSpec Unix paths', () => {
       delete process.env.OPENCODE_CMD
 
       const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        ...withOpencodeServer(),
         model: 'openai/gpt-5-mini',
       })
 
       expect(spec.args).toContain('--model')
       expect(spec.args).toContain('openai/gpt-5-mini')
+    })
+
+    it('requires an explicit localhost control endpoint for opencode and passes it as launch args', () => {
+      delete process.env.OPENCODE_CMD
+
+      expect(() => buildSpawnSpec('opencode', '/Users/john/project', 'system')).toThrow(
+        'OpenCode launch requires an allocated localhost control endpoint.',
+      )
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, withOpencodeServer())
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--hostname',
+        '127.0.0.1',
+        '--port',
+        '43123',
+      ]))
     })
 
     it('defaults OpenCode to a usable Google model and alias env when only GEMINI_API_KEY is set', () => {
@@ -986,7 +1014,7 @@ describe('buildSpawnSpec Unix paths', () => {
       delete process.env.ANTHROPIC_API_KEY
       process.env.GEMINI_API_KEY = 'gemini-key'
 
-      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system')
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, withOpencodeServer())
 
       expect(spec.args).toContain('--model')
       expect(spec.args).toContain('google/gemini-3-pro-preview')
@@ -997,6 +1025,7 @@ describe('buildSpawnSpec Unix paths', () => {
       delete process.env.OPENCODE_CMD
 
       const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        ...withOpencodeServer(),
         permissionMode: 'plan',
       })
 
@@ -1007,6 +1036,7 @@ describe('buildSpawnSpec Unix paths', () => {
       delete process.env.OPENCODE_CMD
 
       const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        ...withOpencodeServer(),
         permissionMode: 'acceptEdits',
       })
 
@@ -2495,6 +2525,7 @@ describe('TerminalRegistry', () => {
           mode: 'opencode',
           cwd: '/home/user/project',
           resumeSessionId: 'session-opencode',
+          providerSettings: withOpencodeServer(),
         })
       } catch (err) {
         thrown = err
@@ -2517,7 +2548,11 @@ describe('TerminalRegistry', () => {
       const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
       vi.mocked(cleanupMcpConfig).mockClear()
 
-      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-project' })
+      const record = registry.create({
+        mode: 'opencode',
+        cwd: '/home/user/oc-project',
+        providerSettings: withOpencodeServer(),
+      })
       registry.kill(record.terminalId)
 
       // cleanup must use mcpCwd (the normalized cwd used during injection)
@@ -2528,7 +2563,11 @@ describe('TerminalRegistry', () => {
       const { cleanupMcpConfig } = await import('../../../server/mcp/config-writer.js')
       vi.mocked(cleanupMcpConfig).mockClear()
 
-      const record = registry.create({ mode: 'opencode', cwd: '/home/user/oc-exit' })
+      const record = registry.create({
+        mode: 'opencode',
+        cwd: '/home/user/oc-exit',
+        providerSettings: withOpencodeServer(),
+      })
       const pty = await import('node-pty')
       const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
       const onExitCallback = mockPty.onExit.mock.calls[0][0]
@@ -3536,7 +3575,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
     it('opencode mode passes cwd to generateMcpInjection', async () => {
       const { generateMcpInjection } = await import('../../../server/mcp/config-writer.js')
-      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, undefined, undefined, 'term-oc1')
+      buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, withOpencodeServer(), undefined, 'term-oc1')
       expect(generateMcpInjection).toHaveBeenCalledWith('opencode', 'term-oc1', '/home/user/project', 'unix')
     })
 
@@ -3562,7 +3601,7 @@ describe('buildSpawnSpec Unix paths', () => {
       // On WSL, a Windows-style cwd (e.g. D:\project) should be converted to a Linux path
       // before being passed to generateMcpInjection. resolveUnixShellCwd handles this.
       // The raw Windows path would fail existsSync in config-writer on Linux.
-      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, undefined, undefined, 'term-wsl1')
+      buildSpawnSpec('opencode', 'D:\\project', 'system', undefined, withOpencodeServer(), undefined, 'term-wsl1')
       // The cwd passed to generateMcpInjection should be the resolved Unix path,
       // not the raw Windows path. On WSL, convertWindowsPathToWslPath converts
       // D:\project to /mnt/d/project.

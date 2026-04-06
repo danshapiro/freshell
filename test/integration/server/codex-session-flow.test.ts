@@ -197,7 +197,7 @@ describe('Codex Session Flow Integration', () => {
     server = http.createServer(app)
     registry = new TerminalRegistry()
     cliManager = new CodingCliSessionManager([codexProvider])
-    wsHandler = new WsHandler(server, registry, cliManager)
+    wsHandler = new WsHandler(server, registry, { codingCliManager: cliManager })
 
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {

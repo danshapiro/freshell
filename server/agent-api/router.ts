@@ -2,6 +2,7 @@ import { Router } from 'express'
 import fs from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
+import { allocateLocalhostPort, type OpencodeServerEndpoint } from '../local-port.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { ok, approx, fail } from './response.js'
@@ -29,6 +30,24 @@ async function resolveProviderSettings(
     permissionMode: overrides.permissionMode ?? defaults.permissionMode,
     model: overrides.model ?? defaults.model,
     sandbox: overrides.sandbox ?? defaults.sandbox,
+  }
+}
+
+async function resolveSpawnProviderSettings(
+  mode: string,
+  configStore: any,
+  overrides: { permissionMode?: string; model?: string; sandbox?: string },
+): Promise<{
+  permissionMode?: string
+  model?: string
+  sandbox?: string
+  opencodeServer?: OpencodeServerEndpoint
+} | undefined> {
+  const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
+  if (mode !== 'opencode') return providerSettings
+  return {
+    ...(providerSettings ?? {}),
+    opencodeServer: await allocateLocalhostPort(),
   }
 }
 
@@ -224,7 +243,7 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
-        const providerSettings = await resolveProviderSettings(effectiveMode, configStore, { permissionMode, model, sandbox })
+        const providerSettings = await resolveSpawnProviderSettings(effectiveMode, configStore, { permissionMode, model, sandbox })
         const terminal = registry.create({
           mode: effectiveMode,
           shell,
@@ -551,7 +570,7 @@ export function createAgentApiRouter({
     const created = layoutStore.createTab?.({ title })
     const tabId = created?.tabId || nanoid()
     const paneId = created?.paneId || nanoid()
-    const providerSettings = await resolveProviderSettings(mode, configStore, {})
+    const providerSettings = await resolveSpawnProviderSettings(mode, configStore, {})
     const terminal = registry.create({ mode, shell, cwd, providerSettings, envContext: { tabId, paneId } })
     layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
     wsHandler?.broadcastUiCommand({
@@ -613,7 +632,7 @@ export function createAgentApiRouter({
       content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
     } else {
       const splitMode = req.body?.mode || 'shell'
-      const splitProviderSettings = await resolveProviderSettings(splitMode, configStore, {})
+      const splitProviderSettings = await resolveSpawnProviderSettings(splitMode, configStore, {})
       const terminal = registry.create({
         mode: splitMode,
         shell: req.body?.shell,
@@ -800,7 +819,7 @@ export function createAgentApiRouter({
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
     const effectiveMode = req.body?.mode || 'shell'
-    const providerSettings = await resolveProviderSettings(effectiveMode, configStore, {})
+    const providerSettings = await resolveSpawnProviderSettings(effectiveMode, configStore, {})
     const terminal = registry.create({ mode: effectiveMode, shell: req.body?.shell, cwd: req.body?.cwd, providerSettings, envContext: { tabId, paneId } })
     const content = { kind: 'terminal', terminalId: terminal.terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system', createRequestId: nanoid() }
     layoutStore.attachPaneContent(tabId, paneId, content)

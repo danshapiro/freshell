@@ -58,6 +58,7 @@ import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from 
 import { clearDeadTerminals } from '@/store/panesSlice'
 import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
+import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
@@ -220,7 +221,9 @@ export default function App() {
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const opencodeActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
+  const opencodeActivityOrderRef = useRef(0)
   const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
@@ -626,9 +629,24 @@ export default function App() {
         })
       }
 
+      const requestOpencodeActivityList = () => {
+        const requestId = `opencode-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++opencodeActivityOrderRef.current
+        opencodeActivityListRequestSeqRef.current.set(requestId, requestSeq)
+        ws.send({
+          type: 'opencode.activity.list',
+          requestId,
+        })
+      }
+
       const resetCodexActivityOverlay = () => {
         codexActivityListRequestSeqRef.current.clear()
         dispatch(resetCodexActivity())
+      }
+
+      const resetOpencodeActivityOverlay = () => {
+        opencodeActivityListRequestSeqRef.current.clear()
+        dispatch(resetOpencodeActivity())
       }
 
       const wsWithOptionalDisconnect = ws as typeof ws & {
@@ -638,6 +656,7 @@ export default function App() {
       stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
         if (cancelled) return
         resetCodexActivityOverlay()
+        resetOpencodeActivityOverlay()
         dispatch(setStatus('disconnected'))
       }) ?? null
 
@@ -721,6 +740,7 @@ export default function App() {
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()
+          resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
@@ -737,6 +757,7 @@ export default function App() {
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
+          requestOpencodeActivityList()
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
@@ -826,6 +847,35 @@ export default function App() {
             }))
           }
         }
+        if (msg.type === 'opencode.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = opencodeActivityListRequestSeqRef.current.get(requestId)
+          opencodeActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setOpencodeActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+        }
+        if (msg.type === 'opencode.activity.updated') {
+          const mutationSeq = ++opencodeActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertOpencodeActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeOpencodeActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
+          }
+        }
         if (msg.type === 'terminal.exit') {
           const terminalId = msg.terminalId
           const code = msg.exitCode
@@ -893,6 +943,7 @@ export default function App() {
         if (cancelled) return
         lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
+        resetOpencodeActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
         dispatch(setServerInstanceId(ws.serverInstanceId))
@@ -902,6 +953,7 @@ export default function App() {
 
         if (!cancelled) {
           requestCodexActivityList()
+          requestOpencodeActivityList()
         }
         void recoverMissingStartupState()
         return
@@ -915,6 +967,7 @@ export default function App() {
       } catch (err: any) {
         if (!cancelled) {
           resetCodexActivityOverlay()
+          resetOpencodeActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))
           if (typeof err?.wsCloseCode === 'number') {
