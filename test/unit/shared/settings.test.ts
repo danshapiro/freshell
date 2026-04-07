@@ -34,6 +34,9 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ sidebar: { sortMode: 'activity' } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { showSubagents: true } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { ignoreCodexSubagents: true } }).success).toBe(false)
+    expect(schema.safeParse({ agentChat: { showThinking: true } }).success).toBe(false)
+    expect(schema.safeParse({ agentChat: { showTools: true } }).success).toBe(false)
+    expect(schema.safeParse({ agentChat: { showTimecodes: true } }).success).toBe(false)
   })
 
   it('defaults local sort mode to activity', () => {
@@ -107,6 +110,8 @@ describe('shared settings contract', () => {
       },
       agentChat: {
         defaultPlugins: ['fs'],
+        showThinking: true,
+        showTools: true,
       },
     }
 
@@ -125,6 +130,10 @@ describe('shared settings contract', () => {
         sortMode: 'project',
         showSubagents: true,
         ignoreCodexSubagents: false,
+      },
+      agentChat: {
+        showThinking: true,
+        showTools: true,
       },
       notifications: {
         soundEnabled: false,
@@ -199,6 +208,7 @@ describe('shared settings contract', () => {
       },
       agentChat: {
         defaultPlugins: ['fs'],
+        showThinking: true,
       },
     }
 

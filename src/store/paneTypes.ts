@@ -104,12 +104,6 @@ export type AgentChatPaneContent = {
   effort?: 'low' | 'medium' | 'high' | 'max'
   /** Plugin paths to load into this session (absolute paths to plugin directories) */
   plugins?: string[]
-  /** Show thinking blocks in message feed */
-  showThinking?: boolean
-  /** Show tool-use blocks in message feed */
-  showTools?: boolean
-  /** Show timestamps on messages */
-  showTimecodes?: boolean
   /** Whether the user has dismissed the first-launch settings popover */
   settingsDismissed?: boolean
 }

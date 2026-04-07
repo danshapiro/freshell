@@ -7,7 +7,11 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { AgentChatProviderConfig } from '@/lib/agent-chat-types'
 import { formatModelDisplayName } from '../../../shared/format-model-name'
 
-type SettingsFields = Pick<AgentChatPaneContent, 'model' | 'permissionMode' | 'effort' | 'showThinking' | 'showTools' | 'showTimecodes'>
+type SettingsFields = Pick<AgentChatPaneContent, 'model' | 'permissionMode' | 'effort'> & {
+  showThinking?: boolean
+  showTools?: boolean
+  showTimecodes?: boolean
+}
 
 interface AgentChatSettingsProps {
   model: string

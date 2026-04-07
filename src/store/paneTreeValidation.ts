@@ -50,9 +50,6 @@ function isPaneContentShape(content: unknown): boolean {
           || content.effort === 'max')
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
-        && (content.showThinking === undefined || typeof content.showThinking === 'boolean')
-        && (content.showTools === undefined || typeof content.showTools === 'boolean')
-        && (content.showTimecodes === undefined || typeof content.showTimecodes === 'boolean')
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
     case 'extension':
       return typeof content.extensionName === 'string'

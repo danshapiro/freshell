@@ -30,6 +30,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 import type { Tab } from '@/store/types'
 import {
   buildAgentChatPersistedIdentityUpdate,
@@ -64,9 +65,10 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
   const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
   const defaultEffort = providerConfig?.defaultEffort ?? 'high'
-  const defaultShowThinking = providerConfig?.defaultShowThinking ?? true
-  const defaultShowTools = providerConfig?.defaultShowTools ?? true
-  const defaultShowTimecodes = providerConfig?.defaultShowTimecodes ?? false
+  const localSettings = useAppSelector((state) => state.settings.settings)
+  const defaultShowThinking = localSettings.agentChat.showThinking
+  const defaultShowTools = localSettings.agentChat.showTools
+  const defaultShowTimecodes = localSettings.agentChat.showTimecodes
   const providerLabel = providerConfig?.label ?? 'Agent Chat'
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
@@ -543,11 +545,28 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [])
 
   const handleSettingsChange = useCallback((changes: Record<string, unknown>) => {
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: { ...paneContentRef.current, ...changes },
-    }))
+    const paneChanges: Partial<AgentChatPaneContent> = {}
+    const localChanges: Record<string, unknown> = {}
+
+    for (const [key, value] of Object.entries(changes)) {
+      if (key === 'showThinking' || key === 'showTools' || key === 'showTimecodes') {
+        localChanges[key] = value
+      } else {
+        (paneChanges as Record<string, unknown>)[key] = value
+      }
+    }
+
+    if (Object.keys(paneChanges).length > 0) {
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: { ...paneContentRef.current, ...paneChanges },
+      }))
+    }
+
+    if (Object.keys(localChanges).length > 0) {
+      dispatch(updateSettingsLocal({ agentChat: localChanges }))
+    }
 
     const pc = paneContentRef.current
 
@@ -703,9 +722,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             model={paneContent.model ?? defaultModel}
             permissionMode={paneContent.permissionMode ?? defaultPermissionMode}
             effort={paneContent.effort ?? defaultEffort}
-            showThinking={paneContent.showThinking ?? defaultShowThinking}
-            showTools={paneContent.showTools ?? defaultShowTools}
-            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            showThinking={defaultShowThinking}
+            showTools={defaultShowTools}
+            showTimecodes={defaultShowTimecodes}
             sessionStarted={sessionStarted}
             defaultOpen={shouldShowSettings}
             modelOptions={availableModels.length > 0 ? availableModels : undefined}
@@ -765,9 +784,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 content={turn.message.content}
                 timestamp={turn.message.timestamp}
                 model={turn.message.model}
-                showThinking={paneContent.showThinking ?? defaultShowThinking}
-                showTools={paneContent.showTools ?? defaultShowTools}
-                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                showThinking={defaultShowThinking}
+                showTools={defaultShowTools}
+                showTimecodes={defaultShowTimecodes}
               />
             )
           }
@@ -785,9 +804,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                   turnId: item.turnId,
                 }))
               }}
-              showThinking={paneContent.showThinking ?? defaultShowThinking}
-              showTools={paneContent.showTools ?? defaultShowTools}
-              showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+              showThinking={defaultShowThinking}
+              showTools={defaultShowTools}
+              showTimecodes={defaultShowTimecodes}
             />
           )
         })}
@@ -805,9 +824,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     key={`turn-${i}`}
                     userMessage={item.user}
                     assistantMessage={item.assistant}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                 )
               }
@@ -817,9 +836,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     speaker={item.user.role}
                     content={item.user.content}
                     timestamp={item.user.timestamp}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                   <MessageBubble
                     speaker={item.assistant.role}
@@ -827,9 +846,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     timestamp={item.assistant.timestamp}
                     model={item.assistant.model}
                     isLastMessage={isLast}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                 </React.Fragment>
               )
@@ -843,9 +862,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 timestamp={item.message.timestamp}
                 model={item.message.model}
                 isLastMessage={isLast}
-                showThinking={paneContent.showThinking ?? defaultShowThinking}
-                showTools={paneContent.showTools ?? defaultShowTools}
-                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                showThinking={defaultShowThinking}
+                showTools={defaultShowTools}
+                showTimecodes={defaultShowTimecodes}
               />
             )
           })
@@ -855,9 +874,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           <MessageBubble
             speaker="assistant"
             content={streamingContent}
-            showThinking={paneContent.showThinking ?? defaultShowThinking}
-            showTools={paneContent.showTools ?? defaultShowTools}
-            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            showThinking={defaultShowThinking}
+            showTools={defaultShowTools}
+            showTimecodes={defaultShowTimecodes}
           />
         )}
 
