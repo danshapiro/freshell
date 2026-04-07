@@ -234,7 +234,7 @@ git commit -m "feat: add input-history-store with localStorage persistence and 5
 import { describe, it, expect, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useInputHistory } from '@/hooks/useInputHistory'
-import { clearHistory, loadHistory } from '@/lib/input-history-store'
+import { clearHistory, loadHistory, pushEntry } from '@/lib/input-history-store'
 
 describe('useInputHistory', () => {
   beforeEach(() => {
@@ -335,7 +335,6 @@ describe('useInputHistory', () => {
   })
 
   it('loads history from store on mount', () => {
-    const { pushEntry } = await import('@/lib/input-history-store')
     pushEntry('hook-pane', 'pre-existing')
     const { result } = renderHook(() => useInputHistory('hook-pane'))
     expect(result.current.navigateUp('')).toBe('pre-existing')
@@ -348,19 +347,6 @@ describe('useInputHistory', () => {
     act(() => { result.current.push('should not persist') })
     expect(loadHistory('undefined')).toEqual([])
   })
-})
-```
-
-**Note:** The `await import` in "loads history from store on mount" should be a regular import at the top. Adjust accordingly:
-
-```typescript
-import { clearHistory, loadHistory, pushEntry } from '@/lib/input-history-store'
-
-// ... in the test:
-it('loads history from store on mount', () => {
-  pushEntry('hook-pane', 'pre-existing')
-  const { result } = renderHook(() => useInputHistory('hook-pane'))
-  expect(result.current.navigateUp('')).toBe('pre-existing')
 })
 ```
 
@@ -716,8 +702,8 @@ This test validates the full ChatComposer → useInputHistory → input-history-
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import ChatComposer from '../../src/components/agent-chat/ChatComposer'
-import { clearHistory } from '../../src/lib/input-history-store'
+import ChatComposer from '@/components/agent-chat/ChatComposer'
+import { clearHistory } from '@/lib/input-history-store'
 
 const mockDispatch = vi.fn()
 vi.mock('@/store/hooks', () => ({
@@ -809,8 +795,16 @@ describe('agent chat input history flow', () => {
 
     fireEvent.keyDown(textarea, { key: 'ArrowUp' })
     expect(textarea).toHaveValue('same')
+
+    // Second ArrowUp: with dedup only 1 entry exists, so this is a no-op
+    // (cursor stays at oldest). Without dedup there would be 2 entries and
+    // cursor would advance to the older one.
     fireEvent.keyDown(textarea, { key: 'ArrowUp' })
-    expect(textarea).toHaveValue('same')
+
+    // ArrowDown from cursor=0 → cursor=-1 returns draft ('').
+    // Without dedup cursor would be 1 → ArrowDown goes to 0, showing 'same'.
+    fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+    expect(textarea).toHaveValue('')
   })
 })
 ```
