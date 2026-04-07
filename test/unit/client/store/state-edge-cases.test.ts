@@ -787,6 +787,7 @@ describe('State Edge Cases', () => {
           sidebar: {
             excludeFirstChatSubstrings: [],
             excludeFirstChatMustStart: false,
+            autoGenerateTitles: true,
           },
           panes: {
             defaultNewPane: 'shell',
@@ -797,6 +798,7 @@ describe('State Edge Cases', () => {
               claude: { permissionMode: 'default' },
               codex: { model: 'gpt-5-codex' },
             },
+            mcpServer: true,
           },
           editor: {
             externalEditor: 'auto',
@@ -804,6 +806,9 @@ describe('State Edge Cases', () => {
           agentChat: {
             defaultPlugins: ['fs'],
             providers: {},
+          },
+          extensions: {
+            disabled: [],
           },
           network: {
             host: '127.0.0.1',
@@ -841,6 +846,7 @@ describe('State Edge Cases', () => {
               claude: { permissionMode: 'default' },
               codex: { model: 'gpt-5-codex' },
             },
+            mcpServer: true,
           },
           editor: {
             ...defaultSettings.editor,
@@ -850,6 +856,9 @@ describe('State Edge Cases', () => {
             ...defaultSettings.agentChat,
             defaultPlugins: ['fs'],
             providers: {},
+          },
+          extensions: {
+            ...defaultSettings.extensions,
           },
           network: {
             ...defaultSettings.network,

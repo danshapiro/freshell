@@ -208,9 +208,10 @@ describe('ToolStrip', () => {
     expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
-  it('defaults to showTools=true when not specified', () => {
+  it('defaults to showTools=false when not specified', () => {
     const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
     render(<ToolStrip pairs={pairs} isStreaming={false} />)
-    expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
+    expect(screen.getByText('1 tool used')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
   })
 })

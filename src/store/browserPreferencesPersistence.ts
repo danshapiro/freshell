@@ -126,6 +126,14 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
     patch.sidebar = sidebar
   }
 
+  const agentChat: LocalSettingsPatch['agentChat'] = {}
+  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showThinking')
+  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showTools')
+  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showTimecodes')
+  if (Object.keys(agentChat).length > 0) {
+    patch.agentChat = agentChat
+  }
+
   const notifications: LocalSettingsPatch['notifications'] = {}
   assignChangedScalar(notifications, localSettings.notifications, defaultLocalSettings.notifications, 'soundEnabled')
   if (Object.keys(notifications).length > 0) {

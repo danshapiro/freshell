@@ -31,8 +31,8 @@ function MessageBubble({
   content,
   timestamp,
   model,
-  showThinking = true,
-  showTools = true,
+  showThinking = false,
+  showTools = false,
   showTimecodes = false,
   isLastMessage = false,
 }: MessageBubbleProps) {
