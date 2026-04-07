@@ -5,6 +5,7 @@ import { getDraft, setDraft, clearDraft } from '@/lib/draft-store'
 import { useAppDispatch } from '@/store/hooks'
 import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
+import { useInputHistory } from '@/hooks/useInputHistory'
 
 export interface ChatComposerHandle {
   focus: () => void
@@ -21,10 +22,21 @@ interface ChatComposerProps {
   shouldFocusOnReady?: boolean
 }
 
+function isOnFirstLine(textarea: HTMLTextAreaElement): boolean {
+  const textBefore = textarea.value.substring(0, textarea.selectionStart)
+  return !textBefore.includes('\n')
+}
+
+function isOnLastLine(textarea: HTMLTextAreaElement): boolean {
+  const textAfter = textarea.value.substring(textarea.selectionStart)
+  return !textAfter.includes('\n')
+}
+
 const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus, shouldFocusOnReady }, ref) {
   const dispatch = useAppDispatch()
   const [text, setText] = useState(() => (paneId ? getDraft(paneId) : ''))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const { navigateUp, navigateDown, push, reset } = useInputHistory(paneId)
 
   const resizeTextarea = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = 'auto'
@@ -37,11 +49,12 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     if (paneId !== prevPaneIdRef.current) {
       prevPaneIdRef.current = paneId
       setText(paneId ? getDraft(paneId) : '')
+      reset()
       requestAnimationFrame(() => {
         if (textareaRef.current) resizeTextarea(textareaRef.current)
       })
     }
-  }, [paneId, resizeTextarea])
+  }, [paneId, resizeTextarea, reset])
 
   useImperativeHandle(ref, () => ({
     focus: () => textareaRef.current?.focus(),
@@ -75,14 +88,14 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   const handleSend = useCallback(() => {
     const trimmed = text.trim()
     if (!trimmed) return
+    push(trimmed)
     onSend(trimmed)
     setText('')
     if (paneId) clearDraft(paneId)
-    // Reset height
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
-  }, [text, onSend, paneId])
+  }, [text, onSend, paneId, push])
 
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
     const tabDir = getTabSwitchShortcutDirection(e)
@@ -96,12 +109,32 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSend()
+      return
     }
     if (e.key === 'Escape' && isRunning) {
       e.preventDefault()
       onInterrupt()
+      return
     }
-  }, [dispatch, handleSend, isRunning, onInterrupt])
+    if (e.key === 'ArrowUp' && textareaRef.current && isOnFirstLine(textareaRef.current)) {
+      const next = navigateUp(text)
+      if (next !== null) {
+        e.preventDefault()
+        setText(next)
+        if (paneId) setDraft(paneId, next)
+      }
+      return
+    }
+    if (e.key === 'ArrowDown' && textareaRef.current && isOnLastLine(textareaRef.current)) {
+      const next = navigateDown(text)
+      if (next !== null) {
+        e.preventDefault()
+        setText(next)
+        if (paneId) setDraft(paneId, next)
+      }
+      return
+    }
+  }, [dispatch, handleSend, isRunning, onInterrupt, navigateUp, navigateDown, text, paneId])
 
   const handleInput = useCallback(() => {
     if (textareaRef.current) resizeTextarea(textareaRef.current)
