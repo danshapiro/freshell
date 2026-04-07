@@ -17,7 +17,7 @@ export interface ToolPair {
 interface ToolStripProps {
   pairs: ToolPair[]
   isStreaming: boolean
-  /** When false, strip is locked to collapsed view (no expand chevron). Default false. */
+  /** When true, strip starts expanded. Default false. */
   showTools?: boolean
 }
 
