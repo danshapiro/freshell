@@ -42,8 +42,8 @@ function CollapsedTurn({
   message,
   loading = false,
   onExpand,
-  showThinking = true,
-  showTools = true,
+  showThinking = false,
+  showTools = false,
   showTimecodes = false,
 }: CollapsedTurnProps) {
   const [expanded, setExpanded] = useState(false)

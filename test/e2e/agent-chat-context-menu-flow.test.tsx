@@ -18,7 +18,8 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import { defaultLocalSettings } from '@shared/settings'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
@@ -41,6 +42,14 @@ function makeStore() {
       agentChat: agentChatReducer,
       panes: panesReducer,
       settings: settingsReducer,
+    },
+    preloadedState: {
+      settings: {
+        serverSettings: defaultSettings,
+        localSettings: { ...defaultLocalSettings, agentChat: { showThinking: false, showTools: true, showTimecodes: false } },
+        settings: { ...defaultSettings, agentChat: { ...defaultSettings.agentChat, showTools: true } },
+        loaded: false,
+      },
     },
   })
 }
@@ -147,7 +156,7 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Tool strips start expanded when showTools=true (default), so ToolBlock data attributes are in the DOM
+    // showTools=true via preloadedState, so ToolBlock data attributes are in the DOM
     const toolInputEl = container.querySelector('[data-tool-input]')
     expect(toolInputEl).not.toBeNull()
     expect(toolInputEl?.getAttribute('data-tool-name')).toBe('Bash')
@@ -198,7 +207,7 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Tool strips start expanded when showTools=true (default)
+    // showTools=true via preloadedState
     const diffEl = container.querySelector('[data-diff]')
     expect(diffEl).not.toBeNull()
     expect(diffEl?.getAttribute('data-file-path')).toBe('/tmp/test.ts')
@@ -241,7 +250,7 @@ describe('freshclaude context menu integration', () => {
       </Provider>,
     )
 
-    // Tool strips start expanded when showTools=true (default)
+    // showTools=true via preloadedState
     const toolOutputEl = container.querySelector('[data-tool-output]')
     expect(toolOutputEl).not.toBeNull()
 
