@@ -157,4 +157,67 @@ describe('browserPreferencesPersistence', () => {
 
     setItemSpy.mockRestore()
   })
+
+  it('persists agentChat.showThinking/showTools/showTimecodes to browser preferences', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      agentChat: { showThinking: true },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.agentChat).toEqual({ showThinking: true })
+    expect(bp.settings.agentChat.showTools).toBeUndefined()
+    expect(bp.settings.agentChat.showTimecodes).toBeUndefined()
+  })
+
+  it('persists all three agentChat toggles when all are enabled', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      agentChat: { showThinking: true, showTools: true, showTimecodes: true },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.agentChat).toEqual({
+      showThinking: true,
+      showTools: true,
+      showTimecodes: true,
+    })
+  })
+
+  it('round-trips agentChat settings through localStorage', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      agentChat: { showThinking: true, showTools: true },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const saved = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(saved.settings.agentChat).toEqual({ showThinking: true, showTools: true })
+
+    const rehydrated = resolveLocalSettings(saved.settings)
+    expect(rehydrated.agentChat.showThinking).toBe(true)
+    expect(rehydrated.agentChat.showTools).toBe(true)
+    expect(rehydrated.agentChat.showTimecodes).toBe(false)
+  })
+
+  it('does not persist agentChat when set to defaults', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({
+      agentChat: { showThinking: false, showTools: false, showTimecodes: false },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings?.agentChat).toBeUndefined()
+  })
 })
