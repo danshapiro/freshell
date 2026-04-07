@@ -8,6 +8,7 @@ import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/p
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
+import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 
@@ -201,6 +202,85 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
   }
 }
 
+type LegacyDisplayFields = {
+  showThinking?: boolean
+  showTools?: boolean
+  showTimecodes?: boolean
+}
+
+function collectLegacyDisplayFields(node: unknown): LegacyDisplayFields {
+  if (!node || typeof node !== 'object') return {}
+  const n = node as { type?: string; content?: Record<string, unknown>; children?: unknown[] }
+
+  if (n.type === 'leaf' && n.content && n.content.kind === 'agent-chat') {
+    const c = n.content as Record<string, unknown>
+    return {
+      ...(typeof c.showThinking === 'boolean' && c.showThinking ? { showThinking: true } : {}),
+      ...(typeof c.showTools === 'boolean' && c.showTools ? { showTools: true } : {}),
+      ...(typeof c.showTimecodes === 'boolean' && c.showTimecodes ? { showTimecodes: true } : {}),
+    }
+  }
+
+  if (n.type === 'split' && Array.isArray(n.children)) {
+    let merged: LegacyDisplayFields = {}
+    for (const child of n.children) {
+      const childFields = collectLegacyDisplayFields(child)
+      if (childFields.showThinking) merged.showThinking = true
+      if (childFields.showTools) merged.showTools = true
+      if (childFields.showTimecodes) merged.showTimecodes = true
+    }
+    return merged
+  }
+
+  return {}
+}
+
+function stripLegacyDisplayFields(node: any): any {
+  if (!node) return node
+  if (node.type === 'leaf' && node.content?.kind === 'agent-chat') {
+    const { showThinking: _st, showTools: _stl, showTimecodes: _stc, ...rest } = node.content
+    if (_st === undefined && _stl === undefined && _stc === undefined) return node
+    return { ...node, content: rest }
+  }
+  if (node.type === 'split' && Array.isArray(node.children)) {
+    const nextChildren = node.children.map(stripLegacyDisplayFields)
+    if (nextChildren.every((c: any, i: number) => c === node.children[i])) return node
+    return { ...node, children: nextChildren }
+  }
+  return node
+}
+
+function migrateLegacyAgentChatDisplaySettings(state: PanesState): PanesState {
+  let legacy: LegacyDisplayFields = {}
+  let hasLegacy = false
+  const nextLayouts: Record<string, any> = {}
+
+  for (const [tabId, node] of Object.entries(state.layouts)) {
+    const fields = collectLegacyDisplayFields(node)
+    if (fields.showThinking || fields.showTools || fields.showTimecodes) {
+      legacy.showThinking = legacy.showThinking || fields.showThinking
+      legacy.showTools = legacy.showTools || fields.showTools
+      legacy.showTimecodes = legacy.showTimecodes || fields.showTimecodes
+      hasLegacy = true
+    }
+    nextLayouts[tabId] = hasLegacy ? stripLegacyDisplayFields(node) : node
+  }
+
+  if (!hasLegacy) return state
+
+  patchBrowserPreferencesRecord({
+    settings: {
+      agentChat: {
+        ...(legacy.showThinking ? { showThinking: true } : {}),
+        ...(legacy.showTools ? { showTools: true } : {}),
+        ...(legacy.showTimecodes ? { showTimecodes: true } : {}),
+      },
+    },
+  })
+
+  return { ...state, layouts: nextLayouts as Record<string, PaneNode> }
+}
+
 // Load persisted panes state directly at module initialization time
 // This ensures the initial state includes persisted data BEFORE the store is created.
 // Delegates to loadPersistedPanes() so that both Redux initial state and
@@ -233,6 +313,7 @@ function loadInitialPanesState(): PanesState {
       refreshRequestsByPane: {},
     }
     state = cleanOrphanedLayouts(state)
+    state = migrateLegacyAgentChatDisplaySettings(state)
     return state
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
