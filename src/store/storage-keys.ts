@@ -11,6 +11,7 @@ export const STORAGE_KEYS = {
   deviceFingerprint: 'freshell.device-fingerprint.v2',
   deviceAliases: 'freshell.device-aliases.v2',
   deviceDismissed: 'freshell.device-dismissed.v1',
+  inputHistory: 'freshell.input-history.v1',
 } as const
 
 export const LAYOUT_STORAGE_KEY = STORAGE_KEYS.layout
