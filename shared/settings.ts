@@ -1,5 +1,6 @@
 import { z } from 'zod'
 
+import { sanitizeAgentChatPluginPaths } from './agent-chat-plugins.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from './coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from './string-list.js'
 
@@ -891,9 +892,7 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
       agentChat.initialSetupDone = candidate.agentChat.initialSetupDone
     }
     if (hasOwn(candidate.agentChat, 'defaultPlugins') && Array.isArray(candidate.agentChat.defaultPlugins)) {
-      agentChat.defaultPlugins = candidate.agentChat.defaultPlugins.filter(
-        (value): value is string => typeof value === 'string',
-      )
+      agentChat.defaultPlugins = sanitizeAgentChatPluginPaths(candidate.agentChat.defaultPlugins)
     }
     if (isRecord(candidate.agentChat.providers)) {
       const providers: NonNullable<ServerSettingsPatch['agentChat']>['providers'] = {}
@@ -984,7 +983,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
     agentChat: {
       ...mergeDefined(base.agentChat, agentChatPatch),
       defaultPlugins: hasOwn(agentChatPatch, 'defaultPlugins')
-        ? normalizeTrimmedStringList(agentChatPatch?.defaultPlugins)
+        ? sanitizeAgentChatPluginPaths(agentChatPatch?.defaultPlugins)
         : base.agentChat.defaultPlugins,
       providers: mergeRecordOfObjects(base.agentChat.providers, agentChatPatch?.providers),
     },

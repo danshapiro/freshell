@@ -62,6 +62,19 @@ describe('shared settings contract', () => {
     expect(resolved.agentChat.defaultPlugins).toEqual([])
   })
 
+  it('strips the removed Freshell orchestration plugin path from agent chat defaults', () => {
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      agentChat: {
+        defaultPlugins: [
+          '/worktree/.claude/plugins/freshell-orchestration',
+          '/custom/plugins/local-tools',
+        ],
+      },
+    })
+
+    expect(merged.agentChat.defaultPlugins).toEqual(['/custom/plugins/local-tools'])
+  })
+
   it('mergeServerSettings preserves runtime CLI providers outside the built-in defaults', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
       codingCli: {
