@@ -2,7 +2,7 @@
 
 ## Problem
 
-Freshclaude sessions need to load specific skills (via plugins) at creation time. The immediate use case is ensuring every freshclaude session has `freshell-orchestration` available. The future use case is custom pane types (e.g., "kilroy") that wrap freshclaude and inject skills from external repos.
+Freshclaude sessions may need to load explicit Claude SDK plugin bundles at creation time. Freshell orchestration is no longer one of them: the canonical orchestration surface is the `freshell` MCP tool, not a default plugin or skill path.
 
 ## Design
 
@@ -21,8 +21,7 @@ ClaudeChatPaneContent.plugins: string[]    (absolute paths)
 - Add `plugins?: string[]` — array of absolute paths to plugin directories
 
 **2. `AppSettings.freshclaude`** (`src/store/types.ts`)
-- Add `defaultPlugins?: string[]` — default plugin paths for new sessions
-- Server resolves `freshell-orchestration` to its absolute path as the fallback default
+- Add `defaultPlugins?: string[]` — default plugin paths for new sessions when the user explicitly wants extra Claude SDK plugins
 
 **3. WS Protocol** (`shared/ws-protocol.ts`)
 - Add `plugins: z.array(z.string()).optional()` to `SdkCreateSchema`
@@ -30,7 +29,7 @@ ClaudeChatPaneContent.plugins: string[]    (absolute paths)
 **4. `SdkBridge.createSession()`** (`server/sdk-bridge.ts`)
 - Accept `plugins?: string[]` in options
 - Map to `plugins: paths.map(p => ({ type: 'local' as const, path: p }))` in the `query()` call
-- Default: `[path.resolve(projectRoot, '.claude/plugins/freshell-orchestration')]`
+- No implicit orchestration plugin default; Freshell orchestration comes from MCP
 
 **5. WS Handler** (`server/ws-handler.ts`)
 - Pass `m.plugins` through to `sdkBridge.createSession()`
@@ -49,5 +48,5 @@ ClaudeChatPaneContent.plugins: string[]    (absolute paths)
 
 ### Default Behavior
 
-- Every freshclaude session gets `freshell-orchestration` loaded by default
+- Every freshclaude session gets Freshell orchestration through the `freshell` MCP tool, while explicit plugin bundles remain opt-in
 - This is additive — the session still discovers project-level skills from its CWD normally

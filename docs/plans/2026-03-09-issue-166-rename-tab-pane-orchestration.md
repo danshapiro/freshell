@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Expose orchestration operations for renaming tabs and panes, including active-target defaults and explicit identifiers, and document those operations in the Freshell orchestration skill.
+**Goal:** Expose orchestration operations for renaming tabs and panes, including active-target defaults and explicit identifiers, and document those operations in the canonical `freshell` MCP help/instruction surface.
 
-**Architecture:** Keep rename orchestration server-authoritative. Normalize names once at the HTTP boundary, trim blanks out of both rename routes, and only broadcast rename `ui.command` events after the layout store confirms the mutation. Add the missing pane rename write path as a pane-targeted mutation in `LayoutStore`, expose it through `PATCH /api/panes/:id`, mirror the resulting `pane.rename` broadcast into Redux, and extend the CLI plus orchestration skill so agents can create or split workspaces and assign stable tab and pane names entirely through the orchestration surface.
+**Architecture:** Keep rename orchestration server-authoritative. Normalize names once at the HTTP boundary, trim blanks out of both rename routes, and only broadcast rename `ui.command` events after the layout store confirms the mutation. Add the missing pane rename write path as a pane-targeted mutation in `LayoutStore`, expose it through `PATCH /api/panes/:id`, mirror the resulting `pane.rename` broadcast into Redux, and extend the CLI plus `freshell` MCP help text so agents can create or split workspaces and assign stable tab and pane names entirely through the orchestration surface.
 
 **Tech Stack:** TypeScript, Express agent API, Freshell CLI (`server/cli`), React/Redux UI command handling, Vitest, supertest, child-process CLI e2e tests.
 
@@ -28,7 +28,7 @@
 - `rename-pane` is added as a first-class orchestration operation and supports both active-pane and explicit-pane targets.
 - The agent API exposes `PATCH /api/panes/:id` and `LayoutStore.renamePane(paneId, title)` so pane rename shares the same authoritative write path as the rest of layout orchestration.
 - Connected UIs converge immediately because successful mutations broadcast `tab.rename` and `pane.rename` `ui.command` events only after the authoritative store returns a resolved target.
-- The orchestration skill documents both commands, their target grammar, and a concrete create/split/select/rename flow that uses both explicit targets and active-target defaults without any manual UI interaction.
+- The canonical `freshell` MCP help text documents both commands, their target grammar, and a concrete create/split/select/rename flow that uses both explicit targets and active-target defaults without any manual UI interaction.
 
 ### Task 1: Harden Tab Rename Validation and Broadcast Semantics
 
@@ -728,76 +728,66 @@ git add test/e2e/agent-cli-flow.test.ts server/cli/index.ts
 git commit -m "feat(cli): add rename-pane orchestration"
 ```
 
-### Task 6: Update the Orchestration Skill to Expose the New Surface
+### Task 6: Update the MCP Help Surface to Expose the New Rename Actions
 
 **Files:**
-- Modify: `.claude/skills/freshell-orchestration/SKILL.md`
+- Modify: `server/mcp/freshell-tool.ts`
 
 **Step 1: Rewrite the rename command reference**
 
-In `.claude/skills/freshell-orchestration/SKILL.md`, change the command reference to:
+In `server/mcp/freshell-tool.ts`, update the help text and tests so the reference advertises the structured MCP equivalents:
 
 ```md
 Tab commands:
-- `rename-tab NEW_NAME` - rename the active tab
-- `rename-tab TARGET NEW_NAME`
-- `rename-tab -t TARGET -n NEW_NAME`
+- `rename-tab` with `{ name }` renames the caller tab
+- `rename-tab` with `{ target, name }` renames an explicit tab
 
 Pane/layout commands:
-- `rename-pane NEW_NAME` - rename the active pane
-- `rename-pane TARGET NEW_NAME`
-- `rename-pane -t TARGET -n NEW_NAME`
+- `rename-pane` with `{ name }` renames the caller pane
+- `rename-pane` with `{ target, name }` renames an explicit pane
 ```
 
 Under “Targets”, add:
 
 ```md
-- Omitted target on `rename-tab` means the active tab.
-- Omitted target on `rename-pane` means the active pane in the active tab.
-- If a target contains spaces, or if you want an active-target rename with an unquoted multi-word name, prefer the flagged `-t/-n` form.
+- Omitted target on `rename-tab` means the caller tab (falling back to the active tab if no caller identity is available).
+- Omitted target on `rename-pane` means the caller pane (falling back to the active pane if no caller identity is available).
 ```
-
-Important detail:
-- Update the canonical skill at `.claude/skills/freshell-orchestration/SKILL.md`; the plugin directory contains a pointer file at `.claude/plugins/freshell-orchestration/skills/freshell-orchestration` that already resolves back to this skill directory, so do not edit the pointer file for this issue.
 
 **Step 2: Add a concrete create/split/rename playbook**
 
 Append this example:
 
 ```bash
-FSH="npx tsx server/cli/index.ts"
-CWD="/absolute/path/to/repo"
-FILE="/absolute/path/to/repo/README.md"
+seed = freshell({ action: "new-tab", params: { name: "Triager", mode: "codex", cwd: "/absolute/path/to/repo" } })
+tabId = seed.data.tabId
+p0 = seed.data.paneId
+p1 = freshell({ action: "split-pane", params: { target: p0, editor: "/absolute/path/to/repo/README.md" } }).data.paneId
 
-WS="$($FSH new-tab -n 'Triager' --codex --cwd "$CWD")"
-TAB_ID="$(printf '%s' "$WS" | jq -r '.data.tabId')"
-P0="$(printf '%s' "$WS" | jq -r '.data.paneId')"
-P1="$($FSH split-pane -t "$P0" --editor "$FILE" | jq -r '.data.paneId')"
-
-$FSH rename-tab -t "$TAB_ID" -n "Issue 166 work"
-$FSH rename-pane -t "$P0" -n "Codex"
-$FSH select-pane -t "$P1"
-$FSH rename-pane "Editor"
+freshell({ action: "rename-tab", params: { target: tabId, name: "Issue 166 work" } })
+freshell({ action: "rename-pane", params: { target: p0, name: "Codex" } })
+freshell({ action: "select-pane", params: { target: p1 } })
+freshell({ action: "rename-pane", params: { name: "Editor" } })
 ```
 
-**Step 3: Sanity-check the skill markdown**
+**Step 3: Sanity-check the MCP help text**
 
 Run:
 
 ```bash
-sed -n '1,240p' .claude/skills/freshell-orchestration/SKILL.md
+npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/mcp/freshell-tool.test.ts
 ```
 
 Expected:
 - `rename-pane` is documented
-- Active-target defaults are explicit for both rename commands
+- Caller-target defaults are explicit for both rename commands
 - The playbook shows a create/split/rename flow with no UI interaction
 
 **Step 4: Commit**
 
 ```bash
-git add .claude/skills/freshell-orchestration/SKILL.md
-git commit -m "docs(skill): document tab and pane rename orchestration"
+git add server/mcp/freshell-tool.ts test/unit/server/mcp/freshell-tool.test.ts
+git commit -m "docs(mcp): document tab and pane rename orchestration"
 ```
 
 ### Task 7: Final Verification

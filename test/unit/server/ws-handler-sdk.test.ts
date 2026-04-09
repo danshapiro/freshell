@@ -139,11 +139,11 @@ describe('WS Handler SDK Integration', () => {
         type: 'sdk.create',
         requestId: 'req-1',
         cwd: '/home/user/project',
-        plugins: ['/path/to/.claude/plugins/my-skill'],
+        plugins: ['/path/to/.claude/plugins/my-plugin'],
       })
       expect(result.success).toBe(true)
       if (result.success) {
-        expect(result.data.plugins).toEqual(['/path/to/.claude/plugins/my-skill'])
+        expect(result.data.plugins).toEqual(['/path/to/.claude/plugins/my-plugin'])
       }
     })
 
