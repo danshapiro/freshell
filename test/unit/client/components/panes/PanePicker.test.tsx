@@ -3,6 +3,7 @@ import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-li
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
+import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 import { setStatus } from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -140,12 +141,14 @@ describe('PanePicker', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockApiGet.mockReset()
+    resetEnsureExtensionsRegistryCacheForTests()
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token')
   })
 
   afterEach(() => {
     cleanup()
+    resetEnsureExtensionsRegistryCacheForTests()
   })
 
   describe('rendering', () => {

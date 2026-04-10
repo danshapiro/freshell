@@ -2,15 +2,22 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
+import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 
 
 const log = createLogger('PanesSlice')
+
+type HydratePanesMeta = {
+  localLayoutPersistedAt?: number
+  remoteLayoutPersistedAt?: number
+}
 
 function buildPreservedSessionRef(
   localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
@@ -117,9 +124,6 @@ function normalizePaneContent(
       permissionMode: input.permissionMode,
       effort: input.effort,
       plugins: input.plugins,
-      showThinking: input.showThinking,
-      showTools: input.showTools,
-      showTimecodes: input.showTimecodes,
       settingsDismissed: input.settingsDismissed,
     }
   }
@@ -128,6 +132,28 @@ function normalizePaneContent(
   }
   // Editor/picker content passes through unchanged
   return input
+}
+
+function shouldPreferLocalAgentChatPaneDuringHydration(
+  localContent: PaneContent,
+  incomingContent: PaneContent,
+  meta: HydratePanesMeta | undefined,
+): boolean {
+  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+    return false
+  }
+
+  const localLayoutPersistedAt = meta?.localLayoutPersistedAt
+  const remoteLayoutPersistedAt = meta?.remoteLayoutPersistedAt
+  if (
+    typeof localLayoutPersistedAt !== 'number'
+    || typeof remoteLayoutPersistedAt !== 'number'
+    || remoteLayoutPersistedAt >= localLayoutPersistedAt
+  ) {
+    return false
+  }
+
+  return isValidClaudeSessionId(localContent.resumeSessionId)
 }
 
 /**
@@ -176,6 +202,85 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
   }
 }
 
+type LegacyDisplayFields = {
+  showThinking?: boolean
+  showTools?: boolean
+  showTimecodes?: boolean
+}
+
+function collectLegacyDisplayFields(node: unknown): LegacyDisplayFields {
+  if (!node || typeof node !== 'object') return {}
+  const n = node as { type?: string; content?: Record<string, unknown>; children?: unknown[] }
+
+  if (n.type === 'leaf' && n.content && n.content.kind === 'agent-chat') {
+    const c = n.content as Record<string, unknown>
+    return {
+      ...(typeof c.showThinking === 'boolean' && c.showThinking ? { showThinking: true } : {}),
+      ...(typeof c.showTools === 'boolean' && c.showTools ? { showTools: true } : {}),
+      ...(typeof c.showTimecodes === 'boolean' && c.showTimecodes ? { showTimecodes: true } : {}),
+    }
+  }
+
+  if (n.type === 'split' && Array.isArray(n.children)) {
+    let merged: LegacyDisplayFields = {}
+    for (const child of n.children) {
+      const childFields = collectLegacyDisplayFields(child)
+      if (childFields.showThinking) merged.showThinking = true
+      if (childFields.showTools) merged.showTools = true
+      if (childFields.showTimecodes) merged.showTimecodes = true
+    }
+    return merged
+  }
+
+  return {}
+}
+
+function stripLegacyDisplayFields(node: any): any {
+  if (!node) return node
+  if (node.type === 'leaf' && node.content?.kind === 'agent-chat') {
+    const { showThinking: _st, showTools: _stl, showTimecodes: _stc, ...rest } = node.content
+    if (_st === undefined && _stl === undefined && _stc === undefined) return node
+    return { ...node, content: rest }
+  }
+  if (node.type === 'split' && Array.isArray(node.children)) {
+    const nextChildren = node.children.map(stripLegacyDisplayFields)
+    if (nextChildren.every((c: any, i: number) => c === node.children[i])) return node
+    return { ...node, children: nextChildren }
+  }
+  return node
+}
+
+function migrateLegacyAgentChatDisplaySettings(state: PanesState): PanesState {
+  let legacy: LegacyDisplayFields = {}
+  let hasLegacy = false
+  const nextLayouts: Record<string, any> = {}
+
+  for (const [tabId, node] of Object.entries(state.layouts)) {
+    const fields = collectLegacyDisplayFields(node)
+    if (fields.showThinking || fields.showTools || fields.showTimecodes) {
+      legacy.showThinking = legacy.showThinking || fields.showThinking
+      legacy.showTools = legacy.showTools || fields.showTools
+      legacy.showTimecodes = legacy.showTimecodes || fields.showTimecodes
+      hasLegacy = true
+    }
+    nextLayouts[tabId] = hasLegacy ? stripLegacyDisplayFields(node) : node
+  }
+
+  if (!hasLegacy) return state
+
+  patchBrowserPreferencesRecord({
+    settings: {
+      agentChat: {
+        ...(legacy.showThinking ? { showThinking: true } : {}),
+        ...(legacy.showTools ? { showTools: true } : {}),
+        ...(legacy.showTimecodes ? { showTimecodes: true } : {}),
+      },
+    },
+  })
+
+  return { ...state, layouts: nextLayouts as Record<string, PaneNode> }
+}
+
 // Load persisted panes state directly at module initialization time
 // This ensures the initial state includes persisted data BEFORE the store is created.
 // Delegates to loadPersistedPanes() so that both Redux initial state and
@@ -208,6 +313,7 @@ function loadInitialPanesState(): PanesState {
       refreshRequestsByPane: {},
     }
     state = cleanOrphanedLayouts(state)
+    state = migrateLegacyAgentChatDisplaySettings(state)
     return state
   } catch (err) {
     log.error('Failed to load from localStorage:', err)
@@ -432,7 +538,11 @@ function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
  * terminal assignments that are more advanced. A local terminal pane
  * with a terminalId beats an incoming pane without one (same createRequestId).
  */
-function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | null {
+function mergeTerminalState(
+  incoming: PaneNode,
+  local: PaneNode,
+  meta?: HydratePanesMeta,
+): PaneNode | null {
   const incomingValid = hasPaneTreeShape(incoming)
   const localValid = hasPaneTreeShape(local)
   if (!incomingValid) return localValid ? local : null
@@ -479,6 +589,9 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
     if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
+      if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
+        return local
+      }
       if (incoming.content.createRequestId === local.content.createRequestId) {
         if (
           shouldPreserveLocalCanonicalResumeSessionId(
@@ -527,8 +640,8 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | nul
     Array.isArray(incoming.children) && incoming.children.length === 2 &&
     Array.isArray(local.children) && local.children.length === 2
   ) {
-    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0])
-    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1])
+    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0], meta)
+    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1], meta)
     if (!mergedLeft || !mergedRight) {
       return local
     }
@@ -1037,10 +1150,12 @@ export const panesSlice = createSlice({
       const root = state.layouts[tabId]
       if (!root) return
       let normalizedContentForTitle: PaneContent | null = null
+      let previousContentForTitle: PaneContent | null = null
 
       function updateContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             const nextContent = normalizePaneContent(content, node.content)
             normalizedContentForTitle = nextContent
             return { ...node, content: nextContent }
@@ -1060,7 +1175,12 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1075,10 +1195,12 @@ export const panesSlice = createSlice({
       const { tabId, paneId, updates } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      let previousContentForTitle: PaneContent | null = null
 
       function mergeContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
+            previousContentForTitle = node.content
             return {
               ...node,
               content: normalizePaneContent({ ...node.content, ...updates } as PaneContentInput | PaneContent, node.content),
@@ -1100,7 +1222,12 @@ export const panesSlice = createSlice({
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        const existingTitle = state.paneTitles[tabId][paneId]
+        // Pane titles are stored extension-unaware in this slice; canonical labels
+        // such as "OpenCode" are normalized later in the display layer.
+        if (!existingTitle || (previousContentForTitle && matchesDerivedPaneTitle(existingTitle, previousContentForTitle))) {
+          state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -1233,6 +1360,7 @@ export const panesSlice = createSlice({
     },
 
     hydratePanes: (state, action: PayloadAction<PanesState>) => {
+      const meta = (action as PayloadAction<PanesState, string, HydratePanesMeta | undefined>).meta
       const incoming = action.payload
 
       // Merge layouts: preserve local terminal assignments that are more
@@ -1244,7 +1372,7 @@ export const panesSlice = createSlice({
         const localNode = state.layouts[tabId]
         const incomingHasShape = hasPaneTreeShape(incomingNode)
         const mergedNode = localNode
-          ? mergeTerminalState(incomingNode as PaneNode, localNode)
+          ? mergeTerminalState(incomingNode as PaneNode, localNode, meta)
           : (incomingHasShape ? incomingNode as PaneNode : null)
         const mergeUsedIncoming = mergedNode !== localNode
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null

@@ -195,7 +195,12 @@ function dispatchHydrateLayoutFromPersisted(
       paneTitles: parsed.panes.paneTitles,
       paneTitleSetByUser: parsed.panes.paneTitleSetByUser,
     } as any),
-    meta: { skipPersist: true, source: 'cross-tab' },
+    meta: {
+      skipPersist: true,
+      source: 'cross-tab',
+      localLayoutPersistedAt,
+      remoteLayoutPersistedAt: parsed.persistedAt,
+    },
   })
 }
 

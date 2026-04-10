@@ -11,6 +11,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
 import agentChatReducer, { turnResult } from '@/store/agentChatSlice'
+import opencodeActivityReducer, { upsertOpencodeActivity } from '@/store/opencodeActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
 import type { PanesState } from '@/store/panesSlice'
@@ -223,6 +224,7 @@ function createStore(
       terminalMeta: terminalMetaReducer,
       sessions: sessionsReducer,
       agentChat: agentChatReducer,
+      opencodeActivity: opencodeActivityReducer,
       turnCompletion: turnCompletionReducer,
     },
     middleware: (getDefaultMiddleware) =>
@@ -269,6 +271,12 @@ function createStore(
         pendingCreates: {},
         availableModels: [],
         ...initialAgentChatState,
+      },
+      opencodeActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
       },
     },
   })
@@ -908,6 +916,41 @@ describe('PaneContainer', () => {
       )
 
       expect(screen.getByTestId(`terminal-${paneId}`)).toBeInTheDocument()
+    })
+
+    it('marks an opencode pane busy when the exact terminal has live activity', () => {
+      const paneId = 'pane-1'
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: paneId,
+        content: createTerminalContent({
+          mode: 'opencode',
+          status: 'running',
+          createRequestId: 'req-pane-1',
+          terminalId: 'term-opencode',
+        }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': paneId },
+      })
+      store.dispatch(upsertOpencodeActivity({
+        terminals: [{
+          terminalId: 'term-opencode',
+          sessionId: 'session-opencode',
+          phase: 'busy',
+          updatedAt: 10,
+        }],
+      }))
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const pane = screen.getByRole('group', { name: /pane: opencode/i })
+      expect(pane.querySelector('svg.text-blue-500')).toBeTruthy()
     })
 
     it('renders browser content for leaf node', () => {

@@ -9,6 +9,7 @@ export type AgentHistoryResolveOptions = {
 export type AgentHistorySource = {
   resolve: (queryId: string, options?: AgentHistoryResolveOptions) => Promise<RestoreResolution>
   teardownLiveSession: (sessionId: string, options: { recoverable: boolean }) => void
+  syncLiveSession?: (liveSession: SdkSessionState) => Promise<void>
 }
 
 export type AgentHistorySourceDeps = {

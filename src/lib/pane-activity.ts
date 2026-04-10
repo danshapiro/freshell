@@ -11,9 +11,9 @@ import type {
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
 import type { Tab } from '@/store/types'
-import type { CodexActivityRecord } from '@shared/ws-protocol'
+import type { CodexActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
 
-type PaneActivitySource = 'codex' | 'claude-terminal' | 'agent-chat' | 'browser'
+type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'agent-chat' | 'browser'
 
 export type PaneActivityProjection = {
   isBusy: boolean
@@ -106,6 +106,7 @@ export function resolvePaneActivity(input: {
   tabMode?: Tab['mode']
   isOnlyPane: boolean
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
+  opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   agentChatSessions: Record<string, ChatSessionState>
 }): PaneActivityProjection {
@@ -125,6 +126,16 @@ export function resolvePaneActivity(input: {
       })
       return record?.phase === 'busy'
         ? { isBusy: true, source: 'codex' }
+        : IDLE_PANE_ACTIVITY
+    }
+
+    if (effectiveMode === 'opencode') {
+      const terminalId = input.content.terminalId
+      const record = terminalId
+        ? input.opencodeActivityByTerminalId[terminalId]
+        : undefined
+      return record?.phase === 'busy'
+        ? { isBusy: true, source: 'opencode' }
         : IDLE_PANE_ACTIVITY
     }
 
@@ -157,6 +168,7 @@ export function getBusyPaneIdsForTab(input: {
   tab: Tab
   paneLayouts: Record<string, PaneNode | undefined>
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
+  opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   agentChatSessions: Record<string, ChatSessionState>
 }): string[] {
@@ -171,6 +183,7 @@ export function getBusyPaneIdsForTab(input: {
       tabMode: input.tab.mode,
       isOnlyPane: true,
       codexActivityByTerminalId: input.codexActivityByTerminalId,
+      opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       agentChatSessions: input.agentChatSessions,
     }).isBusy
@@ -186,6 +199,7 @@ export function getBusyPaneIdsForTab(input: {
       tabMode: input.tab.mode,
       isOnlyPane,
       codexActivityByTerminalId: input.codexActivityByTerminalId,
+      opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
       agentChatSessions: input.agentChatSessions,
     }).isBusy)
@@ -196,6 +210,7 @@ export function collectBusySessionKeys(input: {
   tabs: Tab[]
   paneLayouts: Record<string, PaneNode | undefined>
   codexActivityByTerminalId: Record<string, CodexActivityRecord>
+  opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
   agentChatSessions: Record<string, ChatSessionState>
 }): string[] {
@@ -213,6 +228,7 @@ export function collectBusySessionKeys(input: {
         tabMode: tab.mode,
         isOnlyPane: true,
         codexActivityByTerminalId: input.codexActivityByTerminalId,
+        opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         agentChatSessions: input.agentChatSessions,
       }).isBusy
@@ -231,6 +247,7 @@ export function collectBusySessionKeys(input: {
         tabMode: tab.mode,
         isOnlyPane,
         codexActivityByTerminalId: input.codexActivityByTerminalId,
+        opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
         agentChatSessions: input.agentChatSessions,
       }).isBusy

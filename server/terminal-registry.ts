@@ -11,6 +11,7 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import type { ServerSettings } from '../shared/settings.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
+import type { OpencodeServerEndpoint } from './local-port.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
@@ -25,10 +26,10 @@ import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
-const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
+const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
 const MIN_SCROLLBACK_CHARS = 64 * 1024
-const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
-const APPROX_CHARS_PER_LINE = 200
+const MAX_SCROLLBACK_CHARS = 4 * 1024 * 1024
+const APPROX_CHARS_PER_LINE = 300
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
@@ -165,10 +166,11 @@ function providerNotificationArgs(
   return { args: mcpInjection.args, env: mcpInjection.env }
 }
 
-type ProviderSettings = {
+export type ProviderSettings = {
   permissionMode?: string
   model?: string
   sandbox?: string
+  opencodeServer?: OpencodeServerEndpoint
 }
 
 function resolveCodingCliCommand(
@@ -199,6 +201,24 @@ function resolveCodingCliCommand(
     }
   }
   const settingsArgs: string[] = []
+  if (mode === 'opencode') {
+    const endpoint = providerSettings?.opencodeServer
+    if (
+      !endpoint
+      || endpoint.hostname !== '127.0.0.1'
+      || !Number.isInteger(endpoint.port)
+      || endpoint.port <= 0
+      || endpoint.port > 65535
+    ) {
+      throw new Error('OpenCode launch requires an allocated localhost control endpoint.')
+    }
+    settingsArgs.push(
+      '--hostname',
+      endpoint.hostname,
+      '--port',
+      String(endpoint.port),
+    )
+  }
   const effectiveModel = mode === 'opencode'
     ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
     : providerSettings?.model
@@ -323,6 +343,7 @@ export type TerminalRecord = {
   title: string
   description?: string
   mode: TerminalMode
+  opencodeServer?: OpencodeServerEndpoint
   resumeSessionId?: string
   pendingResumeName?: string
   createdAt: number
@@ -1137,6 +1158,7 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
+      opencodeServer: opts.mode === 'opencode' ? opts.providerSettings?.opencodeServer : undefined,
       resumeSessionId: undefined,
       createdAt,
       lastActivityAt: createdAt,

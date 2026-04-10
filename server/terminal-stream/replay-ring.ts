@@ -6,7 +6,7 @@ export type ReplayFrame = {
   at: number
 }
 
-export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 256 * 1024
+export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 1024 * 1024
 
 function resolveMaxBytes(explicitMaxBytes?: number): number {
   if (typeof explicitMaxBytes === 'number' && Number.isFinite(explicitMaxBytes) && explicitMaxBytes > 0) {

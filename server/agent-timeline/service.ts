@@ -6,6 +6,7 @@ import type {
   AgentTimelineItem,
   AgentTimelinePage,
   AgentTimelinePageQuery,
+  AgentTimelineTurnBodyQuery,
   AgentTimelineTurn,
 } from './types.js'
 
@@ -21,7 +22,7 @@ type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
 
 export type AgentTimelineService = {
   getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
-  getTurnBody: (query: { sessionId: string; turnId: string; revision?: number; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
+  getTurnBody: (query: AgentTimelineTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
 }
 
 export type AgentTimelineServiceDeps = {
@@ -135,12 +136,15 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
   return {
     async getTimelinePage(query) {
       throwIfAborted(query.signal)
+      if (query.revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const limit = Math.min(query.limit ?? DEFAULT_TIMELINE_LIMIT, MAX_TIMELINE_LIMIT)
       const cursor = query.cursor ? decodeCursor(query.cursor) : null
       const offset = cursor?.offset ?? 0
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
-      if (query.revision != null && query.revision !== timeline.revision) {
+      if (query.revision !== timeline.revision) {
         throw new RestoreStaleRevisionError(query.revision, timeline.revision)
       }
       if (cursor && cursor.revision !== timeline.revision) {
@@ -176,8 +180,11 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
     },
 
     async getTurnBody({ sessionId, turnId, revision }) {
+      if (revision == null) {
+        throw new Error('Restore revision is required')
+      }
       const timeline = await loadTimeline(sessionId)
-      if (revision != null && revision !== timeline.revision) {
+      if (revision !== timeline.revision) {
         throw new RestoreStaleRevisionError(revision, timeline.revision)
       }
       const match = timeline.records.find((record) => record.turnId === turnId)

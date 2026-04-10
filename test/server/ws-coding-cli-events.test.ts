@@ -64,7 +64,7 @@ describe('WebSocket Coding CLI Events', () => {
     server = http.createServer(app)
     registry = new TerminalRegistry()
     cliManager = new CodingCliSessionManager([claudeProvider])
-    wsHandler = new WsHandler(server, registry, cliManager)
+    wsHandler = new WsHandler(server, registry, { codingCliManager: cliManager })
 
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
@@ -251,7 +251,7 @@ describe('WebSocket Coding CLI Events', () => {
     } as unknown as CodingCliSessionManager
 
     wsHandler.close()
-    wsHandler = new WsHandler(server, registry, fakeManager)
+    wsHandler = new WsHandler(server, registry, { codingCliManager: fakeManager })
 
     vi.mocked(configStore.snapshot).mockResolvedValueOnce({
       settings: {

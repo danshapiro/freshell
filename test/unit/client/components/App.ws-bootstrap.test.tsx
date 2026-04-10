@@ -13,6 +13,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
+import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import { makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
 import {
   composeResolvedSettings,
@@ -129,9 +130,16 @@ function createStore(options?: {
     zoomedPane?: Record<string, string>
   }
   codexActivity?: Partial<CodexActivityState>
+  opencodeActivity?: Partial<OpencodeActivityState>
   sessions?: Record<string, unknown>
 }) {
   const defaultCodexActivity: CodexActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  }
+  const defaultOpencodeActivity: OpencodeActivityState = {
     byTerminalId: {},
     lastSnapshotSeq: 0,
     liveMutationSeqByTerminalId: {},
@@ -156,6 +164,7 @@ function createStore(options?: {
       panes: panesReducer,
       network: networkReducer,
       codexActivity: codexActivityReducer,
+      opencodeActivity: opencodeActivityReducer,
       tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       extensions: extensionsReducer,
@@ -187,6 +196,10 @@ function createStore(options?: {
       codexActivity: {
         ...defaultCodexActivity,
         ...(options?.codexActivity ?? {}),
+      },
+      opencodeActivity: {
+        ...defaultOpencodeActivity,
+        ...(options?.opencodeActivity ?? {}),
       },
       tabRegistry: {
         deviceId: 'device-test',
@@ -535,6 +548,7 @@ describe('App WS bootstrap recovery', () => {
     expect(bootstrapCalls).toBe(2)
     expect(sidebarCalls).toBe(2)
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
   it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
@@ -752,6 +766,40 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
+  })
+
+  it('clears stale opencode activity immediately when bootstrap attaches to an already-ready socket', async () => {
+    const store = createStore({
+      opencodeActivity: {
+        byTerminalId: {
+          'term-stale': {
+            terminalId: 'term-stale',
+            sessionId: 'session-stale',
+            phase: 'busy',
+            updatedAt: 10,
+          },
+        },
+        lastSnapshotSeq: 4,
+        liveMutationSeqByTerminalId: { 'term-stale': 4 },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-stale'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-opencode-stale')
+      expect(store.getState().opencodeActivity.byTerminalId).toEqual({})
+    })
+
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
   it('mounts with legacy ws clients that do not implement onDisconnect', async () => {
@@ -819,6 +867,48 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('clears opencode activity promptly when the websocket disconnects after readiness', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-disconnect'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'opencode.activity.updated',
+        upsert: [{
+          terminalId: 'term-live',
+          sessionId: 'session-live',
+          phase: 'busy',
+          updatedAt: 20,
+        }],
+        remove: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().opencodeActivity.byTerminalId['term-live']?.phase).toBe('busy')
+    })
+
+    act(() => {
+      disconnectHandler?.()
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('disconnected')
+      expect(store.getState().opencodeActivity.byTerminalId).toEqual({})
+    })
+  })
+
   it('keeps the WS message handler registered after an initial connect failure, so a later ready can recover state', async () => {
     const store = createStore()
 
@@ -853,6 +943,7 @@ describe('App WS bootstrap recovery', () => {
 
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
   it('dispatches wsCloseCode to lastErrorCode in Redux when connect rejects with close code', async () => {
@@ -1043,6 +1134,7 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
     expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
 
@@ -1130,6 +1222,7 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
   it('keeps the active non-sidebar session surface during websocket recovery when the sidebar window is already loaded', async () => {
@@ -1243,5 +1336,61 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(store.getState().codexActivity.byTerminalId['term-1']?.phase).toBe('idle')
+  })
+
+  it('ignores stale opencode activity list responses that arrive after a newer snapshot', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-race'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    expect(messageHandler).toBeTypeOf('function')
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-preconnected-opencode-race',
+      })
+    })
+
+    await waitFor(() => {
+      const requests = wsMocks.send.mock.calls
+        .map(([payload]) => payload)
+        .filter((payload) => payload?.type === 'opencode.activity.list')
+      expect(requests.length).toBeGreaterThanOrEqual(2)
+    })
+
+    const requests = wsMocks.send.mock.calls
+      .map(([payload]) => payload)
+      .filter((payload) => payload?.type === 'opencode.activity.list')
+    const olderRequestId = requests[0]?.requestId as string
+    const newerRequestId = requests.at(-1)?.requestId as string
+
+    act(() => {
+      messageHandler?.({
+        type: 'opencode.activity.list.response',
+        requestId: newerRequestId,
+        terminals: [
+          {
+            terminalId: 'term-1',
+            sessionId: 'session-1',
+            phase: 'busy',
+            updatedAt: 200,
+          },
+        ],
+      })
+      messageHandler?.({
+        type: 'opencode.activity.list.response',
+        requestId: olderRequestId,
+        terminals: [],
+      })
+    })
+
+    expect(store.getState().opencodeActivity.byTerminalId['term-1']?.phase).toBe('busy')
   })
 })

@@ -1,8 +1,7 @@
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 
 type FakeProjectRow = {
   id: string
@@ -32,7 +31,7 @@ class FakeDatabaseSync {
       projects: FakeProjectRow[]
       sessions: FakeSessionRow[]
     },
-  ) {
+  ): void {
     fakeDatabaseState.set(dbPath, rows)
   }
 
@@ -57,14 +56,21 @@ class FakeDatabaseSync {
     }
   }
 
-  close() {}
+  close(): void {}
 }
+
+vi.mock('node:sqlite', () => ({
+  DatabaseSync: FakeDatabaseSync,
+}))
+
+import { OpencodeProvider } from '../../../../server/coding-cli/providers/opencode'
 
 describe('OpencodeProvider', () => {
   let tempDir: string
 
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-provider-'))
+    fakeDatabaseState.clear()
   })
 
   afterEach(async () => {
@@ -113,12 +119,7 @@ describe('OpencodeProvider', () => {
       ],
     })
 
-    const provider = new OpencodeProvider(
-      tempDir,
-      async () => ({
-        DatabaseSync: FakeDatabaseSync as unknown as typeof import('node:sqlite').DatabaseSync,
-      }),
-    )
+    const provider = new OpencodeProvider(tempDir)
     const sessions = await provider.listSessionsDirect()
 
     expect(provider.getSessionRoots()).toEqual([dbPath])

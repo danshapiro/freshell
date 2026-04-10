@@ -49,6 +49,40 @@ describe('extractChatMessagesFromJsonl', () => {
     })
   })
 
+  it('preserves authoritative top-level ids and model fields for legacy string-form records', () => {
+    const content = [
+      '{"type":"assistant","id":"upstream-top","model":"claude-opus-test","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hello' }],
+      timestamp: '2026-01-01T00:00:00Z',
+      model: 'claude-opus-test',
+      messageId: 'upstream-top',
+    })
+  })
+
+  it('includes top-level legacy model in synthesized deterministic ids', () => {
+    const modelA = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-a","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+    const modelB = extractChatMessagesFromJsonl(
+      '{"type":"assistant","model":"model-b","message":"hello","timestamp":"2026-01-01T00:00:00Z"}',
+    )
+
+    expect(modelA).toHaveLength(1)
+    expect(modelB).toHaveLength(1)
+    expect(modelA[0]?.model).toBe('model-a')
+    expect(modelB[0]?.model).toBe('model-b')
+    expect(modelA[0]?.messageId).toBeDefined()
+    expect(modelB[0]?.messageId).toBeDefined()
+    expect(modelA[0]?.messageId).not.toBe(modelB[0]?.messageId)
+  })
+
   it('preserves tool_use and tool_result content blocks', () => {
     const content = [
       '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me check."},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"echo hi"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
@@ -92,6 +126,24 @@ describe('extractChatMessagesFromJsonl', () => {
     expect(messages).toHaveLength(2)
   })
 
+  it('coalesces tool messages even when malformed lines are interspersed', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      'not valid json',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"output"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      'also malformed',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].content).toHaveLength(3)
+    expect(messages[0].content[0]).toEqual({ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } })
+    expect(messages[0].content[1]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: 'output' })
+    expect(messages[0].content[2]).toEqual({ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } })
+  })
+
   it('returns empty array for empty content', () => {
     expect(extractChatMessagesFromJsonl('')).toEqual([])
     expect(extractChatMessagesFromJsonl('\n\n')).toEqual([])
@@ -130,6 +182,39 @@ describe('extractChatMessagesFromJsonl', () => {
 
     expect(originalMessages[0].messageId).toBeDefined()
     expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
+  })
+
+  it('treats block-end newlines as trailing whitespace when synthesizing deterministic message ids', () => {
+    const original = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+    ].join('\n')
+    const rewritten = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello\\n"}]},"timestamp":"2026-01-02T00:00:01Z"}',
+    ].join('\n')
+
+    const originalMessages = extractChatMessagesFromJsonl(original)
+    const rewrittenMessages = extractChatMessagesFromJsonl(rewritten)
+
+    expect(originalMessages[0].messageId).toBeDefined()
+    expect(originalMessages[0].messageId).toBe(rewrittenMessages[0].messageId)
+  })
+
+  it('preserves parent/reference ancestry and distinguishes synthesized ids across different durable chains', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-a","referenceId":"ref-a"},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"same reply"}],"model":"claude","parentId":"parent-b","referenceId":"ref-b"},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0]?.parentId).toBe('parent-a')
+    expect(messages[0]?.referenceId).toBe('ref-a')
+    expect(messages[1]?.parentId).toBe('parent-b')
+    expect(messages[1]?.referenceId).toBe('ref-b')
+    expect(messages[0]?.messageId).toBeDefined()
+    expect(messages[1]?.messageId).toBeDefined()
+    expect(messages[0]?.messageId).not.toBe(messages[1]?.messageId)
   })
 })
 
@@ -231,5 +316,58 @@ describe('loadSessionHistory', () => {
 
     expect(messages).toHaveLength(1)
     expect(messages![0].content[0].text).toBe('Found me')
+  })
+})
+
+describe('tool message coalescing', () => {
+  it('coalesces consecutive tool-only assistant messages from JSONL', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"file1\\nfile2"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].content).toHaveLength(3)
+    expect(messages[0].content[0]).toEqual({ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } })
+    expect(messages[0].content[1]).toEqual({ type: 'tool_result', tool_use_id: 't1', content: 'file1\nfile2' })
+    expect(messages[0].content[2]).toEqual({ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'f.ts' } })
+  })
+
+  it('does not coalesce when assistant message has text content', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(2)
+  })
+
+  it('does not coalesce across user messages', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Thanks"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"f.ts"}}]},"timestamp":"2026-01-01T00:00:03Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(3)
+  })
+
+  it('preserves timestamp from first message in coalesced group', () => {
+    const content = [
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]},"timestamp":"2026-01-01T00:00:01Z"}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"t1","content":"output"}]},"timestamp":"2026-01-01T00:00:02Z"}',
+    ].join('\n')
+
+    const messages = extractChatMessagesFromJsonl(content)
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].timestamp).toBe('2026-01-01T00:00:01Z')
   })
 })

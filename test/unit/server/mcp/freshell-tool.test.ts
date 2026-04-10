@@ -182,6 +182,11 @@ describe('executeAction -- pane actions', () => {
   })
 
   it('rename-pane calls PATCH /api/panes/:id', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes?tabId=t1')) return Promise.resolve({ panes: [{ id: 'p1', index: 0 }] })
+      return Promise.resolve({})
+    })
     mockClient.patch.mockResolvedValue({ ok: true })
     await executeAction('rename-pane', { target: 'p1', name: 'My Pane' })
     expect(mockClient.patch).toHaveBeenCalledWith(
@@ -507,9 +512,12 @@ describe('executeAction -- meta', () => {
     expect(text).toContain('capture-pane')
     expect(text).toContain('screenshot')
     expect(text).toContain('wait-for')
+    expect(text).toContain('rename-tab      Rename a tab. Params: name, target?')
+    expect(text).toContain('rename-pane     Rename a pane. Params: name, target?')
     // Playbooks
     expect(text).toContain('Playbook')
     expect(text).toContain('literal: true')
+    expect(text).toContain('create, split, and rename without manual UI interaction')
     // Screenshot guidance
     expect(text).toContain('Screenshot guidance')
     expect(text).toContain('canary tab')
@@ -559,6 +567,16 @@ describe('executeAction -- tab target resolution', () => {
     const result = await executeAction('select-tab', { target: 'NonExistent' })
     expect(result).toHaveProperty('error')
     expect(result.error).toContain('not found')
+  })
+
+  it('rename-tab without target resolves to the active tab', async () => {
+    mockClient.get.mockResolvedValue({ tabs: [{ id: 't1', title: 'Work' }], activeTabId: 't1' })
+    mockClient.patch.mockResolvedValue({ ok: true })
+    await executeAction('rename-tab', { name: 'New Name' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/tabs/t1'),
+      expect.objectContaining({ name: 'New Name' }),
+    )
   })
 })
 
@@ -642,6 +660,32 @@ describe('executeAction -- caller identity (FRESHELL_TAB_ID / FRESHELL_PANE_ID)'
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/panes/p-active/split'),
       expect.objectContaining({ direction: 'horizontal' }),
+    )
+  })
+
+  it('rename-pane without target uses caller pane when FRESHELL_PANE_ID is set', async () => {
+    process.env.FRESHELL_TAB_ID = 't-caller'
+    process.env.FRESHELL_PANE_ID = 'p-caller'
+    setupTwoTabs()
+    mockClient.patch.mockResolvedValue({ ok: true })
+
+    await executeAction('rename-pane', { name: 'Caller Pane' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p-caller'),
+      expect.objectContaining({ name: 'Caller Pane' }),
+    )
+  })
+
+  it('rename-pane without target falls back to the active pane when caller identity is absent', async () => {
+    delete process.env.FRESHELL_TAB_ID
+    delete process.env.FRESHELL_PANE_ID
+    setupTwoTabs()
+    mockClient.patch.mockResolvedValue({ ok: true })
+
+    await executeAction('rename-pane', { name: 'Active Pane' })
+    expect(mockClient.patch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p-active'),
+      expect.objectContaining({ name: 'Active Pane' }),
     )
   })
 

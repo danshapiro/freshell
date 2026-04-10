@@ -75,9 +75,10 @@ function makeCreatedSession(overrides: Record<string, any> = {}) {
   return {
     ...session,
     replayGate: replayGate ?? {
-      capture: vi.fn(() => ({
+      drain: vi.fn(() => ({
         watermark: 0,
         session: { ...session },
+        bufferedMessages: [],
       })),
     },
   }
@@ -226,17 +227,10 @@ describe('WsHandler agent history source DI', () => {
     handler = new WsHandler(
       server,
       registry,
-      undefined, // codingCliManager
-      mockSdkBridge as any,
-      undefined, // sessionRepairService
-      undefined, // handshakeSnapshotProvider
-      undefined, // terminalMetaListProvider
-      undefined, // tabsRegistryStore
-      undefined, // serverInstanceId
-      undefined, // layoutStore
-      undefined, // extensionManager
-      undefined, // codexActivityListProvider
-      injectedHistorySource,
+      {
+        sdkBridge: mockSdkBridge as any,
+        agentHistorySource: injectedHistorySource,
+      },
     )
 
     const ws = await connectAndAuth(server)
@@ -297,17 +291,10 @@ describe('WsHandler agent history source DI', () => {
     handler = new WsHandler(
       server,
       registry,
-      undefined,
-      mockSdkBridge as any,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      injectedHistorySource,
+      {
+        sdkBridge: mockSdkBridge as any,
+        agentHistorySource: injectedHistorySource,
+      },
     )
 
     const ws = await connectAndAuth(server)
@@ -363,17 +350,10 @@ describe('WsHandler agent history source DI', () => {
     handler = new WsHandler(
       server,
       registry,
-      undefined,
-      mockSdkBridge as any,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      injectedHistorySource,
+      {
+        sdkBridge: mockSdkBridge as any,
+        agentHistorySource: injectedHistorySource,
+      },
     )
 
     const ws = await connectAndAuth(server)
@@ -448,8 +428,9 @@ describe('WsHandler agent history source DI', () => {
     handler = new WsHandler(
       server,
       registry,
-      undefined,
-      mockSdkBridge as any,
+      {
+        sdkBridge: mockSdkBridge as any,
+      },
     )
 
     const ws = await connectAndAuth(server)

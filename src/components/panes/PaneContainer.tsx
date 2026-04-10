@@ -20,7 +20,7 @@ import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
-import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getPaneDisplayTitle } from '@/lib/pane-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
   formatPaneRuntimeLabel,
@@ -51,6 +51,7 @@ const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
@@ -165,6 +166,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
   )
+  const opencodeActivityByTerminalId = useAppSelector(
+    (s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID
+  )
   const paneRuntimeActivityByPaneId = useAppSelector(
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
@@ -208,12 +212,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
+    const currentTitle = getPaneDisplayTitle(node.content, paneTitles[node.id], extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, extensionEntries, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
@@ -367,7 +371,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Render a leaf pane
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
+    const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'
@@ -420,6 +424,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       tabMode: tab?.mode,
       isOnlyPane,
       codexActivityByTerminalId,
+      opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,
     }).isBusy

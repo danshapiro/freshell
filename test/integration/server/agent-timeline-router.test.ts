@@ -4,6 +4,10 @@ import request from 'supertest'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createAgentTimelineRouter } from '../../../server/agent-timeline/router.js'
 import { createAgentTimelineService } from '../../../server/agent-timeline/service.js'
+import {
+  AgentTimelineTurnBodyQuerySchema,
+  RestoreStaleRevisionResponseSchema,
+} from '../../../shared/read-models.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
@@ -84,7 +88,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
 
   it('serves recent-first timeline pages through the route family', async () => {
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
@@ -93,6 +97,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
     expect(getTimelinePage).toHaveBeenCalledWith({
       sessionId: 'agent-session-1',
       priority: 'visible',
+      revision: 7,
       cursor: undefined,
       limit: 20,
       signal: expect.any(AbortSignal),
@@ -101,28 +106,56 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
 
   it('passes includeBodies through the route family', async () => {
     await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&includeBodies=true')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&includeBodies=true&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(getTimelinePage).toHaveBeenCalledWith(expect.objectContaining({
       sessionId: 'agent-session-1',
       includeBodies: true,
+      revision: 7,
     }))
   })
 
-  it('hydrates turn bodies on demand', async () => {
+  it('rejects unpinned timeline reads that omit restore revision', async () => {
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/turns/turn-2')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=20')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+    expect(getTimelinePage).not.toHaveBeenCalled()
+  })
+
+  it('hydrates turn bodies on demand', async () => {
+    expect(AgentTimelineTurnBodyQuerySchema.parse({ revision: '7' })).toEqual({ revision: 7 })
+
+    const res = await request(app)
+      .get('/api/agent-sessions/agent-session-1/turns/turn-2?revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
     expect(res.body.turnId).toBe('turn-2')
     expect(res.body.message.content[0].text).toBe('full turn body')
+    expect(getTurnBody).toHaveBeenCalledWith({
+      sessionId: 'agent-session-1',
+      turnId: 'turn-2',
+      revision: 7,
+    })
+  })
+
+  it('rejects unpinned turn-body reads that omit restore revision', async () => {
+    expect(AgentTimelineTurnBodyQuerySchema.safeParse({})).toMatchObject({ success: false })
+
+    const res = await request(app)
+      .get('/api/agent-sessions/agent-session-1/turns/turn-2')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(400)
+    expect(getTurnBody).not.toHaveBeenCalled()
   })
 
   it('fails cleanly on invalid timeline queries', async () => {
     const res = await request(app)
-      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=0')
+      .get('/api/agent-sessions/agent-session-1/timeline?priority=visible&limit=0&revision=7')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(400)
@@ -170,7 +203,7 @@ describe('agent timeline router with the real service', () => {
 
     const app = createAuthedApp(service)
     const timelineResponse = await request(app)
-      .get('/api/agent-sessions/sdk-session-321/timeline?priority=visible&includeBodies=true')
+      .get('/api/agent-sessions/sdk-session-321/timeline?priority=visible&includeBodies=true&revision=123')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(timelineResponse.status).toBe(200)
@@ -180,7 +213,7 @@ describe('agent timeline router with the real service', () => {
     expect(timelineResponse.body.bodies[timelineResponse.body.items[0].turnId].sessionId).toBe(canonicalSessionId)
 
     const turnResponse = await request(app)
-      .get(`/api/agent-sessions/sdk-session-321/turns/${timelineResponse.body.items[0].turnId}`)
+      .get(`/api/agent-sessions/sdk-session-321/turns/${timelineResponse.body.items[0].turnId}?revision=123`)
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(turnResponse.status).toBe(200)
@@ -215,7 +248,7 @@ describe('agent timeline router with the real service', () => {
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(staleTimeline.status).toBe(409)
-    expect(staleTimeline.body).toEqual({
+    expect(RestoreStaleRevisionResponseSchema.parse(staleTimeline.body)).toEqual({
       error: 'Stale restore revision',
       code: 'RESTORE_STALE_REVISION',
       currentRevision: 13,
@@ -226,11 +259,68 @@ describe('agent timeline router with the real service', () => {
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(staleTurn.status).toBe(409)
-    expect(staleTurn.body).toEqual({
+    expect(RestoreStaleRevisionResponseSchema.parse(staleTurn.body)).toEqual({
       error: 'Stale restore revision',
       code: 'RESTORE_STALE_REVISION',
       currentRevision: 13,
     })
+  })
+
+  it('round-trips a real service cursor without drifting off the accepted revision', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000777'
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue(makeResolvedHistory({
+          queryId: 'sdk-session-777',
+          liveSessionId: 'sdk-session-777',
+          timelineSessionId: canonicalSessionId,
+          revision: 21,
+          messages: [
+            {
+              role: 'user',
+              timestamp: '2026-03-10T10:00:00.000Z',
+              content: [{ type: 'text', text: 'oldest prompt' }],
+            },
+            {
+              role: 'assistant',
+              timestamp: '2026-03-10T10:01:00.000Z',
+              content: [{ type: 'text', text: 'middle reply' }],
+            },
+            {
+              role: 'user',
+              timestamp: '2026-03-10T10:02:00.000Z',
+              content: [{ type: 'text', text: 'newest prompt' }],
+            },
+          ],
+        })),
+      },
+    })
+
+    const app = createAuthedApp(service)
+    const firstPage = await request(app)
+      .get('/api/agent-sessions/sdk-session-777/timeline?priority=visible&limit=2&revision=21')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(firstPage.status).toBe(200)
+    expect(firstPage.body.revision).toBe(21)
+    expect(firstPage.body.nextCursor).toEqual(expect.any(String))
+
+    const secondPage = await request(app)
+      .get(`/api/agent-sessions/sdk-session-777/timeline?priority=visible&cursor=${encodeURIComponent(firstPage.body.nextCursor)}&revision=21`)
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(secondPage.status).toBe(200)
+    expect(secondPage.body.revision).toBe(21)
+    expect(secondPage.body.nextCursor).toBeNull()
+    expect(secondPage.body.items).toEqual([
+      expect.objectContaining({
+        sessionId: canonicalSessionId,
+        turnId: 'turn-0',
+        messageId: 'message-0',
+        ordinal: 0,
+        source: 'durable',
+      }),
+    ])
   })
 
   it('rejects malformed turn-body revisions with HTTP 400 instead of treating them as stale restore state', async () => {

@@ -1,5 +1,6 @@
 import { deriveTabName } from './deriveTabName'
 import { derivePaneTitle } from './derivePaneTitle'
+import { matchesDerivedPaneTitle } from './pane-title'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -12,8 +13,7 @@ function getSinglePaneOverrideTitle(
   if (!layout || layout.type !== 'leaf') return null
   const storedTitle = paneTitles?.[layout.id]
   if (!storedTitle) return null
-  const derivedPaneTitle = derivePaneTitle(layout.content, extensions)
-  return storedTitle !== derivedPaneTitle ? storedTitle : null
+  return matchesDerivedPaneTitle(storedTitle, layout.content, extensions) ? null : storedTitle
 }
 
 export function getTabDisplayTitle(

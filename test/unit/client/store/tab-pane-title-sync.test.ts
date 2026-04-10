@@ -7,6 +7,7 @@ import panesReducer, {
   updatePaneTitle,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode } from '../../../../src/store/paneTypes'
+import type { ClientExtensionEntry } from '../../../../shared/extension-types'
 import { syncPaneTitleByTerminalId } from '../../../../src/store/paneTitleSync'
 import { applyPaneRename, applyTabRename } from '../../../../src/store/titleSync'
 import { getTabDisplayTitle } from '../../../../src/lib/tab-title'
@@ -137,6 +138,21 @@ describe('tab-pane title sync for single-pane tabs', () => {
   })
 
   describe('runtime title sync uses pane state as the source of truth', () => {
+    const opencodeExtensions: ClientExtensionEntry[] = [{
+      name: 'opencode',
+      version: '1.0.0',
+      label: 'OpenCode',
+      description: '',
+      category: 'cli',
+      picker: { shortcut: 'O' },
+      cli: {
+        supportsModel: true,
+        supportsPermissionMode: true,
+        supportsResume: true,
+        resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'],
+      },
+    }]
+
     it('updates the only pane title and lets the tab display follow it', async () => {
       const store = createStore()
 
@@ -305,6 +321,33 @@ describe('tab-pane title sync for single-pane tabs', () => {
         store.getState().panes.layouts[tabId],
         store.getState().panes.paneTitles[tabId],
       )).toBe('Some Tab')
+    })
+
+    it('ignores legacy auto-derived pane titles when extensions provide the canonical label', () => {
+      const store = createStore()
+
+      store.dispatch(addTab({ title: 'Tab 1', mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-opencode' },
+      }))
+
+      const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
+      store.dispatch(updatePaneTitle({
+        tabId,
+        paneId,
+        title: 'Opencode',
+        setByUser: false,
+      }))
+
+      expect(getTabDisplayTitle(
+        store.getState().tabs.tabs[0],
+        store.getState().panes.layouts[tabId],
+        store.getState().panes.paneTitles[tabId],
+        opencodeExtensions,
+      )).toBe('OpenCode')
     })
   })
 })

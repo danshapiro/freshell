@@ -1,6 +1,9 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
+import {
+  AgentTimelinePageQuerySchema,
+  AgentTimelineTurnBodyQuerySchema,
+} from '../../shared/read-models.js'
 import { RestoreResolutionError, RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
@@ -18,10 +21,6 @@ export type AgentTimelineRouterDeps = {
 const TurnParamsSchema = z.object({
   sessionId: z.string().min(1),
   turnId: z.string().min(1),
-})
-
-const TurnQuerySchema = z.object({
-  revision: z.coerce.number().int().nonnegative().optional(),
 })
 
 export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router {
@@ -47,7 +46,7 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
     const query = AgentTimelinePageQuerySchema.safeParse({
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
-      revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
+      revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
       limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
       includeBodies: typeof req.query.includeBodies === 'string' ? req.query.includeBodies : undefined,
     })
@@ -97,7 +96,7 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
 
   router.get('/agent-sessions/:sessionId/turns/:turnId', async (req, res) => {
     const params = TurnParamsSchema.safeParse(req.params)
-    const query = TurnQuerySchema.safeParse({
+    const query = AgentTimelineTurnBodyQuerySchema.safeParse({
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
     })
     if (!params.success || !query.success) {

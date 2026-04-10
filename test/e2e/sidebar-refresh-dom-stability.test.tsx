@@ -220,9 +220,11 @@ describe('sidebar refresh DOM stability (e2e)', () => {
   beforeEach(() => {
     cleanup()
     vi.clearAllMocks()
+    _resetSessionWindowThunkState()
     wsHandlers.clear()
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
+    localStorage.clear()
 
     fetchSidebarSessionsSnapshot.mockReset()
     searchSessions.mockClear()
@@ -251,6 +253,7 @@ describe('sidebar refresh DOM stability (e2e)', () => {
 
   afterEach(() => {
     _resetSessionWindowThunkState()
+    localStorage.clear()
     cleanup()
   })
 

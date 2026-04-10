@@ -248,14 +248,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
-  'rename-tab':      { required: ['target', 'name'],          optional: [] },
+  'rename-tab':      { required: ['name'],                    optional: ['target'] },
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
   'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
-  'rename-pane':     { required: ['target', 'name'],          optional: [] },
+  'rename-pane':     { required: ['name'],                    optional: ['target'] },
   'kill-pane':       { required: ['target'],                  optional: [] },
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
@@ -340,7 +340,8 @@ Tab commands:
   list-tabs       List all tabs. Returns { tabs: [...], activeTabId }.
   select-tab      Activate a tab. Params: target (tab ID or title)
   kill-tab        Close a tab. Params: target
-  rename-tab      Rename a tab. Params: target, name
+  rename-tab      Rename a tab. Params: name, target?
+                  Omit target to rename the caller tab (or active tab as fallback).
   has-tab         Check if a tab exists. Params: target
   next-tab        Switch to the next tab.
   prev-tab        Switch to the previous tab.
@@ -351,7 +352,8 @@ Pane commands:
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
   kill-pane       Close a pane. Params: target
-  rename-pane     Rename a pane. Params: target, name
+  rename-pane     Rename a pane. Params: name, target?
+                  Omit target to rename the caller pane (or the tab's active pane as fallback).
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
   respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?
@@ -434,6 +436,18 @@ Meta:
 
   // Or new tab with editor
   freshell({ action: "new-tab", params: { name: "Edit README", editor: "/absolute/path/to/README.md" } })
+
+## Playbook: create, split, and rename without manual UI interaction
+
+  seed = freshell({ action: "new-tab", params: { name: "Triager", mode: "codex", cwd: "/path/to/repo" } })
+  tabId = seed.data.tabId
+  p0 = seed.data.paneId
+  p1 = freshell({ action: "split-pane", params: { target: p0, editor: "/path/to/repo/README.md" } }).data.paneId
+
+  freshell({ action: "rename-tab", params: { target: tabId, name: "Issue 166 work" } })
+  freshell({ action: "rename-pane", params: { target: p0, name: "Codex" } })
+  freshell({ action: "select-pane", params: { target: p1 } })
+  freshell({ action: "rename-pane", params: { name: "Editor" } })
 
 ## Playbook: open a URL in a browser pane
 
@@ -545,10 +559,12 @@ async function routeAction(
       return c.delete(`/api/tabs/${encodeURIComponent(tab.id)}`)
     }
     case 'rename-tab': {
-      const target = requireParam(params, 'target')
       const name = requireParam(params, 'name')
+      const target = typeof params?.target === 'string' && params.target.trim().length > 0
+        ? params.target
+        : undefined
       const { tab } = await resolveTabTarget(target)
-      if (!tab) return { error: `Tab '${target}' not found`, hint: "Run action 'list-tabs' to see available tabs." }
+      if (!tab) return { error: target ? `Tab '${target}' not found` : 'No active tab found', hint: "Run action 'list-tabs' to see available tabs." }
       return c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name })
     }
     case 'has-tab': {
@@ -585,9 +601,13 @@ async function routeAction(
       return c.post(`/api/panes/${encodeURIComponent(target)}/select`, {})
     }
     case 'rename-pane': {
-      const target = requireParam(params, 'target')
       const name = requireParam(params, 'name')
-      return c.patch(`/api/panes/${encodeURIComponent(target)}`, { name })
+      const target = typeof params?.target === 'string' && params.target.trim().length > 0
+        ? params.target
+        : undefined
+      const { pane } = await resolvePaneTarget(target)
+      if (!pane) return { error: target ? `Pane '${target}' not found` : 'No active pane found', hint: "Run action 'list-panes' to see available panes." }
+      return c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name })
     }
     case 'kill-pane': {
       const target = requireParam(params, 'target')

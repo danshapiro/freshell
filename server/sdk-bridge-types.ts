@@ -51,7 +51,7 @@ export type {
 } from '@anthropic-ai/claude-agent-sdk'
 
 import type { PermissionUpdate, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
-import type { ContentBlock, SdkSessionStatus } from '../shared/ws-protocol.js'
+import type { ContentBlock, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
 
 // ── SDK Session State (server-side, in-memory) ──
 
@@ -104,8 +104,17 @@ export interface SdkReplayState {
   session: SdkSessionState
 }
 
+export interface SdkReplayEntry {
+  sequence: number
+  message: SdkServerMessage
+}
+
+export interface SdkReplayDrain extends SdkReplayState {
+  bufferedMessages: SdkReplayEntry[]
+}
+
 export interface SdkReplayGate {
-  capture: () => SdkReplayState | null
+  drain: () => SdkReplayDrain | null
 }
 
 export type SdkCreatedSession = SdkSessionState & {

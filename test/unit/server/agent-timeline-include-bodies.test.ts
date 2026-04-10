@@ -54,35 +54,35 @@ function makeResolvedHistory(options: {
 
 describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
   it('accepts boolean true from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts boolean false from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('accepts string "true" from query parameters', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts string "false" from query parameters and parses to false', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('treats omitted includeBodies as undefined', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible' })
+    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBeUndefined()
   })
 
   it('rejects invalid string values for includeBodies', () => {
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible' })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible' })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible', revision: 7 })).toThrow()
   })
 })
 
@@ -100,6 +100,7 @@ describe('agent timeline includeBodies', () => {
     const page = await service.getTimelinePage({
       sessionId: 'sess-1',
       priority: 'visible',
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(page.items).toHaveLength(3)
@@ -121,6 +122,7 @@ describe('agent timeline includeBodies', () => {
       sessionId: 'sdk-sess-1',
       priority: 'visible',
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(page.items).toHaveLength(3)
@@ -151,6 +153,7 @@ describe('agent timeline includeBodies', () => {
       sessionId: 'sess-1',
       priority: 'visible',
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     const itemTurnIds = new Set(page.items.map((i) => i.turnId))
@@ -180,6 +183,7 @@ describe('agent timeline includeBodies', () => {
       priority: 'visible',
       limit: 2,
       includeBodies: true,
+      revision: Date.parse('2026-03-10T10:04:00.000Z'),
     })
 
     expect(page1.items).toHaveLength(2)
@@ -194,6 +198,7 @@ describe('agent timeline includeBodies', () => {
       cursor: page1.nextCursor!,
       limit: 2,
       includeBodies: true,
+      revision: page1.revision,
     })
 
     expect(page2.items).toHaveLength(2)
@@ -217,11 +222,13 @@ describe('agent timeline includeBodies', () => {
     const page = await service.getTimelinePage({
       sessionId: 'sdk-sess-1',
       priority: 'visible',
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     const turn = await service.getTurnBody({
       sessionId: 'sdk-sess-1',
       turnId: page.items[0].turnId,
+      revision: page.revision,
     })
 
     expect(turn).not.toBeNull()

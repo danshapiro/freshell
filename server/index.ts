@@ -20,6 +20,7 @@ import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
+import { wireOpencodeActivityTracker } from './coding-cli/opencode-activity-wiring.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
@@ -185,11 +186,12 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
+  const opencodeActivity = wireOpencodeActivityTracker({ registry })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
 
-  const sdkBridge = new SdkBridge()
+  let sdkBridge: SdkBridge
 
   const extensionManager = new ExtensionManager()
   const userExtDir = path.join(freshellConfigDir, 'extensions')
@@ -281,34 +283,38 @@ async function main() {
     getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
   })
+  sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
     server,
     registry,
-    codingCliSessionManager,
-    sdkBridge,
-    sessionRepairService,
-    async () => {
-      const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
-      const readError = configStore.getLastReadError()
-      const configFallback = readError
-        ? { reason: readError, backupExists: await configStore.backupExists() }
-        : undefined
-      return {
-        settings: currentSettings,
-        projects: codingCliIndexer.getProjects(),
-        perfLogging: perfConfig.enabled,
-        configFallback,
-      }
+    {
+      codingCliManager: codingCliSessionManager,
+      sdkBridge,
+      sessionRepairService,
+      handshakeSnapshotProvider: async () => {
+        const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
+        const readError = configStore.getLastReadError()
+        const configFallback = readError
+          ? { reason: readError, backupExists: await configStore.backupExists() }
+          : undefined
+        return {
+          settings: currentSettings,
+          projects: codingCliIndexer.getProjects(),
+          perfLogging: perfConfig.enabled,
+          configFallback,
+        }
+      },
+      terminalMetaListProvider: () => terminalMetadata.list(),
+      tabsRegistryStore,
+      serverInstanceId,
+      layoutStore,
+      extensionManager,
+      codexActivityListProvider: () => codexActivity.tracker.list(),
+      agentHistorySource,
+      opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
     },
-    () => terminalMetadata.list(),
-    tabsRegistryStore,
-    serverInstanceId,
-    layoutStore,
-    extensionManager,
-    () => codexActivity.tracker.list(),
-    agentHistorySource,
   )
   attachProxyUpgradeHandler(server)
   const port = Number(process.env.PORT || 3001)
@@ -346,6 +352,9 @@ async function main() {
 
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
+  })
+  opencodeActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastOpencodeActivityUpdated(payload)
   })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -782,6 +791,7 @@ async function main() {
 
     // 8b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
+    opencodeActivity.dispose()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()

@@ -65,6 +65,10 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+vi.mock('@/store/crossTabSync', () => ({
+  installCrossTabSync: () => () => {},
+}))
+
 // Mock the api module
 const mockApiGet = vi.fn().mockResolvedValue({})
 const fetchSidebarSessionsSnapshot = vi.fn()

@@ -106,6 +106,27 @@ export const CodexActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+export const OpencodeActivityRecordSchema = z.object({
+  terminalId: z.string().min(1),
+  sessionId: z.string().optional(),
+  phase: z.literal('busy'),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type OpencodeActivityRecord = z.infer<typeof OpencodeActivityRecordSchema>
+
+export const OpencodeActivityListResponseSchema = z.object({
+  type: z.literal('opencode.activity.list.response'),
+  requestId: z.string().min(1),
+  terminals: z.array(OpencodeActivityRecordSchema),
+})
+
+export const OpencodeActivityUpdatedSchema = z.object({
+  type: z.literal('opencode.activity.updated'),
+  upsert: z.array(OpencodeActivityRecordSchema),
+  remove: z.array(z.string().min(1)),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -230,6 +251,11 @@ export const CodexActivityListSchema = z.object({
   requestId: z.string().min(1),
 })
 
+export const OpencodeActivityListSchema = z.object({
+  type: z.literal('opencode.activity.list'),
+  requestId: z.string().min(1),
+})
+
 export const UiLayoutSyncSchema = z.object({
   type: z.literal('ui.layout.sync'),
   tabs: z.array(z.object({
@@ -328,6 +354,7 @@ export const SdkKillSchema = z.object({
 export const SdkAttachSchema = z.object({
   type: z.literal('sdk.attach'),
   sessionId: z.string().min(1),
+  resumeSessionId: z.string().min(1).optional(),
 })
 
 export const SdkSetModelSchema = z.object({
@@ -375,6 +402,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalResizeSchema,
   TerminalKillSchema,
   CodexActivityListSchema,
+  OpencodeActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
   CodingCliCreateSchema,
@@ -490,6 +518,10 @@ export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchem
 export type CodexActivityListResponseMessage = z.infer<typeof CodexActivityListResponseSchema>
 
 export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSchema>
+
+export type OpencodeActivityListResponseMessage = z.infer<typeof OpencodeActivityListResponseSchema>
+
+export type OpencodeActivityUpdatedMessage = z.infer<typeof OpencodeActivityUpdatedSchema>
 
 // -- Sessions --
 
@@ -716,6 +748,8 @@ export type ServerMessage =
   | TerminalInventoryMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage
+  | OpencodeActivityListResponseMessage
+  | OpencodeActivityUpdatedMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

@@ -18,7 +18,8 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import { defaultLocalSettings } from '@shared/settings'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
@@ -49,6 +50,14 @@ function makeStore() {
       agentChat: agentChatReducer,
       panes: panesReducer,
       settings: settingsReducer,
+    },
+    preloadedState: {
+      settings: {
+        serverSettings: defaultSettings,
+        localSettings: { ...defaultLocalSettings, agentChat: { showThinking: false, showTools: true, showTimecodes: false } },
+        settings: { ...defaultSettings, agentChat: { ...defaultSettings.agentChat, showTools: true } },
+        loaded: false,
+      },
     },
   })
 }
@@ -174,7 +183,7 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
     const toolButton = screen.getByRole('button', { name: /tool call/i })
     expect(toolButton).toBeInTheDocument()
 
-    // With showTools=true (default), ToolBlocks start expanded
+    // With showTools=true via preloadedState, ToolBlocks start expanded
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 
     // Click to collapse
@@ -217,7 +226,7 @@ describe('freshclaude polish e2e: all tools expanded when showTools=true', () =>
     const toolButtons = screen.getAllByRole('button', { name: /tool call/i })
     expect(toolButtons).toHaveLength(5)
 
-    // All tools should start expanded when showTools=true (default)
+    // All tools should start expanded when showTools=true via preloadedState
     expect(toolButtons[0]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
@@ -354,7 +363,7 @@ describe('freshclaude polish e2e: diff view for Edit tool', () => {
       </Provider>,
     )
 
-    // Tool block should be present; with showTools=true (default), it starts expanded
+    // Tool block should be present; with showTools=true via preloadedState, it starts expanded
     const toolButton = screen.getByRole('button', { name: /tool call/i })
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 
@@ -397,7 +406,7 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
       </Provider>,
     )
 
-    // ToolBlock should be expanded (showTools=true default)
+    // ToolBlock should be expanded (showTools=true via preloadedState)
     const toolButton = screen.getByRole('button', { name: /tool call/i })
     expect(toolButton).toHaveAttribute('aria-expanded', 'true')
 

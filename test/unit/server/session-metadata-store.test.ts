@@ -72,6 +72,25 @@ describe('SessionMetadataStore', () => {
     expect(allAgain['claude:x']?.sessionType).toBe('freshclaude')
   })
 
+  it('merges derivedTitle into an existing metadata record', async () => {
+    await store.set('codex', 'sess-1', { sessionType: 'codex' })
+    await store.set('codex', 'sess-1', { derivedTitle: 'Investigate sidebar visibility' })
+
+    expect(await store.get('codex', 'sess-1')).toEqual({
+      sessionType: 'codex',
+      derivedTitle: 'Investigate sidebar visibility',
+    })
+  })
+
+  it('returns defensive copies that include derivedTitle', async () => {
+    await store.set('codex', 'sess-2', { derivedTitle: 'Sticky title' })
+
+    const entry = await store.get('codex', 'sess-2')
+    entry!.derivedTitle = 'mutated'
+
+    expect((await store.get('codex', 'sess-2'))?.derivedTitle).toBe('Sticky title')
+  })
+
   it('does not allow caller to mutate cache via set input', async () => {
     const input = { sessionType: 'freshclaude' }
     await store.set('claude', 'y', input)

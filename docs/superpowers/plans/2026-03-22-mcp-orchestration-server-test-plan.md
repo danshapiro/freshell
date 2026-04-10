@@ -25,7 +25,6 @@
 | `test/unit/server/mcp/server.test.ts` | **New** | `server/mcp/server.ts` |
 | `test/unit/server/mcp/config-writer.test.ts` | **New** | `server/mcp/config-writer.ts` |
 | `test/unit/server/terminal-registry.test.ts` | **Modified** | `server/terminal-registry.ts` |
-| `test/unit/server/freshell-orchestration-skill.test.ts` | **Modified** (add MCP tool content checks) | `.claude/skills/freshell-orchestration/SKILL.md` |
 
 ---
 
@@ -313,7 +312,7 @@ This is a real child-process integration test (not mocked). It spawns the actual
 
 ### Helper Replacements
 
-**Remove:** `expectClaudeTurnCompleteArgs()` (currently asserts `--plugin-dir` with `freshell-orchestration`)
+**Remove:** `expectClaudeTurnCompleteArgs()` (currently asserts the legacy orchestration `--plugin-dir`)
 **Replace with:** `expectClaudeMcpArgs()`
 
 ```typescript
@@ -413,18 +412,17 @@ No test logic changes beyond the helper swap are needed for these existing test 
 
 ---
 
-## File 6: `test/unit/server/freshell-orchestration-skill.test.ts` (Verified, may need update)
+## File 6: `test/unit/server/mcp/freshell-tool.test.ts` (Expanded instruction coverage)
 
-**Source:** `.claude/skills/freshell-orchestration/SKILL.md`
+**Source:** `server/mcp/freshell-tool.ts`
 **Category:** Unit
-**Status:** The plan modifies SKILL.md to add MCP tool preference. The existing test checks for specific content (`'If a target or name contains spaces, quote it.'`). This content is retained. **However**, a new test case should be added to verify the MCP section was added.
+**Status:** The MCP tool is the canonical orchestration reference. Expand the existing help/instructions coverage instead of maintaining a separate standalone doc test.
 
-### New Test Case (if SKILL.md is modified)
+### New Test Case
 
 | # | Test Name | Asserts |
 |---|-----------|---------|
-| 1 | `includes MCP tool section` | Read SKILL.md. Expect content to contain `'MCP tool'` or `'freshell MCP'` (confirming the new section exists). |
-| 2 | `mentions CLI as fallback` | Read SKILL.md. Expect content to contain `'CLI fallback'` or `'fallback'` near the MCP section. |
+| 1 | `help text documents rename defaults and rename playbook` | Call `executeAction('help')`. Expect the result to mention `rename-tab`, `rename-pane`, omitted-target semantics, and the create/split/rename playbook. |
 
 ---
 
@@ -459,7 +457,7 @@ The implementation plan uses red-green-refactor TDD. Tests should be written and
 3. **Task 4:** `test/unit/server/mcp/server.test.ts` -- write tests first (red), implement `server/mcp/server.ts` (green), refactor
 4. **Task 5:** `test/unit/server/mcp/config-writer.test.ts` -- write tests first (red), implement `server/mcp/config-writer.ts` (green), refactor
 5. **Task 6:** Modify `test/unit/server/terminal-registry.test.ts` -- update helpers (red), modify `server/terminal-registry.ts` (green), delete dead code, refactor
-6. **Task 7:** Optionally update `test/unit/server/freshell-orchestration-skill.test.ts`, update SKILL.md
+6. **Task 7:** Optionally expand `test/unit/server/mcp/freshell-tool.test.ts` to cover the canonical MCP help/instruction surface
 
 ---
 
@@ -473,5 +471,4 @@ The implementation plan uses red-green-refactor TDD. Tests should be written and
 | `config-writer.test.ts` | 26 | 0 |
 | `config-writer-paths.test.ts` | 5 | 0 |
 | `terminal-registry.test.ts` | 11 | ~12 (helper swap) |
-| `freshell-orchestration-skill.test.ts` | 2 | 0 |
 | **Total** | **114** | **~12** |

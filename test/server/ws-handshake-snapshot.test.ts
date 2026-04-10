@@ -188,10 +188,9 @@ describe('ws handshake snapshot', () => {
     new (WsHandler as any)(
       server,
       new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      async () => snapshot
+      {
+        handshakeSnapshotProvider: async () => snapshot,
+      },
     )
 
     const info = await listen(server)

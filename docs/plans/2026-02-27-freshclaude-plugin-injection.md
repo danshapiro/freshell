@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Allow freshclaude sessions to load plugins (which expose skills) at creation time, defaulting to `freshell-orchestration`.
+**Goal:** Allow freshclaude sessions to load explicit plugin bundles at creation time. Freshell orchestration should come from the `freshell` MCP tool, not a default skill/plugin path.
 
-**Architecture:** Add a `plugins` parameter (array of absolute paths to plugin directories) that flows from `ClaudeChatPaneContent` through the WS protocol to `SdkBridge.createSession()`, which maps them to the SDK's `plugins` option on `query()`. The server resolves a default plugin path for `freshell-orchestration` at runtime.
+**Architecture:** Add a `plugins` parameter (array of absolute paths to plugin directories) that flows from `ClaudeChatPaneContent` through the WS protocol to `SdkBridge.createSession()`, which maps them to the SDK's `plugins` option on `query()`. Orchestration itself is provided separately by the `freshell` MCP tool.
 
 **Tech Stack:** TypeScript, Zod (WS protocol), React/Redux (client), Node.js (server), Vitest (tests)
 
@@ -26,11 +26,11 @@ it('parses sdk.create with plugins array', () => {
     type: 'sdk.create',
     requestId: 'req-1',
     cwd: '/home/user/project',
-    plugins: ['/path/to/.claude/plugins/my-skill'],
+    plugins: ['/path/to/.claude/plugins/my-plugin'],
   })
   expect(result.success).toBe(true)
   if (result.success) {
-    expect(result.data.plugins).toEqual(['/path/to/.claude/plugins/my-skill'])
+    expect(result.data.plugins).toEqual(['/path/to/.claude/plugins/my-plugin'])
   }
 })
 
@@ -350,7 +350,7 @@ git commit -m "feat(client): wire plugins through pane creation and sdk.create m
 
 ---
 
-### Task 6: Add default freshell-orchestration plugin resolution
+### Task 6: Keep orchestration on MCP instead of a default plugin
 
 **Files:**
 - Modify: `server/sdk-bridge.ts` (top of file + createSession)
@@ -359,16 +359,13 @@ git commit -m "feat(client): wire plugins through pane creation and sdk.create m
 **Step 1: Write the failing test**
 
 ```typescript
-describe('default plugins', () => {
-  it('resolves freshell-orchestration as default when no plugins specified', async () => {
+describe('plugins option', () => {
+  it('omits plugins when not set', async () => {
     await bridge.createSession({ cwd: '/tmp' })
-    expect(mockQueryOptions?.plugins).toBeDefined()
-    expect(mockQueryOptions?.plugins).toHaveLength(1)
-    expect(mockQueryOptions?.plugins[0].type).toBe('local')
-    expect(mockQueryOptions?.plugins[0].path).toContain('.claude/plugins/freshell-orchestration')
+    expect(mockQueryOptions?.plugins).toBeUndefined()
   })
 
-  it('does not add defaults when plugins are explicitly provided', async () => {
+  it('passes explicit plugins through unchanged', async () => {
     await bridge.createSession({ cwd: '/tmp', plugins: ['/custom/plugin'] })
     expect(mockQueryOptions?.plugins).toEqual([
       { type: 'local', path: '/custom/plugin' },
@@ -384,58 +381,28 @@ describe('default plugins', () => {
 
 **Step 2: Run test to verify it fails**
 
-Run: `npx vitest run test/unit/server/sdk-bridge.test.ts -t "default plugins"`
-Expected: FAIL — currently plugins is undefined when not set
+Run: `npx vitest run test/unit/server/sdk-bridge.test.ts -t "plugins option"`
+Expected: FAIL — a legacy default orchestration plugin is still being injected when `plugins` is omitted
 
-**Step 3: Implement default plugin resolution**
+**Step 3: Remove the default orchestration plugin resolution**
 
-At top of `server/sdk-bridge.ts`, add path resolution:
-
-```typescript
-import path from 'path'
-import { fileURLToPath } from 'url'
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const PROJECT_ROOT = path.resolve(__dirname, '..')
-const DEFAULT_PLUGINS = [
-  path.resolve(PROJECT_ROOT, '.claude/plugins/freshell-orchestration'),
-]
-```
-
-Then update the plugins mapping in `createSession` to use defaults:
-
-```typescript
-const resolvedPlugins = options.plugins !== undefined
-  ? options.plugins.map(p => ({ type: 'local' as const, path: p }))
-  : DEFAULT_PLUGINS.map(p => ({ type: 'local' as const, path: p }))
-```
-
-And pass `plugins: resolvedPlugins` directly (not spread-conditionally) in the query options.
+In `server/sdk-bridge.ts`, remove the default orchestration plugin constant and keep `plugins` omitted unless the caller explicitly provided them. Freshell orchestration continues to come from the `mcpServers.freshell` entry in the same query options.
 
 **Step 4: Run test to verify it passes**
 
-Run: `npx vitest run test/unit/server/sdk-bridge.test.ts -t "default plugins"`
+Run: `npx vitest run test/unit/server/sdk-bridge.test.ts -t "plugins option"`
 Expected: PASS
 
 **Step 5: Run all tests**
 
 Run: `npx vitest run`
-Expected: PASS — the `omits plugins when not set` test from Task 2 will now fail and needs updating to expect the default plugin instead. Update it:
-
-```typescript
-it('uses default plugins when not set', async () => {
-  await bridge.createSession({ cwd: '/tmp' })
-  expect(mockQueryOptions?.plugins).toBeDefined()
-  expect(mockQueryOptions?.plugins).toHaveLength(1)
-  expect(mockQueryOptions?.plugins[0].path).toContain('freshell-orchestration')
-})
-```
+Expected: PASS
 
 **Step 6: Commit**
 
 ```bash
 git add server/sdk-bridge.ts test/unit/server/sdk-bridge.test.ts
-git commit -m "feat(sdk-bridge): resolve freshell-orchestration as default plugin"
+git commit -m "refactor(sdk-bridge): remove legacy orchestration plugin fallback"
 ```
 
 ---
@@ -454,7 +421,7 @@ Expected: PASS
 
 **Step 3: Manual smoke test (if dev server available)**
 
-1. Create a freshclaude pane (no custom plugins) — should load freshell-orchestration by default
-2. Verify the session can use the freshell-orchestration skill
+1. Create a freshclaude pane (no custom plugins) — should rely on the `freshell` MCP tool for orchestration and not inject a default orchestration plugin
+2. Verify the session exposes the `freshell` MCP tool for orchestration
 
 **Step 4: Final commit (if any fixups needed)**

@@ -23,6 +23,7 @@ vi.mock('@xterm/xterm', () => ({
     }),
     onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
     attachCustomKeyEventHandler: vi.fn(),
+    attachCustomWheelEventHandler: vi.fn(),
     dispose: vi.fn(),
     write: vi.fn(),
     writeln: vi.fn(),

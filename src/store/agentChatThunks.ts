@@ -3,6 +3,7 @@ import {
   getAgentTimelinePage,
   getAgentTurnBody,
 } from '@/lib/api'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type { AppDispatch, RootState } from './store'
 import {
   restoreRetryRequested,
@@ -44,6 +45,35 @@ function isStaleRevisionError(error: unknown): error is {
   return candidate.status === 409 && candidate.details?.code === 'RESTORE_STALE_REVISION'
 }
 
+function getTimelineErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message
+  }
+  if (
+    typeof error === 'object'
+    && error !== null
+    && 'message' in error
+    && typeof (error as { message?: unknown }).message === 'string'
+    && (error as { message: string }).message.trim().length > 0
+  ) {
+    return (error as { message: string }).message
+  }
+  return fallback
+}
+
+function getRestoreFailureCode(error: unknown): string | undefined {
+  if (
+    typeof error === 'object'
+    && error !== null
+    && 'details' in error
+    && typeof (error as { details?: { code?: unknown } }).details?.code === 'string'
+  ) {
+    const code = (error as { details: { code: string } }).details.code
+    return code.startsWith('RESTORE_') ? code : undefined
+  }
+  return undefined
+}
+
 function requestStaleRestoreRetry(
   sessionId: string,
   dispatch: AppDispatch,
@@ -66,25 +96,37 @@ export const loadAgentTurnBody = createAsyncThunk<
   'agentChat/loadTurnBody',
   async ({ sessionId, timelineSessionId, turnId }, { dispatch, signal, getState }) => {
     const revision = getState().agentChat.sessions[sessionId]?.timelineRevision
+    if (revision == null) {
+      const error = new Error('Restore revision required')
+      dispatch(timelineLoadFailed({
+        sessionId,
+        message: error.message,
+      }))
+      throw error
+    }
     try {
       const turn = await getAgentTurnBody(timelineSessionId ?? sessionId, turnId, { revision, signal })
       dispatch(turnBodyReceived({
         sessionId,
-        turnId,
-        message: turn.message,
+        turn,
       }))
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw error
       }
 
-      if (isStaleRevisionError(error) && requestStaleRestoreRetry(sessionId, dispatch, getState)) {
-        return
+      if (isStaleRevisionError(error)) {
+        dispatch(timelineLoadFailed({
+          sessionId,
+          message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        }))
+        throw error
       }
 
       dispatch(timelineLoadFailed({
         sessionId,
-        message: error instanceof Error ? error.message : 'Timeline request failed',
+        message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        code: getRestoreFailureCode(error),
       }))
       throw error
     }
@@ -107,21 +149,34 @@ export const loadAgentTimelineWindow = createAsyncThunk<
 
     dispatch(timelineLoadStarted({ sessionId }))
     const revision = getState().agentChat.sessions[sessionId]?.timelineRevision
+    if (revision == null) {
+      const error = new Error('Restore revision required')
+      dispatch(timelineLoadFailed({
+        sessionId,
+        message: error.message,
+      }))
+      throw error
+    }
 
     try {
       const page = await getAgentTimelinePage(
         timelineSessionId ?? sessionId,
         {
           priority: 'visible',
-          ...(revision != null ? { revision } : {}),
+          revision,
           ...(!cursor ? { includeBodies: true } : {}),
           ...(cursor ? { cursor } : {}),
         },
         { signal: controller.signal },
       )
+      const canonicalTimelineSessionId = isValidClaudeSessionId(page.sessionId)
+        ? page.sessionId
+        : undefined
+      const resolvedTimelineSessionId = canonicalTimelineSessionId ?? timelineSessionId ?? sessionId
 
       dispatch(timelinePageReceived({
         sessionId,
+        timelineSessionId: canonicalTimelineSessionId,
         items: page.items,
         nextCursor: page.nextCursor,
         revision: page.revision,
@@ -133,14 +188,13 @@ export const loadAgentTimelineWindow = createAsyncThunk<
       if (!newestTurn || page.bodies?.[newestTurn.turnId]) return
 
       const turn = await getAgentTurnBody(
-        timelineSessionId ?? sessionId,
+        resolvedTimelineSessionId,
         newestTurn.turnId,
         { revision: page.revision, signal: controller.signal },
       )
       dispatch(turnBodyReceived({
         sessionId,
-        turnId: newestTurn.turnId,
-        message: turn.message,
+        turn,
       }))
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
@@ -155,7 +209,8 @@ export const loadAgentTimelineWindow = createAsyncThunk<
 
       dispatch(timelineLoadFailed({
         sessionId,
-        message: error instanceof Error ? error.message : 'Timeline request failed',
+        message: getTimelineErrorMessage(error, 'Timeline request failed'),
+        code: getRestoreFailureCode(error),
       }))
       throw error
     } finally {

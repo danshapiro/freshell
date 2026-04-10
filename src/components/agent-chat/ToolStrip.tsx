@@ -17,11 +17,11 @@ export interface ToolPair {
 interface ToolStripProps {
   pairs: ToolPair[]
   isStreaming: boolean
-  /** When false, strip is locked to collapsed view (no expand chevron). Default true. */
+  /** When true, strip starts expanded. Default false. */
   showTools?: boolean
 }
 
-function ToolStrip({ pairs, isStreaming, showTools = true }: ToolStripProps) {
+function ToolStrip({ pairs, isStreaming, showTools = false }: ToolStripProps) {
   const [stripExpanded, setStripExpanded] = useState(showTools)
   useEffect(() => { setStripExpanded(showTools) }, [showTools])
 

@@ -24,6 +24,9 @@ export interface ChatMessage {
 
 export interface AgentTimelineItem {
   turnId: string
+  messageId: string
+  ordinal: number
+  source: 'durable' | 'live'
   sessionId: string
   role: ChatMessage['role']
   summary: string
@@ -33,6 +36,9 @@ export interface AgentTimelineItem {
 export interface AgentTimelineTurn {
   sessionId: string
   turnId: string
+  messageId: string
+  ordinal: number
+  source: 'durable' | 'live'
   message: ChatMessage
 }
 
@@ -79,7 +85,7 @@ export interface ChatSessionState {
   status: 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
   messages: ChatMessage[]
   timelineItems: AgentTimelineItem[]
-  timelineBodies: Record<string, ChatMessage>
+  timelineBodies: Record<string, AgentTimelineTurn>
   nextTimelineCursor?: string | null
   timelineLoading?: boolean
   timelineError?: string
@@ -96,12 +102,18 @@ export interface ChatSessionState {
   historyLoaded?: boolean
   /** True while a resumed create must wait for the durable Claude id before hydrating backlog. */
   awaitingDurableHistory?: boolean
-  /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
+  /** True when server reports session is gone (INVALID_SESSION_ID). Triggers recovery once restore handoff is safe. */
   lost?: boolean
   /** Number of restore restarts already requested for stale-revision handling. */
   restoreRetryCount?: number
   /** Last restore-specific failure code surfaced during hydration. */
   restoreFailureCode?: string
+  /** User-visible restore failure message once restore has ended terminally. */
+  restoreFailureMessage?: string
+  /** Monotonic key for requesting one fresh sdk.attach snapshot refresh before hydration resumes. */
+  snapshotRefreshRequestId?: number
+  /** Monotonic key for restarting visible restore hydration from a newer snapshot. */
+  restoreHydrationRequestId?: number
 }
 
 export interface PendingAgentCreate {

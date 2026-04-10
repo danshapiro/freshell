@@ -1,5 +1,3 @@
-import fs from 'fs'
-import path from 'path'
 import { nanoid } from 'nanoid'
 import { EventEmitter } from 'events'
 import {
@@ -14,21 +12,20 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
+import { sanitizeAgentChatPluginPaths } from '../shared/agent-chat-plugins.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
+import type { AgentHistorySource } from './agent-timeline/history-source.js'
 import type {
   SdkSessionState,
   SdkCreatedSession,
+  SdkReplayDrain,
+  SdkReplayState,
   ContentBlock,
   SdkServerMessage,
   QuestionDefinition,
 } from './sdk-bridge-types.js'
-
-/** Default plugin candidates resolved from cwd. Checked at session creation time. */
-const DEFAULT_PLUGIN_CANDIDATES = [
-  path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration'),
-]
 
 const log = logger.child({ component: 'sdk-bridge' })
 
@@ -53,6 +50,10 @@ export class SdkBridge extends EventEmitter {
   private processes = new Map<string, SessionProcess>()
   private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
 
+  constructor(private readonly agentHistorySource?: AgentHistorySource) {
+    super()
+  }
+
   private cloneSessionState(state: SdkSessionState): SdkSessionState {
     return {
       ...state,
@@ -74,6 +75,24 @@ export class SdkBridge extends EventEmitter {
       return message.messageId
     }
     return synthesizeLiveMessageId(state.sessionId, state.messages.length)
+  }
+
+  private syncRestoreLedger(state: SdkSessionState): void {
+    void this.agentHistorySource?.syncLiveSession?.(state).catch((err) => {
+      log.warn({
+        err: err instanceof Error ? err : new Error(String(err)),
+        sessionId: state.sessionId,
+      }, 'Failed to sync restore ledger from SDK state')
+    })
+  }
+
+  private readReplayState(sessionId: string): { sp: SessionProcess; currentState: SdkSessionState } | null {
+    const sp = this.processes.get(sessionId)
+    const currentState = this.sessions.get(sessionId)
+    if (!sp || !currentState) {
+      return null
+    }
+    return { sp, currentState }
   }
 
   async createSession(options: {
@@ -150,18 +169,16 @@ export class SdkBridge extends EventEmitter {
           return this.handlePermissionRequest(sessionId, toolName, input as Record<string, unknown>, ctx)
         },
         settingSources: ['user', 'project', 'local'],
-        // Explicit plugins override defaults; omit entirely when no defaults exist
-        // to avoid suppressing SDK's own plugin discovery with an empty array.
-        // Resolve defaults at session creation time (not module load) so new/removed
-        // plugins are picked up without a server restart.
+        // Explicit plugins remain supported for non-Freshell Claude SDK bundles.
+        // Freshell orchestration itself is provided by the MCP server above.
         ...((() => {
           if (options.plugins !== undefined) {
-            return { plugins: options.plugins.map(p => ({ type: 'local' as const, path: p })) }
+            return {
+              plugins: sanitizeAgentChatPluginPaths(options.plugins)
+                .map(p => ({ type: 'local' as const, path: p })),
+            }
           }
-          const defaults = DEFAULT_PLUGIN_CANDIDATES.filter(p => fs.existsSync(p))
-          return defaults.length > 0
-            ? { plugins: defaults.map(p => ({ type: 'local' as const, path: p })) }
-            : {}
+          return {}
         })()),
       },
     })
@@ -176,6 +193,8 @@ export class SdkBridge extends EventEmitter {
       inputStream,
     })
 
+    await this.agentHistorySource?.syncLiveSession?.(state)
+
     // Start consuming the message stream in the background
     this.consumeStream(sessionId, sdkQuery).catch((err) => {
       log.error({ sessionId, err }, 'SDK stream error')
@@ -183,17 +202,41 @@ export class SdkBridge extends EventEmitter {
 
     return Object.assign(state, {
       replayGate: {
-        capture: () => {
-          const sp = this.processes.get(sessionId)
-          const currentState = this.sessions.get(sessionId)
-          if (!sp || !currentState) return null
+        drain: () => {
+          const replayState = this.readReplayState(sessionId)
+          if (!replayState) return null
+          const { sp, currentState } = replayState
+          const bufferedMessages = sp.messageBuffer.splice(0, sp.messageBuffer.length)
           return {
             watermark: sp.nextSequence - 1,
             session: this.cloneSessionState(currentState),
+            bufferedMessages,
           }
         },
       },
     })
+  }
+
+  captureReplayState(sessionId: string): SdkReplayState | null {
+    const replayState = this.readReplayState(sessionId)
+    if (!replayState) return null
+    const { sp, currentState } = replayState
+    return {
+      watermark: sp.nextSequence - 1,
+      session: this.cloneSessionState(currentState),
+    }
+  }
+
+  drainReplayBuffer(sessionId: string): SdkReplayDrain | null {
+    const replayState = this.readReplayState(sessionId)
+    if (!replayState) return null
+    const { sp, currentState } = replayState
+    const bufferedMessages = sp.messageBuffer.splice(0, sp.messageBuffer.length)
+    return {
+      watermark: sp.nextSequence - 1,
+      session: this.cloneSessionState(currentState),
+      bufferedMessages,
+    }
   }
 
   // Creates an async iterable that yields user messages written via sendUserMessage
@@ -297,6 +340,7 @@ export class SdkBridge extends EventEmitter {
           state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
           state.status = 'connected'
+          this.syncRestoreLedger(state)
           this.broadcastToSession(sessionId, {
             type: 'sdk.session.init',
             sessionId,
@@ -345,6 +389,7 @@ export class SdkBridge extends EventEmitter {
           }),
           ...(typeof (aMsg.message as any)?.model === 'string' ? { model: (aMsg.message as any).model } : {}),
         })
+        this.syncRestoreLedger(state)
         state.streamingActive = false
         state.streamingText = ''
         state.status = 'running'
@@ -591,7 +636,11 @@ export class SdkBridge extends EventEmitter {
     return true
   }
 
-  subscribe(sessionId: string, listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void): { off: () => void; replayed: boolean } | null {
+  subscribe(
+    sessionId: string,
+    listener: (msg: SdkServerMessage, meta?: { sequence: number }) => void,
+    options?: { skipReplayBuffer?: boolean },
+  ): { off: () => void; replayed: boolean } | null {
     const sp = this.processes.get(sessionId)
     if (!sp) return null
     sp.browserListeners.add(listener)
@@ -600,13 +649,15 @@ export class SdkBridge extends EventEmitter {
     let replayed = false
     if (!sp.hasSubscribers) {
       sp.hasSubscribers = true
-      replayed = true
-      for (const entry of sp.messageBuffer) {
-        try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
-          log.warn({ err, sessionId }, 'Buffer replay error')
+      if (!options?.skipReplayBuffer) {
+        replayed = true
+        for (const entry of sp.messageBuffer) {
+          try { listener(entry.message, { sequence: entry.sequence }) } catch (err) {
+            log.warn({ err, sessionId }, 'Buffer replay error')
+          }
         }
+        sp.messageBuffer.length = 0
       }
-      sp.messageBuffer.length = 0
     }
 
     return { off: () => { sp.browserListeners.delete(listener) }, replayed }
@@ -630,6 +681,7 @@ export class SdkBridge extends EventEmitter {
           timestamp,
         }),
       })
+      this.syncRestoreLedger(state)
     }
 
     const content: any[] = [{ type: 'text', text }]

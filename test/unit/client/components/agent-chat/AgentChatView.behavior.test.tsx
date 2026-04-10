@@ -7,10 +7,12 @@ import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
+  appendStreamDelta,
+  setStreaming,
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 
@@ -45,6 +47,7 @@ function makeStore(settingsOverrides?: Record<string, unknown>) {
     preloadedState: {
       settings: {
         settings: {
+          ...defaultSettings,
           ...(settingsOverrides || {}),
         } as any,
         loaded: true,
@@ -188,6 +191,35 @@ describe('AgentChatView thinking indicator', () => {
   })
 })
 
+describe('AgentChatView streaming preview lifecycle', () => {
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+  })
+
+  it('removes the stale streaming preview once the final assistant message is committed', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(setStreaming({ sessionId: 'sess-1', active: true }))
+    store.dispatch(appendStreamDelta({ sessionId: 'sess-1', text: 'partial reply' }))
+    store.dispatch(setStreaming({ sessionId: 'sess-1', active: false }))
+    store.dispatch(addAssistantMessage({
+      sessionId: 'sess-1',
+      content: [{ type: 'text', text: 'final reply' }],
+    }))
+
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    expect(screen.getByText('final reply')).toBeInTheDocument()
+    expect(screen.queryByText('partial reply')).not.toBeInTheDocument()
+  })
+})
+
 describe('AgentChatView density', () => {
   afterEach(cleanup)
 
@@ -298,7 +330,7 @@ describe('AgentChatView tool blocks expanded by default', () => {
   })
 
   it('all tool blocks start expanded when showTools is true', () => {
-    const store = makeStore()
+    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, showTools: true } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     // Create a turn with 5 completed tools
     addTurns(store, 1, 5)
@@ -375,7 +407,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
   })
 
   it('does not open settings on new pane when global initialSetupDone is true', () => {
-    const store = makeStore({ agentChat: { initialSetupDone: true, providers: {} } })
+    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, initialSetupDone: true, providers: {} } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
     // Fresh pane (no settingsDismissed), but global flag is set
@@ -389,8 +421,6 @@ describe('AgentChatView settings auto-open (#110)', () => {
   })
 
   it('does not open settings while global settings are still loading', () => {
-    // Simulates a returning user: settings haven't loaded from server yet,
-    // so initialSetupDone is still false. We should NOT flash the settings panel.
     const store = configureStore({
       reducer: {
         agentChat: agentChatReducer,
@@ -399,7 +429,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
       },
       preloadedState: {
         settings: {
-          settings: {} as any,
+          settings: { ...defaultSettings } as any,
           loaded: false,
           lastSavedAt: 0,
         },
@@ -418,7 +448,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
 
   it('auto-focuses composer when global initialSetupDone skips settings', () => {
     vi.useFakeTimers()
-    const store = makeStore({ agentChat: { initialSetupDone: true, providers: {} } })
+    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, initialSetupDone: true, providers: {} } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
     render(

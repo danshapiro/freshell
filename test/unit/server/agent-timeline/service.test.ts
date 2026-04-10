@@ -58,6 +58,7 @@ describe('agent timeline service', () => {
       sessionId: 'agent-session-1',
       priority: 'visible',
       limit: 2,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(firstPage.items.map((item) => item.summary)).toEqual([
@@ -72,6 +73,7 @@ describe('agent timeline service', () => {
       priority: 'visible',
       cursor: firstPage.nextCursor ?? undefined,
       limit: 2,
+      revision: firstPage.revision,
     })
 
     expect(secondPage.items.map((item) => item.summary)).toEqual(['oldest user turn'])
@@ -101,11 +103,13 @@ describe('agent timeline service', () => {
       sessionId: 'agent-session-2',
       priority: 'visible',
       limit: 1,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     const turn = await service.getTurnBody({
       sessionId: 'agent-session-2',
       turnId: page.items[0]!.turnId,
+      revision: page.revision,
     })
 
     expect(turn).toMatchObject({
@@ -138,6 +142,7 @@ describe('agent timeline service', () => {
       sessionId: 'sdk-1',
       priority: 'visible',
       limit: 1,
+      revision: Date.parse('2026-03-10T10:02:00.000Z'),
     })
 
     expect(page.sessionId).toBe('00000000-0000-4000-8000-000000000001')
@@ -146,6 +151,7 @@ describe('agent timeline service', () => {
     const turn = await service.getTurnBody({
       sessionId: 'sdk-1',
       turnId: page.items[0]!.turnId,
+      revision: page.revision,
     })
 
     expect(turn?.sessionId).toBe('00000000-0000-4000-8000-000000000001')
@@ -170,6 +176,7 @@ describe('agent timeline service', () => {
       sessionId: 'agent-session-3',
       priority: 'background',
       cursor: 'not-a-valid-cursor',
+      revision: 0,
     })).rejects.toThrow(/cursor/i)
   })
 
@@ -186,6 +193,7 @@ describe('agent timeline service', () => {
     await expect(service.getTimelinePage({
       sessionId: 'missing-agent',
       priority: 'visible',
+      revision: 0,
     })).rejects.toMatchObject({
       code: 'RESTORE_NOT_FOUND',
     })
@@ -205,10 +213,27 @@ describe('agent timeline service', () => {
     await expect(service.getTimelinePage({
       sessionId: 'unavailable-agent',
       priority: 'visible',
+      revision: 0,
     })).rejects.toMatchObject({
       code: 'RESTORE_UNAVAILABLE',
       message: 'History store is unavailable',
     })
+  })
+
+  it('rejects timeline-page reads that omit the accepted restore revision', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
+          revision: 13,
+        }),
+      },
+    })
+
+    await expect(service.getTimelinePage({
+      sessionId: 'sdk-1',
+      priority: 'visible',
+    } as any)).rejects.toThrow('Restore revision is required')
   })
 
   it('rejects stale timeline-page revisions with the current ledger revision', async () => {
@@ -251,5 +276,21 @@ describe('agent timeline service', () => {
       requestedRevision: 12,
       actualRevision: 13,
     })
+  })
+
+  it('rejects turn-body reads that omit the accepted restore revision', async () => {
+    const service = createAgentTimelineService({
+      agentHistorySource: {
+        resolve: vi.fn().mockResolvedValue({
+          ...toResolvedHistory('sdk-1', '00000000-0000-4000-8000-000000000001'),
+          revision: 13,
+        }),
+      },
+    })
+
+    await expect(service.getTurnBody({
+      sessionId: 'sdk-1',
+      turnId: 'turn:sdk-1-2',
+    } as any)).rejects.toThrow('Restore revision is required')
   })
 })

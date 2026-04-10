@@ -30,6 +30,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 import type { Tab } from '@/store/types'
 import {
   buildAgentChatPersistedIdentityUpdate,
@@ -64,13 +65,15 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
   const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
   const defaultEffort = providerConfig?.defaultEffort ?? 'high'
-  const defaultShowThinking = providerConfig?.defaultShowThinking ?? true
-  const defaultShowTools = providerConfig?.defaultShowTools ?? true
-  const defaultShowTimecodes = providerConfig?.defaultShowTimecodes ?? false
+  const localSettings = useAppSelector((state) => state.settings.settings)
+  const defaultShowThinking = localSettings.agentChat.showThinking
+  const defaultShowTools = localSettings.agentChat.showTools
+  const defaultShowTimecodes = localSettings.agentChat.showTimecodes
   const providerLabel = providerConfig?.label ?? 'Agent Chat'
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
   const staleRetryAttachKeyRef = useRef<string | null>(null)
+  const snapshotRefreshAttachKeyRef = useRef<string | null>(null)
   const composerRef = useRef<ChatComposerHandle>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -109,6 +112,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = getPreferredResumeSessionId(session)
+    ?? (
+      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
+        ? paneContent.resumeSessionId
+        : undefined
+    )
+  const attachPayload = useMemo(() => {
+    if (!paneContent.sessionId) return null
+    return {
+      type: 'sdk.attach' as const,
+      sessionId: paneContent.sessionId,
+      ...(attachResumeSessionId ? { resumeSessionId: attachResumeSessionId } : {}),
+    }
+  }, [attachResumeSessionId, paneContent.sessionId])
   const waitingForDurableHistoryIdentity = Boolean(
     session?.awaitingDurableHistory
       && session.latestTurnId === null
@@ -122,7 +139,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
   // HTTP timeline window (even if it is empty).
-  const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
+  const hasRestoreFailure = Boolean(
+    paneContent.sessionId
+      && session?.historyLoaded
+      && session?.restoreFailureCode
+      && session?.restoreFailureMessage,
+  )
+  const isRestoring = !!paneContent.sessionId && !session?.historyLoaded && !hasRestoreFailure
 
   // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
@@ -145,14 +168,44 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     attachSentRef.current = false
   }, [tabId, paneId, dispatch])
 
-  // Immediate recovery when server confirms session is gone (markSessionLost sets
-  // session.lost = true).
+  // Recover once the server confirms the session is gone. If a pinned restore
+  // snapshot is still waiting on its first timeline window, let that hydrate
+  // first so the rebuilt transcript can render before the pane detaches.
   const sessionLost = !!session?.lost
+  const waitingForInitialRestoreWindow = (
+    sessionLost
+    && session?.latestTurnId !== undefined
+    && session?.historyLoaded === false
+  )
+  const shouldDeferLostRecoveryUntilAfterRestoreRender = (
+    sessionLost
+    && session?.latestTurnId !== undefined
+    && session?.historyLoaded === true
+  )
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!sessionLost || !paneContent.sessionId) return
+    if (waitingForInitialRestoreWindow) return
+    if (shouldDeferLostRecoveryUntilAfterRestoreRender) {
+      const sessionIdForRecovery = paneContent.sessionId
+      const timeoutId = window.setTimeout(() => {
+        if (paneContentRef.current.sessionId !== sessionIdForRecovery) return
+        if (!sessionRef.current?.lost) return
+        triggerRecovery()
+      }, 0)
+      return () => {
+        clearTimeout(timeoutId)
+      }
+    }
     triggerRecovery()
-  }, [sessionLost, paneContent.sessionId, suppressNetworkEffects, triggerRecovery])
+  }, [
+    shouldDeferLostRecoveryUntilAfterRestoreRender,
+    sessionLost,
+    paneContent.sessionId,
+    suppressNetworkEffects,
+    triggerRecovery,
+    waitingForInitialRestoreWindow,
+  ])
 
   useEffect(() => {
     if (suppressNetworkEffects) return
@@ -168,14 +221,42 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       staleRetryAttachKeyRef.current = null
       return
     }
-    const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}`
+    const retryKey = `${paneContent.sessionId}:${session.restoreRetryCount}:${attachPayload?.resumeSessionId ?? ''}`
     if (staleRetryAttachKeyRef.current === retryKey) return
     staleRetryAttachKeyRef.current = retryKey
-    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
+    if (attachPayload) {
+      ws.send(attachPayload)
+    }
   }, [
+    attachPayload,
     paneContent.sessionId,
     session?.restoreFailureCode,
     session?.restoreRetryCount,
+    suppressNetworkEffects,
+    ws,
+  ])
+
+  useEffect(() => {
+    if (suppressNetworkEffects) return
+    if (!paneContent.sessionId) {
+      snapshotRefreshAttachKeyRef.current = null
+      return
+    }
+    const snapshotRefreshRequestId = session?.snapshotRefreshRequestId
+    if (!snapshotRefreshRequestId) {
+      snapshotRefreshAttachKeyRef.current = null
+      return
+    }
+    const refreshKey = `${paneContent.sessionId}:${snapshotRefreshRequestId}:${attachPayload?.resumeSessionId ?? ''}`
+    if (snapshotRefreshAttachKeyRef.current === refreshKey) return
+    snapshotRefreshAttachKeyRef.current = refreshKey
+    if (attachPayload) {
+      ws.send(attachPayload)
+    }
+  }, [
+    attachPayload,
+    paneContent.sessionId,
+    session?.snapshotRefreshRequestId,
     suppressNetworkEffects,
     ws,
   ])
@@ -327,22 +408,22 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Attach to existing session on mount (e.g. after page refresh with persisted pane)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId || attachSentRef.current) return
+    if (!attachPayload || attachSentRef.current) return
     // Only attach if we didn't just create this session ourselves
     if (createSentRef.current) return
 
     attachSentRef.current = true
-    ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId })
-  }, [paneContent.sessionId, suppressNetworkEffects, ws])
+    ws.send(attachPayload)
+  }, [attachPayload, suppressNetworkEffects, ws])
 
   // Re-attach on WS reconnect so server re-subscribes this client
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!paneContent.sessionId) return
+    if (!attachPayload) return
     return ws.onReconnect(() => {
-      ws.send({ type: 'sdk.attach', sessionId: paneContent.sessionId! })
+      ws.send(attachPayload)
     })
-  }, [paneContent.sessionId, suppressNetworkEffects, ws])
+  }, [attachPayload, suppressNetworkEffects, ws])
 
   useEffect(() => {
     if (suppressNetworkEffects) return
@@ -368,6 +449,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     paneContent.sessionId,
     paneId,
     restoreHistoryQueryId,
+    session?.restoreHydrationRequestId,
     session?.latestTurnId,
     waitingForDurableHistoryIdentity,
     suppressNetworkEffects,
@@ -463,11 +545,28 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [])
 
   const handleSettingsChange = useCallback((changes: Record<string, unknown>) => {
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: { ...paneContentRef.current, ...changes },
-    }))
+    const paneChanges: Partial<AgentChatPaneContent> = {}
+    const localChanges: Record<string, unknown> = {}
+
+    for (const [key, value] of Object.entries(changes)) {
+      if (key === 'showThinking' || key === 'showTools' || key === 'showTimecodes') {
+        localChanges[key] = value
+      } else {
+        (paneChanges as Record<string, unknown>)[key] = value
+      }
+    }
+
+    if (Object.keys(paneChanges).length > 0) {
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: { ...paneContentRef.current, ...paneChanges },
+      }))
+    }
+
+    if (Object.keys(localChanges).length > 0) {
+      dispatch(updateSettingsLocal({ agentChat: localChanges }))
+    }
 
     const pc = paneContentRef.current
 
@@ -623,9 +722,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             model={paneContent.model ?? defaultModel}
             permissionMode={paneContent.permissionMode ?? defaultPermissionMode}
             effort={paneContent.effort ?? defaultEffort}
-            showThinking={paneContent.showThinking ?? defaultShowThinking}
-            showTools={paneContent.showTools ?? defaultShowTools}
-            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            showThinking={defaultShowThinking}
+            showTools={defaultShowTools}
+            showTimecodes={defaultShowTimecodes}
             sessionStarted={sessionStarted}
             defaultOpen={shouldShowSettings}
             modelOptions={availableModels.length > 0 ? availableModels : undefined}
@@ -646,6 +745,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           </div>
         )}
 
+        {hasRestoreFailure && session?.restoreFailureMessage && (
+          <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
+            <p className="font-medium text-red-700 dark:text-red-300">Session restore failed</p>
+            <p className="mt-1 text-red-700/90 dark:text-red-200">{session.restoreFailureMessage}</p>
+          </div>
+        )}
+
         {paneContent.status === 'create-failed' && paneContent.createError && (
           <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
             <p className="font-medium text-red-700 dark:text-red-300">Session start failed</p>
@@ -661,7 +767,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         )}
 
         {/* Welcome: no sessionId or the current session is empty after restore completed. */}
-        {!session?.messages.length && timelineItems.length === 0 && !isRestoring && paneContent.status !== 'create-failed' && (
+        {!session?.messages.length && timelineItems.length === 0 && !isRestoring && !hasRestoreFailure && paneContent.status !== 'create-failed' && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
@@ -669,18 +775,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         )}
 
         {timelineItems.map((item) => {
-          const message = timelineBodies[item.turnId]
-          if (message) {
+          const turn = timelineBodies[item.turnId]
+          if (turn) {
             return (
               <MessageBubble
                 key={`timeline-${item.turnId}`}
-                speaker={message.role}
-                content={message.content}
-                timestamp={message.timestamp}
-                model={message.model}
-                showThinking={paneContent.showThinking ?? defaultShowThinking}
-                showTools={paneContent.showTools ?? defaultShowTools}
-                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                speaker={turn.message.role}
+                content={turn.message.content}
+                timestamp={turn.message.timestamp}
+                model={turn.message.model}
+                showThinking={defaultShowThinking}
+                showTools={defaultShowTools}
+                showTimecodes={defaultShowTimecodes}
               />
             )
           }
@@ -698,9 +804,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                   turnId: item.turnId,
                 }))
               }}
-              showThinking={paneContent.showThinking ?? defaultShowThinking}
-              showTools={paneContent.showTools ?? defaultShowTools}
-              showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+              showThinking={defaultShowThinking}
+              showTools={defaultShowTools}
+              showTimecodes={defaultShowTimecodes}
             />
           )
         })}
@@ -718,9 +824,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     key={`turn-${i}`}
                     userMessage={item.user}
                     assistantMessage={item.assistant}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                 )
               }
@@ -730,9 +836,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     speaker={item.user.role}
                     content={item.user.content}
                     timestamp={item.user.timestamp}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                   <MessageBubble
                     speaker={item.assistant.role}
@@ -740,9 +846,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     timestamp={item.assistant.timestamp}
                     model={item.assistant.model}
                     isLastMessage={isLast}
-                    showThinking={paneContent.showThinking ?? defaultShowThinking}
-                    showTools={paneContent.showTools ?? defaultShowTools}
-                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                    showThinking={defaultShowThinking}
+                    showTools={defaultShowTools}
+                    showTimecodes={defaultShowTimecodes}
                   />
                 </React.Fragment>
               )
@@ -756,9 +862,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 timestamp={item.message.timestamp}
                 model={item.message.model}
                 isLastMessage={isLast}
-                showThinking={paneContent.showThinking ?? defaultShowThinking}
-                showTools={paneContent.showTools ?? defaultShowTools}
-                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+                showThinking={defaultShowThinking}
+                showTools={defaultShowTools}
+                showTimecodes={defaultShowTimecodes}
               />
             )
           })
@@ -768,9 +874,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           <MessageBubble
             speaker="assistant"
             content={streamingContent}
-            showThinking={paneContent.showThinking ?? defaultShowThinking}
-            showTools={paneContent.showTools ?? defaultShowTools}
-            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            showThinking={defaultShowThinking}
+            showTools={defaultShowTools}
+            showTimecodes={defaultShowTimecodes}
           />
         )}
 
@@ -809,13 +915,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         ))}
 
         {/* Error display */}
-        {session?.lastError && (
+        {!hasRestoreFailure && session?.lastError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.lastError}
           </div>
         )}
 
-        {session?.timelineError && (
+        {!hasRestoreFailure && session?.timelineError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.timelineError}
           </div>

@@ -14,6 +14,8 @@ import {
   setSessionMetadata,
 } from '@/lib/api'
 import {
+  AgentTimelineTurnBodyQuerySchema,
+  RestoreStaleRevisionResponseSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
 } from '@shared/read-models'
@@ -105,12 +107,12 @@ describe('visible-first read-model helpers', () => {
       .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
       .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', body: [] }))
 
-    await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20 }, { signal })
-    await getAgentTurnBody('session-1', 'turn-1', { signal })
+    await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20, revision: 7 }, { signal })
+    await getAgentTurnBody('session-1', 'turn-1', { revision: 7, signal })
 
     expect(mockFetch).toHaveBeenNthCalledWith(
       1,
-      '/api/agent-sessions/session-1/timeline?cursor=page-2&limit=20',
+      '/api/agent-sessions/session-1/timeline?cursor=page-2&revision=7&limit=20',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -118,7 +120,7 @@ describe('visible-first read-model helpers', () => {
     )
     expect(mockFetch).toHaveBeenNthCalledWith(
       2,
-      '/api/agent-sessions/session-1/turns/turn-1',
+      '/api/agent-sessions/session-1/turns/turn-1?revision=7',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -126,14 +128,32 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('rejects timeline requests that omit the pinned restore revision', async () => {
+    await expect(getAgentTimelinePage('session-1', { priority: 'visible' }, { signal: new AbortController().signal }))
+      .rejects
+      .toMatchObject({
+        name: 'ZodError',
+      })
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('rejects turn-body requests that omit the pinned restore revision', async () => {
+    await expect(getAgentTurnBody('session-1', 'turn-1', { signal: new AbortController().signal }))
+      .rejects
+      .toMatchObject({
+        name: 'ZodError',
+      })
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
   it('serializes includeBodies=true for the first visible agent timeline request', async () => {
     const signal = new AbortController().signal
     mockFetch.mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
 
-    await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true }, { signal })
+    await getAgentTimelinePage('session-1', { priority: 'visible', includeBodies: true, revision: 11 }, { signal })
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/agent-sessions/session-1/timeline?priority=visible&includeBodies=true',
+      '/api/agent-sessions/session-1/timeline?priority=visible&revision=11&includeBodies=true',
       expect.objectContaining({
         signal,
         headers: expect.any(Headers),
@@ -170,6 +190,19 @@ describe('visible-first read-model helpers', () => {
         headers: expect.any(Headers),
       }),
     )
+  })
+
+  it('shares the turn-body revision query and stale-revision error contracts from read-models', () => {
+    expect(AgentTimelineTurnBodyQuerySchema.parse({ revision: '13' })).toEqual({ revision: 13 })
+    expect(RestoreStaleRevisionResponseSchema.parse({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })).toEqual({
+      error: 'Stale restore revision',
+      code: 'RESTORE_STALE_REVISION',
+      currentRevision: 13,
+    })
   })
 
   it('terminal view helpers target only viewport, scrollback, and search routes while forwarding AbortSignal', async () => {

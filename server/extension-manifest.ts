@@ -42,6 +42,11 @@ const ServerConfigSchema = z.strictObject({
   singleton: z.boolean().optional().default(true),
 })
 
+const TerminalBehaviorConfigSchema = z.strictObject({
+  preferredRenderer: z.enum(['canvas']).optional(),
+  scrollInputPolicy: z.enum(['native', 'fallbackToCursorKeysWhenAltScreenMouseCapture']).optional(),
+})
+
 const CliConfigSchema = z.strictObject({
   command: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
@@ -56,6 +61,7 @@ const CliConfigSchema = z.strictObject({
   supportsPermissionMode: z.boolean().optional(),
   supportsModel: z.boolean().optional(),      // shows model field in SettingsView
   supportsSandbox: z.boolean().optional(),    // shows sandbox selector in SettingsView
+  terminalBehavior: TerminalBehaviorConfigSchema.optional(),
 })
 
 // ──────────────────────────────────────────────────────────────

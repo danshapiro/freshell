@@ -5,6 +5,11 @@ import {
 import type {
   SDKMessage,
   PermissionResult,
+  SdkCreatedSession,
+  SdkReplayEntry,
+  SdkReplayGate,
+  SdkReplayDrain,
+  SdkServerMessage,
   SdkSessionState,
 } from '../../../server/sdk-bridge-types.js'
 
@@ -94,6 +99,64 @@ describe('SDK Protocol Types', () => {
       }
       pending.resolve(result)
       expect(resolveFn).toHaveBeenCalledWith(result)
+    })
+  })
+
+  describe('transactional restore boundary types', () => {
+    it('drains replay state with a watermark, session snapshot, and buffered early messages', () => {
+      const state: SdkSessionState = {
+        sessionId: 'test',
+        status: 'connected',
+        createdAt: Date.now(),
+        messages: [],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+        costUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+      }
+      const bufferedMessage: SdkReplayEntry = {
+        sequence: 7,
+        message: {
+          type: 'sdk.stream',
+          sessionId: 'test',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'hello' },
+          },
+        } satisfies SdkServerMessage,
+      }
+      const replayState: SdkReplayDrain = {
+        watermark: 7,
+        session: state,
+        bufferedMessages: [bufferedMessage],
+      }
+      const replayGate: SdkReplayGate = {
+        drain: vi.fn(() => replayState),
+      }
+      const session: SdkCreatedSession = {
+        ...state,
+        replayGate,
+      }
+
+      expect(session.replayGate.drain()).toEqual(replayState)
+      expect(replayGate.drain).toHaveBeenCalledTimes(1)
+    })
+
+    it('types sdk.create.failed as a request-scoped restore failure message', () => {
+      const message: Extract<SdkServerMessage, { type: 'sdk.create.failed' }> = {
+        type: 'sdk.create.failed',
+        requestId: 'req-1',
+        code: 'RESTORE_INTERNAL',
+        message: 'Restore failed',
+        retryable: true,
+      }
+
+      expect(message.requestId).toBe('req-1')
+      expect(message.code).toBe('RESTORE_INTERNAL')
+      expect(message.retryable).toBe(true)
     })
   })
 

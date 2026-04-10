@@ -12,6 +12,10 @@ class FakeRegistry {
   detach() {
     return true
   }
+
+  list() {
+    return []
+  }
 }
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
@@ -96,29 +100,26 @@ describe('ws sidebar snapshot refresh', () => {
     wsHandler = new (WsHandler as any)(
       server,
       new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      async () => ({
-        settings: { theme: 'dark' },
-        projects: [
-          {
-            projectPath: '/demo',
-            sessions: [
-              {
-                provider: 'claude',
-                sessionId: 'older-open',
-                projectPath: '/demo',
-                lastActivityAt: 10,
-              },
-            ],
-          },
-        ],
-      }),
-      undefined,
-      undefined,
-      'srv-local',
-      new (LayoutStore as any)(),
+      {
+        handshakeSnapshotProvider: async () => ({
+          settings: { theme: 'dark' },
+          projects: [
+            {
+              projectPath: '/demo',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionId: 'older-open',
+                  projectPath: '/demo',
+                  lastActivityAt: 10,
+                },
+              ],
+            },
+          ],
+        }),
+        serverInstanceId: 'srv-local',
+        layoutStore: new (LayoutStore as any)(),
+      },
     )
 
     const info = await listen(server)

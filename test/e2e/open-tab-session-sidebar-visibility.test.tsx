@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -251,6 +251,7 @@ function createStore(options?: {
 
 describe('open tab session sidebar visibility (e2e)', () => {
   beforeEach(() => {
+    vi.useRealTimers()
     cleanup()
     vi.clearAllMocks()
     wsHandlers.clear()
@@ -283,6 +284,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     _resetSessionWindowThunkState()
     cleanup()
   })
@@ -1067,6 +1069,9 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
 
     fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search plus' } })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350))
+    })
 
     await waitFor(() => {
       expect(searchSessions).toHaveBeenCalledTimes(2)
@@ -1143,6 +1148,80 @@ describe('open tab session sidebar visibility (e2e)', () => {
     await waitFor(() => {
       // The session should appear in the sidebar as a fallback item
       expect(screen.getAllByText('137 tour').length).toBeGreaterThan(0)
+    })
+  })
+
+  it('keeps an open Codex session visible when the indexed sidebar row is titleless', async () => {
+    const sessionId = 'codex-current'
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [
+        {
+          projectPath: '/repo',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId,
+              projectPath: '/repo',
+              lastActivityAt: 40,
+              title: undefined,
+              cwd: '/repo',
+            },
+          ],
+        },
+      ],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 40,
+      oldestIncludedSessionId: `codex:${sessionId}`,
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-1',
+        title: 'Investigate sidebar visibility',
+        mode: 'codex',
+        resumeSessionId: sessionId,
+        createdAt: Date.now(),
+      }],
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-1',
+              status: 'running',
+              resumeSessionId: sessionId,
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Investigate sidebar visibility' } },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    const sidebarList = await screen.findByTestId('sidebar-session-list')
+
+    await waitFor(() => {
+      expect(within(sidebarList).getAllByText('Investigate sidebar visibility').length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      broadcastWs({ type: 'sessions.changed', revision: 1 })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalled()
+      expect(within(sidebarList).getAllByText('Investigate sidebar visibility').length).toBeGreaterThan(0)
     })
   })
 })

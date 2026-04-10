@@ -1,5 +1,6 @@
 import { z } from 'zod'
 
+import { sanitizeAgentChatPluginPaths } from './agent-chat-plugins.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from './coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from './string-list.js'
 
@@ -59,6 +60,11 @@ const SIDEBAR_LOCAL_KEYS = [
   'hideEmptySessions',
   'width',
   'collapsed',
+] as const
+const AGENT_CHAT_LOCAL_KEYS = [
+  'showThinking',
+  'showTools',
+  'showTimecodes',
 ] as const
 
 export type ThemeMode = (typeof THEME_VALUES)[number]
@@ -180,6 +186,11 @@ export type LocalSettings = {
     width: number
     collapsed: boolean
   }
+  agentChat: {
+    showThinking: boolean
+    showTools: boolean
+    showTimecodes: boolean
+  }
   notifications: {
     soundEnabled: boolean
   }
@@ -201,7 +212,7 @@ export type ResolvedSettings = {
   codingCli: ServerSettings['codingCli']
   panes: ServerSettings['panes'] & LocalSettings['panes']
   editor: ServerSettings['editor']
-  agentChat: ServerSettings['agentChat']
+  agentChat: ServerSettings['agentChat'] & LocalSettings['agentChat']
   extensions: ServerSettings['extensions']
   network: ServerSettings['network']
 }
@@ -465,6 +476,22 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
   }
 
+  if (isRecord(patch.agentChat)) {
+    const agentChat: LocalSettingsPatch['agentChat'] = {}
+    if (typeof patch.agentChat.showThinking === 'boolean') {
+      agentChat.showThinking = patch.agentChat.showThinking as boolean
+    }
+    if (typeof patch.agentChat.showTools === 'boolean') {
+      agentChat.showTools = patch.agentChat.showTools as boolean
+    }
+    if (typeof patch.agentChat.showTimecodes === 'boolean') {
+      agentChat.showTimecodes = patch.agentChat.showTimecodes as boolean
+    }
+    if (Object.keys(agentChat).length > 0) {
+      normalized.agentChat = agentChat
+    }
+  }
+
   if (isRecord(patch.notifications)) {
     const notifications: LocalSettingsPatch['notifications'] = {}
     if (typeof patch.notifications.soundEnabled === 'boolean') {
@@ -624,7 +651,7 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
       autoKillIdleMinutes: 180,
     },
     terminal: {
-      scrollback: 5000,
+      scrollback: 10000,
     },
     panes: {
       defaultNewPane: 'ask',
@@ -694,6 +721,11 @@ export const defaultLocalSettings: LocalSettings = {
     hideEmptySessions: true,
     width: 288,
     collapsed: false,
+  },
+  agentChat: {
+    showThinking: false,
+    showTools: false,
+    showTimecodes: false,
   },
   notifications: {
     soundEnabled: true,
@@ -860,9 +892,7 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
       agentChat.initialSetupDone = candidate.agentChat.initialSetupDone
     }
     if (hasOwn(candidate.agentChat, 'defaultPlugins') && Array.isArray(candidate.agentChat.defaultPlugins)) {
-      agentChat.defaultPlugins = candidate.agentChat.defaultPlugins.filter(
-        (value): value is string => typeof value === 'string',
-      )
+      agentChat.defaultPlugins = sanitizeAgentChatPluginPaths(candidate.agentChat.defaultPlugins)
     }
     if (isRecord(candidate.agentChat.providers)) {
       const providers: NonNullable<ServerSettingsPatch['agentChat']>['providers'] = {}
@@ -953,7 +983,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
     agentChat: {
       ...mergeDefined(base.agentChat, agentChatPatch),
       defaultPlugins: hasOwn(agentChatPatch, 'defaultPlugins')
-        ? normalizeTrimmedStringList(agentChatPatch?.defaultPlugins)
+        ? sanitizeAgentChatPluginPaths(agentChatPatch?.defaultPlugins)
         : base.agentChat.defaultPlugins,
       providers: mergeRecordOfObjects(base.agentChat.providers, agentChatPatch?.providers),
     },
@@ -978,6 +1008,7 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
+    agentChat: mergeDefined(defaultLocalSettings.agentChat, patch?.agentChat),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }
@@ -1016,6 +1047,14 @@ export function mergeLocalSettings(base: LocalSettingsPatch | undefined, patch: 
   }
   if (Object.keys(sidebar).length > 0) {
     next.sidebar = sidebar as LocalSettingsPatch['sidebar']
+  }
+
+  const agentChat = mergeDefined(
+    (base?.agentChat || {}) as Record<string, unknown>,
+    patch.agentChat as Record<string, unknown> | undefined,
+  )
+  if (Object.keys(agentChat).length > 0) {
+    next.agentChat = agentChat as LocalSettingsPatch['agentChat']
   }
 
   const notifications = mergeDefined(
@@ -1062,6 +1101,7 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
       ...server.agentChat,
       defaultPlugins: [...server.agentChat.defaultPlugins],
       providers: mergeRecordOfObjects(server.agentChat.providers),
+      ...local.agentChat,
     },
     extensions: {
       disabled: [...server.extensions.disabled],
@@ -1096,6 +1136,9 @@ export function extractLegacyLocalSettingsSeed(
       sidebarPatch.ignoreCodexSubagents = raw.sidebar.ignoreCodexSubagentSessions
     }
     maybeAssignNested(patch, 'sidebar', sidebarPatch)
+  }
+  if (isRecord(raw.agentChat)) {
+    maybeAssignNested(patch, 'agentChat', pickKeys(raw.agentChat, AGENT_CHAT_LOCAL_KEYS))
   }
   if (isRecord(raw.notifications)) {
     maybeAssignNested(patch, 'notifications', pickKeys(raw.notifications, ['soundEnabled']))
@@ -1137,6 +1180,15 @@ export function stripLocalSettings(
       next.sidebar = strippedSidebar
     } else {
       delete next.sidebar
+    }
+  }
+
+  if (isRecord(raw.agentChat)) {
+    const strippedAgentChat = omitKeys(raw.agentChat, AGENT_CHAT_LOCAL_KEYS)
+    if (Object.keys(strippedAgentChat).length > 0) {
+      next.agentChat = strippedAgentChat
+    } else {
+      delete next.agentChat
     }
   }
 

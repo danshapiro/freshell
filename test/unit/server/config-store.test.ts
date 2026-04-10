@@ -248,6 +248,32 @@ describe('ConfigStore', () => {
       expect(saved.settings.sidebar.excludeFirstChatMustStart).toBe(true)
     })
 
+    it('drops the removed Freshell orchestration plugin path when loading server settings', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const existingConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          agentChat: {
+            ...defaultSettings.agentChat,
+            defaultPlugins: [
+              '/home/user/code/freshell/.claude/plugins/freshell-orchestration',
+              '/custom/plugin',
+            ],
+          },
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(existingConfig, null, 2))
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.settings.agentChat.defaultPlugins).toEqual(['/custom/plugin'])
+    })
+
     it('merges existing legacyLocalSettingsSeed with moved local fields still present in settings', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       const partiallyMigratedConfig: UserConfig = {
