@@ -6,6 +6,7 @@ import TabBar from '@/components/TabBar'
 import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
+import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -128,6 +129,12 @@ function createStore(
     liveMutationSeqByTerminalId: {},
     removedMutationSeqByTerminalId: {},
   },
+  opencodeActivityState: OpencodeActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  },
 ) {
   const serverSettings = createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
@@ -139,6 +146,7 @@ function createStore(
       tabs: tabsReducer,
       codingCli: codingCliReducer,
       codexActivity: codexActivityReducer,
+      opencodeActivity: opencodeActivityReducer,
       panes: panesReducer,
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
@@ -155,6 +163,7 @@ function createStore(
         pendingRequests: {},
       },
       codexActivity: codexActivityState,
+      opencodeActivity: opencodeActivityState,
       panes: {
         layouts: {},
         activePane: {},
@@ -410,6 +419,39 @@ describe('TabBar', () => {
         .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
       expect(blueIcons).toHaveLength(0)
+    })
+
+    it('shows blue icon on the exact busy OpenCode terminal in a tab', () => {
+      const tab = createTab({
+        id: 'tab-opencode',
+        title: 'OpenCode Tab',
+        mode: 'opencode',
+        terminalId: 'term-opencode-1',
+      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-opencode' },
+        {},
+        { layouts: { 'tab-opencode': createTwoTerminalSplitLayout('term-opencode-1', 'term-opencode-2') } },
+        undefined,
+        {
+          byTerminalId: {
+            'term-opencode-1': { terminalId: 'term-opencode-1', phase: 'busy', updatedAt: 10 },
+          },
+          lastSnapshotSeq: 0,
+          liveMutationSeqByTerminalId: {},
+          removedMutationSeqByTerminalId: {},
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const tabElement = screen.getByLabelText('OpenCode Tab')
+      const icons = within(tabElement).getAllByTestId('pane-icon')
+      const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-opencode-1')
+      const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-opencode-2')
+
+      expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
+      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
     })
   })
 

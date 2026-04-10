@@ -4,6 +4,7 @@ import { logger } from './logger.js'
 
 export interface SessionMetadataEntry {
   sessionType?: string
+  derivedTitle?: string
 }
 
 interface MetadataFile {
@@ -126,7 +127,10 @@ export class SessionMetadataStore {
       if (!sessions[provider]) {
         sessions[provider] = safeRecord()
       }
-      sessions[provider][sessionId] = { ...entry }
+      sessions[provider][sessionId] = {
+        ...(sessions[provider][sessionId] ?? {}),
+        ...entry,
+      }
       await this.save({ version: 1, sessions })
     })
   }

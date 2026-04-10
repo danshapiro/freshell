@@ -10,7 +10,7 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 
 beforeAll(() => {
@@ -47,7 +47,7 @@ describe('AgentChatView perf audit milestone', () => {
           paneTitles: {},
         },
         settings: {
-          settings: {},
+          settings: { ...defaultSettings } as any,
           loaded: true,
           lastSavedAt: 0,
         },

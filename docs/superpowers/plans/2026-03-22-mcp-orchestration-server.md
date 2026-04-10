@@ -22,7 +22,7 @@ After this lands:
 - Shell-mode terminals are unaffected -- no MCP injection for plain shells.
 - The existing CLI fallback path continues to work; agents that happen to be running outside Freshell or inside the repo itself can still use the CLI via `npx tsx server/cli/index.ts`.
 - Temp MCP config files are cleaned up when terminals exit.
-- The orchestration skill SKILL.md is updated to prefer the MCP tool when available, with CLI as fallback.
+- The MCP tool instructions in `server/mcp/freshell-tool.ts` become the canonical orchestration reference, with CLI examples retained inside the tool help text.
 
 ## Contracts And Invariants
 
@@ -42,13 +42,13 @@ After this lands:
 
 8. **Dev/production detection for MCP server command.** When `process.env.NODE_ENV === 'production'`, the config uses `node <repoRoot>/dist/server/mcp/server.js`. Otherwise, it uses `node --import <repoRoot>/node_modules/tsx/dist/esm/index.mjs <repoRoot>/server/mcp/server.ts`. All paths are absolute, resolved from `import.meta.url` in `server/mcp/config-writer.ts`. The `--import` path must be absolute (not bare `tsx/esm`) because the MCP server process runs in the agent's cwd, not the repo root.
 
-9. **Dead code removal is complete.** After MCP injection replaces skill/plugin injection: `claudePluginArgs()`, `codexOrchestrationSkillArgs()`, `codexSkillsDir()`, `encodeTomlString()`, `firstExistingPath()`, `firstExistingPaths()`, and all associated constants (`DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR`, `LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR`, `DEFAULT_FRESHELL_DEMO_SKILL_DIR`, `LEGACY_FRESHELL_DEMO_SKILL_DIR`, `DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR`, `LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR`, `DEFAULT_CODEX_HOME`) are removed from `terminal-registry.ts`. The orphaned `server/spawn-spec.ts` is deleted. **`.claude/plugins/freshell-orchestration/` is NOT deleted** — it is still used by `SdkBridge` for Claude Agent SDK sessions (agent-chat panes). `SdkBridge.DEFAULT_PLUGIN_CANDIDATES` and its tests are left unchanged. The plugin directory will be replaced with MCP in a future follow-up that adds MCP support to SdkBridge sessions.
+9. **Dead code removal is complete.** After MCP injection replaces skill/plugin injection: `claudePluginArgs()`, `codexOrchestrationSkillArgs()`, `codexSkillsDir()`, `encodeTomlString()`, `firstExistingPath()`, `firstExistingPaths()`, and all associated constants (`DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR`, `LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR`, `DEFAULT_FRESHELL_DEMO_SKILL_DIR`, `LEGACY_FRESHELL_DEMO_SKILL_DIR`, `DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR`, `LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR`, `DEFAULT_CODEX_HOME`) are removed from `terminal-registry.ts`. The orphaned `server/spawn-spec.ts` is deleted. In the follow-up safe cleanup, `SdkBridge.DEFAULT_PLUGIN_CANDIDATES` is removed, the legacy orchestration plugin/skill wrapper files are deleted, and agent-chat panes rely on MCP for Freshell orchestration while still allowing explicit plugin arrays for unrelated Claude SDK bundles.
 
-10. **Test assertions update cleanly.** The existing `expectClaudeTurnCompleteArgs()` and `expectCodexTurnCompleteArgs()` test helpers in `terminal-registry.test.ts` are replaced with MCP-aware equivalents. The `freshell-orchestration-skill.test.ts` is updated to verify the new MCP tool section was added to SKILL.md (Task 7 adds MCP preference text; the test gains 2 new assertions for MCP content).
+10. **Test assertions update cleanly.** The existing `expectClaudeTurnCompleteArgs()` and `expectCodexTurnCompleteArgs()` test helpers in `terminal-registry.test.ts` are replaced with MCP-aware equivalents. The canonical orchestration docs coverage lives in `test/unit/server/mcp/freshell-tool.test.ts`; no separate standalone doc test remains.
 
 ## Root Cause Summary
 
-- **Claude Code:** `--plugin-dir` points to `.claude/plugins/freshell-orchestration/` which contains a `skills/freshell-orchestration` file that should be a symlink but is a plain text file containing `../../../skills/freshell-orchestration` (git `core.symlinks=false` on WSL).
+- **Claude Code:** `--plugin-dir` pointed at a legacy Freshell orchestration wrapper whose pointer file was brittle on WSL (`core.symlinks=false`), so plugin-based orchestration was an unreliable transport.
 - **Codex:** `-c skills.config=[{path=..., enabled=true}]` attempts TOML array-of-tables syntax via the `-c` dotted-path flag. The `-c` flag parses the value as TOML, but a TOML inline array containing inline tables with embedded paths is fragile and silently fails depending on Codex's TOML parser version.
 - **Gemini/Kimi/OpenCode:** `providerNotificationArgs()` returns `[]` for these modes -- no orchestration injection attempted at all.
 
@@ -99,16 +99,20 @@ No user decision is required.
 | `package.json` | Add `@modelcontextprotocol/sdk` dependency |
 | `server/terminal-registry.ts` | (1) Import `generateMcpInjection` and `cleanupMcpConfig` from `./mcp/config-writer.js`. (2) Thread `terminalId` and `cwd` through `buildSpawnSpec()` → `resolveCodingCliCommand()` → `providerNotificationArgs()`, where `generateMcpInjection()` is called and its args/env are merged into the existing call chain (MCP args flow through the same pipeline as notification args, correctly placed inside any shell wrapping). (3) Add `cleanupMcpConfig()` in `onExit`, `kill()`, and spawn-failure catch. (4) Remove dead code: `claudePluginArgs()`, `codexOrchestrationSkillArgs()`, `codexSkillsDir()`, `encodeTomlString()`, `firstExistingPath()`, `firstExistingPaths()`, and associated constants. (5) Update `providerNotificationArgs()` to remove plugin/skill calls (keep bell hooks). |
 | `test/unit/server/terminal-registry.test.ts` | Replace `expectClaudeTurnCompleteArgs()` and `expectCodexTurnCompleteArgs()` helpers with MCP-aware equivalents. Add test cases for Gemini, Kimi, OpenCode MCP injection. |
-| ~~`server/sdk-bridge.ts`~~ | NOT modified — SdkBridge still uses the plugin directory for agent-chat sessions. Left unchanged. |
-| `.claude/skills/freshell-orchestration/SKILL.md` | Add MCP tool preference section at top, keep CLI reference as fallback. |
+| `server/sdk-bridge.ts` | Remove the default legacy orchestration plugin fallback while preserving explicit plugin arrays, and rely on MCP for Freshell orchestration in agent-chat panes. |
+| `server/mcp/freshell-tool.ts` | Keep the canonical orchestration instructions and `help` text aligned with the `freshell` MCP surface. |
 
 ### Files to Delete
 
 | File | Reason |
 |------|--------|
 | `server/spawn-spec.ts` | Orphaned duplicate of `buildSpawnSpec()` -- nothing imports it at runtime (verified: only referenced in docs/plans). |
+| `legacy Freshell orchestration plugin wrapper` | Legacy Claude-only orchestration wrapper replaced by MCP for both terminals and agent-chat panes. |
+| `legacy Freshell orchestration wrapper` | Replaced by the canonical MCP tool instructions in `server/mcp/freshell-tool.ts`. |
+| `legacy Codex orchestration pointer` | No longer used for orchestration. |
+| `obsolete standalone orchestration doc test` | Coverage lives in `test/unit/server/mcp/freshell-tool.test.ts`. |
 
-**Note:** `.claude/plugins/freshell-orchestration/` is NOT deleted. Although it contains a broken symlink on WSL, it is still used by `SdkBridge` for Claude Agent SDK sessions. Replacing plugin-based orchestration in SdkBridge with MCP is a separate follow-up.
+**Note:** The follow-up safe cleanup removes the remaining orchestration wrapper files after `SdkBridge` stops defaulting them.
 
 ---
 
@@ -462,8 +466,8 @@ Replace the broken `providerNotificationArgs()` / `claudePluginArgs()` / `codexO
 - Modify: `server/terminal-registry.ts`
 - Modify: `test/unit/server/terminal-registry.test.ts`
 - Delete: `server/spawn-spec.ts`
-- NOT deleting: `.claude/plugins/freshell-orchestration/` (still used by SdkBridge)
-- NOT modifying: `server/sdk-bridge.ts` or `test/unit/server/sdk-bridge.test.ts` (SdkBridge plugin behavior unchanged)
+- Modify: `server/sdk-bridge.ts`
+- Modify: `test/unit/server/sdk-bridge.test.ts`
 
 - [ ] **Step 1: Update existing tests to expect MCP injection**
 
@@ -593,7 +597,7 @@ grep -r "from.*spawn-spec\|import.*spawn-spec\|require.*spawn-spec" server/ src/
 ```
 Expected: no matches
 
-**Note:** `.claude/plugins/freshell-orchestration/` is NOT deleted — still used by SdkBridge for agent-chat sessions.
+**Note:** The later safe cleanup deletes the legacy orchestration plugin wrapper after `SdkBridge` stops defaulting it.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -625,43 +629,26 @@ SdkBridge agent-chat sessions."
 
 ---
 
-### Task 7: Update Orchestration Skill Content
+### Task 7: Keep MCP Tool Instructions Canonical
 
-The SKILL.md told agents to use the CLI via `npx tsx server/cli/index.ts`. Now the MCP tool is the preferred path. Update the skill for contexts where it's still discovered natively (e.g., agents working inside the Freshell repo).
+The canonical orchestration reference now lives in `server/mcp/freshell-tool.ts`. Keep its `INSTRUCTIONS` and `HELP_TEXT` aligned with the supported MCP surface.
 
 **Files:**
-- Modify: `.claude/skills/freshell-orchestration/SKILL.md`
+- Modify: `server/mcp/freshell-tool.ts`
 
-- [ ] **Step 1: Update SKILL.md to mention MCP tool**
+- [ ] **Step 1: Update the `freshell` MCP tool instructions and help text**
 
-Add a new section after "Start state" and before "Mental model":
+Ensure the tool description, instructions, and `help` output cover:
+- preferred use of the `freshell` MCP tool
+- CLI examples only as fallback guidance
+- concrete rename examples and caller-target defaults where supported
 
-```markdown
-## MCP tool (preferred)
-
-If you have the `freshell` MCP tool available, use it directly -- it's faster and doesn't require Bash approval for each command.
-
-Quick start:
-- `freshell({action: "help"})` -- see all available commands
-- `freshell({action: "list-tabs"})` -- see open tabs
-- `freshell({action: "new-tab", params: {name: "Work", mode: "claude"}})` -- create a tab
-- `freshell({action: "send-keys", params: {target: "p1", keys: "hello\n"}})` -- send input
-
-The MCP tool accepts the same commands as the CLI below but with structured JSON input instead of positional arguments.
-
-## CLI fallback
-
-If the MCP tool is not available (e.g., running outside Freshell or in a context without MCP support), use the CLI:
-```
-
-Keep the rest of the file unchanged -- it serves as reference for the CLI fallback path and as documentation for the MCP tool's action names.
-
-- [ ] **Step 2: Verify the orchestration skill test still passes**
+- [ ] **Step 2: Verify the canonical MCP help/instruction test still passes**
 
 ```bash
-npm run test:vitest -- --run test/unit/server/freshell-orchestration-skill.test.ts
+npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/mcp/freshell-tool.test.ts
 ```
-Expected: PASS (this test checks for specific content in the SKILL.md)
+Expected: PASS
 
 - [ ] **Step 3: Run full test suite one final time**
 
@@ -673,8 +660,8 @@ Expected: Typecheck + all tests pass
 - [ ] **Step 4: Commit**
 
 ```bash
-git add .claude/skills/freshell-orchestration/SKILL.md
-git commit -m "docs: update orchestration skill to prefer MCP tool over CLI"
+git add server/mcp/freshell-tool.ts test/unit/server/mcp/freshell-tool.test.ts
+git commit -m "docs: keep freshell MCP tool instructions canonical"
 ```
 
 ---

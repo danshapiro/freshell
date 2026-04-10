@@ -3,6 +3,7 @@ import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatComposer from '../../../../../src/components/agent-chat/ChatComposer'
 import { getDraft, clearDraft } from '@/lib/draft-store'
+import { clearHistory } from '@/lib/input-history-store'
 
 const mockDispatch = vi.fn()
 vi.mock('@/store/hooks', () => ({
@@ -25,6 +26,9 @@ describe('ChatComposer', () => {
     clearDraft('test-pane')
     clearDraft('pane-a')
     clearDraft('pane-b')
+    clearHistory('test-pane')
+    clearHistory('pane-a')
+    clearHistory('pane-b')
     mockDispatch.mockClear()
   })
   it('renders textarea and send button', () => {
@@ -266,6 +270,108 @@ describe('ChatComposer', () => {
       fireEvent.keyDown(textarea, { code: 'BracketRight', ctrlKey: false, shiftKey: true })
       fireEvent.keyDown(textarea, { code: 'BracketLeft', ctrlKey: true, shiftKey: false })
       expect(mockDispatch).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('input history navigation', () => {
+    afterEach(() => {
+      clearHistory('test-pane')
+    })
+
+    it('ArrowUp on empty input navigates to previous history entry', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'first message{Enter}')
+      await user.type(textarea, 'second message{Enter}')
+      await user.click(textarea)
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('second message')
+    })
+
+    it('ArrowUp navigates through multiple entries', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'first{Enter}')
+      await user.type(textarea, 'second{Enter}')
+      await user.click(textarea)
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('second')
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('first')
+    })
+
+    it('ArrowDown restores draft after navigating up', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'history entry{Enter}')
+      await user.type(textarea, 'my draft')
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('history entry')
+      fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+      expect(textarea).toHaveValue('my draft')
+    })
+
+    it('ArrowDown at bottom position does nothing', async () => {
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+      fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+      expect(textarea).toHaveValue('')
+    })
+
+    it('ArrowUp does not navigate when cursor is not on first line', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'history entry{Enter}')
+      await user.type(textarea, 'line1{Shift>}{Enter}{/Shift}')
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('line1\n')
+    })
+
+    it('ArrowDown does not navigate when cursor is not on last line', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'history entry{Enter}')
+      await user.type(textarea, 'line1{Shift>}{Enter}{/Shift}line2')
+      fireEvent.keyDown(textarea, { key: 'ArrowDown' })
+      expect(textarea).toHaveValue('line1\nline2')
+    })
+
+    it('sends add to history and can be recalled', async () => {
+      const onSend = vi.fn()
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={onSend} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+
+      await user.type(textarea, 'sent message{Enter}')
+      expect(onSend).toHaveBeenCalledWith('sent message')
+      expect(textarea).toHaveValue('')
+
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('sent message')
+    })
+
+    it('history is independent per pane', async () => {
+      const user = userEvent.setup()
+      const { unmount } = render(
+        <ChatComposer paneId="pane-a" onSend={() => {}} onInterrupt={() => {}} />
+      )
+      await user.type(screen.getByRole('textbox'), 'pane-a message{Enter}')
+      unmount()
+
+      render(<ChatComposer paneId="pane-b" onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+      fireEvent.keyDown(textarea, { key: 'ArrowUp' })
+      expect(textarea).toHaveValue('')
     })
   })
 })

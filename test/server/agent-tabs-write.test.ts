@@ -51,6 +51,36 @@ describe('tab endpoints', () => {
     expect(layoutStore.attachPaneContent).toHaveBeenCalled()
   })
 
+  it('allocates and passes an OpenCode control endpoint when creating an opencode tab', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: () => {},
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler: { broadcastUiCommand: () => {} } }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'opencode', name: 'OpenCode' })
+
+    expect(res.body.status).toBe('ok')
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'opencode',
+      providerSettings: expect.objectContaining({
+        opencodeServer: {
+          hostname: '127.0.0.1',
+          port: expect.any(Number),
+        },
+      }),
+    }))
+  })
+
   it('rejects blank tab rename payloads', async () => {
     const app = express()
     app.use(express.json())

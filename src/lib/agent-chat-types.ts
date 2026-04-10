@@ -17,10 +17,6 @@ export interface AgentChatProviderConfig {
   defaultPermissionMode: string
   /** Default effort level */
   defaultEffort: 'low' | 'medium' | 'high' | 'max'
-  /** Default display settings */
-  defaultShowThinking: boolean
-  defaultShowTools: boolean
-  defaultShowTimecodes: boolean
   /** Which settings are visible in the settings popover */
   settingsVisibility: {
     model: boolean

@@ -17,9 +17,6 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: 'high',
-    defaultShowThinking: true,
-    defaultShowTools: true,
-    defaultShowTimecodes: false,
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -38,9 +35,6 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
     defaultEffort: 'high',
-    defaultShowThinking: true,
-    defaultShowTools: true,
-    defaultShowTimecodes: false,
     settingsVisibility: {
       model: true,
       permissionMode: true,

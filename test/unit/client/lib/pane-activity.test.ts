@@ -23,6 +23,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {
         'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
       },
+      opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     })).toMatchObject({ isBusy: true, source: 'codex' })
@@ -35,6 +36,7 @@ describe('pane activity', () => {
       codexActivityByTerminalId: {
         'term-live': { terminalId: 'term-live', phase: 'pending', updatedAt: 10 },
       },
+      opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {},
     }).isBusy).toBe(false)
@@ -45,6 +47,43 @@ describe('pane activity', () => {
       tabTerminalId: undefined,
       isOnlyPane: false,
       codexActivityByTerminalId: {
+        'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
+      },
+      opencodeActivityByTerminalId: {},
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    }).isBusy).toBe(false)
+  })
+
+  it('keeps OpenCode exact-match semantics and only treats live terminal matches as busy', () => {
+    const content: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-opencode',
+      status: 'running',
+      mode: 'opencode',
+      terminalId: 'term-live',
+      shell: 'system',
+      resumeSessionId: 'session-opencode',
+    }
+
+    expect(resolvePaneActivity({
+      paneId: 'pane-1',
+      content,
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {
+        'term-live': { terminalId: 'term-live', phase: 'busy', updatedAt: 10 },
+      },
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    })).toMatchObject({ isBusy: true, source: 'opencode' })
+
+    expect(resolvePaneActivity({
+      paneId: 'pane-1',
+      content: { ...content, terminalId: undefined },
+      isOnlyPane: true,
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {
         'term-foreign': { terminalId: 'term-foreign', phase: 'busy', updatedAt: 10 },
       },
       paneRuntimeActivityByPaneId: {},
@@ -111,6 +150,7 @@ describe('pane activity', () => {
       tabs,
       paneLayouts,
       codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {
         'pane-claude': {
           source: 'terminal',
@@ -171,6 +211,7 @@ describe('pane activity', () => {
         },
       },
       codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {
         'sdk-restore-1': {
@@ -222,6 +263,7 @@ describe('pane activity', () => {
         },
       },
       codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {},
       paneRuntimeActivityByPaneId: {},
       agentChatSessions: {
         'sdk-restore-2': {
@@ -244,5 +286,52 @@ describe('pane activity', () => {
     })
 
     expect(busySessionKeys).toEqual(['claude:00000000-0000-4000-8000-000000000321'])
+  })
+
+  it('collects busy session keys from OpenCode terminals using exact terminal matches', () => {
+    const sessionId = '33333333-3333-4333-8333-333333333333'
+    const busySessionKeys = collectBusySessionKeys({
+      tabs: [
+        {
+          id: 'tab-opencode',
+          title: 'OpenCode',
+          createRequestId: 'req-opencode',
+          status: 'running',
+          mode: 'opencode',
+          shell: 'system',
+          createdAt: 1,
+          terminalId: 'term-live',
+          resumeSessionId: sessionId,
+        },
+      ],
+      paneLayouts: {
+        'tab-opencode': {
+          type: 'leaf',
+          id: 'pane-opencode',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-opencode',
+            status: 'running',
+            mode: 'opencode',
+            shell: 'system',
+            terminalId: 'term-live',
+            resumeSessionId: sessionId,
+          },
+        },
+      },
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {
+        'term-live': {
+          terminalId: 'term-live',
+          sessionId,
+          phase: 'busy',
+          updatedAt: 1,
+        },
+      },
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    })
+
+    expect(busySessionKeys).toEqual([`opencode:${sessionId}`])
   })
 })
