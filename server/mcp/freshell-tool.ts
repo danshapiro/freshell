@@ -534,7 +534,7 @@ async function routeAction(
         ? params.target
         : undefined
       const { tab } = await resolveTabTarget(target)
-      if (!tab) return { error: `Tab '${target}' not found`, hint: "Run action 'list-tabs' to see available tabs." }
+      if (!tab) return { error: target ? `Tab '${target}' not found` : 'No active tab found', hint: "Run action 'list-tabs' to see available tabs." }
       return c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name })
     }
     case 'has-tab': {
@@ -582,7 +582,7 @@ async function routeAction(
         ? params.target
         : undefined
       const { pane } = await resolvePaneTarget(target)
-      if (!pane) return { error: `Pane '${target}' not found`, hint: "Run action 'list-panes' to see available panes." }
+      if (!pane) return { error: target ? `Pane '${target}' not found` : 'No active pane found', hint: "Run action 'list-panes' to see available panes." }
       return c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name })
     }
     case 'kill-pane': {

@@ -1,5 +1,5 @@
 function normalizePluginPath(value: string): string {
-  return value.replace(/\\/g, '/').replace(/\/+/g, '/').trim().toLowerCase()
+  return value.replace(/\\/g, '/').replace(/\/+/g, '/').trim()
 }
 
 export function isLegacyFreshellOrchestrationPluginPath(value: string): boolean {
