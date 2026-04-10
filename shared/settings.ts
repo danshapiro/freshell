@@ -651,7 +651,7 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
       autoKillIdleMinutes: 180,
     },
     terminal: {
-      scrollback: 5000,
+      scrollback: 10000,
     },
     panes: {
       defaultNewPane: 'ask',

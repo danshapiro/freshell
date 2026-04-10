@@ -78,6 +78,7 @@ vi.mock('@xterm/xterm', () => {
     attachCustomKeyEventHandler = vi.fn((handler: (event: KeyboardEvent) => boolean) => {
       capturedKeyHandler = handler
     })
+    attachCustomWheelEventHandler = vi.fn()
     getSelection = vi.fn(() => 'selected text')
     focus = vi.fn()
 
