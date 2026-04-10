@@ -25,10 +25,10 @@ import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
-const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
+const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
 const MIN_SCROLLBACK_CHARS = 64 * 1024
-const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
-const APPROX_CHARS_PER_LINE = 200
+const MAX_SCROLLBACK_CHARS = 4 * 1024 * 1024
+const APPROX_CHARS_PER_LINE = 300
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE_OUTPUT_FLUSH_MS || 40)

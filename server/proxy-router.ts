@@ -206,6 +206,9 @@ export function attachProxyUpgradeHandler(server: http.Server): void {
 
     proxySocket.on('error', (err) => {
       log.warn({ err, targetPort, path: targetPath }, 'WebSocket proxy connection failed')
+      if (socket.writable) {
+        socket.write('HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\nExtension server on port ' + targetPort + ' is unavailable\r\n')
+      }
       socket.destroy()
     })
 
