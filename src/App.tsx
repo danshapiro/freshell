@@ -708,22 +708,24 @@ export default function App() {
         if (!msg?.type) return
         if (msg.type === 'ready') {
           const ready = ReadyMessageSchema.safeParse(msg)
+          const nextServerInstanceId = ready.success ? ready.data.serverInstanceId : undefined
           if (
             ready.success &&
             lastReadyServerInstanceId &&
-            lastReadyServerInstanceId !== ready.data.serverInstanceId
+            lastReadyServerInstanceId !== nextServerInstanceId
           ) {
             platformCapabilitiesLoaded = false
+            dispatch(setRegistry([]))
           }
           if (ready.success) {
-            lastReadyServerInstanceId = ready.data.serverInstanceId
+            lastReadyServerInstanceId = nextServerInstanceId
           }
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
-          dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
+          dispatch(setServerInstanceId(nextServerInstanceId))
           const newBootId = ready.success ? ready.data.bootId : undefined
           const previousBootId = appStore.getState().connection.bootId
           const serverRestarted = !!previousBootId && previousBootId !== newBootId
@@ -891,6 +893,14 @@ export default function App() {
       // sidebar snapshot. The HTTP bootstrap window remains the source of truth.
       if (ws.isReady) {
         if (cancelled) return
+        const previousServerInstanceId = appStore.getState().connection.serverInstanceId
+        if (
+          previousServerInstanceId &&
+          ws.serverInstanceId &&
+          previousServerInstanceId !== ws.serverInstanceId
+        ) {
+          dispatch(setRegistry([]))
+        }
         lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
         dispatch(setError(undefined))
