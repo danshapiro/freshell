@@ -50,17 +50,26 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
 
+## Choosing the right action
+
+- **split-pane vs new-tab:** When the user says "pane", "split", "alongside", "next to", or "side by side", use split-pane. Use new-tab only when the user explicitly says "tab", "window", or "new [thing]" with no spatial reference. When unsure, split-pane is the safer default -- it keeps work in one tab.
+- **Prefer specialized pane types:** Do NOT open a terminal to run cat/vim/nano/curl/wget when a dedicated pane type is a better fit.
+  - "open/edit/show a file" -> split-pane({ editor: "/absolute/path" }) or new-tab({ editor: "/absolute/path" })
+  - "open/show a URL" or "view a webpage" -> split-pane({ browser: "https://..." }) or open-browser({ url: "https://..." })
+  - "run a command" or "use a CLI tool" -> split-pane({ mode: "shell" }) or new-tab({ mode: "shell" })
+- **Sending text:** Always use literal: true with send-keys for natural-language prompts or multi-word text. Token mode (default) treats special words like ENTER as control sequences and mangles prose. Do NOT append the word "ENTER" as literal text -- use keys: ["ENTER"] as a separate send-keys call instead.
+
 ## Targets
 
 - Tab target: tab ID or exact tab title.
-- Pane target: pane ID, numeric pane index (scoped to active tab), or pane title.
+- Pane target: pane ID, numeric pane index (scoped to caller's tab), or pane title.
 - Omitted target defaults to the caller's own tab and pane (where the MCP server was spawned), NOT the user's active viewport. This means split-pane without a target splits your own pane, not whatever the user is looking at.
 - If a target is ambiguous (e.g. duplicate pane titles), the error returns the specific pane IDs to use.
 - If target resolution fails, run list-tabs / list-panes and retry with explicit IDs.
 
 ## Key gotchas
 
-- Use literal mode for natural-language prompts: { keys: "your prompt text", literal: true }. Token mode (default) translates special tokens like ENTER/C-C but mangles prose.
+- send-keys: use literal mode (literal: true + keys as a string) for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text -- send the command with literal:true, then send ["ENTER"] as a separate call in token mode.
 - wait-for with stable (seconds of no output) is more reliable than pattern matching across different CLI providers.
 - Editor panes show "Loading..." until the tab is visited in the browser. When screenshotting multiple tabs, visit each tab first (select-tab), then loop back for screenshots.
 - Browser pane screenshots: proxied localhost URLs render actual content in the iframe. Truly cross-origin URLs (e.g. https://example.com) render a placeholder with the source URL instead of a blank region.
@@ -304,6 +313,23 @@ function validateParams(action: string, params: Record<string, unknown> | undefi
 
 const HELP_TEXT = `Freshell MCP tool -- full reference
 
+## Decision guide: which action and pane type to use
+
+User says...                  | Action                | Key param
+────────────────────────────────────────────────────────────────────────
+"open a pane / split"         | split-pane            | (no target = split your own pane)
+"open a tab / window"         | new-tab               |
+"open/edit/show a file"       | split-pane            | editor: "/absolute/path"
+"open/show a URL"             | split-pane            | browser: "https://..."
+"view a webpage (new tab)"    | open-browser          | url: "https://..."
+"run a command"               | split-pane            | mode: "shell"
+"open alongside / next to"    | split-pane            | (not new-tab)
+
+Rules:
+- split-pane is the default. Use new-tab only when the user explicitly says "tab" or "window".
+- Prefer specialized pane types (editor, browser) over terminals with cat/vim/curl.
+- Do NOT append "ENTER" as literal text. Send the command text with literal:true, then ["ENTER"] separately.
+
 ## Command reference
 
 Tab commands:
@@ -321,8 +347,8 @@ Tab commands:
   prev-tab        Switch to the previous tab.
 
 Pane commands:
-  split-pane      Split a pane. Params: target?, direction (horizontal|vertical), mode?, shell?, cwd?, browser?, editor?
-                  Omit target to split the active pane. Returns { paneId, tabId }.
+  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?
+                  Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
   kill-pane       Close a pane. Params: target
@@ -392,8 +418,8 @@ Meta:
   p0 = seed.data.paneId
 
   p1 = freshell({ action: "split-pane", params: { target: p0, mode: "claude", cwd: "/path/to/repo" } }).data.paneId
-  p2 = freshell({ action: "split-pane", params: { target: p0, direction: "vertical", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
-  p3 = freshell({ action: "split-pane", params: { target: p1, direction: "vertical", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
+  p2 = freshell({ action: "split-pane", params: { target: p0, direction: "horizontal", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
+  p3 = freshell({ action: "split-pane", params: { target: p1, direction: "horizontal", mode: "claude", cwd: "/path/to/repo" } }).data.paneId
 
   // Send same prompt to all 4 panes, wait, capture
   for each paneId in [p0, p1, p2, p3]:
@@ -405,11 +431,11 @@ Meta:
 
 ## Playbook: open file in editor pane
 
-  // New tab with editor
-  freshell({ action: "new-tab", params: { name: "Edit README", editor: "/absolute/path/to/README.md" } })
+  // Split current pane with editor (preferred)
+  freshell({ action: "split-pane", params: { editor: "/absolute/path/to/README.md" } })
 
-  // Or split an existing pane
-  freshell({ action: "split-pane", params: { editor: "/absolute/path/to/file.ts" } })
+  // Or new tab with editor
+  freshell({ action: "new-tab", params: { name: "Edit README", editor: "/absolute/path/to/README.md" } })
 
 ## Playbook: create, split, and rename without manual UI interaction
 
@@ -425,7 +451,10 @@ Meta:
 
 ## Playbook: open a URL in a browser pane
 
-  // Open a URL in a new browser tab (correct way)
+  // Split current pane with browser (preferred for "open alongside")
+  freshell({ action: "split-pane", params: { browser: "https://example.com" } })
+
+  // Or open a URL in a new browser tab
   freshell({ action: "open-browser", params: { url: "https://example.com", name: "My Page" } })
 
   // Navigate an existing browser pane to a different URL
@@ -442,6 +471,7 @@ Meta:
 ## Gotchas
 
 - Always use literal: true with send-keys for natural-language prompts or multi-word text.
+- Do NOT write "ENTER" as literal text in a keys string. Use literal:true for the command, then send ["ENTER"] as a separate call in token mode.
 - wait-for with stable (seconds of no output) is usually more reliable than pattern matching across different CLI providers.
 - Freshell has a 50 PTY limit. Scripted runs accumulate orphan terminals silently. Use list-terminals and clean up with kill-tab/kill-pane.
 - Picker panes are transient -- a new tab without mode/browser/editor starts as a picker. Always specify mode/browser/editor to get a usable pane immediately.
@@ -549,15 +579,9 @@ async function routeAction(
     // -- Pane actions --
     case 'split-pane': {
       const rawTarget = params?.target as string | undefined
-      let paneId: string
-      if (rawTarget) {
-        paneId = rawTarget
-      } else {
-        // Resolve to active pane (same fallback as CLI)
-        const resolved = await resolvePaneTarget(undefined)
-        if (!resolved.pane) return { error: 'No active pane found', hint: "Run action 'list-panes' to see available panes." }
-        paneId = resolved.pane.id
-      }
+      const resolved = await resolvePaneTarget(rawTarget)
+      if (!resolved.pane) return { error: resolved.message || 'No pane found', hint: "Run action 'list-panes' to see available panes." }
+      const paneId = resolved.pane.id
       const { direction, browser, editor, mode, shell, cwd, target: _t, ...rest } = params || {}
       return c.post(`/api/panes/${encodeURIComponent(paneId)}/split`, {
         direction, browser, editor, mode, shell, cwd, ...rest,

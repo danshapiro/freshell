@@ -1,0 +1,227 @@
+---
+name: freshell-orchestration
+description: "Use when interacting with Freshell panes, panels, or tabs from the CLI for tmux-style automation and multi-pane workflows, outside external-browser automation tasks."
+---
+
+# Freshell tmux-style automation
+
+## Start state
+
+Freshell injects `FRESHELL_URL` and `FRESHELL_TOKEN` into every spawned terminal. They are already set in your environment.
+
+## MCP tool (preferred)
+
+If you have the `freshell` MCP tool available, use it directly -- it's faster and doesn't require Bash approval for each command.
+
+Quick start:
+- `freshell({action: "help"})` -- see all available commands
+- `freshell({action: "list-tabs"})` -- see open tabs
+- `freshell({action: "new-tab", params: {name: "Work", mode: "claude"}})` -- create a tab
+- `freshell({action: "send-keys", params: {target: "p1", keys: "hello\n"}})` -- send input
+
+The MCP tool accepts the same commands as the CLI below but with structured JSON input instead of positional arguments.
+
+## CLI fallback
+
+If the MCP tool is not available (e.g., running outside Freshell or in a context without MCP support), use the CLI:
+
+```bash
+FSH="npx tsx server/cli/index.ts"
+$FSH health
+```
+
+Use absolute paths for `--cwd` and `--editor`.
+
+## Mental model
+
+- Freshell CLI is an HTTP client over `/api/*`, not a local tmux socket client.
+- Tabs and pane trees live in `layoutStore`.
+- Terminal lifecycle + scrollback live in `terminalRegistry`.
+- Pane kinds: `terminal`, `editor`, `browser`, `agent-chat` (Claude/Codex), `picker` (transient).
+- **Picker panes are ephemeral.** A freshly-created tab without `--mode`/`--browser`/`--editor` starts as a `picker` pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a `picker` pane for splits or other mutations — wait until it resolves to its final kind, or use `--mode`/`--browser`/`--editor` flags on `new-tab`/`split-pane` to skip the picker entirely.
+- Typical loop: `new-tab/split-pane` -> `send-keys` -> `wait-for` -> `capture-pane`/`screenshot-*`.
+
+## Choosing the right action and pane type
+
+- **split-pane vs new-tab:** When the user says "pane", "split", "alongside", "next to", or "side by side", use `split-pane`. Use `new-tab` only when the user explicitly says "tab", "window", or "new [thing]" with no spatial reference. When unsure, `split-pane` is the safer default.
+- **Prefer specialized pane types:** Do NOT open a terminal to run `cat`/`vim`/`nano`/`curl`/`wget` when a dedicated pane type fits.
+  - "open/edit/show a file" -> `split-pane --editor /path/to/file`
+  - "open/show a URL" or "view a webpage" -> `split-pane --browser URL` or `open-browser URL`
+  - "run a command" or "use a CLI tool" -> `split-pane --mode shell` or `new-tab --mode shell`
+- **Sending text:** Use `send-keys -l` for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text — send the command with `-l`, then send `ENTER` as a separate call.
+- **Default targeting (MCP only):** When no target is specified, the MCP tool resolves to your own pane/tab (set by `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`), not the user's active viewport. `split-pane` without a target splits your own pane.
+- **Default direction:** `split-pane` defaults to vertical (top/bottom). Use `-h` for horizontal (left/right).
+
+## Command reference
+
+Output behavior:
+- Most commands print JSON.
+- `list-tabs` and `list-panes` print TSV unless `--json`.
+- `list-panes --titles` appends a fifth TSV column with the pane title.
+- `capture-pane` and `display` print plain text.
+
+Targets:
+- Tab target: tab ID or exact tab title.
+- Pane target: pane ID, pane index in active tab, or `tabRef.paneIndex`.
+- Omitted target on `rename-tab` means the active tab.
+- Omitted target on `rename-pane` means the active pane in the active tab.
+- Omitted target on `split-pane` (MCP) means your own pane, not the user's active viewport.
+- Omitted target falls back to active pane in active tab when command supports it (CLI only).
+- If a target or name contains spaces, quote it.
+- Use the flagged `-t/-n` form when you want to make the target and name explicit.
+
+Tab commands:
+- `new-tab [-n NAME] [--claude|--codex|--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE] [--resume SESSION_ID] [--prompt TEXT]`
+- `list-tabs [--json]`
+- `select-tab [TARGET]` or `select-tab -t TARGET`
+- `kill-tab [TARGET]` or `kill-tab -t TARGET`
+- `rename-tab NEW_NAME` - rename the active tab
+- `rename-tab TARGET NEW_NAME`
+- `rename-tab -t TARGET -n NEW_NAME`
+- `has-tab TARGET` or `has-tab -t TARGET`
+- `next-tab`
+- `prev-tab`
+
+Pane/layout commands:
+- `split-pane [-t PANE_TARGET] [-h] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]`
+- `list-panes [-t TAB_TARGET] [--json] [--titles]`
+- `select-pane PANE_TARGET` or `select-pane -t PANE_TARGET`
+- `rename-pane NEW_NAME` - rename the active pane
+- `rename-pane TARGET NEW_NAME`
+- `rename-pane -t TARGET -n NEW_NAME`
+- `kill-pane PANE_TARGET` or `kill-pane -t PANE_TARGET`
+- `resize-pane PANE_TARGET [--x X_PCT] [--y Y_PCT]`
+- `swap-pane PANE_TARGET --other OTHER_PANE_TARGET`
+- `respawn-pane PANE_TARGET [--mode MODE] [--shell SHELL] [--cwd DIR]`
+- `attach TERMINAL_ID [PANE_TARGET]` or `attach -t TERMINAL_ID -p PANE_TARGET`
+
+Terminal interaction:
+- `send-keys [-t PANE_TARGET] [-l] KEYS...`
+- `capture-pane [-t PANE_TARGET] [-S START] [-J] [-e]`
+- `wait-for [-t PANE_TARGET] [-p PATTERN] [--stable SECONDS] [--exit] [--prompt] [-T TIMEOUT_SECONDS]`
+- `display -p FORMAT [-t PANE_TARGET]` or `display FORMAT [PANE_TARGET]`
+- `run [--capture|-c] [--detach|-d] [-T TIMEOUT_SECONDS] [-n NAME] [--cwd DIR] COMMAND...`
+- `summarize PANE_TARGET` or `summarize -t PANE_TARGET`
+- `list-terminals`
+
+Browser/navigation:
+- `open-browser URL [-n NAME]`
+- `navigate URL [PANE_TARGET]` or `navigate --url URL -t PANE_TARGET`
+
+Screenshot commands:
+- `screenshot --scope pane|tab|view --name NAME [--path DIR_OR_FILE] [--overwrite] [-t TARGET]`
+- Aliases:
+  - `screenshot-pane -t PANE_TARGET --name NAME [--path ...] [--overwrite]`
+  - `screenshot-tab -t TAB_TARGET --name NAME [--path ...] [--overwrite]`
+  - `screenshot-view --name NAME [--path ...] [--overwrite]`
+- `--name` is required.
+- `--path` is optional; default output root is OS temp dir.
+- Pane/tab scopes resolve target before capture; view scope captures current app viewport.
+
+Session/service:
+- `list-sessions`
+- `search-sessions QUERY` or `search-sessions -q QUERY`
+- `health`
+- `lan-info`
+
+tmux-style aliases:
+- `new-window`, `new-session` -> `new-tab`
+- `list-windows` -> `list-tabs`
+- `select-window` -> `select-tab`
+- `kill-window` -> `kill-tab`
+- `rename-window` -> `rename-tab`
+- `next-window` -> `next-tab`
+- `previous-window`, `prev-window` -> `prev-tab`
+- `split-window` -> `split-pane`
+- `display-message` -> `display`
+- `screenshot-pane`, `screenshot-tab`, `screenshot-view` -> `screenshot`
+
+## tmux differences
+
+- Transport/auth: tmux uses local socket; Freshell uses HTTP API + token auth.
+- Pane types: tmux terminal-only; Freshell supports terminal/editor/browser.
+- Target model: tmux session/window/pane grammar vs Freshell ID/title/index resolution.
+- Runtime model: tmux TTY-local; Freshell browser-first and remote-friendly.
+- Feature model: Freshell adds session indexing/search and AI summary workflows.
+
+## Playbook: open file in editor pane
+
+New tab:
+
+```bash
+FILE="/absolute/path/to/file.ts"
+$FSH new-tab -n "Edit $(basename "$FILE")" --editor "$FILE"
+```
+
+Split current tab:
+
+```bash
+FILE="/absolute/path/to/file.ts"
+$FSH split-pane --editor "$FILE"
+```
+
+## Playbook: create, split, and rename without UI interaction
+
+```bash
+FSH="npx tsx server/cli/index.ts"
+CWD="/absolute/path/to/repo"
+FILE="/absolute/path/to/repo/README.md"
+
+WS="$($FSH new-tab -n 'Triager' --codex --cwd "$CWD")"
+TAB_ID="$(printf '%s' "$WS" | jq -r '.data.tabId')"
+P0="$(printf '%s' "$WS" | jq -r '.data.paneId')"
+P1="$($FSH split-pane -t "$P0" --editor "$FILE" | jq -r '.data.paneId')"
+
+$FSH rename-tab -t "$TAB_ID" -n "Issue 166 work"
+$FSH rename-pane -t "$P0" -n "Codex"
+$FSH select-pane -t "$P1"
+$FSH rename-pane "Editor"
+```
+
+## Playbook: parallel Claude panes
+
+```bash
+FSH="npx tsx server/cli/index.ts"
+CWD="/absolute/path/to/repo"
+PROMPT="Implement <task>. Run tests. Summarize tradeoffs."
+
+SEED_JSON="$($FSH new-tab -n 'Claude x4 Eval' --claude --cwd "$CWD")"
+P0="$(printf '%s' "$SEED_JSON" | jq -r '.data.paneId')"
+J1="$($FSH split-pane -t "$P0" --mode claude --cwd "$CWD")"
+P1="$(printf '%s' "$J1" | jq -r '.data.paneId')"
+J2="$($FSH split-pane -t "$P0" -h --mode claude --cwd "$CWD")"
+P2="$(printf '%s' "$J2" | jq -r '.data.paneId')"
+J3="$($FSH split-pane -t "$P1" -h --mode claude --cwd "$CWD")"
+P3="$(printf '%s' "$J3" | jq -r '.data.paneId')"
+
+for p in "$P0" "$P1" "$P2" "$P3"; do
+  $FSH send-keys -t "$p" -l "$PROMPT"
+  $FSH send-keys -t "$p" ENTER
+  $FSH wait-for -t "$p" --stable 8 -T 1800
+  $FSH capture-pane -t "$p" -S -120 > "/tmp/${p}.txt"
+done
+```
+
+## Screenshot-specific guidance
+
+- Use a dedicated canary tab when validating screenshot behavior so live project panes are not contaminated.
+- Close temporary tabs/panes after verification unless user asked to keep them open.
+- Browser panes:
+  - Same-origin iframe content is captured best-effort.
+  - If iframe content is not capturable (for example cross-origin/security), screenshots intentionally render a placeholder message with source URL context instead of a silent blank region.
+  - For assertions, allow either explicit page content or the explicit non-capturable placeholder text depending on origin/security context.
+
+## REST API patterns
+
+- Auth header: `x-auth-token: <TOKEN>` (not Bearer).
+- `POST /api/tabs` with `{ name, mode: "shell", shell: "wsl", cwd }` creates a tab with a terminal, bypassing the picker.
+- `POST /api/panes/:id/split` with `{ direction: "horizontal"|"vertical", browser?, editor?, mode?, cwd? }` — defaults to vertical; always 50/50.
+- `POST /api/panes/:id/resize` with `{ sizes: [left, right] }` (percentages summing to 100) — call immediately after split to fix proportions.
+- Editor panes show "Loading..." until visited. When screenshotting multiple tabs, visit each tab once first to trigger editor loading, then loop back for screenshots.
+- `DELETE /api/terminals/:id` removes orphaned terminals. Freshell has a 50 PTY limit; orphans from scripted runs accumulate silently.
+
+## Gotchas
+
+- Use `send-keys -l` for natural-language prompts.
+- `wait-for --stable` is usually more reliable than prompt heuristics across providers.
+- If target resolution fails, run `list-tabs` and `list-panes --json`, then retry with explicit IDs.
