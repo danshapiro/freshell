@@ -112,6 +112,14 @@ export function createAgentApiRouter({
 }) {
   const router = Router()
 
+  const broadcastReplayableUiCommand = (command: { command: string; payload?: any }) => {
+    if (typeof wsHandler?.broadcastUiCommandWithReplay === 'function') {
+      wsHandler.broadcastUiCommandWithReplay(command)
+      return
+    }
+    wsHandler?.broadcastUiCommand?.(command)
+  }
+
   const resolvePaneTarget = (raw: string) => {
     if (layoutStore.resolveTarget) {
       const resolved = layoutStore.resolveTarget(raw)
@@ -336,6 +344,62 @@ export function createAgentApiRouter({
     const tabs = layoutStore.listTabs?.() || []
     const activeTabId = layoutStore.getActiveTabId?.() || null
     res.json(ok({ tabs, activeTabId }))
+  })
+
+  router.post('/terminals/:id/open', (req, res) => {
+    const terminalId = typeof req.params.id === 'string' ? req.params.id.trim() : ''
+    if (!terminalId) return res.status(400).json(fail('terminal id required'))
+    const term = registry.get?.(terminalId)
+    if (!term) return res.status(404).json(fail('terminal not found'))
+
+    const existing = layoutStore.findPaneByTerminalId?.(terminalId)
+    if (existing?.tabId && existing?.paneId) {
+      const result = layoutStore.selectPane?.(existing.tabId, existing.paneId) || existing
+      const paneId = result?.paneId || existing.paneId
+      const tabId = result?.tabId || existing.tabId
+      if (tabId && paneId) {
+        broadcastReplayableUiCommand({
+          command: 'tab.select',
+          payload: { id: tabId },
+        })
+        broadcastReplayableUiCommand({
+          command: 'pane.select',
+          payload: { tabId, paneId },
+        })
+      }
+      return res.json(ok({ tabId, paneId, terminalId, reused: true }, result?.message || 'terminal selected'))
+    }
+
+    if (!layoutStore.createTab || !layoutStore.attachPaneContent) {
+      return res.status(503).json(fail('layout store does not support terminal attach'))
+    }
+
+    const title = parseRequiredName(req.body?.name) || term.title || terminalId
+    const { tabId, paneId } = layoutStore.createTab({ title })
+    const paneContent = {
+      kind: 'terminal',
+      terminalId,
+      status: term.status || 'running',
+      mode: term.mode || 'shell',
+      initialCwd: term.cwd,
+      resumeSessionId: term.resumeSessionId,
+    }
+    layoutStore.attachPaneContent(tabId, paneId, paneContent)
+    broadcastReplayableUiCommand({
+      command: 'tab.create',
+      payload: {
+        id: tabId,
+        title,
+        mode: term.mode || 'shell',
+        terminalId,
+        initialCwd: term.cwd,
+        resumeSessionId: term.resumeSessionId,
+        paneId,
+        paneContent,
+        status: term.status || 'running',
+      },
+    })
+    res.json(ok({ tabId, paneId, terminalId, reused: false }, 'terminal opened'))
   })
 
   router.get('/panes', (req, res) => {

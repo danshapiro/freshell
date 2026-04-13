@@ -335,6 +335,10 @@ type PendingScreenshot = {
 }
 
 type ScreenshotErrorCode = 'NO_SCREENSHOT_CLIENT' | 'SCREENSHOT_TIMEOUT' | 'SCREENSHOT_CONNECTION_CLOSED'
+type UiCommand = { command: string; payload?: any }
+type PendingUiCommand = { command: UiCommand; expiresAt: number }
+const UI_COMMAND_REPLAY_TTL_MS = 15_000
+const UI_COMMAND_RECENT_CONNECTION_MS = 3_000
 
 function createScreenshotError(code: ScreenshotErrorCode, message: string): Error & { code: ScreenshotErrorCode } {
   const err = new Error(message) as Error & { code: ScreenshotErrorCode }
@@ -366,6 +370,7 @@ export class WsHandler {
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
+  private pendingUiCommands: PendingUiCommand[] = []
   private sessionsRevision = 0
   private terminalsRevision = 0
 
@@ -1359,6 +1364,7 @@ export class WsHandler {
           bootId: this.bootId,
         })
         this.scheduleHandshakeSnapshot(ws, state)
+        this.flushPendingUiCommands(ws)
         return
       }
 
@@ -2495,8 +2501,75 @@ export class WsHandler {
     }
   }
 
-  broadcastUiCommand(command: { command: string; payload?: any }) {
-    this.broadcast({ type: 'ui.command', ...command })
+  private authenticatedUiConnections(): LiveWebSocket[] {
+    return [...this.connections].filter((ws) => {
+      if (ws.readyState !== WebSocket.OPEN) return false
+      return !!this.clientStates.get(ws)?.authenticated
+    })
+  }
+
+  private uiCommandKey(command: UiCommand): string {
+    return JSON.stringify(command)
+  }
+
+  private queueUiCommand(command: UiCommand, now = Date.now()): void {
+    const key = this.uiCommandKey(command)
+    this.pendingUiCommands = this.pendingUiCommands.filter((item) => (
+      item.expiresAt > now && this.uiCommandKey(item.command) !== key
+    ))
+    this.pendingUiCommands.push({ command, expiresAt: now + UI_COMMAND_REPLAY_TTL_MS })
+  }
+
+  private flushPendingUiCommands(target?: LiveWebSocket): void {
+    const now = Date.now()
+    const pending = this.pendingUiCommands.filter((item) => item.expiresAt > now)
+    this.pendingUiCommands = []
+    if (!pending.length) return
+
+    const targets = target ? [target] : this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.pendingUiCommands.push(...pending)
+      return
+    }
+
+    for (const item of pending) {
+      for (const ws of targets) {
+        if (ws.readyState === WebSocket.OPEN) {
+          this.send(ws, { type: 'ui.command', ...item.command })
+        }
+      }
+    }
+  }
+
+  broadcastUiCommand(command: UiCommand) {
+    const targets = this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.queueUiCommand(command)
+      return
+    }
+    for (const ws of targets) {
+      this.send(ws, { type: 'ui.command', ...command })
+    }
+  }
+
+  broadcastUiCommandWithReplay(command: UiCommand) {
+    const now = Date.now()
+    const targets = this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.queueUiCommand(command, now)
+      return
+    }
+
+    const hasRecentTarget = targets.some((ws) => (
+      typeof ws.connectedAt === 'number' && now - ws.connectedAt <= UI_COMMAND_RECENT_CONNECTION_MS
+    ))
+    if (!hasRecentTarget) {
+      this.queueUiCommand(command, now)
+    }
+
+    for (const ws of targets) {
+      this.send(ws, { type: 'ui.command', ...command })
+    }
   }
 
   broadcastSessionsChanged(revision: number): void {

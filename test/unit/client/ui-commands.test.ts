@@ -80,6 +80,24 @@ describe('handleUiCommand', () => {
     expect(actions[1].type).toBe('panes/swapPanes')
   })
 
+  it('selects the tab when selecting a pane', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.select',
+      payload: { tabId: 't1', paneId: 'p1' },
+    }, dispatch)
+
+    expect(actions.map((a) => a.type)).toEqual(['tabs/setActiveTab', 'panes/setActivePane'])
+    expect(actions[0].payload).toBe('t1')
+    expect(actions[1].payload).toEqual({ tabId: 't1', paneId: 'p1' })
+  })
+
   it('handles pane.rename', () => {
     const actions: any[] = []
     const dispatch = (action: any) => {
