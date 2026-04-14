@@ -121,6 +121,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
     case 'pane.close':
       return dispatch(closePaneWithCleanup({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.select':
+      dispatch(setActiveTab(msg.payload.tabId))
       return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.rename':
       return dispatch(applyPaneRename({
