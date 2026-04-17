@@ -50,6 +50,16 @@ const wss = new WebSocketServer({ host, port })
 wss.on('connection', (socket) => {
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (behavior.requireJsonRpc && message.jsonrpc !== '2.0') {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: 'Expected jsonrpc: "2.0" request envelope',
+        },
+      }))
+      return
+    }
     const method = message.method
 
     if (behavior.ignoreMethods?.includes(method)) {
@@ -73,5 +83,8 @@ wss.on('connection', (socket) => {
 })
 
 process.on('SIGTERM', () => {
+  if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
+    return
+  }
   wss.close(() => process.exit(0))
 })

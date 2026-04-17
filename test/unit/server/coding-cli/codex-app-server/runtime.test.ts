@@ -51,6 +51,25 @@ async function occupyLoopbackPort(): Promise<{ blocker: http.Server; endpoint: O
   }
 }
 
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') {
+        return
+      }
+      throw error
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+
+  throw new Error(`Timed out waiting for process ${pid} to exit`)
+}
+
 function createRuntime(options: ConstructorParameters<typeof CodexAppServerRuntime>[0] = {}): CodexAppServerRuntime {
   const runtime = new CodexAppServerRuntime({
     command: process.execPath,
@@ -88,6 +107,20 @@ describe('CodexAppServerRuntime', () => {
 
     await runtime.shutdown()
 
+    expect(runtime.status()).toBe('stopped')
+  })
+
+  it('forces the child down when it ignores SIGTERM', async () => {
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM: '1',
+      },
+    })
+
+    const ready = await runtime.ensureReady()
+    await runtime.shutdown()
+
+    await waitForProcessExit(ready.processPid)
     expect(runtime.status()).toBe('stopped')
   })
 

@@ -12,6 +12,7 @@ const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cl
 
 type FakeServerBehavior = {
   ignoreMethods?: string[]
+  requireJsonRpc?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
 }
 
@@ -107,6 +108,16 @@ describe('CodexAppServerClient', () => {
 
   it('sends thread/start and returns the exact thread id', async () => {
     const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+      threadId: 'thread-new-1',
+    })
+  })
+
+  it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {
+    const server = await startFakeCodexAppServer({ requireJsonRpc: true })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await client.initialize()

@@ -201,7 +201,12 @@ export class CodexAppServerRuntime {
 
     child.kill('SIGTERM')
     await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => resolve(), 1_000)
+      const timeout = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          child.kill('SIGKILL')
+        }
+        resolve()
+      }, 1_000)
       child.once('exit', () => {
         clearTimeout(timeout)
         resolve()

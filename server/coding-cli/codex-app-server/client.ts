@@ -230,7 +230,7 @@ export class CodexAppServerClient {
         timeout,
       })
 
-      socket.send(JSON.stringify({ id, method, params }), (error) => {
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), (error) => {
         if (!error) return
         clearTimeout(timeout)
         this.pendingRequests.delete(id)

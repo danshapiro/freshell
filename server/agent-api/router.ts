@@ -4,6 +4,11 @@ import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
 import { allocateLocalhostPort, type OpencodeServerEndpoint } from '../local-port.js'
 import type { CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
+import {
+  CodexLaunchConfigError,
+  getCodexSessionBindingReason,
+  normalizeCodexSandboxSetting,
+} from '../coding-cli/codex-launch-config.js'
 import { makeSessionKey } from '../coding-cli/types.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { ok, approx, fail } from './response.js'
@@ -56,16 +61,11 @@ async function resolveSpawnProviderSettings(
     if (!opts.codexLaunchPlanner) {
       throw new Error('Codex terminal launch requires the shared app-server planner.')
     }
-    const sandbox = providerSettings?.sandbox
-    const normalizedSandbox =
-      sandbox === 'read-only' || sandbox === 'workspace-write' || sandbox === 'danger-full-access'
-        ? sandbox
-        : undefined
     const plan = await opts.codexLaunchPlanner.planCreate({
       cwd: opts.cwd,
       resumeSessionId: opts.resumeSessionId,
       model: providerSettings?.model,
-      sandbox: normalizedSandbox,
+      sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
       approvalPolicy: providerSettings?.permissionMode,
     })
     return {
@@ -286,14 +286,13 @@ export function createAgentApiRouter({
           { permissionMode, model, sandbox },
           { cwd, resumeSessionId, codexLaunchPlanner },
         )
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, resumeSessionId)
         const terminal = registry.create({
           mode: effectiveMode,
           shell,
           cwd,
           resumeSessionId: launch?.resumeSessionId,
-          ...(effectiveMode === 'codex' && !resumeSessionId
-            ? { sessionBindingReason: 'start' as const }
-            : {}),
+          ...(sessionBindingReason ? { sessionBindingReason } : {}),
           providerSettings: launch,
           envContext: { tabId, paneId },
         })
@@ -328,7 +327,8 @@ export function createAgentApiRouter({
 
       res.json(ok({ tabId, paneId, terminalId }, 'tab created'))
     } catch (err: any) {
-      res.status(500).json(fail(err?.message || 'Failed to create tab'))
+      const status = err instanceof CodexLaunchConfigError ? 400 : 500
+      res.status(status).json(fail(err?.message || 'Failed to create tab'))
     }
   })
 
@@ -611,46 +611,50 @@ export function createAgentApiRouter({
     const rawTimeout = payload.timeout || payload.T
     const timeoutSeconds = typeof rawTimeout === 'number' ? rawTimeout : Number(rawTimeout)
     const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
+    try {
+      const created = layoutStore.createTab?.({ title })
+      const tabId = created?.tabId || nanoid()
+      const paneId = created?.paneId || nanoid()
+      const launch = await resolveSpawnProviderSettings(mode, configStore, {}, { cwd, codexLaunchPlanner })
+      const sessionBindingReason = getCodexSessionBindingReason(mode)
+      const terminal = registry.create({
+        mode,
+        shell,
+        cwd,
+        resumeSessionId: launch?.resumeSessionId,
+        ...(sessionBindingReason ? { sessionBindingReason } : {}),
+        providerSettings: launch,
+        envContext: { tabId, paneId },
+      })
+      layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
+      wsHandler?.broadcastUiCommand({
+        command: 'tab.create',
+        payload: { id: tabId, title, mode, shell, terminalId: terminal.terminalId, initialCwd: cwd },
+      })
 
-    const created = layoutStore.createTab?.({ title })
-    const tabId = created?.tabId || nanoid()
-    const paneId = created?.paneId || nanoid()
-    const launch = await resolveSpawnProviderSettings(mode, configStore, {}, { cwd, codexLaunchPlanner })
-    const terminal = registry.create({
-      mode,
-      shell,
-      cwd,
-      resumeSessionId: launch?.resumeSessionId,
-      ...(mode === 'codex' ? { sessionBindingReason: 'start' as const } : {}),
-      providerSettings: launch,
-      envContext: { tabId, paneId },
-    })
-    layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
-    wsHandler?.broadcastUiCommand({
-      command: 'tab.create',
-      payload: { id: tabId, title, mode, shell, terminalId: terminal.terminalId, initialCwd: cwd },
-    })
+      const sentinel = `__FRESHELL_DONE_${nanoid()}__`
+      const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
+      registry.input(terminal.terminalId, input)
 
-    const sentinel = `__FRESHELL_DONE_${nanoid()}__`
-    const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-    registry.input(terminal.terminalId, input)
+      if (!capture || detached) {
+        const message = detached ? 'command started (detached)' : 'command sent'
+        return res.json(ok({ terminalId: terminal.terminalId, tabId, paneId }, message))
+      }
 
-    if (!capture || detached) {
-      const message = detached ? 'command started (detached)' : 'command sent'
-      return res.json(ok({ terminalId: terminal.terminalId, tabId, paneId }, message))
+      const escaped = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const result = await waitForMatch(
+        () => renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false }),
+        new RegExp(escaped),
+        { timeoutMs },
+      )
+      const rawOutput = renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false })
+      const output = rawOutput.split(sentinel).join('').trim()
+      const responder = result.matched ? ok : approx
+      const message = result.matched ? 'run complete' : 'timeout waiting for command'
+      return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
+    } catch (err: any) {
+      return res.status(500).json(fail(err?.message || 'Failed to run command'))
     }
-
-    const escaped = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const result = await waitForMatch(
-      () => renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false }),
-      new RegExp(escaped),
-      { timeoutMs },
-    )
-    const rawOutput = renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false })
-    const output = rawOutput.split(sentinel).join('').trim()
-    const responder = result.matched ? ok : approx
-    const message = result.matched ? 'run complete' : 'timeout waiting for command'
-    return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
   })
 
   router.post('/panes/:id/split', async (req, res) => {
@@ -695,14 +699,13 @@ export function createAgentApiRouter({
           codexLaunchPlanner,
         },
       )
+      const sessionBindingReason = getCodexSessionBindingReason(splitMode, req.body?.resumeSessionId)
       const terminal = registry.create({
         mode: splitMode,
         shell: req.body?.shell,
         cwd: req.body?.cwd,
         resumeSessionId: launch?.resumeSessionId,
-        ...(splitMode === 'codex' && !req.body?.resumeSessionId
-          ? { sessionBindingReason: 'start' as const }
-          : {}),
+        ...(sessionBindingReason ? { sessionBindingReason } : {}),
         providerSettings: launch,
         envContext: { tabId, paneId: newPaneId },
       })
@@ -902,14 +905,13 @@ export function createAgentApiRouter({
         codexLaunchPlanner,
       },
     )
+    const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, req.body?.resumeSessionId)
     const terminal = registry.create({
       mode: effectiveMode,
       shell: req.body?.shell,
       cwd: req.body?.cwd,
       resumeSessionId: launch?.resumeSessionId,
-      ...(effectiveMode === 'codex' && !req.body?.resumeSessionId
-        ? { sessionBindingReason: 'start' as const }
-        : {}),
+      ...(sessionBindingReason ? { sessionBindingReason } : {}),
       providerSettings: launch,
       envContext: { tabId, paneId },
     })

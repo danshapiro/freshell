@@ -34,6 +34,10 @@ import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
 import type { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
+  getCodexSessionBindingReason,
+  normalizeCodexSandboxSetting,
+} from './coding-cli/codex-launch-config.js'
+import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
@@ -650,6 +654,23 @@ export class WsHandler {
       return undefined
     }
     return cached
+  }
+
+  private async planCodexLaunch(
+    cwd: string | undefined,
+    resumeSessionId: string | undefined,
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+  ) {
+    if (!this.codexLaunchPlanner) {
+      throw new Error('Codex terminal launch requires the shared app-server planner.')
+    }
+    return this.codexLaunchPlanner.planCreate({
+      cwd,
+      resumeSessionId,
+      model: providerSettings?.model,
+      sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
+      approvalPolicy: providerSettings?.permissionMode,
+    })
   }
 
   private terminalCreateLockKey(
@@ -1628,19 +1649,11 @@ export class WsHandler {
                 effectiveResumeSessionId,
               }, '[TRACE resumeSessionId] about to create terminal')
 
+              const requestedCodexResumeSessionId = m.mode === 'codex'
+                ? effectiveResumeSessionId
+                : undefined
               const codexPlan = m.mode === 'codex'
-                ? await (() => {
-                    if (!this.codexLaunchPlanner) {
-                      throw new Error('Codex terminal launch requires the shared app-server planner.')
-                    }
-                    return this.codexLaunchPlanner.planCreate({
-                      cwd: m.cwd,
-                      resumeSessionId: effectiveResumeSessionId,
-                      model: providerSettings?.model,
-                      sandbox: providerSettings?.sandbox,
-                      approvalPolicy: providerSettings?.permissionMode,
-                    })
-                  })()
+                ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
                 : undefined
 
               if (codexPlan) {
@@ -1674,7 +1687,7 @@ export class WsHandler {
                 resumeSessionId: effectiveResumeSessionId,
                 ...(codexPlan
                   ? {
-                      sessionBindingReason: m.resumeSessionId ? 'resume' as const : 'start' as const,
+                      sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
                     }
                   : {}),
                 envContext: { tabId: m.tabId, paneId: m.paneId },

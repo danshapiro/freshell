@@ -2,6 +2,7 @@ import { it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 it('runs a command and returns captured output', async () => {
   let buffer = ''
@@ -55,6 +56,47 @@ it('allocates and passes an OpenCode control endpoint for /api/run in opencode m
       opencodeServer: {
         hostname: '127.0.0.1',
         port: expect.any(Number),
+      },
+    }),
+  }))
+})
+
+it('uses the shared Codex planner and marks fresh /api/run sessions as starts', async () => {
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term1' })),
+    input: vi.fn(() => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.body.status).toBe('ok')
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+    approvalPolicy: undefined,
+    cwd: undefined,
+    model: undefined,
+    resumeSessionId: undefined,
+    sandbox: undefined,
+  }])
+  expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+    mode: 'codex',
+    resumeSessionId: 'thread-new-1',
+    sessionBindingReason: 'start',
+    providerSettings: expect.objectContaining({
+      resumeSessionId: 'thread-new-1',
+      codexAppServer: {
+        wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
       },
     }),
   }))

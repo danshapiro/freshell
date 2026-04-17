@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 class FakeRegistry {
   create = vi.fn(() => ({ terminalId: 'term_1' }))
@@ -79,6 +80,38 @@ describe('tab endpoints', () => {
         },
       }),
     }))
+  })
+
+  it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: () => {},
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'codex',
+      name: 'bad sandbox',
+      sandbox: 'totally-open',
+    })
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({
+      status: 'error',
+      message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+    })
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+    expect(registry.create).not.toHaveBeenCalled()
   })
 
   it('rejects blank tab rename payloads', async () => {

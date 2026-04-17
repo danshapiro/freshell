@@ -520,6 +520,7 @@ describe('terminal.create reuse running codex terminal', () => {
         mode: 'codex',
         cwd: '/repo/worktree',
         resumeSessionId: 'thread-new-1',
+        sessionBindingReason: 'start',
         providerSettings: {
           codexAppServer: {
             wsUrl: CODEX_REMOTE_WS_URL,
