@@ -90,7 +90,7 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
-  it('keeps Codex association working and emits an association binding event', () => {
+  it('does not heuristically associate codex sessions', () => {
     const registry = new TerminalRegistry()
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)
     const onBound = vi.fn()
@@ -106,26 +106,25 @@ describe('SessionAssociationCoordinator integration', () => {
       cwd: '/home/user/project',
     })
 
-    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
-    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(onBound).toHaveBeenCalledWith({
-      terminalId: terminal.terminalId,
-      provider: 'codex',
-      sessionId: 'codex-session-abc-123',
-      reason: 'association',
-    })
+    expect(result).toEqual({ associated: false, reason: 'provider_managed' })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(onBound).not.toHaveBeenCalled()
 
     registry.shutdown()
   })
 })
 
 describe('Session-Terminal metadata broadcasts', () => {
-  it('broadcasts terminal.session.associated and terminal.meta.updated for Codex association flow', async () => {
+  it('applies terminal.meta.updated for a prebound codex terminal without association broadcast', async () => {
     const registry = new TerminalRegistry()
     const metadata = createMetadataService()
     const broadcasts: any[] = []
 
-    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const terminal = registry.create({
+      mode: 'codex',
+      cwd: '/home/user/project',
+      resumeSessionId: SESSION_ID_ONE,
+    })
     await metadata.seedFromTerminal(registry.list()[0] as any)
 
     const codexSession: CodingCliSession = {
@@ -147,28 +146,7 @@ describe('Session-Terminal metadata broadcasts', () => {
       },
     }
 
-    const unassociated = registry.findUnassociatedTerminals('codex', codexSession.cwd!)
-    expect(unassociated).toHaveLength(1)
-
-    const associated = registry.setResumeSessionId(unassociated[0].terminalId, codexSession.sessionId)
-    expect(associated).toBe(true)
-
-    broadcasts.push({
-      type: 'terminal.session.associated',
-      terminalId: unassociated[0].terminalId,
-      sessionId: codexSession.sessionId,
-    })
-
-    const associatedMeta = metadata.associateSession(unassociated[0].terminalId, 'codex', codexSession.sessionId)
-    if (associatedMeta) {
-      broadcasts.push({
-        type: 'terminal.meta.updated',
-        upsert: [associatedMeta],
-        remove: [],
-      })
-    }
-
-    const sessionMeta = await metadata.applySessionMetadata(unassociated[0].terminalId, codexSession)
+    const sessionMeta = await metadata.applySessionMetadata(terminal.terminalId, codexSession)
     if (sessionMeta) {
       broadcasts.push({
         type: 'terminal.meta.updated',
@@ -177,11 +155,7 @@ describe('Session-Terminal metadata broadcasts', () => {
       })
     }
 
-    expect(broadcasts).toContainEqual({
-      type: 'terminal.session.associated',
-      terminalId: terminal.terminalId,
-      sessionId: SESSION_ID_ONE,
-    })
+    expect(broadcasts.find((m) => m.type === 'terminal.session.associated')).toBeUndefined()
 
     const latestMeta = broadcasts.filter((m) => m.type === 'terminal.meta.updated').at(-1)
     expect(latestMeta).toBeTruthy()
@@ -688,7 +662,7 @@ describe('Session-Terminal Association Platform-specific', () => {
   })
 })
 
-describe('Codex Session-Terminal Association via onUpdate', () => {
+describe('Session-Terminal Association via onUpdate', () => {
   /**
    * Simulates the association logic in the codingCliIndexer.onUpdate handler.
    * After consolidation, onUpdate handles ALL providers (including Claude).
@@ -712,12 +686,11 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     }
   }
 
-  it('associates codex terminal when session appears in onUpdate', () => {
+  it('skips codex sessions in onUpdate ownership pass', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
     const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    expect(term.resumeSessionId).toBeUndefined()
 
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
@@ -730,119 +703,8 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0]).toEqual({
-      type: 'terminal.session.associated',
-      terminalId: term.terminalId,
-      sessionId: 'codex-session-abc-123',
-    })
-
-    registry.shutdown()
-  })
-
-  it('is idempotent: repeated onUpdate calls do not double-associate', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    const projects = [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex' as const,
-        sessionId: 'codex-session-abc-123',
-        projectPath: '/home/user/project',
-        lastActivityAt: Date.now(),
-        cwd: '/home/user/project',
-      }],
-    }]
-
-    associateOnUpdate(registry, projects, broadcasts)
-    expect(broadcasts).toHaveLength(1)
-
-    associateOnUpdate(registry, projects, broadcasts)
-    expect(broadcasts).toHaveLength(1) // Still 1
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-
-    registry.shutdown()
-  })
-
-  it('does not associate one codex session to multiple terminals across repeated updates', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    const term3 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    const projects = [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex' as const,
-        sessionId: 'codex-session-abc-123',
-        projectPath: '/home/user/project',
-        lastActivityAt: Date.now(),
-        cwd: '/home/user/project',
-      }],
-    }]
-
-    associateOnUpdate(registry, projects, broadcasts)
-    associateOnUpdate(registry, projects, broadcasts)
-    associateOnUpdate(registry, projects, broadcasts)
-
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
-    expect(registry.get(term3.terminalId)?.resumeSessionId).toBeUndefined()
-    expect(broadcasts).toHaveLength(1)
-
-    registry.shutdown()
-  })
-
-  it('does not cross-associate: codex session does not match claude terminal', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    registry.create({ mode: 'claude', cwd: '/home/user/project' })
-
-    associateOnUpdate(registry, [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex',
-        sessionId: 'codex-session-abc-123',
-        projectPath: '/home/user/project',
-        lastActivityAt: Date.now(),
-        cwd: '/home/user/project',
-      }],
-    }], broadcasts)
-
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
     expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-
-  it('only associates the oldest terminal when multiple match', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    associateOnUpdate(registry, [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex',
-        sessionId: 'codex-session-abc-123',
-        projectPath: '/home/user/project',
-        lastActivityAt: Date.now(),
-        cwd: '/home/user/project',
-      }],
-    }], broadcasts)
-
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
 
     registry.shutdown()
   })
@@ -851,7 +713,11 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
-    const term = registry.create({ mode: 'opencode', cwd: '/home/user/project' })
+    const term = registry.create({
+      mode: 'opencode',
+      cwd: '/home/user/project',
+      providerSettings: { opencodeServer: { hostname: '127.0.0.1', port: 4173 } },
+    })
 
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
@@ -914,77 +780,6 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     // Should associate — Claude is now handled in the unified flow
     expect(broadcasts).toHaveLength(1)
     expect(registry.get(term.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
-
-    registry.shutdown()
-  })
-
-  it('does not overwrite existing resumeSessionId', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'existing-session' })
-
-    associateOnUpdate(registry, [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex',
-        sessionId: 'different-session',
-        projectPath: '/home/user/project',
-        lastActivityAt: Date.now(),
-        cwd: '/home/user/project',
-      }],
-    }], broadcasts)
-
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('existing-session')
-    expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-
-  it('does not associate with stale sessions from before the terminal was created', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    const hoursAgo = Date.now() - 3 * 60 * 60 * 1000
-    associateOnUpdate(registry, [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex',
-        sessionId: 'old-stale-session',
-        projectPath: '/home/user/project',
-        lastActivityAt: hoursAgo,
-        cwd: '/home/user/project',
-      }],
-    }], broadcasts)
-
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
-    expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-
-  it('associates with a session created shortly after the terminal', () => {
-    const registry = new TerminalRegistry()
-    const broadcasts: any[] = []
-
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    const shortly = term.createdAt + 2000
-    associateOnUpdate(registry, [{
-      projectPath: '/home/user/project',
-      sessions: [{
-        provider: 'codex',
-        sessionId: 'matching-session',
-        projectPath: '/home/user/project',
-        lastActivityAt: shortly,
-        cwd: '/home/user/project',
-      }],
-    }], broadcasts)
-
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('matching-session')
-    expect(broadcasts).toHaveLength(1)
 
     registry.shutdown()
   })

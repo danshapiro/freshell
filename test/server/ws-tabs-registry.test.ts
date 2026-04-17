@@ -106,12 +106,7 @@ describe('ws tabs registry protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      tabsStore,
+      { tabsRegistryStore: tabsStore },
     )
     port = await listen(server)
   })

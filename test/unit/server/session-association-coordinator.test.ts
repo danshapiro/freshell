@@ -4,7 +4,7 @@ import type { CodingCliSession } from '../../../server/coding-cli/types'
 
 function createSession(overrides: Partial<CodingCliSession> = {}): CodingCliSession {
   return {
-    provider: 'codex',
+    provider: 'claude',
     sessionId: 'session-main',
     projectPath: '/repo/project',
     lastActivityAt: 2_000,
@@ -55,13 +55,28 @@ describe('SessionAssociationCoordinator', () => {
       isNonInteractive: true,
     }))
 
-    expect(subagentResult).toEqual({ associated: false })
-    expect(execResult).toEqual({ associated: false })
+    expect(subagentResult).toEqual({ associated: false, reason: 'subagent' })
+    expect(execResult).toEqual({ associated: false, reason: 'non_interactive' })
     expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
     expect(registry.bindSession).not.toHaveBeenCalled()
   })
 
-  it('associates regular sessions with matching unassociated terminals', () => {
+  it('does not attempt heuristic association for codex sessions', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession({ provider: 'codex' }))
+
+    expect(result).toEqual({ associated: false, reason: 'provider_managed' })
+    expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
+    expect(registry.bindSession).not.toHaveBeenCalled()
+  })
+
+  it('associates claude sessions with matching unassociated terminals', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
@@ -72,8 +87,23 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('codex', '/repo/project')
-    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'codex', 'session-main', 'association')
+    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('claude', '/repo/project')
+    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'claude', 'session-main', 'association')
+  })
+
+  it('associates opencode sessions with matching unassociated terminals', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-2', createdAt: 1_000 }]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession({ provider: 'opencode' }))
+
+    expect(result).toEqual({ associated: true, terminalId: 'term-2' })
+    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('opencode', '/repo/project')
+    expect(registry.bindSession).toHaveBeenCalledWith('term-2', 'opencode', 'session-main', 'association')
   })
 
   it('skips association when session is already bound to another terminal', () => {
@@ -87,7 +117,7 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: false })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('claude', 'session-main')
     expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
     expect(registry.bindSession).not.toHaveBeenCalled()
   })
@@ -103,7 +133,7 @@ describe('SessionAssociationCoordinator', () => {
     const result = coordinator.associateSingleSession(createSession())
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
-    expect(registry.isSessionBound).toHaveBeenCalledWith('codex', 'session-main')
+    expect(registry.isSessionBound).toHaveBeenCalledWith('claude', 'session-main')
     expect(registry.bindSession).toHaveBeenCalled()
   })
 })

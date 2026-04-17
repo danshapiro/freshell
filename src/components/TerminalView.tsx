@@ -19,6 +19,7 @@ import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRu
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
+import { buildDurableResumeIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
@@ -2025,8 +2026,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (currentTab) {
             dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
           }
-          if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
-            updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
+          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
+            paneResumeSessionId: contentRef.current?.resumeSessionId,
+            tabResumeSessionId: currentTab?.resumeSessionId,
+            sessionId: msg.effectiveResumeSessionId,
+          })
+          if (durableIdentityUpdate?.paneUpdates) {
+            updateContent(durableIdentityUpdate.paneUpdates)
+          }
+          if (currentTab && durableIdentityUpdate?.tabUpdates) {
+            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
+          }
+          if (durableIdentityUpdate?.shouldFlush) {
+            dispatch(flushPersistedLayoutNow())
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))
@@ -2113,15 +2125,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
             }
             : undefined
-          updateContent({
-            resumeSessionId: sessionId,
-            ...(sessionRef ? { sessionRef } : {}),
-          })
-          // Mirror to tab so TabContent can reconstruct correct default
-          // content if pane layout is lost (e.g., localStorage quota error)
           const currentTab = tabRef.current
-          if (currentTab) {
-            dispatch(updateTab({ id: currentTab.id, updates: { resumeSessionId: sessionId } }))
+          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
+            paneResumeSessionId: contentRef.current?.resumeSessionId,
+            tabResumeSessionId: currentTab?.resumeSessionId,
+            sessionId,
+          })
+          if (durableIdentityUpdate?.paneUpdates || sessionRef) {
+            updateContent({
+              ...(durableIdentityUpdate?.paneUpdates ?? {}),
+              ...(sessionRef ? { sessionRef } : {}),
+            })
+          }
+          if (currentTab && durableIdentityUpdate?.tabUpdates) {
+            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
+          }
+          if (durableIdentityUpdate?.shouldFlush) {
+            dispatch(flushPersistedLayoutNow())
           }
         }
 

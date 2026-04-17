@@ -7,6 +7,52 @@ import { sessionMetadataKey } from '@/lib/session-metadata'
 
 export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
+export function buildDurableResumeIdentityUpdate({
+  paneResumeSessionId,
+  tabResumeSessionId,
+  sessionId,
+  flushSessionId = sessionId,
+}: {
+  paneResumeSessionId?: string
+  tabResumeSessionId?: string
+  sessionId?: string
+  flushSessionId?: string
+}): {
+  paneUpdates?: { resumeSessionId: string }
+  tabUpdates?: { resumeSessionId: string }
+  shouldFlush: boolean
+} | null {
+  if (!sessionId) return null
+
+  const paneUpdates =
+    paneResumeSessionId !== sessionId
+      ? { resumeSessionId: sessionId }
+      : undefined
+
+  const tabUpdates =
+    tabResumeSessionId !== sessionId
+      ? { resumeSessionId: sessionId }
+      : undefined
+
+  const shouldFlush = Boolean(
+    flushSessionId
+      && (
+        paneResumeSessionId !== flushSessionId
+        || tabResumeSessionId !== flushSessionId
+      ),
+  )
+
+  if (!paneUpdates && !tabUpdates && !shouldFlush) {
+    return null
+  }
+
+  return {
+    paneUpdates,
+    tabUpdates,
+    shouldFlush,
+  }
+}
+
 type SessionIdentityState = Pick<ChatSessionState, 'timelineSessionId' | 'cliSessionId'> | undefined
 
 export function getPreferredResumeSessionId(session: SessionIdentityState): string | undefined {
@@ -133,18 +179,18 @@ export function buildAgentChatPersistedIdentityUpdate({
 } | null {
   const preferredResumeSessionId = getPreferredResumeSessionId(session)
   if (!preferredResumeSessionId) return null
-
-  const paneUpdates =
-    paneContent.resumeSessionId !== preferredResumeSessionId
-      ? { resumeSessionId: preferredResumeSessionId }
-      : undefined
+  const canonicalDurableSessionId = getCanonicalDurableSessionId(session)
+  const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
+    paneResumeSessionId: paneContent.resumeSessionId,
+    tabResumeSessionId: currentTab?.resumeSessionId,
+    sessionId: preferredResumeSessionId,
+    flushSessionId: canonicalDurableSessionId,
+  })
+  const paneUpdates = durableIdentityUpdate?.paneUpdates
 
   let tabUpdates: Partial<Tab> | undefined
   if (currentTab) {
-    const nextTabUpdates: Partial<Tab> = {}
-    if (currentTab.resumeSessionId !== preferredResumeSessionId) {
-      nextTabUpdates.resumeSessionId = preferredResumeSessionId
-    }
+    const nextTabUpdates: Partial<Tab> = { ...(durableIdentityUpdate?.tabUpdates ?? {}) }
     if (metadataProvider && currentTab.codingCliProvider !== metadataProvider) {
       nextTabUpdates.codingCliProvider = metadataProvider
     }
@@ -169,14 +215,7 @@ export function buildAgentChatPersistedIdentityUpdate({
     }
   }
 
-  const canonicalDurableSessionId = getCanonicalDurableSessionId(session)
-  const shouldFlush = Boolean(
-    canonicalDurableSessionId
-      && (
-        paneContent.resumeSessionId !== canonicalDurableSessionId
-        || currentTab?.resumeSessionId !== canonicalDurableSessionId
-      ),
-  )
+  const shouldFlush = durableIdentityUpdate?.shouldFlush ?? false
 
   if (!paneUpdates && !tabUpdates && !shouldFlush) {
     return null

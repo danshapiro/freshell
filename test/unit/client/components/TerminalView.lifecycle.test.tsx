@@ -8,6 +8,10 @@ import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/s
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
+import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
+import { parsePersistedLayoutRaw } from '@/store/persistedState'
+import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
@@ -185,6 +189,12 @@ function latestAttachRequestIdForTerminal(terminalId: string | undefined): strin
   return typeof attach?.attachRequestId === 'string' ? attach.attachRequestId : undefined
 }
 
+function readPersistedLayoutSnapshotForTest() {
+  ensureLocalStorageApiForTest()
+  const raw = globalThis.localStorage?.getItem(LAYOUT_STORAGE_KEY)
+  return raw ? parsePersistedLayoutRaw(raw) : null
+}
+
 function createSettingsState(overrides: Record<string, unknown> = {}) {
   const serverSettings = (overrides.serverSettings as Record<string, unknown> | undefined) ?? createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
@@ -226,6 +236,8 @@ describe('TerminalView lifecycle updates', () => {
     clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
     __resetLastSentViewportCacheForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPersistFlushListenersForTests()
     latestAttachRequestIdByTerminal.clear()
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
@@ -2404,6 +2416,85 @@ describe('TerminalView lifecycle updates', () => {
     // Verify tab also has resumeSessionId mirrored
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
     expect(tab?.resumeSessionId).toBe(sessionId)
+  })
+
+  it('persists the durable codex session id immediately on terminal.created', async () => {
+    const tabId = 'tab-codex-durable'
+    const paneId = 'pane-codex-durable'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-codex-durable',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(persistMiddleware),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-codex-durable',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    const sessionId = 'thread-new-1'
+    messageHandler!({
+      type: 'terminal.created',
+      requestId: 'req-codex-durable',
+      terminalId: 'term-codex-durable',
+      createdAt: 123,
+      effectiveResumeSessionId: sessionId,
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.resumeSessionId).toBe(sessionId)
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+      expect(tab?.resumeSessionId).toBe(sessionId)
+      expect(dispatchSpy.mock.calls.some(([action]) => action?.type === flushPersistedLayoutNow.type)).toBe(true)
+
+      const persisted = readPersistedLayoutSnapshotForTest()
+      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.resumeSessionId).toBe(sessionId)
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBe(sessionId)
+    })
   })
 
   it('clears tab terminalId and sets status to creating on INVALID_TERMINAL_ID reconnect', async () => {

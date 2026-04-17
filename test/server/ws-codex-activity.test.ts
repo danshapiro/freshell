@@ -105,16 +105,7 @@ describe('ws codex activity protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      () => sampleActivity as any,
+      { codexActivityListProvider: () => sampleActivity as any },
     )
     port = await listen(server)
   })

@@ -101,11 +101,7 @@ describe('ws terminal metadata protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      () => sampleMeta as any,
+      { terminalMetaListProvider: () => sampleMeta as any },
     )
     port = await listen(server)
   })

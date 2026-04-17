@@ -2,7 +2,15 @@ import { Router } from 'express'
 import fs from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
+import { allocateLocalhostPort } from '../local-port.js'
+import type { CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
+import {
+  CodexLaunchConfigError,
+  getCodexSessionBindingReason,
+  normalizeCodexSandboxSetting,
+} from '../coding-cli/codex-launch-config.js'
 import { makeSessionKey } from '../coding-cli/types.js'
+import type { ProviderSettings } from '../terminal-registry.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
@@ -11,6 +19,10 @@ import { resolveScreenshotOutputPath } from './screenshot-path.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+
+function agentRouteErrorStatus(error: unknown): number {
+  return error instanceof CodexLaunchConfigError ? 400 : 500
+}
 
 /**
  * Resolve provider settings for a terminal spawn. Explicit API params override
@@ -29,6 +41,50 @@ async function resolveProviderSettings(
     permissionMode: overrides.permissionMode ?? defaults.permissionMode,
     model: overrides.model ?? defaults.model,
     sandbox: overrides.sandbox ?? defaults.sandbox,
+  }
+}
+
+async function resolveSpawnProviderSettings(
+  mode: string,
+  configStore: any,
+  overrides: { permissionMode?: string; model?: string; sandbox?: string },
+  opts: {
+    cwd?: string
+    resumeSessionId?: string
+    codexLaunchPlanner?: CodexLaunchPlanner
+  } = {},
+): Promise<{ resumeSessionId?: string; providerSettings?: ProviderSettings }> {
+  const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
+  if (mode === 'codex') {
+    if (!opts.codexLaunchPlanner) {
+      throw new Error('Codex terminal launch requires the shared app-server planner.')
+    }
+    const plan = await opts.codexLaunchPlanner.planCreate({
+      cwd: opts.cwd,
+      resumeSessionId: opts.resumeSessionId,
+      model: providerSettings?.model,
+      sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
+      approvalPolicy: providerSettings?.permissionMode,
+    })
+    return {
+      resumeSessionId: plan.sessionId,
+      providerSettings: {
+        codexAppServer: plan.remote,
+      },
+    }
+  }
+  if (mode !== 'opencode') {
+    return {
+      resumeSessionId: opts.resumeSessionId,
+      providerSettings,
+    }
+  }
+  return {
+    resumeSessionId: opts.resumeSessionId,
+    providerSettings: {
+      ...(providerSettings ?? {}),
+      opencodeServer: await allocateLocalhostPort(),
+    },
   }
 }
 
@@ -82,6 +138,7 @@ export function createAgentApiRouter({
   terminalMetadata,
   codingCliIndexer,
   codexActivityTracker,
+  codexLaunchPlanner,
 }: {
   layoutStore: any
   registry: any
@@ -90,6 +147,7 @@ export function createAgentApiRouter({
   terminalMetadata?: { list: () => Array<{ terminalId: string; provider?: string; sessionId?: string }> }
   codingCliIndexer?: { refresh: () => Promise<void> }
   codexActivityTracker?: CodexPromptBlocker
+  codexLaunchPlanner?: CodexLaunchPlanner
 }) {
   const router = Router()
 
@@ -213,8 +271,6 @@ export function createAgentApiRouter({
     const wantsEditor = !!editor
 
     try {
-      const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
-
       let paneContent: any
       let terminalId: string | undefined
 
@@ -224,13 +280,21 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
-        const providerSettings = await resolveProviderSettings(effectiveMode, configStore, { permissionMode, model, sandbox })
+        const launch = await resolveSpawnProviderSettings(
+          effectiveMode,
+          configStore,
+          { permissionMode, model, sandbox },
+          { cwd, resumeSessionId, codexLaunchPlanner },
+        )
+        const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, resumeSessionId)
         const terminal = registry.create({
           mode: effectiveMode,
           shell,
           cwd,
-          resumeSessionId,
-          providerSettings,
+          resumeSessionId: launch.resumeSessionId,
+          ...(sessionBindingReason ? { sessionBindingReason } : {}),
+          providerSettings: launch.providerSettings,
           envContext: { tabId, paneId },
         })
         terminalId = terminal.terminalId
@@ -240,11 +304,32 @@ export function createAgentApiRouter({
           status: 'running',
           mode: mode || 'shell',
           shell: shell || 'system',
-          resumeSessionId,
+          resumeSessionId: launch.resumeSessionId,
           initialCwd: cwd,
         }
+
+        layoutStore.attachPaneContent(tabId, paneId, paneContent)
+
+        wsHandler?.broadcastUiCommand({
+          command: 'tab.create',
+          payload: {
+            id: tabId,
+            title: name,
+            mode: mode || 'shell',
+            shell,
+            terminalId,
+            initialCwd: cwd,
+            resumeSessionId: paneContent?.resumeSessionId,
+            paneId,
+            paneContent,
+          },
+        })
+
+        res.json(ok({ tabId, paneId, terminalId }, 'tab created'))
+        return
       }
 
+      const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
       layoutStore.attachPaneContent(tabId, paneId, paneContent)
 
       wsHandler?.broadcastUiCommand({
@@ -256,7 +341,7 @@ export function createAgentApiRouter({
           shell,
           terminalId,
           initialCwd: cwd,
-          resumeSessionId,
+          resumeSessionId: paneContent?.resumeSessionId,
           paneId,
           paneContent,
         },
@@ -264,7 +349,8 @@ export function createAgentApiRouter({
 
       res.json(ok({ tabId, paneId, terminalId }, 'tab created'))
     } catch (err: any) {
-      res.status(500).json(fail(err?.message || 'Failed to create tab'))
+      const status = agentRouteErrorStatus(err)
+      res.status(status).json(fail(err?.message || 'Failed to create tab'))
     }
   })
 
@@ -547,99 +633,135 @@ export function createAgentApiRouter({
     const rawTimeout = payload.timeout || payload.T
     const timeoutSeconds = typeof rawTimeout === 'number' ? rawTimeout : Number(rawTimeout)
     const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
+    try {
+      const launch = await resolveSpawnProviderSettings(mode, configStore, {}, { cwd, codexLaunchPlanner })
+      const created = layoutStore.createTab?.({ title })
+      const tabId = created?.tabId || nanoid()
+      const paneId = created?.paneId || nanoid()
+      const sessionBindingReason = getCodexSessionBindingReason(mode)
+      const terminal = registry.create({
+        mode,
+        shell,
+        cwd,
+        resumeSessionId: launch.resumeSessionId,
+        ...(sessionBindingReason ? { sessionBindingReason } : {}),
+        providerSettings: launch.providerSettings,
+        envContext: { tabId, paneId },
+      })
+      layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
+      wsHandler?.broadcastUiCommand({
+        command: 'tab.create',
+        payload: { id: tabId, title, mode, shell, terminalId: terminal.terminalId, initialCwd: cwd },
+      })
 
-    const created = layoutStore.createTab?.({ title })
-    const tabId = created?.tabId || nanoid()
-    const paneId = created?.paneId || nanoid()
-    const providerSettings = await resolveProviderSettings(mode, configStore, {})
-    const terminal = registry.create({ mode, shell, cwd, providerSettings, envContext: { tabId, paneId } })
-    layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
-    wsHandler?.broadcastUiCommand({
-      command: 'tab.create',
-      payload: { id: tabId, title, mode, shell, terminalId: terminal.terminalId, initialCwd: cwd },
-    })
+      const sentinel = `__FRESHELL_DONE_${nanoid()}__`
+      const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
+      registry.input(terminal.terminalId, input)
 
-    const sentinel = `__FRESHELL_DONE_${nanoid()}__`
-    const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-    registry.input(terminal.terminalId, input)
+      if (!capture || detached) {
+        const message = detached ? 'command started (detached)' : 'command sent'
+        return res.json(ok({ terminalId: terminal.terminalId, tabId, paneId }, message))
+      }
 
-    if (!capture || detached) {
-      const message = detached ? 'command started (detached)' : 'command sent'
-      return res.json(ok({ terminalId: terminal.terminalId, tabId, paneId }, message))
+      const escaped = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const result = await waitForMatch(
+        () => renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false }),
+        new RegExp(escaped),
+        { timeoutMs },
+      )
+      const rawOutput = renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false })
+      const output = rawOutput.split(sentinel).join('').trim()
+      const responder = result.matched ? ok : approx
+      const message = result.matched ? 'run complete' : 'timeout waiting for command'
+      return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
+    } catch (err: any) {
+      const status = agentRouteErrorStatus(err)
+      return res.status(status).json(fail(err?.message || 'Failed to run command'))
     }
-
-    const escaped = sentinel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const result = await waitForMatch(
-      () => renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false }),
-      new RegExp(escaped),
-      { timeoutMs },
-    )
-    const rawOutput = renderCapture(registry.get(terminal.terminalId)?.buffer.snapshot() || '', { includeAnsi: false })
-    const output = rawOutput.split(sentinel).join('').trim()
-    const responder = result.matched ? ok : approx
-    const message = result.matched ? 'run complete' : 'timeout waiting for command'
-    return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
   })
 
   router.post('/panes/:id/split', async (req, res) => {
-    const rawPaneId = req.params.id
-    const resolved = resolvePaneTarget(rawPaneId)
-    if (rejectPaneTargetError(res, resolved)) return
-    const paneId = resolved.paneId || rawPaneId
-    const direction = req.body?.direction || 'horizontal'
-    const wantsBrowser = !!req.body?.browser
-    const wantsEditor = !!req.body?.editor
+    try {
+      const rawPaneId = req.params.id
+      const resolved = resolvePaneTarget(rawPaneId)
+      if (rejectPaneTargetError(res, resolved)) return
+      const paneId = resolved.paneId || rawPaneId
+      const direction = req.body?.direction || 'horizontal'
+      const wantsBrowser = !!req.body?.browser
+      const wantsEditor = !!req.body?.editor
 
-    const result = layoutStore.splitPane({
-      paneId,
-      direction,
-      browser: wantsBrowser ? req.body?.browser : undefined,
-      editor: wantsEditor ? req.body?.editor : undefined,
-    })
-
-    if (!result?.tabId || !result?.newPaneId) {
-      res.json(approx(result, 'pane split requested; not applied'))
-      return
-    }
-
-    const tabId = result.tabId
-    const newPaneId = result.newPaneId
-
-    let content: any
-    let terminalId: string | undefined
-    if (wantsBrowser) {
-      content = { kind: 'browser', url: req.body.browser, devToolsOpen: false }
-    } else if (wantsEditor) {
-      content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
-    } else {
-      const splitMode = req.body?.mode || 'shell'
-      const splitProviderSettings = await resolveProviderSettings(splitMode, configStore, {})
-      const terminal = registry.create({
-        mode: splitMode,
-        shell: req.body?.shell,
-        cwd: req.body?.cwd,
-        providerSettings: splitProviderSettings,
-        envContext: { tabId, paneId: newPaneId },
-      })
-      terminalId = terminal.terminalId
-      content = { kind: 'terminal', terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system' }
-    }
-
-    layoutStore.attachPaneContent(tabId, newPaneId, content)
-
-    wsHandler?.broadcastUiCommand({
-      command: 'pane.split',
-      payload: {
-        tabId,
+      const result = layoutStore.splitPane({
         paneId,
         direction,
-        newPaneId,
-        newContent: content,
-      },
-    })
+        browser: wantsBrowser ? req.body?.browser : undefined,
+        editor: wantsEditor ? req.body?.editor : undefined,
+      })
 
-    const message = wantsBrowser || wantsEditor ? 'pane split (non-terminal)' : 'pane split'
-    res.json(ok({ paneId: newPaneId, terminalId }, message))
+      if (!result?.tabId || !result?.newPaneId) {
+        res.json(approx(result, 'pane split requested; not applied'))
+        return
+      }
+
+      const tabId = result.tabId
+      const newPaneId = result.newPaneId
+
+      let content: any
+      let terminalId: string | undefined
+      if (wantsBrowser) {
+        content = { kind: 'browser', url: req.body.browser, devToolsOpen: false }
+      } else if (wantsEditor) {
+        content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
+      } else {
+        const splitMode = req.body?.mode || 'shell'
+        const launch = await resolveSpawnProviderSettings(
+          splitMode,
+          configStore,
+          {},
+          {
+            cwd: req.body?.cwd,
+            resumeSessionId: req.body?.resumeSessionId,
+            codexLaunchPlanner,
+          },
+        )
+        const sessionBindingReason = getCodexSessionBindingReason(splitMode, req.body?.resumeSessionId)
+        const terminal = registry.create({
+          mode: splitMode,
+          shell: req.body?.shell,
+          cwd: req.body?.cwd,
+          resumeSessionId: launch.resumeSessionId,
+          ...(sessionBindingReason ? { sessionBindingReason } : {}),
+          providerSettings: launch.providerSettings,
+          envContext: { tabId, paneId: newPaneId },
+        })
+        terminalId = terminal.terminalId
+        content = {
+          kind: 'terminal',
+          terminalId,
+          status: 'running',
+          mode: req.body?.mode || 'shell',
+          shell: req.body?.shell || 'system',
+          ...(launch.resumeSessionId ? { resumeSessionId: launch.resumeSessionId } : {}),
+        }
+      }
+
+      layoutStore.attachPaneContent(tabId, newPaneId, content)
+
+      wsHandler?.broadcastUiCommand({
+        command: 'pane.split',
+        payload: {
+          tabId,
+          paneId,
+          direction,
+          newPaneId,
+          newContent: content,
+        },
+      })
+
+      const message = wantsBrowser || wantsEditor ? 'pane split (non-terminal)' : 'pane split'
+      res.json(ok({ paneId: newPaneId, terminalId }, message))
+    } catch (err: any) {
+      res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to split pane'))
+    }
   })
 
   router.patch('/panes/:id', async (req, res) => {
@@ -793,19 +915,49 @@ export function createAgentApiRouter({
   })
 
   router.post('/panes/:id/respawn', async (req, res) => {
-    const resolved = resolvePaneTarget(req.params.id)
-    if (rejectPaneTargetError(res, resolved)) return
-    const paneId = resolved.paneId || req.params.id
-    const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
-    const tabId = target?.tabId
-    if (!tabId) return res.status(404).json(fail('pane not found'))
-    const effectiveMode = req.body?.mode || 'shell'
-    const providerSettings = await resolveProviderSettings(effectiveMode, configStore, {})
-    const terminal = registry.create({ mode: effectiveMode, shell: req.body?.shell, cwd: req.body?.cwd, providerSettings, envContext: { tabId, paneId } })
-    const content = { kind: 'terminal', terminalId: terminal.terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system', createRequestId: nanoid() }
-    layoutStore.attachPaneContent(tabId, paneId, content)
-    wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
-    res.json(ok({ terminalId: terminal.terminalId }, 'pane respawned'))
+    try {
+      const resolved = resolvePaneTarget(req.params.id)
+      if (rejectPaneTargetError(res, resolved)) return
+      const paneId = resolved.paneId || req.params.id
+      const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
+      const tabId = target?.tabId
+      if (!tabId) return res.status(404).json(fail('pane not found'))
+      const effectiveMode = req.body?.mode || 'shell'
+      const launch = await resolveSpawnProviderSettings(
+        effectiveMode,
+        configStore,
+        {},
+        {
+          cwd: req.body?.cwd,
+          resumeSessionId: req.body?.resumeSessionId,
+          codexLaunchPlanner,
+        },
+      )
+      const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, req.body?.resumeSessionId)
+      const terminal = registry.create({
+        mode: effectiveMode,
+        shell: req.body?.shell,
+        cwd: req.body?.cwd,
+        resumeSessionId: launch.resumeSessionId,
+        ...(sessionBindingReason ? { sessionBindingReason } : {}),
+        providerSettings: launch.providerSettings,
+        envContext: { tabId, paneId },
+      })
+      const content = {
+        kind: 'terminal',
+        terminalId: terminal.terminalId,
+        status: 'running',
+        mode: req.body?.mode || 'shell',
+        shell: req.body?.shell || 'system',
+        createRequestId: nanoid(),
+        ...(launch.resumeSessionId ? { resumeSessionId: launch.resumeSessionId } : {}),
+      }
+      layoutStore.attachPaneContent(tabId, paneId, content)
+      wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
+      res.json(ok({ terminalId: terminal.terminalId }, 'pane respawned'))
+    } catch (err: any) {
+      res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to respawn pane'))
+    }
   })
 
   router.post('/panes/:id/attach', (req, res) => {

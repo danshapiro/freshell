@@ -93,13 +93,8 @@ describe('ws sidebar snapshot refresh', () => {
       res.end()
     })
 
-    wsHandler = new (WsHandler as any)(
-      server,
-      new FakeRegistry() as any,
-      undefined,
-      undefined,
-      undefined,
-      async () => ({
+    wsHandler = new (WsHandler as any)(server, new FakeRegistry() as any, {
+      handshakeSnapshotProvider: async () => ({
         settings: { theme: 'dark' },
         projects: [
           {
@@ -115,11 +110,9 @@ describe('ws sidebar snapshot refresh', () => {
           },
         ],
       }),
-      undefined,
-      undefined,
-      'srv-local',
-      new (LayoutStore as any)(),
-    )
+      serverInstanceId: 'srv-local',
+      layoutStore: new (LayoutStore as any)(),
+    })
 
     const info = await listen(server)
     port = info.port

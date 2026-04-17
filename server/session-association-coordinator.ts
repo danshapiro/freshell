@@ -21,6 +21,12 @@ type AssociationRegistry = {
 export type SessionAssociationResult = {
   associated: boolean
   terminalId?: string
+  reason?:
+    | 'provider_managed'
+    | 'provider_not_supported'
+    | 'missing_cwd'
+    | 'subagent'
+    | 'non_interactive'
 }
 
 export class SessionAssociationCoordinator {
@@ -49,7 +55,8 @@ export class SessionAssociationCoordinator {
   }
 
   associateSingleSession(session: CodingCliSession): SessionAssociationResult {
-    if (!this.isAssociationCandidate(session)) return { associated: false }
+    const candidate = this.associationCandidateReason(session)
+    if (candidate !== 'ok') return { associated: false, reason: candidate }
     if (this.registry.isSessionBound(session.provider, session.sessionId)) return { associated: false }
     const cwd = session.cwd!
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
@@ -65,11 +72,18 @@ export class SessionAssociationCoordinator {
   }
 
   private isAssociationCandidate(session: CodingCliSession): boolean {
-    if (!modeSupportsResume(session.provider)) return false
-    if (!session.cwd) return false
-    if (session.isSubagent) return false
-    if (session.isNonInteractive) return false
-    return true
+    return this.associationCandidateReason(session) === 'ok'
+  }
+
+  private associationCandidateReason(
+    session: CodingCliSession,
+  ): 'ok' | NonNullable<SessionAssociationResult['reason']> {
+    if (session.provider === 'codex') return 'provider_managed'
+    if (!modeSupportsResume(session.provider)) return 'provider_not_supported'
+    if (!session.cwd) return 'missing_cwd'
+    if (session.isSubagent) return 'subagent'
+    if (session.isNonInteractive) return 'non_interactive'
+    return 'ok'
   }
 
   private trackIfAdvanced(session: CodingCliSession): boolean {

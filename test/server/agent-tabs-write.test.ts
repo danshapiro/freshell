@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 class FakeRegistry {
   create = vi.fn(() => ({ terminalId: 'term_1' }))
@@ -49,6 +50,70 @@ describe('tab endpoints', () => {
     expect(createTab).toHaveBeenCalled()
     expect(registry.create).not.toHaveBeenCalled()
     expect(layoutStore.attachPaneContent).toHaveBeenCalled()
+  })
+
+  it('allocates and passes an OpenCode control endpoint when creating an opencode tab', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: () => {},
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler: { broadcastUiCommand: () => {} } }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'opencode', name: 'OpenCode' })
+
+    expect(res.body.status).toBe('ok')
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'opencode',
+      providerSettings: expect.objectContaining({
+        opencodeServer: {
+          hostname: '127.0.0.1',
+          port: expect.any(Number),
+        },
+      }),
+    }))
+  })
+
+  it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const layoutStore = {
+      createTab,
+      attachPaneContent: () => {},
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'codex',
+      name: 'bad sandbox',
+      sandbox: 'totally-open',
+    })
+
+    expect(res.status).toBe(400)
+    expect(res.body).toEqual({
+      status: 'error',
+      message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+    })
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+    expect(createTab).not.toHaveBeenCalled()
+    expect(registry.create).not.toHaveBeenCalled()
   })
 
   it('rejects blank tab rename payloads', async () => {

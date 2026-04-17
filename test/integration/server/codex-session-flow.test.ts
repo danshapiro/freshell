@@ -5,16 +5,17 @@ import os from 'os'
 import path from 'path'
 import express from 'express'
 import WebSocket from 'ws'
-import { WsHandler } from '../../../server/ws-handler'
-import { TerminalRegistry } from '../../../server/terminal-registry'
-import { CodingCliSessionManager } from '../../../server/coding-cli/session-manager'
-import { codexProvider } from '../../../server/coding-cli/providers/codex'
-import { configStore } from '../../../server/config-store'
-import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
+import { WsHandler } from '../../../server/ws-handler.js'
+import { TerminalRegistry } from '../../../server/terminal-registry.js'
+import { CodexAppServerRuntime } from '../../../server/coding-cli/codex-app-server/runtime.js'
+import { CodexLaunchPlanner } from '../../../server/coding-cli/codex-app-server/launch-planner.js'
+import { configStore } from '../../../server/config-store.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
-vi.mock('../../../server/config-store', () => ({
+vi.mock('../../../server/config-store.js', () => ({
   configStore: {
     snapshot: vi.fn(),
+    pushRecentDirectory: vi.fn().mockResolvedValue(undefined),
   },
 }))
 
@@ -35,48 +36,22 @@ vi.mock('../../../server/logger', () => {
 process.env.AUTH_TOKEN = 'test-token'
 
 const MESSAGE_TIMEOUT_MS = 5_000
+const FAKE_APP_SERVER_PATH = path.resolve(
+  process.cwd(),
+  'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
+)
 
 async function writeFakeCodexExecutable(binaryPath: string) {
   const script = `#!/usr/bin/env node
 const fs = require('fs')
 
-const sessionId = 'fake-codex-session-1'
 const argLogPath = process.env.FAKE_CODEX_ARG_LOG
 if (argLogPath) {
   fs.writeFileSync(argLogPath, JSON.stringify(process.argv.slice(2)), 'utf8')
 }
 
-const events = [
-  {
-    type: 'session_meta',
-    payload: {
-      id: sessionId,
-      cwd: process.cwd(),
-      model: 'gpt-5-codex',
-    },
-  },
-  {
-    type: 'event_msg',
-    session_id: sessionId,
-    payload: {
-      type: 'agent_message',
-      message: 'hello world',
-    },
-  },
-]
-
-let index = 0
-const emitNext = () => {
-  if (index >= events.length) {
-    setTimeout(() => process.exit(0), 10)
-    return
-  }
-  process.stdout.write(JSON.stringify(events[index]) + '\\n')
-  index += 1
-  setTimeout(emitNext, 10)
-}
-
-emitNext()
+process.stdout.write('codex remote attached\\n')
+setTimeout(() => process.exit(0), 50)
 `
 
   await fsp.writeFile(binaryPath, script, 'utf8')
@@ -122,6 +97,19 @@ function waitForMessage(
     ws.on('error', onError)
     ws.on('close', onClose)
   })
+}
+
+async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await fsp.access(filePath)
+      return
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+  }
+  throw new Error(`Timed out waiting for file: ${filePath}`)
 }
 
 async function createAuthenticatedWs(port: number): Promise<WebSocket> {
@@ -180,7 +168,8 @@ describe('Codex Session Flow Integration', () => {
   let port: number
   let wsHandler: WsHandler
   let registry: TerminalRegistry
-  let cliManager: CodingCliSessionManager
+  let runtime: CodexAppServerRuntime
+  let planner: CodexLaunchPlanner
 
   beforeAll(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-flow-'))
@@ -196,8 +185,12 @@ describe('Codex Session Flow Integration', () => {
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    cliManager = new CodingCliSessionManager([codexProvider])
-    wsHandler = new WsHandler(server, registry, cliManager)
+    runtime = new CodexAppServerRuntime({
+      command: process.execPath,
+      commandArgs: [FAKE_APP_SERVER_PATH],
+    })
+    planner = new CodexLaunchPlanner(runtime)
+    wsHandler = new WsHandler(server, registry, { codexLaunchPlanner: planner })
 
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
@@ -212,7 +205,12 @@ describe('Codex Session Flow Integration', () => {
       settings: {
         codingCli: {
           enabledProviders: ['codex'],
-          providers: {},
+          providers: {
+            codex: {
+              model: 'gpt-5-codex',
+              sandbox: 'workspace-write',
+            },
+          },
         },
       },
     })
@@ -231,75 +229,52 @@ describe('Codex Session Flow Integration', () => {
       process.env.FAKE_CODEX_ARG_LOG = previousFakeCodexArgLog
     }
 
-    cliManager.shutdown()
+    await runtime.shutdown()
     registry.shutdown()
     wsHandler.close()
     await new Promise<void>((resolve) => server.close(() => resolve()))
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('creates a codex session and streams parsed provider events from a local codex executable', async () => {
+  it('starts the exact codex thread before PTY spawn and launches the TUI in remote mode', async () => {
     const ws = await createAuthenticatedWs(port)
-    const observedMessages: any[] = []
-    const onMessage = (data: WebSocket.Data) => {
-      observedMessages.push(JSON.parse(data.toString()))
-    }
-    ws.on('message', onMessage)
 
     try {
       ws.send(JSON.stringify({
-        type: 'codingcli.create',
+        type: 'terminal.create',
         requestId: 'test-req-codex',
-        provider: 'codex',
-        prompt: 'say "hello world" and nothing else',
+        mode: 'codex',
+        cwd: tempDir,
       }))
 
       const created = await waitForMessage(
         ws,
-        (msg) => msg.type === 'codingcli.created' && msg.requestId === 'test-req-codex',
+        (msg) => (
+          msg.requestId === 'test-req-codex'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
       )
-      const exited = await waitForMessage(
-        ws,
-        (msg) => msg.type === 'codingcli.exit' && msg.sessionId === created.sessionId,
-      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
 
-      const eventMessages = observedMessages
-        .filter((msg) => msg.type === 'codingcli.event' && msg.sessionId === created.sessionId)
-        .map((msg) => msg.event)
+      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
 
-      expect(created.provider).toBe('codex')
-      expect(exited.exitCode).toBe(0)
-      expect(eventMessages).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            type: 'session.start',
-            sessionId: 'fake-codex-session-1',
-            provider: 'codex',
-            session: expect.objectContaining({
-              cwd: process.cwd(),
-              model: 'gpt-5-codex',
-            }),
-          }),
-          expect.objectContaining({
-            type: 'message.assistant',
-            sessionId: 'fake-codex-session-1',
-            provider: 'codex',
-            message: {
-              role: 'assistant',
-              content: 'hello world',
-            },
-          }),
-        ]),
-      )
+      const record = registry.get(created.terminalId)
+      expect(record?.resumeSessionId).toBe('thread-new-1')
 
+      await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
-      expect(recordedArgs).toEqual([
-        'exec',
-        '--json',
-        'say "hello world" and nothing else',
+      expect(recordedArgs.slice(0, 2)).toEqual([
+        '--remote',
+        expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
+      expect(recordedArgs).toContain('resume')
+      expect(recordedArgs).toContain('thread-new-1')
+      expect(recordedArgs).toContain('tui.notification_method=bel')
+      expect(recordedArgs).not.toContain('--model')
+      expect(recordedArgs).not.toContain('--sandbox')
     } finally {
-      ws.off('message', onMessage)
       await closeWebSocket(ws)
     }
   })
