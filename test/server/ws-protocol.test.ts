@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
+import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -236,6 +237,7 @@ describe('ws protocol', () => {
   let WsHandler: any
   let handler: any
   let registry: FakeRegistry
+  let codexLaunchPlanner: FakeCodexLaunchPlanner
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
@@ -251,7 +253,8 @@ describe('ws protocol', () => {
       res.end()
     })
     registry = new FakeRegistry()
-    handler = new WsHandler(server, registry as any)
+    codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    handler = new WsHandler(server, registry as any, { codexLaunchPlanner })
     const info = await listen(server)
     port = info.port
   }, HOOK_TIMEOUT_MS)
@@ -265,6 +268,7 @@ describe('ws protocol', () => {
     registry.inputCalls = []
     registry.resizeCalls = []
     registry.killCalls = []
+    codexLaunchPlanner.planCreateCalls = []
   })
 
   afterAll(async () => {
@@ -420,10 +424,18 @@ describe('ws protocol', () => {
     )
 
     expect(registry.createCalls).toHaveLength(1)
-    expect(registry.createCalls[0]?.providerSettings).toEqual({
-      permissionMode: undefined,
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+      approvalPolicy: undefined,
+      cwd: undefined,
       model: 'gpt-5-codex',
+      resumeSessionId: undefined,
       sandbox: 'workspace-write',
+    }])
+    expect(registry.createCalls[0]?.resumeSessionId).toBe('thread-new-1')
+    expect(registry.createCalls[0]?.providerSettings).toEqual({
+      codexAppServer: {
+        wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
+      },
     })
 
     await closeWebSocket(ws)

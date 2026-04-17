@@ -7,6 +7,7 @@ import express from 'express'
 import http from 'http'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { LayoutStore } from '../../server/agent-api/layout-store'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 function startTestServer(
   layoutStoreOverrides: Partial<Record<string, any>> = {},
@@ -14,6 +15,7 @@ function startTestServer(
 ) {
   const app = express()
   app.use(express.json())
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   app.use('/api', createAgentApiRouter({
     layoutStore: {
       listTabs: () => ([{ id: 'tab_1', title: 'Alpha', activePaneId: 'pane_1' }]),
@@ -35,6 +37,7 @@ function startTestServer(
     },
     wsHandler: options.wsHandler,
     codexActivityTracker: options.codexActivityTracker,
+    codexLaunchPlanner,
   }))
 
   const server = http.createServer(app)
@@ -87,6 +90,7 @@ async function startTestServerWithRealLayoutStore() {
   const layoutStore = new LayoutStore()
   const app = express()
   app.use(express.json())
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
 
   let terminalCount = 0
   app.use('/api', createAgentApiRouter({
@@ -96,6 +100,7 @@ async function startTestServerWithRealLayoutStore() {
       get: () => undefined,
       input: () => {},
     },
+    codexLaunchPlanner,
   }))
 
   const server = http.createServer(app)

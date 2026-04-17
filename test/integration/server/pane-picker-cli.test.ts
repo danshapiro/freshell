@@ -7,6 +7,7 @@ import request from 'supertest'
 import { detectPlatform, detectAvailableClis } from '../../../server/platform.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
 import { createPlatformRouter } from '../../../server/platform-router'
+import { FakeCodexLaunchPlanner } from '../../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -269,6 +270,7 @@ describe('Pane Picker CLI Integration', () => {
     let port: number
     let WsHandler: any
     let registry: FakeRegistry
+    let codexLaunchPlanner: FakeCodexLaunchPlanner
 
     beforeAll(async () => {
       process.env.NODE_ENV = 'test'
@@ -284,7 +286,8 @@ describe('Pane Picker CLI Integration', () => {
         res.end()
       })
       registry = new FakeRegistry()
-      new WsHandler(server, registry as any)
+      codexLaunchPlanner = new FakeCodexLaunchPlanner()
+      new WsHandler(server, registry as any, { codexLaunchPlanner })
       const info = await listen(server)
       port = info.port
     }, HOOK_TIMEOUT_MS)
