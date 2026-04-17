@@ -174,9 +174,11 @@ export class CodexAppServerClient {
       return
     }
 
-    const notification = CodexRpcNotificationEnvelopeSchema.safeParse(parsed)
-    if (notification.success) {
-      return
+    if (!this.hasOwnProperty(parsed, 'id')) {
+      const notification = CodexRpcNotificationEnvelopeSchema.safeParse(parsed)
+      if (notification.success) {
+        return
+      }
     }
 
     const success = CodexRpcSuccessEnvelopeSchema.safeParse(parsed)
@@ -214,6 +216,9 @@ export class CodexAppServerClient {
   }
 
   private async request<TParams extends object>(method: string, params: TParams): Promise<unknown> {
+    if (method !== 'initialize' && !this.initializePromise) {
+      await this.initialize()
+    }
     const socket = await this.ensureSocket()
     const id = this.nextRequestId++
 
@@ -241,5 +246,9 @@ export class CodexAppServerClient {
 
   private formatRpcError(method: string, error: CodexRpcError): string {
     return `Codex app-server ${method} failed: ${error.message}`
+  }
+
+  private hasOwnProperty(value: unknown, key: string): boolean {
+    return !!value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, key)
   }
 }

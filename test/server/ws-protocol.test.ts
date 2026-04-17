@@ -441,6 +441,43 @@ describe('ws protocol', () => {
     await closeWebSocket(ws)
   })
 
+  it('returns INVALID_MESSAGE when persisted Codex settings are invalid', async () => {
+    mockConfigStore.snapshot.mockResolvedValue({
+      ...defaultConfigSnapshot(),
+      settings: {
+        codingCli: {
+          providers: {
+            codex: {
+              sandbox: 'totally-open',
+            },
+          },
+        },
+      },
+    })
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-codex-invalid-settings'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
+
+    const error = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(error.code).toBe('INVALID_MESSAGE')
+    expect(error.message).toBe(
+      'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+    )
+    expect(registry.createCalls).toHaveLength(0)
+    await closeWebSocket(ws)
+  })
+
   it('accepts shell parameter with system default', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))

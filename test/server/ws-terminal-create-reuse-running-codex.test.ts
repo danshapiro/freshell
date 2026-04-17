@@ -2,11 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const HOOK_TIMEOUT_MS = 30_000
 const MESSAGE_TIMEOUT_MS = 5_000
 const CODEX_SESSION_ID = 'codex-session-abc-123'
-const CODEX_REMOTE_WS_URL = 'ws://127.0.0.1:43123'
+const CODEX_REMOTE_WS_URL = DEFAULT_CODEX_REMOTE_WS_URL
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -258,25 +259,6 @@ class FakeRegistry {
   }
 
   list() { return [] }
-}
-
-class FakeCodexLaunchPlanner {
-  planCreateCalls: any[] = []
-
-  constructor(
-    private readonly plan: {
-      sessionId: string
-      remote: { wsUrl: string }
-    } = {
-      sessionId: 'thread-new-1',
-      remote: { wsUrl: CODEX_REMOTE_WS_URL },
-    },
-  ) {}
-
-  async planCreate(input: any) {
-    this.planCreateCalls.push(input)
-    return this.plan
-  }
 }
 
 describe('terminal.create reuse running codex terminal', () => {

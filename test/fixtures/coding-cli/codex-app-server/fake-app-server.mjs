@@ -41,6 +41,7 @@ function successResult(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+const closeSocketAfterMethodsOnce = new Set(behavior.closeSocketAfterMethodsOnce || [])
 const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
@@ -79,6 +80,9 @@ wss.on('connection', (socket) => {
       id: message.id,
       result: override?.result ?? successResult(method, message.params),
     }))
+    if (closeSocketAfterMethodsOnce.delete(method)) {
+      setTimeout(() => socket.close(), 0)
+    }
   })
 })
 

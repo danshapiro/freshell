@@ -11,6 +11,7 @@ const __dirname = path.dirname(__filename)
 const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs')
 
 type FakeServerBehavior = {
+  closeSocketAfterMethodsOnce?: string[]
   ignoreMethods?: string[]
   requireJsonRpc?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
@@ -136,6 +137,18 @@ describe('CodexAppServerClient', () => {
       cwd: '/repo/worktree',
     })).resolves.toEqual({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+    })
+  })
+
+  it('re-initializes after the app-server drops the websocket without exiting', async () => {
+    const server = await startFakeCodexAppServer({ closeSocketAfterMethodsOnce: ['initialize'] })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+      threadId: 'thread-new-1',
     })
   })
 

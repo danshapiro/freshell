@@ -34,6 +34,7 @@ import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
 import type { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
+  CodexLaunchConfigError,
   getCodexSessionBindingReason,
   normalizeCodexSandboxSetting,
 } from './coding-cli/codex-launch-config.js'
@@ -1732,7 +1733,7 @@ export class WsHandler {
           }
           log.warn({ err, connectionId: ws.connectionId }, 'terminal.create failed')
           this.sendError(ws, {
-            code: 'PTY_SPAWN_FAILED',
+            code: err instanceof CodexLaunchConfigError ? 'INVALID_MESSAGE' : 'PTY_SPAWN_FAILED',
             message: err?.message || 'Failed to spawn PTY',
             requestId: m.requestId,
           })

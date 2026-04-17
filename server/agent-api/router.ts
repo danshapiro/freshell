@@ -653,7 +653,8 @@ export function createAgentApiRouter({
       const message = result.matched ? 'run complete' : 'timeout waiting for command'
       return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
     } catch (err: any) {
-      return res.status(500).json(fail(err?.message || 'Failed to run command'))
+      const status = err instanceof CodexLaunchConfigError ? 400 : 500
+      return res.status(status).json(fail(err?.message || 'Failed to run command'))
     }
   })
 
