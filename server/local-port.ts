@@ -20,7 +20,7 @@ export async function allocateLocalhostPort(): Promise<LoopbackServerEndpoint> {
     server.listen(0, '127.0.0.1', () => {
       const address = server.address()
       if (!address || typeof address === 'string') {
-        server.close(() => reject(new Error('Failed to allocate a localhost control port for OpenCode.')))
+        server.close(() => reject(new Error('Failed to allocate a localhost loopback control port.')))
         return
       }
 

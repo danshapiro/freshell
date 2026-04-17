@@ -160,7 +160,7 @@ describe('CodexAppServerRuntime', () => {
     const { blocker, endpoint } = await occupyLoopbackPort()
     let first = true
     const runtime = createRuntime({
-      startupRetryLimit: 3,
+      startupAttemptLimit: 3,
       startupAttemptTimeoutMs: 200,
       portAllocator: async () => {
         if (first) {

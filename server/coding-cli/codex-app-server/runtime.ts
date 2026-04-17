@@ -15,12 +15,12 @@ type RuntimeOptions = {
   commandArgs?: string[]
   env?: NodeJS.ProcessEnv
   requestTimeoutMs?: number
-  startupRetryLimit?: number
+  startupAttemptLimit?: number
   startupAttemptTimeoutMs?: number
   portAllocator?: () => Promise<LoopbackServerEndpoint>
 }
 
-const DEFAULT_STARTUP_RETRY_LIMIT = 2
+const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
 const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
 const STARTUP_POLL_MS = 50
 
@@ -39,7 +39,7 @@ export class CodexAppServerRuntime {
   private readonly commandArgs: string[]
   private readonly env?: NodeJS.ProcessEnv
   private readonly requestTimeoutMs?: number
-  private readonly startupRetryLimit: number
+  private readonly startupAttemptLimit: number
   private readonly startupAttemptTimeoutMs: number
   private readonly portAllocator: () => Promise<LoopbackServerEndpoint>
 
@@ -48,7 +48,7 @@ export class CodexAppServerRuntime {
     this.commandArgs = options.commandArgs ?? []
     this.env = options.env
     this.requestTimeoutMs = options.requestTimeoutMs
-    this.startupRetryLimit = options.startupRetryLimit ?? DEFAULT_STARTUP_RETRY_LIMIT
+    this.startupAttemptLimit = options.startupAttemptLimit ?? DEFAULT_STARTUP_ATTEMPT_LIMIT
     this.startupAttemptTimeoutMs = options.startupAttemptTimeoutMs ?? DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS
     this.portAllocator = options.portAllocator ?? allocateLocalhostPort
   }
@@ -111,7 +111,7 @@ export class CodexAppServerRuntime {
   private async startRuntime(): Promise<ReadyState> {
     let lastError: Error | undefined
 
-    for (let attempt = 1; attempt <= this.startupRetryLimit; attempt += 1) {
+    for (let attempt = 1; attempt <= this.startupAttemptLimit; attempt += 1) {
       const endpoint = await this.portAllocator()
       const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
       const child = spawn(this.command, [
@@ -154,7 +154,7 @@ export class CodexAppServerRuntime {
     }
 
     throw new Error(
-      `Failed to start Codex app-server on a loopback endpoint after ${this.startupRetryLimit} attempts: ${lastError?.message ?? 'unknown error'}`,
+      `Failed to start Codex app-server on a loopback endpoint after ${this.startupAttemptLimit} attempts: ${lastError?.message ?? 'unknown error'}`,
     )
   }
 

@@ -360,7 +360,6 @@ export type TerminalRecord = {
   title: string
   description?: string
   mode: TerminalMode
-  opencodeServer?: LoopbackServerEndpoint
   resumeSessionId?: string
   pendingResumeName?: string
   createdAt: number
@@ -1176,7 +1175,6 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
-      opencodeServer: opts.mode === 'opencode' ? opts.providerSettings?.opencodeServer : undefined,
       resumeSessionId: undefined,
       createdAt,
       lastActivityAt: createdAt,

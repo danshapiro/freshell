@@ -177,7 +177,7 @@ export class CodexAppServerClient {
       return
     }
 
-    if (!this.hasOwnProperty(parsed, 'id')) {
+    if (!this.hasIdField(parsed)) {
       const notification = CodexRpcNotificationEnvelopeSchema.safeParse(parsed)
       if (notification.success) {
         return
@@ -254,7 +254,7 @@ export class CodexAppServerClient {
     return `Codex app-server ${method} failed: ${error.message}`
   }
 
-  private hasOwnProperty(value: unknown, key: string): boolean {
-    return !!value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, key)
+  private hasIdField(value: unknown): boolean {
+    return !!value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'id')
   }
 }
