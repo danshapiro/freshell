@@ -87,8 +87,9 @@ describe('tab endpoints', () => {
     app.use(express.json())
     const registry = new FakeRegistry()
     const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
     const layoutStore = {
-      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      createTab,
       attachPaneContent: () => {},
       selectTab: () => ({}),
       renameTab: () => ({}),
@@ -111,6 +112,7 @@ describe('tab endpoints', () => {
       message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
     })
     expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+    expect(createTab).not.toHaveBeenCalled()
     expect(registry.create).not.toHaveBeenCalled()
   })
 

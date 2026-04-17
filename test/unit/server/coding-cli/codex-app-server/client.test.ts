@@ -12,8 +12,10 @@ const FAKE_SERVER_PATH = path.resolve(__dirname, '../../../../fixtures/coding-cl
 
 type FakeServerBehavior = {
   closeSocketAfterMethodsOnce?: string[]
+  delayMethodsMs?: Record<string, number>
   ignoreMethods?: string[]
   requireJsonRpc?: boolean
+  requireInitializeBeforeOtherMethods?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
 }
 
@@ -148,6 +150,24 @@ describe('CodexAppServerClient', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+      threadId: 'thread-new-1',
+    })
+  })
+
+  it('waits for an in-flight initialize before sending thread/start', async () => {
+    const server = await startFakeCodexAppServer({
+      delayMethodsMs: { initialize: 50 },
+      requireInitializeBeforeOtherMethods: true,
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    const initializePromise = client.initialize()
+    const startThreadPromise = client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(initializePromise).resolves.toMatchObject({
+      protocolVersion: expect.any(String),
+    })
+    await expect(startThreadPromise).resolves.toEqual({
       threadId: 'thread-new-1',
     })
   })

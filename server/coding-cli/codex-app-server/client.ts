@@ -216,8 +216,8 @@ export class CodexAppServerClient {
   }
 
   private async request<TParams extends object>(method: string, params: TParams): Promise<unknown> {
-    if (method !== 'initialize' && !this.initializePromise) {
-      await this.initialize()
+    if (method !== 'initialize') {
+      await (this.initializePromise ?? this.initialize())
     }
     const socket = await this.ensureSocket()
     const id = this.nextRequestId++

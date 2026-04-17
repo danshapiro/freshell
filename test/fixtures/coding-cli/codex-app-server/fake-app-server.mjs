@@ -49,6 +49,7 @@ const port = Number(url.port)
 const wss = new WebSocketServer({ host, port })
 
 wss.on('connection', (socket) => {
+  let initialized = false
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
     if (behavior.requireJsonRpc && message.jsonrpc !== '2.0') {
@@ -63,26 +64,45 @@ wss.on('connection', (socket) => {
     }
     const method = message.method
 
+    if (behavior.requireInitializeBeforeOtherMethods && method !== 'initialize' && !initialized) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32000,
+          message: 'initialize must complete before other RPC methods',
+        },
+      }))
+      return
+    }
+
     if (behavior.ignoreMethods?.includes(method)) {
       return
     }
 
     const override = behavior.overrides?.[method]
+    const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     if (override?.error) {
-      socket.send(JSON.stringify({
-        id: message.id,
-        error: override.error,
-      }))
+      setTimeout(() => {
+        socket.send(JSON.stringify({
+          id: message.id,
+          error: override.error,
+        }))
+      }, delayMs)
       return
     }
 
-    socket.send(JSON.stringify({
-      id: message.id,
-      result: override?.result ?? successResult(method, message.params),
-    }))
-    if (closeSocketAfterMethodsOnce.delete(method)) {
-      setTimeout(() => socket.close(), 0)
-    }
+    setTimeout(() => {
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: override?.result ?? successResult(method, message.params),
+      }))
+      if (method === 'initialize') {
+        initialized = true
+      }
+      if (closeSocketAfterMethodsOnce.delete(method)) {
+        setTimeout(() => socket.close(), 0)
+      }
+    }, delayMs)
   })
 })
 

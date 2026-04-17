@@ -101,3 +101,45 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
     }),
   }))
 })
+
+it('rejects invalid Codex settings for /api/run before creating a tab', async () => {
+  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
+  const registry = {
+    create: vi.fn(() => ({ terminalId: 'term1' })),
+    input: vi.fn(() => true),
+  }
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      createTab,
+      attachPaneContent: () => {},
+    },
+    registry,
+    codexLaunchPlanner,
+    configStore: {
+      getSettings: async () => ({
+        codingCli: {
+          providers: {
+            codex: {
+              sandbox: 'totally-open',
+            },
+          },
+        },
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(createTab).not.toHaveBeenCalled()
+  expect(registry.create).not.toHaveBeenCalled()
+})

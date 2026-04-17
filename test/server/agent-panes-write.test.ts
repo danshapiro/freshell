@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 it('splits a pane horizontally', async () => {
   const app = express()
@@ -23,6 +24,80 @@ it('splits a pane horizontally', async () => {
     envContext: { tabId: 'tab_1', paneId: 'pane_new' },
   }))
   expect(attachPaneContent).toHaveBeenCalled()
+})
+
+it('rejects invalid Codex settings when splitting a pane before spawning', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+    configStore: {
+      getSettings: async () => ({
+        codingCli: {
+          providers: {
+            codex: {
+              sandbox: 'totally-open',
+            },
+          },
+        },
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
+it('rejects invalid Codex settings when respawning a pane before spawning', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+    configStore: {
+      getSettings: async () => ({
+        codingCli: {
+          providers: {
+            codex: {
+              sandbox: 'totally-open',
+            },
+          },
+        },
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
+
+  expect(res.status).toBe(400)
+  expect(res.body).toEqual({
+    status: 'error',
+    message: 'Invalid Codex sandbox setting "totally-open". Expected read-only, workspace-write, or danger-full-access.',
+  })
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([])
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
 it('resolves tmux-style pane targets for close', async () => {
