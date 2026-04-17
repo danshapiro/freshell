@@ -744,6 +744,182 @@ describe('version 5 migration (drop claude-chat panes)', () => {
   })
 })
 
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '../../../../src/store/storage-keys'
+
+describe('legacy agent-chat display settings migration', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+    resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
+  })
+
+  it('migrates showThinking/showTools/showTimecodes from agent-chat panes to browser preferences', async () => {
+    localStorageMock.clear()
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'claude',
+              createRequestId: 'req1',
+              status: 'idle',
+              showThinking: true,
+              showTools: true,
+              showTimecodes: true,
+            },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    vi.resetModules()
+    const { default: freshPanesReducer } = await import('../../../../src/store/panesSlice')
+    const store = configureStore({ reducer: { panes: freshPanesReducer } })
+    const content = (store.getState().panes.layouts['tab1'] as any).content
+
+    expect(content.showThinking).toBeUndefined()
+    expect(content.showTools).toBeUndefined()
+    expect(content.showTimecodes).toBeUndefined()
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.agentChat).toEqual({
+      showThinking: true,
+      showTools: true,
+      showTimecodes: true,
+    })
+  })
+
+  it('migrates legacy display settings from panes inside splits', async () => {
+    localStorageMock.clear()
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          tab1: {
+            type: 'split',
+            id: 'split1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane1',
+                content: { kind: 'terminal', createRequestId: 'req1', status: 'running', mode: 'shell' },
+              },
+              {
+                type: 'leaf',
+                id: 'pane2',
+                content: {
+                  kind: 'agent-chat',
+                  provider: 'claude',
+                  createRequestId: 'req2',
+                  status: 'idle',
+                  showTools: true,
+                },
+              },
+            ],
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    vi.resetModules()
+    const { default: freshPanesReducer } = await import('../../../../src/store/panesSlice')
+    const store = configureStore({ reducer: { panes: freshPanesReducer } })
+    const split = store.getState().panes.layouts['tab1'] as any
+
+    expect(split.children[1].content.showTools).toBeUndefined()
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.agentChat.showTools).toBe(true)
+  })
+
+  it('does not touch panes that have no legacy fields', async () => {
+    localStorageMock.clear()
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: { kind: 'terminal', createRequestId: 'req1', status: 'running', mode: 'shell' },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    vi.resetModules()
+    const { default: freshPanesReducer } = await import('../../../../src/store/panesSlice')
+    configureStore({ reducer: { panes: freshPanesReducer } })
+
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
+  })
+
+  it('merges with existing browser preferences without clobbering', async () => {
+    localStorageMock.clear()
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: { theme: 'dark' },
+      tabs: { searchRangeDays: 60 },
+    }))
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'claude',
+              createRequestId: 'req1',
+              status: 'idle',
+              showThinking: true,
+            },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    vi.resetModules()
+    const { default: freshPanesReducer } = await import('../../../../src/store/panesSlice')
+    configureStore({ reducer: { panes: freshPanesReducer } })
+
+    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(bp.settings.theme).toBe('dark')
+    expect(bp.tabs.searchRangeDays).toBe(60)
+    expect(bp.settings.agentChat.showThinking).toBe(true)
+  })
+})
+
 describe('schema version consistency', () => {
   beforeEach(() => {
     localStorageMock.clear()

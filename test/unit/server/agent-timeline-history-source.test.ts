@@ -106,7 +106,7 @@ describe('agent timeline history source', () => {
       kind: 'resolved',
       readiness: 'live_only',
       liveSessionId: 'sdk-gone',
-      timelineSessionId: 'named-only',
+      timelineSessionId: undefined,
     })
 
     await expect(source.resolve('named-only')).resolves.toMatchObject({

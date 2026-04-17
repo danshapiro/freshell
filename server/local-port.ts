@@ -5,6 +5,8 @@ export type LoopbackServerEndpoint = {
   port: number
 }
 
+export type OpencodeServerEndpoint = LoopbackServerEndpoint
+
 // This is a best-effort ephemeral port reservation. There is an unavoidable race
 // between closing this probe socket and the child process binding the same port,
 // so callers must still be prepared to retry startup if the CLI loses the bind.

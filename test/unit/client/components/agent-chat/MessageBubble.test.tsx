@@ -63,6 +63,7 @@ describe('MessageBubble', () => {
       <MessageBubble
         role="assistant"
         content={[{ type: 'thinking', thinking: 'Let me think...' }]}
+        showThinking={true}
       />
     )
     expect(screen.getByText(/Thinking/)).toBeInTheDocument()
@@ -235,7 +236,7 @@ describe('MessageBubble display toggles', () => {
     expect(screen.getByRole('article').querySelector('time')).not.toBeInTheDocument()
   })
 
-  it('defaults to showing thinking and tools, hiding timecodes', () => {
+  it('defaults to hiding thinking, tools, and timecodes', () => {
     render(
       <MessageBubble
         role="assistant"
@@ -243,7 +244,7 @@ describe('MessageBubble display toggles', () => {
         timestamp="2026-02-13T10:00:00Z"
       />
     )
-    expect(screen.getByText(/Let me think/)).toBeInTheDocument()
+    expect(screen.queryByText(/Let me think/)).not.toBeInTheDocument()
     expect(screen.getByRole('region', { name: /tool strip/i })).toBeInTheDocument()
     expect(screen.getByRole('article').querySelector('time')).not.toBeInTheDocument()
   })
@@ -476,6 +477,7 @@ describe('MessageBubble tool strip grouping', () => {
           { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
           { type: 'tool_result', tool_use_id: 't1', content: 'output' },
         ]}
+        showThinking={true}
         showTools={true}
       />
     )

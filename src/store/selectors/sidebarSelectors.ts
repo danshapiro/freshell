@@ -69,6 +69,7 @@ export function buildSessionItems(
   worktreeGrouping: WorktreeGrouping = 'repo',
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
+  const itemsByKey = new Map<string, SidebarSessionItem>()
   const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[] }>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
@@ -108,7 +109,7 @@ export function buildSessionItems(
       const effectivePath = worktreeGrouping === 'worktree'
         ? (session.checkoutPath || project.projectPath)
         : project.projectPath
-      items.push({
+      const item: SidebarSessionItem = {
         id: `session-${provider}-${session.sessionId}`,
         sessionId: session.sessionId,
         provider,
@@ -129,11 +130,13 @@ export function buildSessionItems(
         isSubagent: session.isSubagent,
         isNonInteractive: session.isNonInteractive,
         firstUserMessage: session.firstUserMessage,
-      })
+        isFallback: undefined,
+      }
+      items.push(item)
+      itemsByKey.set(key, item)
     }
   }
 
-  const knownKeys = new Set(items.map((item) => `${item.provider}:${item.sessionId}`))
   const paneTitles = panes?.paneTitles ?? {}
 
   const pushFallbackItem = (input: {
@@ -146,14 +149,39 @@ export function buildSessionItems(
     metadata?: SessionListMetadata
   }) => {
     const key = `${input.provider}:${input.sessionId}`
-    if (knownKeys.has(key)) return
-    knownKeys.add(key)
+    const existing = itemsByKey.get(key)
+    if (existing) {
+      existing.hasTab = true
+      existing.timestamp = Math.max(existing.timestamp, input.timestamp ?? 0)
+      const fallbackTitle = input.title?.trim()
+      if (!existing.hasTitle && fallbackTitle) {
+        existing.title = fallbackTitle
+        existing.hasTitle = true
+      }
+      const fallbackSessionType = input.metadata?.sessionType || input.sessionType
+      if (fallbackSessionType && (!existing.sessionType || existing.sessionType === existing.provider)) {
+        existing.sessionType = fallbackSessionType
+      }
+      if (!existing.cwd && input.cwd) {
+        existing.cwd = input.cwd
+      }
+      if (!existing.firstUserMessage && input.metadata?.firstUserMessage) {
+        existing.firstUserMessage = input.metadata.firstUserMessage
+      }
+      if (existing.isSubagent === undefined && input.metadata?.isSubagent !== undefined) {
+        existing.isSubagent = input.metadata.isSubagent
+      }
+      if (existing.isNonInteractive === undefined && input.metadata?.isNonInteractive !== undefined) {
+        existing.isNonInteractive = input.metadata.isNonInteractive
+      }
+      return
+    }
 
     const fallbackTitle = input.title?.trim() || input.sessionId.slice(0, 8)
     const runningTerminal = runningSessionMap.get(key)
     const runningTerminalId = runningTerminal?.terminalId
     const runningTerminalIds = runningTerminal?.allTerminalIds
-    items.push({
+    const item: SidebarSessionItem = {
       id: `session-${input.provider}-${input.sessionId}`,
       sessionId: input.sessionId,
       provider: input.provider,
@@ -173,7 +201,9 @@ export function buildSessionItems(
       isNonInteractive: input.metadata?.isNonInteractive,
       firstUserMessage: input.metadata?.firstUserMessage,
       isFallback: true,
-    })
+    }
+    items.push(item)
+    itemsByKey.set(key, item)
   }
 
   const collectFallbackItemsFromNode = (
@@ -323,7 +353,7 @@ export function filterSessionItemsByVisibility(
     if (!settings.showSubagents && item.isSubagent) return false
     if (settings.ignoreCodexSubagents && item.isSubagent && item.provider === 'codex') return false
     if (shouldHideAsNonInteractive(item, settings.showNoninteractiveSessions)) return false
-    if (settings.hideEmptySessions && !item.hasTitle) return false
+    if (settings.hideEmptySessions && !item.hasTitle && !item.hasTab && !item.isRunning) return false
     if (isExcludedByFirstUserMessage(item.firstUserMessage, exclusions, settings.excludeFirstChatMustStart)) return false
     return true
   })

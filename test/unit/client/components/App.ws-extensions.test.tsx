@@ -308,4 +308,57 @@ describe('App WS extension messages', () => {
     expect(store.getState().extensions.entries[0].serverRunning).toBe(false)
     expect(store.getState().extensions.entries[0].serverPort).toBeUndefined()
   })
+
+  it('clears stale extension metadata when ready reports a new server instance', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandlers.size).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      broadcastWs({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-old',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.serverInstanceId).toBe('srv-old')
+    })
+
+    const extensions: ClientExtensionEntry[] = [{
+      name: 'test-ext',
+      version: '1.0.0',
+      label: 'Test Extension',
+      description: 'A test extension',
+      category: 'client',
+    }]
+
+    act(() => {
+      broadcastWs({ type: 'extensions.registry', extensions })
+    })
+
+    expect(store.getState().extensions.entries).toEqual(extensions)
+
+    act(() => {
+      broadcastWs({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-new',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.serverInstanceId).toBe('srv-new')
+      expect(store.getState().extensions.entries).toEqual([])
+    })
+  })
 })

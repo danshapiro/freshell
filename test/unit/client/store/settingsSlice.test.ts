@@ -29,7 +29,7 @@ describe('settingsSlice', () => {
     const { default: settingsReducer, defaultSettings } = await importFreshSettingsSlice()
     const state = settingsReducer(undefined, { type: 'unknown' })
 
-    expect(state.serverSettings.terminal.scrollback).toBe(5000)
+    expect(state.serverSettings.terminal.scrollback).toBe(10000)
     expect(state.localSettings.theme).toBe('dark')
     expect(state.localSettings.terminal.fontSize).toBe(18)
     expect(state.settings).toEqual({
@@ -49,7 +49,7 @@ describe('settingsSlice', () => {
     expect(defaultSettings.theme).toBe('system')
     expect(defaultSettings.sidebar.sortMode).toBe('activity')
     expect(defaultSettings.terminal.fontFamily).toBe('monospace')
-    expect(defaultSettings.terminal.scrollback).toBe(5000)
+    expect(defaultSettings.terminal.scrollback).toBe(10000)
   })
 
   it('setServerSettings replaces serverSettings and recomputes the resolved view', async () => {

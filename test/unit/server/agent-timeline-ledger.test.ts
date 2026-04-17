@@ -86,7 +86,7 @@ describe('restore ledger manager', () => {
       kind: 'resolved',
       readiness: 'live_only',
       liveSessionId: 'sdk-live',
-      timelineSessionId: 'named-resume-token',
+      timelineSessionId: undefined,
     })
     if (liveOnly.kind !== 'resolved') throw new Error('expected resolved')
     const initialRevision = liveOnly.revision
@@ -96,7 +96,7 @@ describe('restore ledger manager', () => {
       kind: 'resolved',
       readiness: 'live_only',
       liveSessionId: 'sdk-live',
-      timelineSessionId: 'named-resume-token',
+      timelineSessionId: undefined,
     })
     if (namedAliasLiveOnly.kind !== 'resolved') throw new Error('expected resolved')
     expect(namedAliasLiveOnly.revision).toBe(initialRevision)
@@ -378,7 +378,7 @@ describe('restore ledger manager', () => {
       kind: 'resolved',
       readiness: 'live_only',
       liveSessionId: 'sdk-gone',
-      timelineSessionId: 'named-only',
+      timelineSessionId: undefined,
     })
 
     const beforeTeardown = await manager.resolve('named-only')
@@ -769,7 +769,7 @@ describe('restore ledger manager', () => {
       kind: 'resolved',
       readiness: 'live_only',
       liveSessionId: 'sdk-repeat-upgrade',
-      timelineSessionId: 'named-repeat-upgrade',
+      timelineSessionId: undefined,
     })
 
     liveSession.cliSessionId = canonicalSessionId

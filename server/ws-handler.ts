@@ -18,6 +18,7 @@ import type { SdkBridge } from './sdk-bridge.js'
 import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
 import type {
   CodexActivityRecord,
+  OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
 } from '../shared/ws-protocol.js'
@@ -45,6 +46,9 @@ import {
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
   CodexActivityUpdatedSchema,
+  OpencodeActivityListResponseSchema,
+  OpencodeActivityListSchema,
+  OpencodeActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
   TerminalAttachSchema,
@@ -97,6 +101,7 @@ export type WsHandlerOptions = {
   extensionManager?: ExtensionManager
   codexActivityListProvider?: () => CodexActivityRecord[]
   agentHistorySource?: AgentHistorySource
+  opencodeActivityListProvider?: () => OpencodeActivityRecord[]
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -360,6 +365,7 @@ export class WsHandler {
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
   private codexActivityListProvider?: () => CodexActivityRecord[]
+  private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
@@ -401,6 +407,7 @@ export class WsHandler {
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
     this.terminalMetaListProvider = options.terminalMetaListProvider
     this.codexActivityListProvider = options.codexActivityListProvider
+    this.opencodeActivityListProvider = options.opencodeActivityListProvider
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
     this.extensionManager = options.extensionManager
@@ -479,6 +486,7 @@ export class WsHandler {
       TerminalResizeSchema,
       TerminalKillSchema,
       CodexActivityListSchema,
+      OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
       dynamicCodingCliCreateSchema,
@@ -1656,18 +1664,18 @@ export class WsHandler {
               const spawnProviderSettings = (
                 providerSettings
                   ? {
-                      ...(m.mode === 'codex'
-                        ? {}
-                        : {
-                            permissionMode: providerSettings.permissionMode,
-                            model: providerSettings.model,
-                            sandbox: providerSettings.sandbox,
-                          }),
-                      ...(m.mode === 'opencode'
-                        ? { opencodeServer: await allocateLocalhostPort() }
-                        : {}),
-                      ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
-                    }
+                    ...(m.mode === 'codex'
+                      ? {}
+                      : {
+                        permissionMode: providerSettings.permissionMode,
+                        model: providerSettings.model,
+                        sandbox: providerSettings.sandbox,
+                      }),
+                    ...(m.mode === 'opencode'
+                      ? { opencodeServer: await allocateLocalhostPort() }
+                      : {}),
+                    ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
+                  }
                   : (codexPlan
                     ? { codexAppServer: codexPlan.remote }
                     : undefined)
@@ -1826,6 +1834,26 @@ export class WsHandler {
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
             message: 'Codex activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
+      case 'opencode.activity.list': {
+        const terminals = this.opencodeActivityListProvider ? this.opencodeActivityListProvider() : []
+        const response = OpencodeActivityListResponseSchema.safeParse({
+          type: 'opencode.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid opencode.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'OpenCode activity unavailable',
             requestId: m.requestId,
           })
           return
@@ -2563,6 +2591,21 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid codex.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastOpencodeActivityUpdated(msg: { upsert?: OpencodeActivityRecord[]; remove?: string[] }): void {
+    const parsed = OpencodeActivityUpdatedSchema.safeParse({
+      type: 'opencode.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid opencode.activity.updated payload')
       return
     }
 

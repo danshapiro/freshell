@@ -41,6 +41,17 @@ Use absolute paths for `--cwd` and `--editor`.
 - **Picker panes are ephemeral.** A freshly-created tab without `--mode`/`--browser`/`--editor` starts as a `picker` pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a `picker` pane for splits or other mutations — wait until it resolves to its final kind, or use `--mode`/`--browser`/`--editor` flags on `new-tab`/`split-pane` to skip the picker entirely.
 - Typical loop: `new-tab/split-pane` -> `send-keys` -> `wait-for` -> `capture-pane`/`screenshot-*`.
 
+## Choosing the right action and pane type
+
+- **split-pane vs new-tab:** When the user says "pane", "split", "alongside", "next to", or "side by side", use `split-pane`. Use `new-tab` only when the user explicitly says "tab", "window", or "new [thing]" with no spatial reference. When unsure, `split-pane` is the safer default.
+- **Prefer specialized pane types:** Do NOT open a terminal to run `cat`/`vim`/`nano`/`curl`/`wget` when a dedicated pane type fits.
+  - "open/edit/show a file" -> `split-pane --editor /path/to/file`
+  - "open/show a URL" or "view a webpage" -> `split-pane --browser URL` or `open-browser URL`
+  - "run a command" or "use a CLI tool" -> `split-pane --mode shell` or `new-tab --mode shell`
+- **Sending text:** Use `send-keys -l` for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text — send the command with `-l`, then send `ENTER` as a separate call.
+- **Default targeting (MCP only):** When no target is specified, the MCP tool resolves to your own pane/tab (set by `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`), not the user's active viewport. `split-pane` without a target splits your own pane.
+- **Default direction:** `split-pane` defaults to vertical (top/bottom). Use `-h` for horizontal (left/right).
+
 ## Command reference
 
 Output behavior:
@@ -54,7 +65,8 @@ Targets:
 - Pane target: pane ID, pane index in active tab, or `tabRef.paneIndex`.
 - Omitted target on `rename-tab` means the active tab.
 - Omitted target on `rename-pane` means the active pane in the active tab.
-- Omitted target falls back to active pane in active tab when command supports it.
+- Omitted target on `split-pane` (MCP) means your own pane, not the user's active viewport.
+- Omitted target falls back to active pane in active tab when command supports it (CLI only).
 - If a target or name contains spaces, quote it.
 - Use the flagged `-t/-n` form when you want to make the target and name explicit.
 
@@ -71,7 +83,7 @@ Tab commands:
 - `prev-tab`
 
 Pane/layout commands:
-- `split-pane [-t PANE_TARGET] [-v] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]`
+- `split-pane [-t PANE_TARGET] [-h] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]`
 - `list-panes [-t TAB_TARGET] [--json] [--titles]`
 - `select-pane PANE_TARGET` or `select-pane -t PANE_TARGET`
 - `rename-pane NEW_NAME` - rename the active pane
@@ -177,9 +189,9 @@ SEED_JSON="$($FSH new-tab -n 'Claude x4 Eval' --claude --cwd "$CWD")"
 P0="$(printf '%s' "$SEED_JSON" | jq -r '.data.paneId')"
 J1="$($FSH split-pane -t "$P0" --mode claude --cwd "$CWD")"
 P1="$(printf '%s' "$J1" | jq -r '.data.paneId')"
-J2="$($FSH split-pane -t "$P0" -v --mode claude --cwd "$CWD")"
+J2="$($FSH split-pane -t "$P0" -h --mode claude --cwd "$CWD")"
 P2="$(printf '%s' "$J2" | jq -r '.data.paneId')"
-J3="$($FSH split-pane -t "$P1" -v --mode claude --cwd "$CWD")"
+J3="$($FSH split-pane -t "$P1" -h --mode claude --cwd "$CWD")"
 P3="$(printf '%s' "$J3" | jq -r '.data.paneId')"
 
 for p in "$P0" "$P1" "$P2" "$P3"; do
@@ -203,7 +215,7 @@ done
 
 - Auth header: `x-auth-token: <TOKEN>` (not Bearer).
 - `POST /api/tabs` with `{ name, mode: "shell", shell: "wsl", cwd }` creates a tab with a terminal, bypassing the picker.
-- `POST /api/panes/:id/split` with `{ direction: "horizontal"|"vertical", browser?, editor?, mode?, cwd? }` — always defaults to 50/50.
+- `POST /api/panes/:id/split` with `{ direction: "horizontal"|"vertical", browser?, editor?, mode?, cwd? }` — defaults to vertical; always 50/50.
 - `POST /api/panes/:id/resize` with `{ sizes: [left, right] }` (percentages summing to 100) — call immediately after split to fix proportions.
 - Editor panes show "Loading..." until visited. When screenshotting multiple tabs, visit each tab once first to trigger editor loading, then loop back for screenshots.
 - `DELETE /api/terminals/:id` removes orphaned terminals. Freshell has a 50 PTY limit; orphans from scripted runs accumulate silently.

@@ -6,13 +6,24 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import extensionsReducer, { setRegistry } from '@/store/extensionsSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(),
   onReconnect: vi.fn().mockReturnValue(() => {}),
+}))
+
+const apiMocks = vi.hoisted(() => ({
+  get: vi.fn(),
+}))
+
+const authMocks = vi.hoisted(() => ({
+  getAuthToken: vi.fn(() => undefined),
 }))
 
 const runtimeMockState = vi.hoisted(() => ({
@@ -37,6 +48,12 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: wsMocks.onReconnect,
   }),
 }))
+
+vi.mock('@/lib/api', () => ({
+  api: apiMocks,
+}))
+
+vi.mock('@/lib/auth', () => authMocks)
 
 vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: () => ({}),
@@ -102,6 +119,7 @@ vi.mock('@xterm/xterm', () => {
     onData = vi.fn()
     onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
     attachCustomKeyEventHandler = vi.fn()
+    attachCustomWheelEventHandler = vi.fn()
     getSelection = vi.fn(() => '')
     focus = vi.fn()
 
@@ -145,6 +163,7 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas', mode: TerminalPaneCo
       panes: panesReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       tabs: {
@@ -174,10 +193,25 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas', mode: TerminalPaneCo
         status: 'loaded',
       },
       connection: { status: 'ready', error: null },
+      extensions: { entries: [] },
     },
   })
 
   return { store, tabId, paneId, paneContent, terminalId }
+}
+
+const opencodeExtensionWithBehaviorHint: ClientExtensionEntry = {
+  name: 'opencode',
+  version: '1.0.0',
+  label: 'OpenCode',
+  description: 'OpenCode CLI agent',
+  category: 'cli',
+  cli: {
+    terminalBehavior: {
+      preferredRenderer: 'canvas',
+      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+    },
+  },
 }
 
 describe('TerminalView renderer mode', () => {
@@ -187,6 +221,10 @@ describe('TerminalView renderer mode', () => {
     runtimeMockState.throwOnAttach = false
     runtimeMockState.lastEnableWebgl = null
     runtimeMockState.lastRuntime = null
+    apiMocks.get.mockReset()
+    authMocks.getAuthToken.mockReset()
+    authMocks.getAuthToken.mockReturnValue(undefined)
+    resetEnsureExtensionsRegistryCacheForTests()
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -208,6 +246,7 @@ describe('TerminalView renderer mode', () => {
 
   afterEach(() => {
     cleanup()
+    resetEnsureExtensionsRegistryCacheForTests()
     vi.unstubAllGlobals()
     messageHandler = null
   })
@@ -225,7 +264,7 @@ describe('TerminalView renderer mode', () => {
     })
   })
 
-  it('auto mode keeps OpenCode on canvas by default', async () => {
+  it('auto mode does not force canvas for opencode without a behavior hint', async () => {
     const { store, tabId, paneId, paneContent } = createStore('auto', 'opencode')
     render(
       <Provider store={store}>
@@ -234,6 +273,38 @@ describe('TerminalView renderer mode', () => {
     )
 
     await waitFor(() => {
+      expect(runtimeMockState.lastEnableWebgl).toBe(true)
+    })
+  })
+
+  it('auto mode keeps OpenCode on canvas when the behavior hint prefers it', async () => {
+    const { store, tabId, paneId, paneContent } = createStore('auto', 'opencode')
+    store.dispatch(setRegistry([opencodeExtensionWithBehaviorHint]))
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(runtimeMockState.lastEnableWebgl).toBe(false)
+    })
+  })
+
+  it('waits for extension metadata before choosing the auto renderer for opencode panes', async () => {
+    authMocks.getAuthToken.mockReturnValue('token-test')
+    apiMocks.get.mockResolvedValue([opencodeExtensionWithBehaviorHint])
+    const { store, tabId, paneId, paneContent } = createStore('auto', 'opencode')
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiMocks.get).toHaveBeenCalled()
       expect(runtimeMockState.lastEnableWebgl).toBe(false)
     })
   })

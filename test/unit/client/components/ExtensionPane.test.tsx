@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import ExtensionPane from '@/components/panes/ExtensionPane'
+import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 import extensionsReducer, { updateServerStatus } from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
@@ -50,8 +51,13 @@ afterEach(cleanup)
 describe('ExtensionPane', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    resetEnsureExtensionsRegistryCacheForTests()
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    resetEnsureExtensionsRegistryCacheForTests()
   })
 
   it('renders iframe with correct URL for a server extension', () => {

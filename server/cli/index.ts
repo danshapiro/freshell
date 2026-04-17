@@ -399,7 +399,7 @@ async function main() {
     }
     case 'split-pane': {
       const target = (getFlag(flags, 't', 'target', 'pane') as string | undefined) || args[0]
-      const direction = isTruthy(getFlag(flags, 'v', 'vertical')) ? 'vertical' : 'horizontal'
+      const direction = isTruthy(getFlag(flags, 'h', 'horizontal')) ? 'horizontal' : 'vertical'
       const browser = getFlag(flags, 'browser') as string | undefined
       const editor = getFlag(flags, 'editor') as string | undefined
       const mode = getFlag(flags, 'mode') as string | undefined

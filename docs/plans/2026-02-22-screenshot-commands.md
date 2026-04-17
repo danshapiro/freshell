@@ -1286,11 +1286,11 @@ git commit -m "test+fix(screenshot): add integration coverage for focus-preservi
 
 ---
 
-### Task 8: Update User-Facing Docs (Skill + Mock UI)
+### Task 8: Update User-Facing Docs (MCP Tool + Mock UI)
 
 **Files:**
 - Modify: `docs/index.html`
-- Rewrite: `.claude/skills/freshell-orchestration/SKILL.md` (or the canonical skill path used in this repo/session)
+- Rewrite: `server/mcp/freshell-tool.ts` (the canonical MCP instruction source used in this repo/session)
 
 **Step 1: Write the failing doc check (manual checklist)**
 
@@ -1322,8 +1322,8 @@ Required sections:
 **Step 3: Commit**
 
 ```bash
-git add docs/index.html .claude/skills/freshell-orchestration/SKILL.md
-git commit -m "docs: update screenshot command guidance in mock UI and tmux-style skill"
+git add docs/index.html server/mcp/freshell-tool.ts
+git commit -m "docs: update screenshot command guidance in mock UI and freshell MCP help"
 ```
 
 ---

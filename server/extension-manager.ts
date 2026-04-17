@@ -182,6 +182,7 @@ export class ExtensionManager extends EventEmitter {
           supportsSandbox: manifest.cli.supportsSandbox,
           supportsResume: !!manifest.cli.resumeArgs,
           resumeCommandTemplate,
+          terminalBehavior: manifest.cli.terminalBehavior,
         }
       }
 

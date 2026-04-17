@@ -78,7 +78,7 @@ Commands: `new-tab`, `list-tabs`, `select-tab`, `kill-tab`, `rename-tab`, `split
 
 **Design spec:** `TMUX-SEMANTICS-PROPOSAL.md` (775 lines). Transport is HTTP+token, not Unix sockets.
 
-**Orchestration skill:** `.claude/skills/freshell-orchestration/SKILL.md` provides agent guidance for CLI automation.
+**Orchestration surface:** the `freshell` MCP tool in `server/mcp/freshell-tool.ts` provides the canonical automation guidance and action reference.
 
 ---
 

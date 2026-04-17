@@ -20,6 +20,7 @@ import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
+import { wireOpencodeActivityTracker } from './coding-cli/opencode-activity-wiring.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
@@ -187,6 +188,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
+  const opencodeActivity = wireOpencodeActivityTracker({ registry })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -316,6 +318,7 @@ async function main() {
       extensionManager,
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
+      opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
     },
   )
   attachProxyUpgradeHandler(server)
@@ -355,6 +358,9 @@ async function main() {
 
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
+  })
+  opencodeActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastOpencodeActivityUpdated(payload)
   })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -794,6 +800,7 @@ async function main() {
 
     // 8b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
+    opencodeActivity.dispose()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()

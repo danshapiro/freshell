@@ -68,6 +68,21 @@ describe('POST /api/session-metadata', () => {
     expect(mockRefresh).toHaveBeenCalled()
   })
 
+  it('preserves derivedTitle when the session metadata API updates sessionType', async () => {
+    await sessionMetadataStore.set('claude', 'sess-123', { derivedTitle: 'Sticky title' })
+
+    const res = await request(app)
+      .post('/api/session-metadata')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ provider: 'claude', sessionId: 'sess-123', sessionType: 'agent' })
+
+    expect(res.status).toBe(200)
+    expect(await sessionMetadataStore.get('claude', 'sess-123')).toEqual({
+      sessionType: 'agent',
+      derivedTitle: 'Sticky title',
+    })
+  })
+
   it('returns 400 when provider is missing', async () => {
     const res = await request(app)
       .post('/api/session-metadata')

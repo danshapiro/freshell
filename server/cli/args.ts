@@ -10,7 +10,7 @@ const SHORT_BOOLEAN_FLAGS = new Set([
   'e', // capture-pane include escapes
   'J', // capture-pane join wrapped lines
   'l', // send-keys --literal
-  'v', // split-pane --vertical
+  'h', // split-pane --horizontal
 ])
 
 const FLAGS_ALLOWING_DASH_PREFIX_VALUES = new Set([

@@ -253,6 +253,33 @@ export default function WorkspaceSettings({
         </SettingsRow>
       </SettingsSection>
 
+      <SettingsSection title="Agent chat" description="Display settings for agent chat panes">
+        <SettingsRow label="Show thinking">
+          <Toggle
+            checked={settings.agentChat?.showThinking ?? false}
+            onChange={(checked) => {
+              applyLocalSetting({ agentChat: { showThinking: checked } })
+            }}
+          />
+        </SettingsRow>
+        <SettingsRow label="Show tools">
+          <Toggle
+            checked={settings.agentChat?.showTools ?? false}
+            onChange={(checked) => {
+              applyLocalSetting({ agentChat: { showTools: checked } })
+            }}
+          />
+        </SettingsRow>
+        <SettingsRow label="Show timecodes &amp; model">
+          <Toggle
+            checked={settings.agentChat?.showTimecodes ?? false}
+            onChange={(checked) => {
+              applyLocalSetting({ agentChat: { showTimecodes: checked } })
+            }}
+          />
+        </SettingsRow>
+      </SettingsSection>
+
       <SettingsSection title="Editor" description="External editor for file opening">
         <SettingsRow label="External editor" description="Which editor to use when opening files from the editor pane">
           <select

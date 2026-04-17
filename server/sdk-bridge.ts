@@ -1,5 +1,3 @@
-import fs from 'fs'
-import path from 'path'
 import { nanoid } from 'nanoid'
 import { EventEmitter } from 'events'
 import {
@@ -14,6 +12,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
+import { sanitizeAgentChatPluginPaths } from '../shared/agent-chat-plugins.js'
 import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
@@ -27,11 +26,6 @@ import type {
   SdkServerMessage,
   QuestionDefinition,
 } from './sdk-bridge-types.js'
-
-/** Default plugin candidates resolved from cwd. Checked at session creation time. */
-const DEFAULT_PLUGIN_CANDIDATES = [
-  path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration'),
-]
 
 const log = logger.child({ component: 'sdk-bridge' })
 
@@ -175,18 +169,16 @@ export class SdkBridge extends EventEmitter {
           return this.handlePermissionRequest(sessionId, toolName, input as Record<string, unknown>, ctx)
         },
         settingSources: ['user', 'project', 'local'],
-        // Explicit plugins override defaults; omit entirely when no defaults exist
-        // to avoid suppressing SDK's own plugin discovery with an empty array.
-        // Resolve defaults at session creation time (not module load) so new/removed
-        // plugins are picked up without a server restart.
+        // Explicit plugins remain supported for non-Freshell Claude SDK bundles.
+        // Freshell orchestration itself is provided by the MCP server above.
         ...((() => {
           if (options.plugins !== undefined) {
-            return { plugins: options.plugins.map(p => ({ type: 'local' as const, path: p })) }
+            return {
+              plugins: sanitizeAgentChatPluginPaths(options.plugins)
+                .map(p => ({ type: 'local' as const, path: p })),
+            }
           }
-          const defaults = DEFAULT_PLUGIN_CANDIDATES.filter(p => fs.existsSync(p))
-          return defaults.length > 0
-            ? { plugins: defaults.map(p => ({ type: 'local' as const, path: p })) }
-            : {}
+          return {}
         })()),
       },
     })

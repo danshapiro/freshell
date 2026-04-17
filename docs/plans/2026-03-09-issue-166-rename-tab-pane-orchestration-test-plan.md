@@ -11,9 +11,9 @@ Reconciliation note: the implementation plan does not invalidate the expected te
 - `Plan-1`: Rename stays server-authoritative; names are normalized once at the HTTP boundary; blank names are rejected; rename broadcasts are success-only. Source: [2026-03-09-issue-166-rename-tab-pane-orchestration.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/docs/plans/2026-03-09-issue-166-rename-tab-pane-orchestration.md).
 - `Plan-2`: Pane rename persists through `LayoutStore.renamePane(paneId, title)` and `PATCH /api/panes/:id`, with pane ownership resolved internally from the pane target. Source: [2026-03-09-issue-166-rename-tab-pane-orchestration.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/docs/plans/2026-03-09-issue-166-rename-tab-pane-orchestration.md).
 - `Plan-3`: Connected UIs converge by handling `tab.rename` and `pane.rename` `ui.command` broadcasts after successful authoritative mutations. Source: [2026-03-09-issue-166-rename-tab-pane-orchestration.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/docs/plans/2026-03-09-issue-166-rename-tab-pane-orchestration.md).
-- `Skill-1`: `rename-tab` supports active-target default, explicit positional target, and flagged `-t/-n` forms. Source: post-change contract in [.claude/skills/freshell-orchestration/SKILL.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/.claude/skills/freshell-orchestration/SKILL.md) and the implementation plan.
-- `Skill-2`: `rename-pane` supports active-target default, explicit positional target, and flagged `-t/-n` forms. Source: post-change contract in [.claude/skills/freshell-orchestration/SKILL.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/.claude/skills/freshell-orchestration/SKILL.md) and the implementation plan.
-- `Skill-3`: The orchestration skill documents a concrete create/split/select/rename flow that assigns tab and pane names with no manual UI interaction. Source: post-change contract in [.claude/skills/freshell-orchestration/SKILL.md](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/.claude/skills/freshell-orchestration/SKILL.md) and the implementation plan.
+- `MCP-1`: `rename-tab` supports caller-target default via `{ name }` and explicit target via `{ target, name }`. Source: post-change contract in [server/mcp/freshell-tool.ts](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/server/mcp/freshell-tool.ts) and the implementation plan.
+- `MCP-2`: `rename-pane` supports caller-target default via `{ name }` and explicit target via `{ target, name }`. Source: post-change contract in [server/mcp/freshell-tool.ts](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/server/mcp/freshell-tool.ts) and the implementation plan.
+- `MCP-3`: The `freshell` MCP help text documents a concrete create/split/select/rename flow that assigns tab and pane names with no manual UI interaction. Source: post-change contract in [server/mcp/freshell-tool.ts](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/server/mcp/freshell-tool.ts) and the implementation plan.
 
 ## Harness requirements
 
@@ -41,13 +41,13 @@ Reconciliation note: the implementation plan does not invalidate the expected te
    - Estimated complexity: low; existing coverage already seeds snapshots directly in [test/unit/server/agent-layout-store-write.test.ts](/home/user/code/freshell/.worktrees/trycycle-issues-166-163-162-160-158-156-151/test/unit/server/agent-layout-store-write.test.ts).
    - Tests that depend on it: 9.
 
-5. `skill-doc-inspection` harness
-   - What it does: reads the canonical orchestration skill markdown and asserts on the published command reference and example workflow.
+5. `mcp-help-inspection` harness
+   - What it does: reads the canonical `freshell` MCP help source and asserts on the published command reference and example workflow.
    - What it exposes: file-content assertions against documented commands and playbooks.
    - Estimated complexity: low.
    - Tests that depend on it: 8.
 
-Build order: `agent-api-route`, `layout-store-snapshot`, and `ui-command-dispatch` can be extended first because they unblock the lower-level red tests. `cli-real-layout` comes next because it proves the end-to-end acceptance flow. `skill-doc-inspection` is last because it depends on the documented contract after the CLI surface is settled.
+Build order: `agent-api-route`, `layout-store-snapshot`, and `ui-command-dispatch` can be extended first because they unblock the lower-level red tests. `cli-real-layout` comes next because it proves the end-to-end acceptance flow. `mcp-help-inspection` is last because it depends on the documented contract after the CLI surface is settled.
 
 ## Test plan
 
@@ -140,16 +140,16 @@ Build order: `agent-api-route`, `layout-store-snapshot`, and `ui-command-dispatc
      - The failed-mutation request does not emit any `pane.rename` broadcast because the authoritative store did not confirm an owning `{ tabId, paneId }` rename result. Source: `Plan-1`, `Plan-2`, `Plan-3`.
    - **Interactions:** HTTP validation boundary, layout-store error path, websocket broadcast suppression.
 
-8. **Name:** The orchestration skill advertises both rename commands, their active-target defaults, and a no-UI create/split/rename playbook
+8. **Name:** The `freshell` MCP help text advertises both rename commands, their caller-target defaults, and a no-UI create/split/rename playbook
    - **Type:** regression
-   - **Harness:** `skill-doc-inspection`
-   - **Preconditions:** Read the canonical skill file at `.claude/skills/freshell-orchestration/SKILL.md`.
-   - **Actions:** Assert that the skill markdown contains the `rename-tab` and `rename-pane` command forms, the omitted-target semantics, and a concrete create/split/select/rename example.
+   - **Harness:** `mcp-help-inspection`
+   - **Preconditions:** Read the canonical MCP help source at `server/mcp/freshell-tool.ts`.
+   - **Actions:** Assert that the MCP help text contains the `rename-tab` and `rename-pane` command forms, the omitted-target semantics, and a concrete create/split/select/rename example.
    - **Expected outcome:**
-     - The command reference includes `rename-tab NEW_NAME`, `rename-tab TARGET NEW_NAME`, and `rename-tab -t TARGET -n NEW_NAME`. Source: `AC-1`, `AC-3`, `Skill-1`.
-     - The command reference includes `rename-pane NEW_NAME`, `rename-pane TARGET NEW_NAME`, and `rename-pane -t TARGET -n NEW_NAME`. Source: `AC-2`, `AC-3`, `Skill-2`.
-     - The skill explicitly states that omitted targets use the active tab or active pane, and includes a documented create/split/select/rename workflow that needs no manual UI interaction. Source: `AC-4`, `Skill-2`, `Skill-3`.
-   - **Interactions:** Agent skill consumers, plugin indirection through the canonical skill file.
+     - The command reference includes `rename-tab` with `{ name }` and `rename-tab` with `{ target, name }`. Source: `AC-1`, `AC-3`, `MCP-1`.
+     - The command reference includes `rename-pane` with `{ name }` and `rename-pane` with `{ target, name }`. Source: `AC-2`, `AC-3`, `MCP-2`.
+     - The MCP help text explicitly states that omitted targets use the caller tab or caller pane, and includes a documented create/split/select/rename workflow that needs no manual UI interaction. Source: `AC-4`, `MCP-2`, `MCP-3`.
+   - **Interactions:** Agent MCP consumers using the canonical `freshell` tool help surface.
 
 9. **Name:** Renaming a pane in `LayoutStore` writes the title under the pane’s owning tab and never renames the tab itself
    - **Type:** invariant
@@ -171,9 +171,9 @@ Covered action space:
 - Multi-word rename names in both flagged and positional CLI forms.
 - HTTP rename validation, trimming, and success-only broadcast behavior for both tabs and panes.
 - Client convergence for the new `pane.rename` broadcast.
-- Published orchestration-skill documentation for the new rename surface and the no-UI workflow.
+- Published `freshell` MCP help documentation for the new rename surface and the no-UI workflow.
 
 Explicit exclusions:
 - No browser-level manual UI automation is planned for this issue. The acceptance criteria require a no-UI orchestration flow, and the highest-value proof is the real CLI plus real `LayoutStore` scenario coverage. Residual risk: a live browser WebSocket client could still mishandle a rename even if `handleUiCommand()` is correct, though that risk is limited because `tab.rename` already exists and the new client-side work is a single `pane.rename` dispatch path.
 - No dedicated performance benchmark is planned. These renames are single PATCH requests plus small in-memory mutations, so performance risk is low. Residual risk: a pathological regression in target resolution or broadcast fan-out would not be caught by this plan, but any such regression would more likely surface as functional test timeouts first.
-- No separate test targets the plugin pointer file at `.claude/plugins/freshell-orchestration/skills/freshell-orchestration`, because the implementation plan explicitly leaves that pointer unchanged and the canonical skill file is the source of truth. Residual risk: if the pointer is independently broken, agents loading the plugin indirection could still miss the updated docs despite the canonical file being correct.
+- No separate legacy plugin-pointer coverage is planned. The canonical orchestration reference is the `freshell` MCP tool help text, so there is no remaining plugin indirection to keep in sync.

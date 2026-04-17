@@ -26,6 +26,7 @@ import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
@@ -308,6 +309,7 @@ export default function Sidebar({
     tabs: state.tabs.tabs,
     paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
     codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
+    opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
     agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
   }), shallowEqual)

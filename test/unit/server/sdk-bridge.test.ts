@@ -1,4 +1,3 @@
-import path from 'path'
 import { EventEmitter } from 'events'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createAgentHistorySource } from '../../../server/agent-timeline/history-source.js'
@@ -1068,28 +1067,14 @@ describe('SdkBridge', () => {
       ])
     })
 
-    it('uses default plugins when not set', async () => {
+    it('omits plugins when not set', async () => {
       await bridge.createSession({ cwd: '/tmp' })
-      expect(mockQueryOptions?.plugins).toBeDefined()
-      expect(mockQueryOptions?.plugins).toHaveLength(1)
-      expect(mockQueryOptions?.plugins[0].path).toContain('freshell-orchestration')
+      expect(mockQueryOptions?.plugins).toBeUndefined()
     })
 
     it('passes empty plugins array when given empty array', async () => {
       await bridge.createSession({ cwd: '/tmp', plugins: [] })
       expect(mockQueryOptions?.plugins).toEqual([])
-    })
-  })
-
-  describe('default plugins', () => {
-    it('resolves freshell-orchestration as default when no plugins specified', async () => {
-      await bridge.createSession({ cwd: '/tmp' })
-      expect(mockQueryOptions?.plugins).toBeDefined()
-      expect(mockQueryOptions?.plugins).toHaveLength(1)
-      expect(mockQueryOptions?.plugins[0].type).toBe('local')
-      // Must resolve from process.cwd(), not import.meta.url (which would land in dist/)
-      const expectedPath = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
-      expect(mockQueryOptions?.plugins[0].path).toBe(expectedPath)
     })
 
     it('does not add defaults when plugins are explicitly provided', async () => {
@@ -1102,6 +1087,19 @@ describe('SdkBridge', () => {
     it('does not add defaults when empty plugins array is provided', async () => {
       await bridge.createSession({ cwd: '/tmp', plugins: [] })
       expect(mockQueryOptions?.plugins).toEqual([])
+    })
+
+    it('filters the removed Freshell orchestration plugin path from explicit plugins', async () => {
+      await bridge.createSession({
+        cwd: '/tmp',
+        plugins: [
+          '/tmp/worktree/.claude/plugins/freshell-orchestration',
+          '/custom/plugin',
+        ],
+      })
+      expect(mockQueryOptions?.plugins).toEqual([
+        { type: 'local', path: '/custom/plugin' },
+      ])
     })
   })
 
