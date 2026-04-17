@@ -6,6 +6,7 @@ import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 const HOOK_TIMEOUT_MS = 30_000
 const MESSAGE_TIMEOUT_MS = 5_000
 const CODEX_SESSION_ID = 'codex-session-abc-123'
+const CODEX_REMOTE_WS_URL = 'ws://127.0.0.1:43123'
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -259,10 +260,30 @@ class FakeRegistry {
   list() { return [] }
 }
 
+class FakeCodexLaunchPlanner {
+  planCreateCalls: any[] = []
+
+  constructor(
+    private readonly plan: {
+      sessionId: string
+      remote: { wsUrl: string }
+    } = {
+      sessionId: 'thread-new-1',
+      remote: { wsUrl: CODEX_REMOTE_WS_URL },
+    },
+  ) {}
+
+  async planCreate(input: any) {
+    this.planCreateCalls.push(input)
+    return this.plan
+  }
+}
+
 describe('terminal.create reuse running codex terminal', () => {
   let server: http.Server | undefined
   let port: number
   let registry: FakeRegistry
+  let codexLaunchPlanner: FakeCodexLaunchPlanner
   let originalNodeEnv: string | undefined
   let originalAuthToken: string | undefined
   let originalHelloTimeoutMs: string | undefined
@@ -279,7 +300,8 @@ describe('terminal.create reuse running codex terminal', () => {
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     registry = new FakeRegistry(['term-codex-existing'])
-    new WsHandler(server, registry as any)
+    codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    new WsHandler(server, registry as any, { codexLaunchPlanner })
     const info = await listen(server)
     port = info.port
     registry.attachCalls = []
@@ -462,6 +484,48 @@ describe('terminal.create reuse running codex terminal', () => {
       }))
       const created = await createdPromise
       expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('returns terminal.created with the exact codex session id for a fresh terminal', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'codex-fresh-1'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        cwd: '/repo/worktree',
+      }))
+
+      const created = await createdPromise
+
+      expect(created.terminalId).toBe('term-codex-existing')
+      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+        cwd: '/repo/worktree',
+        resumeSessionId: undefined,
+        model: undefined,
+        sandbox: undefined,
+        approvalPolicy: undefined,
+      }])
+      expect(registry.createCalls).toHaveLength(1)
+      expect(registry.createCalls[0]).toMatchObject({
+        mode: 'codex',
+        cwd: '/repo/worktree',
+        resumeSessionId: 'thread-new-1',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: CODEX_REMOTE_WS_URL,
+          },
+        },
+      })
     } finally {
       await closeWebSocket(ws)
     }

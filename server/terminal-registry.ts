@@ -170,6 +170,9 @@ export type ProviderSettings = {
   permissionMode?: string
   model?: string
   sandbox?: string
+  codexAppServer?: {
+    wsUrl: string
+  }
   opencodeServer?: OpencodeServerEndpoint
 }
 
@@ -189,8 +192,22 @@ function resolveCodingCliCommand(
   const providerArgs = notification.args
   const baseArgs = spec.args || []
   const commandEnv: Record<string, string> = { ...(spec.env || {}), ...notification.env }
+  const remoteArgs: string[] = []
   if (mode === 'opencode') {
     Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
+  }
+  if (mode === 'codex' && providerSettings?.codexAppServer) {
+    const wsUrl = providerSettings.codexAppServer.wsUrl
+    let parsed: URL
+    try {
+      parsed = new URL(wsUrl)
+    } catch {
+      throw new Error('Codex launch requires a valid loopback app-server websocket URL.')
+    }
+    if (parsed.protocol !== 'ws:' || parsed.hostname !== '127.0.0.1') {
+      throw new Error('Codex launch requires a loopback app-server websocket URL.')
+    }
+    remoteArgs.push('--remote', wsUrl)
   }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
@@ -248,7 +265,7 @@ function resolveCodingCliCommand(
   }
   return {
     command,
-    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
+    args: [...remoteArgs, ...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
     env: commandEnv,
     label: spec.label,
   }
@@ -379,7 +396,7 @@ export type TerminalRecord = {
 
 export type BindSessionResult =
   | { ok: true; terminalId: string; sessionId: string }
-  | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' }
+  | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' | 'terminal_not_running' }
   | BindResult
 
 export type RepairLegacySessionOwnersResult = {
@@ -1085,6 +1102,7 @@ export class TerminalRegistry extends EventEmitter {
     cols?: number
     rows?: number
     resumeSessionId?: string
+    sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
     envContext?: { tabId?: string; paneId?: string }
   }): TerminalRecord {
@@ -1287,7 +1305,7 @@ export class TerminalRegistry extends EventEmitter {
         terminalId,
         opts.mode as CodingCliProviderName,
         exactSessionId,
-        'resume',
+        opts.sessionBindingReason ?? 'resume',
       )
       if (!bound.ok) {
         logger.warn(
@@ -1814,6 +1832,7 @@ export class TerminalRegistry extends EventEmitter {
     const targetCwd = normalize(cwd)
 
     for (const term of this.terminals.values()) {
+      if (term.status !== 'running') continue
       if (term.mode !== mode) continue
       if (term.resumeSessionId) continue // Already associated
       if (!term.cwd) continue
@@ -1846,6 +1865,7 @@ export class TerminalRegistry extends EventEmitter {
     const term = this.terminals.get(terminalId)
     if (!term) return { ok: false, reason: 'terminal_missing' }
     if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
+    if (term.status !== 'running') return { ok: false, reason: 'terminal_not_running' }
 
     const normalized = normalizeResumeForBinding(provider, sessionId)
     if (!normalized) return { ok: false, reason: 'invalid_session_id' }

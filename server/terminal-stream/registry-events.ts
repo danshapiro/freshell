@@ -1,6 +1,6 @@
 import type { CodingCliProviderName } from '../../shared/ws-protocol.js'
 
-export type SessionBindingReason = 'resume' | 'association'
+export type SessionBindingReason = 'start' | 'resume' | 'association'
 export type SessionUnbindReason = 'exit' | 'rebind' | 'stale_owner' | 'repair_duplicate'
 
 export type TerminalInputRawEvent = {

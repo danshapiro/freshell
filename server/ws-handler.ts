@@ -32,6 +32,7 @@ import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-reg
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
+import type { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
   ErrorCode,
   ShellSchema,
@@ -84,6 +85,7 @@ type WsHandlerConfig = {
 
 export type WsHandlerOptions = {
   codingCliManager?: CodingCliSessionManager
+  codexLaunchPlanner?: CodexLaunchPlanner
   sdkBridge?: SdkBridge
   sessionRepairService?: SessionRepairService
   handshakeSnapshotProvider?: HandshakeSnapshotProvider
@@ -347,6 +349,7 @@ export class WsHandler {
   private readonly authToken: string
   private readonly registry: TerminalRegistry
   private readonly codingCliManager?: CodingCliSessionManager
+  private readonly codexLaunchPlanner?: CodexLaunchPlanner
   private readonly sdkBridge?: SdkBridge
   private wss: WebSocketServer
   private connections = new Set<LiveWebSocket>()
@@ -393,6 +396,7 @@ export class WsHandler {
     this.authToken = getRequiredAuthToken()
     this.registry = registry
     this.codingCliManager = options.codingCliManager
+    this.codexLaunchPlanner = options.codexLaunchPlanner
     this.sdkBridge = options.sdkBridge
     this.sessionRepairService = options.sessionRepairService
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
@@ -1624,22 +1628,55 @@ export class WsHandler {
                 effectiveResumeSessionId,
               }, '[TRACE resumeSessionId] about to create terminal')
 
-              const spawnProviderSettings = providerSettings
-                ? {
-                    permissionMode: providerSettings.permissionMode,
-                    model: providerSettings.model,
-                    sandbox: providerSettings.sandbox,
-                    ...(m.mode === 'opencode'
-                      ? { opencodeServer: await allocateLocalhostPort() }
-                      : {}),
-                  }
+              const codexPlan = m.mode === 'codex'
+                ? await (() => {
+                    if (!this.codexLaunchPlanner) {
+                      throw new Error('Codex terminal launch requires the shared app-server planner.')
+                    }
+                    return this.codexLaunchPlanner.planCreate({
+                      cwd: m.cwd,
+                      resumeSessionId: effectiveResumeSessionId,
+                      model: providerSettings?.model,
+                      sandbox: providerSettings?.sandbox,
+                      approvalPolicy: providerSettings?.permissionMode,
+                    })
+                  })()
                 : undefined
+
+              if (codexPlan) {
+                effectiveResumeSessionId = codexPlan.sessionId
+              }
+
+              const spawnProviderSettings = (
+                providerSettings
+                  ? {
+                      ...(m.mode === 'codex'
+                        ? {}
+                        : {
+                            permissionMode: providerSettings.permissionMode,
+                            model: providerSettings.model,
+                            sandbox: providerSettings.sandbox,
+                          }),
+                      ...(m.mode === 'opencode'
+                        ? { opencodeServer: await allocateLocalhostPort() }
+                        : {}),
+                      ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
+                    }
+                  : (codexPlan
+                    ? { codexAppServer: codexPlan.remote }
+                    : undefined)
+              )
 
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                 cwd: m.cwd,
                 resumeSessionId: effectiveResumeSessionId,
+                ...(codexPlan
+                  ? {
+                      sessionBindingReason: m.resumeSessionId ? 'resume' as const : 'start' as const,
+                    }
+                  : {}),
                 envContext: { tabId: m.tabId, paneId: m.paneId },
                 providerSettings: spawnProviderSettings,
               })

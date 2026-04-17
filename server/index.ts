@@ -70,6 +70,8 @@ import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
+import { CodexAppServerRuntime } from './coding-cli/codex-app-server/runtime.js'
+import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -286,11 +288,14 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
+  const codexAppServerRuntime = new CodexAppServerRuntime()
+  const codexLaunchPlanner = new CodexLaunchPlanner(codexAppServerRuntime)
   const wsHandler = new WsHandler(
     server,
     registry,
     {
       codingCliManager: codingCliSessionManager,
+      codexLaunchPlanner,
       sdkBridge,
       sessionRepairService,
       handshakeSnapshotProvider: async () => {
@@ -331,6 +336,7 @@ async function main() {
     terminalMetadata,
     codingCliIndexer,
     codexActivityTracker: codexActivity.tracker,
+    codexLaunchPlanner,
   }))
 
   // --- Extension lifecycle broadcasts ---
@@ -770,6 +776,9 @@ async function main() {
 
     // 4. Kill all coding CLI sessions
     codingCliSessionManager.shutdown()
+
+    // 4b. Stop the shared Codex app-server runtime
+    await codexAppServerRuntime.shutdown()
 
     // 5. Close SDK bridge sessions
     sdkBridge.close()

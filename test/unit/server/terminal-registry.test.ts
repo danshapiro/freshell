@@ -2246,6 +2246,18 @@ describe('TerminalRegistry', () => {
       expect(results).toHaveLength(1)
       expect(results[0].terminalId).toBe(term.terminalId)
     })
+
+    it('only returns running terminals', () => {
+      const running = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      const exited = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+
+      registry.kill(exited.terminalId)
+
+      const results = registry.findUnassociatedTerminals('claude', '/home/user/project')
+
+      expect(results).toHaveLength(1)
+      expect(results[0].terminalId).toBe(running.terminalId)
+    })
   })
 
   describe('findUnassociatedClaudeTerminals delegates to findUnassociatedTerminals', () => {
@@ -2322,6 +2334,23 @@ describe('TerminalRegistry', () => {
   })
 
   describe('session binding events', () => {
+    it('rejects binding exited terminals', () => {
+      const term = registry.create({
+        mode: 'claude',
+        cwd: '/home/user/project',
+      })
+
+      registry.kill(term.terminalId)
+
+      const result = registry.bindSession(term.terminalId, 'claude', VALID_CLAUDE_SESSION_ID, 'association')
+
+      expect(result).toEqual({
+        ok: false,
+        reason: 'terminal_not_running',
+      })
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+    })
+
     it('emits terminal.session.unbound with rebind reason before binding a new session', () => {
       const term = registry.create({
         mode: 'codex',
