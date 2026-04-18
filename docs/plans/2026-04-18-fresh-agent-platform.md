@@ -197,7 +197,6 @@ The plan therefore reuses both, renames the product domain to `fresh-agent`, mig
 **Files:**
 - Create: `shared/fresh-agent.ts`
 - Create: `src/lib/fresh-agent-registry.ts`
-- Create: `src/lib/fresh-agent-capabilities.ts`
 - Modify: `shared/settings.ts`
 - Modify: `server/config-store.ts`
 - Modify: `server/platform-router.ts`
@@ -840,6 +839,8 @@ git commit -m "feat: ship shared fresh agent pane shell"
 - Create: `test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
 - Modify: existing Playwright helpers only if needed
 - Test: all targeted unit, integration, and e2e suites below
+
+Rename or consolidate the old browser specs into `fresh-agent.spec.ts` and `fresh-agent-mobile.spec.ts` unless a surviving split is clearly better, in which case keep the replacement names on a `fresh-agent-*` pattern instead of leaving `agent-chat` names behind.
 
 - [ ] **Step 1: Identify or write the failing tests**
 
