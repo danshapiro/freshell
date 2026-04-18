@@ -64,24 +64,26 @@ Create `test/unit/client/hooks/useKeyboardInset.test.ts`:
 ```typescript
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-
-// Mock useMobile before importing the hook
-const useMobileMock = vi.hoisted(() => vi.fn(() => false))
-vi.mock('@/hooks/useMobile', () => ({ useMobile: useMobileMock }))
-
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
+
+// Uses the test-setup `setMobileForTest()` infrastructure (test/setup/dom.ts)
+// to control useMobile(), matching the pattern used across all existing tests.
 
 describe('useKeyboardInset', () => {
   let originalVisualViewport: VisualViewport | null
+  let originalInnerHeight: number
   let fakeViewport: {
     height: number
     offsetTop: number
     addEventListener: ReturnType<typeof vi.fn>
     removeEventListener: ReturnType<typeof vi.fn>
   }
+  let requestAnimationFrameSpy: ReturnType<typeof vi.spyOn>
+  let cancelAnimationFrameSpy: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
     originalVisualViewport = window.visualViewport
+    originalInnerHeight = window.innerHeight
     fakeViewport = {
       height: 800,
       offsetTop: 0,
@@ -90,27 +92,36 @@ describe('useKeyboardInset', () => {
     }
     Object.defineProperty(window, 'innerHeight', { value: 800, writable: true, configurable: true })
     Object.defineProperty(window, 'visualViewport', { value: fakeViewport, writable: true, configurable: true })
-    useMobileMock.mockReturnValue(false)
+    requestAnimationFrameSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      cb(0)
+      return 1
+    })
+    cancelAnimationFrameSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+    ;(globalThis as any).setMobileForTest(false)
   })
 
   afterEach(() => {
+    ;(globalThis as any).setMobileForTest(false)
     Object.defineProperty(window, 'visualViewport', { value: originalVisualViewport, writable: true, configurable: true })
+    Object.defineProperty(window, 'innerHeight', { value: originalInnerHeight, writable: true, configurable: true })
+    requestAnimationFrameSpy.mockRestore()
+    cancelAnimationFrameSpy.mockRestore()
   })
 
   it('returns 0 on desktop', () => {
-    useMobileMock.mockReturnValue(false)
+    ;(globalThis as any).setMobileForTest(false)
     const { result } = renderHook(() => useKeyboardInset())
     expect(result.current).toBe(0)
   })
 
   it('returns 0 on mobile when no keyboard is open', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     const { result } = renderHook(() => useKeyboardInset())
     expect(result.current).toBe(0)
   })
 
   it('returns keyboard height on mobile when keyboard is open', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     fakeViewport.height = 400 // keyboard takes 400px
     const { result } = renderHook(() => useKeyboardInset())
 
@@ -121,14 +132,12 @@ describe('useKeyboardInset', () => {
 
     act(() => {
       resizeHandler!()
-      // Flush rAF
-      vi.advanceTimersByTime(16)
     })
     expect(result.current).toBe(400)
   })
 
   it('ignores small viewport changes below activation threshold', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     fakeViewport.height = 750 // only 50px smaller, below 80px threshold
     const { result } = renderHook(() => useKeyboardInset())
 
@@ -137,13 +146,12 @@ describe('useKeyboardInset', () => {
 
     act(() => {
       resizeHandler?.()
-      vi.advanceTimersByTime(16)
     })
     expect(result.current).toBe(0)
   })
 
   it('cleans up event listeners on unmount', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     const { unmount } = renderHook(() => useKeyboardInset())
     unmount()
     expect(fakeViewport.removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function))
@@ -300,28 +308,23 @@ This is the core task. When the mobile keyboard opens, the entire AgentChatView 
 Create `test/unit/client/components/agent-chat/AgentChatView.mobile-keyboard.test.tsx`:
 
 ```typescript
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
 import agentChatReducer from '@/store/agentChatSlice'
+import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 
-const useMobileMock = vi.hoisted(() => vi.fn(() => false))
-vi.mock('@/hooks/useMobile', () => ({ useMobile: useMobileMock }))
-
+// Mock useKeyboardInset to control keyboard inset value directly
 const useKeyboardInsetMock = vi.hoisted(() => vi.fn(() => 0))
 vi.mock('@/hooks/useKeyboardInset', () => ({ useKeyboardInset: useKeyboardInsetMock }))
 
 vi.mock('@/lib/ws-client', () => ({
-  getWsClient: vi.fn(() => ({
+  getWsClient: () => ({
     send: vi.fn(),
-    onMessage: vi.fn(() => vi.fn()),
     onReconnect: vi.fn(() => vi.fn()),
-  })),
+  }),
 }))
 
 import AgentChatView from '@/components/agent-chat/AgentChatView'
@@ -330,18 +333,10 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 function createStore() {
   return configureStore({
     reducer: {
-      tabs: tabsReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
       settings: settingsReducer,
-      connection: connectionReducer,
-      agentChat: agentChatReducer,
     },
-    preloadedState: {
-      settings: {
-        settings: { ...defaultSettings },
-        loaded: true,
-      },
-    } as any,
   })
 }
 
@@ -354,8 +349,13 @@ const basePaneContent: AgentChatPaneContent = {
 }
 
 describe('AgentChatView mobile keyboard', () => {
+  afterEach(() => {
+    cleanup()
+    ;(globalThis as any).setMobileForTest(false)
+  })
+
   it('applies keyboard inset padding to the outer container on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     useKeyboardInsetMock.mockReturnValue(300)
 
     const store = createStore()
@@ -372,7 +372,7 @@ describe('AgentChatView mobile keyboard', () => {
   })
 
   it('does not apply keyboard inset on desktop', () => {
-    useMobileMock.mockReturnValue(false)
+    ;(globalThis as any).setMobileForTest(false)
     useKeyboardInsetMock.mockReturnValue(0)
 
     const store = createStore()
@@ -476,15 +476,11 @@ The send and stop buttons are currently `p-2` (~32px). On mobile they must be at
 Create `test/unit/client/components/agent-chat/ChatComposer.mobile.test.tsx`:
 
 ```typescript
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
-
-const useMobileMock = vi.hoisted(() => vi.fn(() => false))
-vi.mock('@/hooks/useMobile', () => ({ useMobile: useMobileMock }))
-
 import ChatComposer from '@/components/agent-chat/ChatComposer'
 
 function createStore() {
@@ -497,8 +493,13 @@ function createStore() {
 }
 
 describe('ChatComposer mobile touch targets', () => {
+  afterEach(() => {
+    cleanup()
+    ;(globalThis as any).setMobileForTest(false)
+  })
+
   it('send button has min-h-11 min-w-11 on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     const store = createStore()
     render(
       <Provider store={store}>
@@ -511,7 +512,7 @@ describe('ChatComposer mobile touch targets', () => {
   })
 
   it('stop button has min-h-11 min-w-11 on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     const store = createStore()
     render(
       <Provider store={store}>
@@ -611,12 +612,8 @@ Allow/Deny buttons are currently `px-3 py-1` (~26px tall). On mobile these need 
 Create `test/unit/client/components/agent-chat/PermissionBanner.mobile.test.tsx`:
 
 ```typescript
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
-
-const useMobileMock = vi.hoisted(() => vi.fn(() => false))
-vi.mock('@/hooks/useMobile', () => ({ useMobile: useMobileMock }))
-
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, cleanup } from '@testing-library/react'
 import PermissionBanner from '@/components/agent-chat/PermissionBanner'
 
 describe('PermissionBanner mobile touch targets', () => {
@@ -625,8 +622,13 @@ describe('PermissionBanner mobile touch targets', () => {
     tool: { name: 'Bash', input: { command: 'ls' } },
   }
 
+  afterEach(() => {
+    cleanup()
+    ;(globalThis as any).setMobileForTest(false)
+  })
+
   it('Allow and Deny buttons have min-h-11 on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     render(
       <PermissionBanner
         permission={basePermission}
@@ -641,7 +643,7 @@ describe('PermissionBanner mobile touch targets', () => {
   })
 
   it('buttons do not have min-h-11 on desktop', () => {
-    useMobileMock.mockReturnValue(false)
+    ;(globalThis as any).setMobileForTest(false)
     render(
       <PermissionBanner
         permission={basePermission}
@@ -740,12 +742,8 @@ The option buttons and "Other"/"Submit" buttons are currently `px-3 py-1.5` (~28
 Create `test/unit/client/components/agent-chat/QuestionBanner.mobile.test.tsx`:
 
 ```typescript
-import { describe, it, expect, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
-
-const useMobileMock = vi.hoisted(() => vi.fn(() => false))
-vi.mock('@/hooks/useMobile', () => ({ useMobile: useMobileMock }))
-
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { render, screen, cleanup } from '@testing-library/react'
 import QuestionBanner from '@/components/agent-chat/QuestionBanner'
 
 describe('QuestionBanner mobile touch targets', () => {
@@ -760,8 +758,13 @@ describe('QuestionBanner mobile touch targets', () => {
     }],
   }
 
+  afterEach(() => {
+    cleanup()
+    ;(globalThis as any).setMobileForTest(false)
+  })
+
   it('option buttons have min-h-11 on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     render(
       <QuestionBanner
         question={baseQuestion}
@@ -773,7 +776,7 @@ describe('QuestionBanner mobile touch targets', () => {
   })
 
   it('Other button has min-h-11 on mobile', () => {
-    useMobileMock.mockReturnValue(true)
+    ;(globalThis as any).setMobileForTest(true)
     render(
       <QuestionBanner
         question={baseQuestion}
@@ -894,16 +897,30 @@ style={isMobile ? { bottom: `${keyboardInsetPx}px` } : undefined}
 
 - [ ] **Step 3: Add test for keyboard-aware bottom sheet positioning**
 
-In `test/unit/client/components/agent-chat/AgentChatSettings.mobile.test.tsx`, add:
+In `test/unit/client/components/agent-chat/AgentChatSettings.mobile.test.tsx`, add the mock at the top of the file (after existing mocks):
 
 ```typescript
 const useKeyboardInsetMock = vi.hoisted(() => vi.fn(() => 0))
 vi.mock('@/hooks/useKeyboardInset', () => ({ useKeyboardInset: useKeyboardInsetMock }))
+```
 
+Then add a new test inside the existing describe block:
+
+```typescript
 it('applies keyboard inset to bottom sheet on mobile', () => {
+  ;(globalThis as any).setMobileForTest(true)
   useKeyboardInsetMock.mockReturnValue(300)
-  // ... render settings in mobile mode with open=true ...
-  const dialog = screen.getByRole('dialog')
+
+  render(
+    <AgentChatSettings
+      {...defaults}
+      sessionStarted={false}
+      defaultOpen={true}
+      onChange={vi.fn()}
+    />
+  )
+
+  const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
   expect(dialog.style.bottom).toBe('300px')
 })
 ```
@@ -992,50 +1009,54 @@ git commit -m "feat: increase ToolStrip toggle touch target on mobile"
 
 ---
 
-### Task 9: Optimize MessageBubble horizontal space on mobile
+### Task 9: Optimize horizontal space on mobile
 
 **Files:**
-- Modify: `src/components/agent-chat/MessageBubble.tsx`
+- Modify: `src/components/agent-chat/AgentChatView.tsx`
+- Modify: `src/components/agent-chat/ChatComposer.tsx`
 
-On a 375px screen, the message area gets only ~369px (375 - 2*3px padding). The left border indicator + pl-2.5 is fine, but the prose max-width should be clamped tighter and we should reduce the scroll container padding on mobile.
+On a 375px screen, the message area gets only ~369px (375 - 2*3px padding). The left border indicator + pl-2.5 is fine, but the horizontal padding should be tighter on mobile. This task uses the `isMobile` variable already added to AgentChatView in Task 3 (via `useMobile()`) and adds `useMobile()` to ChatComposer (already added in Task 4). This keeps mobile detection consistent with the rest of the plan -- no `md:` viewport breakpoints mixed in.
 
-- [ ] **Step 1: Run existing MessageBubble tests to confirm green baseline**
+- [ ] **Step 1: Run existing agent chat tests to confirm green baseline**
 
-Run: `npm run test:vitest -- --run test/unit/client/components/agent-chat/MessageBubble.test.tsx`
+Run: `npm run test:vitest -- --run test/unit/client/components/agent-chat/`
 Expected: PASS
 
-- [ ] **Step 2: Reduce horizontal padding on mobile**
+- [ ] **Step 2: Reduce horizontal padding on mobile using `isMobile`**
 
-In `src/components/agent-chat/AgentChatView.tsx`, change the scroll container's padding from fixed to responsive:
+In `src/components/agent-chat/AgentChatView.tsx`, the `isMobile` variable was added in Task 3. Use it to conditionally set padding:
 
-Change:
+Change the scroll container:
 ```tsx
-className="h-full overflow-y-auto overflow-x-auto px-3 py-3 space-y-2"
+className={cn(
+  'h-full overflow-y-auto overflow-x-auto py-3 space-y-2',
+  isMobile ? 'px-2' : 'px-3',
+)}
 ```
 
-To:
+Change the status bar:
 ```tsx
-className="h-full overflow-y-auto overflow-x-auto px-2 md:px-3 py-3 space-y-2"
+className={cn(
+  'flex items-center justify-between py-1 border-b text-xs text-muted-foreground',
+  isMobile ? 'px-2' : 'px-3',
+)}
 ```
 
-This saves 4px per side (8px total) on mobile while keeping the desktop spacing.
+In `src/components/agent-chat/ChatComposer.tsx`, the `isMobile` variable was added in Task 4. Use it to conditionally set the composer wrapper padding:
 
-Also in the status bar:
+Change the outer div:
 ```tsx
-className="flex items-center justify-between px-2 md:px-3 py-1 border-b text-xs text-muted-foreground"
-```
-
-And in the ChatComposer wrapper:
-```tsx
-className="border-t px-2 md:px-3 py-2"
+<div className={cn('border-t py-2', isMobile ? 'px-2' : 'px-3')}>
 ```
 
 - [ ] **Step 3: Run tests to verify no regression**
 
-Run: `npm run test:vitest -- --run test/unit/client/components/agent-chat/MessageBubble.test.tsx`
-Expected: PASS
+Run: `npm run test:vitest -- --run test/unit/client/components/agent-chat/`
+Expected: all PASS
 
 - [ ] **Step 4: Refactor and verify**
+
+Verify there are no remaining `md:` or `sm:` viewport breakpoint classes in agent chat components (all mobile adaptation uses `useMobile()`).
 
 Run: `npm run test:vitest -- --run test/unit/client/components/agent-chat/`
 Expected: all PASS
