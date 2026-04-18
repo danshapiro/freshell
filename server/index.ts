@@ -84,6 +84,7 @@ import { joinCodexShutdownOwners } from './shutdown-join.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -233,9 +234,6 @@ async function main() {
   const serverInstanceId = await loadOrCreateServerInstanceId()
   await runCodexStartupReaper({ serverInstanceId })
   const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
-  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
-    registry: createFreshAgentProviderRegistry([]),
-  })
 
   let sdkBridge: SdkBridge
 
@@ -330,6 +328,28 @@ async function main() {
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
   })
   sdkBridge = new SdkBridge(agentHistorySource)
+  const claudeFreshAgentTimelineService = createAgentTimelineService({
+    agentHistorySource,
+  })
+  const claudeFreshAgentAdapter = createClaudeFreshAgentAdapter({
+    sdkBridge,
+    agentHistorySource,
+    timelineService: claudeFreshAgentTimelineService,
+  })
+  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+    registry: createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+      {
+        sessionType: 'kilroy',
+        runtimeProvider: 'claude',
+        adapter: claudeFreshAgentAdapter,
+      },
+    ]),
+  })
 
   const server = http.createServer(app)
   const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
@@ -567,9 +587,7 @@ async function main() {
   }))
 
   app.use('/api', createAgentTimelineRouter({
-    service: createAgentTimelineService({
-      agentHistorySource,
-    }),
+    service: claudeFreshAgentTimelineService,
   }))
   app.use('/api', createFreshAgentRouter({ runtimeManager: freshAgentRuntimeManager }))
 
