@@ -2,12 +2,13 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, act, waitFor, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
 import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
-import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
+import type { FreshAgentPaneContent, PaneNode } from '@/store/paneTypes'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
@@ -41,6 +42,7 @@ function makeStore() {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       panes: panesReducer,
       tabs: tabsReducer,
       settings: settingsReducer,
@@ -58,11 +60,11 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
     const root = s.panes.layouts.t1
     if (!root) return undefined
     const leaf = findLeaf(root, 'p1')
-    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
+    return leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined
   })
 
   if (!content) return null
-  return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+  return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
 }
 
 describe('agent chat resume history flow', () => {
@@ -155,15 +157,17 @@ describe('agent chat resume history flow', () => {
       tabId: 't1',
       paneId: 'p1',
       content: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-resume',
         status: 'creating',
+        resumeSessionId: canonicalSessionId,
         sessionRef: {
           provider: 'claude',
           sessionId: canonicalSessionId,
         },
-      },
+      } satisfies FreshAgentPaneContent,
     }))
 
     render(
@@ -381,12 +385,13 @@ describe('agent chat resume history flow', () => {
       tabId: 't1',
       paneId: 'p1',
       content: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-live-only',
         status: 'creating',
         resumeSessionId: 'named-resume',
-      },
+      } satisfies FreshAgentPaneContent,
     }))
 
     render(
@@ -456,7 +461,8 @@ describe('agent chat resume history flow', () => {
     expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionRef : undefined).toEqual({
+    expect(pane?.content.kind === 'fresh-agent' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    expect(pane?.content.kind === 'fresh-agent' ? pane.content.sessionRef : undefined).toEqual({
       provider: 'claude',
       sessionId: canonicalSessionId,
     })
@@ -556,8 +562,9 @@ describe('agent chat resume history flow', () => {
       tabId: 't1',
       paneId: 'p1',
       content: {
-        kind: 'agent-chat',
-        provider: 'freshclaude',
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         createRequestId: 'req-restart',
         sessionId: 'sdk-stale-778',
         sessionRef: {
@@ -565,7 +572,7 @@ describe('agent chat resume history flow', () => {
           sessionId: canonicalSessionId,
         },
         status: 'idle',
-      },
+      } satisfies FreshAgentPaneContent,
     }))
 
     render(
@@ -625,10 +632,11 @@ describe('agent chat resume history flow', () => {
     })
 
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionRef : undefined).toEqual({
+    expect(pane?.content.kind === 'fresh-agent' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    expect(pane?.content.kind === 'fresh-agent' ? pane.content.sessionRef : undefined).toEqual({
       provider: 'claude',
       sessionId: canonicalSessionId,
     })
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionId : undefined).toBeUndefined()
+    expect(pane?.content.kind === 'fresh-agent' ? pane.content.sessionId : undefined).toBeUndefined()
   })
 })

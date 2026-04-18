@@ -70,7 +70,7 @@ describe('runVisibleFirstAudit', () => {
     expect(artifact.scenarios.map((scenario) => scenario.id)).toEqual([
       'auth-required-cold-boot',
       'terminal-cold-boot',
-      'agent-chat-cold-boot',
+      'fresh-agent-cold-boot',
       'sidebar-search-large-corpus',
       'terminal-reconnect-backlog',
       'offscreen-tab-selection',
