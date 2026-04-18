@@ -65,6 +65,7 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentCreateSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -80,6 +81,7 @@ import {
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
+import type { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -110,6 +112,7 @@ export type WsHandlerOptions = {
   codexActivityListProvider?: () => CodexActivityRecord[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  freshAgentRuntimeManager?: FreshAgentRuntimeManager
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -464,6 +467,7 @@ export class WsHandler {
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
   private agentHistorySource?: AgentHistorySource
+  private readonly freshAgentRuntimeManager?: FreshAgentRuntimeManager
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
@@ -508,6 +512,7 @@ export class WsHandler {
     this.codingCliManager = options.codingCliManager
     this.codexLaunchPlanner = options.codexLaunchPlanner
     this.sdkBridge = options.sdkBridge
+    this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.sessionRepairService = options.sessionRepairService
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
     this.terminalMetaListProvider = options.terminalMetaListProvider
@@ -600,6 +605,7 @@ export class WsHandler {
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
+      FreshAgentCreateSchema,
       SdkCreateSchema,
       SdkSendSchema,
       SdkPermissionRespondSchema,
@@ -3017,6 +3023,51 @@ export class WsHandler {
             this.sendSdkCreateFailed(ws, m.requestId, failure)
           }
         })
+        return
+      }
+
+      case 'freshAgent.create': {
+        if (!this.freshAgentRuntimeManager) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: 'Fresh-agent runtime not enabled',
+            retryable: true,
+          } as const)
+          return
+        }
+        try {
+          const created = await this.freshAgentRuntimeManager.create({
+            requestId: m.requestId,
+            sessionType: m.sessionType,
+            cwd: m.cwd,
+            resumeSessionId: m.resumeSessionId,
+            model: m.model,
+            permissionMode: m.permissionMode,
+            effort: m.effort,
+            plugins: m.plugins,
+          })
+          this.send(ws, {
+            type: 'freshAgent.created',
+            requestId: m.requestId,
+            sessionId: created.sessionId,
+            sessionType: created.sessionType,
+            runtimeProvider: created.runtimeProvider,
+          } as const)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
+          const code = error && typeof error === 'object' && 'code' in error
+            ? String((error as { code?: unknown }).code)
+            : 'FRESH_AGENT_CREATE_FAILED'
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code,
+            message,
+            retryable: true,
+          } as const)
+        }
         return
       }
 

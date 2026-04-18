@@ -403,7 +403,20 @@ export const SdkQuestionRespondSchema = z.object({
   answers: z.record(z.string(), z.string()),
 })
 
+export const FreshAgentCreateSchema = z.object({
+  type: z.literal('freshAgent.create'),
+  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: z.string().optional(),
+  permissionMode: z.string().optional(),
+  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  plugins: z.array(z.string()).optional(),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
+  FreshAgentCreateSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -436,6 +449,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentCreateSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -701,6 +715,10 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_INTERNAL'
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
+
+export type FreshAgentServerMessage =
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; runtimeProvider: string }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }

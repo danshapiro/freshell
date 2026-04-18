@@ -81,6 +81,9 @@ import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner
 import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
+import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
+import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import { createFreshAgentRouter } from './fresh-agent/router.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -230,6 +233,9 @@ async function main() {
   const serverInstanceId = await loadOrCreateServerInstanceId()
   await runCodexStartupReaper({ serverInstanceId })
   const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
+  const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+    registry: createFreshAgentProviderRegistry([]),
+  })
 
   let sdkBridge: SdkBridge
 
@@ -363,6 +369,7 @@ async function main() {
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity?.tracker.list() ?? [],
+      freshAgentRuntimeManager,
     },
   )
   attachProxyUpgradeHandler(server)
@@ -564,6 +571,7 @@ async function main() {
       agentHistorySource,
     }),
   }))
+  app.use('/api', createFreshAgentRouter({ runtimeManager: freshAgentRuntimeManager }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
