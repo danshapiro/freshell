@@ -72,6 +72,7 @@ import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
 import { CodexAppServerRuntime } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { registerStaticClientRoutes } from './static-client-routes.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -518,11 +519,9 @@ async function main() {
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')
   const clientDir = path.join(distRoot, 'client')
-  const indexHtml = path.join(clientDir, 'index.html')
 
   if (!isDev) {
-    app.use(express.static(clientDir, { index: false }))
-    app.get('*', (_req, res) => res.sendFile(indexHtml))
+    registerStaticClientRoutes(app, clientDir)
   }
 
   // Coding CLI watcher hooks
