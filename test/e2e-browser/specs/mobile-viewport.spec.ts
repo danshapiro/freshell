@@ -63,6 +63,75 @@ test.describe('Mobile Viewport', () => {
     await expect(prevTab).toBeVisible({ timeout: 3_000 })
   })
 
+  test('agent chat composer and region are visible on mobile viewport', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+
+    // Get the active leaf pane
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const paneId = layout.id as string
+
+    // Suppress network effects and inject agent-chat pane content via Redux
+    await page.evaluate((currentPaneId: string) => {
+      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+    }, paneId)
+
+    const sessionId = 'sdk-e2e-mobile-chat'
+    const cliSessionId = '44444444-4444-4444-8444-444444444444'
+
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.dispatch({
+        type: 'agentChat/sessionCreated',
+        payload: {
+          requestId: 'req-e2e-mobile-chat',
+          sessionId: currentSessionId,
+        },
+      })
+      harness?.dispatch({
+        type: 'agentChat/sessionInit',
+        payload: {
+          sessionId: currentSessionId,
+          cliSessionId: currentCliSessionId,
+        },
+      })
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-e2e-mobile-chat',
+            sessionId: currentSessionId,
+            resumeSessionId: currentCliSessionId,
+            status: 'idle',
+          },
+        },
+      })
+    }, {
+      currentTabId: tabId!,
+      currentPaneId: paneId,
+      currentSessionId: sessionId,
+      currentCliSessionId: cliSessionId,
+    })
+
+    // Verify the chat region is visible
+    const region = page.getByRole('region', { name: /chat/i })
+    await expect(region).toBeVisible({ timeout: 10_000 })
+
+    // Verify the send button is visible and interactable
+    const sendBtn = page.getByRole('button', { name: /send message/i })
+    await expect(sendBtn).toBeVisible()
+
+    // Verify the chat input is visible
+    const input = page.getByRole('textbox', { name: /chat message input/i })
+    await expect(input).toBeVisible()
+  })
+
   test('mobile layout adapts to orientation change', async ({ freshellPage, page, terminal }) => {
     // Switch to landscape
     await page.setViewportSize({ width: 844, height: 390 })
