@@ -460,16 +460,17 @@ function mergeHydratedPaneMetadata(
   for (const [tabId, layout] of Object.entries(layouts)) {
     const paneIds = collectLeafPaneIds(layout)
     const paneIdSet = new Set(paneIds)
-    const preferredTitleSource = incomingLayoutTabIds.has(tabId)
-      ? incoming.paneTitles
-      : state.paneTitles
-    const preferredTitleSetByUserSource = incomingLayoutTabIds.has(tabId)
-      ? incoming.paneTitleSetByUser
-      : state.paneTitleSetByUser
+    const localLayoutPreserved = !incomingLayoutTabIds.has(tabId)
+    const preferredTitleSource = localLayoutPreserved
+      ? state.paneTitles
+      : incoming.paneTitles
+    const preferredTitleSetByUserSource = localLayoutPreserved
+      ? state.paneTitleSetByUser
+      : incoming.paneTitleSetByUser
 
     const nextActivePane = pickHydratedActivePane(
       paneIds,
-      incoming.activePane?.[tabId],
+      localLayoutPreserved ? undefined : incoming.activePane?.[tabId],
       state.activePane?.[tabId],
     )
     if (nextActivePane) {
@@ -477,8 +478,14 @@ function mergeHydratedPaneMetadata(
     }
 
     const nextPaneTitles = filterPaneMetadataByLayout(preferredTitleSource, tabId, paneIdSet)
+    const fallbackTitles = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
+      : undefined
     if (nextPaneTitles) {
-      paneTitles[tabId] = nextPaneTitles
+      const merged = fallbackTitles ? { ...fallbackTitles, ...nextPaneTitles } : nextPaneTitles
+      paneTitles[tabId] = merged
+    } else if (fallbackTitles) {
+      paneTitles[tabId] = fallbackTitles
     }
 
     const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
@@ -651,7 +658,27 @@ function mergeTerminalState(
     }
   }
 
-  // Structure changed (leaf↔split) or malformed children — take incoming
+  // Structure changed (leaf↔split) or malformed children
+  // Cross-tab sync can deliver stale structure changes. Use both timestamps
+  // and content heuristics to decide which side to keep.
+  if (local.type !== incoming.type) {
+    const localAt = meta?.localLayoutPersistedAt
+    const remoteAt = meta?.remoteLayoutPersistedAt
+    const timestampsAvailable = typeof localAt === 'number' && typeof remoteAt === 'number'
+    const localIsNewer = timestampsAvailable && remoteAt < localAt
+    const remoteIsNewer = timestampsAvailable && remoteAt >= localAt
+
+    if (local.type === 'split' && incoming.type === 'leaf') {
+      if (localIsNewer) return local
+      if (remoteIsNewer) return incoming
+    }
+
+    if (local.type === 'leaf' && incoming.type === 'split') {
+      if (localIsNewer) return local
+      if (remoteIsNewer) return incoming
+    }
+  }
+
   return incoming
 }
 
