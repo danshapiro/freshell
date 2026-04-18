@@ -805,6 +805,105 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('reuses an already-live sdk session when the resume alias resolves to a liveSessionId only through history', async () => {
+      const staleAlias = 'stale-live-alias-ledger-only'
+      const durableSessionId = '00000000-0000-4000-8000-0000000005aa'
+      const liveSession = {
+        sessionId: 'sdk-live-ledger-reuse',
+        status: 'connected',
+        cliSessionId: durableSessionId,
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/ledger-reuse',
+        tools: [],
+        messages: [],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockReturnValue(undefined)
+      mockSdkBridge.captureReplayState.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 0,
+          session: liveSession,
+        }
+      })
+      mockSdkBridge.drainReplayBuffer.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 0,
+          session: liveSession,
+          bufferedMessages: [],
+        }
+      })
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === staleAlias || queryId === durableSessionId) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === liveSession.sessionId && opts?.liveSessionOverride) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: liveSession.sessionId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 43,
+          messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages = await collectMessagesUntil(
+          ws,
+          (received) => received.some((message) => message.type === 'sdk.session.init'),
+          () => {
+            ws.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-ledger-live-reuse',
+              resumeSessionId: staleAlias,
+            }))
+          },
+        )
+
+        expect(mockSdkBridge.createSession).not.toHaveBeenCalled()
+        expect(messages.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-ledger-live-reuse',
+          sessionId: liveSession.sessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toMatchObject({
+          type: 'sdk.session.snapshot',
+          sessionId: liveSession.sessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.session.init')).toMatchObject({
+          type: 'sdk.session.init',
+          sessionId: liveSession.sessionId,
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
     it('reuses the first created sdk session when the same fresh requestId is resent after reconnect', async () => {
       let releaseFirstHistory: (() => void) | undefined
       const firstHistoryGate = new Promise<void>((resolve) => {

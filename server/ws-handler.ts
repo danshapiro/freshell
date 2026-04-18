@@ -816,15 +816,16 @@ export class WsHandler {
     return undefined
   }
 
-  private resolveLiveSdkSessionForCreate(
+  private async resolveLiveSdkSessionForCreate(
     resumeSessionId: string | undefined,
     ownerKey?: string,
-  ): SdkSessionState | undefined {
+  ): Promise<SdkSessionState | undefined> {
     if (!resumeSessionId || !this.sdkBridge) return undefined
+    const sdkBridge = this.sdkBridge
     const cachedOwnerSession = ownerKey ? this.resolveSdkOwnerSession(ownerKey) : undefined
     if (cachedOwnerSession) return cachedOwnerSession
 
-    const directLiveSession = this.sdkBridge.getLiveSession(resumeSessionId)
+    const directLiveSession = sdkBridge.getLiveSession(resumeSessionId)
     if (this.sdkSessionMatchesLookup(directLiveSession, resumeSessionId)) {
       return directLiveSession
     }
@@ -833,9 +834,45 @@ export class WsHandler {
       ? ownerKey.slice('resume:'.length)
       : undefined
 
-    const resolvedLiveSession = this.sdkBridge.findLiveSessionByCliSessionId?.(normalizedResumeSessionId ?? resumeSessionId)
+    const resolvedLiveSession = sdkBridge.findLiveSessionByCliSessionId?.(normalizedResumeSessionId ?? resumeSessionId)
     if (this.sdkSessionMatchesLookup(resolvedLiveSession, normalizedResumeSessionId ?? resumeSessionId)) {
       return resolvedLiveSession
+    }
+
+    try {
+      const resolveHistoryLiveSession = async (
+        historyQueryId: string,
+        ledgerLookupId: string,
+      ): Promise<SdkSessionState | undefined> => {
+        const resolvedHistory = await this.agentHistorySource?.resolve(historyQueryId) ?? null
+        if (resolvedHistory?.kind !== 'resolved' || !resolvedHistory.liveSessionId) {
+          return undefined
+        }
+
+        const restoredLiveSession = sdkBridge.getLiveSession(resolvedHistory.liveSessionId)
+        if (
+          this.sdkSessionMatchesLookup(restoredLiveSession, resolvedHistory.liveSessionId)
+          && this.sdkSessionMatchesLookup(restoredLiveSession, resolvedHistory.timelineSessionId ?? ledgerLookupId)
+        ) {
+          return restoredLiveSession
+        }
+
+        const restoredTimelineSession = resolvedHistory.timelineSessionId
+          ? sdkBridge.findLiveSessionByCliSessionId?.(resolvedHistory.timelineSessionId)
+          : undefined
+        if (this.sdkSessionMatchesLookup(restoredTimelineSession, resolvedHistory.timelineSessionId ?? ledgerLookupId)) {
+          return restoredTimelineSession
+        }
+
+        return undefined
+      }
+
+      const restoredFromResumeAlias = await resolveHistoryLiveSession(resumeSessionId, resumeSessionId)
+      if (restoredFromResumeAlias) {
+        return restoredFromResumeAlias
+      }
+    } catch {
+      // Create-time restore semantics still come from the later snapshot/restore path.
     }
     return undefined
   }
@@ -2351,7 +2388,7 @@ export class WsHandler {
               return
             }
 
-            const liveSession = this.resolveLiveSdkSessionForCreate(m.resumeSessionId, ownership.ownerKey)
+            const liveSession = await this.resolveLiveSdkSessionForCreate(m.resumeSessionId, ownership.ownerKey)
             if (liveSession) {
               reusedSessionId = liveSession.sessionId
               this.rememberCreatedSdkSession(m.requestId, liveSession.sessionId)

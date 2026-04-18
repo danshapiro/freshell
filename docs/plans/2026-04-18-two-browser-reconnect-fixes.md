@@ -171,7 +171,7 @@ Run:
 
 ```bash
 npm run test:vitest -- test/unit/client/lib/ws-client.test.ts
-npm run test:vitest -- test/unit/server/ws-handler-sdk.test.ts
+npm run test:server -- --run test/unit/server/ws-handler-sdk.test.ts
 npm run test:vitest -- test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
@@ -232,7 +232,7 @@ Run:
 
 ```bash
 npm run test:vitest -- test/unit/client/lib/ws-client.test.ts
-npm run test:vitest -- test/unit/server/ws-handler-sdk.test.ts
+npm run test:server -- --run test/unit/server/ws-handler-sdk.test.ts
 npm run test:vitest -- test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
@@ -247,7 +247,8 @@ Refactor only after the new behavior is green:
 - re-run the related SDK restore checks:
 
 ```bash
-npm run test:vitest -- test/unit/server/ws-handler-sdk.test.ts test/e2e/agent-chat-restore-flow.test.tsx
+npm run test:server -- --run test/unit/server/ws-handler-sdk.test.ts
+npm run test:vitest -- test/e2e/agent-chat-restore-flow.test.tsx
 ```
 
 Expected: PASS with no weakened assertions.
@@ -308,7 +309,7 @@ Run:
 ```bash
 npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx
 npm run test:vitest -- test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-settings-remount-scrollback.test.tsx
-npm run test:vitest -- test/server/ws-protocol.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+npm run test:server -- --run test/server/ws-protocol.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
 ```
 
 Expected:
@@ -349,7 +350,7 @@ Run:
 npm run test:vitest -- test/unit/client/lib/ws-client.test.ts
 npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx
 npm run test:vitest -- test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-settings-remount-scrollback.test.tsx
-npm run test:vitest -- test/server/ws-protocol.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts
+npm run test:server -- --run test/server/ws-protocol.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-create-session-repair.test.ts
 ```
 
 Expected: all PASS.
