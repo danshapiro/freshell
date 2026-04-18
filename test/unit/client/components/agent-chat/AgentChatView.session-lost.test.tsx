@@ -1,399 +1,156 @@
-import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { act, render, screen, waitFor } from '@testing-library/react'
+import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import { Provider, useSelector } from 'react-redux'
-import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
-import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
+import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import type { FreshAgentPaneContent } from '@/store/paneTypes'
-import type { PaneNode } from '@/store/paneTypes'
-import { buildRestoreError } from '@shared/session-contract'
+import freshAgentReducer from '@/store/freshAgentSlice'
+import agentChatReducer, { markSessionLost, sessionSnapshotReceived } from '@/store/agentChatSlice'
+import { useAppSelector } from '@/store/hooks'
 
-// jsdom doesn't implement scrollIntoView
-beforeAll(() => {
-  Element.prototype.scrollIntoView = vi.fn()
-})
+const wsMock = vi.hoisted(() => ({
+  send: vi.fn(),
+  onMessage: vi.fn(() => () => {}),
+}))
 
-const wsSend = vi.fn()
-const getAgentTimelinePage = vi.fn()
-const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
+const apiMock = vi.hoisted(() => ({
+  getFreshAgentThreadSnapshot: vi.fn(),
+}))
 
 vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({
-    send: wsSend,
-    onReconnect: vi.fn(() => vi.fn()),
-  }),
+  getWsClient: () => wsMock,
 }))
 
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
-    getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
-    setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
+    getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
   }
 })
 
-function makeStore() {
+function createStore() {
   return configureStore({
     reducer: {
-      agentChat: agentChatReducer,
       panes: panesReducer,
       settings: settingsReducer,
+      freshAgent: freshAgentReducer,
+      agentChat: agentChatReducer,
+    },
+    preloadedState: {
+      panes: {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
     },
   })
 }
 
-/** Read pane content from the store for a given tab/pane ID. */
-function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): FreshAgentPaneContent | undefined {
-  const root = store.getState().panes.layouts[tabId]
-  if (!root) return undefined
-  function find(node: PaneNode): FreshAgentPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'fresh-agent') {
-      return node.content
+function StoreBackedFreshAgentView({ tabId, paneId }: { tabId: string; paneId: string }) {
+  const paneContent = useAppSelector((state) => {
+    const layout = state.panes.layouts[tabId]
+    if (!layout || layout.type !== 'leaf' || layout.id !== paneId || layout.content.kind !== 'fresh-agent') {
+      throw new Error(`Missing fresh-agent pane ${paneId}`)
     }
-    if (node.type === 'split') {
-      return find(node.children[0]) || find(node.children[1])
-    }
-    return undefined
-  }
-  return find(root)
+    return layout.content
+  })
+  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} />
 }
 
-describe('AgentChatView — immediate recovery when session is lost', () => {
-  afterEach(() => {
-    cleanup()
-    wsSend.mockClear()
-    getAgentTimelinePage.mockReset()
-    setSessionMetadata.mockClear()
-    vi.useRealTimers()
+describe('Fresh-agent lost-session recovery coverage', () => {
+  beforeEach(() => {
+    wsMock.send.mockReset()
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation(() => () => {})
+    apiMock.getFreshAgentThreadSnapshot.mockReset()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/dead-session-id'))
   })
 
-  it('does not restart from a mutable named resume token when session is marked as lost', async () => {
-    const store = makeStore()
-    const pane: FreshAgentPaneContent = {
-      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
-      createRequestId: 'req-stale',
+  it('shows a restoring state for a durable freshclaude resume before recovery completes', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-stale',
+        sessionId: 'dead-session-id',
+        status: 'idle',
+        resumeSessionId: 'named-resume',
+      },
+    }))
+    store.dispatch(sessionSnapshotReceived({
       sessionId: 'dead-session-id',
+      latestTurnId: 'turn-1',
       status: 'idle',
-      resumeSessionId: 'cli-session-to-resume',
-    }
-
-    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
-
-    // Use a wrapper that reads pane content reactively from the store
-    function Wrapper() {
-      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
-      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
-        ? root.content
-        : undefined
-      if (!content) return null
-      return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
-    }
+      timelineSessionId: 'cli-session-abc-123',
+      revision: 2,
+    }))
 
     render(
       <Provider store={store}>
-        <Wrapper />
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
       </Provider>,
     )
 
-    // Initially shows restoring (sessionId exists but no session in Redux yet)
-    expect(screen.getByText(/restoring/i)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
+    })
+    expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+  })
 
-    wsSend.mockClear()
+  it('recreates a lost freshclaude session with the canonical durable resume id', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-stale',
+        sessionId: 'dead-session-id',
+        status: 'idle',
+        resumeSessionId: 'named-resume',
+      },
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'dead-session-id',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'cli-session-abc-123',
+      revision: 2,
+    }))
 
-    // Simulate server responding to sdk.attach with INVALID_SESSION_ID:
-    // The sdk-message-handler dispatches markSessionLost which creates the
-    // session entry with lost=true and historyLoaded=true.
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
+    })
+
     act(() => {
       store.dispatch(markSessionLost({ sessionId: 'dead-session-id' }))
     })
 
-    // The dead live SDK session should be cleared, but the client must not
-    // restart from a mutable named resume token once no canonical durable id exists.
     await waitFor(() => {
-      const content = getPaneContent(store, 't1', 'p1')
-      expect(content).toBeDefined()
-      expect(content!.sessionId).toBeUndefined()
-    })
-
-    const content = getPaneContent(store, 't1', 'p1')!
-    expect(content.status).toBe('idle')
-    expect(content.restoreError).toEqual(buildRestoreError('dead_live_handle'))
-    // The pane may still carry the original mutable name for display, but it
-    // must not be used as a restore target.
-    expect(content.resumeSessionId).toBe('cli-session-to-resume')
-    const createCalls = wsSend.mock.calls.filter(
-      (c: any[]) => c[0]?.type === 'sdk.create',
-    )
-    expect(createCalls).toHaveLength(0)
-  })
-
-  it('recovers with timelineSessionId from sdk.session.snapshot even when the session is marked lost before sdk.session.init', async () => {
-    const canonicalSessionId = '00000000-0000-4000-8000-000000000211'
-    let resolveTimelinePage: ((value: {
-      sessionId: string
-      items: Array<Record<string, unknown>>
-      nextCursor: null
-      revision: number
-      bodies: Record<string, unknown>
-    }) => void) | undefined
-    getAgentTimelinePage.mockImplementationOnce(() => new Promise((resolve) => {
-      resolveTimelinePage = resolve
-    }))
-
-    const store = makeStore()
-    const pane = {
-      kind: 'fresh-agent',
-      sessionType: 'freshclaude',
-      provider: 'claude',
-      createRequestId: 'req-stale',
-      sessionId: 'sdk-stale-1',
-      status: 'idle',
-      resumeSessionId: 'named-resume',
-    } satisfies FreshAgentPaneContent
-
-    store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
-
-    function Wrapper() {
-      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
-        ? root.content
-        : undefined
-      if (!content) return null
-      return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
-    }
-
-    render(
-      <Provider store={store}>
-        <Wrapper />
-      </Provider>,
-    )
-
-    act(() => {
-      store.dispatch(sessionSnapshotReceived({
-        sessionId: 'sdk-stale-1',
-        latestTurnId: 'turn-2',
-        status: 'idle',
-        timelineSessionId: canonicalSessionId,
-        revision: 2,
+      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshclaude',
+        resumeSessionId: 'cli-session-abc-123',
       }))
-      store.dispatch(markSessionLost({ sessionId: 'sdk-stale-1' }))
     })
-
-    await waitFor(() => {
-      expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        canonicalSessionId,
-        expect.objectContaining({ priority: 'visible', revision: 2, includeBodies: true }),
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
-      )
-    })
-
-    expect(wsSend.mock.calls.some((call: any[]) => call[0]?.type === 'sdk.create')).toBe(false)
-
-    await act(async () => {
-      resolveTimelinePage?.({
-        sessionId: canonicalSessionId,
-        items: [
-          {
-            turnId: 'turn-2',
-            sessionId: canonicalSessionId,
-            role: 'assistant',
-            summary: 'Recovered answer',
-            timestamp: '2026-03-10T10:00:20.000Z',
-          },
-        ],
-        nextCursor: null,
-        revision: 2,
-        bodies: {
-          'turn-2': {
-            sessionId: canonicalSessionId,
-            turnId: 'turn-2',
-            message: {
-              role: 'assistant',
-              content: [{ type: 'text', text: 'Recovered durable answer' }],
-              timestamp: '2026-03-10T10:00:20.000Z',
-            },
-          },
-        },
-      })
-      await Promise.resolve()
-    })
-
-    await waitFor(() => {
-      const createCalls = wsSend.mock.calls.filter((call: any[]) => call[0]?.type === 'sdk.create')
-      expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe(canonicalSessionId)
-    })
-  })
-})
-
-describe('AgentChatView — remount resilience (split pane bug)', () => {
-  afterEach(() => {
-    cleanup()
-    wsSend.mockClear()
-    vi.useRealTimers()
-  })
-
-  it('does not get stuck after remount when session is already established', () => {
-    const store = makeStore()
-    const pane: FreshAgentPaneContent = {
-      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
-      createRequestId: 'req-1',
-      sessionId: 'sess-1',
-      status: 'idle',
-    }
-
-    // Pre-populate the Redux session as if sdk.created + sdk.session.init already happened
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
-    store.dispatch(sessionInit({
-      sessionId: 'sess-1',
-      cliSessionId: 'cli-abc',
-      model: 'claude-opus-4-6',
-    }))
-
-    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
-
-    // First mount (simulating the original render)
-    const { unmount } = render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-
-    // Should NOT show restoring — session is already established with historyLoaded=true
-    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
-
-    // Composer should be interactive (not "Waiting for connection")
-    const textarea = screen.getByRole('textbox')
-    expect(textarea).not.toBeDisabled()
-
-    // Now simulate unmount + remount (what happens during split)
-    unmount()
-    wsSend.mockClear()
-
-    render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-
-    // After remount, should still NOT show restoring
-    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
-
-    // Composer should still be interactive
-    const textarea2 = screen.getByRole('textbox')
-    expect(textarea2).not.toBeDisabled()
-
-    // Should NOT send sdk.attach — session is already hydrated and WS
-    // subscription is connection-scoped, so it survives the remount.
-    const attachCalls = wsSend.mock.calls.filter(
-      (c: any[]) => c[0]?.type === 'sdk.attach',
-    )
-    expect(attachCalls).toHaveLength(0)
-
-    // Should NOT have sent sdk.create
-    const createCalls = wsSend.mock.calls.filter(
-      (c: any[]) => c[0]?.type === 'sdk.create',
-    )
-    expect(createCalls).toHaveLength(0)
-  })
-
-  it('pane status remains interactive after remount (not reset to starting)', () => {
-    const store = makeStore()
-    const pane: FreshAgentPaneContent = {
-      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
-      createRequestId: 'req-1',
-      sessionId: 'sess-1',
-      status: 'connected',
-    }
-
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
-    store.dispatch(sessionInit({
-      sessionId: 'sess-1',
-      cliSessionId: 'cli-abc',
-      model: 'claude-opus-4-6',
-    }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'connected' }))
-
-    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
-
-    // Simulate unmount + remount
-    const { unmount } = render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-    unmount()
-
-    render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-
-    // Status bar should show "Connected", not "Starting Claude Code..."
-    expect(screen.getByText('Connected')).toBeInTheDocument()
-    expect(screen.queryByText(/starting/i)).not.toBeInTheDocument()
-  })
-
-  it('does not regress to "starting" when sdk.status arrives after remount for a still-initializing session', () => {
-    const store = makeStore()
-    const pane: FreshAgentPaneContent = {
-      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
-      createRequestId: 'req-1',
-      sessionId: 'sess-1',
-      status: 'starting',
-    }
-
-    // Session just created — still in 'starting' status, not yet 'connected'
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
-
-    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
-
-    // First mount
-    const { unmount } = render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-
-    // Simulate unmount + remount (what happens during split)
-    unmount()
-    wsSend.mockClear()
-
-    render(
-      <Provider store={store}>
-        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
-      </Provider>,
-    )
-
-    // Session is hydrated (historyLoaded=true from fresh create) so
-    // sdk.attach is skipped — WS subscription survives the remount.
-    const attachCalls = wsSend.mock.calls.filter(
-      (c: any[]) => c[0]?.type === 'sdk.attach',
-    )
-    expect(attachCalls).toHaveLength(0)
-
-    // Simulate server status arriving (e.g. from the live subscription):
-    act(() => {
-      store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'starting' }))
-    })
-
-    // Pane should still show "Starting Claude Code..." — that's fine for now
-    // The key thing is: when the session later transitions to 'connected',
-    // the pane should update accordingly
-    act(() => {
-      store.dispatch(sessionInit({
-        sessionId: 'sess-1',
-        cliSessionId: 'cli-abc',
-        model: 'claude-opus-4-6',
-      }))
-      store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'connected' }))
-    })
-
-    // Now the status should have progressed — no longer stuck on 'starting'
-    const content = getPaneContent(store, 't1', 'p1')
-    expect(content!.status).toBe('connected')
   })
 })

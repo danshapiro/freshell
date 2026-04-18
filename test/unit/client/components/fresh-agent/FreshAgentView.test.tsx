@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
@@ -9,6 +9,7 @@ import agentChatReducer from '@/store/agentChatSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { initLayout } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
+import { markSessionLost, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
 
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
@@ -279,6 +280,103 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.fork',
       sessionId: 'thread-1',
+    })
+  })
+
+  it('keeps an established freshclaude pane interactive after remount when snapshot loading is unavailable', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
+    store.dispatch(sessionInit({
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+
+    const paneContent = {
+      kind: 'fresh-agent' as const,
+      sessionType: 'freshclaude' as const,
+      provider: 'claude' as const,
+      createRequestId: 'req-remount',
+      sessionId: 'sess-1',
+      status: 'idle' as const,
+      resumeSessionId: 'cli-abc',
+    }
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Ready')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+
+    unmount()
+    wsMock.send.mockClear()
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Ready')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
+    expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+  })
+
+  it('recreates a lost freshclaude session through fresh-agent create with the durable resume id', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/dead-session-id'))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-lost',
+        sessionId: 'dead-session-id',
+        status: 'idle',
+        resumeSessionId: 'named-resume',
+      },
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'dead-session-id',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: 'cli-session-abc-123',
+      revision: 2,
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
+    })
+    expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
+
+    act(() => {
+      store.dispatch(markSessionLost({ sessionId: 'dead-session-id' }))
+    })
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        sessionType: 'freshclaude',
+        resumeSessionId: 'cli-session-abc-123',
+      }))
     })
   })
 })
