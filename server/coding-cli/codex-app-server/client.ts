@@ -108,9 +108,7 @@ export class CodexAppServerClient {
   ): Promise<CodexThreadOperationResult> {
     const result = await this.request('thread/start', {
       ...params,
-      // Freshell attaches the visible TUI over `codex --remote`, so it does not
-      // need the app-server's raw event stream for fresh threads.
-      experimentalRawEvents: false,
+      experimentalRawEvents: params.richClient === true,
       persistExtendedHistory: true,
     })
     const parsed = CodexThreadOperationResultSchema.safeParse(result)

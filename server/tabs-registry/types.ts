@@ -10,6 +10,7 @@ export const RegistryPaneKindSchema = z.enum([
   'picker',
   'claude-chat',
   'agent-chat',
+  'fresh-agent',
   'extension',
 ])
 export type RegistryPaneKind = z.infer<typeof RegistryPaneKindSchema>

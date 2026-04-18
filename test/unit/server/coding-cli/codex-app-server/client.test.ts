@@ -261,6 +261,28 @@ describe('CodexAppServerClient', () => {
     })))
   })
 
+  it('starts rich Codex threads with raw events enabled when requested', async () => {
+    const server = await startFakeCodexAppServer({
+      overrides: {
+        'thread/start': {
+          result: {
+            thread: { id: 'thread-rich-1', path: null, ephemeral: false },
+          },
+        },
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.startThread({ cwd: '/repo/worktree', richClient: true })).resolves.toEqual({
+      thread: {
+        id: 'thread-rich-1',
+        path: null,
+        ephemeral: false,
+      },
+    })
+  })
+
   it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {
     const server = await startFakeCodexAppServer({ requireJsonRpc: true })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })

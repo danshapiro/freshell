@@ -220,6 +220,19 @@ describe('CodexAppServerRuntime', () => {
     })
   })
 
+  it('passes rich-client raw-event intent through thread/start', async () => {
+    const runtime = createRuntime()
+
+    await expect(runtime.startThread({ cwd: '/repo/worktree', richClient: true })).resolves.toEqual({
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    })
+  })
+
   it('drops cached state after an unexpected child exit and starts a fresh process on the next call', async () => {
     const runtime = createRuntime()
 

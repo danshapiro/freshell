@@ -31,6 +31,7 @@ export const CodexThreadStartParamsSchema = z.object({
   model: z.string().optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
   approvalPolicy: z.string().optional(),
+  richClient: z.boolean().optional(),
   experimentalRawEvents: z.boolean(),
   persistExtendedHistory: z.boolean(),
 })
@@ -41,6 +42,7 @@ export const CodexThreadResumeParamsSchema = z.object({
   model: z.string().optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
   approvalPolicy: z.string().optional(),
+  richClient: z.boolean().optional(),
   persistExtendedHistory: z.boolean(),
 })
 

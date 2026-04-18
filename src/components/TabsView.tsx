@@ -161,6 +161,28 @@ function sanitizePaneSnapshot(
       plugins: payload.plugins as string[] | undefined,
     }
   }
+  if (snapshot.kind === 'fresh-agent') {
+    const resumeSessionId = payload.resumeSessionId as string | undefined
+    const provider = ((payload.provider as string | undefined) || 'claude') as CodingCliProviderName
+    const sessionRef = resolveSessionRef({
+      payload,
+      fallbackProvider: provider,
+      fallbackSessionId: resumeSessionId,
+      fallbackServerInstanceId: record.serverInstanceId,
+    })
+    return {
+      kind: 'fresh-agent',
+      provider: provider as any,
+      sessionType: ((payload.sessionType as string | undefined) || 'freshclaude') as any,
+      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      sessionRef,
+      initialCwd: payload.initialCwd as string | undefined,
+      model: payload.model as string | undefined,
+      permissionMode: payload.permissionMode as string | undefined,
+      effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
+      plugins: payload.plugins as string[] | undefined,
+    }
+  }
   if (snapshot.kind === 'extension') {
     return {
       kind: 'extension',
@@ -178,6 +200,9 @@ function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
     if (typeof mode === 'string') return mode as TabMode
     return 'shell'
   }
+  if (firstKind === 'fresh-agent') {
+    return 'shell'
+  }
   if (firstKind === 'agent-chat') return 'claude'
   return 'shell'
 }
@@ -186,6 +211,7 @@ function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'terminal') return TerminalSquare
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
+  if (kind === 'fresh-agent') return Bot
   if (kind === 'agent-chat') return Bot
   return Square
 }
@@ -194,6 +220,7 @@ function paneKindColorClass(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'text-foreground/50'
   if (kind === 'browser') return 'text-blue-500'
   if (kind === 'editor') return 'text-emerald-500'
+  if (kind === 'fresh-agent') return 'text-amber-500'
   if (kind === 'agent-chat' || kind === 'claude-chat') return 'text-amber-500'
   if (kind === 'extension') return 'text-purple-500'
   return 'text-muted-foreground'
@@ -203,6 +230,7 @@ function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'Terminal'
   if (kind === 'browser') return 'Browser'
   if (kind === 'editor') return 'Editor'
+  if (kind === 'fresh-agent') return 'Fresh Agent'
   if (kind === 'agent-chat' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
   return kind
