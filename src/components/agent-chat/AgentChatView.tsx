@@ -729,7 +729,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp} style={keyboardContainerStyle}>
       {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1 border-b text-xs text-muted-foreground">
+      <div className={cn('flex items-center justify-between py-1 border-b text-xs text-muted-foreground', isMobile ? 'px-2' : 'px-3')}>
         <span>
           {hasWaitingItems && 'Waiting for answer...'}
           {!hasWaitingItems && paneContent.status === 'creating' && 'Creating session...'}
@@ -764,7 +764,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto overflow-x-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
+      <div ref={scrollContainerRef} onScroll={handleScroll} className={cn('h-full overflow-y-auto overflow-x-auto py-3 space-y-2', isMobile ? 'px-2' : 'px-3')} data-context="agent-chat" data-session-id={paneContent.sessionId}>
         {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav). */}
         {isRestoring && (
           <div className="text-center text-muted-foreground text-sm py-6">
