@@ -66,6 +66,9 @@ import {
   CodingCliInputSchema,
   CodingCliKillSchema,
   FreshAgentCreateSchema,
+  FreshAgentForkSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentSendSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -393,6 +396,7 @@ type ClientState = {
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
+  freshAgentSessions: Set<string>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
@@ -606,6 +610,9 @@ export class WsHandler {
       CodingCliInputSchema,
       CodingCliKillSchema,
       FreshAgentCreateSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentForkSchema,
       SdkCreateSchema,
       SdkSendSchema,
       SdkPermissionRespondSchema,
@@ -1177,6 +1184,7 @@ export class WsHandler {
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
+      freshAgentSessions: new Set(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
@@ -1232,6 +1240,7 @@ export class WsHandler {
       off()
     }
     state.sdkSubscriptions.clear()
+    state.freshAgentSessions?.clear()
 
     for (const [requestId, pending] of this.screenshotRequests) {
       if (pending.connectionId !== ws.connectionId) continue
@@ -3055,6 +3064,7 @@ export class WsHandler {
             sessionType: created.sessionType,
             runtimeProvider: created.runtimeProvider,
           } as const)
+          state.freshAgentSessions.add(created.sessionId)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
           const code = error && typeof error === 'object' && 'code' in error
@@ -3067,6 +3077,63 @@ export class WsHandler {
             message,
             retryable: true,
           } as const)
+        }
+        return
+      }
+
+      case 'freshAgent.send': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.send(m.sessionId, {
+            text: m.text,
+            images: m.images,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to send fresh-agent message'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.interrupt': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.interrupt(m.sessionId)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to interrupt fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.fork': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.fork(m.sessionId, m.input)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to fork fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
         }
         return
       }

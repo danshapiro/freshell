@@ -198,6 +198,7 @@ export default function App() {
       () => { (ws as any).ws?.close() },
       // sendWsMessage: send a raw WS message for test cleanup (e.g., terminal.kill)
       (msg: unknown) => { ws.send(msg) },
+      (msg) => { ws.receiveMessageForTest?.(msg) },
       () => perfAuditBridgeRef.current?.snapshot() ?? null,
     )
     ws.setOutboundMessageObserver?.((msg) => {

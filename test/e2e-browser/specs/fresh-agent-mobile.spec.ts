@@ -3,26 +3,18 @@ import { test, expect } from '../helpers/fixtures.js'
 test.describe('Fresh Agent Mobile', () => {
   test.use({ viewport: { width: 390, height: 844 } })
 
-  test('mobile tab switcher and sidebar stay usable with a fresh-agent pane', async ({ freshellPage, page, harness, terminal }) => {
+  test('mobile tab switcher and sidebar stay usable with a restored fresh-agent pane', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const tabId = await harness.getActiveTabId()
     const layout = await harness.getPaneLayout(tabId!)
     expect(layout?.type).toBe('leaf')
     const paneId = layout.id as string
 
-    await page.evaluate(({ currentTabId, currentPaneId }) => {
+    await page.evaluate((currentPaneId: string) => {
       window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'agentChat/sessionCreated',
-        payload: { requestId: 'req-mobile', sessionId: 'sdk-mobile' },
-      })
-      window.__FRESHELL_TEST_HARNESS__?.dispatch({
-        type: 'agentChat/sessionInit',
-        payload: {
-          sessionId: 'sdk-mobile',
-          cliSessionId: '55555555-5555-4555-8555-555555555555',
-        },
-      })
+    }, paneId)
+
+    await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'panes/updatePaneContent',
         payload: {
@@ -34,12 +26,26 @@ test.describe('Fresh Agent Mobile', () => {
             provider: 'claude',
             createRequestId: 'req-mobile',
             sessionId: 'sdk-mobile',
+            resumeSessionId: '55555555-5555-4555-8555-555555555555',
             status: 'idle',
             settingsDismissed: true,
           },
         },
       })
     }, { currentTabId: tabId, currentPaneId: paneId })
+
+    await harness.receiveWsMessage({
+      type: 'sdk.created',
+      requestId: 'req-mobile',
+      sessionId: 'sdk-mobile',
+    })
+    await harness.receiveWsMessage({
+      type: 'sdk.session.init',
+      sessionId: 'sdk-mobile',
+      cliSessionId: '55555555-5555-4555-8555-555555555555',
+      model: 'claude-opus-4-6',
+      cwd: '/workspace/mobile',
+    })
 
     await expect(page.getByRole('textbox', { name: 'Chat message input' })).toBeVisible()
 

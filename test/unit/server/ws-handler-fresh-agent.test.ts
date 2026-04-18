@@ -90,4 +90,56 @@ describe('WsHandler fresh-agent routing', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('routes freshAgent.send, freshAgent.interrupt, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      send: vi.fn().mockResolvedValue(undefined),
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      fork: vi.fn().mockResolvedValue({ sessionId: 'forked-session' }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-2',
+        sessionType: 'freshcodex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        sessionId: 'codex-session-2',
+        text: 'Ship it',
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.interrupt',
+        sessionId: 'codex-session-2',
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.fork',
+        sessionId: 'codex-session-2',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith('codex-session-2', { text: 'Ship it', images: undefined })
+        expect(runtimeManager.interrupt).toHaveBeenCalledWith('codex-session-2')
+        expect(runtimeManager.fork).toHaveBeenCalledWith('codex-session-2', undefined)
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

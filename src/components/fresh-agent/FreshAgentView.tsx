@@ -67,9 +67,7 @@ export function FreshAgentView({
     if (usesClaudeCompatibility || paneContent.sessionId || hidden) return
     const suppressed = typeof window !== 'undefined'
       && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
-    if (suppressed) return
-    registerFreshAgentCreate(dispatch, paneContent.createRequestId)
-    ws.send({
+    const createMessage = {
       type: 'freshAgent.create',
       requestId: paneContent.createRequestId,
       sessionType: paneContent.sessionType,
@@ -79,7 +77,13 @@ export function FreshAgentView({
       permissionMode: paneContent.permissionMode,
       effort: paneContent.effort,
       plugins: paneContent.plugins,
-    })
+    } as const
+    registerFreshAgentCreate(dispatch, paneContent.createRequestId)
+    if (suppressed) {
+      window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(createMessage)
+      return
+    }
+    ws.send(createMessage)
   }, [
     dispatch,
     hidden,
@@ -99,7 +103,7 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (usesClaudeCompatibility || !paneContent.sessionId) return
+    if (usesClaudeCompatibility) return
     const unsubscribe = ws.onMessage((message) => {
       if (message.type === 'freshAgent.created' && message.requestId === paneContent.createRequestId) {
         dispatch(updatePaneContent({
@@ -131,22 +135,40 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [dispatch, paneContent, paneId, tabId, usesClaudeCompatibility, ws])
+  }, [
+    dispatch,
+    paneContent,
+    paneId,
+    paneContent.createRequestId,
+    tabId,
+    usesClaudeCompatibility,
+    ws,
+  ])
 
   useEffect(() => {
     if (usesClaudeCompatibility || !paneContent.sessionId) return
     const controller = new AbortController()
     setLoadError(null)
-    void getFreshAgentThreadSnapshot(paneContent.provider, paneContent.sessionId, { signal: controller.signal })
+    const sessionId = paneContent.sessionId
+    const provider = paneContent.provider
+    const resumeSessionId = paneContent.resumeSessionId
+    const currentStatus = paneContent.status
+    void getFreshAgentThreadSnapshot(provider, sessionId, { signal: controller.signal })
       .then((next) => {
-        setSnapshot(next as FreshAgentSnapshot)
+        const resolved = next as FreshAgentSnapshot
+        setSnapshot(resolved)
+        const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? currentStatus
+        const nextResumeSessionId = resumeSessionId ?? sessionId
+        if (nextStatus === currentStatus && nextResumeSessionId === resumeSessionId) {
+          return
+        }
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
             ...paneContent,
-            status: ((next as FreshAgentSnapshot).status as FreshAgentPaneContent['status']) ?? paneContent.status,
-            resumeSessionId: paneContent.resumeSessionId ?? paneContent.sessionId,
+            status: nextStatus,
+            resumeSessionId: nextResumeSessionId,
           },
         }))
       })
@@ -155,7 +177,17 @@ export function FreshAgentView({
         setLoadError(error instanceof Error ? error.message : 'Failed to load session')
       })
     return () => controller.abort()
-  }, [dispatch, paneContent, paneId, tabId, usesClaudeCompatibility])
+  }, [
+    dispatch,
+    paneContent,
+    paneContent.provider,
+    paneContent.resumeSessionId,
+    paneContent.sessionId,
+    paneContent.status,
+    paneId,
+    tabId,
+    usesClaudeCompatibility,
+  ])
 
   const content = useMemo(() => {
     if (usesClaudeCompatibility) {
@@ -179,6 +211,8 @@ export function FreshAgentView({
     const worktrees = snapshot?.worktrees ?? []
     const childThreads = snapshot?.childThreads ?? []
     const diffs = snapshot?.diffs ?? []
+    const canSend = snapshot?.capabilities?.send === true
+    const canInterrupt = snapshot?.capabilities?.interrupt === true
     const canFork = snapshot?.capabilities?.fork === true
     const totalTokens = snapshot?.tokenUsage?.totalTokens
 
@@ -195,7 +229,40 @@ export function FreshAgentView({
               <button
                 type="button"
                 className="rounded border border-border/70 px-2 py-1 disabled:opacity-50"
-                disabled={!canFork}
+                disabled={!canInterrupt || !paneContent.sessionId}
+                onClick={() => {
+                  if (!paneContent.sessionId || !canInterrupt) return
+                  const message = {
+                    type: 'freshAgent.interrupt',
+                    sessionId: paneContent.sessionId,
+                  } as const
+                  if (typeof window !== 'undefined'
+                    && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
+                    window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
+                    return
+                  }
+                  ws.send(message)
+                }}
+              >
+                Interrupt
+              </button>
+              <button
+                type="button"
+                className="rounded border border-border/70 px-2 py-1 disabled:opacity-50"
+                disabled={!canFork || !paneContent.sessionId}
+                onClick={() => {
+                  if (!paneContent.sessionId || !canFork) return
+                  const message = {
+                    type: 'freshAgent.fork',
+                    sessionId: paneContent.sessionId,
+                  } as const
+                  if (typeof window !== 'undefined'
+                    && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
+                    window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
+                    return
+                  }
+                  ws.send(message)
+                }}
               >
                 Fork
               </button>
@@ -218,7 +285,23 @@ export function FreshAgentView({
               <FreshAgentDiffPanel diffs={diffs} />
             </div>
             <FreshAgentTranscript turns={turns} />
-            <FreshAgentComposer disabled />
+            <FreshAgentComposer
+              disabled={!canSend || !paneContent.sessionId}
+              onSend={(text) => {
+                if (!paneContent.sessionId || !canSend) return
+                const message = {
+                  type: 'freshAgent.send',
+                  sessionId: paneContent.sessionId,
+                  text,
+                } as const
+                if (typeof window !== 'undefined'
+                  && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
+                  window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
+                  return
+                }
+                ws.send(message)
+              }}
+            />
           </div>
           <FreshAgentSidebar worktrees={worktrees} childThreads={childThreads} />
         </div>

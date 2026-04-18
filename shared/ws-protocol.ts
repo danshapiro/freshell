@@ -415,8 +415,32 @@ export const FreshAgentCreateSchema = z.object({
   plugins: z.array(z.string()).optional(),
 })
 
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  sessionId: z.string().min(1),
+  text: z.string().min(1),
+  images: z.array(z.object({
+    mediaType: z.string(),
+    data: z.string(),
+  })).optional(),
+})
+
+export const FreshAgentInterruptSchema = z.object({
+  type: z.literal('freshAgent.interrupt'),
+  sessionId: z.string().min(1),
+})
+
+export const FreshAgentForkSchema = z.object({
+  type: z.literal('freshAgent.fork'),
+  sessionId: z.string().min(1),
+  input: z.record(z.string(), z.unknown()).optional(),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -450,6 +474,9 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliInputSchema,
   CodingCliKillSchema,
   FreshAgentCreateSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
