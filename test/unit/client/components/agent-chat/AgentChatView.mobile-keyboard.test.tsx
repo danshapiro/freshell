@@ -81,4 +81,39 @@ describe('AgentChatView mobile keyboard', () => {
     expect(region).toBeTruthy()
     expect(region.style.paddingBottom).toBeFalsy()
   })
+
+  it('uses tighter horizontal padding (px-2) on mobile', () => {
+    ;(globalThis as any).setMobileForTest(true)
+    useKeyboardInsetMock.mockReturnValue(0)
+
+    const store = createStore()
+    const { container } = render(
+      <Provider store={store}>
+        <AgentChatView tabId="tab-1" paneId="pane-1" paneContent={basePaneContent} />
+      </Provider>,
+    )
+
+    // The scroll container has data-context="agent-chat"
+    const scrollContainer = container.querySelector('[data-context="agent-chat"]') as HTMLElement
+    expect(scrollContainer).toBeTruthy()
+    expect(scrollContainer.className).toContain('px-2')
+    expect(scrollContainer.className).not.toContain('px-3')
+  })
+
+  it('uses standard horizontal padding (px-3) on desktop', () => {
+    ;(globalThis as any).setMobileForTest(false)
+    useKeyboardInsetMock.mockReturnValue(0)
+
+    const store = createStore()
+    const { container } = render(
+      <Provider store={store}>
+        <AgentChatView tabId="tab-1" paneId="pane-1" paneContent={basePaneContent} />
+      </Provider>,
+    )
+
+    const scrollContainer = container.querySelector('[data-context="agent-chat"]') as HTMLElement
+    expect(scrollContainer).toBeTruthy()
+    expect(scrollContainer.className).toContain('px-3')
+    expect(scrollContainer.className).not.toContain('px-2')
+  })
 })

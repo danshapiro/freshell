@@ -132,6 +132,101 @@ test.describe('Mobile Viewport', () => {
     await expect(input).toBeVisible()
   })
 
+  test('permission banner buttons are visible and functional on mobile', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+
+    // Get the active leaf pane
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const paneId = layout.id as string
+
+    // Suppress network effects
+    await page.evaluate((currentPaneId: string) => {
+      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+    }, paneId)
+
+    const sessionId = 'sdk-e2e-mobile-perm'
+    const cliSessionId = '55555555-5555-4555-8555-555555555555'
+
+    // Inject agent-chat pane with a pending permission request
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.dispatch({
+        type: 'agentChat/sessionCreated',
+        payload: {
+          requestId: 'req-e2e-mobile-perm',
+          sessionId: currentSessionId,
+        },
+      })
+      harness?.dispatch({
+        type: 'agentChat/sessionInit',
+        payload: {
+          sessionId: currentSessionId,
+          cliSessionId: currentCliSessionId,
+        },
+      })
+      harness?.dispatch({
+        type: 'agentChat/addPermissionRequest',
+        payload: {
+          sessionId: currentSessionId,
+          requestId: 'perm-e2e-mobile',
+          subtype: 'can_use_tool',
+          tool: {
+            name: 'Bash',
+            input: { command: 'echo mobile-permission-test' },
+          },
+        },
+      })
+      harness?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            createRequestId: 'req-e2e-mobile-perm',
+            sessionId: currentSessionId,
+            resumeSessionId: currentCliSessionId,
+            status: 'running',
+          },
+        },
+      })
+    }, {
+      currentTabId: tabId!,
+      currentPaneId: paneId,
+      currentSessionId: sessionId,
+      currentCliSessionId: cliSessionId,
+    })
+
+    // Verify the permission banner is visible on mobile
+    const banner = page.getByRole('alert', { name: /permission request for bash/i })
+    await expect(banner).toBeVisible({ timeout: 10_000 })
+    await expect(banner).toContainText('Permission requested: Bash')
+
+    // Verify Allow and Deny buttons are visible and clickable on mobile
+    const allowBtn = banner.getByRole('button', { name: /allow tool use/i })
+    const denyBtn = banner.getByRole('button', { name: /deny tool use/i })
+    await expect(allowBtn).toBeVisible()
+    await expect(denyBtn).toBeVisible()
+
+    // Click Allow and verify the sdk.permission.respond WS message is sent
+    await harness.clearSentWsMessages()
+    await allowBtn.click()
+
+    await expect.poll(async () => {
+      const sent = await harness.getSentWsMessages()
+      return sent.find((msg: any) => msg?.type === 'sdk.permission.respond') ?? null
+    }).toMatchObject({
+      type: 'sdk.permission.respond',
+      sessionId,
+      requestId: 'perm-e2e-mobile',
+      behavior: 'allow',
+    })
+  })
+
   test('mobile layout adapts to orientation change', async ({ freshellPage, page, terminal }) => {
     // Switch to landscape
     await page.setViewportSize({ width: 844, height: 390 })

@@ -214,4 +214,37 @@ describe('ToolStrip', () => {
     expect(screen.getByText('1 tool used')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
   })
+
+  describe('mobile touch targets', () => {
+    afterEach(() => {
+      ;(globalThis as any).setMobileForTest(false)
+    })
+
+    it('collapsed toggle button has min-h-11 min-w-11 on mobile', () => {
+      ;(globalThis as any).setMobileForTest(true)
+      const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
+      render(<ToolStrip pairs={pairs} isStreaming={false} />)
+      const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+      expect(toggle.className).toContain('min-h-11')
+      expect(toggle.className).toContain('min-w-11')
+    })
+
+    it('expanded toggle button has min-h-11 min-w-11 on mobile', () => {
+      ;(globalThis as any).setMobileForTest(true)
+      const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
+      render(<ToolStrip pairs={pairs} isStreaming={false} showTools={true} />)
+      const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+      expect(toggle.className).toContain('min-h-11')
+      expect(toggle.className).toContain('min-w-11')
+    })
+
+    it('toggle button stays compact on desktop', () => {
+      ;(globalThis as any).setMobileForTest(false)
+      const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
+      render(<ToolStrip pairs={pairs} isStreaming={false} />)
+      const toggle = screen.getByRole('button', { name: /toggle tool details/i })
+      expect(toggle.className).not.toContain('min-h-11')
+      expect(toggle.className).toContain('p-0.5')
+    })
+  })
 })
