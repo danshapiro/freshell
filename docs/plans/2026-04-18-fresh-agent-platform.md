@@ -254,6 +254,8 @@ it('migrates legacy settings.agentChat to settings.freshAgent', () => {
 })
 
 it('does not clear freshell layout storage during the fresh-agent migration', () => {
+  // Use the real layout-storage key from storage-migration.ts in the implementation test.
+  // The literal below is illustrative only.
   localStorage.setItem('freshell.layout.v3', '{"version":3}')
   runStorageMigration()
   expect(localStorage.getItem('freshell.layout.v3')).toBe('{"version":3}')
@@ -319,7 +321,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add shared/fresh-agent.ts src/lib/fresh-agent-registry.ts shared/settings.ts server/config-store.ts server/platform-router.ts src/store/settingsSlice.ts src/store/settingsThunks.ts src/store/browserPreferencesPersistence.ts src/store/storage-migration.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/crossTabSync.ts src/store/paneTreeValidation.ts src/lib/agent-chat-utils.ts src/lib/agent-chat-types.ts src/lib/pane-title.ts src/components/panes/PaneContainer.tsx src/components/TabContent.tsx src/lib/tab-registry-snapshot.ts test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts
+git add shared/fresh-agent.ts src/lib/fresh-agent-registry.ts shared/settings.ts server/config-store.ts server/platform-router.ts src/store/settingsSlice.ts src/store/settingsThunks.ts src/store/browserPreferencesPersistence.ts src/store/storage-migration.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/crossTabSync.ts src/store/paneTreeValidation.ts src/lib/agent-chat-utils.ts src/lib/agent-chat-types.ts src/lib/pane-title.ts src/components/panes/PaneContainer.tsx src/components/TabContent.tsx src/lib/tab-registry-snapshot.ts test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/integration/server/settings-api.test.ts test/integration/server/platform-api.test.ts
 git commit -m "refactor: rename rich pane domain to fresh agent"
 ```
 
@@ -417,7 +419,7 @@ it('merges ledger-backed restore state and live stream into one canonical snapsh
 it('preserves plugin defaults and mid-session model/permission changes through the claude adapter', async () => {
   expect(adapter.updateSessionSettings).toHaveBeenCalledWith(expect.objectContaining({
     defaultPlugins: ['/tmp/plugin'],
-    model: 'claude-sonnet-4-20250514',
+    model: expect.any(String),
     permissionMode: 'plan',
   }))
 })
@@ -565,7 +567,7 @@ Cover the resume and snapshot contract:
 it('keeps derivedTitle when sessionType is updated to freshcodex', async () => {
   await store.set('codex', 'sess-1', { derivedTitle: 'Sticky title' })
   await request(app).post('/api/session-metadata').send({ provider: 'codex', sessionId: 'sess-1', sessionType: 'freshcodex' })
-  expect(await store.get('codex', 'sess-1')).toEqual({ derivedTitle: 'Sticky title', sessionType: 'freshcodex' })
+  expect(await store.get('codex', 'sess-1')).toMatchObject({ derivedTitle: 'Sticky title', sessionType: 'freshcodex' })
 })
 
 it('serializes fresh-agent panes in remote layout snapshots and rehydrates them back into fresh-agent panes', () => {
@@ -613,7 +615,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/coding-cli/session-indexer.ts server/coding-cli/types.ts server/sessions-router.ts server/session-metadata-store.ts server/agent-api/layout-store.ts server/tabs-registry/types.ts src/store/tabRegistryTypes.ts src/lib/api.ts src/lib/session-metadata.ts src/lib/session-type-utils.ts src/lib/tab-directory-preference.ts src/lib/tab-registry-snapshot.ts src/components/TabContent.tsx src/components/TabsView.tsx src/store/selectors/sidebarSelectors.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts
+git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/coding-cli/session-indexer.ts server/coding-cli/types.ts server/sessions-router.ts server/session-metadata-store.ts server/agent-api/layout-store.ts server/tabs-registry/types.ts src/store/tabRegistryTypes.ts src/lib/api.ts src/lib/session-metadata.ts src/lib/session-type-utils.ts src/lib/tab-directory-preference.ts src/lib/tab-registry-snapshot.ts src/components/TabContent.tsx src/components/TabsView.tsx src/store/selectors/sidebarSelectors.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts
 git commit -m "feat: project fresh agent sessions through metadata and snapshots"
 ```
 
