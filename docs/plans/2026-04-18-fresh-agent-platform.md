@@ -18,6 +18,7 @@
 - It did not include the layout bootstrap path through [`src/components/TabContent.tsx`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/components/TabContent.tsx:1), [`src/lib/tab-directory-preference.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/lib/tab-directory-preference.ts:1), and [`src/store/paneTreeValidation.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/paneTreeValidation.ts:1). Those still special-case `agent-chat`.
 - It sequenced the persistence cutover too early. If an executor migrates stored panes from `agent-chat` to `fresh-agent` before `PaneContainer`, `TabContent`, `crossTabSync`, pane-title helpers, and local snapshot parsing can read the new shape, the next reload or cross-tab hydrate will strand rich panes as unknown content.
 - It did not call out [`src/store/selectors/sidebarSelectors.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/selectors/sidebarSelectors.ts:1) and related session metadata helpers, which are where `provider` and `sessionType` semantics get merged for history/sidebar rendering. Missing them would reintroduce the wrong identity model after the store cutover.
+- It did not call out [`server/coding-cli/session-indexer.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/coding-cli/session-indexer.ts:1) and [`server/coding-cli/types.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/coding-cli/types.ts:1), which are where stored session metadata, derived titles, and indexed Codex runtime metadata get merged before the session directory and sidebar consume them. Leaving that seam out would make the migration look complete in storage while the user-visible projections stayed wrong.
 - It did not call out [`server/platform-router.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/platform-router.ts:1), which is part of keeping hidden `kilroy` support wired through the platform feature flags.
 - It did not include the existing browser specs, Vitest e2e flows, context-menu tests, visible-first perf fixtures, and MCP help text that still hard-code `agent-chat` or `sdk.*`. An executor could finish the product code, hit the repo-wide verification gate, and then discover a second migration hidden in the test/tooling surface.
 - It was still too optimistic about “delete old `agent-chat` glue later”. Some of the old files are not merely legacy UI; they currently encode product-critical behavior that must be ported deliberately before deletion: restore hydration, question/approval state, plugin defaults, input history, and lost-session recovery.
@@ -224,6 +225,7 @@ The plan therefore reuses both, renames the product domain to `fresh-agent`, mig
 - Test: `test/unit/server/config-store.fresh-agent-settings.test.ts`
 - Test: `test/integration/server/settings-api.test.ts`
 - Test: `test/unit/server/agent-layout-schema.test.ts`
+- Test: `test/integration/server/platform-api.test.ts`
 
 - [ ] **Step 1: Identify or write the failing tests**
 
@@ -281,7 +283,7 @@ it('preserves canonical resume identity when cross-tab sync rehydrates a fresh-a
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/integration/server/settings-api.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/integration/server/settings-api.test.ts test/integration/server/platform-api.test.ts`
 Expected: FAIL because the registry and migrations do not exist yet.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -300,7 +302,7 @@ Implement the shared vocabulary and migrations:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/integration/server/settings-api.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/integration/server/settings-api.test.ts test/integration/server/platform-api.test.ts`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
@@ -311,7 +313,7 @@ Refactor compatibility to one place only:
 - runtime readers accept `fresh-agent` first and tolerate legacy `agent-chat` only at bootstrap boundaries
 - `agent-chat` helper modules become thin compatibility exports or are queued for removal
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/integration/server/settings-api.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/client/store/panesPersistence.test.ts test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/integration/server/settings-api.test.ts test/integration/server/platform-api.test.ts`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
@@ -529,6 +531,8 @@ git commit -m "feat: add codex rich runtime support"
 - Modify: `server/session-directory/projection.ts`
 - Modify: `server/session-directory/service.ts`
 - Modify: `server/session-directory/types.ts`
+- Modify: `server/coding-cli/session-indexer.ts`
+- Modify: `server/coding-cli/types.ts`
 - Modify: `server/sessions-router.ts`
 - Modify: `server/session-metadata-store.ts`
 - Modify: `server/agent-api/layout-store.ts`
@@ -543,6 +547,8 @@ git commit -m "feat: add codex rich runtime support"
 - Modify: `src/components/TabsView.tsx`
 - Modify: `src/store/selectors/sidebarSelectors.ts`
 - Test: `test/unit/server/session-directory/fresh-agent-projection.test.ts`
+- Test: `test/unit/server/coding-cli/session-indexer.test.ts`
+- Test: `test/unit/server/session-metadata-store.test.ts`
 - Test: `test/integration/server/session-metadata-api.test.ts`
 - Test: `test/unit/server/agent-api/layout-store.fresh-agent.test.ts`
 - Test: `test/unit/client/components/TabsView.fresh-agent.test.tsx`
@@ -566,11 +572,18 @@ it('serializes fresh-agent panes in remote layout snapshots and rehydrates them 
   expect(snapshot.panes[0]).toMatchObject({ kind: 'fresh-agent' })
   expect(restored.content).toMatchObject({ kind: 'fresh-agent', sessionType: 'freshclaude' })
 })
+
+it('projects fresh sessionType and codex runtime metadata through the indexed session directory snapshot', async () => {
+  expect(projects[0]?.sessions[0]).toMatchObject({
+    sessionType: 'freshcodex',
+    isSubagent: true,
+  })
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
 Expected: FAIL because fresh-agent metadata and snapshot flows are not fully projected yet.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -580,26 +593,27 @@ Implement projection and metadata updates so that:
 - sidebar and history pages show `freshclaude`, `freshcodex`, and `kilroy` correctly
 - resume actions rebuild `kind: 'fresh-agent'` panes
 - `sessionType` updates do not clobber `derivedTitle`
+- coding-cli indexing merges `sessionType`, derived titles, and Codex task metadata into the same summaries the session directory and sidebar render
 - remote layout snapshots and registry records store `fresh-agent`, not `agent-chat`
 - session directory carries the metadata needed for fork, worktree, and subagent badges
 - tabs-registry persistence and HTTP/session-directory routes expose the same migrated shape the UI hydrates
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
 
 Keep `provider` and `sessionType` semantics separate everywhere. Do not smuggle UI identity back into filesystem or provider fields.
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/server/session-directory/service.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx`
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/types.test.ts test/integration/server/tabs-registry-store.persistence.test.ts test/integration/server/session-directory-router.test.ts test/unit/server/session-directory/service.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/sessions-router.ts server/session-metadata-store.ts server/agent-api/layout-store.ts server/tabs-registry/types.ts src/store/tabRegistryTypes.ts src/lib/api.ts src/lib/session-metadata.ts src/lib/session-type-utils.ts src/lib/tab-directory-preference.ts src/lib/tab-registry-snapshot.ts src/components/TabContent.tsx src/components/TabsView.tsx src/store/selectors/sidebarSelectors.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts
+git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/coding-cli/session-indexer.ts server/coding-cli/types.ts server/sessions-router.ts server/session-metadata-store.ts server/agent-api/layout-store.ts server/tabs-registry/types.ts src/store/tabRegistryTypes.ts src/lib/api.ts src/lib/session-metadata.ts src/lib/session-type-utils.ts src/lib/tab-directory-preference.ts src/lib/tab-registry-snapshot.ts src/components/TabContent.tsx src/components/TabsView.tsx src/store/selectors/sidebarSelectors.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-metadata-store.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts
 git commit -m "feat: project fresh agent sessions through metadata and snapshots"
 ```
 
