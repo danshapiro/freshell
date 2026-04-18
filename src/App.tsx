@@ -63,6 +63,7 @@ import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import { selectTabPaneByTerminalId } from '@/store/selectors/paneTerminalSelectors'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
@@ -934,7 +935,8 @@ export default function App() {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
-        // SDK message handling (freshclaude pane)
+        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>)
+        // SDK message handling (freshclaude compatibility surface)
         handleSdkMessage(dispatch, msg as Record<string, unknown>, ws)
       })
 

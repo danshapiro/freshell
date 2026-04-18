@@ -875,8 +875,10 @@ describe('ContextMenuProvider', () => {
       expect(newPane).toBeDefined()
       if (newPane?.type === 'leaf') {
         expect(newPane.content).toMatchObject({
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          resumeSessionId: VALID_SESSION_ID,
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_SESSION_ID,

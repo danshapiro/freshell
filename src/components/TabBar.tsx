@@ -153,7 +153,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const agentChatSessions = useAppSelector((s) => s.freshAgent?.sessions ?? s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const paneRuntimeActivityByPaneId = useAppSelector(
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )

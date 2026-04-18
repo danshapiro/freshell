@@ -12,8 +12,14 @@ import type {
   CodexInitializeResult,
   CodexThreadHandle,
   CodexThreadOperationResult,
+  CodexThreadReadParams,
+  CodexThreadReadResult,
   CodexThreadResumeParams,
   CodexThreadStartParams,
+  CodexThreadTurnReadParams,
+  CodexThreadTurnReadResult,
+  CodexThreadTurnsListParams,
+  CodexThreadTurnsListResult,
 } from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
@@ -644,6 +650,21 @@ export class CodexAppServerRuntime {
   async watchPath(targetPath: string, watchId: string): Promise<CodexFsWatchResult> {
     await this.ensureReady()
     return this.client!.watchPath(targetPath, watchId)
+  }
+
+  async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
+    await this.ensureReady()
+    return await this.client!.readThread(params)
+  }
+
+  async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
+    await this.ensureReady()
+    return await this.client!.listThreadTurns(params)
+  }
+
+  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    await this.ensureReady()
+    return await this.client!.readThreadTurn(params)
   }
 
   async unwatchPath(watchId: string): Promise<void> {

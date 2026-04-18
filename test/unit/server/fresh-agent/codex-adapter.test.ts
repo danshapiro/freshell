@@ -13,21 +13,23 @@ describe('Codex fresh-agent adapter', () => {
         threadId: 'thread-resume-1',
         wsUrl: 'ws://127.0.0.1:43123',
       }),
+      readThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-new-1',
+        revision: 7,
+        status: 'idle',
+        summary: 'Codex summary',
+        turns: [],
+        tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, totalTokens: 3 },
+        worktrees: [],
+        diffs: [],
+        childThreads: [],
+        extension: { codex: {} },
+      }),
+      listThreadTurns: vi.fn().mockResolvedValue({ turns: [], nextCursor: null, revision: 7 }),
+      readThreadTurn: vi.fn().mockResolvedValue(null),
     }
     const adapter = createCodexFreshAgentAdapter({
       runtime: runtime as any,
-      readStore: {
-        getSnapshot: vi.fn().mockResolvedValue({
-          summary: 'Codex summary',
-          tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, totalTokens: 3 },
-          worktrees: [],
-          diffs: [],
-          childThreads: [],
-          extension: { codex: {} },
-        }),
-        getTurnPage: vi.fn().mockResolvedValue({ turns: [], nextCursor: null }),
-        getTurnBody: vi.fn().mockResolvedValue(null),
-      } as any,
     })
 
     await expect(adapter.create({
@@ -52,5 +54,48 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       richClient: true,
     }))
+  })
+
+  it('reads snapshots and turns from the official Codex thread APIs', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-new-1',
+        revision: 7,
+        status: 'idle',
+        summary: 'Codex summary',
+        turns: [],
+        tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, totalTokens: 3 },
+        worktrees: [],
+        diffs: [],
+        childThreads: [],
+        extension: { codex: {} },
+      }),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: null,
+        turns: [{ turnId: 'turn-1' }],
+      }),
+      readThreadTurn: vi.fn().mockResolvedValue({
+        turnId: 'turn-1',
+        revision: 7,
+      }),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.getSnapshot?.({ provider: 'codex', threadId: 'thread-new-1' }, 7)).resolves.toMatchObject({
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      revision: 7,
+    })
+    await expect(adapter.getTurnPage?.({ provider: 'codex', threadId: 'thread-new-1' }, { revision: 7 })).resolves.toMatchObject({
+      revision: 7,
+      turns: [{ turnId: 'turn-1' }],
+    })
+    await expect(adapter.getTurnBody?.({ provider: 'codex', threadId: 'thread-new-1', turnId: 'turn-1' }, 7)).resolves.toMatchObject({
+      turnId: 'turn-1',
+      revision: 7,
+    })
   })
 })

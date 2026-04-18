@@ -133,6 +133,64 @@ function successResult(method, params) {
   if (method === 'fs/unwatch') {
     return {}
   }
+  if (method === 'thread/read') {
+    return {
+      threadId: params?.threadId,
+      revision: params?.revision ?? 7,
+      status: 'idle',
+      turns: [{
+        id: 'turn-1',
+        turnId: 'turn-1',
+        messageId: 'msg-1',
+        ordinal: 0,
+        source: 'durable',
+        role: 'assistant',
+        summary: 'Fixture turn',
+        items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
+      }],
+    }
+  }
+  if (method === 'thread/turns/list') {
+    return {
+      revision: params?.revision ?? 7,
+      nextCursor: null,
+      turns: [{
+        id: 'turn-1',
+        turnId: 'turn-1',
+        messageId: 'msg-1',
+        ordinal: 0,
+        source: 'durable',
+        role: 'assistant',
+        summary: 'Fixture turn',
+        items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
+      }],
+      bodies: params?.includeBodies ? {
+        'turn-1': {
+          id: 'turn-1',
+          turnId: 'turn-1',
+          messageId: 'msg-1',
+          ordinal: 0,
+          source: 'durable',
+          role: 'assistant',
+          summary: 'Fixture turn',
+          items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
+        },
+      } : undefined,
+    }
+  }
+  if (method === 'thread/turn/read') {
+    return {
+      id: params?.turnId,
+      turnId: params?.turnId,
+      messageId: 'msg-1',
+      ordinal: 0,
+      source: 'durable',
+      role: 'assistant',
+      summary: 'Fixture turn',
+      revision: params?.revision ?? 7,
+      items: [{ id: `${params?.turnId}:item-0`, kind: 'text', text: 'Fixture turn' }],
+    }
+  }
   return {}
 }
 

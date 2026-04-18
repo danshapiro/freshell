@@ -85,6 +85,7 @@ import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registr
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
 import { createFreshAgentRouter } from './fresh-agent/router.js'
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
+import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -336,6 +337,20 @@ async function main() {
     agentHistorySource,
     timelineService: claudeFreshAgentTimelineService,
   })
+
+  const server = http.createServer(app)
+  const codexAppServerRuntime = new CodexAppServerRuntime({ serverInstanceId })
+  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
+    runtime: new CodexAppServerRuntime({
+      serverInstanceId,
+      cwd: input.cwd,
+      commandArgs: input.commandArgs,
+      env: input.env,
+    }),
+  }))
+  const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+    runtime: codexAppServerRuntime,
+  })
   const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
     registry: createFreshAgentProviderRegistry([
       {
@@ -348,18 +363,13 @@ async function main() {
         runtimeProvider: 'claude',
         adapter: claudeFreshAgentAdapter,
       },
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexFreshAgentAdapter,
+      },
     ]),
   })
-
-  const server = http.createServer(app)
-  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
-    runtime: new CodexAppServerRuntime({
-      serverInstanceId,
-      cwd: input.cwd,
-      commandArgs: input.commandArgs,
-      env: input.env,
-    }),
-  }))
   const wsHandler = new WsHandler(
     server,
     registry,

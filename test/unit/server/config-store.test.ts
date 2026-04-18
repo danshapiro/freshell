@@ -225,6 +225,10 @@ describe('ConfigStore', () => {
           ...defaultSettings.agentChat,
           defaultPlugins: ['fs'],
         },
+        freshAgent: {
+          ...defaultSettings.freshAgent,
+          defaultPlugins: ['fs'],
+        },
       })
       expect(config.legacyLocalSettingsSeed).toEqual({
         theme: 'dark',

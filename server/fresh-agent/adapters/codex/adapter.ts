@@ -17,17 +17,19 @@ type CodexRuntimePort = {
     approvalPolicy?: string
     richClient?: boolean
   }) => Promise<{ threadId: string; wsUrl: string }>
-}
-
-type CodexReadStore = {
-  getSnapshot: (threadId: string, revision?: number) => Promise<Record<string, any>>
-  getTurnPage: (threadId: string, query: Record<string, unknown>) => Promise<unknown>
-  getTurnBody: (threadId: string, turnId: string, revision: number) => Promise<unknown>
+  readThread: (input: { threadId: string; revision?: number }) => Promise<Record<string, any>>
+  listThreadTurns: (input: {
+    threadId: string
+    revision?: number
+    cursor?: string
+    limit?: number
+    includeBodies?: boolean
+  }) => Promise<Record<string, any>>
+  readThreadTurn: (input: { threadId: string; turnId: string; revision?: number }) => Promise<Record<string, any>>
 }
 
 export function createCodexFreshAgentAdapter(deps: {
   runtime: CodexRuntimePort
-  readStore: CodexReadStore
 }): FreshAgentRuntimeAdapter {
   return {
     runtimeProvider: 'codex',
@@ -55,7 +57,7 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getSnapshot(thread, revision) {
-      const rawSnapshot = await deps.readStore.getSnapshot(thread.threadId, revision)
+      const rawSnapshot = await deps.runtime.readThread({ threadId: thread.threadId, revision })
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: Number(rawSnapshot.revision ?? revision ?? 0),
@@ -68,11 +70,21 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getTurnPage(thread, query) {
-      return await deps.readStore.getTurnPage(thread.threadId, query)
+      return await deps.runtime.listThreadTurns({
+        threadId: thread.threadId,
+        revision: typeof query.revision === 'number' ? query.revision : Number(query.revision),
+        cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
+        limit: typeof query.limit === 'number' ? query.limit : undefined,
+        includeBodies: query.includeBodies === true,
+      })
     },
 
     async getTurnBody(thread, revision) {
-      return await deps.readStore.getTurnBody(thread.threadId, thread.turnId, revision)
+      return await deps.runtime.readThreadTurn({
+        threadId: thread.threadId,
+        turnId: thread.turnId,
+        revision,
+      })
     },
   }
 }

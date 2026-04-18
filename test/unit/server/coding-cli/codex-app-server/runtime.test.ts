@@ -233,6 +233,18 @@ describe('CodexAppServerRuntime', () => {
     })
   })
 
+  it('proxies thread/read through the shared client after boot', async () => {
+    const runtime = createRuntime()
+
+    await expect(runtime.readThread({
+      threadId: 'thread-new-1',
+      revision: 7,
+    })).resolves.toMatchObject({
+      threadId: 'thread-new-1',
+      revision: 7,
+    })
+  })
+
   it('drops cached state after an unexpected child exit and starts a fresh process on the next call', async () => {
     const runtime = createRuntime()
 

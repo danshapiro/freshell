@@ -410,4 +410,48 @@ describe('CodexAppServerClient', () => {
       'Codex app-server returned an invalid thread/start payload.',
     )
   })
+
+  it('reads thread snapshots from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.readThread({ threadId: 'thread-new-1', revision: 7 })).resolves.toMatchObject({
+      threadId: 'thread-new-1',
+      revision: 7,
+      status: 'idle',
+    })
+  })
+
+  it('lists thread turns from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.listThreadTurns({
+      threadId: 'thread-new-1',
+      revision: 7,
+      includeBodies: true,
+    })).resolves.toMatchObject({
+      revision: 7,
+      nextCursor: null,
+      turns: [expect.objectContaining({ turnId: 'turn-1' })],
+      bodies: { 'turn-1': expect.objectContaining({ turnId: 'turn-1' }) },
+    })
+  })
+
+  it('reads an individual thread turn from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.readThreadTurn({
+      threadId: 'thread-new-1',
+      turnId: 'turn-1',
+      revision: 7,
+    })).resolves.toMatchObject({
+      turnId: 'turn-1',
+      revision: 7,
+    })
+  })
 })

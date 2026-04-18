@@ -836,6 +836,7 @@ export type ServerMessage =
   | CodingCliExitMessage
   | CodingCliStderrMessage
   | CodingCliKilledMessage
+  | FreshAgentServerMessage
   | SdkServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage

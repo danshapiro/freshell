@@ -1,9 +1,11 @@
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { collectPaneEntries } from '@/lib/pane-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type {
   AgentChatPaneContent,
+  FreshAgentPaneContent,
   PaneContent,
   PaneNode,
   TerminalPaneContent,
@@ -50,6 +52,21 @@ function resolveAgentChatSessionKey(
   return `${provider}:${sessionId}`
 }
 
+function resolveFreshAgentSessionKey(
+  content: FreshAgentPaneContent,
+  session: ChatSessionState | undefined,
+): string | undefined {
+  const explicit = content.sessionRef
+  if (explicit?.provider && explicit.sessionId) {
+    return `${explicit.provider}:${explicit.sessionId}`
+  }
+
+  const provider = resolveFreshAgentType(content.sessionType)?.runtimeProvider ?? content.provider
+  const sessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
+  if (!provider || !sessionId) return undefined
+  return `${provider}:${sessionId}`
+}
+
 function isAgentChatBusy(
   content: AgentChatPaneContent,
   session: ChatSessionState | undefined,
@@ -65,6 +82,20 @@ function isAgentChatBusy(
 
   if (session?.streamingActive) return true
   return status === 'running'
+}
+
+function isFreshAgentBusy(
+  content: FreshAgentPaneContent,
+  session: ChatSessionState | undefined,
+): boolean {
+  if (content.provider === 'codex') {
+    return content.status === 'running' || content.status === 'compacting'
+  }
+  return isAgentChatBusy({
+    ...content,
+    kind: 'agent-chat',
+    provider: content.sessionType === 'kilroy' ? 'kilroy' : 'freshclaude',
+  }, session)
 }
 
 function resolveTerminalSessionKey(
@@ -163,6 +194,15 @@ export function resolvePaneActivity(input: {
       ? input.agentChatSessions[input.content.sessionId]
       : undefined
     return isAgentChatBusy(input.content, session)
+      ? { isBusy: true, source: 'agent-chat' }
+      : IDLE_PANE_ACTIVITY
+  }
+
+  if (input.content.kind === 'fresh-agent') {
+    const session = input.content.sessionId
+      ? input.agentChatSessions[input.content.sessionId]
+      : undefined
+    return isFreshAgentBusy(input.content, session)
       ? { isBusy: true, source: 'agent-chat' }
       : IDLE_PANE_ACTIVITY
   }
@@ -266,6 +306,13 @@ export function collectBusySessionKeys(input: {
             ? input.agentChatSessions[entry.content.sessionId]
             : undefined,
         )
+        : entry.content.kind === 'fresh-agent'
+          ? resolveFreshAgentSessionKey(
+            entry.content,
+            entry.content.sessionId
+              ? input.agentChatSessions[entry.content.sessionId]
+              : undefined,
+          )
         : entry.content.kind === 'terminal'
           ? resolveTerminalSessionKey(entry.content, tab.sessionRef, tab.resumeSessionId, tab.mode)
           : undefined

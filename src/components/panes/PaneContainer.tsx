@@ -8,6 +8,7 @@ import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import AgentChatView from '../agent-chat/AgentChatView'
+import FreshAgentView from '../fresh-agent/FreshAgentView'
 import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
@@ -166,7 +167,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
   const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const agentChatSessions = useAppSelector((s) => s.freshAgent?.sessions ?? s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
   )
@@ -190,7 +191,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
   const sdkPendingCreates = useAppSelector(
-    (s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+    (s) => s.freshAgent?.pendingCreates ?? s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES
   )
 
   // Drag state for snapping: track the original size and accumulated delta
@@ -415,13 +416,18 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           initialCwd: paneInitialCwd,
         })
         : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
-          ? resolveFreshClaudeRuntimeMeta(
-            indexedProjects,
-            node.content.kind === 'fresh-agent'
-              ? { ...node.content, kind: 'agent-chat', provider: node.content.sessionType }
-              : node.content,
-            node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+          ? (
+            node.content.kind === 'agent-chat'
+            || (node.content.kind === 'fresh-agent' && node.content.provider === 'claude')
           )
+            ? resolveFreshClaudeRuntimeMeta(
+              indexedProjects,
+              node.content.kind === 'fresh-agent'
+                ? { ...node.content, kind: 'agent-chat', provider: node.content.sessionType === 'kilroy' ? 'kilroy' : 'freshclaude' }
+                : node.content,
+              node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+            )
+            : undefined
         : undefined
     const paneMetaLabel =
       paneRuntimeMeta
@@ -525,7 +531,10 @@ function PickerWrapper({
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
   const agentChatSettings = useAppSelector(
-    (s) => s.settings?.settings?.agentChat ?? s.settings?.serverSettings?.agentChat
+    (s) => s.settings?.settings?.freshAgent
+      ?? s.settings?.settings?.agentChat
+      ?? s.settings?.serverSettings?.freshAgent
+      ?? s.settings?.serverSettings?.agentChat
   )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
@@ -548,20 +557,33 @@ function PickerWrapper({
       }
     }
 
-    if (isAgentChatProviderName(type)) {
-      const providerConfig = getAgentChatProviderConfig(type)!
-      const freshAgentType = resolveFreshAgentType(type)!
+    const freshAgentType = resolveFreshAgentType(type)
+    if (freshAgentType) {
+      const providerConfig = isAgentChatProviderName(type)
+        ? getAgentChatProviderConfig(type)
+        : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
       return {
         kind: 'fresh-agent',
-        sessionType: type,
+        sessionType: freshAgentType.sessionType,
         provider: freshAgentType.runtimeProvider,
         createRequestId: nanoid(),
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
-        permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
-        effort: normalizeAgentChatEffortOverride(providerSettings?.effort),
-        plugins: agentChatSettings?.defaultPlugins,
+        model: freshAgentType.runtimeProvider === 'codex'
+          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
+          : freshAgentType.defaultModel,
+        permissionMode: providerSettings?.defaultPermissionMode
+          ?? (freshAgentType.runtimeProvider === 'codex'
+            ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
+            : undefined)
+          ?? providerConfig?.defaultPermissionMode
+          ?? freshAgentType.defaultPermissionMode,
+        sandbox: freshAgentType.runtimeProvider === 'codex'
+          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
+          : undefined,
+        effort: normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
+        plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
@@ -632,7 +654,7 @@ function PickerWrapper({
   }, [agentChatSettings, extensionEntries])
 
   const handleSelect = useCallback((type: PanePickerType) => {
-    if (isAgentChatProviderName(type)) {
+    if (resolveFreshAgentType(type)) {
       setStep({ step: 'directory', providerType: type })
       return
     }
@@ -755,15 +777,26 @@ function renderContent(
     )
   }
 
-  if (content.kind === 'agent-chat' || content.kind === 'fresh-agent') {
+  if (content.kind === 'agent-chat') {
     return (
       <ErrorBoundary key={paneId} label="Chat">
         <AgentChatView
           tabId={tabId}
           paneId={paneId}
-          paneContent={content.kind === 'fresh-agent'
-            ? { ...content, kind: 'agent-chat', provider: content.sessionType }
-            : content}
+          paneContent={content}
+          hidden={hidden}
+        />
+      </ErrorBoundary>
+    )
+  }
+
+  if (content.kind === 'fresh-agent') {
+    return (
+      <ErrorBoundary key={paneId} label="Fresh Agent">
+        <FreshAgentView
+          tabId={tabId}
+          paneId={paneId}
+          paneContent={content}
           hidden={hidden}
         />
       </ErrorBoundary>

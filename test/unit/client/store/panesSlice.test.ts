@@ -378,11 +378,12 @@ describe('panesSlice', () => {
   })
 
   describe('restartAgentChatCreate', () => {
-    it('moves an agent-chat pane into stable create-failed state until an explicit retry restarts it', () => {
+    it('moves a fresh-agent pane into stable create-failed state until an explicit retry restarts it', () => {
       const state = panesReducer(
         stateWithLeaf('pane-agent', {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-1',
           status: 'create-failed' as any,
           createError: {
@@ -396,10 +397,10 @@ describe('panesSlice', () => {
 
       const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(layout.content).toMatchObject({
-        kind: 'agent-chat',
+        kind: 'fresh-agent',
         status: 'creating',
       })
-      if (layout.content.kind === 'agent-chat') {
+      if (layout.content.kind === 'fresh-agent') {
         expect((layout.content as any).createError).toBeUndefined()
         expect(layout.content.createRequestId).not.toBe('req-1')
       }

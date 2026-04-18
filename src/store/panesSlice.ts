@@ -91,7 +91,7 @@ function normalizePaneContent(
       ? migratedInput.provider
       : resolveFreshAgentRuntimeProvider(sessionType)
     if (!sessionType || !provider) {
-      return input.kind === 'agent-chat' ? input : previous ?? input
+      return previous ?? { kind: 'picker' }
     }
     const sessionRef = sanitizeSessionRef(input.sessionRef)
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)

@@ -12,12 +12,21 @@ import {
   CodexThreadLifecycleNotificationSchema,
   CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
+  CodexThreadReadResultSchema,
+  CodexThreadTurnReadResultSchema,
+  CodexThreadTurnsListResultSchema,
   type CodexInitializeResult,
   type CodexRpcError,
   type CodexThreadHandle,
   type CodexThreadOperationResult,
+  type CodexThreadReadParams,
+  type CodexThreadReadResult,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
+  type CodexThreadTurnReadParams,
+  type CodexThreadTurnReadResult,
+  type CodexThreadTurnsListParams,
+  type CodexThreadTurnsListResult,
 } from './protocol.js'
 
 type CodexAppServerClientOptions = {
@@ -153,6 +162,33 @@ export class CodexAppServerClient {
     await this.request('fs/unwatch', CodexFsUnwatchParamsSchema.parse({
       watchId,
     }))
+  }
+
+  async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
+    const result = await this.request('thread/read', params)
+    const parsed = CodexThreadReadResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid thread/read payload.')
+    }
+    return parsed.data
+  }
+
+  async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
+    const result = await this.request('thread/turns/list', params)
+    const parsed = CodexThreadTurnsListResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid thread/turns/list payload.')
+    }
+    return parsed.data
+  }
+
+  async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
+    const result = await this.request('thread/turn/read', params)
+    const parsed = CodexThreadTurnReadResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid thread/turn/read payload.')
+    }
+    return parsed.data
   }
 
   async close(): Promise<void> {

@@ -2,12 +2,13 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
 import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
-import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
+import type { FreshAgentPaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 
@@ -83,6 +84,7 @@ function makeStore(tabOverrides: Partial<Tab> = {}) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
+      freshAgent: freshAgentReducer,
       panes: panesReducer,
       settings: settingsReducer,
       tabs: tabsReducer,
@@ -119,11 +121,11 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
     const root = s.panes.layouts.t1
     if (!root) return undefined
     const leaf = findLeaf(root, 'p1')
-    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
+    return leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined
   })
 
   if (!content) return null
-  return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+  return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
 }
 
 describe('agent chat restore flow', () => {
@@ -147,12 +149,13 @@ describe('agent chat restore flow', () => {
       },
     })
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-reload',
       sessionId: 'sdk-sess-1',
       status: 'idle',
-    } satisfies AgentChatPaneContent
+    } satisfies FreshAgentPaneContent
 
     store.dispatch(initLayout({
       tabId: 't1',
@@ -223,7 +226,8 @@ describe('agent chat restore flow', () => {
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionRef : undefined).toEqual({
+      expect(leaf?.content.kind === 'fresh-agent' ? leaf.content.resumeSessionId : undefined).toBe('cli-session-1')
+      expect(leaf?.content.kind === 'fresh-agent' ? leaf.content.sessionRef : undefined).toEqual({
         provider: 'claude',
         sessionId: canonicalSessionId,
       })
@@ -267,13 +271,14 @@ describe('agent chat restore flow', () => {
       },
     })
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-stale',
       sessionId: 'sdk-stale-1',
       status: 'idle',
       resumeSessionId: canonicalSessionId,
-    } satisfies AgentChatPaneContent
+    } satisfies FreshAgentPaneContent
 
     store.dispatch(initLayout({
       tabId: 't1',

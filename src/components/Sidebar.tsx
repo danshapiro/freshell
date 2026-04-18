@@ -320,7 +320,7 @@ export default function Sidebar({
     codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-    agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
+    agentChatSessions: state.freshAgent?.sessions ?? state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
 

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vite
 import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { loadAgentTurnBody } from '@/store/agentChatThunks'
 import agentChatReducer, {
@@ -22,7 +22,7 @@ import panesReducer, { initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent as AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -138,7 +138,7 @@ function makeTimelineTurn(
 }
 
 const RELOAD_PANE: AgentChatPaneContent = {
-  kind: 'agent-chat', provider: 'freshclaude',
+  kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
   createRequestId: 'req-1',
   sessionId: 'sess-reload-1',
   status: 'idle',
@@ -156,6 +156,8 @@ const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
   resumeSessionId: 'named-resume-token',
 }
+
+const AgentChatView = FreshAgentView
 
 describe('AgentChatView reload/restore behavior', () => {
   beforeEach(() => {
@@ -260,7 +262,7 @@ describe('AgentChatView reload/restore behavior', () => {
   it('does NOT send sdk.attach when paneContent has no sessionId (new session)', () => {
     const store = makeStore()
     const newPane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-new',
       status: 'creating',
     }
@@ -279,8 +281,9 @@ describe('AgentChatView reload/restore behavior', () => {
   it('shows sdk.create.failed retry UI without fabricating a session id and only retries on click', async () => {
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-create-failed',
       status: 'creating',
     }
@@ -289,7 +292,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
         ? root.content
         : undefined
       if (!content) return null
@@ -596,7 +599,7 @@ describe('AgentChatView reload/restore behavior', () => {
   it('shows welcome screen when no sessionId (brand new session)', () => {
     const store = makeStore()
     const newPane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-new',
       status: 'creating',
     }
@@ -662,7 +665,7 @@ describe('AgentChatView reload/restore behavior', () => {
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-fresh' }))
 
     const freshPane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-fresh',
       status: 'starting',
@@ -695,8 +698,9 @@ describe('AgentChatView reload/restore behavior', () => {
           tabId="t1"
           paneId="p1"
           paneContent={{
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-fresh',
             sessionId: 'sdk-fresh',
             status: 'starting',
@@ -1138,8 +1142,9 @@ describe('AgentChatView reload/restore behavior', () => {
   it('persists timelineSessionId into pane content and tab fallback metadata before sdk.session.init arrives', () => {
     const store = makeStoreWithTabs()
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sdk-sess-1',
       status: 'starting',
@@ -1194,8 +1199,9 @@ describe('AgentChatView reload/restore behavior', () => {
   it('persists codingCliProvider into shell-tab fallback metadata when timelineSessionId becomes durable', () => {
     const store = makeStoreWithTabs()
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-shell',
       sessionId: 'sdk-shell-1',
       status: 'starting',
@@ -1349,8 +1355,9 @@ describe('AgentChatView reload/restore behavior', () => {
 
     const store = makeStoreWithTabs()
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-meta-upgrade',
       sessionId: 'sdk-meta-upgrade-1',
       status: 'idle',
@@ -1480,8 +1487,9 @@ describe('AgentChatView reload/restore behavior', () => {
     const store = makeStoreWithTabs()
     const dispatchSpy = vi.spyOn(store, 'dispatch')
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-flush',
       sessionId: 'sdk-flush-1',
       status: 'starting',
@@ -1633,8 +1641,9 @@ describe('AgentChatView reload/restore behavior', () => {
           tabId="t1"
           paneId="p1"
           paneContent={{
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             createRequestId: 'req-empty',
             sessionId: 'sdk-empty',
             status: 'starting',
@@ -1878,7 +1887,7 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   function find(node: PaneNode): AgentChatPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
+    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'fresh-agent') {
       return node.content
     }
     if (node.type === 'split') {
@@ -1899,7 +1908,7 @@ describe('AgentChatView server-restart recovery', () => {
   it('persists cliSessionId as resumeSessionId in pane content when sessionInit arrives', () => {
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sdk-sess-1',
       status: 'starting',
@@ -1936,7 +1945,7 @@ describe('AgentChatView server-restart recovery', () => {
     vi.useFakeTimers()
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-stale',
       sessionId: 'dead-session-id',
       status: 'idle',
@@ -1989,8 +1998,9 @@ describe('AgentChatView server-restart recovery', () => {
 
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-stale',
       sessionId: 'sdk-stale-1',
       status: 'idle',
@@ -2001,7 +2011,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
         ? root.content
         : undefined
       if (!content) return null
@@ -2056,8 +2066,9 @@ describe('AgentChatView server-restart recovery', () => {
   it('surfaces attach-time restore failures as a terminal restore state instead of staying in restore mode', async () => {
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-attach-failure',
       sessionId: 'sdk-missing-history',
       status: 'idle',
@@ -2068,7 +2079,7 @@ describe('AgentChatView server-restart recovery', () => {
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
         ? root.content
         : undefined
       if (!content) return null
@@ -2141,8 +2152,9 @@ describe('AgentChatView server-restart recovery', () => {
 
     const store = makeStore()
     const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-revision-refresh',
       sessionId: 'sdk-revision-refresh-1',
       status: 'idle',

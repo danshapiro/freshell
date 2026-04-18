@@ -49,14 +49,34 @@ export function buildResumeContent(opts: {
   cwd?: string
   agentChatProviderSettings?: AgentChatProviderSettings
 }): TerminalPaneInput | FreshAgentPaneInput | AgentChatPaneInput {
+  const freshAgentType = resolveFreshAgentType(opts.sessionType)
+  if (freshAgentType) {
+    const agentConfig = getAgentChatProviderConfig(opts.sessionType)
+    const ps = opts.agentChatProviderSettings
+    return {
+      kind: 'fresh-agent',
+      sessionType: freshAgentType.sessionType,
+      provider: freshAgentType.runtimeProvider,
+      resumeSessionId: opts.sessionId,
+      sessionRef: {
+        provider: freshAgentType.runtimeProvider,
+        sessionId: opts.sessionId,
+      },
+      initialCwd: opts.cwd,
+      modelSelection: ps?.modelSelection,
+      model: freshAgentType.defaultModel,
+      permissionMode: ps?.defaultPermissionMode ?? agentConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode,
+      effort: ps?.effort,
+    }
+  }
+
   const agentConfig = getAgentChatProviderConfig(opts.sessionType)
   if (agentConfig) {
     const ps = opts.agentChatProviderSettings
-    const freshAgentType = resolveFreshAgentType(opts.sessionType)
     return {
       kind: 'fresh-agent',
       sessionType: agentConfig.name as AgentChatProviderName,
-      provider: freshAgentType?.runtimeProvider ?? 'claude',
+      provider: 'claude',
       resumeSessionId: opts.sessionId,
       initialCwd: opts.cwd,
       modelSelection: ps?.modelSelection,

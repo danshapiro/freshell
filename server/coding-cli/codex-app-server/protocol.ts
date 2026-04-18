@@ -63,6 +63,59 @@ export const CodexFsUnwatchParamsSchema = z.object({
   watchId: z.string().min(1),
 })
 
+export const CodexThreadReadParamsSchema = z.object({
+  threadId: z.string().min(1),
+  revision: z.number().int().nonnegative().optional(),
+})
+
+export const CodexThreadTurnItemSchema = z.object({
+  id: z.string().min(1),
+  kind: z.string().min(1),
+}).passthrough()
+
+export const CodexThreadTurnSchema = z.object({
+  id: z.string().min(1),
+  turnId: z.string().min(1).optional(),
+  messageId: z.string().min(1).optional(),
+  ordinal: z.number().int().nonnegative().optional(),
+  source: z.enum(['durable', 'live']).optional(),
+  role: z.enum(['user', 'assistant']).optional(),
+  summary: z.string().optional(),
+  items: z.array(CodexThreadTurnItemSchema).optional(),
+}).passthrough()
+
+export const CodexThreadReadResultSchema = z.object({
+  threadId: z.string().min(1).optional(),
+  revision: z.number().int().nonnegative().optional(),
+  status: z.string().optional(),
+  turns: z.array(CodexThreadTurnSchema).optional(),
+}).passthrough()
+
+export const CodexThreadTurnsListParamsSchema = z.object({
+  threadId: z.string().min(1),
+  revision: z.number().int().nonnegative().optional(),
+  cursor: z.string().min(1).optional(),
+  limit: z.number().int().positive().optional(),
+  includeBodies: z.boolean().optional(),
+})
+
+export const CodexThreadTurnsListResultSchema = z.object({
+  revision: z.number().int().nonnegative().optional(),
+  nextCursor: z.string().nullable().optional(),
+  turns: z.array(CodexThreadTurnSchema).optional(),
+  bodies: z.record(z.string(), CodexThreadTurnSchema).optional(),
+}).passthrough()
+
+export const CodexThreadTurnReadParamsSchema = z.object({
+  threadId: z.string().min(1),
+  turnId: z.string().min(1),
+  revision: z.number().int().nonnegative().optional(),
+})
+
+export const CodexThreadTurnReadResultSchema = CodexThreadTurnSchema.extend({
+  revision: z.number().int().nonnegative().optional(),
+}).passthrough()
+
 export const CodexRpcErrorSchema = z.object({
   code: z.number(),
   message: z.string().min(1),
@@ -133,6 +186,12 @@ export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResu
 export type CodexFsWatchParams = z.infer<typeof CodexFsWatchParamsSchema>
 export type CodexFsWatchResult = z.infer<typeof CodexFsWatchResultSchema>
 export type CodexFsUnwatchParams = z.infer<typeof CodexFsUnwatchParamsSchema>
+export type CodexThreadReadParams = z.infer<typeof CodexThreadReadParamsSchema>
+export type CodexThreadReadResult = z.infer<typeof CodexThreadReadResultSchema>
+export type CodexThreadTurnsListParams = z.infer<typeof CodexThreadTurnsListParamsSchema>
+export type CodexThreadTurnsListResult = z.infer<typeof CodexThreadTurnsListResultSchema>
+export type CodexThreadTurnReadParams = z.infer<typeof CodexThreadTurnReadParamsSchema>
+export type CodexThreadTurnReadResult = z.infer<typeof CodexThreadTurnReadResultSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>
 export type CodexThreadStartedNotification = z.infer<typeof CodexThreadStartedNotificationSchema>
 export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNotificationSchema>

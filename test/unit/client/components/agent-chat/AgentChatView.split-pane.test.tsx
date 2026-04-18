@@ -11,7 +11,7 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
 import agentChatReducer, {
   sessionCreated,
   sessionInit,
@@ -21,7 +21,7 @@ import agentChatReducer, {
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout, addPane } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -118,11 +118,11 @@ function findLeaf(node: PaneNode, paneId: string): Extract<PaneNode, { type: 'le
 }
 
 /** Read pane content from the store for a given tab/pane ID. */
-function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): AgentChatPaneContent | undefined {
+function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): FreshAgentPaneContent | undefined {
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   const leaf = findLeaf(root, paneId)
-  if (leaf && leaf.content.kind === 'agent-chat') return leaf.content
+  if (leaf && leaf.content.kind === 'fresh-agent') return leaf.content
   return undefined
 }
 
@@ -135,15 +135,15 @@ function ReactiveWrapper({ store, tabId, paneId }: {
   tabId: string
   paneId: string
 }) {
-  const content = useSelector((s: ReturnType<typeof store.getState>) => {
-    const root = s.panes.layouts[tabId]
-    if (!root) return undefined
-    const leaf = findLeaf(root, paneId)
-    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
-  })
-  if (!content) return <div data-testid="no-content">No content</div>
-  return <AgentChatView tabId={tabId} paneId={paneId} paneContent={content} />
-}
+    const content = useSelector((s: ReturnType<typeof store.getState>) => {
+      const root = s.panes.layouts[tabId]
+      if (!root) return undefined
+      const leaf = findLeaf(root, paneId)
+      return leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined
+    })
+    if (!content) return <div data-testid="no-content">No content</div>
+    return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={content} />
+  }
 
 describe('AgentChatView — split pane (Bug 2)', () => {
   afterEach(() => {
@@ -159,9 +159,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     const store = makeStore()
 
     // Set up a fully connected freshclaude pane
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'connected',
@@ -221,9 +222,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('idle pane stays idle after unmount/remount', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -265,9 +267,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     const store = makeStore()
 
     // Pane thinks it's connected, but server might respond differently
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'connected',
@@ -325,9 +328,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('restores a split-pane remount from sdk.session.snapshot plus HTTP timeline hydration', async () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -398,9 +402,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('handles the full addPane flow: connected pane survives tree restructuring', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -459,9 +464,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('does not regress from connected to starting when server reports stale status', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'connected',
@@ -508,9 +514,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('does not regress from idle to starting when server reports stale status', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -544,9 +551,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('allows forward status transitions (starting -> connected -> idle)', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'starting',
@@ -580,9 +588,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('allows running -> idle transition (normal turn completion cycle)', () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -633,9 +642,10 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   it('expands older turns by fetching bodies on demand after a split-pane remount', async () => {
     const store = makeStore()
 
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',

@@ -46,7 +46,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 ## Mental model
 
 - Tabs contain pane trees (splits). Panes contain content.
-- Pane kinds: terminal, editor, browser, agent-chat (Claude/Codex/etc.), picker (transient).
+- Pane kinds: terminal, editor, browser, fresh-agent (Freshclaude/Freshcodex/etc.), picker (transient).
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
 

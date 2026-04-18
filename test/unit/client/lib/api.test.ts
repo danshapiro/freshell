@@ -3,6 +3,9 @@ import {
   api,
   getAgentChatCapabilities,
   refreshAgentChatCapabilities,
+  getFreshAgentThreadSnapshot,
+  getFreshAgentTurnBody,
+  getFreshAgentTurnPage,
   fetchSidebarSessionsSnapshot,
   getAgentTimelinePage,
   getAgentTurnBody,
@@ -174,6 +177,34 @@ describe('visible-first read-model helpers', () => {
         retryable: false,
       },
     })
+  })
+
+  it('fresh-agent helpers target the fresh-agent route family and pin provider, revision, and cursor', async () => {
+    const signal = new AbortController().signal
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ threadId: 'thread-1', revision: 7 }))
+      .mockResolvedValueOnce(mockJson({ turns: [], nextCursor: null, revision: 7 }))
+      .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', revision: 7 }))
+
+    await getFreshAgentThreadSnapshot('codex', 'thread-1', { revision: 7, signal })
+    await getFreshAgentTurnPage('codex', 'thread-1', { revision: 7, cursor: 'cursor-1', limit: 20 }, { signal })
+    await getFreshAgentTurnBody('codex', 'thread-1', 'turn-1', { revision: 7, signal })
+
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/fresh-agent/threads/codex/thread-1?revision=7',
+      expect.objectContaining({ signal, headers: expect.any(Headers) }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/fresh-agent/threads/codex/thread-1/turns?revision=7&cursor=cursor-1&limit=20',
+      expect.objectContaining({ signal, headers: expect.any(Headers) }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      3,
+      '/api/fresh-agent/threads/codex/thread-1/turns/turn-1?revision=7',
+      expect.objectContaining({ signal, headers: expect.any(Headers) }),
+    )
   })
 
   it('rejects timeline requests that omit the pinned restore revision', async () => {

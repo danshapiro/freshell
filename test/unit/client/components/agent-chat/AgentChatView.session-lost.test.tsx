@@ -2,11 +2,11 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
 import agentChatReducer, { markSessionLost, sessionCreated, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 import { buildRestoreError } from '@shared/session-contract'
 
@@ -46,11 +46,11 @@ function makeStore() {
 }
 
 /** Read pane content from the store for a given tab/pane ID. */
-function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): AgentChatPaneContent | undefined {
+function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): FreshAgentPaneContent | undefined {
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
-  function find(node: PaneNode): AgentChatPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
+  function find(node: PaneNode): FreshAgentPaneContent | undefined {
+    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'fresh-agent') {
       return node.content
     }
     if (node.type === 'split') {
@@ -72,8 +72,8 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
 
   it('does not restart from a mutable named resume token when session is marked as lost', async () => {
     const store = makeStore()
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-stale',
       sessionId: 'dead-session-id',
       status: 'idle',
@@ -85,11 +85,11 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
     // Use a wrapper that reads pane content reactively from the store
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
         ? root.content
         : undefined
       if (!content) return null
-      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+      return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
     }
 
     render(
@@ -145,23 +145,24 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
 
     const store = makeStore()
     const pane = {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       createRequestId: 'req-stale',
       sessionId: 'sdk-stale-1',
       status: 'idle',
       resumeSessionId: 'named-resume',
-    } satisfies AgentChatPaneContent
+    } satisfies FreshAgentPaneContent
 
     store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: pane }))
 
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
-      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'fresh-agent'
         ? root.content
         : undefined
       if (!content) return null
-      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+      return <FreshAgentView tabId="t1" paneId="p1" paneContent={content} />
     }
 
     render(
@@ -236,8 +237,8 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
 
   it('does not get stuck after remount when session is already established', () => {
     const store = makeStore()
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'idle',
@@ -256,7 +257,7 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
     // First mount (simulating the original render)
     const { unmount } = render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -273,7 +274,7 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
 
     render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -300,8 +301,8 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
 
   it('pane status remains interactive after remount (not reset to starting)', () => {
     const store = makeStore()
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'connected',
@@ -320,14 +321,14 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
     // Simulate unmount + remount
     const { unmount } = render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
     unmount()
 
     render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -338,8 +339,8 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
 
   it('does not regress to "starting" when sdk.status arrives after remount for a still-initializing session', () => {
     const store = makeStore()
-    const pane: AgentChatPaneContent = {
-      kind: 'agent-chat', provider: 'freshclaude',
+    const pane: FreshAgentPaneContent = {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'starting',
@@ -353,7 +354,7 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
     // First mount
     const { unmount } = render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -363,7 +364,7 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
 
     render(
       <Provider store={store}>
-        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <FreshAgentView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 

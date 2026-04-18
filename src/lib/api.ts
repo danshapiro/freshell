@@ -296,6 +296,63 @@ export async function getAgentTurnBody(
   )
 }
 
+export async function getFreshAgentThreadSnapshot(
+  provider: string,
+  threadId: string,
+  query: { revision?: number; signal?: AbortSignal } = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  return api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
+      ['revision', query.revision],
+    ])}`,
+    { ...options, signal },
+  )
+}
+
+export async function getFreshAgentTurnPage(
+  provider: string,
+  threadId: string,
+  query: {
+    cursor?: string
+    priority?: string
+    revision: number
+    limit?: number
+    includeBodies?: boolean
+    signal?: AbortSignal
+  },
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  return api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns${buildQueryString([
+      ['revision', query.revision],
+      ['cursor', query.cursor],
+      ['priority', query.priority],
+      ['limit', query.limit],
+      ['includeBodies', query.includeBodies ? 'true' : undefined],
+    ])}`,
+    { ...options, signal },
+  )
+}
+
+export async function getFreshAgentTurnBody(
+  provider: string,
+  threadId: string,
+  turnId: string,
+  query: { revision: number; signal?: AbortSignal },
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  return api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+      ['revision', query.revision],
+    ])}`,
+    { ...options, signal },
+  )
+}
+
 export async function getTerminalViewport(
   terminalId: string,
   options: ApiRequestOptions = {},
