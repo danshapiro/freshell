@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import AgentChatView from '@/components/agent-chat/AgentChatView'
+import PermissionBanner from '@/components/agent-chat/PermissionBanner'
+import QuestionBanner from '@/components/agent-chat/QuestionBanner'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
@@ -9,7 +10,6 @@ import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
-import { FreshAgentQuestionBanner } from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
 import { FreshAgentComposer } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -24,8 +24,23 @@ type FreshAgentSnapshot = {
   worktrees?: Array<{ id: string; path: string; branch?: string }>
   diffs?: Array<{ id: string; path?: string; title?: string }>
   childThreads?: Array<{ id: string; threadId: string; origin?: string; title?: string }>
-  pendingApprovals?: Array<{ requestId: string; toolName?: string }>
-  pendingQuestions?: Array<{ requestId: string; questions?: Array<{ question: string }> }>
+  pendingApprovals?: Array<{
+    requestId: string
+    toolName?: string
+    toolUseID?: string
+    blockedPath?: string
+    decisionReason?: string
+    input?: Record<string, unknown>
+  }>
+  pendingQuestions?: Array<{
+    requestId: string
+    questions?: Array<{
+      question: string
+      header?: string
+      options?: Array<{ label: string; description: string }>
+      multiSelect?: boolean
+    }>
+  }>
   turns?: Array<{
     id: string
     role: 'user' | 'assistant'
@@ -61,12 +76,19 @@ export function FreshAgentView({
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
-  const usesClaudeCompatibility = paneContent.provider === 'claude'
 
-  useEffect(() => {
-    if (usesClaudeCompatibility || paneContent.sessionId || hidden) return
+  function sendFreshAgentMessage(message: Record<string, unknown>) {
     const suppressed = typeof window !== 'undefined'
       && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
+    if (suppressed) {
+      window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
+      return
+    }
+    ws.send(message as never)
+  }
+
+  useEffect(() => {
+    if (paneContent.sessionId || hidden) return
     const createMessage = {
       type: 'freshAgent.create',
       requestId: paneContent.createRequestId,
@@ -79,11 +101,7 @@ export function FreshAgentView({
       plugins: paneContent.plugins,
     } as const
     registerFreshAgentCreate(dispatch, paneContent.createRequestId)
-    if (suppressed) {
-      window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(createMessage)
-      return
-    }
-    ws.send(createMessage)
+    sendFreshAgentMessage(createMessage)
   }, [
     dispatch,
     hidden,
@@ -93,17 +111,13 @@ export function FreshAgentView({
     paneContent.model,
     paneContent.permissionMode,
     paneContent.plugins,
-    paneContent.provider,
     paneContent.resumeSessionId,
     paneContent.sessionId,
     paneContent.sessionType,
-    paneId,
-    usesClaudeCompatibility,
-    ws,
   ])
 
   useEffect(() => {
-    if (usesClaudeCompatibility) return
+    if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
       if (message.type === 'freshAgent.created' && message.requestId === paneContent.createRequestId) {
         dispatch(updatePaneContent({
@@ -135,18 +149,10 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [
-    dispatch,
-    paneContent,
-    paneId,
-    paneContent.createRequestId,
-    tabId,
-    usesClaudeCompatibility,
-    ws,
-  ])
+  }, [dispatch, paneContent, paneContent.createRequestId, paneId, tabId, ws])
 
   useEffect(() => {
-    if (usesClaudeCompatibility || !paneContent.sessionId) return
+    if (!paneContent.sessionId) return
     const controller = new AbortController()
     setLoadError(null)
     const sessionId = paneContent.sessionId
@@ -186,25 +192,9 @@ export function FreshAgentView({
     paneContent.status,
     paneId,
     tabId,
-    usesClaudeCompatibility,
   ])
 
   const content = useMemo(() => {
-    if (usesClaudeCompatibility) {
-      return (
-        <AgentChatView
-          tabId={tabId}
-          paneId={paneId}
-          paneContent={{
-            ...paneContent,
-            kind: 'agent-chat',
-            provider: paneContent.sessionType === 'kilroy' ? 'kilroy' : 'freshclaude',
-          }}
-          hidden={hidden}
-        />
-      )
-    }
-
     const turns = snapshot?.turns ?? []
     const pendingApprovals = snapshot?.pendingApprovals ?? []
     const pendingQuestions = snapshot?.pendingQuestions ?? []
@@ -232,16 +222,10 @@ export function FreshAgentView({
                 disabled={!canInterrupt || !paneContent.sessionId}
                 onClick={() => {
                   if (!paneContent.sessionId || !canInterrupt) return
-                  const message = {
+                  sendFreshAgentMessage({
                     type: 'freshAgent.interrupt',
                     sessionId: paneContent.sessionId,
-                  } as const
-                  if (typeof window !== 'undefined'
-                    && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
-                    window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
-                    return
-                  }
-                  ws.send(message)
+                  })
                 }}
               >
                 Interrupt
@@ -252,16 +236,10 @@ export function FreshAgentView({
                 disabled={!canFork || !paneContent.sessionId}
                 onClick={() => {
                   if (!paneContent.sessionId || !canFork) return
-                  const message = {
+                  sendFreshAgentMessage({
                     type: 'freshAgent.fork',
                     sessionId: paneContent.sessionId,
-                  } as const
-                  if (typeof window !== 'undefined'
-                    && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
-                    window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
-                    return
-                  }
-                  ws.send(message)
+                  })
                 }}
               >
                 Fork
@@ -277,10 +255,59 @@ export function FreshAgentView({
               ) : null}
               {loadError ? <FreshAgentApprovalBanner text={loadError} /> : null}
               {pendingApprovals.map((approval) => (
-                <FreshAgentApprovalBanner key={approval.requestId} text={`Approval required: ${approval.toolName ?? approval.requestId}`} />
+                <PermissionBanner
+                  key={approval.requestId}
+                  permission={{
+                    requestId: approval.requestId,
+                    subtype: 'can_use_tool',
+                    tool: approval.toolName
+                      ? { name: approval.toolName, input: approval.input }
+                      : undefined,
+                  }}
+                  onAllow={() => {
+                    if (!paneContent.sessionId) return
+                    sendFreshAgentMessage({
+                      type: 'freshAgent.approval.respond',
+                      sessionId: paneContent.sessionId,
+                      requestId: approval.requestId,
+                      decision: { behavior: 'allow', updatedInput: {} },
+                    })
+                  }}
+                  onDeny={() => {
+                    if (!paneContent.sessionId) return
+                    sendFreshAgentMessage({
+                      type: 'freshAgent.approval.respond',
+                      sessionId: paneContent.sessionId,
+                      requestId: approval.requestId,
+                      decision: { behavior: 'deny', message: 'Denied by user', interrupt: false },
+                    })
+                  }}
+                  disabled={!paneContent.sessionId}
+                />
               ))}
               {pendingQuestions.map((question) => (
-                <FreshAgentQuestionBanner key={question.requestId} text={question.questions?.[0]?.question ?? 'Question'} />
+                <QuestionBanner
+                  key={question.requestId}
+                  question={{
+                    requestId: question.requestId,
+                    questions: (question.questions ?? []).map((entry) => ({
+                      question: entry.question,
+                      header: entry.header ?? 'Question',
+                      options: entry.options ?? [],
+                      multiSelect: entry.multiSelect === true,
+                    })),
+                  }}
+                  onAnswer={(answers) => {
+                    if (!paneContent.sessionId) return
+                    sendFreshAgentMessage({
+                      type: 'freshAgent.question.respond',
+                      sessionId: paneContent.sessionId,
+                      requestId: question.requestId,
+                      answers,
+                    })
+                  }}
+                  disabled={!paneContent.sessionId}
+                />
               ))}
               <FreshAgentDiffPanel diffs={diffs} />
             </div>
@@ -289,17 +316,11 @@ export function FreshAgentView({
               disabled={!canSend || !paneContent.sessionId}
               onSend={(text) => {
                 if (!paneContent.sessionId || !canSend) return
-                const message = {
+                sendFreshAgentMessage({
                   type: 'freshAgent.send',
                   sessionId: paneContent.sessionId,
                   text,
-                } as const
-                if (typeof window !== 'undefined'
-                  && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true) {
-                  window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
-                  return
-                }
-                ws.send(message)
+                })
               }}
             />
           </div>
@@ -307,7 +328,7 @@ export function FreshAgentView({
         </div>
       </div>
     )
-  }, [descriptor?.label, hidden, loadError, paneContent, pendingCreateFailure, snapshot, tabId, paneId, usesClaudeCompatibility])
+  }, [descriptor?.label, loadError, paneContent, pendingCreateFailure, snapshot])
 
   useEffect(() => {
     if (!pendingCreateFailure) return

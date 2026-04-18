@@ -33,4 +33,28 @@ describe('FreshAgentRuntimeManager', () => {
       runtimeProvider: 'codex',
     })
   })
+
+  it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
+    const claudeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'claude-session-1' }),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.create({
+      requestId: 'req-kill',
+      sessionType: 'freshclaude',
+    })
+
+    await expect(manager.kill('claude-session-1')).resolves.toBe(true)
+    expect(claudeAdapter.kill).toHaveBeenCalledWith('claude-session-1')
+    await expect(manager.kill('claude-session-1')).rejects.toThrow(/not tracked/i)
+  })
 })

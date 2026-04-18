@@ -95,8 +95,32 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
-  it('renders the Claude compatibility surface for freshclaude', () => {
+  it('renders freshclaude in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      summary: 'Claude summary',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
+      pendingApprovals: [{
+        requestId: 'approval-1',
+        toolName: 'Bash',
+        input: { command: 'echo hello-from-fresh-agent' },
+      }],
+      pendingQuestions: [{
+        requestId: 'question-1',
+        questions: [{
+          header: 'Approve plan',
+          question: 'How should Claude proceed?',
+          options: [
+            { label: 'Continue', description: 'Keep going' },
+            { label: 'Stop', description: 'Pause the task' },
+          ],
+          multiSelect: false,
+        }],
+      }],
+      turns: [],
+    })
+
     render(
       <Provider store={store}>
         <FreshAgentView
@@ -107,13 +131,38 @@ describe('FreshAgentView', () => {
             sessionType: 'freshclaude',
             provider: 'claude',
             createRequestId: 'req-1',
-            status: 'idle',
+            sessionId: 'claude-thread-1',
+            status: 'connected',
           }}
         />
       </Provider>,
     )
 
-    expect(screen.getByText('agent:freshclaude')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('Claude summary')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('agent:freshclaude')).not.toBeInTheDocument()
+
+    const permissionBanner = screen.getByRole('alert', { name: /permission request for bash/i })
+    expect(permissionBanner).toHaveTextContent('echo hello-from-fresh-agent')
+    fireEvent.click(screen.getByRole('button', { name: /allow tool use/i }))
+
+    const questionBanner = screen.getByRole('region', { name: /question from claude/i })
+    expect(questionBanner).toHaveTextContent('How should Claude proceed?')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.approval.respond',
+      sessionId: 'claude-thread-1',
+      requestId: 'approval-1',
+      decision: { behavior: 'allow', updatedInput: {} },
+    })
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.question.respond',
+      sessionId: 'claude-thread-1',
+      requestId: 'question-1',
+      answers: { 'How should Claude proceed?': 'Continue' },
+    })
   })
 
   it('renders Codex capability metadata in the shared shell', async () => {

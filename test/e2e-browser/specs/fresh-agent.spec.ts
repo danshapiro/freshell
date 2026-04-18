@@ -46,14 +46,66 @@ test.describe('Fresh Agent', () => {
   test('freshclaude banners render through the fresh-agent pane surface and answer over WS', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)
-    const sessionId = 'sdk-e2e-freshclaude'
-    const cliSessionId = '33333333-3333-4333-8333-333333333333'
+    const sessionId = 'freshclaude-thread-1'
 
-    await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
-    }, paneId)
+    await page.route(`**/api/fresh-agent/threads/claude/${sessionId}*`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          provider: 'claude',
+          threadId: sessionId,
+          sessionId,
+          revision: 1,
+          latestTurnId: null,
+          status: 'running',
+          capabilities: {
+            send: true,
+            interrupt: true,
+            approvals: true,
+            questions: true,
+            fork: false,
+          },
+          settings: {
+            model: 'claude-opus-4-6',
+            permissionMode: 'default',
+            plugins: [],
+          },
+          tokenUsage: {
+            inputTokens: 10,
+            outputTokens: 20,
+            totalTokens: 30,
+            costUsd: 0,
+          },
+          pendingApprovals: [{
+            requestId: 'perm-e2e',
+            toolName: 'Bash',
+            input: { command: 'echo hello-from-fresh-agent' },
+          }],
+          pendingQuestions: [{
+            requestId: 'question-e2e',
+            questions: [{
+              header: 'Approve plan',
+              question: 'How should Claude proceed?',
+              options: [
+                { label: 'Continue', description: 'Keep going' },
+                { label: 'Stop', description: 'Pause the task' },
+              ],
+              multiSelect: false,
+            }],
+          }],
+          turns: [],
+          extensions: {
+            claude: {
+              liveSessionId: sessionId,
+              cliSessionId: '33333333-3333-4333-8333-333333333333',
+            },
+          },
+        }),
+      })
+    })
 
-    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {
+    await page.evaluate(({ currentTabId, currentPaneId, currentSessionId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'panes/updatePaneContent',
         payload: {
@@ -65,7 +117,7 @@ test.describe('Fresh Agent', () => {
             provider: 'claude',
             createRequestId: 'req-e2e-permission',
             sessionId: currentSessionId,
-            resumeSessionId: currentCliSessionId,
+            resumeSessionId: currentSessionId,
             status: 'idle',
             settingsDismissed: true,
           },
@@ -75,62 +127,7 @@ test.describe('Fresh Agent', () => {
       currentTabId: tabId,
       currentPaneId: paneId,
       currentSessionId: sessionId,
-      currentCliSessionId: cliSessionId,
     })
-    await page.evaluate(({ currentSessionId, currentCliSessionId }) => {
-      const harness = window.__FRESHELL_TEST_HARNESS__
-      harness?.dispatch({
-        type: 'agentChat/sessionCreated',
-        payload: { requestId: 'req-e2e-permission', sessionId: currentSessionId },
-      })
-      harness?.dispatch({
-        type: 'agentChat/sessionInit',
-        payload: {
-          sessionId: currentSessionId,
-          cliSessionId: currentCliSessionId,
-          model: 'claude-opus-4-6',
-          cwd: '/workspace',
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/addPermissionRequest',
-        payload: {
-          sessionId: currentSessionId,
-          requestId: 'perm-e2e',
-          subtype: 'can_use_tool',
-          tool: {
-            name: 'Bash',
-            input: { command: 'echo hello-from-fresh-agent' },
-          },
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/addQuestionRequest',
-        payload: {
-          sessionId: currentSessionId,
-          requestId: 'question-e2e',
-          questions: [{
-            header: 'Approve plan',
-            question: 'How should Claude proceed?',
-            options: [
-              { label: 'Continue', description: 'Keep going' },
-              { label: 'Stop', description: 'Pause the task' },
-            ],
-            multiSelect: false,
-          }],
-        },
-      })
-      harness?.dispatch({
-        type: 'agentChat/timelinePageReceived',
-        payload: {
-          sessionId: currentSessionId,
-          timelineSessionId: '33333333-3333-4333-8333-333333333333',
-          items: [],
-          nextCursor: null,
-          revision: 1,
-        },
-      })
-    }, { currentSessionId: sessionId, currentCliSessionId: cliSessionId })
 
     const permissionBanner = page.getByRole('alert', { name: /permission request for bash/i })
     await expect(permissionBanner).toBeVisible()
@@ -146,18 +143,20 @@ test.describe('Fresh Agent', () => {
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
       return {
-        permission: sent.find((msg: any) => msg?.type === 'sdk.permission.respond') ?? null,
-        question: sent.find((msg: any) => msg?.type === 'sdk.question.respond') ?? null,
+        permission: sent.find((msg: any) => msg?.type === 'freshAgent.approval.respond') ?? null,
+        question: sent.find((msg: any) => msg?.type === 'freshAgent.question.respond') ?? null,
       }
     }).toMatchObject({
       permission: {
-        type: 'sdk.permission.respond',
+        type: 'freshAgent.approval.respond',
         sessionId,
         requestId: 'perm-e2e',
-        behavior: 'allow',
+        decision: {
+          behavior: 'allow',
+        },
       },
       question: {
-        type: 'sdk.question.respond',
+        type: 'freshAgent.question.respond',
         sessionId,
         requestId: 'question-e2e',
         answers: { 'How should Claude proceed?': 'Continue' },

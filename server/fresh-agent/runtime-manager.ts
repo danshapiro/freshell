@@ -101,6 +101,18 @@ export class FreshAgentRuntimeManager {
     await record.adapter.interrupt(sessionId)
   }
 
+  async kill(sessionId: string): Promise<boolean> {
+    const record = this.requireSession(sessionId)
+    try {
+      if (record.adapter.kill) {
+        return await record.adapter.kill(sessionId)
+      }
+      return true
+    } finally {
+      this.sessions.delete(sessionId)
+    }
+  }
+
   async fork(sessionId: string, input?: Record<string, unknown>) {
     const record = this.requireSession(sessionId)
     if (!record.adapter.fork) {

@@ -280,7 +280,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       })
     }
     // Clean up agent-chat resources
-    if (content.kind === 'agent-chat' || content.kind === 'fresh-agent') {
+    if (content.kind === 'agent-chat') {
       clearDraft(paneId)
       const pendingCreate = sdkPendingCreates[content.createRequestId]
       const pendingSessionId = pendingCreate?.sessionId
@@ -293,6 +293,19 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         cancelCreate(content.createRequestId)
       }
       // Clean up Redux state for orphaned pending creates
+      if (!content.sessionId && pendingSessionId) {
+        dispatch(removeSession({ sessionId: pendingSessionId }))
+        dispatch(clearPendingCreate({ requestId: content.createRequestId }))
+      }
+    }
+    if (content.kind === 'fresh-agent') {
+      clearDraft(paneId)
+      const pendingCreate = sdkPendingCreates[content.createRequestId]
+      const pendingSessionId = pendingCreate?.sessionId
+      const sessionId = content.sessionId || pendingSessionId
+      if (sessionId) {
+        ws.send({ type: 'freshAgent.kill', sessionId })
+      }
       if (!content.sessionId && pendingSessionId) {
         dispatch(removeSession({ sessionId: pendingSessionId }))
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))

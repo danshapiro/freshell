@@ -91,7 +91,7 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
-  it('routes freshAgent.send, freshAgent.interrupt, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
+  it('routes freshAgent.send, freshAgent.interrupt, freshAgent approvals/questions, freshAgent.kill, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({
         sessionId: 'codex-session-2',
@@ -100,6 +100,9 @@ describe('WsHandler fresh-agent routing', () => {
       }),
       send: vi.fn().mockResolvedValue(undefined),
       interrupt: vi.fn().mockResolvedValue(undefined),
+      resolveApproval: vi.fn().mockResolvedValue(undefined),
+      answerQuestion: vi.fn().mockResolvedValue(undefined),
+      kill: vi.fn().mockResolvedValue(true),
       fork: vi.fn().mockResolvedValue({ sessionId: 'forked-session' }),
     }
     const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
@@ -127,6 +130,22 @@ describe('WsHandler fresh-agent routing', () => {
         sessionId: 'codex-session-2',
       }))
       ws.send(JSON.stringify({
+        type: 'freshAgent.approval.respond',
+        sessionId: 'codex-session-2',
+        requestId: 'approval-1',
+        decision: { behavior: 'allow', updatedInput: {} },
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.question.respond',
+        sessionId: 'codex-session-2',
+        requestId: 'question-1',
+        answers: { proceed: 'yes' },
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'codex-session-2',
+      }))
+      ws.send(JSON.stringify({
         type: 'freshAgent.fork',
         sessionId: 'codex-session-2',
       }))
@@ -134,6 +153,9 @@ describe('WsHandler fresh-agent routing', () => {
       await vi.waitFor(() => {
         expect(runtimeManager.send).toHaveBeenCalledWith('codex-session-2', { text: 'Ship it', images: undefined })
         expect(runtimeManager.interrupt).toHaveBeenCalledWith('codex-session-2')
+        expect(runtimeManager.resolveApproval).toHaveBeenCalledWith('codex-session-2', 'approval-1', { behavior: 'allow', updatedInput: {} })
+        expect(runtimeManager.answerQuestion).toHaveBeenCalledWith('codex-session-2', 'question-1', { proceed: 'yes' })
+        expect(runtimeManager.kill).toHaveBeenCalledWith('codex-session-2')
         expect(runtimeManager.fork).toHaveBeenCalledWith('codex-session-2', undefined)
       })
     } finally {

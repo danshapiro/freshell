@@ -430,6 +430,25 @@ export const FreshAgentInterruptSchema = z.object({
   sessionId: z.string().min(1),
 })
 
+export const FreshAgentApprovalRespondSchema = z.object({
+  type: z.literal('freshAgent.approval.respond'),
+  sessionId: z.string().min(1),
+  requestId: z.string().min(1),
+  decision: z.record(z.string(), z.unknown()),
+})
+
+export const FreshAgentQuestionRespondSchema = z.object({
+  type: z.literal('freshAgent.question.respond'),
+  sessionId: z.string().min(1),
+  requestId: z.string().min(1),
+  answers: z.record(z.string(), z.string()),
+})
+
+export const FreshAgentKillSchema = z.object({
+  type: z.literal('freshAgent.kill'),
+  sessionId: z.string().min(1),
+})
+
 export const FreshAgentForkSchema = z.object({
   type: z.literal('freshAgent.fork'),
   sessionId: z.string().min(1),
@@ -440,6 +459,9 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
   FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
@@ -476,6 +498,9 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
   FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
@@ -746,6 +771,7 @@ export type SdkRestoreFailureCode =
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; runtimeProvider: string }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.killed'; sessionId: string; success: boolean }
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }

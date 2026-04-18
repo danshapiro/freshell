@@ -66,8 +66,11 @@ import {
   CodingCliInputSchema,
   CodingCliKillSchema,
   FreshAgentCreateSchema,
+  FreshAgentApprovalRespondSchema,
   FreshAgentForkSchema,
   FreshAgentInterruptSchema,
+  FreshAgentKillSchema,
+  FreshAgentQuestionRespondSchema,
   FreshAgentSendSchema,
   SdkCreateSchema,
   SdkSendSchema,
@@ -612,6 +615,9 @@ export class WsHandler {
       FreshAgentCreateSchema,
       FreshAgentSendSchema,
       FreshAgentInterruptSchema,
+      FreshAgentApprovalRespondSchema,
+      FreshAgentQuestionRespondSchema,
+      FreshAgentKillSchema,
       FreshAgentForkSchema,
       SdkCreateSchema,
       SdkSendSchema,
@@ -3115,6 +3121,62 @@ export class WsHandler {
           await this.freshAgentRuntimeManager.interrupt(m.sessionId)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to interrupt fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.approval.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.resolveApproval(m.sessionId, m.requestId, m.decision)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to resolve fresh-agent approval'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.question.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.answerQuestion(m.sessionId, m.requestId, m.answers)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to answer fresh-agent question'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.kill': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        if (!state.freshAgentSessions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          const killed = await this.freshAgentRuntimeManager.kill(m.sessionId)
+          state.freshAgentSessions.delete(m.sessionId)
+          this.send(ws, { type: 'freshAgent.killed', sessionId: m.sessionId, success: killed })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to kill fresh-agent session'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
         }
         return

@@ -21,6 +21,7 @@ type ClaudeBridgePort = Pick<
   | 'subscribe'
   | 'sendUserMessage'
   | 'interrupt'
+  | 'killSession'
   | 'respondQuestion'
   | 'respondPermission'
   | 'getSession'
@@ -115,6 +116,10 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
         deps.sdkBridge.interrupt(sessionId),
         `Claude session ${sessionId} is not available`,
       )
+    },
+
+    kill(sessionId) {
+      return deps.sdkBridge.killSession(sessionId)
     },
 
     answerQuestion(sessionId, requestId, answers) {

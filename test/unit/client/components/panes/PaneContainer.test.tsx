@@ -68,6 +68,7 @@ const {
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
+    onMessage: () => () => {},
   }),
 }))
 
@@ -77,6 +78,12 @@ vi.mock('@/lib/api', () => ({
     post: (path: string, body: unknown) => mockApiPost(path, body),
     patch: (path: string, body: unknown) => mockApiPatch(path, body),
   },
+  getFreshAgentThreadSnapshot: vi.fn().mockResolvedValue({
+    status: 'idle',
+    summary: 'Fresh agent test snapshot',
+    capabilities: { send: false, interrupt: false, fork: false },
+    turns: [],
+  }),
 }))
 
 vi.mock('@/store/settingsThunks', () => ({
@@ -851,6 +858,37 @@ describe('PaneContainer', () => {
       const state = store.getState().panes
       expect(state.layouts['tab-1'].type).toBe('leaf')
       expect((state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id).toBe(pane1Id)
+    })
+
+    it('sends freshAgent.kill when a fresh-agent pane is closed', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-close',
+          sessionId: 'thread-codex-1',
+          status: 'connected',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent' },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(mockSend).toHaveBeenCalledWith({ type: 'freshAgent.kill', sessionId: 'thread-codex-1' })
     })
 
     it('updates active pane when closing the active pane', () => {
