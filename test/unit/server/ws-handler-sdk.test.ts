@@ -805,7 +805,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('reuses an already-live sdk session when the resume alias resolves to a liveSessionId only through history', async () => {
+    it('reuses an already-live sdk session when only the canonical durable history query resolves to the liveSessionId', async () => {
       const staleAlias = 'stale-live-alias-ledger-only'
       const durableSessionId = '00000000-0000-4000-8000-0000000005aa'
       const liveSession = {
@@ -846,7 +846,15 @@ describe('WS Handler SDK Integration', () => {
         }
       })
       mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
-        if (queryId === staleAlias || queryId === durableSessionId) {
+        if (queryId === staleAlias) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === durableSessionId) {
           return Promise.resolve(makeResolvedHistory({
             queryId,
             liveSessionId: liveSession.sessionId,
@@ -899,6 +907,9 @@ describe('WS Handler SDK Integration', () => {
           type: 'sdk.session.init',
           sessionId: liveSession.sessionId,
         })
+        expect(
+          mockHistorySource.resolve.mock.calls.some(([queryId]: [string]) => queryId === durableSessionId),
+        ).toBe(true)
       } finally {
         ws.close()
       }

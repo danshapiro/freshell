@@ -728,6 +728,7 @@ export class WsHandler {
   ): Promise<{
     lockKey: string
     ownerKey?: string
+    normalizedResumeSessionId?: string
   }> {
     if (!resumeSessionId) {
       return {
@@ -744,6 +745,7 @@ export class WsHandler {
       ?? directLiveSession?.resumeSessionId
       ?? directLiveSession?.sessionId
       ?? resumeSessionId
+    let normalizedResumeSessionId = directLiveSession?.cliSessionId
 
     try {
       const resolved = await this.agentHistorySource?.resolve(
@@ -752,6 +754,7 @@ export class WsHandler {
       ) ?? null
       if (resolved?.kind === 'resolved') {
         normalizedResumeOwner = resolved.timelineSessionId ?? resolved.liveSessionId ?? normalizedResumeOwner
+        normalizedResumeSessionId = resolved.timelineSessionId ?? normalizedResumeSessionId
       }
     } catch {
       // Ownership normalization is advisory-only. Create-time restore semantics
@@ -762,6 +765,7 @@ export class WsHandler {
     return {
       lockKey: ownerKey,
       ownerKey,
+      normalizedResumeSessionId,
     }
   }
 
@@ -819,6 +823,7 @@ export class WsHandler {
   private async resolveLiveSdkSessionForCreate(
     resumeSessionId: string | undefined,
     ownerKey?: string,
+    normalizedResumeSessionId?: string,
   ): Promise<SdkSessionState | undefined> {
     if (!resumeSessionId || !this.sdkBridge) return undefined
     const sdkBridge = this.sdkBridge
@@ -830,12 +835,13 @@ export class WsHandler {
       return directLiveSession
     }
 
-    const normalizedResumeSessionId = ownerKey?.startsWith('resume:')
+    const normalizedOwnerKeySessionId = ownerKey?.startsWith('resume:')
       ? ownerKey.slice('resume:'.length)
       : undefined
+    const normalizedResumeLookupId = normalizedOwnerKeySessionId ?? normalizedResumeSessionId
 
-    const resolvedLiveSession = sdkBridge.findLiveSessionByCliSessionId?.(normalizedResumeSessionId ?? resumeSessionId)
-    if (this.sdkSessionMatchesLookup(resolvedLiveSession, normalizedResumeSessionId ?? resumeSessionId)) {
+    const resolvedLiveSession = sdkBridge.findLiveSessionByCliSessionId?.(normalizedResumeLookupId ?? resumeSessionId)
+    if (this.sdkSessionMatchesLookup(resolvedLiveSession, normalizedResumeLookupId ?? resumeSessionId)) {
       return resolvedLiveSession
     }
 
@@ -870,6 +876,16 @@ export class WsHandler {
       const restoredFromResumeAlias = await resolveHistoryLiveSession(resumeSessionId, resumeSessionId)
       if (restoredFromResumeAlias) {
         return restoredFromResumeAlias
+      }
+
+      if (normalizedResumeSessionId && normalizedResumeSessionId !== resumeSessionId) {
+        const restoredFromNormalizedIdentity = await resolveHistoryLiveSession(
+          normalizedResumeSessionId,
+          normalizedResumeSessionId,
+        )
+        if (restoredFromNormalizedIdentity) {
+          return restoredFromNormalizedIdentity
+        }
       }
     } catch {
       // Create-time restore semantics still come from the later snapshot/restore path.
@@ -2388,7 +2404,11 @@ export class WsHandler {
               return
             }
 
-            const liveSession = await this.resolveLiveSdkSessionForCreate(m.resumeSessionId, ownership.ownerKey)
+            const liveSession = await this.resolveLiveSdkSessionForCreate(
+              m.resumeSessionId,
+              ownership.ownerKey,
+              ownership.normalizedResumeSessionId,
+            )
             if (liveSession) {
               reusedSessionId = liveSession.sessionId
               this.rememberCreatedSdkSession(m.requestId, liveSession.sessionId)
