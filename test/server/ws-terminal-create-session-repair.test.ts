@@ -807,6 +807,7 @@ describe('terminal.create session repair wait', () => {
       creator.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
+        intent: 'viewport_hydrate',
         sinceSeq: 0,
         cols: 120,
         rows: 40,

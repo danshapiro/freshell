@@ -374,6 +374,7 @@ describe('WebSocket edge cases', () => {
     ws.send(JSON.stringify({
       type: 'terminal.attach',
       terminalId,
+      intent: 'viewport_hydrate',
       sinceSeq: opts?.sinceSeq ?? 0,
       cols: opts?.cols ?? 120,
       rows: opts?.rows ?? 40,
@@ -665,6 +666,7 @@ describe('WebSocket edge cases', () => {
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId,
+        intent: 'viewport_hydrate',
         sinceSeq: 0,
         cols: 120,
         rows: 40,
@@ -1760,7 +1762,7 @@ describe('WebSocket edge cases', () => {
       const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-missing-vp')
 
       registry.simulateOutput(created.terminalId, 'seed-split-missing-vp')
-      ws.send(JSON.stringify({ type: 'terminal.attach', terminalId: created.terminalId, sinceSeq: 0 }))
+      ws.send(JSON.stringify({ type: 'terminal.attach', terminalId: created.terminalId, intent: 'viewport_hydrate', sinceSeq: 0 }))
       const error = await waitForMessage(ws, (m) => m.type === 'error')
       expect(error.code).toBe('INVALID_MESSAGE')
       const msgs = await collectMessages(ws, 150)

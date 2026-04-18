@@ -1596,6 +1596,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send({
       type: 'terminal.attach',
       terminalId: tid,
+      intent,
       cols,
       rows,
       sinceSeq,
