@@ -148,7 +148,7 @@ gh issue list --state open
 
 **If there are no open issues**, report that the issue queue is clear and proceed to teardown.
 
-**If there are open issues**, process them oldest-to-newest, one at a time, using the same assess-then-gate pattern as PRs.
+**If there are open issues**, process them newest-first, one at a time, using the same assess-then-gate pattern as PRs.
 
 #### Per-Issue Workflow
 
@@ -253,4 +253,5 @@ If you catch yourself thinking any of these, you are about to violate a gate:
 | Forgetting to update worktree between PRs | Stale base causes unnecessary conflicts. Always reset to origin/main. |
 | Forgetting to close after local merge | Local merges don't trigger GitHub auto-close. Always check and `gh pr close` if still open. |
 | Signing comment as "Codex" or "Claude" | Always sign as `— Codex CLI`. |
-| Processing newest-first | Oldest-first minimizes cascading conflicts since earlier PRs often touch files later ones depend on. |
+| Processing PRs newest-first | Oldest-first minimizes cascading conflicts since earlier PRs often touch files later ones depend on. |
+| Processing issues oldest-first | Issue triage is newest-first so the most recent reports and follow-ups are evaluated first. |
