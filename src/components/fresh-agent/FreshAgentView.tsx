@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { nanoid } from 'nanoid'
 import PermissionBanner from '@/components/agent-chat/PermissionBanner'
-import QuestionBanner from '@/components/agent-chat/QuestionBanner'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
@@ -12,6 +11,7 @@ import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
+import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
 import { FreshAgentComposer } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
@@ -43,6 +43,20 @@ function getStatusLabel(status: FreshAgentPaneContent['status'], restoring: bool
       return 'Create failed'
     default:
       return 'Starting session'
+  }
+}
+
+function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
+  if (paneContent.sessionType === 'kilroy') return 'Kilroy'
+  switch (paneContent.provider) {
+    case 'claude':
+      return 'Claude'
+    case 'codex':
+      return 'Codex'
+    case 'opencode':
+      return 'Opencode'
+    default:
+      return descriptorLabel ?? 'Fresh Agent'
   }
 }
 
@@ -256,7 +270,7 @@ export function FreshAgentView({
       })
       .catch((error: unknown) => {
         if (error instanceof Error && error.name === 'AbortError') return
-        if (paneContent.provider === 'claude') {
+        if (paneContent.provider === 'claude' && claudeSession) {
           setLoadError(null)
           return
         }
@@ -363,13 +377,14 @@ export function FreshAgentView({
     const canFork = snapshot?.capabilities?.fork === true
     const totalTokens = snapshot?.tokenUsage?.totalTokens
     const statusLabel = getStatusLabel(effectiveStatus, isRestoring)
+    const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
     const summaryText = isRestoring
       ? 'Restoring session'
       : snapshot?.summary || paneContent.sessionId || statusLabel
-    const visibleLoadError = paneContent.provider === 'claude' ? null : loadError
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
       : null
+    const visibleLoadError = visibleRestoreFailure ? null : loadError
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
@@ -453,7 +468,7 @@ export function FreshAgentView({
                 />
               ))}
               {pendingQuestions.map((question) => (
-                <QuestionBanner
+                <FreshAgentQuestionBanner
                   key={question.requestId}
                   question={{
                     requestId: question.requestId,
@@ -464,6 +479,7 @@ export function FreshAgentView({
                       multiSelect: entry.multiSelect === true,
                     })),
                   }}
+                  providerLabel={questionAgentLabel}
                   onAnswer={(answers) => {
                     if (!paneContent.sessionId) return
                     sendFreshAgentMessage({

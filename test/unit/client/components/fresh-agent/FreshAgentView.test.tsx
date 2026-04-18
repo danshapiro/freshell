@@ -168,6 +168,27 @@ describe('FreshAgentView', () => {
 
   it('renders Codex capability metadata in the shared shell', async () => {
     const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      summary: 'Codex summary',
+      capabilities: { send: true, interrupt: true, questions: true, fork: true },
+      pendingQuestions: [{
+        requestId: 'question-codex',
+        questions: [{
+          header: 'Choose path',
+          question: 'How should Codex continue?',
+          options: [
+            { label: 'Patch', description: 'Apply the diff' },
+            { label: 'Explain', description: 'Describe the change' },
+          ],
+          multiSelect: false,
+        }],
+      }],
+      diffs: [{ id: 'diff-1', title: 'README.md' }],
+      worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/x' }],
+      turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
+    })
+
     render(
       <Provider store={store}>
         <FreshAgentView
@@ -191,6 +212,7 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('button', { name: 'Fork' })).toBeEnabled()
     expect(screen.getByText('README.md')).toBeInTheDocument()
     expect(screen.getByText(/feature\/x/)).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: /question from codex/i })).toHaveTextContent('Codex has a question')
   })
 
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
@@ -378,5 +400,31 @@ describe('FreshAgentView', () => {
         resumeSessionId: 'cli-session-abc-123',
       }))
     })
+  })
+
+  it('shows the underlying snapshot-load error when a freshclaude restore has no session-state failure message', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce(new Error('Stale restore revision'))
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-error',
+            sessionId: 'claude-thread-restore',
+            status: 'idle',
+            resumeSessionId: 'claude-thread-restore',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
   })
 })
