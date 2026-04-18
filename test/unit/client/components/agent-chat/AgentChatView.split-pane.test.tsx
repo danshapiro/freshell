@@ -730,4 +730,125 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     })
     expect(await screen.findByText('Expanded older turn body')).toBeInTheDocument()
   })
+
+  it('skips sdk.attach and preserves content on split when session is fully hydrated', async () => {
+    const store = makeStore()
+
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-1',
+      sessionId: 'sess-1',
+      status: 'idle',
+      resumeSessionId: 'cli-abc',
+    }
+
+    // Build a fully-hydrated session: snapshot + timeline page received
+    store.dispatch(sessionInit({
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-1',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      revision: 3,
+    }))
+    store.dispatch(timelinePageReceived({
+      sessionId: 'sess-1',
+      items: [
+        makeTimelineItem('turn-1', 'assistant', 'Hello from Claude', {
+          sessionId: 'cli-abc',
+          ordinal: 1,
+          timestamp: '2026-03-10T10:00:00.000Z',
+        }),
+      ],
+      nextCursor: null,
+      revision: 3,
+      replace: true,
+      bodies: {
+        'turn-1': makeTimelineTurn('turn-1', 'assistant', 'Hello from Claude — full body', {
+          sessionId: 'cli-abc',
+          ordinal: 1,
+          timestamp: '2026-03-10T10:00:00.000Z',
+        }),
+      },
+    }))
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    // Verify historyLoaded is true before the test
+    expect(store.getState().agentChat.sessions['sess-1']!.historyLoaded).toBe(true)
+
+    // First render — fully loaded, content visible
+    const { unmount } = render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+    expect(await screen.findByText('Hello from Claude — full body')).toBeInTheDocument()
+
+    // Simulate split: unmount + remount
+    unmount()
+    wsSend.mockClear()
+    getAgentTimelinePage.mockClear()
+
+    render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    // Content should still be visible immediately — no "Restoring session..." flash
+    expect(screen.getByText('Hello from Claude — full body')).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+
+    // Should NOT have sent sdk.attach (session already hydrated, WS subscription persists)
+    const attachCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.attach',
+    )
+    expect(attachCalls).toHaveLength(0)
+
+    // Should NOT have re-fetched timeline (historyLoaded is still true)
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+
+    // Should NOT have sent sdk.create
+    const createCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.create',
+    )
+    expect(createCalls).toHaveLength(0)
+  })
+
+  it('still sends sdk.attach after page refresh when session is not in Redux', () => {
+    const store = makeStore()
+
+    // After a page refresh, pane content has sessionId but Redux session state is empty.
+    // The session is NOT in agentChat.sessions, so historyLoaded is undefined.
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-1',
+      sessionId: 'sess-1',
+      status: 'connected',
+      resumeSessionId: 'cli-abc',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    // No session state dispatched — simulates post-refresh state
+    expect(store.getState().agentChat.sessions['sess-1']).toBeUndefined()
+
+    render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    // Should have sent sdk.attach since session is not hydrated
+    const attachCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.attach',
+    )
+    expect(attachCalls).toHaveLength(1)
+    expect(attachCalls[0][0].sessionId).toBe('sess-1')
+  })
 })
