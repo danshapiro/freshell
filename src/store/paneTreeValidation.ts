@@ -53,6 +53,24 @@ function isPaneContentShape(content: unknown): boolean {
         && (content.viewMode === 'source' || content.viewMode === 'preview')
     case 'picker':
       return true
+    case 'fresh-agent':
+      return typeof content.sessionType === 'string'
+        && typeof content.provider === 'string'
+        && typeof content.createRequestId === 'string'
+        && typeof content.status === 'string'
+        && isOptionalString(content.sessionId)
+        && isOptionalString(content.resumeSessionId)
+        && isOptionalString(content.initialCwd)
+        && isOptionalString(content.model)
+        && isOptionalString(content.permissionMode)
+        && (content.effort === undefined
+          || content.effort === 'low'
+          || content.effort === 'medium'
+          || content.effort === 'high'
+          || content.effort === 'max')
+        && (content.plugins === undefined
+          || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
+        && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
     case 'agent-chat':
       return typeof content.provider === 'string'
         && typeof content.createRequestId === 'string'

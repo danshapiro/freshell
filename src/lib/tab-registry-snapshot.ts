@@ -59,6 +59,28 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
           plugins: content.plugins,
         }
       }
+    case 'fresh-agent':
+      {
+        const sessionRef = content.sessionRef
+          || (content.resumeSessionId
+            ? {
+                provider: content.provider,
+                sessionId: content.resumeSessionId,
+                serverInstanceId,
+              }
+            : undefined)
+        return {
+          provider: content.provider,
+          sessionType: content.sessionType,
+          resumeSessionId: content.resumeSessionId,
+          sessionRef,
+          initialCwd: content.initialCwd,
+          model: content.model,
+          permissionMode: content.permissionMode,
+          effort: content.effort,
+          plugins: content.plugins,
+        }
+      }
     case 'extension':
       return {
         extensionName: content.extensionName,

@@ -6,6 +6,7 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { migrateLegacyFreshAgentNode } from '@shared/fresh-agent'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -252,7 +253,10 @@ function normalizePersistedNode(node: unknown): unknown {
 
 function normalizePersistedLayouts(layouts: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(layouts).map(([tabId, node]) => [tabId, normalizePersistedNode(node)]),
+    Object.entries(layouts).map(([tabId, node]) => [
+      tabId,
+      migrateLegacyFreshAgentNode(normalizePersistedNode(node)),
+    ]),
   )
 }
 

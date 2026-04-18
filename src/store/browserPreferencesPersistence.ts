@@ -126,12 +126,13 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
     patch.sidebar = sidebar
   }
 
-  const agentChat: LocalSettingsPatch['agentChat'] = {}
-  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showThinking')
-  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showTools')
-  assignChangedScalar(agentChat, localSettings.agentChat, defaultLocalSettings.agentChat, 'showTimecodes')
-  if (Object.keys(agentChat).length > 0) {
-    patch.agentChat = agentChat
+  const freshAgent: LocalSettingsPatch['freshAgent'] = {}
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showThinking')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTools')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTimecodes')
+  if (Object.keys(freshAgent).length > 0) {
+    patch.freshAgent = freshAgent
+    patch.agentChat = freshAgent
   }
 
   const notifications: LocalSettingsPatch['notifications'] = {}

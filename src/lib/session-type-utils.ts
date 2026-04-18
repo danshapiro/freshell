@@ -2,9 +2,10 @@ import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type { FreshAgentPaneInput, AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export interface SessionTypeConfig {
@@ -47,17 +48,16 @@ export function buildResumeContent(opts: {
   sessionId: string
   cwd?: string
   agentChatProviderSettings?: AgentChatProviderSettings
-}): TerminalPaneInput | AgentChatPaneInput {
+}): TerminalPaneInput | FreshAgentPaneInput | AgentChatPaneInput {
   const agentConfig = getAgentChatProviderConfig(opts.sessionType)
   if (agentConfig) {
     const ps = opts.agentChatProviderSettings
+    const freshAgentType = resolveFreshAgentType(opts.sessionType)
     return {
-      kind: 'agent-chat',
-      provider: agentConfig.name as AgentChatProviderName,
-      sessionRef: {
-        provider: agentConfig.codingCliProvider ?? 'claude',
-        sessionId: opts.sessionId,
-      },
+      kind: 'fresh-agent',
+      sessionType: agentConfig.name as AgentChatProviderName,
+      provider: freshAgentType?.runtimeProvider ?? 'claude',
+      resumeSessionId: opts.sessionId,
       initialCwd: opts.cwd,
       modelSelection: ps?.modelSelection,
       permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,

@@ -1,6 +1,7 @@
 import type { PaneContent } from '@/store/paneTypes'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
+import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 /**
@@ -21,6 +22,10 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
 
   if (content.kind === 'agent-chat') {
     return getAgentChatProviderLabel(content.provider)
+  }
+
+  if (content.kind === 'fresh-agent') {
+    return getFreshAgentLabel(content.sessionType)
   }
 
   if (content.kind === 'browser') {

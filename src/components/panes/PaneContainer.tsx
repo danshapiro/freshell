@@ -13,6 +13,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -278,7 +279,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       })
     }
     // Clean up agent-chat resources
-    if (content.kind === 'agent-chat') {
+    if (content.kind === 'agent-chat' || content.kind === 'fresh-agent') {
       clearDraft(paneId)
       const pendingCreate = sdkPendingCreates[content.createRequestId]
       const pendingSessionId = pendingCreate?.sessionId
@@ -377,7 +378,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
-      : node.content.kind === 'agent-chat'
+      : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
         ? (node.content.status === 'exited' ? 'exited' : 'running')
         : 'running'
     const isRenaming = renamingPaneId === node.id
@@ -413,10 +414,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           provider: paneProvider,
           initialCwd: paneInitialCwd,
         })
-        : node.content.kind === 'agent-chat'
+        : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
           ? resolveFreshClaudeRuntimeMeta(
             indexedProjects,
-            node.content,
+            node.content.kind === 'fresh-agent'
+              ? { ...node.content, kind: 'agent-chat', provider: node.content.sessionType }
+              : node.content,
             node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
           )
         : undefined
@@ -547,10 +550,12 @@ function PickerWrapper({
 
     if (isAgentChatProviderName(type)) {
       const providerConfig = getAgentChatProviderConfig(type)!
+      const freshAgentType = resolveFreshAgentType(type)!
       const providerSettings = agentChatSettings?.providers?.[type]
       return {
-        kind: 'agent-chat',
-        provider: type,
+        kind: 'fresh-agent',
+        sessionType: type,
+        provider: freshAgentType.runtimeProvider,
         createRequestId: nanoid(),
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
@@ -750,10 +755,17 @@ function renderContent(
     )
   }
 
-  if (content.kind === 'agent-chat') {
+  if (content.kind === 'agent-chat' || content.kind === 'fresh-agent') {
     return (
       <ErrorBoundary key={paneId} label="Chat">
-        <AgentChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+        <AgentChatView
+          tabId={tabId}
+          paneId={paneId}
+          paneContent={content.kind === 'fresh-agent'
+            ? { ...content, kind: 'agent-chat', provider: content.sessionType }
+            : content}
+          hidden={hidden}
+        />
       </ErrorBoundary>
     )
   }
