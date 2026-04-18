@@ -14,6 +14,14 @@ export interface SessionTypeConfig {
 }
 
 export function resolveSessionTypeConfig(sessionType: string, extensions?: ClientExtensionEntry[]): SessionTypeConfig {
+  const freshAgentType = resolveFreshAgentType(sessionType)
+  if (freshAgentType) {
+    return {
+      icon: freshAgentType.icon,
+      label: freshAgentType.label,
+    }
+  }
+
   // 1. Check agent-chat providers first (they have explicit configs)
   const agentConfig = getAgentChatProviderConfig(sessionType)
   if (agentConfig) {

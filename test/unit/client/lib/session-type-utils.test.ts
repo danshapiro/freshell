@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
+import { CodexIcon } from '@/components/icons/provider-icons'
 
 describe('resolveSessionTypeConfig', () => {
   it('returns claude config for "claude"', () => {
@@ -18,6 +19,12 @@ describe('resolveSessionTypeConfig', () => {
     const config = resolveSessionTypeConfig('freshclaude')
     expect(config.label).toBe('Freshclaude')
     expect(config.icon).toBeDefined()
+  })
+
+  it('returns the registry-backed Codex icon for "freshcodex"', () => {
+    const config = resolveSessionTypeConfig('freshcodex')
+    expect(config.label).toBe('Freshcodex')
+    expect(config.icon).toBe(CodexIcon)
   })
 
   it('returns kilroy config for "kilroy"', () => {

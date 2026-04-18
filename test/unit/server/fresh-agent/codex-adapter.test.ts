@@ -36,6 +36,8 @@ describe('Codex fresh-agent adapter', () => {
       requestId: 'req-1',
       sessionType: 'freshcodex',
       cwd: '/repo',
+      permissionMode: 'acceptEdits',
+      model: 'gpt-5-codex',
     })).resolves.toEqual({ sessionId: 'thread-new-1' })
 
     await expect(adapter.resume?.({
@@ -43,15 +45,21 @@ describe('Codex fresh-agent adapter', () => {
       sessionType: 'freshcodex',
       resumeSessionId: 'thread-resume-1',
       cwd: '/repo',
+      permissionMode: 'plan',
+      model: 'gpt-5-codex',
     })).resolves.toEqual({ sessionId: 'thread-resume-1' })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
       cwd: '/repo',
+      model: 'gpt-5-codex',
+      approvalPolicy: 'acceptEdits',
       richClient: true,
     }))
     expect(runtime.resumeThread).toHaveBeenCalledWith(expect.objectContaining({
       threadId: 'thread-resume-1',
       cwd: '/repo',
+      model: 'gpt-5-codex',
+      approvalPolicy: 'plan',
       richClient: true,
     }))
   })

@@ -38,6 +38,7 @@ export function createCodexFreshAgentAdapter(deps: {
       const started = await deps.runtime.startThread({
         cwd: input.cwd,
         model: input.model,
+        approvalPolicy: input.permissionMode,
         richClient: true,
       })
       return { sessionId: started.threadId }
@@ -51,6 +52,7 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: input.resumeSessionId,
         cwd: input.cwd,
         model: input.model,
+        approvalPolicy: input.permissionMode,
         richClient: true,
       })
       return { sessionId: resumed.threadId }
