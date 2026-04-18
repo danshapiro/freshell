@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a shared `fresh-agent` platform that powers `freshclaude` and `freshcodex` from one architecture, preserves current Freshclaude behavior, and leaves a clean adapter seam for `freshopencode` later.
+**Goal:** Ship a shared `fresh-agent` platform that powers `freshclaude` and `freshcodex` from one architecture, preserves existing Freshclaude behavior and saved state, and leaves a clean adapter seam for `freshopencode` later without another rewrite.
 
-**Architecture:** Rename the rich-pane domain from `agent-chat` to `fresh-agent`, migrate persisted state/settings to that vocabulary, and drive all rich panes from a provider registry plus runtime adapters. Reuse the existing Claude ledger/history stack and the existing Codex app-server foundation, extend them where needed, and normalize both into one lane-aware read model and one shared UI shell.
+**Architecture:** Cut over directly from the current `agent-chat` domain to a new `fresh-agent` domain that separates user-facing `sessionType` from runtime `provider`. Reuse Claude’s existing durable/live ledger stack and the existing Codex app-server runtime, normalize both into one read model plus one shared UI shell, and migrate every persistence/restore surface up front so current users keep their tabs, settings, history, and remote snapshots.
 
 **Tech Stack:** TypeScript, React 18, Redux Toolkit, Express, WebSocket/Zod contracts, existing read-model scheduler, Claude SDK bridge, Codex app-server runtime/client, Vitest, Testing Library, Playwright browser e2e.
 
@@ -12,31 +12,34 @@
 
 ## Why The Previous Plan Would Fail
 
-- It created a second Codex app-server client under `server/fresh-agent/adapters/codex/client.ts` even though the repo already has a tested app-server stack in `server/coding-cli/codex-app-server/*`. That would fork the protocol surface and guarantee drift.
-- It never migrated persisted `kind: 'agent-chat'` panes or `settings.agentChat`, so existing Freshclaude tabs/settings would break or fossilize the old naming forever.
-- It ignored hidden Claude-backed `kilroy` support. Deleting or orphaning it would be a regression.
-- It proposed vitest e2e files under `test/e2e/*.test.tsx` for flows that belong in the repo’s Playwright browser suite under `test/e2e-browser/specs/*.spec.ts`.
-- It did not require preserving existing Freshclaude features that are already real product behavior: plugin injection, mid-session model/permission changes, durable restore, lost-session recovery, timeline hydration, input history, and current local/server settings behavior.
-- It did not specify how Freshcodex gets rich live data from the Codex app-server. The existing client currently starts fresh threads with `experimentalRawEvents: false` for terminal/TUI flows; a rich pane needs explicit event/replay support.
+- It correctly chose the target architecture, but it did not fully cover the persistence and restore surfaces that still encode `agent-chat`. An executor following it would get partway through the cutover and then discover breakage in local storage versioning, remote tab snapshots, tab registry history, and sidebar resume behavior.
+- It did not account for [`src/store/storage-migration.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/storage-migration.ts:1), which currently hard-clears persisted browser state on incompatible version changes. A naive schema bump would erase exactly the saved Freshclaude tabs and settings the user asked to preserve.
+- It did not include the remote snapshot and restore path through [`server/agent-api/layout-store.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/agent-api/layout-store.ts:1), [`server/tabs-registry/types.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/tabs-registry/types.ts:1), [`src/store/tabRegistryTypes.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/tabRegistryTypes.ts:1), and [`src/components/TabsView.tsx`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/components/TabsView.tsx:1). Without those, reopened remote tabs would still serialize and hydrate `agent-chat`.
+- It did not include the layout bootstrap path through [`src/components/TabContent.tsx`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/components/TabContent.tsx:1), [`src/lib/tab-directory-preference.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/lib/tab-directory-preference.ts:1), and [`src/store/paneTreeValidation.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/paneTreeValidation.ts:1). Those still special-case `agent-chat`.
+- It did not call out [`src/store/selectors/sidebarSelectors.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/src/store/selectors/sidebarSelectors.ts:1) and related session metadata helpers, which are where `provider` and `sessionType` semantics get merged for history/sidebar rendering. Missing them would reintroduce the wrong identity model after the store cutover.
+- It did not call out [`server/platform-router.ts`](/home/user/code/freshell/.worktrees/fresh-agent-platform/server/platform-router.ts:1), which is part of keeping hidden `kilroy` support wired through the platform feature flags.
+- It was still too optimistic about “delete old `agent-chat` glue later”. Some of the old files are not merely legacy UI; they currently encode product-critical behavior that must be ported deliberately before deletion: restore hydration, question/approval state, plugin defaults, input history, and lost-session recovery.
 
 ## Steady-State Product Behavior
 
 - Rich panes use `kind: 'fresh-agent'`, not `kind: 'agent-chat'`.
 - `freshclaude`, `freshcodex`, and hidden `kilroy` all come from one fresh-agent registry.
-- `provider` keeps meaning runtime family (`claude`, `codex`, later `opencode`).
-- `sessionType` keeps meaning user-facing identity (`freshclaude`, `freshcodex`, `kilroy`, later `freshopencode`).
-- Existing Freshclaude sessions, settings, reopen entries, and sidebar items survive migration with no manual repair.
+- `provider` means runtime family (`claude`, `codex`, later `opencode`).
+- `sessionType` means user-facing identity (`freshclaude`, `freshcodex`, `kilroy`, later `freshopencode`).
+- Existing Freshclaude sessions, settings, reopen entries, local layouts, remote tab snapshots, and sidebar/history items survive migration with no manual repair.
 - Raw CLI terminals remain separate pane types. Rich panes never silently degrade into terminal scraping.
-- Codex rich panes use the Codex app-server as the source of truth and surface fork, diff/review, worktree, child-thread, and token/context metadata when the runtime exposes them.
-- OpenCode is not shipped here, but the registry, adapter interface, and normalized model already admit it.
+- Freshcodex rich panes use the Codex app-server as the source of truth and surface fork, diff/review, worktree, child-thread, and token/context metadata when the runtime exposes them.
+- OpenCode is not shipped here, but the registry, adapter interface, and normalized model already admit it without Claude- or Codex-specific assumptions leaking into shared code.
 
 ## Contracts And Invariants
 
 ### Naming and persistence
 
 - The final domain name is `fresh-agent`, not `agent-chat`.
-- Persisted pane/layout data must migrate existing `agent-chat` leaves to `fresh-agent`.
-- Settings must migrate `agentChat` to `freshAgent` while continuing to read legacy input during rollout.
+- Persisted pane/layout data must migrate existing `agent-chat` leaves to `fresh-agent` leaves.
+- Browser storage migration must preserve existing Freshell auth, layout, and settings data; do not solve this by clearing local storage.
+- Server/local settings must migrate `agentChat` to `freshAgent` while continuing to read legacy input during rollout.
+- Remote layout snapshots and tab registry records must serialize `fresh-agent`, not `agent-chat`.
 - Session metadata remains keyed by `provider:sessionId`; updating `sessionType` must keep `derivedTitle`.
 
 ### Registry and adapters
@@ -52,6 +55,7 @@
 - Normalized entities have stable ids for thread, turn, item, approval, question, diff, artifact, child thread, and worktree references.
 - Read-model routes stay revisioned and lane-aware and must never mix bodies from one revision with summaries from another.
 - Existing Freshclaude UX stays intact unless the new shared shell makes it stronger.
+- Mobile and sidebar behavior remain first-class requirements, not follow-up cleanup.
 
 ## File Structure
 
@@ -82,6 +86,8 @@
 - `src/components/fresh-agent/renderers/*`
 - `test/fixtures/fresh-agent/claude/*`
 - `test/fixtures/fresh-agent/codex/*`
+- `test/e2e-browser/specs/fresh-agent.spec.ts`
+- `test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
 
 ### Modify
 
@@ -91,6 +97,7 @@
 - `server/config-store.ts`
 - `server/index.ts`
 - `server/ws-handler.ts`
+- `server/platform-router.ts`
 - `server/sdk-bridge.ts`
 - `server/sdk-bridge-types.ts`
 - `server/agent-timeline/*`
@@ -102,33 +109,44 @@
 - `server/session-directory/*`
 - `server/sessions-router.ts`
 - `server/session-metadata-store.ts`
+- `server/agent-api/layout-store.ts`
+- `server/tabs-registry/types.ts`
 - `src/store/paneTypes.ts`
 - `src/store/panesSlice.ts`
 - `src/store/persistedState.ts`
 - `src/store/persistMiddleware.ts`
+- `src/store/storage-migration.ts`
 - `src/store/store.ts`
 - `src/store/persistControl.ts`
 - `src/store/tabsSlice.ts`
 - `src/store/settingsSlice.ts`
 - `src/store/settingsThunks.ts`
 - `src/store/browserPreferencesPersistence.ts`
+- `src/store/paneTreeValidation.ts`
+- `src/store/tabRegistryTypes.ts`
+- `src/store/selectors/sidebarSelectors.ts`
 - `src/lib/session-type-utils.ts`
 - `src/lib/derivePaneTitle.ts`
 - `src/lib/pane-activity.ts`
 - `src/lib/session-utils.ts`
+- `src/lib/tab-directory-preference.ts`
 - `src/lib/tab-registry-snapshot.ts`
 - `src/lib/ws-client.ts`
+- `src/lib/api.ts`
 - `src/lib/agent-chat-utils.ts`
 - `src/lib/agent-chat-types.ts`
 - `src/components/panes/PaneContainer.tsx`
 - `src/components/panes/PanePicker.tsx`
 - `src/components/Sidebar.tsx`
 - `src/components/HistoryView.tsx`
+- `src/components/TabContent.tsx`
+- `src/components/TabsView.tsx`
 - `src/components/context-menu/*`
 - `src/components/icons/PaneIcon.tsx`
 - `src/components/TabBar.tsx`
 - `src/components/TabSwitcher.tsx`
 - `src/components/MobileTabStrip.tsx`
+- `src/components/SettingsView.tsx`
 - `src/components/settings/WorkspaceSettings.tsx`
 - `docs/index.html`
 
@@ -147,26 +165,30 @@ The right path is a direct cutover to the final architecture, not another “gen
 - Claude has durable/live merge and restore semantics in `server/sdk-bridge.ts` and `server/agent-timeline/*`.
 - Codex already has a shared app-server runtime/client/planner in `server/coding-cli/codex-app-server/*`.
 
-The plan therefore reuses both, renames the product domain to `fresh-agent`, migrates persistence/settings up front, and then lands one transport, one read model, and one UI shell. That is the cleanest route to the requested end state and the only route that avoids another rewrite when `freshopencode` arrives.
+The plan therefore reuses both, renames the product domain to `fresh-agent`, migrates persistence/settings/restore surfaces first, and then lands one transport, one read model, one store, and one UI shell. That is the cleanest route to the requested end state and the only route that avoids another rewrite when `freshopencode` arrives.
 
-### Task 1: Rename the domain to `fresh-agent` and migrate persisted settings/layouts
+### Task 1: Rename the domain to `fresh-agent` and migrate local/server persistence without data loss
 
 **Files:**
 - Create: `shared/fresh-agent.ts`
 - Create: `src/lib/fresh-agent-registry.ts`
 - Modify: `shared/settings.ts`
 - Modify: `server/config-store.ts`
+- Modify: `server/platform-router.ts`
 - Modify: `src/store/settingsSlice.ts`
 - Modify: `src/store/settingsThunks.ts`
 - Modify: `src/store/browserPreferencesPersistence.ts`
+- Modify: `src/store/storage-migration.ts`
 - Modify: `src/store/paneTypes.ts`
 - Modify: `src/store/panesSlice.ts`
 - Modify: `src/store/persistedState.ts`
 - Modify: `src/store/persistMiddleware.ts`
+- Modify: `src/store/paneTreeValidation.ts`
 - Modify: `src/lib/agent-chat-utils.ts`
 - Modify: `src/lib/agent-chat-types.ts`
 - Test: `test/unit/shared/fresh-agent-registry.test.ts`
 - Test: `test/unit/client/store/persisted-state.fresh-agent.test.ts`
+- Test: `test/unit/client/store/storage-migration.fresh-agent.test.ts`
 - Test: `test/unit/server/config-store.fresh-agent-settings.test.ts`
 
 - [ ] **Step 1: Identify or write the failing tests**
@@ -195,6 +217,12 @@ it('migrates legacy settings.agentChat to settings.freshAgent', () => {
   expect(settings.freshAgent.defaultPlugins).toEqual(['/tmp/plugin'])
 })
 
+it('does not clear freshell layout storage during the fresh-agent migration', () => {
+  localStorage.setItem('freshell.layout.v3', '{"version":3}')
+  runStorageMigration()
+  expect(localStorage.getItem('freshell.layout.v3')).toBe('{"version":3}')
+})
+
 it('keeps kilroy as a hidden claude-backed fresh-agent type', () => {
   expect(resolveFreshAgentType('kilroy')).toMatchObject({ runtimeProvider: 'claude', hidden: true })
 })
@@ -202,10 +230,10 @@ it('keeps kilroy as a hidden claude-backed fresh-agent type', () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts`
 Expected: FAIL because the registry and migrations do not exist yet.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Implement the shared vocabulary and migrations:
 
@@ -214,11 +242,12 @@ Implement the shared vocabulary and migrations:
 - registry entries for `freshclaude`, `freshcodex`, hidden `kilroy`, and disabled `freshopencode`
 - persisted layout migration from `kind: 'agent-chat'` to `kind: 'fresh-agent'`
 - server/local settings migration from `agentChat` to `freshAgent`, still accepting legacy input
+- storage migration that preserves saved Freshell state instead of clearing it
 - pane content shape that stores `sessionType` explicitly instead of overloading `provider`
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
@@ -229,13 +258,13 @@ Refactor compatibility to one place only:
 - runtime code consumes only `fresh-agent`
 - `agent-chat` helper modules become thin compatibility exports or are queued for removal
 
-Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/client/store/tabsSlice.merge.test.ts`
+Run: `npm run test:vitest -- test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/client/store/tabsSlice.merge.test.ts`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add shared/fresh-agent.ts src/lib/fresh-agent-registry.ts shared/settings.ts server/config-store.ts src/store/settingsSlice.ts src/store/settingsThunks.ts src/store/browserPreferencesPersistence.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/lib/agent-chat-utils.ts src/lib/agent-chat-types.ts test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts
+git add shared/fresh-agent.ts src/lib/fresh-agent-registry.ts shared/settings.ts server/config-store.ts server/platform-router.ts src/store/settingsSlice.ts src/store/settingsThunks.ts src/store/browserPreferencesPersistence.ts src/store/storage-migration.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistedState.ts src/store/persistMiddleware.ts src/store/paneTreeValidation.ts src/lib/agent-chat-utils.ts src/lib/agent-chat-types.ts test/unit/shared/fresh-agent-registry.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts
 git commit -m "refactor: rename rich pane domain to fresh agent"
 ```
 
@@ -275,7 +304,7 @@ it('returns 409 for stale thread revisions instead of mixing bodies from differe
 Run: `npm run test:vitest -- test/unit/server/fresh-agent/runtime-manager.test.ts test/unit/server/fresh-agent/router.test.ts test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: FAIL because the fresh-agent transport does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Implement:
 
@@ -344,7 +373,7 @@ it('preserves plugin defaults and mid-session model/permission changes through t
 Run: `npm run test:vitest -- test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/fresh-agent/claude-normalize.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts`
 Expected: FAIL because the adapter does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Wrap the existing Claude stack behind the adapter:
 
@@ -410,17 +439,17 @@ it('normalizes codex fork, review, worktree, and child-thread metadata into the 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npm run test:vitest -- test/unit/server/coding-cli/codex-app-server/client.test.ts test/unit/server/coding-cli/codex-app-server/runtime.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/codex-normalize.test.ts`
-Expected: FAIL because the existing app-server layer does not yet expose rich-session events/capabilities.
+Expected: FAIL because the existing app-server layer does not yet expose rich-session events and capabilities.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Extend the current Codex app-server stack instead of copying it:
 
 - add protocol/client support for the notifications and RPCs needed by rich Freshcodex
 - keep terminal-mode behavior intact
-- allow rich-pane creation/resume to request raw events/replay where required
+- allow rich-pane creation and resume to request raw events and replay where required
 - normalize review, diff, fork lineage, worktree, token/context, and child-thread metadata into the shared model
-- keep `server/coding-cli/providers/codex.ts` focused on indexing/terminal concerns
+- keep `server/coding-cli/providers/codex.ts` focused on indexing and terminal concerns
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -441,7 +470,7 @@ git add server/fresh-agent/adapters/codex/adapter.ts server/fresh-agent/adapters
 git commit -m "feat: add codex rich runtime support"
 ```
 
-### Task 5: Integrate fresh-agent sessions into session directory, metadata, and resume flows
+### Task 5: Integrate fresh-agent sessions into metadata, session directory, remote snapshots, and resume flows
 
 **Files:**
 - Modify: `server/session-directory/projection.ts`
@@ -449,14 +478,26 @@ git commit -m "feat: add codex rich runtime support"
 - Modify: `server/session-directory/types.ts`
 - Modify: `server/sessions-router.ts`
 - Modify: `server/session-metadata-store.ts`
+- Modify: `server/agent-api/layout-store.ts`
+- Modify: `server/tabs-registry/types.ts`
+- Modify: `src/store/tabRegistryTypes.ts`
 - Modify: `src/lib/api.ts`
+- Modify: `src/lib/session-metadata.ts`
+- Modify: `src/lib/session-type-utils.ts`
+- Modify: `src/lib/tab-directory-preference.ts`
+- Modify: `src/lib/tab-registry-snapshot.ts`
+- Modify: `src/components/TabContent.tsx`
+- Modify: `src/components/TabsView.tsx`
+- Modify: `src/store/selectors/sidebarSelectors.ts`
 - Test: `test/unit/server/session-directory/fresh-agent-projection.test.ts`
 - Test: `test/integration/server/session-metadata-api.test.ts`
+- Test: `test/unit/server/agent-api/layout-store.fresh-agent.test.ts`
+- Test: `test/unit/client/components/TabsView.fresh-agent.test.tsx`
 - Test: `test/unit/client/lib/api.test.ts`
 
 - [ ] **Step 1: Identify or write the failing tests**
 
-Cover the resume/sidebar contract:
+Cover the resume and snapshot contract:
 
 ```ts
 it('keeps derivedTitle when sessionType is updated to freshcodex', async () => {
@@ -465,45 +506,47 @@ it('keeps derivedTitle when sessionType is updated to freshcodex', async () => {
   expect(await store.get('codex', 'sess-1')).toEqual({ derivedTitle: 'Sticky title', sessionType: 'freshcodex' })
 })
 
-it('projects freshcodex sessions into the session directory with fork/worktree badges', async () => {
-  expect(page.items[0]).toMatchObject({ sessionType: 'freshcodex', provider: 'codex' })
+it('serializes fresh-agent panes in remote layout snapshots and rehydrates them back into fresh-agent panes', () => {
+  expect(snapshot.panes[0]).toMatchObject({ kind: 'fresh-agent' })
+  expect(restored.content).toMatchObject({ kind: 'fresh-agent', sessionType: 'freshclaude' })
 })
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/client/lib/api.test.ts`
-Expected: FAIL because fresh-agent metadata is not fully projected yet.
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
+Expected: FAIL because fresh-agent metadata and snapshot flows are not fully projected yet.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Implement projection and metadata updates so that:
 
-- sidebar/history pages show `freshclaude`, `freshcodex`, and `kilroy` correctly
+- sidebar and history pages show `freshclaude`, `freshcodex`, and `kilroy` correctly
 - resume actions rebuild `kind: 'fresh-agent'` panes
 - `sessionType` updates do not clobber `derivedTitle`
-- session directory carries the metadata needed for fork/worktree/subagent badges
+- remote layout snapshots and registry records store `fresh-agent`, not `agent-chat`
+- session directory carries the metadata needed for fork, worktree, and subagent badges
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/client/lib/api.test.ts`
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
 
-Keep `provider` and `sessionType` semantics separate everywhere. Do not smuggle UI identity back into filesystem/provider fields.
+Keep `provider` and `sessionType` semantics separate everywhere. Do not smuggle UI identity back into filesystem or provider fields.
 
-Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/session-directory/service.test.ts`
+Run: `npm run test:vitest -- test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/session-directory/service.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/sessions-router.ts server/session-metadata-store.ts src/lib/api.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/client/lib/api.test.ts
-git commit -m "feat: project fresh agent sessions through sidebar metadata"
+git add server/session-directory/projection.ts server/session-directory/service.ts server/session-directory/types.ts server/sessions-router.ts server/session-metadata-store.ts server/agent-api/layout-store.ts server/tabs-registry/types.ts src/store/tabRegistryTypes.ts src/lib/api.ts src/lib/session-metadata.ts src/lib/session-type-utils.ts src/lib/tab-directory-preference.ts src/lib/tab-registry-snapshot.ts src/components/TabContent.tsx src/components/TabsView.tsx src/store/selectors/sidebarSelectors.ts test/unit/server/session-directory/fresh-agent-projection.test.ts test/integration/server/session-metadata-api.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/components/TabsView.fresh-agent.test.tsx test/unit/client/lib/api.test.ts
+git commit -m "feat: project fresh agent sessions through metadata and snapshots"
 ```
 
-### Task 6: Replace client state and WS handling with the fresh-agent store
+### Task 6: Replace client state and WebSocket handling with the fresh-agent store
 
 **Files:**
 - Create: `src/lib/fresh-agent-ws.ts`
@@ -514,7 +557,9 @@ git commit -m "feat: project fresh agent sessions through sidebar metadata"
 - Modify: `src/store/persistControl.ts`
 - Modify: `src/store/tabsSlice.ts`
 - Modify: `src/lib/ws-client.ts`
-- Modify: `src/lib/session-type-utils.ts`
+- Modify: `src/lib/session-utils.ts`
+- Modify: `src/lib/pane-activity.ts`
+- Modify: `src/components/TabSwitcher.tsx`
 - Test: `test/unit/client/store/freshAgentSlice.test.ts`
 - Test: `test/unit/client/store/freshAgentThunks.test.ts`
 - Test: `test/unit/client/lib/fresh-agent-ws.test.ts`
@@ -539,17 +584,18 @@ it('persists sessionType and provider separately for resume identity', () => {
 Run: `npm run test:vitest -- test/unit/client/store/freshAgentSlice.test.ts test/unit/client/store/freshAgentThunks.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/persistControl.fresh-agent.test.ts`
 Expected: FAIL because the fresh-agent state layer does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Implement the normalized client layer:
 
 - thread state keyed by runtime locator
-- revision-safe snapshot/page/body hydration
+- revision-safe snapshot, page, and body hydration
 - WS handling for `freshAgent.*`
-- pending approvals/questions/action errors in shared state
+- pending approvals, questions, and action errors in shared state
 - resume identity helpers that work for Claude and Codex without Claude-only assumptions
+- pane activity and tab switcher wiring that no longer read from `agentChat`
 
-Do not persist transient streaming/pending action state.
+Do not persist transient streaming or pending-action state.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -558,7 +604,7 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
 
-Convert shared selectors/helpers to consume `freshAgent` state, not `agentChat`.
+Convert shared selectors and helpers to consume `freshAgent` state, not `agentChat`.
 
 Run: `npm run test:vitest -- test/unit/client/store/freshAgentSlice.test.ts test/unit/client/store/freshAgentThunks.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/persistControl.fresh-agent.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx`
 Expected: PASS
@@ -566,7 +612,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/lib/fresh-agent-ws.ts src/store/freshAgentTypes.ts src/store/freshAgentSlice.ts src/store/freshAgentThunks.ts src/store/store.ts src/store/persistControl.ts src/store/tabsSlice.ts src/lib/ws-client.ts src/lib/session-type-utils.ts test/unit/client/store/freshAgentSlice.test.ts test/unit/client/store/freshAgentThunks.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/persistControl.fresh-agent.test.ts
+git add src/lib/fresh-agent-ws.ts src/store/freshAgentTypes.ts src/store/freshAgentSlice.ts src/store/freshAgentThunks.ts src/store/store.ts src/store/persistControl.ts src/store/tabsSlice.ts src/lib/ws-client.ts src/lib/session-utils.ts src/lib/pane-activity.ts src/components/TabSwitcher.tsx test/unit/client/store/freshAgentSlice.test.ts test/unit/client/store/freshAgentThunks.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/store/persistControl.fresh-agent.test.ts
 git commit -m "feat: add fresh agent client state"
 ```
 
@@ -588,8 +634,8 @@ git commit -m "feat: add fresh agent client state"
 - Modify: `src/components/context-menu/*`
 - Modify: `src/components/icons/PaneIcon.tsx`
 - Modify: `src/components/TabBar.tsx`
-- Modify: `src/components/TabSwitcher.tsx`
 - Modify: `src/components/MobileTabStrip.tsx`
+- Modify: `src/components/SettingsView.tsx`
 - Modify: `src/components/settings/WorkspaceSettings.tsx`
 - Modify: `src/lib/derivePaneTitle.ts`
 - Modify: `src/lib/pane-activity.ts`
@@ -598,6 +644,7 @@ git commit -m "feat: add fresh agent client state"
 - Test: `test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx`
 - Test: `test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx`
 - Test: `test/unit/client/components/panes/PaneContainer.test.tsx`
+- Test: `test/unit/client/components/SettingsView.fresh-agent.test.tsx`
 
 - [ ] **Step 1: Identify or write the failing tests**
 
@@ -619,24 +666,24 @@ it('preserves existing freshclaude settings, plugin controls, and question banne
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx`
+Run: `npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/SettingsView.fresh-agent.test.tsx`
 Expected: FAIL because the shared UI shell does not exist.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Build the shared shell with:
 
-- virtualized transcript backed by normalized turns/items
+- virtualized transcript backed by normalized turns and items
 - approval and question banners reused across providers
 - shared composer supporting send, interrupt, fork, and capability-backed actions
-- mobile drawers/sheets for secondary panes
-- preserved Freshclaude features: plugin defaults, settings popover, input history, restore hydration, session-lost recovery, timecodes, show thinking/tools toggles
+- mobile drawers or sheets for secondary panes
+- preserved Freshclaude features: plugin defaults, settings popover, input history, restore hydration, session-lost recovery, timecodes, show thinking and tools toggles
 
 Switch pane picker, pane container, sidebar, history, and context menus to `kind: 'fresh-agent'`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx`
+Run: `npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/SettingsView.fresh-agent.test.tsx`
 Expected: PASS
 
 - [ ] **Step 5: Refactor and verify**
@@ -649,11 +696,11 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/components/fresh-agent src/components/panes/PaneContainer.tsx src/components/panes/PanePicker.tsx src/components/Sidebar.tsx src/components/HistoryView.tsx src/components/context-menu src/components/icons/PaneIcon.tsx src/components/TabBar.tsx src/components/TabSwitcher.tsx src/components/MobileTabStrip.tsx src/components/settings/WorkspaceSettings.tsx src/lib/derivePaneTitle.ts src/lib/pane-activity.ts docs/index.html test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx
+git add src/components/fresh-agent src/components/panes/PaneContainer.tsx src/components/panes/PanePicker.tsx src/components/Sidebar.tsx src/components/HistoryView.tsx src/components/context-menu src/components/icons/PaneIcon.tsx src/components/TabBar.tsx src/components/MobileTabStrip.tsx src/components/SettingsView.tsx src/components/settings/WorkspaceSettings.tsx src/lib/derivePaneTitle.ts src/lib/pane-activity.ts docs/index.html test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentDiffPanel.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/SettingsView.fresh-agent.test.tsx
 git commit -m "feat: ship shared fresh agent pane shell"
 ```
 
-### Task 8: Add browser e2e coverage, remove obsolete code, and run the full verification gate
+### Task 8: Remove obsolete code, add browser e2e coverage, and run the full verification gate
 
 **Files:**
 - Modify/Delete: `src/store/agentChatSlice.ts`
@@ -663,7 +710,7 @@ git commit -m "feat: ship shared fresh agent pane shell"
 - Create: `test/e2e-browser/specs/fresh-agent.spec.ts`
 - Create: `test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
 - Modify: existing Playwright helpers only if needed
-- Test: all targeted unit/integration/e2e suites below
+- Test: all targeted unit, integration, and e2e suites below
 
 - [ ] **Step 1: Identify or write the failing tests**
 
@@ -675,7 +722,7 @@ test('creates and resumes freshcodex with fork lineage and worktree metadata int
   await expect(page.getByText(/worktree/i)).toBeVisible()
 })
 
-test('freshclaude still restores durable history and surfaces approvals/questions', async ({ page }) => {
+test('freshclaude still restores durable history and surfaces approvals and questions', async ({ page }) => {
   await expect(page.getByRole('alert')).toBeVisible()
 })
 ```
@@ -685,7 +732,7 @@ test('freshclaude still restores durable history and surfaces approvals/question
 Run: `npm run test:e2e:chromium -- test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
 Expected: FAIL because the browser flows are not fully wired yet.
 
-- [ ] **Step 3: Write the minimal implementation**
+- [ ] **Step 3: Write minimal implementation**
 
 Delete obsolete `agent-chat` and legacy `sdk.*` client glue only after the new browser flows pass. Keep only compatibility code required for persisted migration or legacy setting reads.
 
@@ -720,15 +767,17 @@ git commit -m "refactor: remove legacy agent chat architecture"
 Do not ship `freshopencode` here. Do ensure the final architecture already supports it:
 
 - disabled registry entry may exist now
-- adapter interface already supports explicit permission/command flows and server-driven event streams
+- adapter interface already supports explicit permission and command flows plus server-driven event streams
 - normalized model already has diff, review, worktree, child-thread, and artifact concepts
 - no client code assumes Claude block messages or Codex review objects are universal
 
 ## Implementation notes for the executing agent
 
 - Work only in `/home/user/code/freshell/.worktrees/fresh-agent-platform`.
-- Reuse the existing Codex app-server runtime/client/planner instead of creating a parallel stack.
+- Reuse the existing Codex app-server runtime, client, and planner instead of creating a parallel stack.
 - Preserve current Freshclaude behavior while renaming the architecture underneath it.
 - Preserve `kilroy` as a hidden Claude-backed fresh-agent type.
-- Use Playwright for browser/mobile e2e, not vitest-only pseudo-e2e files.
+- Preserve saved tabs and settings; do not “solve” migration by clearing local storage.
+- Update remote snapshot and tab registry code in the same migration as local pane persistence.
+- Use Playwright for browser and mobile e2e, not vitest-only pseudo-e2e files.
 - Broad runs go through the test coordinator. Check `npm run test:status` before them.
