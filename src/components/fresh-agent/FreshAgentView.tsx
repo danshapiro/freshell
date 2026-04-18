@@ -125,6 +125,7 @@ export function FreshAgentView({
   ))
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const paneContentRef = useRef(paneContent)
   paneContentRef.current = paneContent
@@ -189,7 +190,9 @@ export function FreshAgentView({
       effort: paneContent.effort,
       plugins: paneContent.plugins,
     } as const
-    registerFreshAgentCreate(dispatch, paneContent.createRequestId)
+    registerFreshAgentCreate(dispatch, paneContent.createRequestId, {
+      resumeSessionId: paneContent.resumeSessionId,
+    })
     sendFreshAgentMessage(createMessage)
   }, [
     dispatch,
@@ -204,6 +207,16 @@ export function FreshAgentView({
     paneContent.sessionId,
     paneContent.sessionType,
   ])
+
+  useEffect(() => {
+    if (!paneContent.sessionId || hidden) return
+    sendFreshAgentMessage({
+      type: 'freshAgent.attach',
+      sessionId: paneContent.sessionId,
+      sessionType: paneContent.sessionType,
+      resumeSessionId: paneContent.resumeSessionId,
+    })
+  }, [hidden, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
@@ -235,6 +248,9 @@ export function FreshAgentView({
             },
           },
         }))
+      }
+      if (message.type === 'freshAgent.event' && message.sessionId === paneContent.sessionId) {
+        setSnapshotRefreshNonce((value) => value + 1)
       }
     })
     return unsubscribe
@@ -286,6 +302,7 @@ export function FreshAgentView({
     paneContent.sessionId,
     paneContent.status,
     paneId,
+    snapshotRefreshNonce,
     tabId,
   ])
 
@@ -432,7 +449,31 @@ export function FreshAgentView({
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="space-y-2 px-3 pt-3">
               {pendingCreateFailure || paneContent.createError ? (
-                <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />
+                <div className="flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm">
+                  <FreshAgentApprovalBanner text={(pendingCreateFailure ?? paneContent.createError)?.message ?? 'Create failed'} />
+                  {(pendingCreateFailure ?? paneContent.createError)?.retryable ? (
+                    <button
+                      type="button"
+                      className="rounded border border-border/70 px-2 py-1"
+                      onClick={() => {
+                        const nextRequestId = nanoid()
+                        dispatch(updatePaneContent({
+                          tabId,
+                          paneId,
+                          content: {
+                            ...paneContentRef.current,
+                            sessionId: undefined,
+                            createRequestId: nextRequestId,
+                            status: 'starting',
+                            createError: undefined,
+                          },
+                        }))
+                      }}
+                    >
+                      Retry
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
               {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}

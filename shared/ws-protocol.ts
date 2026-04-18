@@ -415,6 +415,13 @@ export const FreshAgentCreateSchema = z.object({
   plugins: z.array(z.string()).optional(),
 })
 
+export const FreshAgentAttachSchema = z.object({
+  type: z.literal('freshAgent.attach'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  resumeSessionId: z.string().optional(),
+})
+
 export const FreshAgentSendSchema = z.object({
   type: z.literal('freshAgent.send'),
   sessionId: z.string().min(1),
@@ -457,6 +464,7 @@ export const FreshAgentForkSchema = z.object({
 
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
   FreshAgentApprovalRespondSchema,
@@ -496,6 +504,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliInputSchema,
   CodingCliKillSchema,
   FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
   FreshAgentApprovalRespondSchema,
@@ -771,6 +780,7 @@ export type SdkRestoreFailureCode =
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; runtimeProvider: string }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; event: unknown }
   | { type: 'freshAgent.killed'; sessionId: string; success: boolean }
 
 export type SdkServerMessage =

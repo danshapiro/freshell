@@ -200,7 +200,7 @@ test.describe('Fresh Agent', () => {
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
-    await expect(page.getByText('Starting session')).toBeVisible()
+    await expect(page.locator('[data-context="fresh-agent"]').getByText('Starting session', { exact: true }).first()).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({

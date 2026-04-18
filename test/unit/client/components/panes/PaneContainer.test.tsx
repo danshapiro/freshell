@@ -37,6 +37,7 @@ const {
   mockSend,
   mockTerminalView,
   mockAgentChatView,
+  mockFreshAgentView,
   mockBrowserPane,
   browserPaneMounts,
   browserPaneUnmounts,
@@ -44,6 +45,7 @@ const {
   mockApiPost,
   mockApiPatch,
   saveServerSettingsPatchSpy,
+  cancelCreateSpy,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -51,6 +53,9 @@ const {
   )),
   mockAgentChatView: vi.fn(({ paneId }: { paneId: string }) => (
     <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>
+  )),
+  mockFreshAgentView: vi.fn(({ paneId }: { paneId: string }) => (
+    <div data-testid={`fresh-agent-${paneId}`}>Fresh Agent</div>
   )),
   mockBrowserPane: vi.fn(),
   browserPaneMounts: [] as string[],
@@ -62,6 +67,7 @@ const {
     type: 'settings/saveServerSettingsPatch',
     payload: patch,
   })),
+  cancelCreateSpy: vi.fn(),
 }))
 
 // Mock the ws-client module
@@ -88,6 +94,10 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
+vi.mock('@/lib/sdk-message-handler', () => ({
+  cancelCreate: (requestId: string) => cancelCreateSpy(requestId),
 }))
 
 // Mock lucide-react icons
@@ -170,6 +180,10 @@ vi.mock('@/components/TerminalView', () => ({
 
 vi.mock('@/components/agent-chat/AgentChatView', () => ({
   default: mockAgentChatView,
+}))
+
+vi.mock('@/components/fresh-agent/FreshAgentView', () => ({
+  default: mockFreshAgentView,
 }))
 
 // Mock BrowserPane component
@@ -307,6 +321,7 @@ describe('PaneContainer', () => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
     mockAgentChatView.mockClear()
+    mockFreshAgentView.mockClear()
     mockBrowserPane.mockClear()
     browserPaneMounts.length = 0
     browserPaneUnmounts.length = 0
@@ -314,6 +329,7 @@ describe('PaneContainer', () => {
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
     saveServerSettingsPatchSpy.mockClear()
+    cancelCreateSpy.mockClear()
     mockApiGet.mockResolvedValue({ directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
@@ -889,6 +905,47 @@ describe('PaneContainer', () => {
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
       expect(mockSend).toHaveBeenCalledWith({ type: 'freshAgent.kill', sessionId: 'thread-codex-1' })
+    })
+
+    it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh-agent-pending',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'req-fresh-pending',
+          status: 'creating',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh-agent-pending' },
+        },
+        {},
+        {},
+        {
+          pendingCreates: {
+            'req-fresh-pending': {
+              sessionId: undefined,
+              expectsHistoryHydration: false,
+            },
+          },
+        } as Partial<AgentChatState>,
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(cancelCreateSpy).toHaveBeenCalledWith('req-fresh-pending')
+      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     })
 
     it('updates active pane when closing the active pane', () => {

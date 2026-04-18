@@ -164,4 +164,62 @@ describe('WsHandler fresh-agent routing', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('attaches a persisted fresh-agent session and forwards live adapter events over freshAgent.event', async () => {
+    const listeners = new Map<string, (message: unknown) => void>()
+    const runtimeManager = {
+      attach: vi.fn().mockReturnValue({
+        sessionId: 'claude-session-attached',
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+      }),
+      subscribe: vi.fn().mockImplementation(async (sessionId: string, listener: (message: unknown) => void) => {
+        listeners.set(sessionId, listener)
+        return () => {
+          listeners.delete(sessionId)
+        }
+      }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'claude-session-attached',
+        sessionType: 'freshclaude',
+        resumeSessionId: 'cli-session-attached',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.attach).toHaveBeenCalledWith({
+          sessionId: 'claude-session-attached',
+          sessionType: 'freshclaude',
+        })
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          'claude-session-attached',
+          expect.any(Function),
+        )
+      })
+
+      listeners.get('claude-session-attached')?.({ kind: 'thread.updated', revision: 2 })
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.event',
+          sessionId: 'claude-session-attached',
+          event: { kind: 'thread.updated', revision: 2 },
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

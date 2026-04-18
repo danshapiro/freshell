@@ -22,10 +22,14 @@ type FreshAgentCreateFailedMessage = {
 
 type FreshAgentClientMessage = FreshAgentCreatedMessage | FreshAgentCreateFailedMessage
 
-export function registerFreshAgentCreate(dispatch: AppDispatch, requestId: string): void {
+export function registerFreshAgentCreate(
+  dispatch: AppDispatch,
+  requestId: string,
+  options: { resumeSessionId?: string } = {},
+): void {
   dispatch(registerPendingCreate({
     requestId,
-    expectsHistoryHydration: false,
+    expectsHistoryHydration: Boolean(options.resumeSessionId),
   }))
   dispatch(clearPendingCreateFailure({ requestId }))
 }

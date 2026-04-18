@@ -34,6 +34,38 @@ describe('FreshAgentRuntimeManager', () => {
     })
   })
 
+  it('routes creates with resumeSessionId through adapter.resume when available', async () => {
+    const codexAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'codex-session-created' }),
+      resume: vi.fn().mockResolvedValue({ sessionId: 'codex-session-resumed' }),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    const resumed = await manager.create({
+      requestId: 'req-resume',
+      sessionType: 'freshcodex',
+      resumeSessionId: 'thread-existing-1',
+    })
+
+    expect(codexAdapter.resume).toHaveBeenCalledWith(expect.objectContaining({
+      sessionType: 'freshcodex',
+      resumeSessionId: 'thread-existing-1',
+    }))
+    expect(codexAdapter.create).not.toHaveBeenCalled()
+    expect(resumed).toEqual({
+      sessionId: 'codex-session-resumed',
+      sessionType: 'freshcodex',
+      runtimeProvider: 'codex',
+    })
+  })
+
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
     const claudeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'claude-session-1' }),

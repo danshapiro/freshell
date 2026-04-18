@@ -43,7 +43,9 @@ export class FreshAgentRuntimeManager {
       throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${input.sessionType}`)
     }
 
-    const created = await registration.adapter.create(input)
+    const created = input.resumeSessionId && registration.adapter.resume
+      ? await registration.adapter.resume(input)
+      : await registration.adapter.create(input)
     this.sessions.set(created.sessionId, {
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
@@ -51,6 +53,25 @@ export class FreshAgentRuntimeManager {
     })
     return {
       sessionId: created.sessionId,
+      sessionType: input.sessionType,
+      runtimeProvider: registration.runtimeProvider,
+    }
+  }
+
+  attach(input: { sessionId: string; sessionType: FreshAgentSessionType }): FreshAgentCreateResult {
+    const registration = this.options.registry.resolveBySessionType(input.sessionType)
+    if (!registration) {
+      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${input.sessionType}`)
+    }
+
+    this.sessions.set(input.sessionId, {
+      sessionType: input.sessionType,
+      runtimeProvider: registration.runtimeProvider,
+      adapter: registration.adapter,
+    })
+
+    return {
+      sessionId: input.sessionId,
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
     }

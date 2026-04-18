@@ -65,6 +65,7 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentAttachSchema,
   FreshAgentCreateSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentForkSchema,
@@ -400,6 +401,7 @@ type ClientState = {
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
   freshAgentSessions: Set<string>
+  freshAgentSubscriptions: Map<string, () => void>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
@@ -613,6 +615,7 @@ export class WsHandler {
       CodingCliInputSchema,
       CodingCliKillSchema,
       FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
       FreshAgentSendSchema,
       FreshAgentInterruptSchema,
       FreshAgentApprovalRespondSchema,
@@ -1191,6 +1194,7 @@ export class WsHandler {
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
       freshAgentSessions: new Set(),
+      freshAgentSubscriptions: new Map(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
@@ -1246,6 +1250,10 @@ export class WsHandler {
       off()
     }
     state.sdkSubscriptions.clear()
+    for (const off of state.freshAgentSubscriptions?.values() ?? []) {
+      off()
+    }
+    state.freshAgentSubscriptions?.clear()
     state.freshAgentSessions?.clear()
 
     for (const [requestId, pending] of this.screenshotRequests) {
@@ -1707,6 +1715,40 @@ export class WsHandler {
         this.safeSend(ws, metadata)
       }
       createReadyForLiveForward = true
+    }
+  }
+
+  private registerClientFreshAgentSession(
+    ws: LiveWebSocket,
+    state: ClientState,
+    sessionId: string,
+  ): void {
+    state.freshAgentSessions.add(sessionId)
+    const existing = state.freshAgentSubscriptions.get(sessionId)
+    if (existing) {
+      return
+    }
+    if (!this.freshAgentRuntimeManager) {
+      return
+    }
+    void this.freshAgentRuntimeManager.subscribe(sessionId, (event) => {
+      if (!state.freshAgentSessions.has(sessionId)) return
+      this.safeSend(ws, {
+        type: 'freshAgent.event',
+        sessionId,
+        event,
+      })
+    }).then((off) => {
+      state.freshAgentSubscriptions.set(sessionId, off)
+    }).catch(() => undefined)
+  }
+
+  private clearClientFreshAgentSession(state: ClientState, sessionId: string): void {
+    state.freshAgentSessions.delete(sessionId)
+    const off = state.freshAgentSubscriptions.get(sessionId)
+    if (off) {
+      off()
+      state.freshAgentSubscriptions.delete(sessionId)
     }
   }
 
@@ -3070,7 +3112,7 @@ export class WsHandler {
             sessionType: created.sessionType,
             runtimeProvider: created.runtimeProvider,
           } as const)
-          state.freshAgentSessions.add(created.sessionId)
+          this.registerClientFreshAgentSession(ws, state, created.sessionId)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
           const code = error && typeof error === 'object' && 'code' in error
@@ -3083,6 +3125,24 @@ export class WsHandler {
             message,
             retryable: true,
           } as const)
+        }
+        return
+      }
+
+      case 'freshAgent.attach': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        try {
+          const attached = this.freshAgentRuntimeManager.attach({
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+          })
+          this.registerClientFreshAgentSession(ws, state, attached.sessionId)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to attach fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
         }
         return
       }
@@ -3173,7 +3233,7 @@ export class WsHandler {
         }
         try {
           const killed = await this.freshAgentRuntimeManager.kill(m.sessionId)
-          state.freshAgentSessions.delete(m.sessionId)
+          this.clearClientFreshAgentSession(state, m.sessionId)
           this.send(ws, { type: 'freshAgent.killed', sessionId: m.sessionId, success: killed })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to kill fresh-agent session'

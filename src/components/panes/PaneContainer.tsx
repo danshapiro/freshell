@@ -305,6 +305,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
         ws.send({ type: 'freshAgent.kill', sessionId })
+      } else {
+        cancelCreate(content.createRequestId)
       }
       if (!content.sessionId && pendingSessionId) {
         dispatch(removeSession({ sessionId: pendingSessionId }))

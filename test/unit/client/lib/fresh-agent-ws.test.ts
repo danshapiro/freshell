@@ -4,14 +4,14 @@ import freshAgentReducer from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 
 describe('fresh-agent-ws', () => {
-  it('registers creates and handles freshAgent.created', () => {
+  it('registers resumed creates with history hydration and handles freshAgent.created', () => {
     const store = configureStore({
       reducer: {
         freshAgent: freshAgentReducer,
       },
     })
 
-    registerFreshAgentCreate(store.dispatch, 'req-1')
+    registerFreshAgentCreate(store.dispatch, 'req-1', { resumeSessionId: 'thread-1' })
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-1',
@@ -21,6 +21,7 @@ describe('fresh-agent-ws', () => {
     expect(handled).toBe(true)
     expect(store.getState().freshAgent.pendingCreates['req-1']).toMatchObject({
       sessionId: 'thread-1',
+      expectsHistoryHydration: true,
     })
   })
 
