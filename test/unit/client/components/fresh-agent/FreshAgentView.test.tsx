@@ -9,7 +9,7 @@ import agentChatReducer from '@/store/agentChatSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { initLayout } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
-import { markSessionLost, sessionInit, sessionSnapshotReceived, setSessionStatus } from '@/store/agentChatSlice'
+import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
@@ -354,7 +354,7 @@ describe('FreshAgentView', () => {
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
   })
 
-  it('recreates a lost freshclaude session through fresh-agent create with the durable resume id', async () => {
+  it('recreates a lost freshclaude session through fresh-agent transport events with the durable resume id', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/dead-session-id'))
     store.dispatch(initLayout({
@@ -370,13 +370,6 @@ describe('FreshAgentView', () => {
         resumeSessionId: 'named-resume',
       },
     }))
-    store.dispatch(sessionSnapshotReceived({
-      sessionId: 'dead-session-id',
-      latestTurnId: 'turn-1',
-      status: 'idle',
-      timelineSessionId: 'cli-session-abc-123',
-      revision: 2,
-    }))
 
     render(
       <Provider store={store}>
@@ -384,13 +377,40 @@ describe('FreshAgentView', () => {
       </Provider>,
     )
 
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    expect(onMessage).toBeTypeOf('function')
+
+    act(() => {
+      onMessage({
+        type: 'freshAgent.event',
+        sessionId: 'dead-session-id',
+        event: {
+          type: 'sdk.session.snapshot',
+          sessionId: 'dead-session-id',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: 'cli-session-abc-123',
+          revision: 2,
+        },
+      })
+    })
+
     await waitFor(() => {
       expect(screen.getAllByText(/restoring/i).length).toBeGreaterThan(0)
     })
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
     act(() => {
-      store.dispatch(markSessionLost({ sessionId: 'dead-session-id' }))
+      onMessage({
+        type: 'freshAgent.event',
+        sessionId: 'dead-session-id',
+        event: {
+          type: 'sdk.error',
+          sessionId: 'dead-session-id',
+          code: 'INVALID_SESSION_ID',
+          message: 'Session no longer exists',
+        },
+      })
     })
 
     await waitFor(() => {

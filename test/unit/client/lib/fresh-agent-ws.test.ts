@@ -47,4 +47,44 @@ describe('fresh-agent-ws', () => {
       retryable: false,
     })
   })
+
+  it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+      },
+    })
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'claude-thread-1',
+      event: {
+        type: 'sdk.session.snapshot',
+        sessionId: 'claude-thread-1',
+        latestTurnId: 'turn-1',
+        status: 'idle',
+        timelineSessionId: 'cli-session-1',
+        revision: 7,
+      },
+    })).toBe(true)
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'claude-thread-1',
+      event: {
+        type: 'sdk.error',
+        sessionId: 'claude-thread-1',
+        code: 'INVALID_SESSION_ID',
+        message: 'Session missing on server',
+      },
+    })).toBe(true)
+
+    expect(store.getState().freshAgent.sessions['claude-thread-1']).toEqual(expect.objectContaining({
+      latestTurnId: 'turn-1',
+      timelineSessionId: 'cli-session-1',
+      timelineRevision: 7,
+      lost: true,
+      historyLoaded: false,
+    }))
+  })
 })

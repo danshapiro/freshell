@@ -7,7 +7,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { getFreshAgentThreadSnapshot } from '@/lib/api'
 import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
-import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
@@ -250,6 +250,11 @@ export function FreshAgentView({
         }))
       }
       if (message.type === 'freshAgent.event' && message.sessionId === paneContent.sessionId) {
+        handleFreshAgentTransportEvent(dispatch, {
+          type: 'freshAgent.event',
+          sessionId: message.sessionId,
+          event: (message.event ?? {}) as Record<string, unknown>,
+        })
         setSnapshotRefreshNonce((value) => value + 1)
       }
     })
