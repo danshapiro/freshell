@@ -3,6 +3,7 @@ import { Settings } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
 import { useMobile } from '@/hooks/useMobile'
+import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { AgentChatProviderConfig } from '@/lib/agent-chat-types'
 import { formatModelDisplayName } from '../../../shared/format-model-name'
@@ -64,6 +65,7 @@ export default function AgentChatSettings({
 }: AgentChatSettingsProps) {
   const instanceId = useId()
   const isMobile = useMobile()
+  const keyboardInsetPx = useKeyboardInset()
   const [open, setOpen] = useState(defaultOpen)
   const popoverRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
@@ -184,9 +186,10 @@ export default function AgentChatSettings({
             className={cn(
               'z-50 rounded-lg border bg-card p-3 shadow-lg',
               isMobile
-                ? 'fixed inset-x-0 bottom-0 max-h-[80dvh] overflow-y-auto rounded-b-none border-x-0'
+                ? 'fixed inset-x-0 max-h-[80dvh] overflow-y-auto rounded-b-none border-x-0'
                 : 'absolute right-0 top-full mt-1 w-64',
             )}
+            style={isMobile ? { bottom: `${keyboardInsetPx}px` } : undefined}
             role="dialog"
             aria-label="Agent chat settings"
           >
