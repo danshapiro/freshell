@@ -18,7 +18,12 @@ function loadBehavior() {
 
 function successResult(method, params) {
   if (method === 'initialize') {
-    return { protocolVersion: 'fixture-v1' }
+    return {
+      userAgent: 'freshell-fixture/1.0.0',
+      codexHome: '/tmp/fake-codex-home',
+      platformFamily: 'unix',
+      platformOs: 'linux',
+    }
   }
   if (method === 'thread/start') {
     return {
@@ -26,6 +31,14 @@ function successResult(method, params) {
         id: 'thread-new-1',
       },
       cwd: params?.cwd ?? process.cwd(),
+      model: 'fixture-model',
+      modelProvider: 'openai',
+      instructionSources: [],
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: {
+        type: 'dangerFullAccess',
+      },
     }
   }
   if (method === 'thread/resume') {
@@ -34,6 +47,14 @@ function successResult(method, params) {
         id: params?.threadId,
       },
       cwd: params?.cwd ?? process.cwd(),
+      model: 'fixture-model',
+      modelProvider: 'openai',
+      instructionSources: [],
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: {
+        type: 'dangerFullAccess',
+      },
     }
   }
   return {}
