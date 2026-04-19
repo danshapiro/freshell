@@ -438,7 +438,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
             ? resolveFreshClaudeRuntimeMeta(
               indexedProjects,
               node.content.kind === 'fresh-agent'
-                ? { ...node.content, kind: 'agent-chat', provider: node.content.sessionType === 'kilroy' ? 'kilroy' : 'freshclaude' }
+                ? { ...node.content, kind: 'agent-chat', provider: 'freshclaude' }
                 : node.content,
               node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
             )

@@ -166,12 +166,12 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('renders Codex capability metadata in the shared shell', async () => {
+  it('renders Codex review and fork metadata in the shared shell', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'running',
       summary: 'Codex summary',
-      capabilities: { send: true, interrupt: true, questions: true, fork: true },
+      capabilities: { send: false, interrupt: false, questions: true, fork: false },
       pendingQuestions: [{
         requestId: 'question-codex',
         questions: [{
@@ -186,6 +186,12 @@ describe('FreshAgentView', () => {
       }],
       diffs: [{ id: 'diff-1', title: 'README.md' }],
       worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/x' }],
+      extensions: {
+        codex: {
+          review: { id: 'review-1', status: 'pending' },
+          fork: { parentThreadId: 'thread-parent-1' },
+        },
+      },
       turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex turn' }] }],
     })
 
@@ -209,9 +215,14 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Codex summary')).toBeInTheDocument()
     })
-    expect(screen.getByRole('button', { name: 'Fork' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Fork' })).toBeDisabled()
     expect(screen.getByText('README.md')).toBeInTheDocument()
     expect(screen.getByText(/feature\/x/)).toBeInTheDocument()
+    expect(screen.getByText('Review')).toBeInTheDocument()
+    expect(screen.getByText('review-1')).toBeInTheDocument()
+    expect(screen.getByText('pending')).toBeInTheDocument()
+    expect(screen.getByText('Fork lineage')).toBeInTheDocument()
+    expect(screen.getByText('thread-parent-1')).toBeInTheDocument()
     expect(screen.getByRole('region', { name: /question from codex/i })).toHaveTextContent('Codex has a question')
   })
 

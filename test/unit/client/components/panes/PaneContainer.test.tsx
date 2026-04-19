@@ -2364,6 +2364,70 @@ describe('PaneContainer', () => {
       expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
     })
 
+    it('resolves Claude-backed runtime metadata for fresh-agent kilroy panes', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-kilroy-fresh',
+        content: {
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'kilroy',
+          createRequestId: 'req-kilroy-fresh',
+          status: 'starting',
+          resumeSessionId: 'kilroy-session-restored',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-kilroy-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'kilroy',
+                  sessionId: 'kilroy-session-restored',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                  gitBranch: 'main',
+                  isDirty: false,
+                  lastActivityAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {},
+          pendingCreates: {},
+          availableModels: [],
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByText('Kilroy')).toBeInTheDocument()
+      expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
+    })
+
     it('does not add the token-budget indicator to kilroy panes', () => {
       const node: PaneNode = {
         type: 'leaf',

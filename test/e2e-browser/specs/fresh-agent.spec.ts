@@ -164,7 +164,7 @@ test.describe('Fresh Agent', () => {
     })
   })
 
-  test('browser user can create and resume Freshcodex with worktree and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
+  test('browser user can create and resume Freshcodex with worktree, review, and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
@@ -178,11 +178,17 @@ test.describe('Fresh Agent', () => {
           revision: 7,
           status: 'idle',
           summary: 'Freshcodex session',
-          capabilities: { send: true, interrupt: true, fork: true },
+          capabilities: { send: false, interrupt: false, fork: false },
           tokenUsage: { totalTokens: 42, inputTokens: 10, outputTokens: 32 },
           worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/fresh-agent' }],
           diffs: [{ id: 'diff-1', title: 'README.md' }],
           childThreads: [{ id: 'child-1', threadId: 'child-thread', title: 'Subagent' }],
+          extensions: {
+            codex: {
+              review: { id: 'review-1', status: 'pending' },
+              fork: { parentThreadId: 'thread-parent-1' },
+            },
+          },
           turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex transcript' }] }],
         }),
       })
@@ -225,9 +231,11 @@ test.describe('Fresh Agent', () => {
     })
 
     await expect(page.getByText('Freshcodex session')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Fork' })).toBeVisible()
     await expect(page.getByText(/feature\/fresh-agent/)).toBeVisible()
     await expect(page.getByText('README.md')).toBeVisible()
+    await expect(page.getByText('review-1')).toBeVisible()
+    await expect(page.getByText('pending')).toBeVisible()
+    await expect(page.getByText('thread-parent-1')).toBeVisible()
 
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()

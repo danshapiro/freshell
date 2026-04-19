@@ -65,6 +65,17 @@ type FreshAgentSnapshot = {
   status?: string
   summary?: string
   capabilities?: Record<string, boolean>
+  extensions?: {
+    codex?: {
+      review?: {
+        id?: string
+        status?: string
+      }
+      fork?: {
+        parentThreadId?: string
+      }
+    }
+  }
   tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number }
   worktrees?: Array<{ id: string; path: string; branch?: string }>
   diffs?: Array<{ id: string; path?: string; title?: string }>
@@ -381,6 +392,8 @@ export function FreshAgentView({
     const worktrees = snapshot?.worktrees ?? []
     const childThreads = snapshot?.childThreads ?? []
     const diffs = snapshot?.diffs ?? []
+    const codexReview = snapshot?.extensions?.codex?.review
+    const codexFork = snapshot?.extensions?.codex?.fork
     const effectiveStatus = paneContent.provider === 'claude'
       ? (claudeSessionStatus ?? paneContent.status)
       : paneContent.status
@@ -553,7 +566,12 @@ export function FreshAgentView({
               }}
             />
           </div>
-          <FreshAgentSidebar worktrees={worktrees} childThreads={childThreads} />
+          <FreshAgentSidebar
+            worktrees={worktrees}
+            childThreads={childThreads}
+            codexReview={codexReview}
+            codexFork={codexFork}
+          />
         </div>
       </div>
     )
