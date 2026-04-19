@@ -16,6 +16,34 @@ function loadBehavior() {
   return JSON.parse(raw)
 }
 
+function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return Promise.resolve()
+  }
+
+  const chunk = Buffer.alloc(Math.max(1, Math.min(chunkSize, totalBytes)), 'x')
+  let remaining = totalBytes
+
+  return new Promise((resolve, reject) => {
+    const writeNext = () => {
+      while (remaining > 0) {
+        const size = Math.min(chunk.length, remaining)
+        const payload = size === chunk.length ? chunk : chunk.subarray(0, size)
+        remaining -= size
+        const canContinue = stream.write(payload)
+        if (!canContinue) {
+          stream.once('drain', writeNext)
+          return
+        }
+      }
+      resolve()
+    }
+
+    stream.once('error', reject)
+    writeNext()
+  })
+}
+
 function successResult(method, params) {
   if (method === 'initialize') {
     return {
@@ -102,6 +130,8 @@ wss.on('connection', (socket) => {
 
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
+    const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
+    const floodStderrBytes = Number(behavior.floodStderrBeforeMethodsBytes?.[method] || 0)
     if (override?.error) {
       setTimeout(() => {
         socket.send(JSON.stringify({
@@ -112,7 +142,9 @@ wss.on('connection', (socket) => {
       return
     }
 
-    setTimeout(() => {
+    setTimeout(async () => {
+      await writeBytes(process.stdout, floodStdoutBytes)
+      await writeBytes(process.stderr, floodStderrBytes)
       socket.send(JSON.stringify({
         id: message.id,
         result: override?.result ?? successResult(method, message.params),

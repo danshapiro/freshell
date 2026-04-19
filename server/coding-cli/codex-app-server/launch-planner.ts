@@ -17,19 +17,21 @@ type PlanCreateInput = {
 
 export class CodexLaunchPlanner {
   constructor(
-    private readonly runtime: Pick<CodexAppServerRuntime, 'startThread' | 'resumeThread'>,
+    private readonly runtime: Pick<CodexAppServerRuntime, 'ensureReady' | 'startThread'>,
   ) {}
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
-    const planResult = input.resumeSessionId
-      ? await this.runtime.resumeThread({
-        threadId: input.resumeSessionId,
-        cwd: input.cwd,
-        model: input.model,
-        sandbox: input.sandbox,
-        approvalPolicy: input.approvalPolicy,
-      })
-      : await this.runtime.startThread({
+    if (input.resumeSessionId) {
+      const ready = await this.runtime.ensureReady()
+      return {
+        sessionId: input.resumeSessionId,
+        remote: {
+          wsUrl: ready.wsUrl,
+        },
+      }
+    }
+
+    const planResult = await this.runtime.startThread({
         cwd: input.cwd,
         model: input.model,
         sandbox: input.sandbox,

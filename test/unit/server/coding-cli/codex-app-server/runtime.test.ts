@@ -177,4 +177,43 @@ describe('CodexAppServerRuntime', () => {
     expect(ready.wsUrl).not.toBe(`ws://${endpoint.hostname}:${endpoint.port}`)
     await closeBlocker(blocker)
   })
+
+  it('keeps child stdio drained so large app-server logs do not stall thread/start replies', async () => {
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          floodStdoutBeforeMethodsBytes: {
+            'thread/start': 512 * 1024,
+          },
+        }),
+      },
+      requestTimeoutMs: 1_500,
+    })
+
+    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+      threadId: 'thread-new-1',
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    })
+  })
+
+  it('keeps child stderr drained so large app-server error logs do not stall thread/resume replies', async () => {
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          floodStderrBeforeMethodsBytes: {
+            'thread/resume': 512 * 1024,
+          },
+        }),
+      },
+      requestTimeoutMs: 1_500,
+    })
+
+    await expect(runtime.resumeThread({
+      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      cwd: '/repo/worktree',
+    })).resolves.toEqual({
+      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    })
+  })
 })
