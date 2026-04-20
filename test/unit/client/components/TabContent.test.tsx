@@ -28,6 +28,10 @@ interface TabConfig {
   codingCliProvider?: string
   codingCliSessionId?: string
   resumeSessionId?: string
+  sessionRef?: {
+    provider: string
+    sessionId: string
+  }
   sessionMetadataByKey?: Record<string, unknown>
 }
 
@@ -59,6 +63,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           codingCliProvider: t.codingCliProvider as any,
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
+          sessionRef: t.sessionRef,
           sessionMetadataByKey: t.sessionMetadataByKey,
           createRequestId: 'req-1',
         })),
@@ -147,7 +152,10 @@ describe('TabContent', () => {
         {
           id: 'tab-1',
           mode: 'claude',
-          resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '550e8400-e29b-41d4-a716-446655440000',
+          },
           sessionMetadataByKey: {
             'claude:550e8400-e29b-41d4-a716-446655440000': {
               sessionType: 'freshclaude',
@@ -183,7 +191,10 @@ describe('TabContent', () => {
           id: 'tab-1',
           mode: 'shell',
           codingCliProvider: 'claude',
-          resumeSessionId: '550e8400-e29b-41d4-a716-446655440001',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '550e8400-e29b-41d4-a716-446655440001',
+          },
           sessionMetadataByKey: {
             'claude:550e8400-e29b-41d4-a716-446655440001': {
               sessionType: 'freshclaude',
@@ -207,6 +218,33 @@ describe('TabContent', () => {
               provider: 'claude',
               sessionId: '550e8400-e29b-41d4-a716-446655440001',
             },
+          }),
+        }),
+        expect.anything(),
+      )
+    })
+
+    it('does not reconstruct terminal sessionRef from a raw tab resumeSessionId fallback', () => {
+      const store = createStore([
+        {
+          id: 'tab-1',
+          mode: 'codex',
+          resumeSessionId: 'named-or-legacy-resume',
+        },
+      ])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>,
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'terminal',
+            mode: 'codex',
+            sessionRef: undefined,
           }),
         }),
         expect.anything(),

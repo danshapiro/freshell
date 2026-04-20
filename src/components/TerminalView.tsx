@@ -1780,6 +1780,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         paneId: paneIdRef.current,
         requestId,
         sessionRef: createSessionState.sessionRef,
+        liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
       })
@@ -1790,6 +1791,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         shell: shell || 'system',
         cwd: initialCwd,
         ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),

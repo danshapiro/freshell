@@ -181,10 +181,17 @@ describe('agent chat restore flow', () => {
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionRef : undefined).toEqual({
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      })
 
       const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-      expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+      expect(tab?.resumeSessionId).toBeUndefined()
+      expect(tab?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      })
       expect(tab?.sessionMetadataByKey?.[`claude:${canonicalSessionId}`]).toEqual(expect.objectContaining({
         sessionType: 'freshclaude',
         firstUserMessage: 'Continue from the old tab',

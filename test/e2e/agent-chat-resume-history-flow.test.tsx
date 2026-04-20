@@ -159,7 +159,10 @@ describe('agent chat resume history flow', () => {
         provider: 'freshclaude',
         createRequestId: 'req-resume',
         status: 'creating',
-        resumeSessionId: canonicalSessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: canonicalSessionId,
+        },
       },
     }))
 
@@ -453,9 +456,16 @@ describe('agent chat resume history flow', () => {
     expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionRef : undefined).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(tab?.sessionMetadataByKey).toEqual({
       [sessionMetadataKey('claude', canonicalSessionId)]: {
         sessionType: 'freshclaude',
@@ -550,7 +560,10 @@ describe('agent chat resume history flow', () => {
         provider: 'freshclaude',
         createRequestId: 'req-restart',
         sessionId: 'sdk-stale-778',
-        resumeSessionId: canonicalSessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: canonicalSessionId,
+        },
         status: 'idle',
       },
     }))
@@ -612,7 +625,10 @@ describe('agent chat resume history flow', () => {
     })
 
     const pane = findLeaf(store.getState().panes.layouts.t1!, 'p1')
-    expect(pane?.content.kind === 'agent-chat' ? pane.content.resumeSessionId : undefined).toBe(canonicalSessionId)
+    expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionRef : undefined).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(pane?.content.kind === 'agent-chat' ? pane.content.sessionId : undefined).toBeUndefined()
   })
 })

@@ -261,10 +261,12 @@ describe('TabsView', () => {
           kind: 'terminal',
           payload: {
             mode: 'codex',
-            resumeSessionId: 'codex-session-123',
             sessionRef: {
               provider: 'codex',
               sessionId: 'codex-session-123',
+            },
+            liveTerminal: {
+              terminalId: 'term-remote-1',
               serverInstanceId: 'srv-remote',
             },
           },
@@ -292,6 +294,71 @@ describe('TabsView', () => {
       provider: 'codex',
       sessionId: 'codex-session-123',
     })
+    expect(layout?.content?.terminalId).toBeUndefined()
+  })
+
+  it('preserves explicit live terminal handles when opening a same-server tab copy', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+    store.dispatch(setServerInstanceId('srv-local'))
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [{
+        tabKey: 'remote:session-copy-local',
+        tabId: 'open-3',
+        serverInstanceId: 'srv-local',
+        deviceId: 'other-browser',
+        deviceLabel: 'other-browser',
+        tabName: 'session local',
+        status: 'open',
+        revision: 3,
+        createdAt: 2,
+        updatedAt: 4,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-local',
+          kind: 'terminal',
+          payload: {
+            mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-session-456',
+            },
+            liveTerminal: {
+              terminalId: 'term-local-1',
+              serverInstanceId: 'srv-local',
+            },
+          },
+        }],
+      }],
+      closed: [],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByLabelText('other-browser: session local'))
+
+    const newTab = store.getState().tabs.tabs.find((tab) => tab.title === 'session local')
+    expect(newTab).toBeTruthy()
+    const layout = newTab ? (store.getState().panes.layouts[newTab.id] as any) : undefined
+    expect(layout?.content?.resumeSessionId).toBeUndefined()
+    expect(layout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-456',
+    })
+    expect(layout?.content?.terminalId).toBe('term-local-1')
+    expect(layout?.content?.serverInstanceId).toBe('srv-local')
   })
 
   it('shows pane kind icons with distinct colors', () => {

@@ -138,7 +138,10 @@ const RELOAD_PANE: AgentChatPaneContent = {
 
 const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
-  resumeSessionId: '00000000-0000-4000-8000-000000000321',
+  sessionRef: {
+    provider: 'claude',
+    sessionId: '00000000-0000-4000-8000-000000000321',
+  },
 }
 
 const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
@@ -931,9 +934,16 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.resumeSessionId).toBe(DURABLE_SESSION_ID_ALT)
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBe(DURABLE_SESSION_ID_ALT)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
     expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SESSION_ID_ALT}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from the old tab',
@@ -979,9 +989,16 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.resumeSessionId).toBe(DURABLE_SHELL_SESSION_ID)
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-shell')
-    expect(tab?.resumeSessionId).toBe(DURABLE_SHELL_SESSION_ID)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     expect(tab?.codingCliProvider).toBe('claude')
     expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SHELL_SESSION_ID}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
@@ -1201,9 +1218,16 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
     expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000321']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from metadata upgrade',
@@ -1659,9 +1683,12 @@ describe('AgentChatView server-restart recovery', () => {
       }))
     })
 
-    // Pane content should now have resumeSessionId persisted
+    // Pane content should now have canonical sessionRef persisted
     const content = getPaneContent(store, 't1', 'p1')
-    expect(content?.resumeSessionId).toBe(DURABLE_SESSION_ID_ALT)
+    expect(content?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
   })
 
   it('does not reset the pane or send sdk.create when restore remains pending past the legacy timeout window', () => {

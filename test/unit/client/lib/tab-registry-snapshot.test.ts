@@ -38,7 +38,7 @@ describe('shouldKeepClosedTab', () => {
 
 describe('collectPaneSnapshots', () => {
   describe('terminal and agent-chat durable identity', () => {
-    it('preserves explicit terminal sessionRef without injecting server locality', () => {
+    it('preserves explicit terminal sessionRef and liveTerminal without raw resume mirrors', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-terminal',
@@ -47,8 +47,8 @@ describe('collectPaneSnapshots', () => {
           mode: 'codex',
           shell: 'system',
           status: 'running',
+          terminalId: 'term-codex-1',
           createRequestId: 'req-terminal',
-          resumeSessionId: 'codex-session-1',
           sessionRef: {
             provider: 'codex',
             sessionId: 'codex-session-1',
@@ -65,17 +65,20 @@ describe('collectPaneSnapshots', () => {
         payload: {
           mode: 'codex',
           shell: 'system',
-          resumeSessionId: 'codex-session-1',
           sessionRef: {
             provider: 'codex',
             sessionId: 'codex-session-1',
+          },
+          liveTerminal: {
+            terminalId: 'term-codex-1',
+            serverInstanceId: 'server-local',
           },
           initialCwd: undefined,
         },
       }])
     })
 
-    it('does not synthesize terminal sessionRef from raw resumeSessionId', () => {
+    it('does not serialize raw terminal resumeSessionId when no canonical sessionRef exists', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-terminal-legacy',
@@ -94,13 +97,13 @@ describe('collectPaneSnapshots', () => {
       expect(snapshots[0]?.payload).toEqual({
         mode: 'codex',
         shell: 'system',
-        resumeSessionId: 'codex-session-legacy',
         sessionRef: undefined,
+        liveTerminal: undefined,
         initialCwd: undefined,
       })
     })
 
-    it('does not synthesize agent-chat sessionRef from raw resumeSessionId', () => {
+    it('does not serialize raw agent-chat resumeSessionId when no canonical sessionRef exists', () => {
       const node: PaneNode = {
         type: 'leaf',
         id: 'pane-chat-legacy',
@@ -118,7 +121,7 @@ describe('collectPaneSnapshots', () => {
 
       expect(snapshots[0]?.payload).toEqual({
         provider: 'freshclaude',
-        resumeSessionId: 'named-resume',
+        sessionId: undefined,
         sessionRef: undefined,
         initialCwd: undefined,
         model: 'claude-sonnet',

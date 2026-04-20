@@ -15,6 +15,21 @@ type CodexSidecarReady = {
   codexHome: string
 }
 
+type SidecarProcessIdentity = {
+  commandLine: string[]
+  cwd: string
+  startTimeTicks: string
+}
+
+type SidecarOwnershipMetadata = {
+  pid: number
+  wsUrl: string
+  codexHome: string
+  terminalId: string | null
+  createdAt: string
+  process?: SidecarProcessIdentity
+}
+
 type CodexTerminalAttachment = {
   terminalId: string
   onDurableSession: (sessionId: string) => void
@@ -84,6 +99,60 @@ async function rolloutArtifactMatchesThread(
 
   const content = await fsp.readFile(artifactPath, 'utf8').catch(() => '')
   return content.includes(threadId)
+}
+
+async function readLinuxProcessIdentity(pid: number): Promise<SidecarProcessIdentity | undefined> {
+  if (process.platform !== 'linux') {
+    return undefined
+  }
+
+  try {
+    const [cmdlineRaw, cwd, statRaw] = await Promise.all([
+      fsp.readFile(`/proc/${pid}/cmdline`, 'utf8'),
+      fsp.readlink(`/proc/${pid}/cwd`),
+      fsp.readFile(`/proc/${pid}/stat`, 'utf8'),
+    ])
+
+    const commandLine = cmdlineRaw.split('\0').filter(Boolean)
+    const statClosingParen = statRaw.lastIndexOf(')')
+    const trailingFields = statClosingParen >= 0
+      ? statRaw.slice(statClosingParen + 2).trim().split(/\s+/)
+      : statRaw.trim().split(/\s+/)
+    const startTimeTicks = trailingFields[19]
+
+    if (commandLine.length === 0 || !cwd || !startTimeTicks) {
+      return undefined
+    }
+
+    return {
+      commandLine,
+      cwd,
+      startTimeTicks,
+    }
+  } catch {
+    return undefined
+  }
+}
+
+function processIdentityMatches(
+  metadata: SidecarOwnershipMetadata,
+  current: SidecarProcessIdentity | undefined,
+): boolean {
+  const recorded = metadata.process
+  if (!recorded || !current) {
+    return false
+  }
+
+  return (
+    recorded.cwd === current.cwd
+    && recorded.startTimeTicks === current.startTimeTicks
+    && recorded.commandLine.length > 0
+    && recorded.commandLine.length === current.commandLine.length
+    && recorded.commandLine.every((value, index) => value === current.commandLine[index])
+    && current.commandLine.includes('app-server')
+    && current.commandLine.includes('--listen')
+    && current.commandLine.includes(metadata.wsUrl)
+  )
 }
 
 export class CodexTerminalSidecar {
@@ -211,14 +280,17 @@ export class CodexTerminalSidecar {
       return
     }
 
+    const processIdentity = await readLinuxProcessIdentity(ready.processPid)
     await fsp.mkdir(SIDECAR_OWNERSHIP_DIR, { recursive: true })
-    await fsp.writeFile(this.metadataPath, JSON.stringify({
+    const metadata: SidecarOwnershipMetadata = {
       pid: ready.processPid,
       wsUrl: ready.wsUrl,
       codexHome: ready.codexHome,
       terminalId: this.attachedTerminal?.terminalId ?? null,
       createdAt: new Date().toISOString(),
-    }), 'utf8')
+      ...(processIdentity ? { process: processIdentity } : {}),
+    }
+    await fsp.writeFile(this.metadataPath, JSON.stringify(metadata), 'utf8')
   }
 
   static async reapOrphanedSidecars(): Promise<void> {
@@ -230,7 +302,7 @@ export class CodexTerminalSidecar {
       const metadataPath = path.join(SIDECAR_OWNERSHIP_DIR, entry.name)
       try {
         const raw = await fsp.readFile(metadataPath, 'utf8')
-        const parsed = JSON.parse(raw)
+        const parsed = JSON.parse(raw) as SidecarOwnershipMetadata
         const pid = Number(parsed.pid)
         if (!Number.isInteger(pid) || pid <= 0) {
           await fsp.rm(metadataPath, { force: true })
@@ -238,6 +310,28 @@ export class CodexTerminalSidecar {
         }
         try {
           process.kill(pid, 0)
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (code === 'ESRCH') {
+            await fsp.rm(metadataPath, { force: true }).catch(() => undefined)
+            continue
+          }
+          logger.warn({ err: error, pid, metadataPath }, 'Failed to inspect orphaned Codex sidecar PID')
+          continue
+        }
+
+        const currentIdentity = await readLinuxProcessIdentity(pid)
+        if (!processIdentityMatches(parsed, currentIdentity)) {
+          logger.warn({
+            pid,
+            metadataPath,
+            wsUrl: parsed.wsUrl,
+          }, 'Skipping orphaned Codex sidecar cleanup because PID ownership could not be verified')
+          await fsp.rm(metadataPath, { force: true }).catch(() => undefined)
+          continue
+        }
+
+        try {
           process.kill(pid, 'SIGTERM')
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code
@@ -247,9 +341,9 @@ export class CodexTerminalSidecar {
         }
       } catch (error) {
         logger.warn({ err: error, metadataPath }, 'Failed to read Codex sidecar ownership metadata')
-      } finally {
-        await fsp.rm(metadataPath, { force: true }).catch(() => undefined)
       }
+
+      await fsp.rm(metadataPath, { force: true }).catch(() => undefined)
     }
   }
 }

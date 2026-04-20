@@ -10,14 +10,19 @@ export function countPaneLeaves(node: PaneNode | undefined): number {
   return countPaneLeaves(node.children[0]) + countPaneLeaves(node.children[1])
 }
 
-function stripPanePayload(content: PaneContent, _serverInstanceId: string): Record<string, unknown> {
+function stripPanePayload(content: PaneContent, serverInstanceId: string): Record<string, unknown> {
   switch (content.kind) {
     case 'terminal':
       return {
         mode: content.mode,
         shell: content.shell,
-        resumeSessionId: content.resumeSessionId,
         sessionRef: content.sessionRef,
+        liveTerminal: content.terminalId
+          ? {
+              terminalId: content.terminalId,
+              serverInstanceId: content.serverInstanceId ?? serverInstanceId,
+            }
+          : undefined,
         initialCwd: content.initialCwd,
       }
     case 'browser':
@@ -35,7 +40,7 @@ function stripPanePayload(content: PaneContent, _serverInstanceId: string): Reco
     case 'agent-chat':
       return {
         provider: content.provider,
-        resumeSessionId: content.resumeSessionId,
+        sessionId: content.sessionId,
         sessionRef: content.sessionRef,
         initialCwd: content.initialCwd,
         model: content.model,

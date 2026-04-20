@@ -76,6 +76,24 @@ function resolveSessionRef(options: {
   }
 }
 
+function parseLiveTerminalHandle(
+  value: unknown,
+  recordServerInstanceId: string,
+): { terminalId: string; serverInstanceId: string } | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as { terminalId?: unknown; serverInstanceId?: unknown }
+  if (typeof candidate.terminalId !== 'string' || typeof candidate.serverInstanceId !== 'string') {
+    return undefined
+  }
+  if (candidate.serverInstanceId !== recordServerInstanceId) {
+    return undefined
+  }
+  return {
+    terminalId: candidate.terminalId,
+    serverInstanceId: candidate.serverInstanceId,
+  }
+}
+
 function sanitizePaneSnapshot(
   record: RegistryTabRecord,
   snapshot: RegistryPaneSnapshot,
@@ -85,14 +103,14 @@ function sanitizePaneSnapshot(
   const sameServer = !!localServerInstanceId && record.serverInstanceId === localServerInstanceId
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
-    const resumeSessionId = payload.resumeSessionId as string | undefined
     const sessionRef = resolveSessionRef({ payload })
+    const liveTerminal = parseLiveTerminalHandle(payload.liveTerminal, record.serverInstanceId)
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
+      terminalId: sameServer ? liveTerminal?.terminalId : undefined,
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
     }
@@ -115,12 +133,11 @@ function sanitizePaneSnapshot(
     }
   }
   if (snapshot.kind === 'agent-chat') {
-    const resumeSessionId = payload.resumeSessionId as string | undefined
     const sessionRef = resolveSessionRef({ payload })
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
+      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
       sessionRef,
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,

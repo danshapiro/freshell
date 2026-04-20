@@ -53,6 +53,7 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }
@@ -81,6 +82,7 @@ function normalizePaneContent(
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,

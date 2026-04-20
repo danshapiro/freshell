@@ -2413,17 +2413,17 @@ describe('TerminalView lifecycle updates', () => {
       sessionId,
     })
 
-    // Verify pane content has resumeSessionId + canonical sessionRef
+    // Verify pane content keeps only the canonical sessionRef
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-    expect(layout.content.resumeSessionId).toBe(sessionId)
+    expect(layout.content.resumeSessionId).toBeUndefined()
     expect(layout.content.sessionRef).toEqual({
       provider: 'claude',
       sessionId,
     })
 
-    // Verify tab also has resumeSessionId mirrored and canonical sessionRef
+    // Verify tab also keeps only the canonical sessionRef
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-    expect(tab?.resumeSessionId).toBe(sessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
     expect(tab?.sessionRef).toEqual({
       provider: 'claude',
       sessionId,

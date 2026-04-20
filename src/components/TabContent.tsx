@@ -36,15 +36,8 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   // Build default content based on setting
   let defaultContent: PaneContentInput
   const resumeSessionType = getTabResumeSessionType(tab)
-  const tabSessionId = tab.sessionRef?.sessionId ?? tab.resumeSessionId
-  const tabSessionRef = tab.sessionRef ?? (
-    tab.mode !== 'shell' && tab.resumeSessionId
-      ? {
-          provider: tab.codingCliProvider ?? tab.mode,
-          sessionId: tab.resumeSessionId,
-        }
-      : undefined
-  )
+  const tabSessionId = tab.sessionRef?.sessionId
+  const tabSessionRef = tab.sessionRef
 
   if (tabSessionId && resumeSessionType) {
     defaultContent = buildResumeContent({

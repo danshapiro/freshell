@@ -124,9 +124,12 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
-    ? paneContent.resumeSessionId
-    : undefined
+  const persistedTimelineSessionId = (
+    paneContent.sessionRef?.provider === 'claude'
+    && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
+  )
+    ? paneContent.sessionRef.sessionId
+    : (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = canonicalDurableSessionId ?? paneContent.sessionId
   const attachResumeSessionId = canonicalDurableSessionId
@@ -164,7 +167,12 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const triggerRecovery = useCallback(() => {
     const deadSessionId = paneContentRef.current.sessionId
     const durableResumeSessionId = getCanonicalDurableSessionId(sessionRef.current)
-      ?? (isValidClaudeSessionId(paneContentRef.current.resumeSessionId) ? paneContentRef.current.resumeSessionId : undefined)
+      ?? (
+        paneContentRef.current.sessionRef?.provider === 'claude'
+        && isValidClaudeSessionId(paneContentRef.current.sessionRef.sessionId)
+          ? paneContentRef.current.sessionRef.sessionId
+          : (isValidClaudeSessionId(paneContentRef.current.resumeSessionId) ? paneContentRef.current.resumeSessionId : undefined)
+      )
     if (!durableResumeSessionId) {
       const restoreError = buildRestoreError('dead_live_handle')
       if (deadSessionId) {
@@ -196,7 +204,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId: durableResumeSessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: durableResumeSessionId,
+        },
+        resumeSessionId: undefined,
         createRequestId: newRequestId,
         status: 'creating' as const,
         restoreError: undefined,
@@ -422,7 +434,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     createSentRef.current = true
     dispatch(registerPendingCreate({
       requestId: paneContent.createRequestId,
-      expectsHistoryHydration: Boolean(paneContent.resumeSessionId),
+      expectsHistoryHydration: Boolean(canonicalDurableSessionId || paneContent.resumeSessionId),
     }))
     ws.send({
       type: 'sdk.create',
@@ -431,7 +443,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       permissionMode: paneContent.permissionMode ?? defaultPermissionMode,
       effort: paneContent.effort ?? defaultEffort,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
-      ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
+      ...((canonicalDurableSessionId ?? paneContent.resumeSessionId)
+        ? { resumeSessionId: canonicalDurableSessionId ?? paneContent.resumeSessionId }
+        : {}),
       ...(paneContent.plugins ? { plugins: paneContent.plugins } : {}),
     })
 

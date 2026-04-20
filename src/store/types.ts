@@ -59,7 +59,7 @@ export interface Tab {
   initialCwd?: string
   sessionRef?: SessionLocator
   serverInstanceId?: string
-  resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
+  resumeSessionId?: string     // Legacy migration field; canonical durable identity lives in sessionRef
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
   updatedAt?: number

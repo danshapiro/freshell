@@ -8,52 +8,6 @@ import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
-export function buildDurableResumeIdentityUpdate({
-  paneResumeSessionId,
-  tabResumeSessionId,
-  sessionId,
-  flushSessionId = sessionId,
-}: {
-  paneResumeSessionId?: string
-  tabResumeSessionId?: string
-  sessionId?: string
-  flushSessionId?: string
-}): {
-  paneUpdates?: { resumeSessionId: string }
-  tabUpdates?: { resumeSessionId: string }
-  shouldFlush: boolean
-} | null {
-  if (!sessionId) return null
-
-  const paneUpdates =
-    paneResumeSessionId !== sessionId
-      ? { resumeSessionId: sessionId }
-      : undefined
-
-  const tabUpdates =
-    tabResumeSessionId !== sessionId
-      ? { resumeSessionId: sessionId }
-      : undefined
-
-  const shouldFlush = Boolean(
-    flushSessionId
-      && (
-        paneResumeSessionId !== flushSessionId
-        || tabResumeSessionId !== flushSessionId
-      ),
-  )
-
-  if (!paneUpdates && !tabUpdates && !shouldFlush) {
-    return null
-  }
-
-  return {
-    paneUpdates,
-    tabUpdates,
-    shouldFlush,
-  }
-}
-
 function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {
   return a?.provider === b?.provider && a?.sessionId === b?.sessionId
 }
@@ -73,7 +27,7 @@ export function buildTerminalDurableSessionRefUpdate({
   paneResumeSessionId?: string
   tabResumeSessionId?: string
 }): {
-  paneUpdates?: { sessionRef: SessionRef; resumeSessionId?: string }
+  paneUpdates?: { sessionRef?: SessionRef; resumeSessionId?: undefined }
   tabUpdates?: Partial<Tab>
   shouldFlush: boolean
 } | null {
@@ -84,24 +38,24 @@ export function buildTerminalDurableSessionRefUpdate({
 
   const paneNeedsSessionRef = !sessionRefEquals(paneSessionRef, sessionRef)
   const tabNeedsSessionRef = !sessionRefEquals(tabSessionRef, sessionRef)
-  const paneNeedsResumeMirror = paneResumeSessionId !== sessionRef.sessionId
-  const tabNeedsResumeMirror = tabResumeSessionId !== sessionRef.sessionId
+  const paneNeedsResumeClear = typeof paneResumeSessionId === 'string'
+  const tabNeedsResumeClear = typeof tabResumeSessionId === 'string'
 
-  const paneUpdates = paneNeedsSessionRef || paneNeedsResumeMirror
+  const paneUpdates = paneNeedsSessionRef || paneNeedsResumeClear
     ? {
-        sessionRef,
-        ...(paneNeedsResumeMirror ? { resumeSessionId: sessionRef.sessionId } : {}),
+        ...(paneNeedsSessionRef ? { sessionRef } : {}),
+        ...(paneNeedsResumeClear ? { resumeSessionId: undefined } : {}),
       }
     : undefined
 
-  const tabUpdates = tabNeedsSessionRef || tabNeedsResumeMirror
+  const tabUpdates = tabNeedsSessionRef || tabNeedsResumeClear
     ? {
         ...(tabNeedsSessionRef ? { sessionRef } : {}),
-        ...(tabNeedsResumeMirror ? { resumeSessionId: sessionRef.sessionId } : {}),
+        ...(tabNeedsResumeClear ? { resumeSessionId: undefined } : {}),
       }
     : undefined
 
-  const shouldFlush = paneNeedsSessionRef || tabNeedsSessionRef || paneNeedsResumeMirror || tabNeedsResumeMirror
+  const shouldFlush = paneNeedsSessionRef || tabNeedsSessionRef || paneNeedsResumeClear || tabNeedsResumeClear
 
   if (!paneUpdates && !tabUpdates && !shouldFlush) {
     return null
@@ -259,22 +213,31 @@ export function buildAgentChatPersistedIdentityUpdate({
 } | null {
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session)
   if (!canonicalDurableSessionId) return null
-  const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
-    paneResumeSessionId: paneContent.resumeSessionId,
-    tabResumeSessionId: currentTab?.resumeSessionId,
+  const sessionRef = sanitizeSessionRef({
+    provider: 'claude',
     sessionId: canonicalDurableSessionId,
-    flushSessionId: canonicalDurableSessionId,
   })
-  const paneUpdates = durableIdentityUpdate?.paneUpdates
+  if (!sessionRef) return null
+
+  const paneNeedsSessionRef = !sessionRefEquals(paneContent.sessionRef, sessionRef)
+  const tabNeedsSessionRef = !sessionRefEquals(currentTab?.sessionRef, sessionRef)
+  const paneNeedsResumeClear = typeof paneContent.resumeSessionId === 'string'
+  const tabNeedsResumeClear = typeof currentTab?.resumeSessionId === 'string'
+
+  const paneUpdates = paneNeedsSessionRef || paneNeedsResumeClear || paneContent.restoreError
     ? {
-        ...durableIdentityUpdate.paneUpdates,
-        restoreError: undefined,
+        ...(paneNeedsSessionRef ? { sessionRef } : {}),
+        ...(paneNeedsResumeClear ? { resumeSessionId: undefined } : {}),
+        ...(paneContent.restoreError ? { restoreError: undefined } : {}),
       }
-    : (paneContent.restoreError ? { restoreError: undefined } : undefined)
+    : undefined
 
   let tabUpdates: Partial<Tab> | undefined
   if (currentTab) {
-    const nextTabUpdates: Partial<Tab> = { ...(durableIdentityUpdate?.tabUpdates ?? {}) }
+    const nextTabUpdates: Partial<Tab> = {
+      ...(tabNeedsSessionRef ? { sessionRef } : {}),
+      ...(tabNeedsResumeClear ? { resumeSessionId: undefined } : {}),
+    }
     if (metadataProvider && currentTab.codingCliProvider !== metadataProvider) {
       nextTabUpdates.codingCliProvider = metadataProvider
     }
@@ -284,8 +247,8 @@ export function buildAgentChatPersistedIdentityUpdate({
       remoteSessionMetadataByKey: currentTab.sessionMetadataByKey,
       existingSessionMetadataByKey: currentTab.sessionMetadataByKey,
       provider: metadataProvider,
-      localResumeSessionId: currentTab.resumeSessionId,
-      remoteResumeSessionId: paneContent.resumeSessionId,
+      localResumeSessionId: currentTab.sessionRef?.sessionId ?? currentTab.resumeSessionId,
+      remoteResumeSessionId: paneContent.sessionRef?.sessionId ?? paneContent.resumeSessionId,
       preferredResumeSessionId: canonicalDurableSessionId,
       sessionType: paneContent.provider,
     })
@@ -299,7 +262,7 @@ export function buildAgentChatPersistedIdentityUpdate({
     }
   }
 
-  const shouldFlush = durableIdentityUpdate?.shouldFlush ?? false
+  const shouldFlush = paneNeedsSessionRef || tabNeedsSessionRef || paneNeedsResumeClear || tabNeedsResumeClear
 
   if (!paneUpdates && !tabUpdates && !shouldFlush) {
     return null
