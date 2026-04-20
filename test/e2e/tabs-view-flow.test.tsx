@@ -147,7 +147,6 @@ describe('tabs view flow', () => {
     expect(copiedLayout?.content?.sessionRef).toEqual({
       provider: 'codex',
       sessionId: 'codex-session-123',
-      serverInstanceId: 'srv-remote',
     })
   })
 })

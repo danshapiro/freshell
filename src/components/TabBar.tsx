@@ -179,6 +179,14 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     }
     // Fallback: synthesize a single content from tab.mode
     if (tab.mode) {
+      const sessionRef = tab.sessionRef ?? (
+        tab.mode !== 'shell' && tab.resumeSessionId
+          ? {
+              provider: tab.codingCliProvider ?? tab.mode,
+              sessionId: tab.resumeSessionId,
+            }
+          : undefined
+      )
       return [{
         paneId: tab.id,
         content: {
@@ -187,6 +195,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           shell: tab.shell,
           createRequestId: tab.createRequestId,
           status: tab.status,
+          sessionRef,
           resumeSessionId: tab.resumeSessionId,
           initialCwd: tab.initialCwd,
         },

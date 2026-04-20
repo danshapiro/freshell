@@ -75,7 +75,7 @@ export interface BackgroundTerminal {
   status: 'running' | 'exited'
   hasClients: boolean
   mode?: TabMode
-  resumeSessionId?: string
+  sessionRef?: SessionLocator
 }
 
 export interface CodingCliSession {

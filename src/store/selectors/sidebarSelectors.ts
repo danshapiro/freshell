@@ -74,8 +74,8 @@ export function buildSessionItems(
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
-    if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
-      const sessionKey = `${terminal.mode}:${terminal.resumeSessionId}`
+    if (terminal.status === 'running' && terminal.sessionRef) {
+      const sessionKey = `${terminal.sessionRef.provider}:${terminal.sessionRef.sessionId}`
       const existing = runningSessionMap.get(sessionKey)
       if (existing) {
         existing.allTerminalIds.push(terminal.terminalId)
@@ -220,7 +220,7 @@ export function buildSessionItems(
     const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
 
     if (node.content.kind === 'agent-chat') {
-      const sessionId = node.content.resumeSessionId
+      const sessionId = node.content.sessionRef?.sessionId ?? node.content.resumeSessionId
       if (!sessionId || !isValidClaudeSessionId(sessionId)) return
       const metadata = getSessionMetadata(tab, 'claude', sessionId)
       pushFallbackItem({
@@ -236,12 +236,14 @@ export function buildSessionItems(
     }
 
     if (node.content.kind !== 'terminal') return
-    if (node.content.mode === 'shell' || !node.content.resumeSessionId) return
+    if (node.content.mode === 'shell') return
+    const sessionId = node.content.sessionRef?.sessionId ?? node.content.resumeSessionId
+    if (!sessionId) return
 
-    const metadata = getSessionMetadata(tab, node.content.mode, node.content.resumeSessionId)
+    const metadata = getSessionMetadata(tab, node.content.mode, sessionId)
     pushFallbackItem({
       provider: node.content.mode,
-      sessionId: node.content.resumeSessionId,
+      sessionId,
       sessionType: node.content.mode,
       title: paneTitle || tab.title,
       cwd: node.content.initialCwd,
@@ -260,8 +262,8 @@ export function buildSessionItems(
       continue
     }
 
-    const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-    const sessionId = tab.resumeSessionId
+    const provider = tab.sessionRef?.provider ?? tab.codingCliProvider ?? (tab.mode !== 'shell' ? tab.mode : undefined)
+    const sessionId = tab.sessionRef?.sessionId ?? tab.resumeSessionId
     if (!provider || !sessionId) continue
 
     const metadata = getSessionMetadata(tab, provider, sessionId)

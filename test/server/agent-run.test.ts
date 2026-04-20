@@ -91,7 +91,7 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
   }])
   expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
-    resumeSessionId: 'thread-new-1',
+    resumeSessionId: undefined,
     sessionBindingReason: 'start',
     providerSettings: expect.objectContaining({
       codexAppServer: {

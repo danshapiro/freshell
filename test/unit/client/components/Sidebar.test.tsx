@@ -17,7 +17,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
-import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
+import type { ProjectGroup, BackgroundTerminal, TabMode, Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -84,6 +84,7 @@ function createTestStore(options?: {
   tabs?: Array<{
     id: string
     terminalId?: string
+    sessionRef?: Tab['sessionRef']
     resumeSessionId?: string
     mode?: string
     lastInputAt?: number
@@ -117,7 +118,7 @@ function createTestStore(options?: {
   if (!options?.panes) {
     for (const tab of options?.tabs ?? []) {
       const paneId = `pane-${tab.id}`
-      const mode = (tab.mode as TabMode | undefined) || (tab.resumeSessionId ? 'claude' : 'shell')
+      const mode = (tab.mode as TabMode | undefined) || tab.sessionRef?.provider || (tab.resumeSessionId ? 'claude' : 'shell')
       inferredLayouts[tab.id] = {
         type: 'leaf',
         id: paneId,
@@ -127,6 +128,7 @@ function createTestStore(options?: {
           createRequestId: `req-${tab.id}`,
           status: tab.status || 'running',
           terminalId: tab.terminalId,
+          sessionRef: tab.sessionRef,
           resumeSessionId: tab.resumeSessionId,
         },
       }
@@ -425,7 +427,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-abc'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-abc'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -540,7 +545,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -581,7 +589,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'exited', // Exited, not running
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-1'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-1'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -621,7 +632,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'shell', // Shell mode, not claude
-          resumeSessionId: sessionId('session-1'),
           cwd: '/home/user/project',
         },
       ]
@@ -1057,7 +1067,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'codex',
-          resumeSessionId: busySessionId,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: busySessionId,
+          },
         },
       ]
 
@@ -1127,7 +1140,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'codex',
-          resumeSessionId: sid,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: sid,
+          },
         },
         {
           terminalId: newTerminalId,
@@ -1136,7 +1152,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'codex',
-          resumeSessionId: sid,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: sid,
+          },
         },
       ]
 
@@ -1218,7 +1237,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'opencode',
-          resumeSessionId: busySessionId,
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: busySessionId,
+          },
         },
       ]
 
@@ -1410,10 +1432,13 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should navigate to terminal view
       expect(onNavigate).toHaveBeenCalledWith('terminal')
 
-      // Check store has new tab with resumeSessionId
+      // Check store has new tab with canonical durable sessionRef
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('session-to-resume'))
+      expect(state.tabs.tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: sessionId('session-to-resume'),
+      })
       expect(state.tabs.tabs[0].mode).toBe('claude')
     })
 
@@ -1505,7 +1530,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -1592,7 +1620,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running-no-tab'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running-no-tab'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -1614,7 +1645,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should create a new tab with the terminalId in pane content
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('session-running-no-tab'))
+      expect(state.tabs.tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: sessionId('session-running-no-tab'),
+      })
       expect(state.tabs.tabs[0].mode).toBe('claude')
       // terminalId lives in pane content, not on the tab
       const layout = state.panes.layouts[state.tabs.tabs[0].id]
@@ -3080,7 +3114,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
           (child) =>
             child.type === 'leaf' &&
             child.content.kind === 'terminal' &&
-            child.content.resumeSessionId === sessionId('session-to-split')
+            child.content.sessionRef?.provider === 'claude' &&
+            child.content.sessionRef?.sessionId === sessionId('session-to-split')
         )
         expect(sessionPane).toBeDefined()
       }
@@ -3233,7 +3268,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const localPane = collectLeafPanes(layout).find((pane) => (
         pane.type === 'leaf'
         && pane.content.kind === 'terminal'
-        && pane.content.resumeSessionId === targetSessionId
+        && pane.content.sessionRef?.provider === 'codex'
+        && pane.content.sessionRef?.sessionId === targetSessionId
       ))
       expect(localPane).toBeDefined()
     })
@@ -3280,7 +3316,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should create a new tab since active tab has no layout
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(2)
-      const newTab = state.tabs.tabs.find((t: any) => t.resumeSessionId === sessionId('session-no-layout'))
+      const newTab = state.tabs.tabs.find((t: any) => (
+        t.sessionRef?.provider === 'claude'
+        && t.sessionRef?.sessionId === sessionId('session-no-layout')
+      ))
       expect(newTab).toBeDefined()
     })
   })
