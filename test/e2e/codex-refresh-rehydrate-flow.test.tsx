@@ -291,8 +291,31 @@ describe('codex refresh rehydrate flow (e2e)', () => {
 
     await waitFor(() => {
       const persisted = readPersistedLayoutSnapshotForTest()
-      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.resumeSessionId).toBe('thread-new-1')
-      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBe('thread-new-1')
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.resumeSessionId).toBeUndefined()
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.sessionRef).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.terminalId).toBe('term-codex-refresh-old')
+    })
+
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.session.associated',
+        terminalId: 'term-codex-refresh-old',
+        sessionId: 'codex-session-1',
+      })
+    })
+
+    await waitFor(() => {
+      const persisted = readPersistedLayoutSnapshotForTest()
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      })
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      })
     })
 
     const persisted = readPersistedLayoutSnapshotForTest()
@@ -343,9 +366,13 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       expect(recreated).toMatchObject({
         type: 'terminal.create',
         mode: 'codex',
-        resumeSessionId: 'thread-new-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
         restore: true,
       })
+      expect(recreated?.resumeSessionId).toBeUndefined()
     })
   })
 

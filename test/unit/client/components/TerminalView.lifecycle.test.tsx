@@ -1707,7 +1707,7 @@ describe('TerminalView lifecycle updates', () => {
     }))
   })
 
-  it('recreates terminal once after INVALID_TERMINAL_ID for the current terminal', async () => {
+  it('recreates terminal once after INVALID_TERMINAL_ID when canonical durable identity exists', async () => {
     const tabId = 'tab-3'
     const paneId = 'pane-3'
 
@@ -1718,6 +1718,10 @@ describe('TerminalView lifecycle updates', () => {
       mode: 'claude',
       shell: 'system',
       terminalId: 'term-3',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
       initialCwd: '/tmp',
     }
 
@@ -1804,7 +1808,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(createCalls).toHaveLength(1)
   })
 
-  it('always marks INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {
+  it('marks durable INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {
     // consumeTerminalRestoreRequestId returns false by default (non-restore terminal)
     // This is the common case: terminals created fresh, not from localStorage restore
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
@@ -1815,9 +1819,13 @@ describe('TerminalView lifecycle updates', () => {
       kind: 'terminal',
       createRequestId: 'req-reconnect-restore',
       status: 'running',
-      mode: 'shell',
+      mode: 'claude',
       shell: 'system',
       terminalId: 'term-reconnect-restore',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
       initialCwd: '/tmp',
     }
 
@@ -1834,9 +1842,9 @@ describe('TerminalView lifecycle updates', () => {
         tabs: {
           tabs: [{
             id: tabId,
-            mode: 'shell',
+            mode: 'claude',
             status: 'running',
-            title: 'Shell',
+            title: 'Claude',
             titleSetByUser: false,
             terminalId: 'term-reconnect-restore',
             createRequestId: 'req-reconnect-restore',
@@ -2334,7 +2342,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 
-  it('mirrors resumeSessionId to tab on terminal.session.associated', async () => {
+  it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'
 
@@ -2405,21 +2413,24 @@ describe('TerminalView lifecycle updates', () => {
       sessionId,
     })
 
-    // Verify pane content has resumeSessionId + sessionRef
+    // Verify pane content has resumeSessionId + canonical sessionRef
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.resumeSessionId).toBe(sessionId)
     expect(layout.content.sessionRef).toEqual({
       provider: 'claude',
       sessionId,
-      serverInstanceId: 'srv-local',
     })
 
-    // Verify tab also has resumeSessionId mirrored
+    // Verify tab also has resumeSessionId mirrored and canonical sessionRef
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
     expect(tab?.resumeSessionId).toBe(sessionId)
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId,
+    })
   })
 
-  it('persists the durable codex session id immediately on terminal.created', async () => {
+  it('persists canonical codex identity only after terminal.session.associated', async () => {
     const tabId = 'tab-codex-durable'
     const paneId = 'pane-codex-durable'
 
@@ -2475,30 +2486,60 @@ describe('TerminalView lifecycle updates', () => {
       expect(messageHandler).not.toBeNull()
     })
 
-    const sessionId = 'thread-new-1'
     messageHandler!({
       type: 'terminal.created',
       requestId: 'req-codex-durable',
       terminalId: 'term-codex-durable',
       createdAt: 123,
-      effectiveResumeSessionId: sessionId,
     })
 
     await waitFor(() => {
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-      expect(layout.content.resumeSessionId).toBe(sessionId)
+      expect(layout.content.resumeSessionId).toBeUndefined()
 
       const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
-      expect(tab?.resumeSessionId).toBe(sessionId)
+      expect(tab?.resumeSessionId).toBeUndefined()
+      expect(dispatchSpy.mock.calls.some(([action]) => action?.type === flushPersistedLayoutNow.type)).toBe(false)
+
+      const persisted = readPersistedLayoutSnapshotForTest()
+      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.resumeSessionId).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBeUndefined()
+    })
+
+    const sessionId = 'codex-session-1'
+    messageHandler!({
+      type: 'terminal.session.associated',
+      terminalId: 'term-codex-durable',
+      sessionId,
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+      expect(tab?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
       expect(dispatchSpy.mock.calls.some(([action]) => action?.type === flushPersistedLayoutNow.type)).toBe(true)
 
       const persisted = readPersistedLayoutSnapshotForTest()
-      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.resumeSessionId).toBe(sessionId)
-      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBe(sessionId)
+      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
     })
   })
 
-  it('clears tab terminalId and sets status to creating on INVALID_TERMINAL_ID reconnect', async () => {
+  it('surfaces restore-unavailable for a live-only INVALID_TERMINAL_ID reconnect', async () => {
     const tabId = 'tab-clear-tid'
     const paneId = 'pane-clear-tid'
 
@@ -2567,14 +2608,18 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.content.terminalId).toBeUndefined()
     })
 
-    // Verify tab status was set to 'creating'
+    // Verify tab status was set to an explicit restore failure
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-    expect(tab?.status).toBe('creating')
+    expect(tab?.status).toBe('error')
 
     // Verify pane content was also updated
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBeUndefined()
-    expect(layout.content.status).toBe('creating')
+    expect(layout.content.status).toBe('error')
+    expect(layout.content.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'dead_live_handle',
+    })
   })
 
   describe('non-blocking reconnect', () => {

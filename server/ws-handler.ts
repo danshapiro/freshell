@@ -1429,6 +1429,19 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
+        const canonicalSessionId = (
+          m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
+            ? m.sessionRef.sessionId
+            : (m.mode === 'claude' && typeof m.resumeSessionId === 'string' && isValidClaudeSessionId(m.resumeSessionId)
+              ? m.resumeSessionId
+              : undefined)
+        )
+        const localLiveTerminalId = (
+          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+          && typeof m.liveTerminal?.terminalId === 'string'
+        )
+          ? m.liveTerminal.terminalId
+          : undefined
         log.debug({
           requestId: m.requestId,
           connectionId: ws.connectionId,
@@ -1444,10 +1457,10 @@ export class WsHandler {
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = m.resumeSessionId
+        let effectiveResumeSessionId = canonicalSessionId ?? m.resumeSessionId
         try {
           await this.withTerminalCreateLock(
-            this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
+            this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
             async () => {
               const resolveExistingRequestTerminalId = (requestId: string): string | undefined => {
                 const local = state.createdByRequestId.get(requestId)
@@ -1465,7 +1478,6 @@ export class WsHandler {
                 requestId: string
                 terminalId: string
                 createdAt: number
-                effectiveResumeSessionId?: string
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -1476,7 +1488,6 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
@@ -1484,14 +1495,12 @@ export class WsHandler {
               const attachReusedTerminal = async (
                 reusedTerminalId: string,
                 createdAt: number,
-                resumeSessionId?: string,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
                   terminalId: reusedTerminalId,
                   createdAt,
-                  effectiveResumeSessionId: resumeSessionId,
                 })
                 if (!sent) {
                   return false
@@ -1513,7 +1522,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -1521,23 +1530,31 @@ export class WsHandler {
                 this.forgetCreatedRequestId(m.requestId)
               }
 
-              if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt)
+                  return
+                }
+              }
+
+              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
-                  effectiveResumeSessionId,
+                  canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
                   return
                 }
               }
@@ -1557,7 +1574,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -1581,23 +1598,31 @@ export class WsHandler {
 
               // Re-check session ownership after async config loading in case another request
               // created or repaired a matching running session while we were waiting.
-              if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt)
+                  return
+                }
+              }
+
+              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
-                  effectiveResumeSessionId,
+                  canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
                   return
                 }
               }
@@ -1651,15 +1676,11 @@ export class WsHandler {
               }, '[TRACE resumeSessionId] about to create terminal')
 
               const requestedCodexResumeSessionId = m.mode === 'codex'
-                ? effectiveResumeSessionId
+                ? canonicalSessionId
                 : undefined
               const codexPlan = m.mode === 'codex'
                 ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
                 : undefined
-
-              if (codexPlan) {
-                effectiveResumeSessionId = codexPlan.sessionId
-              }
 
               const spawnProviderSettings = (
                 providerSettings
@@ -1685,7 +1706,7 @@ export class WsHandler {
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                 cwd: m.cwd,
-                resumeSessionId: effectiveResumeSessionId,
+                resumeSessionId: canonicalSessionId ?? effectiveResumeSessionId,
                 ...(codexPlan
                   ? {
                       sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
@@ -1711,7 +1732,6 @@ export class WsHandler {
                 requestId: m.requestId,
                 terminalId: record.terminalId,
                 createdAt: record.createdAt,
-                effectiveResumeSessionId,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for

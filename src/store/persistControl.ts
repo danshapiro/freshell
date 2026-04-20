@@ -4,6 +4,7 @@ import type { AgentChatPaneContent } from './paneTypes'
 import type { CodingCliProviderName, SessionListMetadata, Tab } from './types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { sessionMetadataKey } from '@/lib/session-metadata'
+import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
@@ -41,6 +42,66 @@ export function buildDurableResumeIdentityUpdate({
         || tabResumeSessionId !== flushSessionId
       ),
   )
+
+  if (!paneUpdates && !tabUpdates && !shouldFlush) {
+    return null
+  }
+
+  return {
+    paneUpdates,
+    tabUpdates,
+    shouldFlush,
+  }
+}
+
+function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {
+  return a?.provider === b?.provider && a?.sessionId === b?.sessionId
+}
+
+export function buildTerminalDurableSessionRefUpdate({
+  provider,
+  sessionId,
+  paneSessionRef,
+  tabSessionRef,
+  paneResumeSessionId,
+  tabResumeSessionId,
+}: {
+  provider?: CodingCliProviderName
+  sessionId?: string
+  paneSessionRef?: SessionRef
+  tabSessionRef?: SessionRef
+  paneResumeSessionId?: string
+  tabResumeSessionId?: string
+}): {
+  paneUpdates?: { sessionRef: SessionRef; resumeSessionId?: string }
+  tabUpdates?: Partial<Tab>
+  shouldFlush: boolean
+} | null {
+  const sessionRef = provider && sessionId
+    ? sanitizeSessionRef({ provider, sessionId })
+    : undefined
+  if (!sessionRef) return null
+
+  const paneNeedsSessionRef = !sessionRefEquals(paneSessionRef, sessionRef)
+  const tabNeedsSessionRef = !sessionRefEquals(tabSessionRef, sessionRef)
+  const paneNeedsResumeMirror = paneResumeSessionId !== sessionRef.sessionId
+  const tabNeedsResumeMirror = tabResumeSessionId !== sessionRef.sessionId
+
+  const paneUpdates = paneNeedsSessionRef || paneNeedsResumeMirror
+    ? {
+        sessionRef,
+        ...(paneNeedsResumeMirror ? { resumeSessionId: sessionRef.sessionId } : {}),
+      }
+    : undefined
+
+  const tabUpdates = tabNeedsSessionRef || tabNeedsResumeMirror
+    ? {
+        ...(tabNeedsSessionRef ? { sessionRef } : {}),
+        ...(tabNeedsResumeMirror ? { resumeSessionId: sessionRef.sessionId } : {}),
+      }
+    : undefined
+
+  const shouldFlush = paneNeedsSessionRef || tabNeedsSessionRef || paneNeedsResumeMirror || tabNeedsResumeMirror
 
   if (!paneUpdates && !tabUpdates && !shouldFlush) {
     return null

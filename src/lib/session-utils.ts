@@ -120,6 +120,10 @@ function extractSessionLocators(content: PaneContent): Array<{
 }
 
 function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): SessionLocator | undefined {
+  const explicitSessionRef = sanitizeSessionLocator(tab.sessionRef)
+  if (explicitSessionRef) {
+    return explicitSessionRef
+  }
   const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
   const sessionId = tab.resumeSessionId
   if (!provider || !sessionId) return undefined

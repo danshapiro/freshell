@@ -10,7 +10,7 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
 
 
 const log = createLogger('PanesSlice')
@@ -41,6 +41,7 @@ function normalizePaneContent(
       : undefined
     const resumeSessionId = inputResumeSessionId
     const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -52,6 +53,7 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }
   }
@@ -70,6 +72,7 @@ function normalizePaneContent(
   }
   if (input.kind === 'agent-chat') {
     const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'agent-chat',
       provider: input.provider,
@@ -78,6 +81,7 @@ function normalizePaneContent(
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
       model: input.model,

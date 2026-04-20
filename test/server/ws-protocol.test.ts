@@ -458,7 +458,7 @@ describe('ws protocol', () => {
 
     const requestId = 'req-codex-settings'
     ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
-    await waitForMessage(
+    const created = await waitForMessage(
       ws,
       (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
       5000,
@@ -472,12 +472,13 @@ describe('ws protocol', () => {
       resumeSessionId: undefined,
       sandbox: 'workspace-write',
     }])
-    expect(registry.createCalls[0]?.resumeSessionId).toBe('thread-new-1')
+    expect(registry.createCalls[0]?.resumeSessionId).toBeUndefined()
     expect(registry.createCalls[0]?.providerSettings).toEqual({
       codexAppServer: {
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
       },
     })
+    expect(created.effectiveResumeSessionId).toBeUndefined()
 
     await closeWebSocket(ws)
   })
