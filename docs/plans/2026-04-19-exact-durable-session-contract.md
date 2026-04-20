@@ -81,7 +81,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - `sessionRef` is the only replay-safe identity written to persisted terminal pane/tab state.
 - Persisted terminal and agent-chat pane state also keeps its existing live reattach handles (`terminalId` for terminals, SDK `sessionId` for agent-chat), but those fields remain live-only and must never be interpreted as durable restore targets.
 - Agent-chat keeps its own canonical durable Claude fields; do not force it onto terminal `sessionRef` semantics just to share a type name.
-- Agent-chat's persisted raw `resumeSessionId` field is removed by migration. Durable agent-chat restore continues through canonical Claude fields (`cliSessionId` / `timelineSessionId`), while any temporary named-resume token remains runtime-only.
+- Any raw `resumeSessionId` still present on an agent-chat pane's shared pane/tab state is removed by migration. Durable agent-chat restore continues through canonical Claude fields (`cliSessionId` / `timelineSessionId`), while any temporary named-resume token remains runtime-only.
 - Raw `resumeSessionId` strings do not survive persistence after migration.
 
 ### 2. Live handles are separate from durable identity
@@ -119,6 +119,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
   - restore launches `codex --remote <ws> resume <durable-token>`
   - one app-server sidecar per terminal observes notifications and the provider-owned durable artifact
   - this intentionally replaces the current shared app-server singleton because durable promotion is terminal-owned; the accepted resource trade-off is exactly one sidecar process and one loopback endpoint per live Codex terminal, with no shared pool or fallback runtime
+  - the practical ceiling is exactly the live Codex terminal count Freshell already supports; there is no extra idle pool, background prewarm, or second multiplier beyond that 1:1 ownership model
   - a fresh Codex pane may remain live-only with no thread id at all until the provider actually creates one
   - if an exact thread id appears before the durable artifact exists, it is still launch-only state and must never be persisted
 - Claude terminal sessions:
@@ -334,6 +335,7 @@ The opt-in suite must behave explicitly when binaries are absent:
 - default repo workflows must never invoke it implicitly
 - each missing provider binary must produce a Vitest `skipped` result naming the missing executable; do not rely on ad hoc stdout-only sentinels
 - Task 1 is only complete on the implementation machine when all three provider sections actually run, not when they are skipped
+- if any provider is skipped during later re-verification, final verification is blocked until that binary is restored and the suite reruns with all three provider sections executed again
 
 - [ ] **Step 6: Run the real-provider contract suite**
 
@@ -369,6 +371,8 @@ Cover:
 - dead non-durable session surfaces restore-unavailable
 - canonical durable identity survives rename/title changes
 - FreshClaude keeps live SDK `sessionId` separate from durable Claude identity during restore
+
+Because `shared/session-contract.ts` and the final wire split do not exist until Task 3, these red tests must assert with literal/object-shape expectations or local fixtures rather than importing future contract helpers just to make the suite compile.
 
 - [ ] **Step 2: Run the state-matrix suite and verify it fails**
 
@@ -808,7 +812,7 @@ Expected: PASS. If any valid check fails, keep improving the implementation and 
 
 - [ ] **Step 7: Commit any final doc or cleanup change from this task**
 
-If Step 1 changed `docs/index.html` or verification exposed a final cleanup edit, commit it. If this task produced no file changes, skip the commit. A no-op Task 9 is valid and does not block completion so long as the verification steps passed.
+If Step 1 changed `docs/index.html` or verification exposed a final cleanup edit, commit it with `git commit -m "docs: finalize exact durable session contract verification"`. If this task produced no file changes, skip the commit. A no-op Task 9 is valid and does not block completion so long as the verification steps passed.
 
 ## Completion Checklist
 
