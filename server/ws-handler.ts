@@ -203,16 +203,12 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
   const candidate = value as {
     provider?: unknown
     sessionId?: unknown
-    serverInstanceId?: unknown
   }
   const provider = CodingCliProviderSchema.safeParse(candidate.provider)
   if (!provider.success || !isNonEmptyString(candidate.sessionId)) return undefined
   return {
     provider: provider.data,
     sessionId: candidate.sessionId,
-    ...(isNonEmptyString(candidate.serverInstanceId)
-      ? { serverInstanceId: candidate.serverInstanceId }
-      : {}),
   }
 }
 
@@ -226,7 +222,7 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
 
   const kind = content.kind
   if (kind === 'agent-chat') {
-    if (isNonEmptyString(content.resumeSessionId)) {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
       locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
     }
     return locators
@@ -235,7 +231,12 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   if (kind !== 'terminal') return locators
 
   const mode = CodingCliProviderSchema.safeParse(content.mode)
-  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+  if (
+    !mode.success
+    || mode.data !== 'claude'
+    || !isNonEmptyString(content.resumeSessionId)
+    || !isValidClaudeSessionId(content.resumeSessionId)
+  ) {
     return locators
   }
 
@@ -453,11 +454,10 @@ export class WsHandler {
       cwd: z.string().optional(),
       sessionRef: SessionLocatorSchema.optional(),
       liveTerminal: LiveTerminalHandleSchema.optional(),
-      resumeSessionId: z.string().optional(),
       restore: z.boolean().optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
-    })
+    }).strict()
 
     const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
       if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
@@ -1315,6 +1315,20 @@ export class WsHandler {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
         return
       }
+      const rawSessionRef = (
+        msg?.sessionRef
+        && typeof msg.sessionRef === 'object'
+        && typeof msg.sessionRef.provider === 'string'
+        && msg.sessionRef.provider.length > 0
+        && typeof msg.sessionRef.sessionId === 'string'
+        && msg.sessionRef.sessionId.length > 0
+      )
+        ? {
+            provider: msg.sessionRef.provider,
+            sessionId: msg.sessionRef.sessionId,
+          }
+        : undefined
+      const rawRestoreRequested = msg?.restore === true
 
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
@@ -1433,13 +1447,13 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
-        const canonicalSessionId = (
+        const requestedSessionRef = (
           m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
-            ? m.sessionRef.sessionId
-            : (m.mode === 'claude' && typeof m.resumeSessionId === 'string' && isValidClaudeSessionId(m.resumeSessionId)
-              ? m.resumeSessionId
-              : undefined)
+            ? m.sessionRef
+            : (rawSessionRef?.provider === m.mode ? rawSessionRef : undefined)
         )
+        const canonicalSessionId = requestedSessionRef?.sessionId
+        const restoreRequested = m.restore === true || rawRestoreRequested
         const localLiveTerminalId = (
           m.liveTerminal?.serverInstanceId === this.serverInstanceId
           && typeof m.liveTerminal?.terminalId === 'string'
@@ -1450,8 +1464,8 @@ export class WsHandler {
           requestId: m.requestId,
           connectionId: ws.connectionId,
           mode: m.mode,
-          resumeSessionId: m.resumeSessionId,
-        }, '[TRACE resumeSessionId] terminal.create received')
+          sessionRef: requestedSessionRef,
+        }, '[TRACE sessionRef] terminal.create received')
         const endCreateTimer = startPerfTimer(
           'terminal_create',
           { connectionId: ws.connectionId, mode: m.mode, shell: m.shell },
@@ -1461,8 +1475,7 @@ export class WsHandler {
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = canonicalSessionId
-          ?? (m.mode === 'claude' ? m.resumeSessionId : undefined)
+        let restoreSessionId = canonicalSessionId
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
@@ -1587,7 +1600,7 @@ export class WsHandler {
               }
 
               // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
-              if (!m.restore) {
+              if (!restoreRequested) {
                 const now = Date.now()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
                   (t) => now - t < this.config.terminalCreateRateWindowMs
@@ -1635,12 +1648,12 @@ export class WsHandler {
               // Session repair is Claude-specific (uses JSONL session files).
               // Other providers (codex, opencode, etc.) don't use the same file
               // structure, so this block correctly remains gated on mode === 'claude'.
-              if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
-                const sessionId = effectiveResumeSessionId
+              if (m.mode === 'claude' && restoreSessionId && isValidClaudeSessionId(restoreSessionId) && this.sessionRepairService) {
+                const sessionId = restoreSessionId
                 const cached = this.sessionRepairService.getResult(sessionId)
                 if (cached?.status === 'missing') {
                   log.info({ sessionId, connectionId: ws.connectionId }, 'Session previously marked missing; resume will start fresh')
-                  effectiveResumeSessionId = undefined
+                  restoreSessionId = undefined
                 } else {
                   // Reserve requestId to prevent same-socket duplicate creates during async repair wait.
                   state.createdByRequestId.set(m.requestId, REPAIR_PENDING_SENTINEL)
@@ -1654,7 +1667,7 @@ export class WsHandler {
                     endRepairTimer({ status: result.status })
                     if (result.status === 'missing') {
                       log.info({ sessionId, connectionId: ws.connectionId }, 'Session file missing; resume will start fresh')
-                      effectiveResumeSessionId = undefined
+                      restoreSessionId = undefined
                     }
                   } catch (err) {
                     endRepairTimer({ error: err instanceof Error ? err.message : String(err) })
@@ -1663,7 +1676,7 @@ export class WsHandler {
                 }
               }
 
-              if (m.mode === 'opencode' && m.restore && !canonicalSessionId) {
+              if (m.mode === 'opencode' && restoreRequested && !canonicalSessionId) {
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'OpenCode restore requires a canonical durable session id',
@@ -1672,7 +1685,7 @@ export class WsHandler {
                 return
               }
 
-              if (m.mode === 'claude' && m.restore && !isValidClaudeSessionId(effectiveResumeSessionId)) {
+              if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(restoreSessionId)) {
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'Claude restore requires a canonical durable session id',
@@ -1694,9 +1707,9 @@ export class WsHandler {
               log.debug({
                 requestId: m.requestId,
                 connectionId: ws.connectionId,
-                originalResumeSessionId: m.resumeSessionId,
-                effectiveResumeSessionId,
-              }, '[TRACE resumeSessionId] about to create terminal')
+                sessionRef: requestedSessionRef,
+                restoreSessionId,
+              }, '[TRACE sessionRef] about to create terminal')
 
               const requestedCodexResumeSessionId = m.mode === 'codex'
                 ? canonicalSessionId
@@ -1731,7 +1744,7 @@ export class WsHandler {
                   mode: m.mode as TerminalMode,
                   shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                   cwd: m.cwd,
-                  resumeSessionId: effectiveResumeSessionId,
+                  resumeSessionId: restoreSessionId,
                   ...(requestedCodexResumeSessionId
                     ? {
                         sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
@@ -1741,6 +1754,9 @@ export class WsHandler {
                   providerSettings: spawnProviderSettings,
                   ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
                 })
+                if (canonicalSessionId && modeSupportsResume(m.mode as TerminalMode)) {
+                  record.resumeSessionId = canonicalSessionId
+                }
 
                 if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
                   const recentDirectory = m.cwd.trim()

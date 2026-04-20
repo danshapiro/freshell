@@ -10,6 +10,7 @@ import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
+const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
 
 // Mock the config-store module before importing ws-handler
@@ -200,6 +201,24 @@ class FakeRegistry {
     }
     return undefined
   }
+
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string) {
+    for (const rec of this.records.values()) {
+      if (rec.mode !== mode) continue
+      if (rec.status !== 'running') continue
+      if (rec.resumeSessionId === sessionId) return rec
+    }
+    return undefined
+  }
+
+  repairLegacySessionOwners(mode: string, sessionId: string) {
+    const canonical = this.getCanonicalRunningTerminalBySession(mode, sessionId)
+    return {
+      repaired: false,
+      canonicalTerminalId: canonical?.terminalId,
+      clearedTerminalIds: [] as string[],
+    }
+  }
 }
 
 function countCreateResponses(messages: any[], prefix?: string) {
@@ -321,7 +340,7 @@ describe('ws protocol', () => {
     expect(parsed.success).toBe(false)
   })
 
-  it('accepts terminal.create durable sessionRef separately from raw launch-only tokens', () => {
+  it('accepts terminal.create canonical sessionRef and rejects raw durable resumeSessionId', () => {
     const parsed = TerminalCreateSchema.safeParse({
       type: 'terminal.create',
       requestId: 'req-1',
@@ -340,7 +359,16 @@ describe('ws protocol', () => {
       provider: 'codex',
       sessionId: 'codex-session-1',
     })
-    expect(parsed.data.resumeSessionId).toBeUndefined()
+
+    const legacy = TerminalCreateSchema.safeParse({
+      type: 'terminal.create',
+      requestId: 'req-legacy',
+      mode: 'claude',
+      restore: true,
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+    })
+
+    expect(legacy.success).toBe(false)
   })
 
   it('accepts hello with capabilities', async () => {
@@ -478,7 +506,38 @@ describe('ws protocol', () => {
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
       },
     })
-    expect(created.effectiveResumeSessionId).toBeUndefined()
+    expect(created).not.toHaveProperty('effectiveResumeSessionId')
+
+    await closeWebSocket(ws)
+  })
+
+  it('passes canonical Claude sessionRef through to registry.create without echoing a legacy durable id', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-claude-restore'
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'claude',
+      restore: true,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_SESSION_ID,
+      },
+    }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(registry.createCalls[0]?.resumeSessionId).toBe(VALID_SESSION_ID)
+    expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
     await closeWebSocket(ws)
   })

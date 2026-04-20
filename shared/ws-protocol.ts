@@ -209,11 +209,10 @@ export const TerminalCreateSchema = z.object({
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
-  resumeSessionId: z.string().optional(),
   restore: z.boolean().optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
-})
+}).strict()
 
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
@@ -457,7 +456,6 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
-  effectiveResumeSessionId?: string
 }
 
 export type TerminalAttachReadyMessage = {

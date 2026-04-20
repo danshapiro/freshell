@@ -25,7 +25,7 @@ import {
   waitForCodexSessionArtifact,
   waitForCodexShellSnapshot,
   waitForFileSizeIncrease,
-  waitForHttpBusyStatus,
+  waitForAnyHttpBusyStatus,
   waitForHttpHealthy,
   waitForJsonLine,
   waitForOpencodeDbSession,
@@ -406,10 +406,12 @@ describe.sequential('coding cli real provider session contract', () => {
             },
           )
 
+          const busyStatusPromise = waitForAnyHttpBusyStatus(statusUrl)
           const attachedStepStart = await waitForJsonLine(attachedRun, (value) => value?.type === 'step_start', 60_000)
           const attachedSessionId = attachedStepStart.sessionID as string
-          const busyStatus = await waitForHttpBusyStatus(statusUrl, attachedSessionId)
-          expect(busyStatus[attachedSessionId]).toEqual({ type: 'busy' })
+          const busyStatus = await busyStatusPromise
+          expect(busyStatus.sessionId).toBe(attachedSessionId)
+          expect(busyStatus.payload[attachedSessionId]).toEqual({ type: 'busy' })
           expect((await attachedRun.waitForExit(120_000)).code).toBe(0)
 
           const titledRun = await workspace.spawnProcess(

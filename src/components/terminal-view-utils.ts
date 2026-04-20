@@ -8,12 +8,7 @@ export function getResumeSessionIdFromRef(ref: TerminalContentRef): string | und
 
 export function getCreateSessionStateFromRef(ref: TerminalContentRef): {
   sessionRef?: TerminalPaneContent['sessionRef']
-  resumeSessionId?: string
 } {
   const sessionRef = ref.current?.sessionRef
-  if (sessionRef) {
-    return { sessionRef }
-  }
-  const resumeSessionId = ref.current?.resumeSessionId
-  return resumeSessionId ? { resumeSessionId } : {}
+  return sessionRef ? { sessionRef } : {}
 }

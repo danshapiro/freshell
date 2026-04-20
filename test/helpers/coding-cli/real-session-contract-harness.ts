@@ -1254,12 +1254,30 @@ export async function fetchJson(url: string): Promise<any> {
 
 export async function waitForHttpBusyStatus(url: string, sessionId: string): Promise<Record<string, { type: string }>> {
   return waitFor(`OpenCode busy status for ${sessionId}`, async () => {
-    const payload = await waitForHttpJson(url, 5_000).catch(() => undefined)
+    const payload = await fetchJson(url).catch(() => undefined)
     if (!payload || typeof payload !== 'object') {
       return undefined
     }
     const record = payload as Record<string, { type: string }>
     return record[sessionId]?.type === 'busy' ? record : undefined
+  }, 30_000, 200)
+}
+
+export async function waitForAnyHttpBusyStatus(
+  url: string,
+): Promise<{ sessionId: string; payload: Record<string, { type: string }> }> {
+  return waitFor('OpenCode busy status', async () => {
+    const payload = await fetchJson(url).catch(() => undefined)
+    if (!payload || typeof payload !== 'object') {
+      return undefined
+    }
+    const record = payload as Record<string, { type: string }>
+    const match = Object.entries(record).find(([, status]) => status?.type === 'busy')
+    if (!match) return undefined
+    return {
+      sessionId: match[0],
+      payload: record,
+    }
   }, 30_000, 200)
 }
 

@@ -423,7 +423,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBeUndefined()
@@ -474,7 +474,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       await waitForFile(remoteThreadLogPath)
       expect(await fsp.readFile(remoteThreadLogPath, 'utf8')).toBe('thread-new-1')
@@ -555,7 +555,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))

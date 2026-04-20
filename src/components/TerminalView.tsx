@@ -1779,7 +1779,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
-        resumeSessionId: createSessionState.resumeSessionId,
         sessionRef: createSessionState.sessionRef,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
@@ -1791,7 +1790,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         shell: shell || 'system',
         cwd: initialCwd,
         ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
-        ...(createSessionState.resumeSessionId ? { resumeSessionId: createSessionState.resumeSessionId } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
@@ -2048,9 +2046,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             paneId: paneIdRef.current,
             requestId: reqId,
             terminalId: newId,
-            effectiveResumeSessionId: msg.effectiveResumeSessionId,
             currentResumeSessionId: contentRef.current?.resumeSessionId,
-            willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })

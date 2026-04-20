@@ -468,7 +468,7 @@ describe('terminal.create reuse running codex terminal', () => {
         sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
     } finally {
       await closeWebSocket(ws)
     }
@@ -492,7 +492,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toBe('term-codex-existing')
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
       expect(codexLaunchPlanner.planCreateCalls).toEqual([{
         cwd: '/repo/worktree',
         resumeSessionId: undefined,

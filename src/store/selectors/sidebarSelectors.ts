@@ -255,10 +255,7 @@ export function buildSessionItems(
   for (const tab of tabs || []) {
     const layout = panes.layouts?.[tab.id]
     if (layout) {
-      const refs = collectSessionRefsFromNode(layout)
-      if (refs.length > 0) {
-        collectFallbackItemsFromNode(layout, tab)
-      }
+      collectFallbackItemsFromNode(layout, tab)
       continue
     }
 

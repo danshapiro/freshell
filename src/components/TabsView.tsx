@@ -86,11 +86,7 @@ function sanitizePaneSnapshot(
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
     const resumeSessionId = payload.resumeSessionId as string | undefined
-    const sessionRef = resolveSessionRef({
-      payload,
-      fallbackProvider: mode !== 'shell' ? mode : undefined,
-      fallbackSessionId: resumeSessionId,
-    })
+    const sessionRef = resolveSessionRef({ payload })
     return {
       kind: 'terminal',
       mode,
@@ -119,11 +115,7 @@ function sanitizePaneSnapshot(
   }
   if (snapshot.kind === 'agent-chat') {
     const resumeSessionId = payload.resumeSessionId as string | undefined
-    const sessionRef = resolveSessionRef({
-      payload,
-      fallbackProvider: 'claude',
-      fallbackSessionId: resumeSessionId,
-    })
+    const sessionRef = resolveSessionRef({ payload })
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,

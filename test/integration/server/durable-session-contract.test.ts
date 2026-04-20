@@ -297,7 +297,7 @@ describe('durable session contract (integration)', () => {
         (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
       )
 
-      expect(firstCreated.effectiveResumeSessionId).toBeUndefined()
+      expect(firstCreated).not.toHaveProperty('effectiveResumeSessionId')
       expect(registry.createCallCount).toBe(1)
 
       await closeWebSocket(ws1)
@@ -349,7 +349,7 @@ describe('durable session contract (integration)', () => {
       expect(response).toMatchObject({
         type: 'terminal.created',
       })
-      expect((response as { effectiveResumeSessionId?: string }).effectiveResumeSessionId).toBeUndefined()
+      expect(response).not.toHaveProperty('effectiveResumeSessionId')
       expect(registry.createCallCount).toBe(1)
       expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
       expect(registry.records.size).toBe(1)
@@ -376,14 +376,18 @@ describe('durable session contract (integration)', () => {
         requestId,
         mode: 'claude',
         restore: true,
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const response = await responsePromise
 
       expect(response.type).toBe('terminal.created')
-      expect(response.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
-      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
+      expect(response).not.toHaveProperty('effectiveResumeSessionId')
+      expect(registry.createCallCount).toBe(1)
+      expect(registry.records.size).toBe(1)
     } finally {
       await closeWebSocket(ws)
     }

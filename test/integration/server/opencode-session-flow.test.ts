@@ -342,14 +342,14 @@ describe('opencode session flow (integration)', () => {
       )
 
       expect(response.type).toBe('terminal.created')
-      expect(response.effectiveResumeSessionId).toBeUndefined()
+      expect(response).not.toHaveProperty('effectiveResumeSessionId')
       expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
     } finally {
       await closeWebSocket(ws)
     }
   })
 
-  it('fails closed when opencode restore is requested with only a raw title-like resume token', async () => {
+  it('rejects the legacy raw resumeSessionId field for opencode restore requests', async () => {
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -372,7 +372,7 @@ describe('opencode session flow (integration)', () => {
 
       expect(response).toMatchObject({
         type: 'error',
-        code: 'RESTORE_UNAVAILABLE',
+        code: 'INVALID_MESSAGE',
       })
       expect(registry.createCallCount).toBe(0)
       expect(registry.records.size).toBe(0)

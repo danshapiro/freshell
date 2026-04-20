@@ -150,7 +150,7 @@ describe('TerminalView durable session contract', () => {
     })
   })
 
-  it('keeps terminal.created live-only even if the server includes a provisional resume token', async () => {
+  it('keeps terminal.created live-only until an explicit terminal.session.associated arrives', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'
     let messageHandler: ((msg: any) => void) | null = null
@@ -217,7 +217,6 @@ describe('TerminalView durable session contract', () => {
       type: 'terminal.created',
       requestId: 'req-1',
       terminalId: 'term-1',
-      effectiveResumeSessionId: VALID_CLAUDE_SESSION_ID,
     })
 
     await waitFor(() => {

@@ -285,7 +285,6 @@ describe('codex refresh rehydrate flow (e2e)', () => {
         requestId: 'req-codex-refresh',
         terminalId: 'term-codex-refresh-old',
         createdAt: 1,
-        effectiveResumeSessionId: 'thread-new-1',
       })
     })
 

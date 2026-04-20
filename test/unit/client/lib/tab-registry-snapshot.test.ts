@@ -37,6 +37,98 @@ describe('shouldKeepClosedTab', () => {
 })
 
 describe('collectPaneSnapshots', () => {
+  describe('terminal and agent-chat durable identity', () => {
+    it('preserves explicit terminal sessionRef without injecting server locality', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-terminal',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          status: 'running',
+          createRequestId: 'req-terminal',
+          resumeSessionId: 'codex-session-1',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-1',
+          },
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots).toEqual([{
+        paneId: 'pane-terminal',
+        kind: 'terminal',
+        title: undefined,
+        payload: {
+          mode: 'codex',
+          shell: 'system',
+          resumeSessionId: 'codex-session-1',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-1',
+          },
+          initialCwd: undefined,
+        },
+      }])
+    })
+
+    it('does not synthesize terminal sessionRef from raw resumeSessionId', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-terminal-legacy',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          status: 'running',
+          createRequestId: 'req-terminal-legacy',
+          resumeSessionId: 'codex-session-legacy',
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots[0]?.payload).toEqual({
+        mode: 'codex',
+        shell: 'system',
+        resumeSessionId: 'codex-session-legacy',
+        sessionRef: undefined,
+        initialCwd: undefined,
+      })
+    })
+
+    it('does not synthesize agent-chat sessionRef from raw resumeSessionId', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-chat-legacy',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          status: 'idle',
+          createRequestId: 'req-chat-legacy',
+          resumeSessionId: 'named-resume',
+          model: 'claude-sonnet',
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots[0]?.payload).toEqual({
+        provider: 'freshclaude',
+        resumeSessionId: 'named-resume',
+        sessionRef: undefined,
+        initialCwd: undefined,
+        model: 'claude-sonnet',
+        permissionMode: undefined,
+        effort: undefined,
+        plugins: undefined,
+      })
+    })
+  })
+
   describe('extension content', () => {
     it('serializes extension pane content with correct kind and payload', () => {
       const node: PaneNode = {

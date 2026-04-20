@@ -12,6 +12,7 @@ import {
 import { makeSessionKey } from '../coding-cli/types.js'
 import type { ProviderSettings } from '../terminal-registry.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
+import { sanitizeSessionRef, type SessionRef } from '../../shared/session-contract.js'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
@@ -50,24 +51,30 @@ async function resolveSpawnProviderSettings(
   overrides: { permissionMode?: string; model?: string; sandbox?: string },
   opts: {
     cwd?: string
-    resumeSessionId?: string
+    sessionRef?: SessionRef
     codexLaunchPlanner?: CodexLaunchPlanner
   } = {},
-): Promise<{ resumeSessionId?: string; providerSettings?: ProviderSettings }> {
+): Promise<{ sessionRef?: SessionRef; providerSettings?: ProviderSettings }> {
   const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
+  const sessionRef = opts.sessionRef?.provider === mode ? opts.sessionRef : undefined
   if (mode === 'codex') {
     if (!opts.codexLaunchPlanner) {
       throw new Error('Codex terminal launch requires the shared app-server planner.')
     }
     const plan = await opts.codexLaunchPlanner.planCreate({
       cwd: opts.cwd,
-      resumeSessionId: opts.resumeSessionId,
+      resumeSessionId: sessionRef?.sessionId,
       model: providerSettings?.model,
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
       approvalPolicy: providerSettings?.permissionMode,
     })
     return {
-      resumeSessionId: plan.sessionId,
+      ...(plan.sessionId ? {
+        sessionRef: {
+          provider: mode,
+          sessionId: plan.sessionId,
+        },
+      } : {}),
       providerSettings: {
         codexAppServer: plan.remote,
       },
@@ -75,17 +82,23 @@ async function resolveSpawnProviderSettings(
   }
   if (mode !== 'opencode') {
     return {
-      resumeSessionId: opts.resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
       providerSettings,
     }
   }
   return {
-    resumeSessionId: opts.resumeSessionId,
+    ...(sessionRef ? { sessionRef } : {}),
     providerSettings: {
       ...(providerSettings ?? {}),
       opencodeServer: await allocateLocalhostPort(),
     },
   }
+}
+
+function resolveRequestedSessionRef(mode: string, value: unknown): SessionRef | undefined {
+  const sessionRef = sanitizeSessionRef(value)
+  if (!sessionRef) return undefined
+  return sessionRef.provider === mode ? sessionRef : undefined
 }
 
 type ResizeLayoutStore = {
@@ -225,9 +238,9 @@ export function createAgentApiRouter({
     const meta = terminalId
       ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
       : undefined
-    const resumeSessionId = typeof paneContent?.resumeSessionId === 'string'
-      ? paneContent.resumeSessionId
-      : undefined
+    const paneSessionRef = sanitizeSessionRef(paneContent?.sessionRef)
+    const resumeSessionId = paneSessionRef?.sessionId
+      ?? (typeof paneContent?.resumeSessionId === 'string' ? paneContent.resumeSessionId : undefined)
     const modeCandidates = [
       typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
       terminalId ? registry.get?.(terminalId)?.mode : undefined,
@@ -266,7 +279,7 @@ export function createAgentApiRouter({
   }
 
   router.post('/tabs', async (req, res) => {
-    const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
+    const { name, mode, shell, cwd, browser, editor, sessionRef, permissionMode, model, sandbox } = req.body || {}
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
 
@@ -280,19 +293,20 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
+        const requestedSessionRef = resolveRequestedSessionRef(effectiveMode, sessionRef)
         const launch = await resolveSpawnProviderSettings(
           effectiveMode,
           configStore,
           { permissionMode, model, sandbox },
-          { cwd, resumeSessionId, codexLaunchPlanner },
+          { cwd, sessionRef: requestedSessionRef, codexLaunchPlanner },
         )
         const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
-        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, resumeSessionId)
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedSessionRef?.sessionId)
         const terminal = registry.create({
           mode: effectiveMode,
           shell,
           cwd,
-          resumeSessionId: launch.resumeSessionId,
+          resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId },
@@ -304,7 +318,7 @@ export function createAgentApiRouter({
           status: 'running',
           mode: mode || 'shell',
           shell: shell || 'system',
-          resumeSessionId: launch.resumeSessionId,
+          ...(launch.sessionRef ? { sessionRef: launch.sessionRef } : {}),
           initialCwd: cwd,
         }
 
@@ -319,7 +333,7 @@ export function createAgentApiRouter({
             shell,
             terminalId,
             initialCwd: cwd,
-            resumeSessionId: paneContent?.resumeSessionId,
+            sessionRef: paneContent?.sessionRef,
             paneId,
             paneContent,
           },
@@ -341,7 +355,7 @@ export function createAgentApiRouter({
           shell,
           terminalId,
           initialCwd: cwd,
-          resumeSessionId: paneContent?.resumeSessionId,
+          sessionRef: paneContent?.sessionRef,
           paneId,
           paneContent,
         },
@@ -638,12 +652,12 @@ export function createAgentApiRouter({
       const created = layoutStore.createTab?.({ title })
       const tabId = created?.tabId || nanoid()
       const paneId = created?.paneId || nanoid()
-      const sessionBindingReason = getCodexSessionBindingReason(mode)
+      const sessionBindingReason = getCodexSessionBindingReason(mode, launch.sessionRef?.sessionId)
       const terminal = registry.create({
         mode,
         shell,
         cwd,
-        resumeSessionId: launch.resumeSessionId,
+        resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
@@ -719,16 +733,16 @@ export function createAgentApiRouter({
           {},
           {
             cwd: req.body?.cwd,
-            resumeSessionId: req.body?.resumeSessionId,
+            sessionRef: resolveRequestedSessionRef(splitMode, req.body?.sessionRef),
             codexLaunchPlanner,
           },
         )
-        const sessionBindingReason = getCodexSessionBindingReason(splitMode, req.body?.resumeSessionId)
+        const sessionBindingReason = getCodexSessionBindingReason(splitMode, launch.sessionRef?.sessionId)
         const terminal = registry.create({
           mode: splitMode,
           shell: req.body?.shell,
           cwd: req.body?.cwd,
-          resumeSessionId: launch.resumeSessionId,
+          resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId: newPaneId },
@@ -740,7 +754,7 @@ export function createAgentApiRouter({
           status: 'running',
           mode: req.body?.mode || 'shell',
           shell: req.body?.shell || 'system',
-          ...(launch.resumeSessionId ? { resumeSessionId: launch.resumeSessionId } : {}),
+          ...(launch.sessionRef ? { sessionRef: launch.sessionRef } : {}),
         }
       }
 
@@ -929,16 +943,16 @@ export function createAgentApiRouter({
         {},
         {
           cwd: req.body?.cwd,
-          resumeSessionId: req.body?.resumeSessionId,
+          sessionRef: resolveRequestedSessionRef(effectiveMode, req.body?.sessionRef),
           codexLaunchPlanner,
         },
       )
-      const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, req.body?.resumeSessionId)
+      const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, launch.sessionRef?.sessionId)
       const terminal = registry.create({
         mode: effectiveMode,
         shell: req.body?.shell,
         cwd: req.body?.cwd,
-        resumeSessionId: launch.resumeSessionId,
+        resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
@@ -950,7 +964,7 @@ export function createAgentApiRouter({
         mode: req.body?.mode || 'shell',
         shell: req.body?.shell || 'system',
         createRequestId: nanoid(),
-        ...(launch.resumeSessionId ? { resumeSessionId: launch.resumeSessionId } : {}),
+        ...(launch.sessionRef ? { sessionRef: launch.sessionRef } : {}),
       }
       layoutStore.attachPaneContent(tabId, paneId, content)
       wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
