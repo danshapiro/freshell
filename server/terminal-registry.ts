@@ -22,6 +22,7 @@ import type {
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
+import type { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 
@@ -360,6 +361,7 @@ export type TerminalRecord = {
   title: string
   description?: string
   mode: TerminalMode
+  codexSidecar?: Pick<CodexTerminalSidecar, 'shutdown'>
   opencodeServer?: LoopbackServerEndpoint
   resumeSessionId?: string
   pendingResumeName?: string
@@ -1104,6 +1106,7 @@ export class TerminalRegistry extends EventEmitter {
     resumeSessionId?: string
     sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
+    codexSidecar?: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
     envContext?: { tabId?: string; paneId?: string }
   }): TerminalRecord {
     this.reapExitedTerminals()
@@ -1147,6 +1150,25 @@ export class TerminalRegistry extends EventEmitter {
 
     logger.info({ terminalId, file, args, cwd: procCwd, mode: opts.mode, shell: opts.shell || 'system' }, 'Spawning terminal')
 
+    if (opts.mode === 'codex' && opts.codexSidecar) {
+      opts.codexSidecar.attachTerminal({
+        terminalId,
+        onDurableSession: (sessionId) => {
+          const rebound = this.rebindSession(terminalId, 'codex', sessionId, 'association')
+          if (!rebound.ok) {
+            logger.warn(
+              { terminalId, sessionId, reason: rebound.reason },
+              'Failed to promote Codex durable session from sidecar notification',
+            )
+          }
+        },
+        onFatal: (error) => {
+          logger.warn({ err: error, terminalId }, 'Codex terminal sidecar failed; terminating terminal')
+          this.kill(terminalId)
+        },
+      })
+    }
+
     let ptyProc: ReturnType<typeof pty.spawn>
     try {
       ptyProc = pty.spawn(file, args, {
@@ -1176,6 +1198,7 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
+      codexSidecar: opts.mode === 'codex' ? opts.codexSidecar : undefined,
       opencodeServer: opts.mode === 'opencode' ? opts.providerSettings?.opencodeServer : undefined,
       resumeSessionId: undefined,
       createdAt,
@@ -1286,6 +1309,7 @@ export class TerminalRegistry extends EventEmitter {
       record.lastActivityAt = now
       record.exitedAt = now
       cleanupMcpConfig(terminalId, opts.mode, record.mcpCwd)
+      this.shutdownCodexSidecar(record)
       for (const client of record.clients) {
         this.flushOutputBuffer(client)
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
@@ -1399,6 +1423,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!term) return false
     if (term.status === 'exited') return true
     cleanupMcpConfig(terminalId, term.mode, term.mcpCwd)
+    this.shutdownCodexSidecar(term)
     try {
       term.pty.kill()
     } catch (err) {
@@ -1428,6 +1453,17 @@ export class TerminalRegistry extends EventEmitter {
     this.kill(terminalId)
     this.terminals.delete(terminalId)
     return true
+  }
+
+  private shutdownCodexSidecar(term: TerminalRecord): void {
+    const sidecar = term.codexSidecar
+    if (!sidecar) {
+      return
+    }
+    term.codexSidecar = undefined
+    void sidecar.shutdown().catch((error) => {
+      logger.warn({ err: error, terminalId: term.terminalId }, 'Failed to shut down Codex sidecar')
+    })
   }
 
   list(): Array<{

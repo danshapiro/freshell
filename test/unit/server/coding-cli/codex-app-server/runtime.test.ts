@@ -81,7 +81,7 @@ function createRuntime(options: ConstructorParameters<typeof CodexAppServerRunti
 }
 
 describe('CodexAppServerRuntime', () => {
-  it('starts one shared loopback app-server runtime on first use', async () => {
+  it('starts one loopback app-server runtime on first use', async () => {
     const runtime = createRuntime()
 
     const ready = await runtime.ensureReady()
@@ -89,6 +89,19 @@ describe('CodexAppServerRuntime', () => {
     expect(ready.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
     expect(ready.processPid).toBeGreaterThan(0)
     expect(runtime.status()).toBe('running')
+  })
+
+  it('keeps separate runtime instances isolated for concurrent codex terminals', async () => {
+    const firstRuntime = createRuntime()
+    const secondRuntime = createRuntime()
+
+    const [first, second] = await Promise.all([
+      firstRuntime.ensureReady(),
+      secondRuntime.ensureReady(),
+    ])
+
+    expect(first.processPid).not.toBe(second.processPid)
+    expect(first.wsUrl).not.toBe(second.wsUrl)
   })
 
   it('reuses the same process for repeated ensureReady calls', async () => {
@@ -124,7 +137,7 @@ describe('CodexAppServerRuntime', () => {
     expect(runtime.status()).toBe('stopped')
   })
 
-  it('proxies thread/start through the shared client after boot', async () => {
+  it('proxies thread/start through the runtime client after boot', async () => {
     const runtime = createRuntime()
 
     await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
@@ -133,7 +146,7 @@ describe('CodexAppServerRuntime', () => {
     })
   })
 
-  it('proxies thread/resume through the shared client after boot', async () => {
+  it('proxies thread/resume through the runtime client after boot', async () => {
     const runtime = createRuntime()
 
     await expect(runtime.resumeThread({

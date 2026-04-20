@@ -1,10 +1,11 @@
-import type { CodexAppServerRuntime } from './runtime.js'
+import { CodexTerminalSidecar } from './sidecar.js'
 
 export type CodexLaunchPlan = {
-  sessionId: string
+  sessionId?: string
   remote: {
     wsUrl: string
   }
+  sidecar: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
 }
 
 type PlanCreateInput = {
@@ -17,32 +18,29 @@ type PlanCreateInput = {
 
 export class CodexLaunchPlanner {
   constructor(
-    private readonly runtime: Pick<CodexAppServerRuntime, 'ensureReady' | 'startThread'>,
+    private readonly createSidecar: () => Pick<CodexTerminalSidecar, 'ensureReady' | 'attachTerminal' | 'shutdown'>
+      = () => new CodexTerminalSidecar(),
   ) {}
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
+    const sidecar = this.createSidecar()
+    const ready = await sidecar.ensureReady()
+
     if (input.resumeSessionId) {
-      const ready = await this.runtime.ensureReady()
       return {
         sessionId: input.resumeSessionId,
         remote: {
           wsUrl: ready.wsUrl,
         },
+        sidecar,
       }
     }
 
-    const planResult = await this.runtime.startThread({
-        cwd: input.cwd,
-        model: input.model,
-        sandbox: input.sandbox,
-        approvalPolicy: input.approvalPolicy,
-      })
-
     return {
-      sessionId: planResult.threadId,
       remote: {
-        wsUrl: planResult.wsUrl,
+        wsUrl: ready.wsUrl,
       },
+      sidecar,
     }
   }
 }

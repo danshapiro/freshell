@@ -2,15 +2,19 @@ import { describe, expect, it, vi } from 'vitest'
 import { CodexLaunchPlanner } from '../../../../../server/coding-cli/codex-app-server/launch-planner.js'
 
 describe('CodexLaunchPlanner', () => {
-  it('starts a fresh Codex thread and returns an exact remote endpoint handoff', async () => {
-    const runtime = {
-      ensureReady: vi.fn(),
-      startThread: vi.fn().mockResolvedValue({
-        threadId: 'thread-new-1',
+  function createSidecar() {
+    return {
+      ensureReady: vi.fn().mockResolvedValue({
         wsUrl: 'ws://127.0.0.1:43123',
       }),
+      attachTerminal: vi.fn(),
+      shutdown: vi.fn(),
     }
-    const planner = new CodexLaunchPlanner(runtime as any)
+  }
+
+  it('starts a fresh Codex terminal without preallocating a thread id', async () => {
+    const sidecar = createSidecar()
+    const planner = new CodexLaunchPlanner(() => sidecar as any)
 
     const plan = await planner.planCreate({
       cwd: '/repo/worktree',
@@ -18,53 +22,44 @@ describe('CodexLaunchPlanner', () => {
       sandbox: 'workspace-write',
     })
 
-    expect(runtime.startThread).toHaveBeenCalledWith({
-      cwd: '/repo/worktree',
-      model: 'codex-default',
-      sandbox: 'workspace-write',
-      approvalPolicy: undefined,
-    })
-    expect(plan.sessionId).toBe('thread-new-1')
+    expect(sidecar.ensureReady).toHaveBeenCalledTimes(1)
+    expect(plan.sessionId).toBeUndefined()
     expect(plan.remote.wsUrl).toBe('ws://127.0.0.1:43123')
+    expect(plan.sidecar).toBe(sidecar)
   })
 
   it('reuses an existing Codex session id and only ensures the remote runtime is ready', async () => {
-    const runtime = {
-      ensureReady: vi.fn().mockResolvedValue({
-        wsUrl: 'ws://127.0.0.1:43123',
-      }),
-      startThread: vi.fn(),
-    }
-    const planner = new CodexLaunchPlanner(runtime as any)
+    const sidecar = createSidecar()
+    const planner = new CodexLaunchPlanner(() => sidecar as any)
 
     const plan = await planner.planCreate({
       cwd: '/repo/worktree',
       resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef112',
     })
 
-    expect(runtime.ensureReady).toHaveBeenCalledTimes(1)
-    expect(runtime.startThread).not.toHaveBeenCalled()
+    expect(sidecar.ensureReady).toHaveBeenCalledTimes(1)
     expect(plan.sessionId).toBe('019d9859-5670-72b1-851f-794ad7fef112')
     expect(plan.remote.wsUrl).toBe('ws://127.0.0.1:43123')
+    expect(plan.sidecar).toBe(sidecar)
   })
 
-  it('uses the runtime-reported wsUrl from the same thread create call', async () => {
-    const runtime = {
-      ensureReady: vi.fn(),
-      startThread: vi.fn().mockResolvedValue({
-        threadId: 'thread-new-2',
+  it('uses the ready runtime wsUrl for fresh launch handoff', async () => {
+    const sidecar = {
+      ensureReady: vi.fn().mockResolvedValue({
         wsUrl: 'ws://127.0.0.1:43199',
       }),
+      attachTerminal: vi.fn(),
+      shutdown: vi.fn(),
     }
-    const planner = new CodexLaunchPlanner(runtime as any)
+    const planner = new CodexLaunchPlanner(() => sidecar as any)
 
     const plan = await planner.planCreate({ cwd: '/repo/worktree' })
 
     expect(plan).toEqual({
-      sessionId: 'thread-new-2',
       remote: {
         wsUrl: 'ws://127.0.0.1:43199',
       },
+      sidecar,
     })
   })
 })

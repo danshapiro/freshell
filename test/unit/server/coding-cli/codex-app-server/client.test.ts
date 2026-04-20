@@ -122,6 +122,20 @@ describe('CodexAppServerClient', () => {
     })
   })
 
+  it('surfaces thread/started notifications to sidecar consumers', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    const startedThread = new Promise<string>((resolve) => {
+      client.onThreadStarted((threadId) => resolve(threadId))
+    })
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(startedThread).resolves.toBe('thread-new-1')
+  })
+
   it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {
     const server = await startFakeCodexAppServer({ requireJsonRpc: true })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })

@@ -42,6 +42,7 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
+  SessionLocatorSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
@@ -72,6 +73,7 @@ import {
 } from '../shared/ws-protocol.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
+import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -449,6 +451,8 @@ export class WsHandler {
       }),
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
+      sessionRef: SessionLocatorSchema.optional(),
+      liveTerminal: LiveTerminalHandleSchema.optional(),
       resumeSessionId: z.string().optional(),
       restore: z.boolean().optional(),
       tabId: z.string().min(1).optional(),
@@ -663,7 +667,7 @@ export class WsHandler {
     providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
   ) {
     if (!this.codexLaunchPlanner) {
-      throw new Error('Codex terminal launch requires the shared app-server planner.')
+      throw new Error('Codex terminal launch requires the per-terminal app-server sidecar planner.')
     }
     return this.codexLaunchPlanner.planCreate({
       cwd,
@@ -1678,71 +1682,78 @@ export class WsHandler {
               const requestedCodexResumeSessionId = m.mode === 'codex'
                 ? canonicalSessionId
                 : undefined
-              const codexPlan = m.mode === 'codex'
-                ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
-                : undefined
+              let codexPlan: Awaited<ReturnType<WsHandler['planCodexLaunch']>> | undefined
+              try {
+                codexPlan = m.mode === 'codex'
+                  ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
+                  : undefined
 
-              const spawnProviderSettings = (
-                providerSettings
-                  ? {
-                    ...(m.mode === 'codex'
-                      ? {}
-                      : {
-                        permissionMode: providerSettings.permissionMode,
-                        model: providerSettings.model,
-                        sandbox: providerSettings.sandbox,
-                      }),
-                    ...(m.mode === 'opencode'
-                      ? { opencodeServer: await allocateLocalhostPort() }
-                      : {}),
-                    ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
-                  }
-                  : (codexPlan
-                    ? { codexAppServer: codexPlan.remote }
-                    : undefined)
-              )
-
-              const record = this.registry.create({
-                mode: m.mode as TerminalMode,
-                shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
-                cwd: m.cwd,
-                resumeSessionId: canonicalSessionId ?? effectiveResumeSessionId,
-                ...(codexPlan
-                  ? {
-                      sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
+                const spawnProviderSettings = (
+                  providerSettings
+                    ? {
+                      ...(m.mode === 'codex'
+                        ? {}
+                        : {
+                          permissionMode: providerSettings.permissionMode,
+                          model: providerSettings.model,
+                          sandbox: providerSettings.sandbox,
+                        }),
+                      ...(m.mode === 'opencode'
+                        ? { opencodeServer: await allocateLocalhostPort() }
+                        : {}),
+                      ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
                     }
-                  : {}),
-                envContext: { tabId: m.tabId, paneId: m.paneId },
-                providerSettings: spawnProviderSettings,
-              })
+                    : (codexPlan
+                      ? { codexAppServer: codexPlan.remote }
+                      : undefined)
+                )
 
-              if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
-                const recentDirectory = m.cwd.trim()
-                void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
-                  log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                const record = this.registry.create({
+                  mode: m.mode as TerminalMode,
+                  shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
+                  cwd: m.cwd,
+                  resumeSessionId: canonicalSessionId ?? effectiveResumeSessionId,
+                  ...(requestedCodexResumeSessionId
+                    ? {
+                        sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
+                      }
+                    : {}),
+                  envContext: { tabId: m.tabId, paneId: m.paneId },
+                  providerSettings: spawnProviderSettings,
+                  ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
                 })
-              }
 
-              state.createdByRequestId.set(m.requestId, record.terminalId)
-              this.rememberCreatedRequestId(m.requestId, record.terminalId)
-              terminalId = record.terminalId
+                if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
+                  const recentDirectory = m.cwd.trim()
+                  void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
+                    log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                  })
+                }
 
-              const sent = await sendCreateResult({
-                ws,
-                requestId: m.requestId,
-                terminalId: record.terminalId,
-                createdAt: record.createdAt,
-              })
-              if (!sent) {
-                // Terminal may still exist even if created delivery failed (for
-                // example: socket closed after create). Broadcast inventory so
-                // other clients can discover it.
+                state.createdByRequestId.set(m.requestId, record.terminalId)
+                this.rememberCreatedRequestId(m.requestId, record.terminalId)
+                terminalId = record.terminalId
+
+                const sent = await sendCreateResult({
+                  ws,
+                  requestId: m.requestId,
+                  terminalId: record.terminalId,
+                  createdAt: record.createdAt,
+                })
+                if (!sent) {
+                  // Terminal may still exist even if created delivery failed (for
+                  // example: socket closed after create). Broadcast inventory so
+                  // other clients can discover it.
+                  this.broadcastTerminalsChanged()
+                  return
+                }
+
+                // Notify all clients that list changed
                 this.broadcastTerminalsChanged()
-                return
+              } catch (error) {
+                await codexPlan?.sidecar.shutdown().catch(() => undefined)
+                throw error
               }
-
-              // Notify all clients that list changed
-              this.broadcastTerminalsChanged()
             },
           )
         } catch (err: any) {

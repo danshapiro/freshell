@@ -8,6 +8,7 @@ type RuntimeStatus = 'running' | 'stopped'
 type ReadyState = {
   wsUrl: string
   processPid: number
+  codexHome: string
 }
 
 type RuntimeOptions = {
@@ -34,6 +35,8 @@ export class CodexAppServerRuntime {
   private ready: ReadyState | null = null
   private ensureReadyPromise: Promise<ReadyState> | null = null
   private statusValue: RuntimeStatus = 'stopped'
+  private readonly exitHandlers = new Set<(error?: Error) => void>()
+  private readonly threadStartedHandlers = new Set<(threadId: string) => void>()
 
   private readonly command: string
   private readonly commandArgs: string[]
@@ -55,6 +58,20 @@ export class CodexAppServerRuntime {
 
   status(): RuntimeStatus {
     return this.statusValue
+  }
+
+  onExit(handler: (error?: Error) => void): () => void {
+    this.exitHandlers.add(handler)
+    return () => {
+      this.exitHandlers.delete(handler)
+    }
+  }
+
+  onThreadStarted(handler: (threadId: string) => void): () => void {
+    this.threadStartedHandlers.add(handler)
+    return () => {
+      this.threadStartedHandlers.delete(handler)
+    }
   }
 
   async ensureReady(): Promise<ReadyState> {
@@ -139,14 +156,20 @@ export class CodexAppServerRuntime {
         { wsUrl },
         this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
       )
+      client.onThreadStarted((threadId) => {
+        for (const handler of this.threadStartedHandlers) {
+          handler(threadId)
+        }
+      })
       this.client = client
 
       try {
-        await this.waitForInitialize(client, child)
+        const initialized = await this.waitForInitialize(client, child)
         this.statusValue = 'running'
         return {
           wsUrl,
           processPid: child.pid ?? 0,
+          codexHome: initialized.codexHome,
         }
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
@@ -166,7 +189,7 @@ export class CodexAppServerRuntime {
   private async waitForInitialize(
     client: CodexAppServerClient,
     child: ReturnType<typeof spawn>,
-  ): Promise<void> {
+  ): Promise<{ codexHome: string }> {
     const deadline = Date.now() + this.startupAttemptTimeoutMs
     let lastError: Error | undefined
 
@@ -176,8 +199,10 @@ export class CodexAppServerRuntime {
       }
 
       try {
-        await client.initialize()
-        return
+        const initialized = await client.initialize()
+        return {
+          codexHome: initialized.codexHome,
+        }
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         await sleep(STARTUP_POLL_MS)
@@ -201,6 +226,9 @@ export class CodexAppServerRuntime {
       const client = this.client
       this.client = null
       void client?.close().catch(() => undefined)
+      for (const handler of this.exitHandlers) {
+        handler(new Error('Codex app-server runtime exited unexpectedly.'))
+      }
     })
   }
 

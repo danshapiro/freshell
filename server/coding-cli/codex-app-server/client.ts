@@ -5,6 +5,7 @@ import {
   CodexRpcErrorEnvelopeSchema,
   CodexRpcNotificationEnvelopeSchema,
   CodexRpcSuccessEnvelopeSchema,
+  CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
   type CodexInitializeResult,
   type CodexRpcError,
@@ -36,6 +37,7 @@ export class CodexAppServerClient {
   private initializePromise: Promise<CodexInitializeResult> | null = null
   private nextRequestId = 1
   private pendingRequests = new Map<number, PendingRequest>()
+  private readonly threadStartedHandlers = new Set<(threadId: string) => void>()
 
   constructor(
     private readonly endpoint: CodexAppServerEndpoint,
@@ -51,7 +53,6 @@ export class CodexAppServerClient {
       clientInfo: { name: 'freshell', version: '1.0.0' },
       capabilities: {
         experimentalApi: true,
-        optOutNotificationMethods: ['thread/started'],
       },
     })).then((result) => {
       const parsed = CodexInitializeResultSchema.safeParse(result)
@@ -126,6 +127,13 @@ export class CodexAppServerClient {
     })
   }
 
+  onThreadStarted(handler: (threadId: string) => void): () => void {
+    this.threadStartedHandlers.add(handler)
+    return () => {
+      this.threadStartedHandlers.delete(handler)
+    }
+  }
+
   private async ensureSocket(): Promise<WebSocket> {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       return this.socket
@@ -180,6 +188,12 @@ export class CodexAppServerClient {
     if (!this.hasIdField(parsed)) {
       const notification = CodexRpcNotificationEnvelopeSchema.safeParse(parsed)
       if (notification.success) {
+        const threadStarted = CodexThreadStartedNotificationSchema.safeParse(notification.data)
+        if (threadStarted.success) {
+          for (const handler of this.threadStartedHandlers) {
+            handler(threadStarted.data.params.thread.id)
+          }
+        }
         return
       }
     }

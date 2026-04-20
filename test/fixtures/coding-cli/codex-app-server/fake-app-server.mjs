@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import fs from 'node:fs'
+import path from 'node:path'
 import { WebSocketServer } from 'ws'
 
 function parseListenUrl(argv) {
@@ -14,6 +16,20 @@ function loadBehavior() {
   const raw = process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
   if (!raw) return {}
   return JSON.parse(raw)
+}
+
+function ensureDurableArtifact(threadId) {
+  const codexHome = process.env.CODEX_HOME || '/tmp/fake-codex-home'
+  const now = new Date()
+  const year = String(now.getUTCFullYear())
+  const month = String(now.getUTCMonth() + 1).padStart(2, '0')
+  const day = String(now.getUTCDate()).padStart(2, '0')
+  const sessionDir = path.join(codexHome, 'sessions', year, month, day)
+  fs.mkdirSync(sessionDir, { recursive: true })
+  fs.writeFileSync(path.join(sessionDir, `rollout-${threadId}.jsonl`), JSON.stringify({
+    threadId,
+    createdAt: now.toISOString(),
+  }) + '\n', 'utf8')
 }
 
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
@@ -48,7 +64,7 @@ function successResult(method, params) {
   if (method === 'initialize') {
     return {
       userAgent: 'freshell-fixture/1.0.0',
-      codexHome: '/tmp/fake-codex-home',
+      codexHome: process.env.CODEX_HOME || '/tmp/fake-codex-home',
       platformFamily: 'unix',
       platformOs: 'linux',
     }
@@ -85,17 +101,38 @@ function successResult(method, params) {
       },
     }
   }
+  if (method === 'turn/start') {
+    return {
+      thread: {
+        id: params?.threadId || 'thread-new-1',
+      },
+    }
+  }
   return {}
 }
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
 const closeSocketAfterMethodsOnce = new Set(behavior.closeSocketAfterMethodsOnce || [])
+const exitProcessAfterMethodsOnce = new Set(behavior.exitProcessAfterMethodsOnce || [])
 const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
 
 const wss = new WebSocketServer({ host, port })
+
+function broadcastNotification(method, params) {
+  const payload = JSON.stringify({
+    jsonrpc: '2.0',
+    method,
+    params,
+  })
+  for (const client of wss.clients) {
+    if (client.readyState === 1) {
+      client.send(payload)
+    }
+  }
+}
 
 wss.on('connection', (socket) => {
   let initialized = false
@@ -145,15 +182,30 @@ wss.on('connection', (socket) => {
     setTimeout(async () => {
       await writeBytes(process.stdout, floodStdoutBytes)
       await writeBytes(process.stderr, floodStderrBytes)
+      const result = override?.result ?? successResult(method, message.params)
       socket.send(JSON.stringify({
         id: message.id,
-        result: override?.result ?? successResult(method, message.params),
+        result,
       }))
       if (method === 'initialize') {
         initialized = true
       }
+      if (method === 'thread/start') {
+        const threadId = result?.thread?.id || message.params?.threadId || 'thread-new-1'
+        broadcastNotification('thread/started', {
+          thread: {
+            id: threadId,
+          },
+        })
+      }
+      if (method === 'turn/start' && message.params?.threadId) {
+        ensureDurableArtifact(message.params.threadId)
+      }
       if (closeSocketAfterMethodsOnce.delete(method)) {
         setTimeout(() => socket.close(), 0)
+      }
+      if (exitProcessAfterMethodsOnce.delete(method)) {
+        setTimeout(() => process.exit(0), 0)
       }
     }, delayMs)
   })

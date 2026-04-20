@@ -66,6 +66,13 @@ export const CodexRpcNotificationEnvelopeSchema = z.object({
   params: z.unknown().optional(),
 }).passthrough()
 
+export const CodexThreadStartedNotificationSchema = z.object({
+  method: z.literal('thread/started'),
+  params: z.object({
+    thread: CodexThreadSchema,
+  }).passthrough(),
+}).passthrough()
+
 export type CodexInitializeCapabilities = z.infer<typeof CodexInitializeCapabilitiesSchema>
 export type CodexInitializeParams = z.infer<typeof CodexInitializeParamsSchema>
 export type CodexInitializeResult = z.infer<typeof CodexInitializeResultSchema>
@@ -73,3 +80,4 @@ export type CodexThreadStartParams = z.infer<typeof CodexThreadStartParamsSchema
 export type CodexThreadResumeParams = z.infer<typeof CodexThreadResumeParamsSchema>
 export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResultSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>
+export type CodexThreadStartedNotification = z.infer<typeof CodexThreadStartedNotificationSchema>
