@@ -238,7 +238,7 @@ describe('Codex Session Flow Integration', () => {
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('starts the exact codex thread before PTY spawn and launches the TUI in remote mode', async () => {
+  it('launches a fresh codex terminal in remote mode without promoting a provisional thread id to durable identity', async () => {
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -260,10 +260,10 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(created.effectiveResumeSessionId).toBeUndefined()
 
       const record = registry.get(created.terminalId)
-      expect(record?.resumeSessionId).toBe('thread-new-1')
+      expect(record?.resumeSessionId).toBeUndefined()
 
       await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
@@ -271,8 +271,8 @@ describe('Codex Session Flow Integration', () => {
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
-      expect(recordedArgs).toContain('resume')
-      expect(recordedArgs).toContain('thread-new-1')
+      expect(recordedArgs).not.toContain('resume')
+      expect(recordedArgs).not.toContain('thread-new-1')
       expect(recordedArgs).toContain('tui.notification_method=bel')
       expect(recordedArgs).not.toContain('--model')
       expect(recordedArgs).not.toContain('--sandbox')

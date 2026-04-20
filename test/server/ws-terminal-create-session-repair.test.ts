@@ -905,4 +905,38 @@ describe('terminal.create session repair wait', () => {
       await closeWebSocket(ws)
     }
   })
+
+  it('fails closed when restore is requested without a canonical Claude session id', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'restore-missing-canonical-1'
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+      }))
+
+      const response = await waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
 })

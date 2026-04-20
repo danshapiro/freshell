@@ -90,6 +90,36 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
+  it('keeps the canonical Claude association stable when the terminal title changes', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+
+    const terminal = registry.create({
+      mode: 'claude',
+      cwd: '/home/user/project',
+    })
+
+    registry.updateTitle(terminal.terminalId, 'Release prep')
+
+    const result = coordinator.associateSingleSession({
+      provider: 'claude',
+      sessionId: SESSION_ID_ONE,
+      projectPath: '/home/user/project',
+      lastActivityAt: Date.now(),
+      cwd: '/home/user/project',
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.updateTitle(terminal.terminalId, 'Renamed after attach')
+
+    expect(registry.get(terminal.terminalId)?.title).toBe('Renamed after attach')
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.shutdown()
+  })
+
   it('does not heuristically associate codex sessions', () => {
     const registry = new TerminalRegistry()
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)

@@ -1224,4 +1224,82 @@ describe('open tab session sidebar visibility (e2e)', () => {
       expect(within(sidebarList).getAllByText('Investigate sidebar visibility').length).toBeGreaterThan(0)
     })
   })
+
+  it('keeps an open Codex session visible after the local tab title changes because matching stays session-based', async () => {
+    const sessionId = 'codex-renamed-local-title'
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [
+        {
+          projectPath: '/repo',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId,
+              projectPath: '/repo',
+              lastActivityAt: 50,
+              title: 'Indexed session title',
+              cwd: '/repo',
+            },
+          ],
+        },
+      ],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 50,
+      oldestIncludedSessionId: `codex:${sessionId}`,
+      hasMore: false,
+    })
+
+    const store = createStore({
+      tabs: [{
+        id: 'tab-rename-stable',
+        title: 'Locally renamed title',
+        mode: 'codex',
+        resumeSessionId: sessionId,
+        createdAt: Date.now(),
+      }],
+      panes: {
+        layouts: {
+          'tab-rename-stable': {
+            type: 'leaf',
+            id: 'pane-rename-stable',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-rename-stable',
+              status: 'running',
+              resumeSessionId: sessionId,
+              sessionRef: {
+                provider: 'codex',
+                sessionId,
+                serverInstanceId: 'srv-local',
+              },
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: { 'tab-rename-stable': 'pane-rename-stable' },
+        paneTitles: { 'tab-rename-stable': { 'pane-rename-stable': 'Locally renamed title' } },
+      },
+      connection: {
+        status: 'ready',
+        serverInstanceId: 'srv-local',
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    const sidebarList = await screen.findByTestId('sidebar-session-list')
+
+    await waitFor(() => {
+      const matchingButton = within(sidebarList)
+        .getAllByRole('button')
+        .find((button) => button.getAttribute('data-session-id') === sessionId)
+      expect(matchingButton).toBeTruthy()
+      expect(matchingButton).toHaveTextContent('Indexed session title')
+    })
+  })
 })
