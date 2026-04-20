@@ -43,7 +43,11 @@ describe('buildResumeContent', () => {
     expect(content.kind).toBe('agent-chat')
     if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
     expect(content.provider).toBe('freshclaude')
-    expect(content.resumeSessionId).toBe('abc-123')
+    expect(content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: 'abc-123',
+    })
+    expect(content.resumeSessionId).toBeUndefined()
     expect(content.initialCwd).toBe('/home/user/project')
     expect(content.model).toBe('claude-opus-4-6') // default from provider config
     expect(content.permissionMode).toBe('bypassPermissions') // default from provider config
@@ -57,7 +61,11 @@ describe('buildResumeContent', () => {
     expect(content.kind).toBe('agent-chat')
     if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
     expect(content.provider).toBe('kilroy')
-    expect(content.resumeSessionId).toBe('xyz-789')
+    expect(content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: 'xyz-789',
+    })
+    expect(content.resumeSessionId).toBeUndefined()
   })
 
   it('returns terminal content for claude sessionType', () => {
@@ -69,7 +77,11 @@ describe('buildResumeContent', () => {
     expect(content.kind).toBe('terminal')
     if (content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.mode).toBe('claude')
-    expect(content.resumeSessionId).toBe('abc-123')
+    expect(content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: 'abc-123',
+    })
+    expect(content.resumeSessionId).toBeUndefined()
     expect(content.initialCwd).toBe('/home/user/project')
   })
 
@@ -81,7 +93,11 @@ describe('buildResumeContent', () => {
     expect(content.kind).toBe('terminal')
     if (content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.mode).toBe('codex')
-    expect(content.resumeSessionId).toBe('def-456')
+    expect(content.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'def-456',
+    })
+    expect(content.resumeSessionId).toBeUndefined()
   })
 
   it('defaults to claude terminal for undefined sessionType', () => {
@@ -103,7 +119,11 @@ describe('buildResumeContent', () => {
     if (content.kind !== 'terminal') throw new Error('expected terminal')
     expect(content.terminalId).toBeUndefined()
     expect(content.mode).toBe('claude')
-    expect(content.resumeSessionId).toBe('abc-123')
+    expect(content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: 'abc-123',
+    })
+    expect(content.resumeSessionId).toBeUndefined()
   })
 
   it('agent-chat panes have no terminalId', () => {

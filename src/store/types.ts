@@ -20,7 +20,7 @@ import type {
   TabAttentionStyle,
   WorktreeGrouping,
 } from '@shared/settings'
-import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
+import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
@@ -57,6 +57,7 @@ export interface Tab {
   mode: TabMode
   shell?: ShellType
   initialCwd?: string
+  sessionRef?: SessionLocator
   resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number

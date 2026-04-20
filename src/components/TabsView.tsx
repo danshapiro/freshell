@@ -51,7 +51,7 @@ type DeviceGroupData = {
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
-  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown }
+  const candidate = value as { provider?: unknown; sessionId?: unknown }
   if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
     return undefined
   }
@@ -59,7 +59,6 @@ function parseSessionLocator(value: unknown): SessionLocator | undefined {
   return {
     provider: candidate.provider as CodingCliProviderName,
     sessionId: candidate.sessionId,
-    ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
   }
 }
 
@@ -67,7 +66,6 @@ function resolveSessionRef(options: {
   payload: Record<string, unknown>
   fallbackProvider?: CodingCliProviderName
   fallbackSessionId?: string
-  fallbackServerInstanceId?: string
 }): SessionLocator | undefined {
   const explicit = parseSessionLocator(options.payload.sessionRef)
   if (explicit) return explicit
@@ -75,7 +73,6 @@ function resolveSessionRef(options: {
   return {
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
-    ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
   }
 }
 
@@ -93,7 +90,6 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: mode !== 'shell' ? mode : undefined,
       fallbackSessionId: resumeSessionId,
-      fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
       kind: 'terminal',
@@ -127,7 +123,6 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: 'claude',
       fallbackSessionId: resumeSessionId,
-      fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
       kind: 'agent-chat',

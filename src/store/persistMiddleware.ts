@@ -9,6 +9,7 @@ import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } 
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
+import { sanitizeSessionRef } from '@shared/session-contract'
 
 
 const log = createLogger('PanesPersist')
@@ -54,8 +55,11 @@ function registerFlushCallback(cb: () => void) {
 }
 
 function stripTabVolatileFields(tab: Tab) {
+  const sessionRef = sanitizeSessionRef(tab.sessionRef)
   return {
     ...tab,
+    sessionRef,
+    resumeSessionId: undefined,
     lastInputAt: undefined,
   }
 }
@@ -161,11 +165,28 @@ function stripEditorContent(content: any): any {
   }
 }
 
+function stripTransientSessionFields(content: any): any {
+  if (!content || typeof content !== 'object') return content
+  if (content.kind !== 'terminal' && content.kind !== 'agent-chat') return content
+
+  const sessionRef = sanitizeSessionRef(content.sessionRef)
+  const {
+    resumeSessionId: _resumeSessionId,
+    sessionRef: _legacySessionRef,
+    ...rest
+  } = content
+
+  return {
+    ...rest,
+    ...(sessionRef ? { sessionRef } : {}),
+  }
+}
+
 function stripEditorContentFromNode(node: any): any {
   if (!node) return node
 
   if (node.type === 'leaf') {
-    const nextContent = stripEditorContent(node.content)
+    const nextContent = stripTransientSessionFields(stripEditorContent(node.content))
     if (nextContent === node.content) return node
     return {
       ...node,

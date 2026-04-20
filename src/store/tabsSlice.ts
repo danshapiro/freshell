@@ -20,8 +20,9 @@ import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
-import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
-import { mergeSessionMetadataForPreferredResumeId, preferCanonicalResumeSessionId } from './persistControl'
+import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
+import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
+import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 
 
 const log = createLogger('TabsSlice')
@@ -47,15 +48,24 @@ function migrateTabFields(t: Tab): Tab {
   const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
   // Strip legacy terminalId field from persisted data
   const { terminalId: _legacyTerminalId, ...rest } = t as Tab & { terminalId?: unknown }
+  const codingCliProvider = t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
+  const provider = codingCliProvider || (t.mode !== 'shell' ? t.mode : undefined)
+  const durableState = migrateLegacyTerminalDurableState({
+    provider,
+    sessionRef: (t as any).sessionRef,
+    resumeSessionId: t.resumeSessionId,
+  })
   return {
     ...rest,
     codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
-    codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+    codingCliProvider,
     createdAt: t.createdAt || Date.now(),
     createRequestId: (t as any).createRequestId || t.id,
     status: t.status || 'creating',
     mode: t.mode || 'shell',
     shell: t.shell || 'system',
+    sessionRef: durableState.sessionRef,
+    resumeSessionId: undefined,
     lastInputAt: t.lastInputAt,
   }
 }
@@ -75,23 +85,43 @@ function pickHydratedTabWinner(localTab: Tab, remoteTab: Tab, meta: HydrateTabsM
   return (localTab.updatedAt ?? 0) > (remoteTab.updatedAt ?? 0) ? localTab : remoteTab
 }
 
+function deriveTabSessionRef(tab: Tab) {
+  const explicitSessionRef = sanitizeSessionRef(tab.sessionRef)
+  if (explicitSessionRef) return explicitSessionRef
+
+  return migrateLegacyTerminalDurableState({
+    provider: tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined),
+    sessionRef: tab.sessionRef,
+    resumeSessionId: tab.resumeSessionId,
+  }).sessionRef
+}
+
 function protectCanonicalFallbackIdentity(localTab: Tab, remoteTab: Tab, mergedTab: Tab): Tab {
-  const preferredResumeSessionId = preferCanonicalResumeSessionId(
-    localTab.resumeSessionId,
-    remoteTab.resumeSessionId,
-    mergedTab.resumeSessionId,
-  )
+  const localSessionRef = deriveTabSessionRef(localTab)
+  const remoteSessionRef = deriveTabSessionRef(remoteTab)
+  const mergedSessionRef = deriveTabSessionRef(mergedTab)
+  const preferredSessionRef = localSessionRef ?? remoteSessionRef ?? mergedSessionRef
 
   let nextTab = mergedTab
-  if (preferredResumeSessionId && nextTab.resumeSessionId !== preferredResumeSessionId) {
+  if (
+    preferredSessionRef
+    && (
+      nextTab.sessionRef?.provider !== preferredSessionRef.provider
+      || nextTab.sessionRef?.sessionId !== preferredSessionRef.sessionId
+    )
+  ) {
     nextTab = {
       ...nextTab,
-      resumeSessionId: preferredResumeSessionId,
+      sessionRef: preferredSessionRef,
+      resumeSessionId: undefined,
     }
   }
 
   const metadataProvider =
-    nextTab.codingCliProvider
+    nextTab.sessionRef?.provider
+    ?? remoteSessionRef?.provider
+    ?? localSessionRef?.provider
+    ?? nextTab.codingCliProvider
     ?? remoteTab.codingCliProvider
     ?? localTab.codingCliProvider
     ?? (nextTab.mode !== 'shell' ? nextTab.mode : undefined)
@@ -103,15 +133,22 @@ function protectCanonicalFallbackIdentity(localTab: Tab, remoteTab: Tab, mergedT
     }
   }
 
-  const nextSessionMetadataByKey = mergeSessionMetadataForPreferredResumeId({
+  let nextSessionMetadataByKey = mergeSessionMetadataForPreferredResumeId({
     localSessionMetadataByKey: localTab.sessionMetadataByKey,
     remoteSessionMetadataByKey: remoteTab.sessionMetadataByKey,
     existingSessionMetadataByKey: nextTab.sessionMetadataByKey,
     provider: metadataProvider,
-    localResumeSessionId: localTab.resumeSessionId,
-    remoteResumeSessionId: remoteTab.resumeSessionId,
-    preferredResumeSessionId,
+    localResumeSessionId: localSessionRef?.sessionId ?? localTab.resumeSessionId,
+    remoteResumeSessionId: remoteSessionRef?.sessionId ?? remoteTab.resumeSessionId,
+    preferredResumeSessionId: preferredSessionRef?.sessionId,
   })
+
+  if (metadataProvider && preferredSessionRef && nextSessionMetadataByKey) {
+    const preferredKey = sessionMetadataKey(metadataProvider, preferredSessionRef.sessionId)
+    nextSessionMetadataByKey = nextSessionMetadataByKey[preferredKey]
+      ? { [preferredKey]: nextSessionMetadataByKey[preferredKey] }
+      : nextSessionMetadataByKey
+  }
 
   if (JSON.stringify(nextSessionMetadataByKey ?? {}) !== JSON.stringify(nextTab.sessionMetadataByKey ?? {})) {
     nextTab = {
@@ -177,6 +214,7 @@ type AddTabPayload = {
   mode?: TabMode
   shell?: ShellType
   initialCwd?: string
+  sessionRef?: Tab['sessionRef']
   resumeSessionId?: string
   sessionMetadataByKey?: Tab['sessionMetadataByKey']
   forceNew?: boolean
@@ -197,6 +235,7 @@ export const tabsSlice = createSlice({
       const codingCliSessionId = payload.codingCliSessionId || legacyClaudeSessionId
       const codingCliProvider =
         payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
+      const sessionRef = sanitizeSessionRef(payload.sessionRef)
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
@@ -209,7 +248,8 @@ export const tabsSlice = createSlice({
         mode: payload.mode || 'shell',
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
-        resumeSessionId: payload.resumeSessionId,
+        sessionRef,
+        resumeSessionId: undefined,
         sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -588,7 +628,9 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        resumeSessionId: sessionId,
+        sessionRef: desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat'
+          ? desiredResumeContent.sessionRef
+          : undefined,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -597,7 +639,7 @@ export const openSessionTab = createAsyncThunk(
           kind: 'terminal',
           mode: resolvedProvider,
           terminalId,
-          resumeSessionId: sessionId,
+          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
           initialCwd: cwd,
           status: 'running',
         },
@@ -630,7 +672,7 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        resumeSessionId: sessionId,
+        sessionRef: desiredResumeContent.kind === 'agent-chat' ? desiredResumeContent.sessionRef : undefined,
         sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
@@ -645,7 +687,7 @@ export const openSessionTab = createAsyncThunk(
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
-      resumeSessionId: sessionId,
+      sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
       sessionMetadataByKey: buildSessionMetadataByKey(),
     }))
   }

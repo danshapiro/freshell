@@ -58,7 +58,10 @@ export function buildResumeContent(opts: {
     return {
       kind: 'agent-chat',
       provider: agentConfig.name as AgentChatProviderName,
-      resumeSessionId: opts.sessionId,
+      sessionRef: {
+        provider: agentConfig.codingCliProvider ?? 'claude',
+        sessionId: opts.sessionId,
+      },
       initialCwd: opts.cwd,
       model: ps?.defaultModel ?? agentConfig.defaultModel,
       permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,
@@ -72,7 +75,10 @@ export function buildResumeContent(opts: {
   return {
     kind: 'terminal',
     mode: provider,
-    resumeSessionId: opts.sessionId,
+    sessionRef: {
+      provider,
+      sessionId: opts.sessionId,
+    },
     initialCwd: opts.cwd,
   }
 }

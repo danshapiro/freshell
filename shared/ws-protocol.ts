@@ -9,6 +9,7 @@
 import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
+import { LiveTerminalHandleSchema, SessionRefSchema } from './session-contract.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -38,10 +39,8 @@ export const CodingCliProviderSchema = z.string().min(1)
 
 export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
 
-export const SessionLocatorSchema = z.object({
+export const SessionLocatorSchema = SessionRefSchema.extend({
   provider: CodingCliProviderSchema,
-  sessionId: z.string().min(1),
-  serverInstanceId: z.string().min(1).optional(),
 })
 
 export type SessionLocator = z.infer<typeof SessionLocatorSchema>
@@ -207,6 +206,8 @@ export const TerminalCreateSchema = z.object({
   mode: z.string().default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
+  sessionRef: SessionLocatorSchema.optional(),
+  liveTerminal: LiveTerminalHandleSchema.optional(),
   resumeSessionId: z.string().optional(),
   restore: z.boolean().optional(),
   tabId: z.string().min(1).optional(),

@@ -956,7 +956,10 @@ describe('crossTabSync', () => {
     })
 
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(tab?.sessionMetadataByKey).toEqual(expect.objectContaining({
       [sessionMetadataKey('claude', canonicalSessionId)]: expect.objectContaining({
         sessionType: 'freshclaude',
@@ -1239,7 +1242,10 @@ describe('crossTabSync', () => {
 
     let tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
     expect(tab?.title).toBe('Local canonical title')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: LAYOUT_STORAGE_KEY,
@@ -1284,7 +1290,10 @@ describe('crossTabSync', () => {
 
     tab = store.getState().tabs.tabs.find((entry) => entry.id === 'tab-1')
     expect(tab?.title).toBe('Local canonical title')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
 
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content
     expect(paneContent.resumeSessionId).toBe(canonicalSessionId)

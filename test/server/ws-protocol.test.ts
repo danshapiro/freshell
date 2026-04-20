@@ -1,7 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
-import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
+import {
+  HelloSchema,
+  TerminalCreateSchema,
+  WS_PROTOCOL_VERSION,
+} from '../../shared/ws-protocol.js'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const TEST_TIMEOUT_MS = 30_000
@@ -300,6 +304,43 @@ describe('ws protocol', () => {
     })
     expect(ready.type).toBe('ready')
     await closeWebSocket(ws)
+  })
+
+  it('rejects serverInstanceId inside hello sidebarOpenSessions durable identity', () => {
+    const parsed = HelloSchema.safeParse({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      sidebarOpenSessions: [{
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+        serverInstanceId: 'srv-local',
+      }],
+    })
+
+    expect(parsed.success).toBe(false)
+  })
+
+  it('accepts terminal.create durable sessionRef separately from raw launch-only tokens', () => {
+    const parsed = TerminalCreateSchema.safeParse({
+      type: 'terminal.create',
+      requestId: 'req-1',
+      mode: 'codex',
+      restore: true,
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      },
+    })
+
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+
+    expect((parsed.data as any).sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-1',
+    })
+    expect(parsed.data.resumeSessionId).toBeUndefined()
   })
 
   it('accepts hello with capabilities', async () => {

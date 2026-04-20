@@ -1,10 +1,15 @@
 import { z } from 'zod'
 import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+import {
+  migrateLegacyAgentChatDurableState,
+  migrateLegacyTerminalDurableState,
+  sanitizeSessionRef,
+} from '@shared/session-contract'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
-export const TABS_SCHEMA_VERSION = 1
-export const PANES_SCHEMA_VERSION = 6
+export const TABS_SCHEMA_VERSION = 2
+export const PANES_SCHEMA_VERSION = 7
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -42,6 +47,23 @@ export type ParsedPersistedTabs = {
   tombstones: Array<{ id: string; deletedAt: number }>
 }
 
+function normalizePersistedTab(tab: Record<string, unknown>): Record<string, unknown> {
+  const mode = typeof tab.mode === 'string' ? tab.mode : undefined
+  const codingCliProvider = typeof tab.codingCliProvider === 'string' ? tab.codingCliProvider : undefined
+  const provider = codingCliProvider || (mode && mode !== 'shell' ? mode : undefined)
+  const durableState = migrateLegacyTerminalDurableState({
+    provider,
+    sessionRef: tab.sessionRef,
+    resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
+  })
+  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
+
+  return {
+    ...rest,
+    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+  }
+}
+
 export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
   let parsed: unknown
   try {
@@ -61,6 +83,7 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
     tabs: {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
+      tabs: res.data.tabs.tabs.map((tab) => normalizePersistedTab(tab as unknown as Record<string, unknown>)),
     },
     tombstones: res.data.tombstones || [],
   }
@@ -87,6 +110,101 @@ export type ParsedPersistedPanes = {
   paneTitleSetByUser: Record<string, Record<string, boolean>>
 }
 
+function normalizeTerminalContent(content: Record<string, unknown>): Record<string, unknown> {
+  const durableState = migrateLegacyTerminalDurableState({
+    provider: typeof content.mode === 'string' && content.mode !== 'shell' ? content.mode : undefined,
+    sessionRef: content.sessionRef,
+    resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
+  })
+  const existingRestoreError = (
+    content.restoreError
+    && typeof content.restoreError === 'object'
+    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (content.restoreError as any).reason === 'string'
+  )
+    ? content.restoreError
+    : undefined
+  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+
+  return {
+    ...rest,
+    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...((durableState.restoreError ?? existingRestoreError)
+      ? { restoreError: durableState.restoreError ?? existingRestoreError }
+      : {}),
+  }
+}
+
+function normalizeAgentChatContent(content: Record<string, unknown>): Record<string, unknown> {
+  const durableState = migrateLegacyAgentChatDurableState({
+    sessionRef: content.sessionRef,
+    cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
+    timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
+    resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
+  })
+  const existingRestoreError = (
+    content.restoreError
+    && typeof content.restoreError === 'object'
+    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (content.restoreError as any).reason === 'string'
+  )
+    ? content.restoreError
+    : undefined
+  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+
+  return {
+    ...rest,
+    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...((durableState.restoreError ?? existingRestoreError)
+      ? { restoreError: durableState.restoreError ?? existingRestoreError }
+      : {}),
+  }
+}
+
+function normalizePersistedNode(node: unknown): unknown {
+  if (!node || typeof node !== 'object') return node
+
+  const candidate = node as Record<string, unknown>
+  if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
+    const content = candidate.content as Record<string, unknown>
+    let nextContent = content
+    if (content.kind === 'terminal') {
+      nextContent = normalizeTerminalContent(content)
+    } else if (content.kind === 'agent-chat') {
+      nextContent = normalizeAgentChatContent(content)
+    } else if ('sessionRef' in content) {
+      const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
+      const { sessionRef: _legacySessionRef, ...rest } = content
+      nextContent = {
+        ...rest,
+        ...(sanitizedSessionRef ? { sessionRef: sanitizedSessionRef } : {}),
+      }
+    }
+    return {
+      ...candidate,
+      content: nextContent,
+    }
+  }
+
+  if (candidate.type === 'split' && Array.isArray(candidate.children) && candidate.children.length === 2) {
+    return {
+      ...candidate,
+      children: [
+        normalizePersistedNode(candidate.children[0]),
+        normalizePersistedNode(candidate.children[1]),
+      ],
+    }
+  }
+
+  return node
+}
+
+function normalizePersistedLayouts(layouts: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(layouts).map(([tabId, node]) => [tabId, normalizePersistedNode(node)]),
+  )
+}
+
 export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null {
   let parsed: unknown
   try {
@@ -104,16 +222,16 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
 
   return {
     version,
-    layouts: (res.data.layouts || {}) as Record<string, unknown>,
+    layouts: normalizePersistedLayouts((res.data.layouts || {}) as Record<string, unknown>),
     activePane: (res.data.activePane || {}) as Record<string, string>,
     paneTitles: (res.data.paneTitles || {}) as Record<string, Record<string, string>>,
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
   }
 }
 
-// --- Combined layout key (v3) ---
+// --- Combined layout key (v4) ---
 
-export const LAYOUT_SCHEMA_VERSION = 3
+export const LAYOUT_SCHEMA_VERSION = 4
 
 const zPersistedLayoutPayload = z.object({
   version: z.number(),
@@ -140,20 +258,22 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
 
   const res = zPersistedLayoutPayload.safeParse(parsed)
   if (!res.success) return null
+  if (res.data.version > LAYOUT_SCHEMA_VERSION) return null
 
   const panes = res.data.panes
   let panesVersion = typeof panes.version === 'number' ? panes.version : 1
   if (panesVersion < 1) panesVersion = 1
 
   return {
-    version: res.data.version,
+    version: Math.max(res.data.version, LAYOUT_SCHEMA_VERSION),
     tabs: {
       ...res.data.tabs,
       activeTabId: res.data.tabs.activeTabId ?? null,
+      tabs: res.data.tabs.tabs.map((tab) => normalizePersistedTab(tab as unknown as Record<string, unknown>)),
     },
     panes: {
-      version: panesVersion,
-      layouts: (panes.layouts || {}) as Record<string, unknown>,
+      version: Math.max(panesVersion, PANES_SCHEMA_VERSION),
+      layouts: normalizePersistedLayouts((panes.layouts || {}) as Record<string, unknown>),
       activePane: (panes.activePane || {}) as Record<string, string>,
       paneTitles: (panes.paneTitles || {}) as Record<string, Record<string, string>>,
       paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
