@@ -23,10 +23,13 @@
 - Do not infer identity from cwd matching, PTY stdout, timing, or title text for Codex or OpenCode.
 - Do not silently fall back from “restore this session” to “start fresh.” If no durable target exists, surface restore-unavailable clearly.
 - Do not kill live user terminals during probe cleanup. Only stop probe-owned or provably orphaned helper processes tied to temp homes or this worktree.
+- Task 1 cleanup is provenance-gated, not trust-based: before any stop action, emit a dry-run ownership report for every candidate PID and refuse cleanup unless each candidate is tagged as probe-owned by the current temp home and harness sentinel metadata.
 - Tasks 2 through 8 may contain intentionally red or partially green commits. Those commits are branch-local checkpoints only. Do not land, merge, or fast-forward anything until Task 9 completes and the coordinated full suite is green.
 - When a task's `Run:` commands mention tests that are not listed in that task's Files/Commit block, treat them as regression-only coverage and leave them unchanged unless that task truly requires edits there.
 
 ## Verified Planning Inputs
+
+These are planning-time observations from this machine, not a permanent pin. Task 1 must re-verify them, and the checked-in lab note plus executable contract suite replace any stale planning-time assumption.
 
 - Real-binary probes already confirmed:
   - `codex --version` -> `codex-cli 0.121.0`
@@ -115,6 +118,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
   - fresh create launches `codex --remote <ws>`
   - restore launches `codex --remote <ws> resume <durable-token>`
   - one app-server sidecar per terminal observes notifications and the provider-owned durable artifact
+  - this intentionally replaces the current shared app-server singleton because durable promotion is terminal-owned; the accepted resource trade-off is exactly one sidecar process and one loopback endpoint per live Codex terminal, with no shared pool or fallback runtime
   - a fresh Codex pane may remain live-only with no thread id at all until the provider actually creates one
   - if an exact thread id appears before the durable artifact exists, it is still launch-only state and must never be persisted
 - Claude terminal sessions:
@@ -291,6 +295,15 @@ Run provenance-first process audits such as:
 
 Document exactly which processes are safe to stop and which live sessions must be left untouched.
 
+Before any cleanup path is allowed to terminate a process, require one dry-run ownership report that includes:
+- PID / PPID
+- cwd
+- temp-home path
+- harness sentinel metadata
+- safe-to-stop yes/no
+
+If any candidate lacks the expected temp-home prefix or harness sentinel, abort cleanup and fix the harness before proceeding.
+
 - [ ] **Step 3: Run real probes for create, durability, restore, and rename/title mutation**
 
 Capture:
@@ -436,6 +449,13 @@ Expected: FAIL because the explicit contract and migration helpers do not exist 
 
 Add canonical `sessionRef`, live-only launch-input helpers, one-time migration away from ambiguous persisted `resumeSessionId` strings without clearing persisted tabs/panes wholesale, and the explicit WS payload cutover required by the Wire Contract Rule.
 
+Apply these migration rules explicitly:
+- terminal Codex legacy `resumeSessionId` values that came from fresh-thread persistence under the shipped bug never become canonical `sessionRef`; migrate them to `restoreError`
+- terminal Claude values only become canonical when the provider rules from Task 1 prove they are UUID-backed durable identity; non-canonical name/title values become `restoreError`
+- OpenCode values only become canonical when Task 1 plus authoritative control-surface rules prove they are durable session ids; otherwise migrate to `restoreError`
+- agent-chat entries keep canonical Claude fields when present; entries with only legacy raw `resumeSessionId` and no canonical `cliSessionId` / `timelineSessionId` migrate to `restoreError`
+- migration clears persisted raw `resumeSessionId` values even when the active Redux runtime is still allowed to hold a transient launch-only token in memory
+
 - [ ] **Step 4: Re-run the targeted suite and verify it passes**
 
 Run the same command again.
@@ -545,6 +565,7 @@ git commit -m "refactor: make durable promotion authoritative"
 Change expectations so that:
 - fresh create uses the exact remote CLI form proven by Task 1, which is currently `codex --remote <ws>` with no preallocated `resume`
 - restore uses the exact durable-restore CLI form proven by Task 1, which is currently `codex --remote <ws> resume <durable-token>`
+- two concurrent live Codex terminals prove the intentional per-terminal-sidecar model by owning distinct sidecars/endpoints and isolated cleanup
 - a fresh interactive Codex pane may still be live-only until the provider actually creates a thread
 - once a thread exists, the sidecar learns any exact thread identity only from provider notifications
 - durable promotion happens only after the provider-owned artifact exists
@@ -559,6 +580,7 @@ Expected: FAIL because current implementation still preallocates fresh threads a
 - [ ] **Step 3: Implement the sidecar and terminal lifecycle**
 
 Add one sidecar per Codex terminal, keep fresh panes live-only until the provider actually creates a thread, parse the required notifications, promote durability only after artifact proof, tear the sidecar down on terminal exit and every other cleanup path, and reap orphaned sidecars/endpoints on server boot after a crash using explicit ownership metadata instead of broad kill patterns.
+This task intentionally replaces the current shared singleton runtime; do not keep both architectures alive.
 
 - [ ] **Step 4: Re-run the Codex suite and broader regressions**
 
@@ -614,6 +636,7 @@ Implement:
 - rejection of non-canonical persisted Claude restore inputs
 - agent-chat durable promotion without collapsing live SDK state
 - restore-unavailable when only a mutable name remains and no canonical durable UUID can be proven
+- restore-unavailable for agent-chat entries that only have legacy raw `resumeSessionId` and no canonical Claude identity
 
 - [ ] **Step 4: Re-run the targeted suite and verify it passes**
 
@@ -769,7 +792,7 @@ Expected: PASS.
 
 Run: `npm run test:real:coding-cli-contracts`
 
-Expected: PASS.
+Expected: PASS with all three provider sections executed on the implementation machine. A vacuous all-skipped run does not satisfy final verification.
 
 - [ ] **Step 5: Run the focused cross-cutting regression sweep**
 
