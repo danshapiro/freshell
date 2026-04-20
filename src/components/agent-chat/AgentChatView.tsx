@@ -419,10 +419,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (paneContent.status !== 'creating') return
     if (paneContent.restoreError) return
 
-    const durableResumeSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
-      ? paneContent.resumeSessionId
-      : undefined
-
     createSentRef.current = true
     dispatch(registerPendingCreate({
       requestId: paneContent.createRequestId,

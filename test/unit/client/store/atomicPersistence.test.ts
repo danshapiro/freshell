@@ -87,7 +87,7 @@ describe('atomic persistence', () => {
       expect(v3Raw).not.toBeNull()
 
       const v3 = JSON.parse(v3Raw!)
-      expect(v3.version).toBe(3)
+      expect(v3.version).toBe(4)
       expect(v3.tabs.tabs).toHaveLength(1)
       expect(v3.panes.layouts).toHaveProperty('tab-1')
       expect(v3.tombstones).toHaveLength(1)

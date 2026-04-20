@@ -912,6 +912,14 @@ describe('terminal.create session repair wait', () => {
       await waitForReady(ws)
 
       const requestId = 'restore-missing-canonical-1'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
+
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -919,13 +927,7 @@ describe('terminal.create session repair wait', () => {
         restore: true,
       }))
 
-      const response = await waitForMessage(
-        ws,
-        (m) => (
-          m.requestId === requestId
-          && (m.type === 'terminal.created' || m.type === 'error')
-        ),
-      )
+      const response = await responsePromise
 
       expect(response).toMatchObject({
         type: 'error',

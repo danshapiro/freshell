@@ -47,7 +47,9 @@ export type ParsedPersistedTabs = {
   tombstones: Array<{ id: string; deletedAt: number }>
 }
 
-function normalizePersistedTab(tab: Record<string, unknown>): Record<string, unknown> {
+type PersistedTab = z.infer<typeof zTab>
+
+function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
   const mode = typeof tab.mode === 'string' ? tab.mode : undefined
   const codingCliProvider = typeof tab.codingCliProvider === 'string' ? tab.codingCliProvider : undefined
   const provider = codingCliProvider || (mode && mode !== 'shell' ? mode : undefined)
@@ -61,7 +63,7 @@ function normalizePersistedTab(tab: Record<string, unknown>): Record<string, unk
   return {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-  }
+  } as PersistedTab
 }
 
 export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {

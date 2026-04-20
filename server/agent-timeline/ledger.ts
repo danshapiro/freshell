@@ -150,6 +150,7 @@ export function synthesizeLiveMessageId(sessionId: string, ordinal: number): str
 
 function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState): string | undefined {
   if (isValidClaudeSessionId(liveSession?.cliSessionId)) return liveSession.cliSessionId
+  if (isValidClaudeSessionId(liveSession?.resumeSessionId)) return liveSession.resumeSessionId
   if (isValidClaudeSessionId(queryId)) return queryId
   return undefined
 }

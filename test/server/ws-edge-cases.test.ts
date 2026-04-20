@@ -1594,7 +1594,7 @@ describe('WebSocket edge cases', () => {
       const created2 = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId2)
 
       expect(created2.terminalId).toBe(created1.terminalId)
-      expect(created2.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(created2.effectiveResumeSessionId).toBeUndefined()
 
       close()
     })

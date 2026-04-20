@@ -209,6 +209,41 @@ describe('restore ledger manager', () => {
     ])
   })
 
+  it('hydrates durable history from a canonical resumeSessionId before cliSessionId is known', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
+    const liveSession = makeSession({
+      sessionId: 'sdk-create',
+      resumeSessionId: canonicalSessionId,
+      messages: [],
+    })
+    const durableMessages = [
+      makeMessage('user', 'restored prompt', { messageId: 'durable-restore-1' }),
+    ]
+    const loadSessionHistory = vi.fn(async (sessionId: string) => (
+      sessionId === canonicalSessionId ? durableMessages : null
+    ))
+
+    const manager = createRestoreLedgerManager({
+      loadSessionHistory,
+      getLiveSessionBySdkSessionId: () => undefined,
+      getLiveSessionByCliSessionId: () => undefined,
+    })
+
+    const resolved = await manager.resolve(liveSession.sessionId, {
+      liveSessionOverride: liveSession,
+    })
+
+    expect(loadSessionHistory).toHaveBeenCalledWith(canonicalSessionId)
+    expect(resolved).toMatchObject({
+      kind: 'resolved',
+      queryId: 'sdk-create',
+      timelineSessionId: canonicalSessionId,
+      readiness: 'durable_only',
+    })
+    if (resolved.kind !== 'resolved') throw new Error('expected resolved')
+    expect(resolved.turns.map((turn) => turn.messageId)).toEqual(['durable-restore-1'])
+  })
+
   it('refreshes a non-empty durable backlog while the live ledger remains authoritative', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000555'
     const liveSession = makeSession({

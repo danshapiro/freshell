@@ -396,18 +396,19 @@ describe('agentChatSlice', () => {
   })
 
   it('stores timelineSessionId, timelineRevision, and stream snapshot from sdk.session.snapshot', () => {
+    const canonicalTimelineSessionId = '00000000-0000-4000-8000-000000000123'
     const state = agentChatReducer(initial, sessionSnapshotReceived({
       sessionId: 'sdk-1',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-1',
+      timelineSessionId: canonicalTimelineSessionId,
       revision: 12,
       streamingActive: true,
       streamingText: 'partial reply',
     }))
 
     expect(state.sessions['sdk-1']).toMatchObject({
-      timelineSessionId: 'cli-1',
+      timelineSessionId: canonicalTimelineSessionId,
       timelineRevision: 12,
       streamingActive: true,
       streamingText: 'partial reply',
@@ -502,7 +503,7 @@ describe('agentChatSlice', () => {
 
     expect(state.sessions['sdk-live']).toMatchObject({
       historyLoaded: true,
-      timelineSessionId: 'named-resume',
+      timelineSessionId: undefined,
       timelineRevision: 1,
     })
 

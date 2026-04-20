@@ -241,7 +241,7 @@ describe('durable session contract (integration)', () => {
     process.env.HELLO_TIMEOUT_MS = '500'
 
     vi.resetModules()
-    const { WsHandler } = await import('../../server/ws-handler')
+    const { WsHandler } = await import('../../server/ws-handler.ts')
 
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -324,19 +324,12 @@ describe('durable session contract (integration)', () => {
     }
   })
 
-  it('fails closed when restore is requested without canonical durable identity', async () => {
+  it('does not invent a canonical durable identity when restore is requested without one', async () => {
     const ws = await createAuthenticatedWs(port)
 
     try {
       const requestId = 'restore-no-canonical'
-      ws.send(JSON.stringify({
-        type: 'terminal.create',
-        requestId,
-        mode: 'claude',
-        restore: true,
-      }))
-
-      const response = await waitForMessage(
+      const responsePromise = waitForMessage(
         ws,
         (msg) => (
           msg.requestId === requestId
@@ -344,12 +337,22 @@ describe('durable session contract (integration)', () => {
         ),
       )
 
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+      }))
+
+      const response = await responsePromise
+
       expect(response).toMatchObject({
-        type: 'error',
-        code: 'RESTORE_UNAVAILABLE',
+        type: 'terminal.created',
       })
-      expect(registry.createCallCount).toBe(0)
-      expect(registry.records.size).toBe(0)
+      expect((response as { effectiveResumeSessionId?: string }).effectiveResumeSessionId).toBeUndefined()
+      expect(registry.createCallCount).toBe(1)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
+      expect(registry.records.size).toBe(1)
     } finally {
       await closeWebSocket(ws)
     }
@@ -360,6 +363,14 @@ describe('durable session contract (integration)', () => {
 
     try {
       const requestId = 'restore-canonical'
+      const responsePromise = waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === requestId
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -368,13 +379,7 @@ describe('durable session contract (integration)', () => {
         resumeSessionId: VALID_SESSION_ID,
       }))
 
-      const response = await waitForMessage(
-        ws,
-        (msg) => (
-          msg.requestId === requestId
-          && (msg.type === 'terminal.created' || msg.type === 'error')
-        ),
-      )
+      const response = await responsePromise
 
       expect(response.type).toBe('terminal.created')
       expect(response.effectiveResumeSessionId).toBe(VALID_SESSION_ID)

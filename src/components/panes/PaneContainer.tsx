@@ -85,9 +85,10 @@ function resolvePaneRuntimeMeta(
     if (byTerminalId) return byTerminalId
   }
 
-  if (options.sessionRef?.provider && options.sessionRef.sessionId) {
+  const sessionRef = options.sessionRef
+  if (sessionRef && sessionRef.provider && sessionRef.sessionId) {
     return Object.values(terminalMetaById).find((record) => (
-      record.provider === options.sessionRef?.provider && record.sessionId === options.sessionRef.sessionId
+      record.provider === sessionRef.provider && record.sessionId === sessionRef.sessionId
     ))
   }
 
