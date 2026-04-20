@@ -3227,10 +3227,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
               mode: 'codex',
               createRequestId: 'req-foreign',
               status: 'running',
+              serverInstanceId: 'srv-remote',
               sessionRef: {
                 provider: 'codex',
                 sessionId: targetSessionId,
-                serverInstanceId: 'srv-remote',
               },
             },
           },

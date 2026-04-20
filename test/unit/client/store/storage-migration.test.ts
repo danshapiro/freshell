@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
-import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '@/store/storage-keys'
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LAYOUT_STORAGE_KEY = 'freshell.layout.v3'
@@ -175,6 +175,73 @@ describe('storage-migration', () => {
       code: 'RESTORE_UNAVAILABLE',
       reason: 'invalid_legacy_restore_target',
     })
+  })
+
+  it('migrates recoverable v2 tabs and panes into the v3 layout key before clearing legacy storage', async () => {
+    localStorage.setItem('freshell_version', '3')
+    localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify({
+      version: 2,
+      tabs: {
+        activeTabId: 'tab-v2',
+        tabs: [
+          {
+            id: 'tab-v2',
+            title: 'Recovered Claude',
+            createdAt: 1,
+            mode: 'claude',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        ],
+      },
+      tombstones: [],
+    }))
+    localStorage.setItem(PANES_STORAGE_KEY, JSON.stringify({
+      version: 6,
+      layouts: {
+        'tab-v2': {
+          type: 'leaf',
+          id: 'pane-v2',
+          content: {
+            kind: 'terminal',
+            mode: 'claude',
+            createRequestId: 'req-v2',
+            status: 'running',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        },
+      },
+      activePane: {
+        'tab-v2': 'pane-v2',
+      },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }))
+
+    await importFreshStorageMigration()
+
+    expect(localStorage.getItem(TABS_STORAGE_KEY)).toBeNull()
+    expect(localStorage.getItem(PANES_STORAGE_KEY)).toBeNull()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    expect(parsed?.tabs.activeTabId).toBe('tab-v2')
+    expect(parsed?.tabs.tabs[0]).toEqual(expect.objectContaining({
+      id: 'tab-v2',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      },
+    }))
+    expect(((parsed?.panes.layouts['tab-v2'] as any)?.content) ?? {}).toEqual(expect.objectContaining({
+      kind: 'terminal',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      },
+    }))
   })
 
   it('keeps migration bootstrap order deterministic in static imports', async () => {

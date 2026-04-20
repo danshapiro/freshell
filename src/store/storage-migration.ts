@@ -14,7 +14,7 @@
 
 import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
-import { LAYOUT_SCHEMA_VERSION, PANES_SCHEMA_VERSION } from './persistedState'
+import { LAYOUT_SCHEMA_VERSION, PANES_SCHEMA_VERSION, migrateV2ToV3 } from './persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
 import {
   migrateLegacyAgentChatDurableState,
@@ -174,13 +174,25 @@ function migratePersistedLayout(): boolean {
   return true
 }
 
+function preservePersistedLayout(): boolean {
+  if (migratePersistedLayout()) {
+    return true
+  }
+
+  if (!migrateV2ToV3()) {
+    return false
+  }
+
+  return migratePersistedLayout()
+}
+
 export function runStorageMigration(): void {
   try {
     const currentVersion = readStorageVersion()
     if (currentVersion >= STORAGE_VERSION) return
 
     const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
-    const migratedLayout = migratePersistedLayout()
+    const migratedLayout = preservePersistedLayout()
     clearFreshellKeysExcept([
       AUTH_STORAGE_KEY,
       BROWSER_PREFERENCES_STORAGE_KEY,

@@ -58,6 +58,7 @@ export interface Tab {
   shell?: ShellType
   initialCwd?: string
   sessionRef?: SessionLocator
+  serverInstanceId?: string
   resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number

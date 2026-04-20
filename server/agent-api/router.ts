@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
 import { allocateLocalhostPort } from '../local-port.js'
-import type { CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
+import type { CodexLaunchPlan, CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
 import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
@@ -54,7 +54,11 @@ async function resolveSpawnProviderSettings(
     sessionRef?: SessionRef
     codexLaunchPlanner?: CodexLaunchPlanner
   } = {},
-): Promise<{ sessionRef?: SessionRef; providerSettings?: ProviderSettings }> {
+): Promise<{
+  sessionRef?: SessionRef
+  providerSettings?: ProviderSettings
+  codexSidecar?: CodexLaunchPlan['sidecar']
+}> {
   const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
   const sessionRef = opts.sessionRef?.provider === mode ? opts.sessionRef : undefined
   if (mode === 'codex') {
@@ -75,6 +79,7 @@ async function resolveSpawnProviderSettings(
           sessionId: plan.sessionId,
         },
       } : {}),
+      codexSidecar: plan.sidecar,
       providerSettings: {
         codexAppServer: plan.remote,
       },
@@ -308,6 +313,7 @@ export function createAgentApiRouter({
           cwd,
           resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
+          ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId },
         })
@@ -659,6 +665,7 @@ export function createAgentApiRouter({
         cwd,
         resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
+        ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
       })
@@ -744,6 +751,7 @@ export function createAgentApiRouter({
           cwd: req.body?.cwd,
           resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
+          ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId: newPaneId },
         })
@@ -954,6 +962,7 @@ export function createAgentApiRouter({
         cwd: req.body?.cwd,
         resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
+        ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
       })

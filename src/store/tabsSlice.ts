@@ -215,6 +215,7 @@ type AddTabPayload = {
   shell?: ShellType
   initialCwd?: string
   sessionRef?: Tab['sessionRef']
+  serverInstanceId?: string
   resumeSessionId?: string
   sessionMetadataByKey?: Tab['sessionMetadataByKey']
   forceNew?: boolean
@@ -249,6 +250,7 @@ export const tabsSlice = createSlice({
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
         sessionRef,
+        serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
         sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),

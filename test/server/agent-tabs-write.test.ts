@@ -126,6 +126,44 @@ describe('tab endpoints', () => {
     expect(broadcastUiCommand.mock.calls[0]?.[0]?.payload).not.toHaveProperty('resumeSessionId')
   })
 
+  it('passes the planned Codex sidecar through /api/tabs terminal creation', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
+
+    expect(res.body.status).toBe('ok')
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+      approvalPolicy: undefined,
+      cwd: undefined,
+      model: undefined,
+      resumeSessionId: undefined,
+      sandbox: undefined,
+    }])
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'codex',
+      codexSidecar: codexLaunchPlanner.sidecar,
+      providerSettings: expect.objectContaining({
+        codexAppServer: expect.objectContaining({
+          wsUrl: expect.any(String),
+        }),
+      }),
+    }))
+  })
+
   it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
     const app = express()
     app.use(express.json())

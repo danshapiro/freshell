@@ -25,6 +25,8 @@ export type TerminalPaneContent = {
   resumeSessionId?: string
   /** Portable session reference for cross-device tab snapshots */
   sessionRef?: SessionLocator
+  /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
+  serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   /** Initial working directory */
@@ -95,6 +97,8 @@ export type AgentChatPaneContent = {
   resumeSessionId?: string
   /** Portable session reference for cross-device tab snapshots */
   sessionRef?: SessionLocator
+  /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
+  serverInstanceId?: string
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   /** Working directory */

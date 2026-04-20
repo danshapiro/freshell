@@ -18,6 +18,7 @@ type SessionMatchCandidate = {
   paneId: string | undefined
   locator: SessionMatchLocator
   serverInstanceIdHint?: string
+  hasLiveHandleHint?: boolean
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -83,8 +84,19 @@ function extractExplicitSessionLocator(content: PaneContent): {
 }
 
 function extractSessionLocatorServerInstanceHint(content: PaneContent): string | undefined {
-  const explicit = (content as { sessionRef?: { serverInstanceId?: unknown } }).sessionRef
-  return isNonEmptyString(explicit?.serverInstanceId) ? explicit.serverInstanceId : undefined
+  return isNonEmptyString((content as { serverInstanceId?: unknown }).serverInstanceId)
+    ? (content as { serverInstanceId: string }).serverInstanceId
+    : undefined
+}
+
+function extractSessionLocatorLiveHandleHint(content: PaneContent): boolean {
+  if (content.kind === 'terminal') {
+    return isNonEmptyString(content.terminalId)
+  }
+  if (content.kind === 'agent-chat') {
+    return isNonEmptyString(content.sessionId)
+  }
+  return false
 }
 
 function extractSessionLocators(content: PaneContent): Array<{
@@ -130,9 +142,7 @@ function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): Sessio
 }
 
 function buildTabFallbackServerInstanceHint(tab: RootState['tabs']['tabs'][number]): string | undefined {
-  return isNonEmptyString((tab.sessionRef as { serverInstanceId?: unknown } | undefined)?.serverInstanceId)
-    ? (tab.sessionRef as { serverInstanceId: string }).serverInstanceId
-    : undefined
+  return isNonEmptyString(tab.serverInstanceId) ? tab.serverInstanceId : undefined
 }
 
 function matchScore(
@@ -151,6 +161,9 @@ function matchScore(
     return 0
   }
   if (localServerInstanceId && candidate.serverInstanceIdHint === localServerInstanceId) {
+    return 3
+  }
+  if (localServerInstanceId && candidate.hasLiveHandleHint) {
     return 2
   }
   return 1
@@ -169,6 +182,7 @@ function collectPaneSessionMatchCandidates(
         paneId: node.id,
         locator: explicitLocator,
         serverInstanceIdHint: extractSessionLocatorServerInstanceHint(node.content),
+        hasLiveHandleHint: extractSessionLocatorLiveHandleHint(node.content),
       })
     }
     for (const locator of extractSessionLocators(node.content)) {
@@ -179,7 +193,13 @@ function collectPaneSessionMatchCandidates(
       ) {
         continue
       }
-      candidates.push({ tabId, paneId: node.id, locator })
+      candidates.push({
+        tabId,
+        paneId: node.id,
+        locator,
+        serverInstanceIdHint: extractSessionLocatorServerInstanceHint(node.content),
+        hasLiveHandleHint: extractSessionLocatorLiveHandleHint(node.content),
+      })
     }
     return
   }
@@ -313,6 +333,7 @@ export function findTabIdForSession(
           paneId: undefined,
           locator: candidate.locator,
           serverInstanceIdHint: candidate.serverInstanceIdHint,
+          hasLiveHandleHint: candidate.hasLiveHandleHint,
         })
       }
       continue

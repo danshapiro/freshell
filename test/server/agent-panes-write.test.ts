@@ -26,6 +26,40 @@ it('splits a pane horizontally', async () => {
   expect(attachPaneContent).toHaveBeenCalled()
 })
 
+it('passes the planned Codex sidecar when splitting a pane in codex mode', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
+
+  expect(res.body.status).toBe('ok')
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+    approvalPolicy: undefined,
+    cwd: undefined,
+    model: undefined,
+    resumeSessionId: undefined,
+    sandbox: undefined,
+  }])
+  expect(registryCreate).toHaveBeenCalledWith(expect.objectContaining({
+    mode: 'codex',
+    codexSidecar: codexLaunchPlanner.sidecar,
+    providerSettings: expect.objectContaining({
+      codexAppServer: expect.objectContaining({
+        wsUrl: expect.any(String),
+      }),
+    }),
+  }))
+})
+
 it('rejects invalid Codex settings when splitting a pane before spawning', async () => {
   const app = express()
   app.use(express.json())
@@ -98,6 +132,47 @@ it('rejects invalid Codex settings when respawning a pane before spawning', asyn
   expect(codexLaunchPlanner.planCreateCalls).toEqual([])
   expect(registryCreate).not.toHaveBeenCalled()
   expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
+it('passes the planned Codex sidecar when respawning a pane in codex mode', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
+
+  expect(res.body.status).toBe('ok')
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+    approvalPolicy: undefined,
+    cwd: undefined,
+    model: undefined,
+    resumeSessionId: undefined,
+    sandbox: undefined,
+  }])
+  expect(registryCreate).toHaveBeenCalledWith(expect.objectContaining({
+    mode: 'codex',
+    codexSidecar: codexLaunchPlanner.sidecar,
+    providerSettings: expect.objectContaining({
+      codexAppServer: expect.objectContaining({
+        wsUrl: expect.any(String),
+      }),
+    }),
+  }))
+  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+    kind: 'terminal',
+    terminalId: 'term_new',
+    mode: 'codex',
+  }))
 })
 
 it('resolves tmux-style pane targets for close', async () => {

@@ -25,6 +25,8 @@ function terminalContent(
   options: {
     resumeSessionId?: string
     sessionRef?: SessionLocator
+    serverInstanceId?: string
+    terminalId?: string
   } = {},
 ): TerminalPaneContent {
   const identity = options.sessionRef?.sessionId ?? options.resumeSessionId ?? 'fresh'
@@ -33,8 +35,10 @@ function terminalContent(
     mode,
     status: 'running',
     createRequestId: `req-${identity}`,
+    ...(options.terminalId ? { terminalId: options.terminalId } : {}),
     ...(options.resumeSessionId ? { resumeSessionId: options.resumeSessionId } : {}),
     ...(options.sessionRef ? { sessionRef: options.sessionRef } : {}),
+    ...(options.serverInstanceId ? { serverInstanceId: options.serverInstanceId } : {}),
   }
 }
 
@@ -132,8 +136,8 @@ describe('collectSessionLocatorsFromTabs', () => {
           sessionRef: {
             provider: 'codex',
             sessionId: 'codex-session-1',
-            serverInstanceId: 'srv-local',
-          } as unknown as SessionLocator,
+          },
+          serverInstanceId: 'srv-local',
         })),
         'tab-invalid-claude': leaf('pane-invalid-claude', terminalContent('claude', { resumeSessionId: 'named-resume' })),
       },
@@ -241,15 +245,16 @@ describe('findTabIdForSession', () => {
             sessionRef: {
               provider: 'codex',
               sessionId: 'shared',
-              serverInstanceId: 'srv-remote',
-            } as unknown as SessionLocator,
+            },
+            serverInstanceId: 'srv-remote',
           })),
           'tab-local': leaf('pane-local', terminalContent('codex', {
             sessionRef: {
               provider: 'codex',
               sessionId: 'shared',
-              serverInstanceId: 'srv-local',
-            } as unknown as SessionLocator,
+            },
+            serverInstanceId: 'srv-local',
+            terminalId: 'term-local',
           })),
         },
         activePane: {},
@@ -325,8 +330,8 @@ describe('findPaneForSession', () => {
             sessionRef: {
               provider: 'codex',
               sessionId: 'codex-pane',
-              serverInstanceId: 'srv-remote',
-            } as unknown as SessionLocator,
+            },
+            serverInstanceId: 'srv-remote',
           })),
         },
         activePane: { 'tab-1': 'pane-codex' },

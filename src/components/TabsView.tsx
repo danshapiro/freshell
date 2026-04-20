@@ -93,6 +93,7 @@ function sanitizePaneSnapshot(
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
       resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
     }
   }
@@ -121,6 +122,7 @@ function sanitizePaneSnapshot(
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
       resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
       permissionMode: payload.permissionMode as string | undefined,
@@ -540,6 +542,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         title: record.tabName,
         mode: deriveModeFromRecord(record),
         status: 'creating',
+        serverInstanceId: record.serverInstanceId,
       }),
     )
     dispatch(initLayout({ tabId, content: firstContent }))
@@ -557,6 +560,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         title: `${record.tabName} · ${pane.title || pane.kind}`,
         mode: deriveModeFromRecord(record),
         status: 'creating',
+        serverInstanceId: record.serverInstanceId,
       }),
     )
     dispatch(
