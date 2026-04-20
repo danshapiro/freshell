@@ -23,6 +23,7 @@
 - Do not infer identity from cwd matching, PTY stdout, timing, or title text for Codex or OpenCode.
 - Do not silently fall back from “restore this session” to “start fresh.” If no durable target exists, surface restore-unavailable clearly.
 - Do not kill live user terminals during probe cleanup. Only stop probe-owned or provably orphaned helper processes tied to temp homes or this worktree.
+- Tasks 2 through 8 may contain intentionally red or partially green commits. Those commits are branch-local checkpoints only. Do not land, merge, or fast-forward anything until Task 9 completes and the coordinated full suite is green.
 
 ## Verified Planning Inputs
 
@@ -30,8 +31,8 @@
   - `codex --version` -> `codex-cli 0.121.0`
   - `claude --version` -> `2.1.114 (Claude Code)`
   - `opencode --version` -> `1.4.11`
-- The shipped regression from PR `#298` is still encoded in main:
-  - `server/coding-cli/codex-app-server/launch-planner.ts` calls `thread/start` for fresh create and returns the fresh thread id as if it were replay-safe.
+- The shipped regression currently encoded in main (landed via [PR #298](https://github.com/danshapiro/freshell/pull/298)) is:
+  - `server/coding-cli/codex-app-server/launch-planner.ts` invokes `runtime.startThread()` for fresh create, which sends `thread/start`, and returns the fresh thread id as if it were replay-safe.
   - `server/ws-handler.ts` immediately persists that id as `effectiveResumeSessionId`.
   - `test/integration/server/codex-session-flow.test.ts` currently bakes that bad invariant into the expected CLI launch.
 - Current Freshell behavior already separates some concerns, but not cleanly enough:
@@ -51,6 +52,13 @@
 ## External Contract Rule
 
 Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That note is authoritative for provider behavior. If any current assumption disagrees with the note, update the tests and product code to match the note.
+
+## Wire Contract Rule
+
+- `shared/ws-protocol.ts` must remove raw durable `resumeSessionId` strings from terminal durable-state payloads.
+- `terminal.create` must carry canonical `sessionRef` when requesting a durable restore target, plus explicit live-handle/runtime fields for same-server reattach.
+- `terminal.created` and `terminal.session.associated` must emit canonical `sessionRef` only when durable identity actually exists; they must not echo provisional launch-only tokens as if they were durable restore ids.
+- If any one-shot launch-only input still needs to cross the wire for the current runtime, it must stay explicitly transient and must never be persisted or reused as canonical identity.
 
 ## End-State Contract And Invariants
 
@@ -259,6 +267,9 @@ Add isolated temp-home helpers for `codex`, `claude`, and `opencode` that can:
 - poll for durable artifact creation without guessing
 - record every child PID they start
 - clean up only probe-owned processes deterministically
+- resolve provider binaries with `command -v` before each probe and record the exact path/version used
+
+Update `package.json` to add one opt-in script, `test:real:coding-cli-contracts`, that wraps the real-provider suite. Reuse the existing `cross-env` dependency already in the repo; do not add a second environment-wrapper dependency.
 
 - [ ] **Step 2: Audit provider processes and define the cleanup rule**
 
@@ -293,11 +304,16 @@ Document:
 
 Add `test/integration/real/coding-cli-session-contract.test.ts` so every factual claim in the lab note is executable.
 
+The opt-in suite must behave explicitly when binaries are absent:
+- default repo workflows must never invoke it implicitly
+- each missing provider binary must produce an explicit `test.skip` / skipped suite message naming the missing executable
+- Task 1 is only complete on the implementation machine when all three provider sections actually run, not when they are skipped
+
 - [ ] **Step 6: Run the real-provider contract suite**
 
-Run: `cross-env FRESHELL_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- test/integration/real/coding-cli-session-contract.test.ts`
+Run: `npm run test:real:coding-cli-contracts`
 
-Expected: PASS. If the test and the lab note disagree, fix the test or the note before touching product code.
+Expected: PASS with all three provider sections executed on the implementation machine. If the test and the lab note disagree, fix the test or the note before touching product code.
 
 - [ ] **Step 7: Commit**
 
@@ -373,6 +389,16 @@ git commit -m "test: lock live versus durable session behavior"
 - Modify: `src/store/tabsSlice.ts`
 - Modify: `src/lib/ui-commands.ts`
 - Modify: `src/lib/session-type-utils.ts`
+- Modify: `test/unit/client/store/panesSlice.test.ts`
+- Modify: `test/unit/client/store/tabsSlice.merge.test.ts`
+- Modify: `test/unit/client/layout-mirror-middleware.test.ts`
+- Modify: `test/unit/client/store/crossTabSync.test.ts`
+- Modify: `test/unit/server/agent-layout-schema.test.ts`
+- Modify: `test/server/ws-protocol.test.ts`
+- Modify: `test/unit/client/components/TabsView.test.tsx`
+- Modify: `test/unit/client/components/panes/PaneContainer.createContent.test.tsx`
+- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx`
+- Modify: `test/unit/client/lib/session-type-utils.test.ts`
 
 - [ ] **Step 1: Write the failing contract and migration tests**
 
@@ -381,6 +407,7 @@ Cover:
 - canonical `sessionRef` never carries `serverInstanceId`; existing persisted live handles stay separate
 - pane and tab construction preserve live-only launch inputs only transiently
 - terminal panes/tabs use `sessionRef`, while agent-chat keeps live SDK `sessionId` distinct from its own durable Claude identity
+- websocket durable-state payloads stop using raw `resumeSessionId`; durable restore uses `sessionRef`, while any launch-only token remains transient-only
 - websocket payload normalization does not revive raw persisted resume strings
 - storage-version bootstrap does not clear restorable session state for this feature
 
@@ -392,7 +419,7 @@ Expected: FAIL because the explicit contract and migration helpers do not exist 
 
 - [ ] **Step 3: Implement the shared contract and persistence migration**
 
-Add canonical `sessionRef`, live-only launch-input helpers, and one-time migration away from ambiguous persisted `resumeSessionId` strings without clearing persisted tabs/panes wholesale.
+Add canonical `sessionRef`, live-only launch-input helpers, one-time migration away from ambiguous persisted `resumeSessionId` strings without clearing persisted tabs/panes wholesale, and the explicit WS payload cutover required by the Wire Contract Rule.
 
 - [ ] **Step 4: Re-run the targeted suite and verify it passes**
 
@@ -409,7 +436,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add shared/session-contract.ts shared/ws-protocol.ts src/store/paneTypes.ts src/store/types.ts src/store/panesSlice.ts src/store/paneTreeValidation.ts src/store/persistedState.ts src/store/storage-migration.ts src/store/persistMiddleware.ts src/store/layoutMirrorMiddleware.ts src/store/crossTabSync.ts src/store/tabsSlice.ts src/lib/ui-commands.ts src/lib/session-type-utils.ts test/unit/shared/session-contract.test.ts test/unit/client/lib/session-contract.test.ts test/unit/client/store/storage-migration.test.ts
+git add shared/session-contract.ts shared/ws-protocol.ts src/store/paneTypes.ts src/store/types.ts src/store/panesSlice.ts src/store/paneTreeValidation.ts src/store/persistedState.ts src/store/storage-migration.ts src/store/persistMiddleware.ts src/store/layoutMirrorMiddleware.ts src/store/crossTabSync.ts src/store/tabsSlice.ts src/lib/ui-commands.ts src/lib/session-type-utils.ts test/unit/shared/session-contract.test.ts test/unit/client/lib/session-contract.test.ts test/unit/client/store/storage-migration.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/tabsSlice.merge.test.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/client/store/crossTabSync.test.ts test/unit/server/agent-layout-schema.test.ts test/server/ws-protocol.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/components/panes/PaneContainer.createContent.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/lib/session-type-utils.test.ts
 git commit -m "refactor: add explicit durable session contract"
 ```
 
@@ -710,7 +737,7 @@ Expected: PASS.
 
 - [ ] **Step 4: Re-run the opt-in real-provider contract suite**
 
-Run: `cross-env FRESHELL_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- test/integration/real/coding-cli-session-contract.test.ts`
+Run: `npm run test:real:coding-cli-contracts`
 
 Expected: PASS.
 
@@ -728,7 +755,7 @@ Expected: PASS. If any valid check fails, keep improving the implementation and 
 
 - [ ] **Step 7: Commit any final doc or cleanup change from this task**
 
-If Step 1 changed `docs/index.html` or verification exposed a final cleanup edit, commit it. If this task produced no file changes, skip the commit.
+If Step 1 changed `docs/index.html` or verification exposed a final cleanup edit, commit it. If this task produced no file changes, skip the commit. A no-op Task 9 is valid and does not block completion so long as the verification steps passed.
 
 ## Completion Checklist
 
