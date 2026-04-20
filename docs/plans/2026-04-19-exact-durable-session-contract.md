@@ -30,6 +30,7 @@
 
 - Real-binary probes already confirmed:
   - `codex --version` -> `codex-cli 0.121.0`
+  - current Codex remote CLI contract accepts `codex --remote <ws>` for fresh interactive launch and `codex --remote <ws> resume <SESSION_ID>` for durable restore
   - `claude --version` -> `2.1.114 (Claude Code)`
   - `opencode --version` -> `1.4.11`
 - The shipped regression currently encoded in main is:
@@ -64,7 +65,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 
 ## Restore-Unavailable Rule
 
-- The canonical representation is `restoreError = { code: 'RESTORE_UNAVAILABLE', reason: <enum> }` in persisted/read-model state and the same `RESTORE_UNAVAILABLE` code on WS/API failures.
+- The canonical representation is `restoreError = { code: 'RESTORE_UNAVAILABLE', reason: 'missing_canonical_identity' | 'invalid_legacy_restore_target' | 'dead_live_handle' | 'provider_runtime_failed' | 'durable_artifact_missing' }` in persisted/read-model state and the same `RESTORE_UNAVAILABLE` code on WS/API failures.
 - `restore-unavailable` is never represented by inventing a fake `sessionRef`, overloading a generic pane `status`, or reviving a raw `resumeSessionId`.
 - UI components derive user-facing copy from `restoreError` and clear it only after a successful live reattach or durable restore.
 
@@ -468,6 +469,14 @@ git commit -m "refactor: add explicit durable session contract"
 - Modify: `src/lib/tab-registry-snapshot.ts`
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/components/terminal-view-utils.ts`
+- Modify: `test/unit/server/terminal-registry.test.ts`
+- Modify: `test/unit/server/terminal-registry.findRunningTerminal.test.ts`
+- Modify: `test/server/ws-protocol.test.ts`
+- Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+- Modify: `test/unit/client/components/TerminalView.resumeSession.test.tsx`
+- Modify: `test/unit/client/lib/session-utils.test.ts`
+- Modify: `test/unit/client/lib/tab-registry-snapshot.test.ts`
+- Modify: `test/e2e/codex-refresh-rehydrate-flow.test.tsx`
 
 - [ ] **Step 1: Write the failing promotion-path tests**
 
@@ -507,7 +516,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/session-binding-authority.ts server/session-association-coordinator.ts server/session-association-updates.ts server/index.ts server/ws-handler.ts server/terminal-registry.ts src/store/persistControl.ts src/lib/session-utils.ts src/lib/tab-registry-snapshot.ts src/components/TerminalView.tsx src/components/terminal-view-utils.ts test/unit/server/terminal-registry.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/ws-protocol.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/lib/session-utils.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts
+git add server/session-binding-authority.ts server/session-association-coordinator.ts server/session-association-updates.ts server/index.ts server/ws-handler.ts server/terminal-registry.ts src/store/persistControl.ts src/lib/session-utils.ts src/lib/tab-registry-snapshot.ts src/components/TerminalView.tsx src/components/terminal-view-utils.ts test/unit/server/terminal-registry.test.ts test/unit/server/terminal-registry.findRunningTerminal.test.ts test/server/ws-protocol.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/lib/session-utils.test.ts test/unit/client/lib/tab-registry-snapshot.test.ts test/e2e/codex-refresh-rehydrate-flow.test.tsx
 git commit -m "refactor: make durable promotion authoritative"
 ```
 
@@ -523,12 +532,19 @@ git commit -m "refactor: make durable promotion authoritative"
 - Modify: `server/ws-handler.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`
+- Modify: `test/unit/server/coding-cli/codex-app-server/client.test.ts`
+- Modify: `test/unit/server/coding-cli/codex-app-server/runtime.test.ts`
+- Modify: `test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts`
+- Modify: `test/integration/server/codex-session-flow.test.ts`
+- Modify: `test/integration/server/codex-session-rebind-regression.test.ts`
+- Modify: `test/server/ws-terminal-create-reuse-running-codex.test.ts`
+- Modify: `test/server/codex-activity-exact-subset.test.ts`
 
 - [ ] **Step 1: Rewrite the Codex tests to the real-provider contract**
 
 Change expectations so that:
-- fresh create launches `codex --remote <ws>` with no preallocated `resume`
-- restore launches `codex --remote <ws> resume <durable-token>`
+- fresh create uses the exact remote CLI form proven by Task 1, which is currently `codex --remote <ws>` with no preallocated `resume`
+- restore uses the exact durable-restore CLI form proven by Task 1, which is currently `codex --remote <ws> resume <durable-token>`
 - a fresh interactive Codex pane may still be live-only until the provider actually creates a thread
 - once a thread exists, the sidecar learns any exact thread identity only from provider notifications
 - durable promotion happens only after the provider-owned artifact exists
@@ -542,7 +558,7 @@ Expected: FAIL because current implementation still preallocates fresh threads a
 
 - [ ] **Step 3: Implement the sidecar and terminal lifecycle**
 
-Add one sidecar per Codex terminal, keep fresh panes live-only until the provider actually creates a thread, parse the required notifications, promote durability only after artifact proof, and tear the sidecar down on terminal exit and every other cleanup path.
+Add one sidecar per Codex terminal, keep fresh panes live-only until the provider actually creates a thread, parse the required notifications, promote durability only after artifact proof, tear the sidecar down on terminal exit and every other cleanup path, and reap orphaned sidecars/endpoints on server boot after a crash using explicit ownership metadata instead of broad kill patterns.
 
 - [ ] **Step 4: Re-run the Codex suite and broader regressions**
 
@@ -735,7 +751,7 @@ git commit -m "refactor: cut consumers over to explicit session identity"
 
 - [ ] **Step 1: Update `docs/index.html` only if the visible restore contract changed**
 
-Do not touch the mock unless the default experience now shows materially different restore wording or status affordances.
+Update the mock if the default experience now surfaces explicit `RESTORE_UNAVAILABLE` messaging or any materially different restore wording/status affordances. If the final UI still leaves the default mock accurate without changes, record that conclusion during Task 9 verification.
 
 - [ ] **Step 2: Run lint**
 
