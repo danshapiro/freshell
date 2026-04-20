@@ -301,7 +301,10 @@ describe('pane activity', () => {
           shell: 'system',
           createdAt: 1,
           terminalId: 'term-live',
-          resumeSessionId: sessionId,
+          sessionRef: {
+            provider: 'opencode',
+            sessionId,
+          },
         },
       ],
       paneLayouts: {
@@ -315,7 +318,10 @@ describe('pane activity', () => {
             mode: 'opencode',
             shell: 'system',
             terminalId: 'term-live',
-            resumeSessionId: sessionId,
+            sessionRef: {
+              provider: 'opencode',
+              sessionId,
+            },
           },
         },
       },
@@ -333,5 +339,49 @@ describe('pane activity', () => {
     })
 
     expect(busySessionKeys).toEqual([`opencode:${sessionId}`])
+  })
+
+  it('does not synthesize OpenCode busy session keys from a tab title when no canonical identity exists', () => {
+    const busySessionKeys = collectBusySessionKeys({
+      tabs: [
+        {
+          id: 'tab-opencode-title',
+          title: 'probe-title-two',
+          createRequestId: 'req-opencode-title',
+          status: 'running',
+          mode: 'opencode',
+          shell: 'system',
+          createdAt: 1,
+          terminalId: 'term-live',
+        },
+      ],
+      paneLayouts: {
+        'tab-opencode-title': {
+          type: 'leaf',
+          id: 'pane-opencode-title',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'req-opencode-title',
+            status: 'running',
+            mode: 'opencode',
+            shell: 'system',
+            terminalId: 'term-live',
+          },
+        },
+      },
+      codexActivityByTerminalId: {},
+      opencodeActivityByTerminalId: {
+        'term-live': {
+          terminalId: 'term-live',
+          sessionId: '33333333-3333-4333-8333-333333333333',
+          phase: 'busy',
+          updatedAt: 1,
+        },
+      },
+      paneRuntimeActivityByPaneId: {},
+      agentChatSessions: {},
+    })
+
+    expect(busySessionKeys).toEqual([])
   })
 })

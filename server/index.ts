@@ -362,6 +362,21 @@ async function main() {
   opencodeActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastOpencodeActivityUpdated(payload)
   })
+  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
+    try {
+      wsHandler.broadcast({
+        type: 'terminal.session.associated' as const,
+        terminalId,
+        sessionId,
+      })
+      const metaUpsert = terminalMetadata.associateSession(terminalId, 'opencode', sessionId)
+      if (metaUpsert) {
+        broadcastTerminalMetaUpserts([metaUpsert])
+      }
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+    }
+  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return

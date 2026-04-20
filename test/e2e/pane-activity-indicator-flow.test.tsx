@@ -323,6 +323,7 @@ describe('pane activity indicator flow (e2e)', () => {
   })
 
   it('shows OpenCode terminals blue only for exact terminal busy activity and clears on removal', () => {
+    const sessionId = '33333333-3333-4333-8333-333333333333'
     const pane: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-opencode',
@@ -330,7 +331,10 @@ describe('pane activity indicator flow (e2e)', () => {
       mode: 'opencode',
       shell: 'system',
       terminalId: 'term-opencode',
-      resumeSessionId: 'session-opencode',
+      sessionRef: {
+        provider: 'opencode',
+        sessionId,
+      },
     }
 
     const { store } = renderHarness({
@@ -338,7 +342,10 @@ describe('pane activity indicator flow (e2e)', () => {
       tab: {
         mode: 'opencode',
         terminalId: 'term-opencode',
-        resumeSessionId: 'session-opencode',
+        sessionRef: {
+          provider: 'opencode',
+          sessionId,
+        },
       },
     })
 

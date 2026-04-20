@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import http from 'http'
+import { EventEmitter } from 'events'
 import WebSocket from 'ws'
-import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
+import { OPENCODE_HEALTH_POLL_MS } from '../../../server/coding-cli/opencode-activity-tracker.js'
+import { wireOpencodeActivityTracker } from '../../../server/coding-cli/opencode-activity-wiring.js'
 
 const HOOK_TIMEOUT_MS = 30_000
 const OPENCODE_SESSION_ID = 'opencode-session-123'
@@ -20,7 +23,7 @@ const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   projectColors: {},
 }))
 
-vi.mock('../../server/config-store', () => ({
+vi.mock('../../../server/config-store.js', () => ({
   configStore: {
     snapshot: vi.fn().mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT),
   },
@@ -133,16 +136,38 @@ async function closeWebSocket(ws: WebSocket): Promise<void> {
   })
 }
 
+function createJsonResponse(body: unknown, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(body), {
+    headers: { 'content-type': 'application/json' },
+    ...init,
+  })
+}
+
+function createSseResponse(events: unknown[]) {
+  const encoder = new TextEncoder()
+  return new Response(new ReadableStream({
+    start(controller) {
+      for (const event of events) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+      }
+      controller.close()
+    },
+  }), {
+    headers: { 'content-type': 'text/event-stream' },
+  })
+}
+
 class FakeBuffer {
   snapshot() {
     return ''
   }
 }
 
-class FakeRegistry {
+class FakeRegistry extends EventEmitter {
   records = new Map<string, any>()
   lastCreateOpts: any = null
   createCallCount = 0
+  bindCalls: Array<{ terminalId: string; provider: string; sessionId: string; reason: string }> = []
 
   create(opts: any) {
     this.lastCreateOpts = opts
@@ -159,9 +184,11 @@ class FakeRegistry {
       cols: 80,
       rows: 24,
       resumeSessionId: opts.resumeSessionId,
+      opencodeServer: opts.providerSettings?.opencodeServer,
       clients: new Set<WebSocket>(),
     }
     this.records.set(terminalId, record)
+    this.emit('terminal.created', record)
     return record
   }
 
@@ -222,6 +249,21 @@ class FakeRegistry {
       clearedTerminalIds: [] as string[],
     }
   }
+
+  bindSession(terminalId: string, provider: string, sessionId: string, reason = 'association') {
+    const record = this.records.get(terminalId)
+    if (!record) {
+      return { ok: false, reason: 'terminal_missing' as const }
+    }
+    record.resumeSessionId = sessionId
+    this.bindCalls.push({ terminalId, provider, sessionId, reason })
+    this.emit('terminal.session.bound', { terminalId, provider, sessionId, reason })
+    return { ok: true as const, terminalId, sessionId }
+  }
+
+  rebindSession(terminalId: string, provider: string, sessionId: string, reason = 'association') {
+    return this.bindSession(terminalId, provider, sessionId, reason)
+  }
 }
 
 describe('opencode session flow (integration)', () => {
@@ -241,7 +283,7 @@ describe('opencode session flow (integration)', () => {
     process.env.HELLO_TIMEOUT_MS = '500'
 
     vi.resetModules()
-    const { WsHandler } = await import('../../server/ws-handler')
+    const { WsHandler } = await import('../../../server/ws-handler.js')
 
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -307,16 +349,17 @@ describe('opencode session flow (integration)', () => {
     }
   })
 
-  it('fails closed when opencode restore is requested without canonical durable identity', async () => {
+  it('fails closed when opencode restore is requested with only a raw title-like resume token', async () => {
     const ws = await createAuthenticatedWs(port)
 
     try {
-      const requestId = 'opencode-restore-no-canonical'
+      const requestId = 'opencode-restore-title-token'
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'opencode',
         restore: true,
+        resumeSessionId: 'probe-title-two',
       }))
 
       const response = await waitForMessage(
@@ -348,7 +391,10 @@ describe('opencode session flow (integration)', () => {
         requestId,
         mode: 'opencode',
         restore: true,
-        resumeSessionId: OPENCODE_SESSION_ID,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId: OPENCODE_SESSION_ID,
+        },
       }))
 
       const response = await waitForMessage(
@@ -360,10 +406,100 @@ describe('opencode session flow (integration)', () => {
       )
 
       expect(response.type).toBe('terminal.created')
-      expect(response.effectiveResumeSessionId).toBe(OPENCODE_SESSION_ID)
       expect(registry.lastCreateOpts?.resumeSessionId).toBe(OPENCODE_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
+    }
+  })
+
+  it('keeps an OpenCode terminal live-only until the control surface reports a canonical session id', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true, version: '1.4.11' })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([{ type: 'server.connected', properties: {} }])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const wiring = wireOpencodeActivityTracker({
+      registry: registry as any,
+      fetchImpl: fetchImpl as typeof fetch,
+      random: () => 0,
+    })
+
+    try {
+      const record = registry.create({
+        mode: 'opencode',
+        providerSettings: {
+          opencodeServer: { hostname: '127.0.0.1', port: 43123 },
+        },
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(OPENCODE_HEALTH_POLL_MS)
+
+      expect(record.resumeSessionId).toBeUndefined()
+      expect(registry.bindCalls).toEqual([])
+    } finally {
+      wiring.dispose()
+      vi.useRealTimers()
+    }
+  })
+
+  it('promotes an OpenCode terminal only after authoritative control data exposes a canonical session id', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true, version: '1.4.11' })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          [OPENCODE_SESSION_ID]: { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([{ type: 'server.connected', properties: {} }])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const wiring = wireOpencodeActivityTracker({
+      registry: registry as any,
+      fetchImpl: fetchImpl as typeof fetch,
+      random: () => 0,
+    })
+
+    try {
+      const record = registry.create({
+        mode: 'opencode',
+        providerSettings: {
+          opencodeServer: { hostname: '127.0.0.1', port: 43123 },
+        },
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      await vi.advanceTimersByTimeAsync(OPENCODE_HEALTH_POLL_MS)
+
+      expect(record.resumeSessionId).toBe(OPENCODE_SESSION_ID)
+      expect(registry.bindCalls).toEqual([
+        expect.objectContaining({
+          terminalId: record.terminalId,
+          provider: 'opencode',
+          sessionId: OPENCODE_SESSION_ID,
+          reason: 'association',
+        }),
+      ])
+    } finally {
+      wiring.dispose()
+      vi.useRealTimers()
     }
   })
 })

@@ -1461,7 +1461,8 @@ export class WsHandler {
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = canonicalSessionId ?? m.resumeSessionId
+        let effectiveResumeSessionId = canonicalSessionId
+          ?? (m.mode === 'claude' ? m.resumeSessionId : undefined)
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
@@ -1660,6 +1661,15 @@ export class WsHandler {
                     log.debug({ err, sessionId, connectionId: ws.connectionId }, 'Session repair wait failed, proceeding with resume')
                   }
                 }
+              }
+
+              if (m.mode === 'opencode' && m.restore && !canonicalSessionId) {
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'OpenCode restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
               }
 
               if (m.mode === 'claude' && m.restore && !isValidClaudeSessionId(effectiveResumeSessionId)) {
