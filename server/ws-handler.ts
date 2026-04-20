@@ -1662,6 +1662,15 @@ export class WsHandler {
                 }
               }
 
+              if (m.mode === 'claude' && m.restore && !isValidClaudeSessionId(effectiveResumeSessionId)) {
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'Claude restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
               // After async repair wait, check if the client disconnected
               if (ws.readyState !== WebSocket.OPEN) {
                 log.debug({ connectionId: ws.connectionId, requestId: m.requestId },
@@ -1712,7 +1721,7 @@ export class WsHandler {
                   mode: m.mode as TerminalMode,
                   shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                   cwd: m.cwd,
-                  resumeSessionId: canonicalSessionId ?? effectiveResumeSessionId,
+                  resumeSessionId: effectiveResumeSessionId,
                   ...(requestedCodexResumeSessionId
                     ? {
                         sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),

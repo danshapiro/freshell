@@ -191,6 +191,7 @@ export function mergeSessionMetadataForPreferredResumeId({
 
   const nextSessionMetadataByKey: Record<string, SessionListMetadata> = { ...existing }
   let mergedPreferredMetadata: SessionListMetadata | undefined = existing[preferredKey]
+  let matchedCandidateMetadata = mergedPreferredMetadata != null
 
   for (const sessionId of candidateIds) {
     const key = sessionMetadataKey(provider, sessionId)
@@ -199,6 +200,7 @@ export function mergeSessionMetadataForPreferredResumeId({
       ?? localSessionMetadataByKey?.[key]
       ?? remoteSessionMetadataByKey?.[key]
     if (candidateMetadata) {
+      matchedCandidateMetadata = true
       mergedPreferredMetadata = {
         ...(mergedPreferredMetadata ?? {}),
         ...candidateMetadata,
@@ -206,6 +208,23 @@ export function mergeSessionMetadataForPreferredResumeId({
     }
     if (key !== preferredKey) {
       delete nextSessionMetadataByKey[key]
+    }
+  }
+
+  if (!matchedCandidateMetadata) {
+    const providerEntries = new Map<string, SessionListMetadata>()
+    for (const source of [existing, localSessionMetadataByKey ?? {}, remoteSessionMetadataByKey ?? {}]) {
+      for (const [key, value] of Object.entries(source)) {
+        if (!key.startsWith(`${provider}:`)) continue
+        providerEntries.set(key, value)
+      }
+    }
+    if (providerEntries.size === 1) {
+      const [fallbackMetadata] = providerEntries.values()
+      mergedPreferredMetadata = {
+        ...(mergedPreferredMetadata ?? {}),
+        ...fallbackMetadata,
+      }
     }
   }
 
@@ -238,16 +257,20 @@ export function buildAgentChatPersistedIdentityUpdate({
   tabUpdates?: Partial<Tab>
   shouldFlush: boolean
 } | null {
-  const preferredResumeSessionId = getPreferredResumeSessionId(session)
-  if (!preferredResumeSessionId) return null
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session)
+  if (!canonicalDurableSessionId) return null
   const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
     paneResumeSessionId: paneContent.resumeSessionId,
     tabResumeSessionId: currentTab?.resumeSessionId,
-    sessionId: preferredResumeSessionId,
+    sessionId: canonicalDurableSessionId,
     flushSessionId: canonicalDurableSessionId,
   })
   const paneUpdates = durableIdentityUpdate?.paneUpdates
+    ? {
+        ...durableIdentityUpdate.paneUpdates,
+        restoreError: undefined,
+      }
+    : (paneContent.restoreError ? { restoreError: undefined } : undefined)
 
   let tabUpdates: Partial<Tab> | undefined
   if (currentTab) {
@@ -263,7 +286,7 @@ export function buildAgentChatPersistedIdentityUpdate({
       provider: metadataProvider,
       localResumeSessionId: currentTab.resumeSessionId,
       remoteResumeSessionId: paneContent.resumeSessionId,
-      preferredResumeSessionId,
+      preferredResumeSessionId: canonicalDurableSessionId,
       sessionType: paneContent.provider,
     })
 

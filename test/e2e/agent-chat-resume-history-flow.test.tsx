@@ -75,33 +75,34 @@ describe('agent chat resume history flow', () => {
   })
 
   it('hydrates durable history after sdk.created for a resumed create', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000225'
     getAgentTimelinePage.mockResolvedValue({
-      sessionId: 'cli-session-1',
+      sessionId: canonicalSessionId,
       items: [
         {
           turnId: 'turn-older-user',
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           role: 'user',
           summary: 'Older question',
           timestamp: '2026-03-10T10:00:00.000Z',
         },
         {
           turnId: 'turn-older-assistant',
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           role: 'assistant',
           summary: 'Older answer',
           timestamp: '2026-03-10T10:00:20.000Z',
         },
         {
           turnId: 'turn-new-user',
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           role: 'user',
           summary: 'New prompt',
           timestamp: '2026-03-10T10:01:00.000Z',
         },
         {
           turnId: 'turn-new-assistant',
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           role: 'assistant',
           summary: 'New reply',
           timestamp: '2026-03-10T10:01:20.000Z',
@@ -111,7 +112,7 @@ describe('agent chat resume history flow', () => {
       revision: 4,
       bodies: {
         'turn-older-user': {
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           turnId: 'turn-older-user',
           message: {
             role: 'user',
@@ -120,7 +121,7 @@ describe('agent chat resume history flow', () => {
           },
         },
         'turn-older-assistant': {
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           turnId: 'turn-older-assistant',
           message: {
             role: 'assistant',
@@ -129,7 +130,7 @@ describe('agent chat resume history flow', () => {
           },
         },
         'turn-new-user': {
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           turnId: 'turn-new-user',
           message: {
             role: 'user',
@@ -138,7 +139,7 @@ describe('agent chat resume history flow', () => {
           },
         },
         'turn-new-assistant': {
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           turnId: 'turn-new-assistant',
           message: {
             role: 'assistant',
@@ -158,7 +159,7 @@ describe('agent chat resume history flow', () => {
         provider: 'freshclaude',
         createRequestId: 'req-resume',
         status: 'creating',
-        resumeSessionId: 'cli-session-1',
+        resumeSessionId: canonicalSessionId,
       },
     }))
 
@@ -171,7 +172,7 @@ describe('agent chat resume history flow', () => {
     expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
       type: 'sdk.create',
       requestId: 'req-resume',
-      resumeSessionId: 'cli-session-1',
+      resumeSessionId: canonicalSessionId,
     }))
 
     act(() => {
@@ -185,7 +186,7 @@ describe('agent chat resume history flow', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-session-1',
+        timelineSessionId: canonicalSessionId,
         revision: 4,
       })
     })
@@ -194,7 +195,7 @@ describe('agent chat resume history flow', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-session-1',
+        canonicalSessionId,
         expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 4 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
@@ -227,11 +228,11 @@ describe('agent chat resume history flow', () => {
     })
     getAgentTimelinePage
       .mockResolvedValueOnce({
-        sessionId: 'named-resume',
+        sessionId: 'sdk-live-only',
         items: [
           {
             turnId: 'turn-live-1',
-            sessionId: 'named-resume',
+            sessionId: 'sdk-live-only',
             role: 'assistant',
             summary: 'Live-only reply',
             timestamp: '2026-03-10T10:01:20.000Z',
@@ -241,7 +242,7 @@ describe('agent chat resume history flow', () => {
         revision: 1,
         bodies: {
           'turn-live-1': {
-            sessionId: 'named-resume',
+            sessionId: 'sdk-live-only',
             turnId: 'turn-live-1',
             message: {
               role: 'assistant',
@@ -402,14 +403,13 @@ describe('agent chat resume history flow', () => {
         sessionId: 'sdk-live-only',
         latestTurnId: 'turn-live-1',
         status: 'idle',
-        timelineSessionId: 'named-resume',
         revision: 1,
       })
     })
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'named-resume',
+        'sdk-live-only',
         expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 1 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
@@ -431,7 +431,6 @@ describe('agent chat resume history flow', () => {
         sessionId: 'sdk-live-only',
         latestTurnId: 'turn-live-2',
         status: 'idle',
-        timelineSessionId: 'named-resume',
         revision: 2,
       })
     })
@@ -439,7 +438,7 @@ describe('agent chat resume history flow', () => {
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenNthCalledWith(
         2,
-        'named-resume',
+        'sdk-live-only',
         expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )

@@ -48,8 +48,7 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
 
 function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'timelineSessionId'>): string | undefined {
   return (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
-    ?? session.timelineSessionId
-    ?? session.cliSessionId
+    ?? (isValidClaudeSessionId(session.timelineSessionId) ? session.timelineSessionId : undefined)
 }
 
 function isRestoreFailureCode(code?: string): code is string {
@@ -146,7 +145,7 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      if (action.payload.cliSessionId) {
+      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
         session.awaitingDurableHistory = false
       }
       if (session.status === 'creating' || session.status === 'starting') {
@@ -203,9 +202,12 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextTimelineSessionId = isValidClaudeSessionId(action.payload.timelineSessionId)
+        ? action.payload.timelineSessionId
+        : undefined
       const nextRestoreQueryId = getRestoreQueryId({
         cliSessionId: session.cliSessionId,
-        timelineSessionId: action.payload.timelineSessionId ?? session.timelineSessionId,
+        timelineSessionId: nextTimelineSessionId ?? session.timelineSessionId,
       })
       const shouldRestartHydration = Boolean(
         session.historyLoaded
@@ -225,7 +227,7 @@ const agentChatSlice = createSlice({
 
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
-      session.timelineSessionId = action.payload.timelineSessionId
+      session.timelineSessionId = nextTimelineSessionId
       session.timelineRevision = action.payload.revision
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
@@ -233,7 +235,7 @@ const agentChatSlice = createSlice({
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
-        const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
+        const hasDurableHistoryIdentity = isValidClaudeSessionId(nextTimelineSessionId)
           || isValidClaudeSessionId(session.cliSessionId)
         if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
           session.historyLoaded = true

@@ -353,7 +353,7 @@ describe('terminal.create session repair wait', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toMatch(/^term_/)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
       expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
@@ -454,7 +454,7 @@ describe('terminal.create session repair wait', () => {
 
       // Should still create with the resumeSessionId (repair failed, but we proceed)
       expect(created.terminalId).toMatch(/^term_/)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
     }
@@ -869,7 +869,7 @@ describe('terminal.create session repair wait', () => {
       const created = await createdPromise
 
       // Resume should proceed (not be dropped)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
       // waitForSession should have been called despite cached result
       expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
     } finally {
@@ -897,8 +897,6 @@ describe('terminal.create session repair wait', () => {
 
       // Non-UUID name is now passed through to the registry (not stripped)
       expect(registry.lastCreateOpts?.resumeSessionId).toBe('not-a-uuid')
-      // effectiveResumeSessionId is set because the name is passed through
-      expect(created.effectiveResumeSessionId).toBe('not-a-uuid')
       // Session repair is still skipped for non-UUID names
       expect(sessionRepairService.waitForSessionCalls).not.toContain('not-a-uuid')
     } finally {

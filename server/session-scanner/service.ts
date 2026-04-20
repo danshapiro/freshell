@@ -17,6 +17,7 @@ import { SessionCache } from './cache.js'
 import { SessionRepairQueue, type Priority, ACTIVE_CACHE_GRACE_MS } from './queue.js'
 import { ClaudeHistoryRepairer } from './history-repair.js'
 import type { SessionScanner, SessionScanResult, SessionRepairResult } from './types.js'
+import { isCanonicalClaudeSessionId } from '../../shared/session-contract.js'
 
 const BACKUP_RETENTION_DAYS = 30
 const CACHE_FILENAME = 'session-cache.json'
@@ -150,9 +151,11 @@ export class SessionRepairService extends EventEmitter {
       })
     }
 
-    if (items.length === 0) return
+    const canonicalItems = items.filter((item) => isCanonicalClaudeSessionId(item.sessionId))
 
-    this.enqueueResolved(items)
+    if (canonicalItems.length === 0) return
+
+    this.enqueueResolved(canonicalItems)
   }
 
   /**
@@ -160,6 +163,10 @@ export class SessionRepairService extends EventEmitter {
    * Used by terminal.create before spawning Claude with --resume.
    */
   async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanResult> {
+    if (!isCanonicalClaudeSessionId(sessionId)) {
+      throw new Error(`Session ${sessionId} is not a canonical Claude session id`)
+    }
+
     // Check if already processed
     const existing = this.queue.getResult(sessionId)
     if (existing) {
@@ -317,11 +324,13 @@ export class SessionRepairService extends EventEmitter {
   }
 
   private resolveCachedPath(sessionId: string): string | null {
+    if (!isCanonicalClaudeSessionId(sessionId)) return null
     this.ensureSessionIndex()
     return this.sessionPathIndex.get(sessionId) || null
   }
 
   private async resolveFilePath(sessionId: string): Promise<string | null> {
+    if (!isCanonicalClaudeSessionId(sessionId)) return null
     if (this.filePathResolver) {
       const resolved = this.filePathResolver(sessionId)
       if (resolved) {

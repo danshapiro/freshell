@@ -150,9 +150,6 @@ export function synthesizeLiveMessageId(sessionId: string, ordinal: number): str
 
 function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState): string | undefined {
   if (isValidClaudeSessionId(liveSession?.cliSessionId)) return liveSession.cliSessionId
-  if (isValidClaudeSessionId(liveSession?.resumeSessionId)) {
-    return liveSession.resumeSessionId
-  }
   if (isValidClaudeSessionId(queryId)) return queryId
   return undefined
 }
@@ -538,7 +535,6 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     const timelineSessionId = resolveTimelineSessionId(liveSession.sessionId, liveSession)
     const existing = findLedgerRecord([
       liveSession.sessionId,
-      liveSession.resumeSessionId,
       timelineSessionId,
     ])
     const ledger = existing ?? createLedgerRecord(liveSession.sessionId)
@@ -562,7 +558,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
     })
 
     bindAliases(ledger, {
-      liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],
+      liveAliases: [liveSession.sessionId],
       durableAliases: [isCanonicalDurableSessionId(timelineSessionId) ? timelineSessionId : undefined],
     })
 
@@ -575,7 +571,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
         captureCompatibilityCandidates: ledger.durableMessages.length === 0,
       })
       bindAliases(ledger, {
-        liveAliases: [liveSession.sessionId, liveSession.resumeSessionId],
+        liveAliases: [liveSession.sessionId],
         durableAliases: [timelineSessionId],
       })
     }
@@ -586,7 +582,6 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
   return {
     async syncLiveSession(liveSession: SdkSessionState): Promise<void> {
       tombstonedLiveAliases.delete(liveSession.sessionId)
-      if (liveSession.resumeSessionId) tombstonedLiveAliases.delete(liveSession.resumeSessionId)
       await syncLiveSession(liveSession, { refreshDurableHistory: false })
     },
 

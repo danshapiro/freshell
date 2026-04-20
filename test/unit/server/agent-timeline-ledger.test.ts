@@ -53,7 +53,7 @@ describe('restore ledger manager', () => {
     })
   })
 
-  it('returns typed live-only, merged, and durable-only restore outcomes while upgrading aliases in place', async () => {
+  it('keeps mutable named aliases out of restore resolution while canonical ids upgrade in place', async () => {
     const liveSession = makeSession({
       sessionId: 'sdk-live',
       resumeSessionId: 'named-resume-token',
@@ -91,20 +91,15 @@ describe('restore ledger manager', () => {
     if (liveOnly.kind !== 'resolved') throw new Error('expected resolved')
     const initialRevision = liveOnly.revision
 
-    const namedAliasLiveOnly = await manager.resolve('named-resume-token')
-    expect(namedAliasLiveOnly).toMatchObject({
-      kind: 'resolved',
-      readiness: 'live_only',
-      liveSessionId: 'sdk-live',
-      timelineSessionId: undefined,
+    await expect(manager.resolve('named-resume-token')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
     })
-    if (namedAliasLiveOnly.kind !== 'resolved') throw new Error('expected resolved')
-    expect(namedAliasLiveOnly.revision).toBe(initialRevision)
 
     liveSession.cliSessionId = '00000000-0000-4000-8000-000000000123'
     liveSession.messages.push(makeMessage('assistant', 'new live reply', { messageId: 'live-assistant-2' }))
 
-    const merged = await manager.resolve('named-resume-token')
+    const merged = await manager.resolve('sdk-live')
     expect(merged).toMatchObject({
       kind: 'resolved',
       readiness: 'merged',
@@ -120,21 +115,10 @@ describe('restore ledger manager', () => {
       'live-assistant-2',
     ])
 
-    const namedAliasMerged = await manager.resolve('named-resume-token')
-    expect(namedAliasMerged).toMatchObject({
-      kind: 'resolved',
-      readiness: 'merged',
-      liveSessionId: 'sdk-live',
-      timelineSessionId: '00000000-0000-4000-8000-000000000123',
+    await expect(manager.resolve('named-resume-token')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
     })
-    if (namedAliasMerged.kind !== 'resolved') throw new Error('expected resolved')
-    expect(namedAliasMerged.revision).toBe(merged.revision)
-    expect(namedAliasMerged.turns.map((turn) => turn.messageId)).toEqual([
-      'durable-user-1',
-      'durable-assistant-1',
-      'live-user-1',
-      'live-assistant-2',
-    ])
 
     manager.teardownLiveSession('sdk-live', { recoverable: true })
 
@@ -381,10 +365,17 @@ describe('restore ledger manager', () => {
       timelineSessionId: undefined,
     })
 
-    const beforeTeardown = await manager.resolve('named-only')
-    expect(beforeTeardown).toMatchObject({ kind: 'resolved', readiness: 'live_only' })
+    await expect(manager.resolve('named-only')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
+    })
 
     manager.teardownLiveSession('sdk-gone', { recoverable: false })
+
+    await expect(manager.resolve('sdk-gone')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
+    })
 
     const afterTeardown = await manager.resolve('named-only')
     expect(afterTeardown).toEqual({ kind: 'missing', code: 'RESTORE_NOT_FOUND' })
@@ -774,7 +765,7 @@ describe('restore ledger manager', () => {
 
     liveSession.cliSessionId = canonicalSessionId
 
-    const upgraded = await manager.resolve('named-repeat-upgrade')
+    const upgraded = await manager.resolve('sdk-repeat-upgrade')
 
     expect(upgraded).toMatchObject({
       kind: 'resolved',
