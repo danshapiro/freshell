@@ -220,12 +220,12 @@ export function buildSessionItems(
     const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
 
     if (node.content.kind === 'agent-chat') {
-      const sessionId = node.content.sessionRef?.sessionId ?? node.content.resumeSessionId
-      if (!sessionId || !isValidClaudeSessionId(sessionId)) return
-      const metadata = getSessionMetadata(tab, 'claude', sessionId)
+      const sessionRef = node.content.sessionRef
+      if (sessionRef?.provider !== 'claude' || !isValidClaudeSessionId(sessionRef.sessionId)) return
+      const metadata = getSessionMetadata(tab, 'claude', sessionRef.sessionId)
       pushFallbackItem({
         provider: 'claude',
-        sessionId,
+        sessionId: sessionRef.sessionId,
         sessionType: node.content.provider || 'claude',
         title: paneTitle || tab.title,
         cwd: undefined,
@@ -237,14 +237,14 @@ export function buildSessionItems(
 
     if (node.content.kind !== 'terminal') return
     if (node.content.mode === 'shell') return
-    const sessionId = node.content.sessionRef?.sessionId ?? node.content.resumeSessionId
-    if (!sessionId) return
+    const sessionRef = node.content.sessionRef
+    if (!sessionRef) return
 
-    const metadata = getSessionMetadata(tab, node.content.mode, sessionId)
+    const metadata = getSessionMetadata(tab, sessionRef.provider, sessionRef.sessionId)
     pushFallbackItem({
-      provider: node.content.mode,
-      sessionId,
-      sessionType: node.content.mode,
+      provider: sessionRef.provider,
+      sessionId: sessionRef.sessionId,
+      sessionType: sessionRef.provider,
       title: paneTitle || tab.title,
       cwd: node.content.initialCwd,
       timestamp: fallbackTimestamp,
@@ -259,8 +259,8 @@ export function buildSessionItems(
       continue
     }
 
-    const provider = tab.sessionRef?.provider ?? tab.codingCliProvider ?? (tab.mode !== 'shell' ? tab.mode : undefined)
-    const sessionId = tab.sessionRef?.sessionId ?? tab.resumeSessionId
+    const provider = tab.sessionRef?.provider
+    const sessionId = tab.sessionRef?.sessionId
     if (!provider || !sessionId) continue
 
     const metadata = getSessionMetadata(tab, provider, sessionId)

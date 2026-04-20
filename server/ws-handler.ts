@@ -171,6 +171,20 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+function buildCanonicalTerminalSessionRef(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+): { provider: string; sessionId: string } | undefined {
+  if (mode === 'shell' || !isNonEmptyString(resumeSessionId)) return undefined
+  if (mode === 'claude' && !isValidClaudeSessionId(resumeSessionId)) {
+    return undefined
+  }
+  return {
+    provider: mode,
+    sessionId: resumeSessionId,
+  }
+}
+
 const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
 
 function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
@@ -1278,7 +1292,20 @@ export class WsHandler {
       }
 
       // Send terminal inventory so the client knows what's alive
-      const terminals = this.registry.list()
+      const terminals = this.registry.list().map((terminal) => {
+        const sessionRef = buildCanonicalTerminalSessionRef(terminal.mode, terminal.resumeSessionId)
+        return {
+          terminalId: terminal.terminalId,
+          title: terminal.title,
+          description: terminal.description,
+          mode: terminal.mode,
+          ...(sessionRef ? { sessionRef } : {}),
+          createdAt: terminal.createdAt,
+          lastActivityAt: terminal.lastActivityAt,
+          status: terminal.status,
+          cwd: terminal.cwd,
+        }
+      })
       const terminalMeta = this.terminalMetaListProvider?.() ?? []
       this.safeSend(ws, {
         type: 'terminal.inventory',

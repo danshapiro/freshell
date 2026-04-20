@@ -2410,7 +2410,10 @@ describe('TerminalView lifecycle updates', () => {
     messageHandler!({
       type: 'terminal.session.associated',
       terminalId: 'term-assoc',
-      sessionId,
+      sessionRef: {
+        provider: 'claude',
+        sessionId,
+      },
     })
 
     // Verify pane content keeps only the canonical sessionRef
@@ -2510,7 +2513,10 @@ describe('TerminalView lifecycle updates', () => {
     messageHandler!({
       type: 'terminal.session.associated',
       terminalId: 'term-codex-durable',
-      sessionId,
+      sessionRef: {
+        provider: 'codex',
+        sessionId,
+      },
     })
 
     await waitFor(() => {

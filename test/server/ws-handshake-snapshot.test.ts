@@ -40,11 +40,17 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
 }
 
 class FakeRegistry {
+  private terminals: any[] = []
+
   detach() {
     return true
   }
   list() {
-    return []
+    return [...this.terminals]
+  }
+
+  setTerminals(terminals: any[]) {
+    this.terminals = [...terminals]
   }
 }
 
@@ -142,6 +148,7 @@ describe('ws handshake snapshot', () => {
   let server: http.Server | undefined
   let port: number
   let snapshot: Snapshot
+  let registry: FakeRegistry
   let originalNodeEnv: string | undefined
   let originalAuthToken: string | undefined
   let originalHelloTimeoutMs: string | undefined
@@ -185,7 +192,9 @@ describe('ws handshake snapshot', () => {
       res.end()
     })
 
-    new (WsHandler as any)(server, new FakeRegistry() as any, {
+    registry = new FakeRegistry()
+
+    new (WsHandler as any)(server, registry as any, {
       handshakeSnapshotProvider: async () => snapshot,
     })
 
@@ -313,6 +322,18 @@ describe('ws handshake snapshot', () => {
   })
 
   it('sends terminal inventory in handshake snapshot', async () => {
+    registry.setTerminals([
+      {
+        terminalId: 'term-inventory-1',
+        title: 'Claude CLI',
+        mode: 'claude',
+        resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+        createdAt: 1,
+        lastActivityAt: 2,
+        status: 'running',
+      },
+    ])
+
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -326,6 +347,14 @@ describe('ws handshake snapshot', () => {
       expect(inventory).toHaveProperty('bootId')
       expect(Array.isArray(inventory.terminals)).toBe(true)
       expect(Array.isArray(inventory.terminalMeta)).toBe(true)
+      expect(inventory.terminals).toContainEqual(expect.objectContaining({
+        terminalId: 'term-inventory-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: '550e8400-e29b-41d4-a716-446655440000',
+        },
+      }))
+      expect(inventory.terminals[0]).not.toHaveProperty('resumeSessionId')
     } finally {
       await closeWs(ws)
     }

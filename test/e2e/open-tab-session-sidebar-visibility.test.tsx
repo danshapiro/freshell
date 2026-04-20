@@ -1096,7 +1096,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
   })
 
-  it('shows a fallback sidebar item for a Claude tab with a human-readable resume name', async () => {
+  it('does not synthesize a sidebar fallback item from a Claude tab human-readable resume name', async () => {
     const namedResumeName = '137 tour'
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [],
@@ -1145,10 +1145,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
       </Provider>,
     )
 
-    await waitFor(() => {
-      // The session should appear in the sidebar as a fallback item
-      expect(screen.getAllByText('137 tour').length).toBeGreaterThan(0)
-    })
+    await screen.findByText('No sessions yet')
+    expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
   })
 
   it('keeps an open Codex session visible when the indexed sidebar row is titleless', async () => {
@@ -1180,6 +1178,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
         id: 'tab-1',
         title: 'Investigate sidebar visibility',
         mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId,
+        },
         resumeSessionId: sessionId,
         createdAt: Date.now(),
       }],
@@ -1193,6 +1195,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
               mode: 'codex',
               createRequestId: 'req-1',
               status: 'running',
+              sessionRef: {
+                provider: 'codex',
+                sessionId,
+              },
               resumeSessionId: sessionId,
               initialCwd: '/repo',
             },
@@ -1254,6 +1260,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
         id: 'tab-rename-stable',
         title: 'Locally renamed title',
         mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId,
+        },
         resumeSessionId: sessionId,
         createdAt: Date.now(),
       }],
@@ -1271,7 +1281,6 @@ describe('open tab session sidebar visibility (e2e)', () => {
               sessionRef: {
                 provider: 'codex',
                 sessionId,
-                serverInstanceId: 'srv-local',
               },
               initialCwd: '/repo',
             },

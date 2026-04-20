@@ -301,7 +301,10 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       wsHarness.emit({
         type: 'terminal.session.associated',
         terminalId: 'term-codex-refresh-old',
-        sessionId: 'codex-session-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
       })
     })
 

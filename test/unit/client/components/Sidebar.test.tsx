@@ -312,6 +312,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           id: 'tab-restored',
           title: 'Restored Session',
           mode: 'codex',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-restored',
+          },
           resumeSessionId: 'codex-restored',
           createdAt: 2_000,
         }],
@@ -325,6 +329,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-restored',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: 'codex-restored',
+                },
                 resumeSessionId: 'codex-restored',
                 cwd: '/tmp/restored-project',
               },
@@ -704,7 +712,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toHaveClass('bg-muted')
     })
 
-    it('marks non-UUID Claude pane resumeSessionId as hasTab (named resume)', async () => {
+    it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
       const namedResume = 'not-a-uuid'
       const projects: ProjectGroup[] = [
         {
@@ -757,8 +765,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       const button = screen.getByText('Named resume session').closest('button')
       expect(button).not.toBeNull()
-      // Non-UUID Claude resume names are now recognized as valid tabs
-      expect(button).toHaveAttribute('data-has-tab', 'true')
+      expect(button).toHaveAttribute('data-has-tab', 'false')
+      expect(button).not.toHaveClass('bg-muted')
     })
   })
 
@@ -1219,11 +1227,19 @@ describe('Sidebar Component - Session-Centric Display', () => {
         {
           id: 'tab-1',
           terminalId,
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: busySessionId,
+          },
           resumeSessionId: busySessionId,
           mode: 'opencode',
         },
         {
           id: 'tab-2',
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: idleSessionId,
+          },
           resumeSessionId: idleSessionId,
           mode: 'opencode',
         },
@@ -3529,6 +3545,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-match',
             title: 'Matching Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: matchingFallbackSessionId,
+            },
             resumeSessionId: matchingFallbackSessionId,
             createdAt: 1_000,
           },
@@ -3536,6 +3556,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-unrelated',
             title: 'Unrelated Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: unrelatedFallbackSessionId,
+            },
             resumeSessionId: unrelatedFallbackSessionId,
             createdAt: 900,
           },
@@ -3550,6 +3574,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-match',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: matchingFallbackSessionId,
+                },
                 resumeSessionId: matchingFallbackSessionId,
                 initialCwd: '/tmp/local/trycycle',
               },
@@ -3562,6 +3590,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-unrelated',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: unrelatedFallbackSessionId,
+                },
                 resumeSessionId: unrelatedFallbackSessionId,
                 initialCwd: '/tmp/local/elsewhere',
               },
@@ -3718,6 +3750,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-alpha-fallback',
             title: 'Alpha Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: alphaFallbackSessionId,
+            },
             resumeSessionId: alphaFallbackSessionId,
             createdAt: 1_000,
           },
@@ -3725,6 +3761,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-beta-fallback',
             title: 'Beta Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: betaFallbackSessionId,
+            },
             resumeSessionId: betaFallbackSessionId,
             createdAt: 900,
           },
@@ -3739,6 +3779,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-alpha-fallback',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: alphaFallbackSessionId,
+                },
                 resumeSessionId: alphaFallbackSessionId,
                 initialCwd: '/tmp/local/alpha',
               },
@@ -3751,6 +3795,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-beta-fallback',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: betaFallbackSessionId,
+                },
                 resumeSessionId: betaFallbackSessionId,
                 initialCwd: '/tmp/local/beta',
               },

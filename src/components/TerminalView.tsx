@@ -2124,21 +2124,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
         }
 
-        // Handle one-time session association (when Claude creates a new session)
-        // Message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
+        // Handle one-time session association from the authoritative canonical sessionRef.
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
-          const sessionId = msg.sessionId as string
+          const sessionRef = msg.sessionRef
+          if (!sessionRef?.provider || !sessionRef?.sessionId) {
+            return
+          }
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.session.associated', {
             paneId: paneIdRef.current,
             terminalId: tid,
             oldResumeSessionId: contentRef.current?.resumeSessionId,
-            newResumeSessionId: sessionId,
+            sessionRef,
           })
-          const mode = contentRef.current?.mode
           const currentTab = tabRef.current
           const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
-            provider: mode && mode !== 'shell' ? mode : undefined,
-            sessionId,
+            provider: sessionRef.provider,
+            sessionId: sessionRef.sessionId,
             paneSessionRef: contentRef.current?.sessionRef,
             tabSessionRef: currentTab?.sessionRef,
             paneResumeSessionId: contentRef.current?.resumeSessionId,

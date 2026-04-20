@@ -505,7 +505,7 @@ export type TerminalTitleUpdatedMessage = {
 export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
-  sessionId: string
+  sessionRef: SessionLocator
 }
 
 export type TerminalsChangedMessage = {
@@ -720,7 +720,7 @@ export type TerminalInventoryMessage = {
     title: string
     description?: string
     mode: string
-    resumeSessionId?: string
+    sessionRef?: SessionLocator
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'

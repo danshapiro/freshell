@@ -367,7 +367,10 @@ async function main() {
       wsHandler.broadcast({
         type: 'terminal.session.associated' as const,
         terminalId,
-        sessionId,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId,
+        },
       })
       const metaUpsert = terminalMetadata.associateSession(terminalId, 'opencode', sessionId)
       if (metaUpsert) {
@@ -556,7 +559,10 @@ async function main() {
         wsHandler.broadcast({
           type: 'terminal.session.associated' as const,
           terminalId,
-          sessionId: session.sessionId,
+          sessionRef: {
+            provider: session.provider,
+            sessionId: session.sessionId,
+          },
         })
         const metaUpsert = terminalMetadata.associateSession(
           terminalId,
@@ -643,7 +649,10 @@ async function main() {
       wsHandler.broadcast({
         type: 'terminal.session.associated' as const,
         terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
       const metaUpsert = terminalMetadata.associateSession(terminalId, 'claude', session.sessionId)
       if (metaUpsert) {

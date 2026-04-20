@@ -301,7 +301,10 @@ describe('TerminalView durable session contract', () => {
     messageHandler?.({
       type: 'terminal.session.associated',
       terminalId: 'term-1',
-      sessionId: VALID_CLAUDE_SESSION_ID,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      },
     })
 
     await waitFor(() => {
