@@ -4,7 +4,7 @@
 
 **Goal:** Prove the real provider contracts, then cut Freshell over to one explicit durable-session model where live reattach, durable restore, and launch-only inputs are separate states and only truly replay-safe provider identity is persisted.
 
-**Architecture:** Keep one persisted canonical identity, `sessionRef`, and treat everything else as either a live handle or a launch-time input. Reuse the existing terminal binding path instead of creating a second promotion event: `terminal.session.associated` becomes the single authoritative terminal durable-promotion event, while agent-chat keeps its existing live SDK `sessionId` separate from canonical durable Claude identity. Codex moves to one app-server sidecar per terminal, OpenCode promotes only from its authoritative control surface, and Claude/FreshClaude promote only when canonical UUID-backed history exists.
+**Architecture:** Persist two explicit state axes and nothing hybrid: a canonical durable restore target, `sessionRef = { provider, sessionId }`, and the existing live reattach handles already needed for same-server refresh recovery (`terminalId` for terminal panes, SDK `sessionId` for agent-chat panes). Reuse the existing terminal binding path instead of creating a second promotion event: `terminal.session.associated` becomes the single authoritative terminal durable-promotion event, while agent-chat keeps its existing live SDK `sessionId` separate from canonical durable Claude identity. Codex moves to one app-server sidecar per terminal, OpenCode promotes only from its authoritative control surface, and Claude/FreshClaude promote only when canonical UUID-backed history exists.
 
 **Tech Stack:** TypeScript, React 18, Redux Toolkit, Express, WebSocket (`ws`), node-pty, Vitest, Testing Library, opt-in real-binary probe tests for `codex`, `claude`, and `opencode`
 
@@ -16,7 +16,9 @@
 - Do not widen timeouts, add retries, or add “best effort” fallback resume behavior. The problem is identity semantics, not transport resilience.
 - Do not create a second durable-promotion control plane if the existing one can be made authoritative. Reuse `SessionBindingAuthority`, existing registry binding APIs, and `terminal.session.associated` for terminal durable promotion.
 - Do not persist names, titles, `/rename` results, fresh thread ids, or other launch-only tokens. Persist only canonical durable `sessionRef`.
+- Do not encode `serverInstanceId` into canonical durable identity. It is locality/runtime state, not replay-safe identity.
 - Do not flatten FreshClaude’s live SDK `sessionId` together with its durable Claude identity. Those are different state axes and must stay different.
+- Do not remove persisted live handles that power same-server refresh recovery. Keep them explicit and separate from durable restore identity.
 - Do not “solve” the migration by bumping `src/store/storage-migration.ts` to clear local state. Preserve persisted tabs/panes whenever canonical durable identity can still be proven; only surface restore-unavailable for entries that cannot be repaired safely.
 - Do not infer identity from cwd matching, PTY stdout, timing, or title text for Codex or OpenCode.
 - Do not silently fall back from “restore this session” to “start fresh.” If no durable target exists, surface restore-unavailable clearly.
@@ -55,8 +57,9 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 ### 1. Persisted durable identity
 
 - For terminal panes/tabs, persist exactly one canonical durable identity:
-  - `sessionRef = { provider, sessionId, serverInstanceId? }`
+  - `sessionRef = { provider, sessionId }`
 - `sessionRef` is the only replay-safe identity written to persisted terminal pane/tab state.
+- Persisted terminal and agent-chat pane state also keeps its existing live reattach handles (`terminalId` for terminals, SDK `sessionId` for agent-chat), but those fields remain live-only and must never be interpreted as durable restore targets.
 - Agent-chat keeps its own canonical durable Claude fields; do not force it onto terminal `sessionRef` semantics just to share a type name.
 - Raw `resumeSessionId` strings do not survive persistence after migration.
 
@@ -67,6 +70,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
   - `serverInstanceId`
 - Agent-chat live reattach is keyed by:
   - SDK `sessionId`
+- `serverInstanceId` stays in connection/runtime matching state; it is never part of canonical `sessionRef`.
 - Live handles are not replay targets and are never used as durable restore keys.
 
 ### 3. Launch-only inputs are explicit
@@ -112,7 +116,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - If a live session never became durable and the live process is gone, restore fails with a clear restore-unavailable error.
 - If the Codex sidecar dies or becomes invalid while its PTY is still up, terminate the terminal with a clear error; do not pretend the session is still safely restorable.
 - Same-server reconnect prefers the live handle even when `sessionRef` already exists.
-- Stale `serverInstanceId` or dead live handle forces durable restore if `sessionRef` exists, otherwise restore-unavailable.
+- Stale runtime `serverInstanceId` or dead live handle forces durable restore if `sessionRef` exists, otherwise restore-unavailable.
 
 ### 7. Mutable metadata is never identity
 
@@ -128,7 +132,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - Create: `test/integration/real/coding-cli-session-contract.test.ts`
   Responsibility: executable verification of every provider claim in the lab note.
 - Create: `shared/session-contract.ts`
-  Responsibility: canonical `sessionRef` helpers, launch-input helpers, migration helpers, and provider-aware validation.
+  Responsibility: canonical `sessionRef` helpers, separate live-handle helpers, launch-input helpers, migration helpers, and provider-aware validation.
 - Create: `server/coding-cli/codex-app-server/sidecar.ts`
   Responsibility: per-terminal Codex app-server ownership, notification capture, durable-artifact polling, and cleanup.
 - Create: `server/coding-cli/opencode-session-controller.ts`
@@ -136,7 +140,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - Create: `test/integration/server/opencode-session-flow.test.ts`
   Responsibility: OpenCode durable-promotion and restore contract coverage.
 - Modify: `shared/ws-protocol.ts`
-  Responsibility: make persisted/wire session identity explicit and tighten `terminal.session.associated` semantics.
+  Responsibility: make durable identity and live-handle semantics explicit on the wire and tighten `terminal.session.associated` semantics.
 - Modify: `server/session-binding-authority.ts`
   Responsibility: keep a single durable owner per session and surface clearer binding state where needed.
 - Modify: `server/session-association-coordinator.ts`
@@ -178,33 +182,33 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - Modify: `server/mcp/freshell-tool.ts`
   Responsibility: expose the explicit session contract to MCP callers.
 - Modify: `src/store/paneTypes.ts`
-  Responsibility: persist canonical `sessionRef`, keep live-only launch inputs ephemeral, and preserve agent-chat’s separate live session fields.
+  Responsibility: persist canonical `sessionRef`, preserve existing live-handle fields separately, keep live-only launch inputs ephemeral, and preserve agent-chat’s separate live session fields.
 - Modify: `src/store/types.ts`
   Responsibility: remove ambiguous tab-level `resumeSessionId` persistence.
 - Modify: `src/store/panesSlice.ts`
-  Responsibility: build pane state from canonical durable identity and preserve live-only launch inputs only in-memory where needed.
+  Responsibility: build pane state from separate live-handle and durable-restore fields and preserve live-only launch inputs only in-memory where needed.
 - Modify: `src/store/paneTreeValidation.ts`
   Responsibility: validate the migrated persisted shape.
 - Modify: `src/store/persistedState.ts`
-  Responsibility: migrate legacy `resumeSessionId` snapshots into canonical `sessionRef` or explicit restore-unavailable state.
+  Responsibility: migrate legacy `resumeSessionId` snapshots into canonical `sessionRef` or explicit restore-unavailable state while preserving existing live-handle fields needed for same-server reconnect.
 - Modify: `src/store/storage-migration.ts`
   Responsibility: explicitly preserve existing local state through targeted migration and prevent a schema-bump wipe from becoming the implementation shortcut.
 - Modify: `src/store/persistMiddleware.ts`
-  Responsibility: persist only canonical durable identity.
+  Responsibility: persist canonical durable identity plus existing live handles, never launch-only inputs.
 - Modify: `src/store/persistControl.ts`
-  Responsibility: flush only canonical durable identity and agent-chat canonical upgrades.
+  Responsibility: flush canonical durable identity and existing live-handle state without reviving launch-only inputs.
 - Modify: `src/store/layoutMirrorMiddleware.ts`
-  Responsibility: mirror canonical durable identity only.
+  Responsibility: mirror canonical durable identity and explicit live-handle state only.
 - Modify: `src/store/crossTabSync.ts`
   Responsibility: merge cross-tab state without reviving raw resume strings.
 - Modify: `src/store/tabsSlice.ts`
   Responsibility: remove tab-level fallback reliance on raw `resumeSessionId`.
 - Modify: `src/store/selectors/sidebarSelectors.ts`
-  Responsibility: match open sessions and running state from explicit live-vs-durable state.
+  Responsibility: match open sessions and running state from explicit live handles plus canonical durable identity.
 - Modify: `src/lib/session-utils.ts`
-  Responsibility: resolve canonical session lookup without mutable-name fallback.
+  Responsibility: resolve canonical session lookup and live-handle matching without mutable-name fallback or hybrid `sessionRef` locality fields.
 - Modify: `src/lib/tab-registry-snapshot.ts`
-  Responsibility: stop synthesizing canonical identity from arbitrary strings.
+  Responsibility: stop synthesizing canonical identity from arbitrary strings and stop smuggling locality into durable `sessionRef`.
 - Modify: `src/lib/ui-commands.ts`
   Responsibility: normalize session payloads to the explicit contract.
 - Modify: `src/lib/session-type-utils.ts`
@@ -222,7 +226,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - Modify: `src/components/TabBar.tsx`
   Responsibility: stop reconstructing identity from stale resume strings.
 - Modify: `src/components/TabsView.tsx`
-  Responsibility: reconcile live handles versus durable restore during rehydrate.
+  Responsibility: reconcile persisted live handles versus canonical durable restore during rehydrate.
 - Modify: `src/components/TabContent.tsx`
   Responsibility: surface restore-unavailable state explicitly.
 - Modify: `src/components/panes/PaneContainer.tsx`
@@ -317,6 +321,7 @@ git commit -m "test: lock coding cli provider contracts"
 - [ ] **Step 1: Write the failing end-to-end state-matrix tests**
 
 Cover:
+- same-server reconnect reattaches by persisted live handle (`terminalId` or SDK `sessionId`) even when no canonical `sessionRef` exists yet
 - same-server reconnect reattaches the live terminal/session and does not recreate from `sessionRef`
 - stale `serverInstanceId` or dead live handle uses durable restore only when canonical `sessionRef` exists
 - dead non-durable session surfaces restore-unavailable
@@ -373,6 +378,7 @@ git commit -m "test: lock live versus durable session behavior"
 
 Cover:
 - legacy `resumeSessionId` persistence migrates to canonical `sessionRef` or explicit restore-unavailable state
+- canonical `sessionRef` never carries `serverInstanceId`; existing persisted live handles stay separate
 - pane and tab construction preserve live-only launch inputs only transiently
 - terminal panes/tabs use `sessionRef`, while agent-chat keeps live SDK `sessionId` distinct from its own durable Claude identity
 - websocket payload normalization does not revive raw persisted resume strings
@@ -426,6 +432,7 @@ git commit -m "refactor: add explicit durable session contract"
 
 Cover:
 - `terminal.created` no longer persists non-durable ids
+- `terminal.created` preserves only the live handle needed for same-server reconnect
 - `terminal.session.associated` is the only terminal event that persists canonical durable identity
 - same-server live reattach beats durable recreate
 - missing durable identity yields restore-unavailable rather than fresh-session fallback
@@ -645,7 +652,7 @@ git commit -m "refactor: promote opencode sessions from authoritative events"
 
 Cover:
 - terminal-directory and background-session payloads preserve live-vs-durable identity correctly
-- sidebar matching uses canonical durable identity and live handles, not mutable names
+- sidebar matching uses canonical durable identity plus explicit live handles, not mutable names or hybrid `sessionRef` locality
 - pane headers and runtime metadata stop depending on raw `resumeSessionId`
 - context-menu, agent routes, and MCP surfaces send the explicit contract
 
@@ -729,8 +736,8 @@ If Step 1 changed `docs/index.html` or verification exposed a final cleanup edit
 - The implementation preserves existing persisted tabs/panes through targeted migration; it does not rely on a storage-version wipe.
 - The contract tests explicitly prove when live reattach happens, when durable restore happens, and when restore must fail.
 - Probe-owned helper processes are cleaned up deterministically and live user sessions were not killed.
-- Canonical `sessionRef` is the only persisted replay identity.
-- Live handles remain separate for terminals and agent-chat.
+- Canonical `sessionRef = { provider, sessionId }` is the only persisted replay identity; it never carries `serverInstanceId`.
+- Persisted live handles needed for same-server refresh recovery remain separate for terminals and agent-chat.
 - Mutable names/titles and `/rename`-style inputs are proven non-canonical and never used as restore keys.
 - `terminal.session.associated` is the single authoritative terminal durable-promotion event.
 - Fresh Codex sessions are started only by the Codex CLI itself over a terminal-owned sidecar, remain live-only until the provider actually creates a thread/session, and sidecar death fails clearly.
