@@ -1,6 +1,6 @@
 # Exact Durable Session Contract Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** If the user has requested `trycycle`, use the `trycycle` execution workflow to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Prove the real provider contracts, then cut Freshell over to one explicit durable-session model where live reattach, durable restore, and launch-only inputs are separate states and only truly replay-safe provider identity is persisted.
 
@@ -24,6 +24,7 @@
 - Do not silently fall back from “restore this session” to “start fresh.” If no durable target exists, surface restore-unavailable clearly.
 - Do not kill live user terminals during probe cleanup. Only stop probe-owned or provably orphaned helper processes tied to temp homes or this worktree.
 - Tasks 2 through 8 may contain intentionally red or partially green commits. Those commits are branch-local checkpoints only. Do not land, merge, or fast-forward anything until Task 9 completes and the coordinated full suite is green.
+- When a task's `Run:` commands mention tests that are not listed in that task's Files/Commit block, treat them as regression-only coverage and leave them unchanged unless that task truly requires edits there.
 
 ## Verified Planning Inputs
 
@@ -31,7 +32,7 @@
   - `codex --version` -> `codex-cli 0.121.0`
   - `claude --version` -> `2.1.114 (Claude Code)`
   - `opencode --version` -> `1.4.11`
-- The shipped regression currently encoded in main (landed via [PR #298](https://github.com/danshapiro/freshell/pull/298)) is:
+- The shipped regression currently encoded in main is:
   - `server/coding-cli/codex-app-server/launch-planner.ts` invokes `runtime.startThread()` for fresh create, which sends `thread/start`, and returns the fresh thread id as if it were replay-safe.
   - `server/ws-handler.ts` immediately persists that id as `effectiveResumeSessionId`.
   - `test/integration/server/codex-session-flow.test.ts` currently bakes that bad invariant into the expected CLI launch.
@@ -56,9 +57,16 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 ## Wire Contract Rule
 
 - `shared/ws-protocol.ts` must remove raw durable `resumeSessionId` strings from terminal durable-state payloads.
+- `SessionLocatorSchema` must split into canonical durable `sessionRef` data and a separate live-reattach locator shape; `clientHello`, `fallbackSessionRef`, and any mirror/bootstrap consumers must migrate to that split instead of smuggling `serverInstanceId` through `sessionRef`.
 - `terminal.create` must carry canonical `sessionRef` when requesting a durable restore target, plus explicit live-handle/runtime fields for same-server reattach.
 - `terminal.created` and `terminal.session.associated` must emit canonical `sessionRef` only when durable identity actually exists; they must not echo provisional launch-only tokens as if they were durable restore ids.
 - If any one-shot launch-only input still needs to cross the wire for the current runtime, it must stay explicitly transient and must never be persisted or reused as canonical identity.
+
+## Restore-Unavailable Rule
+
+- The canonical representation is `restoreError = { code: 'RESTORE_UNAVAILABLE', reason: <enum> }` in persisted/read-model state and the same `RESTORE_UNAVAILABLE` code on WS/API failures.
+- `restore-unavailable` is never represented by inventing a fake `sessionRef`, overloading a generic pane `status`, or reviving a raw `resumeSessionId`.
+- UI components derive user-facing copy from `restoreError` and clear it only after a successful live reattach or durable restore.
 
 ## End-State Contract And Invariants
 
@@ -69,6 +77,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - `sessionRef` is the only replay-safe identity written to persisted terminal pane/tab state.
 - Persisted terminal and agent-chat pane state also keeps its existing live reattach handles (`terminalId` for terminals, SDK `sessionId` for agent-chat), but those fields remain live-only and must never be interpreted as durable restore targets.
 - Agent-chat keeps its own canonical durable Claude fields; do not force it onto terminal `sessionRef` semantics just to share a type name.
+- Agent-chat's persisted raw `resumeSessionId` field is removed by migration. Durable agent-chat restore continues through canonical Claude fields (`cliSessionId` / `timelineSessionId`), while any temporary named-resume token remains runtime-only.
 - Raw `resumeSessionId` strings do not survive persistence after migration.
 
 ### 2. Live handles are separate from durable identity
@@ -123,6 +132,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 
 - If a live session never became durable and the live process is gone, restore fails with a clear restore-unavailable error.
 - If the Codex sidecar dies or becomes invalid while its PTY is still up, terminate the terminal with a clear error; do not pretend the session is still safely restorable.
+- If a Codex sidecar cannot start, initialize, or reserve its loopback endpoint, terminal create/restore fails immediately with a clear error. There is no fallback to a shared runtime or heuristic launch path.
 - Same-server reconnect prefers the live handle even when `sessionRef` already exists.
 - Stale runtime `serverInstanceId` or dead live handle forces durable restore if `sessionRef` exists, otherwise restore-unavailable.
 
@@ -148,7 +158,7 @@ Task 1 writes `docs/lab-notes/2026-04-20-coding-cli-session-contract.md`. That n
 - Create: `test/integration/server/opencode-session-flow.test.ts`
   Responsibility: OpenCode durable-promotion and restore contract coverage.
 - Modify: `shared/ws-protocol.ts`
-  Responsibility: make durable identity and live-handle semantics explicit on the wire and tighten `terminal.session.associated` semantics.
+  Responsibility: make durable identity and live-handle semantics explicit on the wire, split `SessionLocatorSchema` from live reattach locators, migrate `fallbackSessionRef`/`clientHello` consumers, and tighten `terminal.session.associated` semantics.
 - Modify: `server/session-binding-authority.ts`
   Responsibility: keep a single durable owner per session and surface clearer binding state where needed.
 - Modify: `server/session-association-coordinator.ts`
@@ -270,6 +280,7 @@ Add isolated temp-home helpers for `codex`, `claude`, and `opencode` that can:
 - resolve provider binaries with `command -v` before each probe and record the exact path/version used
 
 Update `package.json` to add one opt-in script, `test:real:coding-cli-contracts`, that wraps the real-provider suite. Reuse the existing `cross-env` dependency already in the repo; do not add a second environment-wrapper dependency.
+That script must expand to: `cross-env FRESHELL_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- test/integration/real/coding-cli-session-contract.test.ts`
 
 - [ ] **Step 2: Audit provider processes and define the cleanup rule**
 
@@ -299,6 +310,7 @@ Document:
 - whether `/rename`, titles, or names can change independently of canonical ids, or whether no such mutable-name surface exists in the tested mode
 - cleanup rules for probe-owned processes
 - the exact provider behaviors Freshell is allowed to build on
+- why the lab note date is `2026-04-20` even though this implementation plan file was created on `2026-04-19`
 
 - [ ] **Step 5: Encode the lab note as opt-in real-provider tests**
 
@@ -306,7 +318,7 @@ Add `test/integration/real/coding-cli-session-contract.test.ts` so every factual
 
 The opt-in suite must behave explicitly when binaries are absent:
 - default repo workflows must never invoke it implicitly
-- each missing provider binary must produce an explicit `test.skip` / skipped suite message naming the missing executable
+- each missing provider binary must produce a Vitest `skipped` result naming the missing executable; do not rely on ad hoc stdout-only sentinels
 - Task 1 is only complete on the implementation machine when all three provider sections actually run, not when they are skipped
 
 - [ ] **Step 6: Run the real-provider contract suite**
@@ -405,8 +417,10 @@ git commit -m "test: lock live versus durable session behavior"
 Cover:
 - legacy `resumeSessionId` persistence migrates to canonical `sessionRef` or explicit restore-unavailable state
 - canonical `sessionRef` never carries `serverInstanceId`; existing persisted live handles stay separate
+- `SessionLocatorSchema`, `fallbackSessionRef`, and `clientHello` consumers migrate to the live-vs-durable split without smuggling locality into canonical identity
 - pane and tab construction preserve live-only launch inputs only transiently
 - terminal panes/tabs use `sessionRef`, while agent-chat keeps live SDK `sessionId` distinct from its own durable Claude identity
+- agent-chat persisted `resumeSessionId` is removed or migrated to canonical Claude fields rather than surviving as a raw restore token
 - websocket durable-state payloads stop using raw `resumeSessionId`; durable restore uses `sessionRef`, while any launch-only token remains transient-only
 - websocket payload normalization does not revive raw persisted resume strings
 - storage-version bootstrap does not clear restorable session state for this feature
