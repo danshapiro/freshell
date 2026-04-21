@@ -31,7 +31,6 @@ function ensureDurableArtifact(threadId) {
     createdAt: now.toISOString(),
   }) + '\n', 'utf8')
 }
-
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
     return Promise.resolve()

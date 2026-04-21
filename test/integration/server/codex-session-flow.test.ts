@@ -570,4 +570,62 @@ describe('Codex Session Flow Integration', () => {
       delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
     }
   })
+
+  it('restores a persisted Codex session without calling thread/resume on the app-server', async () => {
+    const requestId = 'test-req-codex-restore-no-app-server-resume'
+    const sessionId = 'thread-existing-no-app-server-resume-1'
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      overrides: {
+        'thread/resume': {
+          error: {
+            code: -32600,
+            message: `no rollout found for thread id ${sessionId}`,
+          },
+        },
+      },
+    })
+
+    const ws = await createAuthenticatedWs(port)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId,
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === requestId
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
+
+      const record = registry.get(created.terminalId)
+      expect(record?.resumeSessionId).toBe(sessionId)
+
+      await waitForFile(argLogPath)
+      const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
+      expect(recordedArgs.slice(0, 2)).toEqual([
+        '--remote',
+        expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+      ])
+      expect(recordedArgs).toContain('resume')
+      expect(recordedArgs).toContain(sessionId)
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+    }
+  })
 })
