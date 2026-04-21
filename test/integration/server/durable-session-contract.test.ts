@@ -241,7 +241,7 @@ describe('durable session contract (integration)', () => {
     process.env.HELLO_TIMEOUT_MS = '500'
 
     vi.resetModules()
-    const { WsHandler } = await import('../../server/ws-handler.ts')
+    const { WsHandler } = await import('../../../server/ws-handler.js')
 
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -347,12 +347,12 @@ describe('durable session contract (integration)', () => {
       const response = await responsePromise
 
       expect(response).toMatchObject({
-        type: 'terminal.created',
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
       })
-      expect(response).not.toHaveProperty('effectiveResumeSessionId')
-      expect(registry.createCallCount).toBe(1)
-      expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
-      expect(registry.records.size).toBe(1)
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.lastCreateOpts).toBeNull()
+      expect(registry.records.size).toBe(0)
     } finally {
       await closeWebSocket(ws)
     }

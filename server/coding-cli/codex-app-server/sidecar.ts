@@ -322,6 +322,10 @@ export class CodexTerminalSidecar {
 
         const currentIdentity = await readLinuxProcessIdentity(pid)
         if (!processIdentityMatches(parsed, currentIdentity)) {
+          // Orphan reaping is intentionally Linux-only because PID ownership
+          // verification relies on /proc command line, cwd, and start-time data.
+          // If we cannot prove the PID still belongs to this sidecar, we refuse
+          // to signal it and drop the stale metadata instead.
           logger.warn({
             pid,
             metadataPath,

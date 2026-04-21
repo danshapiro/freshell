@@ -1781,10 +1781,6 @@ export class WsHandler {
                   providerSettings: spawnProviderSettings,
                   ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
                 })
-                if (canonicalSessionId && modeSupportsResume(m.mode as TerminalMode)) {
-                  record.resumeSessionId = canonicalSessionId
-                }
-
                 if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
                   const recentDirectory = m.cwd.trim()
                   void configStore.pushRecentDirectory(recentDirectory).catch((err) => {

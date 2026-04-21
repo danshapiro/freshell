@@ -2460,6 +2460,47 @@ describe('TerminalRegistry', () => {
     })
   })
 
+  describe('codex sidecar callbacks during create', () => {
+    it('registers the terminal before a synchronous durable-session callback fires', () => {
+      let terminalSeenDuringAttach: string | undefined
+
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          attachTerminal: ({ terminalId, onDurableSession }) => {
+            terminalSeenDuringAttach = registry.get(terminalId)?.terminalId
+            onDurableSession('codex-session-sync')
+          },
+          shutdown: vi.fn().mockResolvedValue(undefined),
+        },
+      })
+
+      expect(terminalSeenDuringAttach).toBe(term.terminalId)
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-sync')
+      expect(registry.isSessionBound('codex', 'codex-session-sync')).toBe(true)
+    })
+
+    it('lets a synchronous fatal callback terminate the newly created terminal', () => {
+      let createdTerminalId: string | undefined
+
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          attachTerminal: ({ terminalId, onFatal }) => {
+            createdTerminalId = terminalId
+            onFatal(new Error('sidecar failed during attach'))
+          },
+          shutdown: vi.fn().mockResolvedValue(undefined),
+        },
+      })
+
+      expect(createdTerminalId).toBe(term.terminalId)
+      expect(registry.get(term.terminalId)?.status).toBe('exited')
+    })
+  })
+
   describe('isSessionBound', () => {
     it('returns true when session is already bound to a terminal', () => {
       const term = registry.create({ mode: 'codex', resumeSessionId: '019cf585-9b35-7510-a99c-09b77b1f351a' })

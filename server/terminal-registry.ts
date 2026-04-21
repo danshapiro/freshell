@@ -1150,25 +1150,6 @@ export class TerminalRegistry extends EventEmitter {
 
     logger.info({ terminalId, file, args, cwd: procCwd, mode: opts.mode, shell: opts.shell || 'system' }, 'Spawning terminal')
 
-    if (opts.mode === 'codex' && opts.codexSidecar) {
-      opts.codexSidecar.attachTerminal({
-        terminalId,
-        onDurableSession: (sessionId) => {
-          const rebound = this.rebindSession(terminalId, 'codex', sessionId, 'association')
-          if (!rebound.ok) {
-            logger.warn(
-              { terminalId, sessionId, reason: rebound.reason },
-              'Failed to promote Codex durable session from sidecar notification',
-            )
-          }
-        },
-        onFatal: (error) => {
-          logger.warn({ err: error, terminalId }, 'Codex terminal sidecar failed; terminating terminal')
-          this.kill(terminalId)
-        },
-      })
-    }
-
     let ptyProc: ReturnType<typeof pty.spawn>
     try {
       ptyProc = pty.spawn(file, args, {
@@ -1323,6 +1304,24 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
+    if (opts.mode === 'codex' && opts.codexSidecar) {
+      opts.codexSidecar.attachTerminal({
+        terminalId,
+        onDurableSession: (sessionId) => {
+          const rebound = this.rebindSession(terminalId, 'codex', sessionId, 'association')
+          if (!rebound.ok) {
+            logger.warn(
+              { terminalId, sessionId, reason: rebound.reason },
+              'Failed to promote Codex durable session from sidecar notification',
+            )
+          }
+        },
+        onFatal: (error) => {
+          logger.warn({ err: error, terminalId }, 'Codex terminal sidecar failed; terminating terminal')
+          this.kill(terminalId)
+        },
+      })
+    }
     const exactSessionId = resumeForBinding
     if (modeSupportsResume(opts.mode) && exactSessionId) {
       const bound = this.bindSession(
