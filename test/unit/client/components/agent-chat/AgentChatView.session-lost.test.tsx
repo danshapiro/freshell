@@ -286,11 +286,12 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
     const textarea2 = screen.getByRole('textbox')
     expect(textarea2).not.toBeDisabled()
 
-    // Should send sdk.attach (to re-subscribe), but that's fine
+    // Should NOT send sdk.attach — session is already hydrated and WS
+    // subscription is connection-scoped, so it survives the remount.
     const attachCalls = wsSend.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'sdk.attach',
     )
-    expect(attachCalls).toHaveLength(1)
+    expect(attachCalls).toHaveLength(0)
 
     // Should NOT have sent sdk.create
     const createCalls = wsSend.mock.calls.filter(
@@ -368,14 +369,14 @@ describe('AgentChatView — remount resilience (split pane bug)', () => {
       </Provider>,
     )
 
-    // Should send sdk.attach (to re-subscribe)
+    // Session is hydrated (historyLoaded=true from fresh create) so
+    // sdk.attach is skipped — WS subscription survives the remount.
     const attachCalls = wsSend.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'sdk.attach',
     )
-    expect(attachCalls).toHaveLength(1)
+    expect(attachCalls).toHaveLength(0)
 
-    // Simulate server responding to sdk.attach with sdk.status: 'starting'
-    // (because the session hasn't finished initializing yet)
+    // Simulate server status arriving (e.g. from the live subscription):
     act(() => {
       store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'starting' }))
     })

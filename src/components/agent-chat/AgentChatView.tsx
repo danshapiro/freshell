@@ -405,16 +405,23 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }))
   }, [paneContent.createRequestId, paneContent.sessionId, paneContent.status, tabId, paneId, dispatch, suppressNetworkEffects, ws])
 
-  // Attach to existing session on mount (e.g. after page refresh with persisted pane)
+  // Attach to existing session on mount (e.g. after page refresh with persisted pane).
+  // Skip when session is already fully hydrated (e.g. split-induced remount) — the WS
+  // subscription is connection-scoped so it survives the React unmount/remount cycle.
+  // Real disconnects are handled by the separate onReconnect listener below.
+  const sessionAlreadyHydrated = session?.historyLoaded === true
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!attachPayload || attachSentRef.current) return
     // Only attach if we didn't just create this session ourselves
     if (createSentRef.current) return
+    // Session already loaded in Redux (split-induced remount) — content reflows
+    // naturally without needing to re-fetch from the server.
+    if (sessionAlreadyHydrated) return
 
     attachSentRef.current = true
     ws.send(attachPayload)
-  }, [attachPayload, suppressNetworkEffects, ws])
+  }, [attachPayload, sessionAlreadyHydrated, suppressNetworkEffects, ws])
 
   // Re-attach on WS reconnect so server re-subscribes this client
   useEffect(() => {

@@ -676,6 +676,9 @@ function mergeTerminalState(
     }
   }
 
+  // Structure changed (leaf↔split) or malformed children
+  // Cross-tab sync can deliver stale structure changes. Use both timestamps
+  // and content heuristics to decide which side to keep.
   if (local.type !== incoming.type) {
     const localAt = meta?.localLayoutPersistedAt
     const remoteAt = meta?.remoteLayoutPersistedAt
@@ -694,7 +697,6 @@ function mergeTerminalState(
     }
   }
 
-  // Structure changed (leaf↔split) or malformed children — take incoming
   return incoming
 }
 
