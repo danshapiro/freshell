@@ -487,7 +487,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
     // Auto-title the pane and tab from the first user message,
     // mirroring how terminal CLI panes get titles from session indexer.
-    const isFirstMessage = !session?.messages.length
+    const isFirstMessage = !session?.messages.length && !session?.timelineItems?.length
     if (isFirstMessage) {
       const title = extractTitleFromMessage(text)
       if (title) {
@@ -502,7 +502,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     ws.send({ type: 'sdk.send', sessionId: paneContent.sessionId, text })
     // Always scroll to bottom when the user sends a message
     scrollToBottom()
-  }, [paneContent.sessionId, session?.messages.length, dispatch, ws, scrollToBottom, tabId, paneId, tabTitleSetByUser])
+  }, [paneContent.sessionId, session?.messages.length, session?.timelineItems?.length, dispatch, ws, scrollToBottom, tabId, paneId, tabTitleSetByUser])
 
   const handleInterrupt = useCallback(() => {
     if (!paneContent.sessionId) return
