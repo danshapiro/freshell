@@ -114,3 +114,131 @@ describe('CodexTerminalSidecar orphan reaper', () => {
     await waitForProcessExit(child.pid)
   })
 })
+
+describe('CodexTerminalSidecar durable rollout tracking', () => {
+  it('forwards thread handles into the exact-path tracker and promotes when the tracker confirms durability', () => {
+    let threadStartedHandler: ((thread: { id: string; path: string | null; ephemeral: boolean }) => void) | null = null
+    let trackerOptions:
+      | {
+        onDurableRollout: (sessionId: string) => void
+      }
+      | null = null
+
+    const runtime = {
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn((handler) => {
+        threadStartedHandler = handler
+        return () => {
+          threadStartedHandler = null
+        }
+      }),
+      shutdown: vi.fn(async () => undefined),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+
+    const tracker = {
+      trackThread: vi.fn(),
+      dispose: vi.fn(async () => undefined),
+    }
+
+    const sidecar = new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: (options) => {
+        trackerOptions = {
+          onDurableRollout: options.onDurableRollout,
+        }
+        return tracker
+      },
+    })
+
+    const onDurableSession = vi.fn()
+    sidecar.attachTerminal({
+      terminalId: 'term-1',
+      onDurableSession,
+      onFatal: vi.fn(),
+    })
+
+    const thread = {
+      id: 'thread-new-1',
+      path: '/tmp/fake-codex-home/sessions/2026/04/23/rollout-thread-new-1.jsonl',
+      ephemeral: false,
+    }
+    threadStartedHandler?.(thread)
+
+    expect(tracker.trackThread).toHaveBeenCalledWith(thread)
+    trackerOptions?.onDurableRollout('thread-new-1')
+    expect(onDurableSession).toHaveBeenCalledWith('thread-new-1')
+  })
+
+  it('disposes the rollout tracker before shutting the runtime down', async () => {
+    const lifecycle: string[] = []
+    const runtime = {
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn(() => () => undefined),
+      shutdown: vi.fn(async () => {
+        lifecycle.push('runtime')
+      }),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+    const tracker = {
+      trackThread: vi.fn(),
+      dispose: vi.fn(async () => {
+        lifecycle.push('tracker')
+      }),
+    }
+
+    const sidecar = new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: () => tracker,
+    })
+
+    await sidecar.shutdown()
+
+    expect(lifecycle).toEqual(['tracker', 'runtime'])
+  })
+
+  it('does not boot a stopped runtime just to unwatch during tracker cleanup', async () => {
+    let trackerOptions:
+      | {
+        unwatchPath: (watchId: string) => Promise<void>
+      }
+      | null = null
+
+    const runtime = {
+      status: vi.fn(() => 'stopped'),
+      unwatchPath: vi.fn(async () => undefined),
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn(() => () => undefined),
+      shutdown: vi.fn(async () => undefined),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+
+    new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: (options) => {
+        trackerOptions = {
+          unwatchPath: options.unwatchPath,
+        }
+        return {
+          trackThread: vi.fn(),
+          dispose: vi.fn(async () => undefined),
+        }
+      },
+    })
+
+    await trackerOptions?.unwatchPath('watch-rollout')
+    expect(runtime.unwatchPath).not.toHaveBeenCalled()
+  })
+})

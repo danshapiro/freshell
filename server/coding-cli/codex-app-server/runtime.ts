@@ -1,7 +1,13 @@
 import { spawn } from 'node:child_process'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { CodexAppServerClient } from './client.js'
-import type { CodexThreadResumeParams, CodexThreadStartParams } from './protocol.js'
+import type {
+  CodexFsWatchResult,
+  CodexThreadHandle,
+  CodexThreadOperationResult,
+  CodexThreadResumeParams,
+  CodexThreadStartParams,
+} from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
 
@@ -36,7 +42,8 @@ export class CodexAppServerRuntime {
   private ensureReadyPromise: Promise<ReadyState> | null = null
   private statusValue: RuntimeStatus = 'stopped'
   private readonly exitHandlers = new Set<(error?: Error) => void>()
-  private readonly threadStartedHandlers = new Set<(threadId: string) => void>()
+  private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
+  private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
 
   private readonly command: string
   private readonly commandArgs: string[]
@@ -67,10 +74,17 @@ export class CodexAppServerRuntime {
     }
   }
 
-  onThreadStarted(handler: (threadId: string) => void): () => void {
+  onThreadStarted(handler: (thread: CodexThreadHandle) => void): () => void {
     this.threadStartedHandlers.add(handler)
     return () => {
       this.threadStartedHandlers.delete(handler)
+    }
+  }
+
+  onFsChanged(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void {
+    this.fsChangedHandlers.add(handler)
+    return () => {
+      this.fsChangedHandlers.delete(handler)
     }
   }
 
@@ -89,7 +103,7 @@ export class CodexAppServerRuntime {
 
   async startThread(
     params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
+  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
     const ready = await this.ensureReady()
     return {
       ...(await this.client!.startThread(params)),
@@ -99,12 +113,22 @@ export class CodexAppServerRuntime {
 
   async resumeThread(
     params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
+  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
     const ready = await this.ensureReady()
     return {
       ...(await this.client!.resumeThread(params)),
       wsUrl: ready.wsUrl,
     }
+  }
+
+  async watchPath(targetPath: string, watchId: string): Promise<CodexFsWatchResult> {
+    await this.ensureReady()
+    return this.client!.watchPath(targetPath, watchId)
+  }
+
+  async unwatchPath(watchId: string): Promise<void> {
+    await this.ensureReady()
+    await this.client!.unwatchPath(watchId)
   }
 
   async shutdown(): Promise<void> {
@@ -156,9 +180,14 @@ export class CodexAppServerRuntime {
         { wsUrl },
         this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
       )
-      client.onThreadStarted((threadId) => {
+      client.onThreadStarted((thread) => {
         for (const handler of this.threadStartedHandlers) {
-          handler(threadId)
+          handler(thread)
+        }
+      })
+      client.onFsChanged((event) => {
+        for (const handler of this.fsChangedHandlers) {
+          handler(event)
         }
       })
       this.client = client

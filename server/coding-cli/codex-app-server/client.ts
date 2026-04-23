@@ -1,5 +1,9 @@
 import WebSocket from 'ws'
 import {
+  CodexFsChangedNotificationSchema,
+  CodexFsUnwatchParamsSchema,
+  CodexFsWatchParamsSchema,
+  CodexFsWatchResultSchema,
   CodexInitializeParamsSchema,
   CodexInitializeResultSchema,
   CodexRpcErrorEnvelopeSchema,
@@ -9,6 +13,8 @@ import {
   CodexThreadOperationResultSchema,
   type CodexInitializeResult,
   type CodexRpcError,
+  type CodexThreadHandle,
+  type CodexThreadOperationResult,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
 } from './protocol.js'
@@ -30,6 +36,14 @@ type PendingRequest = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
 
+function normalizeThread(thread: CodexThreadHandle): CodexThreadHandle {
+  return {
+    ...thread,
+    path: thread.path ?? null,
+    ephemeral: thread.ephemeral ?? false,
+  }
+}
+
 export class CodexAppServerClient {
   private readonly requestTimeoutMs: number
   private socket: WebSocket | null = null
@@ -37,7 +51,8 @@ export class CodexAppServerClient {
   private initializePromise: Promise<CodexInitializeResult> | null = null
   private nextRequestId = 1
   private pendingRequests = new Map<number, PendingRequest>()
-  private readonly threadStartedHandlers = new Set<(threadId: string) => void>()
+  private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
+  private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
 
   constructor(
     private readonly endpoint: CodexAppServerEndpoint,
@@ -68,7 +83,9 @@ export class CodexAppServerClient {
     return this.initializePromise
   }
 
-  async startThread(params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>): Promise<{ threadId: string }> {
+  async startThread(
+    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult> {
     const result = await this.request('thread/start', {
       ...params,
       // Freshell attaches the visible TUI over `codex --remote`, so it does not
@@ -80,10 +97,14 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/start payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    return {
+      thread: normalizeThread(parsed.data.thread),
+    }
   }
 
-  async resumeThread(params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>): Promise<{ threadId: string }> {
+  async resumeThread(
+    params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult> {
     // Intentionally preserve Codex's default raw-event behavior for resume calls.
     const result = await this.request('thread/resume', {
       ...params,
@@ -93,7 +114,27 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/resume payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    return {
+      thread: normalizeThread(parsed.data.thread),
+    }
+  }
+
+  async watchPath(targetPath: string, watchId: string): Promise<{ path: string }> {
+    const result = await this.request('fs/watch', CodexFsWatchParamsSchema.parse({
+      path: targetPath,
+      watchId,
+    }))
+    const parsed = CodexFsWatchResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid fs/watch payload.')
+    }
+    return parsed.data
+  }
+
+  async unwatchPath(watchId: string): Promise<void> {
+    await this.request('fs/unwatch', CodexFsUnwatchParamsSchema.parse({
+      watchId,
+    }))
   }
 
   async close(): Promise<void> {
@@ -127,10 +168,17 @@ export class CodexAppServerClient {
     })
   }
 
-  onThreadStarted(handler: (threadId: string) => void): () => void {
+  onThreadStarted(handler: (thread: CodexThreadHandle) => void): () => void {
     this.threadStartedHandlers.add(handler)
     return () => {
       this.threadStartedHandlers.delete(handler)
+    }
+  }
+
+  onFsChanged(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void {
+    this.fsChangedHandlers.add(handler)
+    return () => {
+      this.fsChangedHandlers.delete(handler)
     }
   }
 
@@ -191,7 +239,15 @@ export class CodexAppServerClient {
         const threadStarted = CodexThreadStartedNotificationSchema.safeParse(notification.data)
         if (threadStarted.success) {
           for (const handler of this.threadStartedHandlers) {
-            handler(threadStarted.data.params.thread.id)
+            handler(normalizeThread(threadStarted.data.params.thread))
+          }
+          return
+        }
+
+        const fsChanged = CodexFsChangedNotificationSchema.safeParse(notification.data)
+        if (fsChanged.success) {
+          for (const handler of this.fsChangedHandlers) {
+            handler(fsChanged.data.params)
           }
         }
         return

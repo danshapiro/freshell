@@ -31,12 +31,19 @@ type CodexFacts = {
   version: string
   freshRemoteBootstrapCommand: string
   freshRemoteBootstrapEventsBeforeUserTurn: string[]
-  remoteResumeBootstrapEventsBeforeUserTurn: string[]
+  remoteResumeBootstrapStablePrefix: string[]
+  remoteResumeBootstrapFollowupMethods: string[]
   freshRemoteAllocatesThreadBeforeUserTurn: boolean
   shellSnapshotGlob: string
   durableArtifactGlob: string
   freshInteractiveCreatesShellSnapshotBeforeTurn: boolean
   freshInteractiveCreatesDurableSessionBeforeTurn: boolean
+  appServerThreadPathAvailableBeforeArtifact: boolean
+  appServerMissingPathWatchAccepted: boolean
+  appServerMissingParentWatchAccepted: boolean
+  appServerWatchEchoesCallerWatchId: boolean
+  appServerArtifactMaterializesAtReportedPath: boolean
+  appServerChangedPathsMentionRolloutPath: boolean
   resumeCommandTemplate: string
   mutableNameSurface: 'absent'
 }
@@ -108,6 +115,17 @@ export type OwnershipReportEntry = {
 export type CodexRpcNotification = {
   method: string
   params: any
+}
+
+export type CodexThreadHandle = {
+  id: string
+  path: string | null
+  ephemeral: boolean
+}
+
+export type CodexFsChangedNotification = {
+  watchId: string
+  changedPaths: string[]
 }
 
 type TrackedRootHandle = {
@@ -850,6 +868,19 @@ export class CodexRpcProbeClient {
       threadId,
       cwd,
       persistExtendedHistory: true,
+    })
+  }
+
+  async fsWatch(targetPath: string, watchId: string): Promise<{ path: string }> {
+    return this.request('fs/watch', {
+      path: targetPath,
+      watchId,
+    })
+  }
+
+  async fsUnwatch(watchId: string): Promise<void> {
+    await this.request('fs/unwatch', {
+      watchId,
     })
   }
 

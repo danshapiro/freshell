@@ -1,15 +1,15 @@
 # Coding CLI Session Contract Lab Note
 
-This note records the real-binary provider probes rerun on `2026-04-20` inside `/home/user/code/freshell/.worktrees/exact-durable-session-contract`.
+This note records the real-binary provider probes rerun on `2026-04-23` inside `/home/user/code/freshell/.worktrees/exact-durable-session-contract`.
 
-The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-20` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
+The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-23` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
 
 ## Machine-readable contract
 ```json
 {
-  "capturedOn": "2026-04-20",
+  "capturedOn": "2026-04-23",
   "planCreatedOn": "2026-04-19",
-  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-20 because that is when the real binaries were re-proved on the implementation machine.",
+  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-23 because that is when the real binaries were re-proved on the implementation machine and the earlier 2026-04-20 Codex note was superseded by the newer contract capture.",
   "cleanup": {
     "liveProcessAuditCommand": "ps -eo pid,ppid,stat,cmd --sort=pid | rg \"codex|claude|opencode\"",
     "ownershipReportFields": [
@@ -37,7 +37,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "codex": {
       "executable": "codex",
       "resolvedPath": "/home/user/.npm-global/bin/codex",
-      "version": "codex-cli 0.121.0",
+      "version": "codex-cli 0.123.0",
       "freshRemoteBootstrapCommand": "codex --remote <ws>",
       "freshRemoteBootstrapEventsBeforeUserTurn": [
         "connection",
@@ -48,7 +48,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
         "model/list",
         "thread/start"
       ],
-      "remoteResumeBootstrapEventsBeforeUserTurn": [
+      "remoteResumeBootstrapStablePrefix": [
         "connection",
         "initialize",
         "initialized",
@@ -56,9 +56,11 @@ The implementation plan file is dated `2026-04-19` because the design work was w
         "thread/read",
         "account/read",
         "model/list",
-        "thread/resume",
-        "skills/list",
+        "thread/resume"
+      ],
+      "remoteResumeBootstrapFollowupMethods": [
         "account/rateLimits/read",
+        "skills/list",
         "skills/list"
       ],
       "freshRemoteAllocatesThreadBeforeUserTurn": true,
@@ -66,6 +68,12 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "durableArtifactGlob": ".codex/sessions/YYYY/MM/DD/rollout-*.jsonl",
       "freshInteractiveCreatesShellSnapshotBeforeTurn": true,
       "freshInteractiveCreatesDurableSessionBeforeTurn": false,
+      "appServerThreadPathAvailableBeforeArtifact": true,
+      "appServerMissingPathWatchAccepted": true,
+      "appServerMissingParentWatchAccepted": true,
+      "appServerWatchEchoesCallerWatchId": true,
+      "appServerArtifactMaterializesAtReportedPath": true,
+      "appServerChangedPathsMentionRolloutPath": true,
       "resumeCommandTemplate": "codex --remote <ws> --no-alt-screen resume <sessionId>",
       "mutableNameSurface": "absent"
     },
@@ -73,7 +81,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "executable": "claude",
       "resolvedPath": "/home/user/bin/claude",
       "isolatedBinaryPath": "/home/user/.local/bin/claude",
-      "version": "2.1.114 (Claude Code)",
+      "version": "2.1.116 (Claude Code)",
       "exactIdCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --session-id <uuid> <prompt>",
       "namedResumeCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --resume <title-or-uuid> [--name <title>] <prompt>",
       "transcriptGlob": ".claude/projects/*/<uuid>.jsonl",
@@ -86,7 +94,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.4.11",
+      "version": "1.14.20",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -130,8 +138,10 @@ command -v codex
 # /home/user/.npm-global/bin/codex
 
 codex --version
-# codex-cli 0.121.0
+# codex-cli 0.123.0
 ```
+
+This 2026-04-23 rerun supersedes the older `codex-cli 0.121.0` capture. The current version of record on this machine is `codex-cli 0.123.0`.
 
 Fresh remote bootstrap was probed with a loopback websocket stub and:
 
@@ -150,7 +160,7 @@ Before any user turn, the CLI opened a connection and issued:
 
 That proves fresh `codex --remote` allocates a thread during bootstrap, before the first user turn, but that thread allocation is not yet the durable contract Freshell may persist.
 
-The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued `thread/read`, then `thread/resume`, and then its follow-up `skills/list` and `account/rateLimits/read` calls.
+The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued the stable prefix through `thread/resume`, and then the follow-up `skills/list` and `account/rateLimits/read` calls. The trailing post-resume follow-up order was observed to vary between reruns on the same binary, so only the stable prefix plus the required follow-up method set is treated as contract.
 
 Real provider-owned durability was re-proved against the app-server websocket with:
 
@@ -167,7 +177,43 @@ Observed provider-owned artifacts:
 
 - After `thread/start` and before `turn/start`: a shell snapshot under `.codex/shell_snapshots/*.sh`.
 - After `thread/start` and before `turn/start`: no `.codex/sessions/**.jsonl` durable artifact.
+- `thread/start` already returned `thread.ephemeral: false` and a concrete `thread.path` under `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+- Immediately after `thread/start`, neither the rollout file nor its date directory existed yet.
+- `fs/watch` accepted caller-supplied `watchId` values for both the missing rollout path and the missing parent directory, returned only the canonicalized watched `path`, and later `fs/changed` echoed the original caller-supplied `watchId`.
 - After the first real `turn/start`: a durable artifact under `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
+- After the first real `turn/start`: the durable artifact appeared at the exact `thread.path`, and `fs/changed.changedPaths` mentioned that exact rollout path.
+
+Short JSON-ish transcript from the 2026-04-23 rerun:
+
+```json
+{
+  "thread/start": {
+    "thread": {
+      "id": "<uuid>",
+      "ephemeral": false,
+      "path": "<temp-root>/.codex/sessions/2026/04/23/rollout-...jsonl"
+    }
+  },
+  "preTurn": {
+    "rolloutExists": false,
+    "parentExists": false
+  },
+  "fs/watch": [
+    {
+      "watchId": "probe-rollout-path",
+      "result": { "path": "<same rollout path>" }
+    },
+    {
+      "watchId": "probe-rollout-parent",
+      "result": { "path": "<same parent directory>" }
+    }
+  ],
+  "fs/changed": {
+    "watchId": "probe-rollout-path|probe-rollout-parent",
+    "changedPaths": ["<same rollout path>"]
+  }
+}
+```
 
 The durable restore path that worked after restarting the app-server runtime was:
 
@@ -180,8 +226,9 @@ turn/start <sessionId>
 
 Allowed Freshell behavior:
 
-- Fresh Codex panes may stay live-only even though a fresh thread exists.
-- Freshell may only persist canonical Codex identity after the durable `.jsonl` artifact exists.
+- Fresh Codex panes may stay live-only even though a fresh thread exists and `thread.path` is already known.
+- Freshell may use `fs/watch` as the event source for Codex durability, but it still needs a direct existence check on the exact rollout path before promotion.
+- Freshell may only persist canonical Codex identity after the durable `.jsonl` artifact exists at the provider-reported `thread.path`.
 - Freshell must not treat the bootstrap `thread/start` id as durable restore identity.
 
 ## Claude
@@ -193,7 +240,7 @@ command -v claude
 # /home/user/bin/claude
 
 claude --version
-# 2.1.114 (Claude Code)
+# 2.1.116 (Claude Code)
 ```
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.
@@ -242,7 +289,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.4.11
+# 1.14.20
 ```
 
 Fresh isolated runs were probed with:
@@ -266,7 +313,7 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.4.11`.
+- `/global/health` returned a healthy payload with version `1.14.20`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
 

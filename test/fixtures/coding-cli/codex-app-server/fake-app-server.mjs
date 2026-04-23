@@ -18,18 +18,40 @@ function loadBehavior() {
   return JSON.parse(raw)
 }
 
-function ensureDurableArtifact(threadId) {
-  const codexHome = process.env.CODEX_HOME || '/tmp/fake-codex-home'
+function getCodexHome() {
+  return process.env.CODEX_HOME || '/tmp/fake-codex-home'
+}
+
+function getRolloutSessionDir() {
   const now = new Date()
   const year = String(now.getUTCFullYear())
   const month = String(now.getUTCMonth() + 1).padStart(2, '0')
   const day = String(now.getUTCDate()).padStart(2, '0')
-  const sessionDir = path.join(codexHome, 'sessions', year, month, day)
+  return path.join(getCodexHome(), 'sessions', year, month, day)
+}
+
+function getThreadHandle(threadId) {
+  return {
+    id: threadId,
+    path: path.join(getRolloutSessionDir(), `rollout-${threadId}.jsonl`),
+    ephemeral: false,
+  }
+}
+
+function ensureDurableArtifact(threadId) {
+  const thread = getThreadHandle(threadId)
+  const codexHome = process.env.CODEX_HOME || '/tmp/fake-codex-home'
+  const now = new Date()
+  const sessionDir = path.dirname(thread.path)
   fs.mkdirSync(sessionDir, { recursive: true })
-  fs.writeFileSync(path.join(sessionDir, `rollout-${threadId}.jsonl`), JSON.stringify({
+  fs.writeFileSync(thread.path, JSON.stringify({
     threadId,
     createdAt: now.toISOString(),
   }) + '\n', 'utf8')
+  return {
+    codexHome,
+    thread,
+  }
 }
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
@@ -63,16 +85,14 @@ function successResult(method, params) {
   if (method === 'initialize') {
     return {
       userAgent: 'freshell-fixture/1.0.0',
-      codexHome: process.env.CODEX_HOME || '/tmp/fake-codex-home',
+      codexHome: getCodexHome(),
       platformFamily: 'unix',
       platformOs: 'linux',
     }
   }
   if (method === 'thread/start') {
     return {
-      thread: {
-        id: 'thread-new-1',
-      },
+      thread: getThreadHandle('thread-new-1'),
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
@@ -85,10 +105,9 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/resume') {
+    const threadId = params?.threadId || 'thread-new-1'
     return {
-      thread: {
-        id: params?.threadId,
-      },
+      thread: getThreadHandle(threadId),
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
@@ -102,10 +121,16 @@ function successResult(method, params) {
   }
   if (method === 'turn/start') {
     return {
-      thread: {
-        id: params?.threadId || 'thread-new-1',
-      },
+      thread: getThreadHandle(params?.threadId || 'thread-new-1'),
     }
+  }
+  if (method === 'fs/watch') {
+    return {
+      path: path.resolve(String(params?.path || '')),
+    }
+  }
+  if (method === 'fs/unwatch') {
+    return {}
   }
   return {}
 }
@@ -117,6 +142,7 @@ const exitProcessAfterMethodsOnce = new Set(behavior.exitProcessAfterMethodsOnce
 const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
+const watches = new Map()
 
 const wss = new WebSocketServer({ host, port })
 
@@ -130,6 +156,17 @@ function broadcastNotification(method, params) {
     if (client.readyState === 1) {
       client.send(payload)
     }
+  }
+}
+
+function emitConfiguredNotifications(method) {
+  const notifications = behavior.notifyAfterMethodsOnce?.[method]
+  if (!Array.isArray(notifications) || notifications.length === 0) {
+    return
+  }
+  delete behavior.notifyAfterMethodsOnce[method]
+  for (const notification of notifications) {
+    broadcastNotification(notification.method, notification.params)
   }
 }
 
@@ -190,16 +227,39 @@ wss.on('connection', (socket) => {
         initialized = true
       }
       if (method === 'thread/start') {
-        const threadId = result?.thread?.id || message.params?.threadId || 'thread-new-1'
+        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
         broadcastNotification('thread/started', {
-          thread: {
-            id: threadId,
-          },
+          thread,
         })
       }
-      if (method === 'turn/start' && message.params?.threadId) {
-        ensureDurableArtifact(message.params.threadId)
+      if (method === 'fs/watch') {
+        const watchId = message.params?.watchId
+        const watchedPath = result?.path
+        if (watchId && watchedPath) {
+          watches.set(watchId, watchedPath)
+        }
       }
+      if (method === 'fs/unwatch') {
+        const watchId = message.params?.watchId
+        if (watchId) {
+          watches.delete(watchId)
+        }
+      }
+      if (method === 'turn/start' && message.params?.threadId) {
+        const { thread } = ensureDurableArtifact(message.params.threadId)
+        const rolloutPath = thread.path
+        const rolloutParent = path.dirname(rolloutPath)
+        for (const [watchId, watchedPath] of watches) {
+          if (watchedPath !== rolloutPath && watchedPath !== rolloutParent) {
+            continue
+          }
+          broadcastNotification('fs/changed', {
+            watchId,
+            changedPaths: [rolloutPath],
+          })
+        }
+      }
+      emitConfiguredNotifications(method)
       if (closeSocketAfterMethodsOnce.delete(method)) {
         setTimeout(() => socket.close(), 0)
       }

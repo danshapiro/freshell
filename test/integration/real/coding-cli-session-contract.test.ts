@@ -55,9 +55,9 @@ function requireResolvedBinary(binary: { executable: string; resolvedPath: strin
 
 describe.sequential('coding cli real provider session contract', () => {
   it('loads the checked-in lab note facts and date rationale', async () => {
-    expect(note.capturedOn).toBe('2026-04-20')
+    expect(note.capturedOn).toBe('2026-04-23')
     expect(note.planCreatedOn).toBe('2026-04-19')
-    expect(note.dateReason).toContain('2026-04-20')
+    expect(note.dateReason).toContain('2026-04-23')
     expect(note.dateReason).toContain('2026-04-19')
     expect(noteMarkdown).toContain('The implementation plan file is dated `2026-04-19`')
     expect(note.cleanup.ownershipReportFields).toEqual([
@@ -109,6 +109,61 @@ describe.sequential('coding cli real provider session contract', () => {
       }
     }, 60_000)
 
+    it('surfaces the exact rollout path before it exists and emits fs/changed when the first turn materializes it', async () => {
+      const codexPath = requireResolvedBinary(codexBinary)
+      const workspace = await ProbeWorkspace.create('codex-rollout-watch')
+      const rolloutWatchId = 'probe-rollout-path'
+      const parentWatchId = 'probe-rollout-parent'
+
+      try {
+        await seedCodexHome(workspace)
+
+        const appServer = await startCodexAppServer(workspace, codexPath)
+        const client = await CodexRpcProbeClient.connect(appServer.wsUrl)
+        await client.initialize()
+
+        const start = await client.startThread(process.cwd())
+        expect(start.thread.ephemeral).toBe(false)
+        expect(start.thread.path).toMatch(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-.+\.jsonl$/)
+
+        const rolloutPath = start.thread.path as string
+        const rolloutParent = path.dirname(rolloutPath)
+        expect(await fsp.access(rolloutPath).then(() => true, () => false)).toBe(false)
+        expect(await fsp.access(rolloutParent).then(() => true, () => false)).toBe(false)
+
+        expect(await client.fsWatch(rolloutPath, rolloutWatchId)).toEqual({ path: rolloutPath })
+        expect(await client.fsWatch(rolloutParent, parentWatchId)).toEqual({ path: rolloutParent })
+
+        await client.startTurn(start.thread.id, 'Reply with exactly: codex-watch-probe')
+        await client.waitForNotification(
+          'turn/completed',
+          (notification) => notification.params?.threadId === start.thread.id,
+          120_000,
+        )
+
+        const artifactPath = await waitForCodexSessionArtifact(workspace)
+        expect(artifactPath).toBe(rolloutPath)
+
+        const changed = await client.waitForNotification(
+          'fs/changed',
+          (notification) => (
+            Array.isArray(notification.params?.changedPaths)
+            && notification.params.changedPaths.includes(rolloutPath)
+            && [rolloutWatchId, parentWatchId].includes(notification.params?.watchId)
+          ),
+          120_000,
+        )
+        expect(changed.params.watchId).toBeOneOf([rolloutWatchId, parentWatchId])
+
+        await client.fsUnwatch(rolloutWatchId)
+        await client.fsUnwatch(parentWatchId)
+        await client.close()
+        await appServer.process.stop()
+      } finally {
+        await workspace.cleanup().catch(() => undefined)
+      }
+    }, 180_000)
+
     it('stays live-only until the durable artifact exists, then restores via the artifact id', async () => {
       const codexPath = requireResolvedBinary(codexBinary)
       const workspace = await ProbeWorkspace.create('codex-durable')
@@ -154,7 +209,12 @@ describe.sequential('coding cli real provider session contract', () => {
           codexPath,
           resumeId,
         )
-        expect(resumeBootstrapEvents).toEqual(note.providers.codex.remoteResumeBootstrapEventsBeforeUserTurn)
+        const expectedStablePrefix = note.providers.codex.remoteResumeBootstrapStablePrefix
+        const expectedFollowups = note.providers.codex.remoteResumeBootstrapFollowupMethods
+        expect(resumeBootstrapEvents.slice(0, expectedStablePrefix.length)).toEqual(expectedStablePrefix)
+        expect(
+          [...resumeBootstrapEvents.slice(expectedStablePrefix.length)].sort(),
+        ).toEqual([...expectedFollowups].sort())
 
         const resumedAppServer = await startCodexAppServer(workspace, codexPath)
         const resumedClient = await CodexRpcProbeClient.connect(resumedAppServer.wsUrl)
