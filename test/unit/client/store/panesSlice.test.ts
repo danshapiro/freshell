@@ -2297,6 +2297,323 @@ describe('panesSlice', () => {
       expect(next.paneTitles['tab-1']).toEqual({ 'pane-1': 'Local title' })
       expect(next.paneTitleSetByUser['tab-1']).toEqual({ 'pane-1': true })
     })
+
+    const terminalLeaf = (id: string, terminalId: string): PaneNode => ({
+      type: 'leaf',
+      id,
+      content: {
+        kind: 'terminal',
+        mode: 'shell',
+        createRequestId: `req-${id}`,
+        status: 'running',
+        terminalId,
+      } as TerminalPaneContent,
+    })
+
+    const editorLeaf = (id: string, filePath: string): PaneNode => ({
+      type: 'leaf',
+      id,
+      content: {
+        kind: 'editor',
+        filePath,
+        language: null,
+        readOnly: false,
+        content: '',
+        viewMode: 'source',
+      } as EditorPaneContent,
+    })
+
+    const crossTabMeta = (localLayoutPersistedAt: number, remoteLayoutPersistedAt: number) => ({
+      localLayoutPersistedAt,
+      remoteLayoutPersistedAt,
+    })
+
+    it('preserves local split when incoming is a stale leaf', () => {
+      const now = 1_000_000
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'file.ts' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: { 'tab-1': terminalLeaf('pane-1', 't1') },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const action = {
+        ...hydratePanes(incoming),
+        meta: crossTabMeta(now, now - 60_000),
+      }
+
+      const state = panesReducer(localState, action)
+      expect(state.layouts['tab-1']?.type).toBe('split')
+      expect(state.activePane['tab-1']).toBe('pane-2')
+    })
+
+    it('accepts incoming leaf over local split when incoming is newer', () => {
+      const now = 1_000_000
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'file.ts' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: { 'tab-1': terminalLeaf('pane-1', 't1') },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const action = {
+        ...hydratePanes(incoming),
+        meta: crossTabMeta(now - 60_000, now),
+      }
+
+      const state = panesReducer(localState, action)
+      expect(state.layouts['tab-1']?.type).toBe('leaf')
+      expect(state.activePane['tab-1']).toBe('pane-1')
+    })
+
+    it('accepts incoming leaf over local split when timestamps are absent', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'file.ts' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: { 'tab-1': terminalLeaf('pane-1', 't1') },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      expect(state.layouts['tab-1']?.type).toBe('leaf')
+      expect(state.activePane['tab-1']).toBe('pane-1')
+    })
+
+    it('preserves local leaf when incoming is a stale split', () => {
+      const now = 1_000_000
+      const localState: PanesState = {
+        layouts: { 'tab-1': terminalLeaf('pane-1', 't1') },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'file.ts' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const action = {
+        ...hydratePanes(incoming),
+        meta: crossTabMeta(now, now - 60_000),
+      }
+
+      const state = panesReducer(localState, action)
+      expect(state.layouts['tab-1']?.type).toBe('leaf')
+      expect(state.activePane['tab-1']).toBe('pane-1')
+    })
+
+    it('keeps incoming metadata as the base but reapplies local user titles for surviving panes', () => {
+      const now = 1_000_000
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/local-file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'My shell', 'pane-2': 'My file alias' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true, 'pane-2': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/remote-file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Remote shell', 'pane-2': 'remote-file.ts' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-2': false } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const action = {
+        ...hydratePanes(incoming),
+        meta: crossTabMeta(now - 60_000, now),
+      }
+
+      const state = panesReducer(localState, action)
+      expect(state.activePane['tab-1']).toBe('pane-1')
+      expect(state.paneTitles['tab-1']).toEqual({
+        'pane-1': 'My shell',
+        'pane-2': 'My file alias',
+      })
+      expect(state.paneTitleSetByUser['tab-1']).toEqual({
+        'pane-1': true,
+        'pane-2': true,
+      })
+    })
+
+    it('preserves local user-set pane titles for surviving panes when local layout wins', () => {
+      const now = 1_000_000
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              terminalLeaf('pane-1', 't1'),
+              editorLeaf('pane-2', '/path/to/local-file.ts'),
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'My file alias' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-2': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: { 'tab-1': terminalLeaf('pane-1', 't1') },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const action = {
+        ...hydratePanes(incoming),
+        meta: crossTabMeta(now, now - 60_000),
+      }
+
+      const state = panesReducer(localState, action)
+      expect(state.paneTitles['tab-1']).toEqual({
+        'pane-1': 'Shell',
+        'pane-2': 'My file alias',
+      })
+      expect(state.paneTitleSetByUser['tab-1']).toEqual({
+        'pane-2': true,
+      })
+    })
   })
 
   describe('clearDeadTerminals', () => {
