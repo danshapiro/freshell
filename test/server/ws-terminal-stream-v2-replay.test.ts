@@ -293,6 +293,7 @@ function sendAttach(
   ws.send(JSON.stringify({
     type: 'terminal.attach',
     terminalId,
+    intent: 'viewport_hydrate',
     sinceSeq: opts?.sinceSeq ?? 0,
     cols: opts?.cols ?? 120,
     rows: opts?.rows ?? 40,

@@ -20,6 +20,7 @@ const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
 )
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
+type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
   context: Record<string, unknown>,
@@ -77,6 +78,7 @@ export class TerminalStreamBroker {
   async attach(
     ws: LiveWebSocket,
     terminalId: string,
+    intent: AttachIntent,
     cols: number,
     rows: number,
     sinceSeq: number | undefined,
@@ -100,7 +102,17 @@ export class TerminalStreamBroker {
         return
       }
 
-      if (!this.registry.resize(terminalId, cols, rows)) {
+      const hasOtherAttachedSockets = Boolean(
+        existingState
+        && [...existingState.clients.keys()].some((attachedWs) => attachedWs !== ws)
+      )
+      const shouldResize = intent === 'viewport_hydrate'
+        || (
+          intent === 'transport_reconnect'
+          && (!hasOtherAttachedSockets || Boolean(existingAttachment))
+        )
+
+      if (shouldResize && !this.registry.resize(terminalId, cols, rows)) {
         this.registry.detach(terminalId, ws)
         result = 'missing'
         return

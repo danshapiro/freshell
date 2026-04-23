@@ -250,6 +250,7 @@ describe('terminal create/attach ordering (e2e)', () => {
         cols: expect.any(Number),
         rows: expect.any(Number),
         attachRequestId: expect.any(String),
+        intent: 'viewport_hydrate',
       })
     })
 
@@ -315,6 +316,7 @@ describe('terminal create/attach ordering (e2e)', () => {
         terminalId: 'term-order-hidden',
         sinceSeq: 0,
         attachRequestId: expect.any(String),
+        intent: 'viewport_hydrate',
       })
     })
     expect(wsHarness.send.mock.calls
@@ -405,6 +407,7 @@ describe('terminal create/attach ordering (e2e)', () => {
         terminalId: 'term-order-reconnect',
         sinceSeq: 2,
         attachRequestId: expect.any(String),
+        intent: 'transport_reconnect',
       })
     })
 

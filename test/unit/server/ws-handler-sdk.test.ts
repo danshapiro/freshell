@@ -462,6 +462,36 @@ describe('WS Handler SDK Integration', () => {
       })
     }
 
+    function collectMessagesUntil(
+      ws: WebSocket,
+      shouldResolve: (messages: any[]) => boolean,
+      trigger?: () => void,
+    ): Promise<any[]> {
+      return new Promise((resolve, reject) => {
+        const messages: any[] = []
+        const timeout = setTimeout(() => {
+          cleanup()
+          reject(new Error('Timeout waiting for collected WebSocket messages'))
+        }, 3000)
+
+        const cleanup = () => {
+          clearTimeout(timeout)
+          ws.off('message', onMessage)
+        }
+
+        const onMessage = (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          messages.push(parsed)
+          if (!shouldResolve(messages)) return
+          cleanup()
+          resolve(messages)
+        }
+
+        ws.on('message', onMessage)
+        trigger?.()
+      })
+    }
+
     it('routes sdk.create to sdkBridge.createSession', async () => {
       const ws = await connectAndAuth()
       try {
@@ -487,6 +517,792 @@ describe('WS Handler SDK Integration', () => {
         )
       } finally {
         ws.close()
+      }
+    })
+
+    it('reuses one live sdk session for concurrent sdk.create requests with the same resumeSessionId', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000501'
+      let releaseFirstHistory: (() => void) | undefined
+      const firstHistoryGate = new Promise<void>((resolve) => {
+        releaseFirstHistory = resolve
+      })
+      const liveSessions = new Map<string, any>()
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.createSession
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-shared-resume-1',
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/shared',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/shared',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-shared-resume-2',
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/shared',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/shared',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === durableSessionId) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: durableSessionId,
+            timelineSessionId: durableSessionId,
+            revision: 41,
+            messages: [makeMessage('user', 'shared resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === 'sdk-shared-resume-1' && opts?.liveSessionOverride) {
+          return firstHistoryGate.then(() => makeResolvedHistory({
+            queryId: 'sdk-shared-resume-1',
+            liveSessionId: 'sdk-shared-resume-1',
+            timelineSessionId: durableSessionId,
+            revision: 41,
+            messages: [makeMessage('user', 'shared resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === 'sdk-shared-resume-2' && opts?.liveSessionOverride) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: 'sdk-shared-resume-2',
+            liveSessionId: 'sdk-shared-resume-2',
+            timelineSessionId: durableSessionId,
+            revision: 41,
+            messages: [makeMessage('user', 'shared resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 41,
+          messages: [makeMessage('user', 'shared resume', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws1 = await connectAndAuth()
+      const ws2 = await connectAndAuth()
+      try {
+        const firstCreated = collectMessagesUntil(
+          ws1,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws1.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-shared-resume-1',
+              resumeSessionId: durableSessionId,
+            }))
+          },
+        )
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        })
+
+        const secondCreated = collectMessagesUntil(
+          ws2,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws2.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-shared-resume-2',
+              resumeSessionId: durableSessionId,
+            }))
+          },
+        )
+
+        releaseFirstHistory?.()
+
+        const [messages1, messages2] = await Promise.all([firstCreated, secondCreated])
+        expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        expect(messages1.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-shared-resume-1',
+          sessionId: 'sdk-shared-resume-1',
+        })
+        expect(messages2.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-shared-resume-2',
+          sessionId: 'sdk-shared-resume-1',
+        })
+      } finally {
+        ws1.close()
+        ws2.close()
+      }
+    })
+
+    it('reuses one live sdk session when concurrent sdk.create requests resolve different resume aliases to the same durable history before sdk.session.init makes the first session discoverable by ordinary lookup', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000502'
+      const staleAlias = 'stale-live-alias-502'
+      let releaseFirstHistory: (() => void) | undefined
+      const firstHistoryGate = new Promise<void>((resolve) => {
+        releaseFirstHistory = resolve
+      })
+      const liveSessions = new Map<string, any>()
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.createSession
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-shared-alias-1',
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/alias',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/alias',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-shared-alias-2',
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/alias',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            cliSessionId: durableSessionId,
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/alias',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === staleAlias || queryId === durableSessionId) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            timelineSessionId: durableSessionId,
+            revision: 42,
+            messages: [makeMessage('user', 'alias resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === 'sdk-shared-alias-1' && opts?.liveSessionOverride) {
+          return firstHistoryGate.then(() => makeResolvedHistory({
+            queryId: 'sdk-shared-alias-1',
+            liveSessionId: 'sdk-shared-alias-1',
+            timelineSessionId: durableSessionId,
+            revision: 42,
+            messages: [makeMessage('user', 'alias resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === 'sdk-shared-alias-2' && opts?.liveSessionOverride) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: 'sdk-shared-alias-2',
+            liveSessionId: 'sdk-shared-alias-2',
+            timelineSessionId: durableSessionId,
+            revision: 42,
+            messages: [makeMessage('user', 'alias resume', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 42,
+          messages: [makeMessage('user', 'alias resume', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws1 = await connectAndAuth()
+      const ws2 = await connectAndAuth()
+      try {
+        const firstCreated = collectMessagesUntil(
+          ws1,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws1.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-shared-alias-1',
+              resumeSessionId: staleAlias,
+            }))
+          },
+        )
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        })
+
+        const secondCreated = collectMessagesUntil(
+          ws2,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws2.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-shared-alias-2',
+              resumeSessionId: durableSessionId,
+            }))
+          },
+        )
+
+        releaseFirstHistory?.()
+
+        const [messages1, messages2] = await Promise.all([firstCreated, secondCreated])
+        expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        expect(messages1.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-shared-alias-1',
+          sessionId: 'sdk-shared-alias-1',
+        })
+        expect(messages2.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-shared-alias-2',
+          sessionId: 'sdk-shared-alias-1',
+        })
+      } finally {
+        ws1.close()
+        ws2.close()
+      }
+    })
+
+    it('reuses an already-live sdk session when only the canonical durable history query resolves to the liveSessionId', async () => {
+      const staleAlias = 'stale-live-alias-ledger-only'
+      const durableSessionId = '00000000-0000-4000-8000-0000000005aa'
+      const liveSession = {
+        sessionId: 'sdk-live-ledger-reuse',
+        status: 'connected',
+        cliSessionId: durableSessionId,
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/ledger-reuse',
+        tools: [],
+        messages: [],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+      }
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockReturnValue(undefined)
+      mockSdkBridge.captureReplayState.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 0,
+          session: liveSession,
+        }
+      })
+      mockSdkBridge.drainReplayBuffer.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 0,
+          session: liveSession,
+          bufferedMessages: [],
+        }
+      })
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === staleAlias) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === durableSessionId) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === liveSession.sessionId && opts?.liveSessionOverride) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: liveSession.sessionId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: durableSessionId,
+            revision: 43,
+            messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 43,
+          messages: [makeMessage('user', 'ledger reuse', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages = await collectMessagesUntil(
+          ws,
+          (received) => received.some((message) => message.type === 'sdk.session.init'),
+          () => {
+            ws.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-ledger-live-reuse',
+              resumeSessionId: staleAlias,
+            }))
+          },
+        )
+
+        expect(mockSdkBridge.createSession).not.toHaveBeenCalled()
+        expect(messages.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-ledger-live-reuse',
+          sessionId: liveSession.sessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toMatchObject({
+          type: 'sdk.session.snapshot',
+          sessionId: liveSession.sessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.session.init')).toMatchObject({
+          type: 'sdk.session.init',
+          sessionId: liveSession.sessionId,
+        })
+        expect(
+          mockHistorySource.resolve.mock.calls.some(([queryId]: [string]) => queryId === durableSessionId),
+        ).toBe(true)
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('reuses the first created sdk session when the same fresh requestId is resent after reconnect', async () => {
+      let releaseFirstHistory: (() => void) | undefined
+      const firstHistoryGate = new Promise<void>((resolve) => {
+        releaseFirstHistory = resolve
+      })
+      const liveSessions = new Map<string, any>()
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.createSession
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-request-reuse-1',
+            status: 'connected',
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/request-reuse',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/request-reuse',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+        .mockImplementationOnce(() => {
+          const session = makeCreatedSession({
+            sessionId: 'sdk-request-reuse-2',
+            status: 'connected',
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/request-reuse',
+          })
+          liveSessions.set(session.sessionId, {
+            sessionId: session.sessionId,
+            status: 'connected',
+            model: 'claude-sonnet-4-5-20250929',
+            cwd: '/tmp/request-reuse',
+            messages: [],
+            streamingActive: false,
+            streamingText: '',
+            pendingPermissions: new Map(),
+            pendingQuestions: new Map(),
+          })
+          return session
+        })
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockReturnValue(undefined)
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === 'sdk-request-reuse-1' && opts?.liveSessionOverride) {
+          return firstHistoryGate.then(() => makeResolvedHistory({
+            queryId: 'sdk-request-reuse-1',
+            liveSessionId: 'sdk-request-reuse-1',
+            revision: 43,
+            messages: [makeMessage('user', 'request reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        if (queryId === 'sdk-request-reuse-2' && opts?.liveSessionOverride) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId: 'sdk-request-reuse-2',
+            liveSessionId: 'sdk-request-reuse-2',
+            revision: 43,
+            messages: [makeMessage('user', 'request reuse', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 43,
+          messages: [makeMessage('user', 'request reuse', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws1 = await connectAndAuth()
+      const ws2 = await connectAndAuth()
+      try {
+        const firstCreated = collectMessagesUntil(
+          ws1,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws1.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-fresh-reconnect-reuse',
+              cwd: '/tmp/request-reuse',
+            }))
+          },
+        )
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        })
+
+        const secondCreated = collectMessagesUntil(
+          ws2,
+          (messages) => messages.some((message) => message.type === 'sdk.created'),
+          () => {
+            ws2.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-fresh-reconnect-reuse',
+              cwd: '/tmp/request-reuse',
+            }))
+          },
+        )
+
+        releaseFirstHistory?.()
+
+        const [messages1, messages2] = await Promise.all([firstCreated, secondCreated])
+        expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        expect(messages1.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-fresh-reconnect-reuse',
+          sessionId: 'sdk-request-reuse-1',
+        })
+        expect(messages2.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-fresh-reconnect-reuse',
+          sessionId: 'sdk-request-reuse-1',
+        })
+      } finally {
+        ws1.close()
+        ws2.close()
+      }
+    })
+
+    it('for reused sdk.create sends sdk.created, then sdk.session.snapshot, then sdk.session.init, then pending interactive state', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000503'
+      const pendingPermissions = new Map([
+        ['perm-reused-1', {
+          toolName: 'Bash',
+          input: { command: 'pwd' },
+          toolUseID: 'tool-reused-1',
+          suggestions: [{ tool: 'Bash', permission: 'allow' }],
+          blockedPath: '/tmp/shared',
+          decisionReason: 'Needs approval',
+          resolve: vi.fn(),
+        }],
+      ])
+      const pendingQuestions = new Map([
+        ['question-reused-1', {
+          originalInput: { questions: [] },
+          questions: [{
+            question: 'Continue?',
+            header: 'Confirm',
+            options: [],
+            multiSelect: false,
+          }],
+          resolve: vi.fn(),
+        }],
+      ])
+      const liveSession = {
+        sessionId: 'sdk-reused-live-1',
+        status: 'connected',
+        cliSessionId: durableSessionId,
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/reused-live',
+        tools: [],
+        messages: [],
+        streamingActive: false,
+        streamingText: '',
+        pendingPermissions,
+        pendingQuestions,
+      }
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => (
+        sessionId === liveSession.sessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockImplementation((sessionId: string) => (
+        sessionId === durableSessionId ? liveSession : undefined
+      ))
+      mockSdkBridge.captureReplayState.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 2,
+          session: liveSession,
+        }
+      })
+      mockSdkBridge.drainReplayBuffer.mockImplementation((sessionId: string) => {
+        if (sessionId !== liveSession.sessionId) return null
+        return {
+          watermark: 2,
+          session: liveSession,
+          bufferedMessages: [{
+            sequence: 3,
+            message: {
+              type: 'sdk.stream',
+              sessionId: liveSession.sessionId,
+              event: {
+                type: 'content_block_delta',
+                delta: { type: 'text_delta', text: 'reused-live-stream' },
+              },
+            },
+          }],
+        }
+      })
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === durableSessionId || (queryId === liveSession.sessionId && opts?.liveSessionOverride)) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            liveSessionId: liveSession.sessionId,
+            timelineSessionId: durableSessionId,
+            revision: 44,
+            messages: [
+              makeMessage('user', 'existing turn', '2026-03-10T10:00:00.000Z'),
+              makeMessage('assistant', 'existing reply', '2026-03-10T10:00:01.000Z'),
+            ],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 44,
+          messages: [makeMessage('user', 'existing turn', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages = await collectMessagesUntil(
+          ws,
+          (received) => {
+            const types = received.map((message) => message.type)
+            return types.includes('sdk.question.request') && types.includes('sdk.stream')
+          },
+          () => {
+            ws.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-reused-order',
+              resumeSessionId: durableSessionId,
+            }))
+          },
+        )
+
+        expect(mockSdkBridge.createSession).not.toHaveBeenCalled()
+        expect(messages.map((message) => message.type).slice(0, 5)).toEqual([
+          'sdk.created',
+          'sdk.session.snapshot',
+          'sdk.session.init',
+          'sdk.permission.request',
+          'sdk.question.request',
+        ])
+        expect(messages.find((message) => message.type === 'sdk.created')).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-reused-order',
+          sessionId: liveSession.sessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.session.snapshot')).toMatchObject({
+          type: 'sdk.session.snapshot',
+          sessionId: liveSession.sessionId,
+          timelineSessionId: durableSessionId,
+        })
+        expect(messages.find((message) => message.type === 'sdk.stream')).toMatchObject({
+          type: 'sdk.stream',
+          event: {
+            type: 'content_block_delta',
+            delta: { type: 'text_delta', text: 'reused-live-stream' },
+          },
+        })
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('does not kill or evict the shared live session when a reused sdk.create follower fails during replay/snapshot cutover', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000504'
+      const liveSessions = new Map<string, any>()
+      const originalSendSdkSessionSnapshot = (handler as any).sendSdkSessionSnapshot.bind(handler)
+      let snapshotCallCount = 0
+
+      mockSdkBridge.createSession.mockReset()
+      mockSdkBridge.createSession.mockImplementation(() => {
+        const session = makeCreatedSession({
+          sessionId: 'sdk-shared-follower-1',
+          status: 'connected',
+          cliSessionId: durableSessionId,
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp/follower',
+        })
+        liveSessions.set(session.sessionId, {
+          sessionId: session.sessionId,
+          status: 'connected',
+          cliSessionId: durableSessionId,
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp/follower',
+          messages: [],
+          streamingActive: false,
+          streamingText: '',
+          pendingPermissions: new Map(),
+          pendingQuestions: new Map(),
+        })
+        return session
+      })
+      mockSdkBridge.getSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.getLiveSession.mockImplementation((sessionId: string) => liveSessions.get(sessionId))
+      mockSdkBridge.findLiveSessionByCliSessionId.mockImplementation((sessionId: string) => {
+        if (sessionId !== durableSessionId) return undefined
+        return liveSessions.get('sdk-shared-follower-1')
+      })
+      mockHistorySource.resolve.mockImplementation((queryId: string, opts?: { liveSessionOverride?: { sessionId?: string } }) => {
+        if (queryId === durableSessionId || (queryId === 'sdk-shared-follower-1' && opts?.liveSessionOverride)) {
+          return Promise.resolve(makeResolvedHistory({
+            queryId,
+            liveSessionId: 'sdk-shared-follower-1',
+            timelineSessionId: durableSessionId,
+            revision: 45,
+            messages: [makeMessage('user', 'shared follower', '2026-03-10T10:00:00.000Z')],
+          }))
+        }
+        return Promise.resolve(makeResolvedHistory({
+          queryId,
+          revision: 45,
+          messages: [makeMessage('user', 'shared follower', '2026-03-10T10:00:00.000Z')],
+        }))
+      })
+      vi.spyOn(handler as any, 'sendSdkSessionSnapshot').mockImplementation(async (...args: any[]) => {
+        snapshotCallCount += 1
+        if (snapshotCallCount === 2) {
+          throw new Error('follower snapshot failed')
+        }
+        return originalSendSdkSessionSnapshot(...args)
+      })
+
+      const ws1 = await connectAndAuth()
+      const ws2 = await connectAndAuth()
+      const ws3 = await connectAndAuth()
+      try {
+        const firstCreated = await sendAndWaitForResponse(ws1, {
+          type: 'sdk.create',
+          requestId: 'req-shared-follower-1',
+          resumeSessionId: durableSessionId,
+        }, 'sdk.created')
+
+        const followerMessages = await collectMessagesUntil(
+          ws2,
+          (messages) => messages.some((message) => message.type === 'sdk.create.failed'),
+          () => {
+            ws2.send(JSON.stringify({
+              type: 'sdk.create',
+              requestId: 'req-shared-follower-2',
+              resumeSessionId: durableSessionId,
+            }))
+          },
+        )
+
+        ws1.send(JSON.stringify({
+          type: 'sdk.send',
+          sessionId: firstCreated.sessionId,
+          text: 'still alive after follower failure',
+        }))
+
+        await vi.waitFor(() => {
+          expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith(
+            firstCreated.sessionId,
+            'still alive after follower failure',
+            undefined,
+          )
+        })
+
+        const thirdCreated = await sendAndWaitForResponse(ws3, {
+          type: 'sdk.create',
+          requestId: 'req-shared-follower-3',
+          resumeSessionId: durableSessionId,
+        }, 'sdk.created')
+
+        expect(mockSdkBridge.createSession).toHaveBeenCalledTimes(1)
+        expect(firstCreated.sessionId).toBe('sdk-shared-follower-1')
+        expect(followerMessages.find((message) => message.type === 'sdk.create.failed')).toMatchObject({
+          type: 'sdk.create.failed',
+          requestId: 'req-shared-follower-2',
+          code: 'RESTORE_INTERNAL',
+          message: 'follower snapshot failed',
+          retryable: true,
+        })
+        expect(thirdCreated).toMatchObject({
+          type: 'sdk.created',
+          requestId: 'req-shared-follower-3',
+          sessionId: 'sdk-shared-follower-1',
+        })
+        expect(mockSdkBridge.killSession).not.toHaveBeenCalledWith('sdk-shared-follower-1')
+      } finally {
+        ws1.close()
+        ws2.close()
+        ws3.close()
       }
     })
 

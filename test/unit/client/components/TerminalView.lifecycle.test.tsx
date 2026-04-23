@@ -2949,6 +2949,7 @@ describe('TerminalView lifecycle updates', () => {
         cols: expect.any(Number),
         rows: expect.any(Number),
         attachRequestId: expect.any(String),
+        intent: 'viewport_hydrate',
       })
     })
 
@@ -2988,6 +2989,7 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         cols: expect.any(Number),
         rows: expect.any(Number),
+        intent: 'viewport_hydrate',
       })
     })
 
@@ -3099,6 +3101,7 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: 'term-latched-1',
         cols: expect.any(Number),
         rows: expect.any(Number),
+        intent: 'viewport_hydrate',
       }))
 
       wsMocks.send.mockClear()
@@ -3109,6 +3112,7 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: 'term-latched-1',
         cols: expect.any(Number),
         rows: expect.any(Number),
+        intent: 'transport_reconnect',
       }))
 
       first.unmount()
@@ -3374,39 +3378,71 @@ describe('TerminalView lifecycle updates', () => {
           type: 'terminal.attach',
           terminalId,
           sinceSeq: 0,
+          intent: 'viewport_hydrate',
           attachRequestId: expect.any(String),
         }))
       })
       expect(wsMocks.send.mock.calls
         .map(([msg]) => msg)
         .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
+    it('uses keepalive_delta when a live terminal re-runs the attach effect above the rendered high-water mark', async () => {
+      const { rerender, store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-keepalive-intent',
+        clearSends: false,
+      })
+
+      const initialAttachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      expect(initialAttachRequestId).toBeTruthy()
 
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
           terminalId,
-          headSeq: 3,
+          headSeq: 0,
           replayFromSeq: 1,
-          replayToSeq: 3,
+          replayToSeq: 0,
+          attachRequestId: initialAttachRequestId,
         })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
       })
 
-      wsMocks.send.mockClear()
-      view.rerender(
-        <Provider store={store}>
-          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden />
-        </Provider>
-      )
-      view.rerender(
-        <Provider store={store}>
-          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={false} />
-        </Provider>
-      )
+      const writes = term.write.mock.calls.map(([data]: [string]) => data)
+      expect(writes).toContain('abc')
 
-      const hydrateCalls = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId && msg?.sinceSeq === 0)
-      expect(hydrateCalls).toHaveLength(0)
+      wsMocks.send.mockClear()
+
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal' ? layout.content : null
+      }
+
+      await act(async () => {
+        rerender(
+          <Provider store={store}>
+            <TerminalView
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={{
+                ...readPaneContent()!,
+                createRequestId: 'req-v2-keepalive-intent-rerun',
+              }}
+            />
+          </Provider>,
+        )
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          sinceSeq: 3,
+          intent: 'keepalive_delta',
+          attachRequestId: expect.any(String),
+        }))
+      })
     })
 
     it('uses max(persisted cursor, in-memory sequence) for reconnect attach requests', async () => {
