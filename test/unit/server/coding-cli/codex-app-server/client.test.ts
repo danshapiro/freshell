@@ -100,12 +100,15 @@ afterEach(async () => {
 })
 
 describe('CodexAppServerClient', () => {
-  it('initializes the app-server and returns the reported protocol version', async () => {
+  it('initializes the app-server and returns the negotiated server metadata', async () => {
     const server = await startFakeCodexAppServer()
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await expect(client.initialize()).resolves.toMatchObject({
-      protocolVersion: expect.any(String),
+      userAgent: expect.any(String),
+      codexHome: expect.any(String),
+      platformFamily: expect.any(String),
+      platformOs: expect.any(String),
     })
   })
 
@@ -165,7 +168,10 @@ describe('CodexAppServerClient', () => {
     const startThreadPromise = client.startThread({ cwd: '/repo/worktree' })
 
     await expect(initializePromise).resolves.toMatchObject({
-      protocolVersion: expect.any(String),
+      userAgent: expect.any(String),
+      codexHome: expect.any(String),
+      platformFamily: expect.any(String),
+      platformOs: expect.any(String),
     })
     await expect(startThreadPromise).resolves.toEqual({
       threadId: 'thread-new-1',

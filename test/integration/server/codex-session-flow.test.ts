@@ -201,6 +201,8 @@ describe('Codex Session Flow Integration', () => {
   })
 
   beforeEach(async () => {
+    delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+    await runtime.shutdown()
     vi.mocked(configStore.snapshot).mockResolvedValue({
       settings: {
         codingCli: {
@@ -276,6 +278,59 @@ describe('Codex Session Flow Integration', () => {
       expect(recordedArgs).not.toContain('--sandbox')
     } finally {
       await closeWebSocket(ws)
+    }
+  })
+
+  it('restores a persisted Codex session without calling thread/resume on the app-server', async () => {
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      overrides: {
+        'thread/resume': {
+          error: {
+            code: -32600,
+            message: 'no rollout found for thread id thread-existing-1',
+          },
+        },
+      },
+    })
+
+    const ws = await createAuthenticatedWs(port)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-restore',
+        mode: 'codex',
+        cwd: tempDir,
+        resumeSessionId: 'thread-existing-1',
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-restore'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      expect(created.effectiveResumeSessionId).toBe('thread-existing-1')
+
+      const record = registry.get(created.terminalId)
+      expect(record?.resumeSessionId).toBe('thread-existing-1')
+
+      await waitForFile(argLogPath)
+      const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
+      expect(recordedArgs.slice(0, 2)).toEqual([
+        '--remote',
+        expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+      ])
+      expect(recordedArgs).toContain('resume')
+      expect(recordedArgs).toContain('thread-existing-1')
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
     }
   })
 })
