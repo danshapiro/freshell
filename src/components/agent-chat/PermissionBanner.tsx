@@ -1,6 +1,7 @@
 import { memo } from 'react'
 import { ShieldAlert, Terminal, FileText, Pencil, Eye } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useMobile } from '@/hooks/useMobile'
 import type { PermissionRequest } from '@/store/agentChatTypes'
 
 interface PermissionBannerProps {
@@ -18,6 +19,7 @@ const TOOL_ICONS: Record<string, typeof Terminal> = {
 }
 
 function PermissionBanner({ permission, onAllow, onDeny, disabled }: PermissionBannerProps) {
+  const isMobile = useMobile()
   const toolName = permission.tool?.name ?? 'Unknown'
   const Icon = TOOL_ICONS[toolName] || ShieldAlert
   const input = permission.tool?.input
@@ -50,9 +52,10 @@ function PermissionBanner({ permission, onAllow, onDeny, disabled }: PermissionB
           onClick={onAllow}
           disabled={disabled}
           className={cn(
-            'px-3 py-1 text-xs rounded font-medium',
+            'px-3 text-xs rounded font-medium',
             'bg-green-600 text-white hover:bg-green-700',
-            'disabled:opacity-50'
+            'disabled:opacity-50',
+            isMobile ? 'py-2.5 min-h-11' : 'py-1',
           )}
           aria-label="Allow tool use"
         >
@@ -63,9 +66,10 @@ function PermissionBanner({ permission, onAllow, onDeny, disabled }: PermissionB
           onClick={onDeny}
           disabled={disabled}
           className={cn(
-            'px-3 py-1 text-xs rounded font-medium',
+            'px-3 text-xs rounded font-medium',
             'bg-red-600 text-white hover:bg-red-700',
-            'disabled:opacity-50'
+            'disabled:opacity-50',
+            isMobile ? 'py-2.5 min-h-11' : 'py-1',
           )}
           aria-label="Deny tool use"
         >

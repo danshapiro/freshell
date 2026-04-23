@@ -6,6 +6,7 @@ import { useAppDispatch } from '@/store/hooks'
 import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
 import { useInputHistory } from '@/hooks/useInputHistory'
+import { useMobile } from '@/hooks/useMobile'
 
 export interface ChatComposerHandle {
   focus: () => void
@@ -34,6 +35,7 @@ function isOnLastLine(textarea: HTMLTextAreaElement): boolean {
 
 const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus, shouldFocusOnReady }, ref) {
   const dispatch = useAppDispatch()
+  const isMobile = useMobile()
   const [text, setText] = useState(() => (paneId ? getDraft(paneId) : ''))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const { navigateUp, navigateDown, push, reset } = useInputHistory(paneId)
@@ -150,7 +152,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [])
 
   return (
-    <div className="border-t px-3 py-2">
+    <div className={cn('border-t py-2', isMobile ? 'px-2' : 'px-3')}>
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaCallbackRef}
@@ -162,10 +164,10 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
           placeholder={placeholder ?? 'Message Claude...'}
           rows={1}
           className={cn(
-            'flex-1 resize-none rounded border bg-background px-3 py-1.5 text-sm',
+            'flex-1 resize-none rounded border bg-background px-3 text-sm',
             'focus:outline-none focus:ring-2 focus:ring-ring',
-            'min-h-[36px] max-h-[200px]',
-            'disabled:opacity-50'
+            'disabled:opacity-50',
+            isMobile ? 'py-2.5 min-h-11 max-h-[200px]' : 'py-1.5 min-h-[36px] max-h-[200px]',
           )}
           aria-label="Chat message input"
         />
@@ -173,7 +175,10 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
           <button
             type="button"
             onClick={onInterrupt}
-            className="p-2 rounded bg-red-600 text-white hover:bg-red-700"
+            className={cn(
+              'rounded bg-red-600 text-white hover:bg-red-700',
+              isMobile ? 'p-2.5 min-h-11 min-w-11' : 'p-2',
+            )}
             aria-label="Stop generation"
           >
             <Square className="h-4 w-4" />
@@ -183,7 +188,10 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
             type="button"
             onClick={handleSend}
             disabled={disabled || !text.trim()}
-            className="p-2 rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            className={cn(
+              'rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50',
+              isMobile ? 'p-2.5 min-h-11 min-w-11' : 'p-2',
+            )}
             aria-label="Send message"
           >
             <Send className="h-4 w-4" />

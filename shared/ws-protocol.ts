@@ -30,7 +30,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 3 as const
+export const WS_PROTOCOL_VERSION = 4 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -213,12 +213,19 @@ export const TerminalCreateSchema = z.object({
   paneId: z.string().min(1).optional(),
 })
 
+export const TerminalAttachIntentSchema = z.enum([
+  'viewport_hydrate',
+  'keepalive_delta',
+  'transport_reconnect',
+])
+
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
+  intent: TerminalAttachIntentSchema,
   cols: z.number().int().min(2).max(1000),
   rows: z.number().int().min(2).max(500),
 })

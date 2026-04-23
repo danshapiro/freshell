@@ -481,9 +481,21 @@ function mergeHydratedPaneMetadata(
     const fallbackTitles = !localLayoutPreserved
       ? filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
       : undefined
+    const localUserSetTitleFlags = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
+      : undefined
     if (nextPaneTitles) {
-      const merged = fallbackTitles ? { ...fallbackTitles, ...nextPaneTitles } : nextPaneTitles
-      paneTitles[tabId] = merged
+      if (fallbackTitles && localUserSetTitleFlags) {
+        const merged = { ...nextPaneTitles }
+        for (const [paneId, title] of Object.entries(fallbackTitles)) {
+          if (localUserSetTitleFlags[paneId]) {
+            merged[paneId] = title
+          }
+        }
+        paneTitles[tabId] = merged
+      } else {
+        paneTitles[tabId] = nextPaneTitles
+      }
     } else if (fallbackTitles) {
       paneTitles[tabId] = fallbackTitles
     }
@@ -493,8 +505,14 @@ function mergeHydratedPaneMetadata(
       tabId,
       paneIdSet,
     )
-    if (nextPaneTitleSetByUser) {
-      paneTitleSetByUser[tabId] = nextPaneTitleSetByUser
+    const fallbackTitleSetByUser = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
+      : undefined
+    if (nextPaneTitleSetByUser || fallbackTitleSetByUser) {
+      paneTitleSetByUser[tabId] = {
+        ...(nextPaneTitleSetByUser || {}),
+        ...(fallbackTitleSetByUser || {}),
+      }
     }
   }
 

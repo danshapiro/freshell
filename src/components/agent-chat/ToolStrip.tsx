@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useMobile } from '@/hooks/useMobile'
 import { getToolPreview } from './tool-preview'
 import ToolBlock from './ToolBlock'
 import SlotReel from './SlotReel'
@@ -22,6 +23,7 @@ interface ToolStripProps {
 }
 
 function ToolStrip({ pairs, isStreaming, showTools = false }: ToolStripProps) {
+  const isMobile = useMobile()
   const [stripExpanded, setStripExpanded] = useState(showTools)
   useEffect(() => { setStripExpanded(showTools) }, [showTools])
 
@@ -61,7 +63,10 @@ function ToolStrip({ pairs, isStreaming, showTools = false }: ToolStripProps) {
           <button
             type="button"
             onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
+            className={cn(
+              'shrink-0 hover:bg-accent/50 rounded transition-colors',
+              isMobile ? 'p-1.5 min-h-11 min-w-11 flex items-center justify-center' : 'p-0.5',
+            )}
             aria-label="Toggle tool details"
           >
             <ChevronRight className="h-3 w-3" />
@@ -83,7 +88,10 @@ function ToolStrip({ pairs, isStreaming, showTools = false }: ToolStripProps) {
           <button
             type="button"
             onClick={handleToggle}
-            className="ml-1.5 shrink-0 rounded p-0.5 transition-colors hover:bg-accent/50"
+            className={cn(
+              'ml-1.5 shrink-0 rounded transition-colors hover:bg-accent/50',
+              isMobile ? 'p-1.5 min-h-11 min-w-11 flex items-center justify-center' : 'p-0.5',
+            )}
             aria-label="Toggle tool details"
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />

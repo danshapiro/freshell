@@ -5,7 +5,6 @@ import type {
   AgentTimelineItem,
   AgentTimelineTurn,
   ChatContentBlock,
-  ChatMessage,
   ChatSessionState,
   PendingCreateFailure,
   QuestionDefinition,

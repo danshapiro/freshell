@@ -72,6 +72,7 @@ import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
 import { CodexAppServerRuntime } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { registerStaticClientRoutes } from './static-client-routes.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -518,32 +519,9 @@ async function main() {
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')
   const clientDir = path.join(distRoot, 'client')
-  const indexHtml = path.join(clientDir, 'index.html')
 
   if (!isDev) {
-    app.use(express.static(clientDir, {
-      index: false,
-      setHeaders: (res, filePath) => {
-        const isIndexHtml = filePath.endsWith('/index.html') || filePath.endsWith('\\index.html')
-        const isHashedAsset = filePath.includes(`${path.sep}assets${path.sep}`)
-          && /[.-][A-Za-z0-9_-]{6,}\.(js|css|svg|png|jpg|jpeg|gif|woff2?)$/.test(filePath)
-        if (isIndexHtml) {
-          res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-          res.setHeader('Pragma', 'no-cache')
-          res.setHeader('Expires', '0')
-        } else if (isHashedAsset) {
-          res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
-        } else {
-          res.setHeader('Cache-Control', 'no-cache')
-        }
-      },
-    }))
-    app.get('*', (_req, res) => {
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-      res.setHeader('Pragma', 'no-cache')
-      res.setHeader('Expires', '0')
-      res.sendFile(indexHtml)
-    })
+    registerStaticClientRoutes(app, clientDir)
   }
 
   // Coding CLI watcher hooks

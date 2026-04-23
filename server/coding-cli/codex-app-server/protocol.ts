@@ -14,7 +14,10 @@ export const CodexInitializeParamsSchema = z.object({
 })
 
 export const CodexInitializeResultSchema = z.object({
-  protocolVersion: z.string().min(1),
+  userAgent: z.string().min(1),
+  codexHome: z.string().min(1),
+  platformFamily: z.string().min(1),
+  platformOs: z.string().min(1),
 })
 
 export const CodexThreadSchema = z.object({

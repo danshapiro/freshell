@@ -229,7 +229,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     })
     const closeSpy = vi.spyOn(ws, 'close')
 
-    const attached = await broker.attach(ws as any, 'term-spike', 80, 24, 0)
+    const attached = await broker.attach(ws as any, 'term-spike', 'viewport_hydrate', 80, 24, 0)
     expect(attached).toBe('attached')
 
     registry.emit('terminal.output.raw', { terminalId: 'term-spike', data: 'first', at: Date.now() })
@@ -258,7 +258,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     })
     const closeSpy = vi.spyOn(ws, 'close')
 
-    const attached = await broker.attach(ws as any, 'term-stalled', 80, 24, 0)
+    const attached = await broker.attach(ws as any, 'term-stalled', 'viewport_hydrate', 80, 24, 0)
     expect(attached).toBe('attached')
 
     registry.emit('terminal.output.raw', { terminalId: 'term-stalled', data: 'blocked', at: Date.now() })
@@ -287,14 +287,14 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       registry.createTerminal('term-replay')
 
       const wsSeed = createMockWs()
-      await broker.attach(wsSeed as any, 'term-replay', 80, 24, 0)
+      await broker.attach(wsSeed as any, 'term-replay', 'viewport_hydrate', 80, 24, 0)
 
       registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'aaaa', at: Date.now() })
       registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'bbbb', at: Date.now() })
       registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'cccc', at: Date.now() })
 
       const wsReplay = createMockWs()
-      await broker.attach(wsReplay as any, 'term-replay', 80, 24, 0)
+      await broker.attach(wsReplay as any, 'term-replay', 'viewport_hydrate', 80, 24, 0)
 
       expect(perfSpy.mock.calls.some(([event, payload, level]) =>
         event === 'terminal_stream_replay_miss' &&
@@ -321,7 +321,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-attach-id')
 
     const ws = createMockWs()
-    const attached = await broker.attach(ws as any, 'term-attach-id', 80, 24, 0, 'attach-1')
+    const attached = await broker.attach(ws as any, 'term-attach-id', 'viewport_hydrate', 80, 24, 0, 'attach-1')
     expect(attached).toBe('attached')
 
     registry.emit('terminal.output.raw', { terminalId: 'term-attach-id', data: 'seed', at: Date.now() })
@@ -341,13 +341,47 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('does not resize during transport_reconnect when another viewer is already attached', async () => {
+    const registry = new FakeBrokerRegistry()
+    const resizeSpy = vi.spyOn(registry, 'resize')
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-passive-reconnect')
+
+    const primaryWs = createMockWs()
+    const reconnectingWs = createMockWs()
+
+    await broker.attach(primaryWs as any, 'term-passive-reconnect', 'viewport_hydrate', 120, 40, 0, 'attach-primary')
+    resizeSpy.mockClear()
+
+    const attached = await broker.attach(
+      reconnectingWs as any,
+      'term-passive-reconnect',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'attach-reconnect',
+    )
+
+    expect(attached).toBe('attached')
+    expect(resizeSpy).not.toHaveBeenCalled()
+
+    const payloads = reconnectingWs.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && typeof payload === 'object')
+
+    expect(payloads.some((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'attach-reconnect')).toBe(true)
+
+    broker.close()
+  })
+
   it('keeps each live terminal.output frame within the shared realtime byte budget', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-budget')
 
     const ws = createMockWs()
-    const attached = await broker.attach(ws as any, 'term-budget', 80, 24, 0, 'attach-budget')
+    const attached = await broker.attach(ws as any, 'term-budget', 'viewport_hydrate', 80, 24, 0, 'attach-budget')
     expect(attached).toBe('attached')
 
     for (let i = 0; i < 40; i += 1) {
@@ -375,10 +409,10 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-supersede')
 
     const ws = createMockWs()
-    await broker.attach(ws as any, 'term-supersede', 80, 24, 0, 'attach-old')
+    await broker.attach(ws as any, 'term-supersede', 'viewport_hydrate', 80, 24, 0, 'attach-old')
     registry.emit('terminal.output.raw', { terminalId: 'term-supersede', data: 'old-frame', at: Date.now() })
 
-    await broker.attach(ws as any, 'term-supersede', 80, 24, 1, 'attach-new')
+    await broker.attach(ws as any, 'term-supersede', 'viewport_hydrate', 80, 24, 1, 'attach-new')
     registry.emit('terminal.output.raw', { terminalId: 'term-supersede', data: 'new-frame', at: Date.now() })
     vi.advanceTimersByTime(5)
 
@@ -399,12 +433,12 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-overflow')
 
     const wsSeed = createMockWs()
-    await broker.attach(wsSeed as any, 'term-overflow', 80, 24, 0)
+    await broker.attach(wsSeed as any, 'term-overflow', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-1', at: Date.now() })
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-2', at: Date.now() })
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-overflow', 80, 24, 1)
+    await broker.attach(wsReplay as any, 'term-overflow', 'viewport_hydrate', 80, 24, 1)
     expect(perfSpy.mock.calls.some(([event, payload]) =>
       event === 'terminal_stream_replay_hit' &&
       payload?.terminalId === 'term-overflow' &&
@@ -412,7 +446,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     )).toBe(true)
 
     const wsOverflow = createMockWs()
-    await broker.attach(wsOverflow as any, 'term-overflow', 80, 24, 0)
+    await broker.attach(wsOverflow as any, 'term-overflow', 'viewport_hydrate', 80, 24, 0)
 
     for (let i = 0; i < 220; i += 1) {
       registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'x'.repeat(1024), at: Date.now() })
@@ -448,7 +482,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-replay-budget')
 
     const wsSeed = createMockWs()
-    await broker.attach(wsSeed as any, 'term-replay-budget', 80, 24, 0)
+    await broker.attach(wsSeed as any, 'term-replay-budget', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', {
       terminalId: 'term-replay-budget',
       data: 'a'.repeat(400 * 1024),
@@ -456,7 +490,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     })
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-replay-budget', 80, 24, 0)
+    await broker.attach(wsReplay as any, 'term-replay-budget', 'viewport_hydrate', 80, 24, 0)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
@@ -479,7 +513,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-coding-floor', 'codex')
 
     const wsSeed = createMockWs()
-    await broker.attach(wsSeed as any, 'term-coding-floor', 80, 24, 0)
+    await broker.attach(wsSeed as any, 'term-coding-floor', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', {
       terminalId: 'term-coding-floor',
       data: 'x'.repeat(96 * 1024),
@@ -487,7 +521,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     })
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-coding-floor', 80, 24, 0)
+    await broker.attach(wsReplay as any, 'term-coding-floor', 'viewport_hydrate', 80, 24, 0)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
@@ -510,7 +544,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.createTerminal('term-oversized-tail')
 
     const wsSeed = createMockWs()
-    await broker.attach(wsSeed as any, 'term-oversized-tail', 80, 24, 0)
+    await broker.attach(wsSeed as any, 'term-oversized-tail', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', {
       terminalId: 'term-oversized-tail',
       data: '0123456789',
@@ -518,7 +552,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     })
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-oversized-tail', 80, 24, 0)
+    await broker.attach(wsReplay as any, 'term-oversized-tail', 'viewport_hydrate', 80, 24, 0)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
