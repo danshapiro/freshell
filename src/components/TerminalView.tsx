@@ -40,6 +40,7 @@ import {
   type AttachSeqState,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
+import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
@@ -94,7 +95,6 @@ const SESSION_ACTIVITY_THROTTLE_MS = 5000
 export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
 export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
-const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
 const STARTUP_PROBE_OSC11_QUERY = '\u001b]11;?\u0007'
@@ -312,7 +312,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [keyboardInsetPx, setKeyboardInsetPx] = useState(0)
+  const keyboardInsetPx = useKeyboardInset()
   const [mobileCtrlActive, setMobileCtrlActive] = useState(false)
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
   const mobileCtrlActiveRef = useRef(false)
@@ -597,39 +597,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     sendInput(sequence)
     return true
   }, [sendInput])
-
-  useEffect(() => {
-    if (!isMobile || typeof window === 'undefined' || !window.visualViewport) {
-      setKeyboardInsetPx(0)
-      return
-    }
-
-    const viewport = window.visualViewport
-    let rafId: number | null = null
-
-    const updateKeyboardInset = () => {
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId)
-      }
-      rafId = requestAnimationFrame(() => {
-        const rawInset = Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop))
-        const nextInset = rawInset >= KEYBOARD_INSET_ACTIVATION_PX ? Math.round(rawInset) : 0
-        setKeyboardInsetPx((prev) => (prev === nextInset ? prev : nextInset))
-      })
-    }
-
-    updateKeyboardInset()
-    viewport.addEventListener('resize', updateKeyboardInset)
-    viewport.addEventListener('scroll', updateKeyboardInset)
-
-    return () => {
-      if (rafId !== null) {
-        cancelAnimationFrame(rafId)
-      }
-      viewport.removeEventListener('resize', updateKeyboardInset)
-      viewport.removeEventListener('scroll', updateKeyboardInset)
-    }
-  }, [isMobile])
 
   const clearLongPressTimer = useCallback(() => {
     if (longPressTimerRef.current) {
@@ -1629,6 +1596,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send({
       type: 'terminal.attach',
       terminalId: tid,
+      intent,
       cols,
       rows,
       sinceSeq,

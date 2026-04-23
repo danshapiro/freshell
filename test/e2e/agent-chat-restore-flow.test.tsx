@@ -15,15 +15,57 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
-const wsSend = vi.fn()
+const wsHarness = vi.hoisted(() => {
+  const reconnectHandlers = new Set<() => void>()
+  const sent: unknown[] = []
+  const inFlightSdkCreates = new Map<string, unknown>()
+
+  const send = vi.fn((msg: unknown) => {
+    sent.push(msg)
+    if (!msg || typeof msg !== 'object') return
+    const candidate = msg as { type?: unknown; requestId?: unknown }
+    if (candidate.type === 'sdk.create' && typeof candidate.requestId === 'string') {
+      inFlightSdkCreates.set(candidate.requestId, msg)
+    }
+  })
+
+  return {
+    send,
+    onReconnect: vi.fn((handler: () => void) => {
+      reconnectHandlers.add(handler)
+      return () => reconnectHandlers.delete(handler)
+    }),
+    reconnect() {
+      for (const handler of reconnectHandlers) {
+        handler()
+      }
+      for (const create of inFlightSdkCreates.values()) {
+        send(create)
+      }
+    },
+    clearInFlight(requestId: string) {
+      inFlightSdkCreates.delete(requestId)
+    },
+    sdkCreates() {
+      return sent.filter((msg) => (msg as { type?: unknown })?.type === 'sdk.create')
+    },
+    reset() {
+      reconnectHandlers.clear()
+      sent.length = 0
+      inFlightSdkCreates.clear()
+      send.mockClear()
+      this.onReconnect.mockClear()
+    },
+  }
+})
 const getAgentTimelinePage = vi.fn()
 const getAgentTurnBody = vi.fn()
 const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: wsSend,
-    onReconnect: vi.fn(() => vi.fn()),
+    send: wsHarness.send,
+    onReconnect: wsHarness.onReconnect,
   }),
 }))
 
@@ -87,7 +129,7 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
 describe('agent chat restore flow', () => {
   afterEach(() => {
     cleanup()
-    wsSend.mockClear()
+    wsHarness.reset()
     getAgentTimelinePage.mockReset()
     getAgentTurnBody.mockReset()
     setSessionMetadata.mockClear()
@@ -249,7 +291,7 @@ describe('agent chat restore flow', () => {
     })
 
     await waitFor(() => {
-      const attachCalls = wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
+      const attachCalls = wsHarness.send.mock.calls.filter((call) => call[0]?.type === 'sdk.attach')
       expect(attachCalls).toHaveLength(2)
     })
 
@@ -271,5 +313,87 @@ describe('agent chat restore flow', () => {
     expect(await screen.findByText('Session restore failed')).toBeInTheDocument()
     expect(screen.getByText('Stale restore revision')).toBeInTheDocument()
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+  })
+
+  it('reconnect after sdk.create but before sdk.created resends the same request and binds one session without a retry loop', async () => {
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-reconnect-create',
+      status: 'creating',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsHarness.sdkCreates()).toEqual([
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    await waitFor(() => {
+      expect(wsHarness.sdkCreates()).toEqual([
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.clearInFlight('req-reconnect-create')
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.created',
+        requestId: 'req-reconnect-create',
+        sessionId: 'sdk-reconnected-1',
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.init',
+        sessionId: 'sdk-reconnected-1',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/project',
+        tools: [],
+      })
+    })
+
+    await waitFor(() => {
+      const root = store.getState().panes.layouts.t1
+      const leaf = root && findLeaf(root, 'p1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionId : undefined).toBe('sdk-reconnected-1')
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    expect(wsHarness.sdkCreates()).toHaveLength(2)
+    const root = store.getState().panes.layouts.t1
+    const leaf = root && findLeaf(root, 'p1')
+    expect(leaf?.content.kind === 'agent-chat' ? leaf.content : undefined).toEqual(expect.objectContaining({
+      sessionId: 'sdk-reconnected-1',
+      status: 'connected',
+    }))
   })
 })

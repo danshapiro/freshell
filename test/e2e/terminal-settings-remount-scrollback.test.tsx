@@ -512,6 +512,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
         cols: expect.any(Number),
         rows: expect.any(Number),
         attachRequestId: expect.any(String),
+        intent: 'viewport_hydrate',
       })
     })
 

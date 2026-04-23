@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -38,6 +38,8 @@ import {
   getCanonicalDurableSessionId,
   getPreferredResumeSessionId,
 } from '@/store/persistControl'
+import { useMobile } from '@/hooks/useMobile'
+import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -61,6 +63,8 @@ interface AgentChatViewProps {
 export default function AgentChatView({ tabId, paneId, paneContent, hidden }: AgentChatViewProps) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
+  const isMobile = useMobile()
+  const keyboardInsetPx = useKeyboardInset()
   const providerConfig = getAgentChatProviderConfig(paneContent.provider)
   const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
   const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
@@ -629,6 +633,22 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // When settings are dismissed, focus imperatively via the dismiss callback.
 
 
+  // Keyboard-aware container style: push content above the virtual keyboard on mobile
+  const keyboardContainerStyle = useMemo<CSSProperties | undefined>(() => {
+    if (!isMobile || keyboardInsetPx === 0) return undefined
+    return { paddingBottom: `${keyboardInsetPx}px` }
+  }, [isMobile, keyboardInsetPx])
+
+  // Scroll to bottom when mobile keyboard opens to keep latest content visible
+  const prevKeyboardInsetRef = useRef(0)
+  useEffect(() => {
+    if (keyboardInsetPx > 0 && prevKeyboardInsetRef.current === 0) {
+      // Keyboard just opened -- scroll to bottom
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+    prevKeyboardInsetRef.current = keyboardInsetPx
+  }, [keyboardInsetPx])
+
   // Effort is locked once sdk.create has been sent (no mid-session setter in SDK).
   // Model and permission mode can be changed mid-session via sdk.set-model / sdk.set-permission-mode.
   const sessionStarted = paneContent.status !== 'creating'
@@ -707,9 +727,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [activePaneId, hidden, paneContent.sessionId, paneId, renderItems.length, session?.historyLoaded, tabId, timelineItems.length])
 
   return (
-    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp} style={keyboardContainerStyle}>
       {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1 border-b text-xs text-muted-foreground">
+      <div className={cn('flex items-center justify-between py-1 border-b text-xs text-muted-foreground', isMobile ? 'px-2' : 'px-3')}>
         <span>
           {hasWaitingItems && 'Waiting for answer...'}
           {!hasWaitingItems && paneContent.status === 'creating' && 'Creating session...'}
@@ -744,7 +764,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto overflow-x-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
+      <div ref={scrollContainerRef} onScroll={handleScroll} className={cn('h-full overflow-y-auto overflow-x-auto py-3 space-y-2', isMobile ? 'px-2' : 'px-3')} data-context="agent-chat" data-session-id={paneContent.sessionId}>
         {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav). */}
         {isRestoring && (
           <div className="text-center text-muted-foreground text-sm py-6">
