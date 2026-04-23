@@ -127,6 +127,11 @@ export class CodexAppServerRuntime {
         stdio: ['ignore', 'pipe', 'pipe'],
       })
 
+      // Drain child stdio continuously so verbose app-server or MCP startup logs
+      // cannot fill the pipe buffer and stall JSON-RPC request handling.
+      child.stdout?.resume()
+      child.stderr?.resume()
+
       this.child = child
       this.attachChildExitHandler(child)
 
