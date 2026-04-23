@@ -163,7 +163,8 @@ export default function AgentChatSettings({
         onClick={handleToggle}
         className={cn(
           'p-1 rounded hover:bg-muted transition-colors',
-          open && 'bg-muted'
+          open && 'bg-muted',
+          isMobile && 'min-w-11 min-h-11'
         )}
         aria-label="Settings"
         aria-expanded={open}

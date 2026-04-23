@@ -642,8 +642,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Scroll to bottom when mobile keyboard opens to keep latest content visible
   const prevKeyboardInsetRef = useRef(0)
   useEffect(() => {
-    if (keyboardInsetPx > 0 && prevKeyboardInsetRef.current === 0) {
-      // Keyboard just opened -- scroll to bottom
+    if (keyboardInsetPx > 0 && prevKeyboardInsetRef.current === 0 && isAtBottomRef.current) {
+      // Keyboard just opened -- scroll to bottom (only if user is already at bottom)
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
     prevKeyboardInsetRef.current = keyboardInsetPx
