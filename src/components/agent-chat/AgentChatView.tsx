@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState, type CSSPrope
 import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updatePaneContent, mergePaneContent, restartAgentChatCreate } from '@/store/panesSlice'
+import { updatePaneContent, mergePaneContent, restartAgentChatCreate, updatePaneTitle } from '@/store/panesSlice'
 import { updateTab } from '@/store/tabsSlice'
 import {
   addUserMessage,
@@ -28,6 +28,7 @@ import type { ChatMessage } from '@/store/agentChatTypes'
 import { setSessionMetadata } from '@/lib/api'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { extractTitleFromMessage } from '@shared/title-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { updateSettingsLocal } from '@/store/settingsSlice'
@@ -103,6 +104,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const currentTab = useAppSelector((s) => (
     (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
   ))
+  const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
   const availableModels = useAppSelector((s) => s.agentChat.availableModels)
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
@@ -486,11 +488,25 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   const handleSend = useCallback((text: string) => {
     if (!paneContent.sessionId) return
+
+    // Auto-title the pane and tab from the first user message,
+    // mirroring how terminal CLI panes get titles from session indexer.
+    const isFirstMessage = !session?.messages.length && !session?.timelineItems?.length
+    if (isFirstMessage) {
+      const title = extractTitleFromMessage(text)
+      if (title) {
+        dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: false }))
+        if (!tabTitleSetByUser) {
+          dispatch(updateTab({ id: tabId, updates: { title } }))
+        }
+      }
+    }
+
     dispatch(addUserMessage({ sessionId: paneContent.sessionId, text }))
     ws.send({ type: 'sdk.send', sessionId: paneContent.sessionId, text })
     // Always scroll to bottom when the user sends a message
     scrollToBottom()
-  }, [paneContent.sessionId, dispatch, ws, scrollToBottom])
+  }, [paneContent.sessionId, session?.messages.length, session?.timelineItems?.length, dispatch, ws, scrollToBottom, tabId, paneId, tabTitleSetByUser])
 
   const handleInterrupt = useCallback(() => {
     if (!paneContent.sessionId) return
