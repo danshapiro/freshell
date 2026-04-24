@@ -58,6 +58,8 @@ import {
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
+  getTerminalStartupProbeReplayBoundary,
+  type TerminalStartupProbeState,
 } from '@/lib/terminal-startup-probes'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
@@ -98,8 +100,6 @@ export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
-const STARTUP_PROBE_OSC11_QUERY = '\u001b]11;?\u0007'
-
 function isClaudeTurnSubmit(data: string): boolean {
   return data.includes('\r') || data.includes('\n')
 }
@@ -115,17 +115,24 @@ const TRUNCATED_REPLAY_BYTES = 128 * 1024
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
+  resumeState: TerminalStartupProbeState | null
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
 }
 
-function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
+function consumeStartupProbeReplayDiscard(
+  raw: string,
+  state: StartupProbeReplayDiscardState,
+): {
+  raw: string
+  resumeState: TerminalStartupProbeState | null
+} {
   const remainder = state.remainder
   if (!remainder) {
     state.buffered = ''
-    return raw
+    return { raw, resumeState: null }
   }
 
   let matched = state.buffered
@@ -140,32 +147,26 @@ function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplay
   }
 
   if (matched.length === remainder.length) {
+    const resumeState = state.resumeState
     state.remainder = null
     state.buffered = ''
-    return raw.slice(index)
+    state.resumeState = null
+    return { raw: raw.slice(index), resumeState }
   }
 
   if (index < raw.length) {
     state.remainder = null
     state.buffered = ''
-    return `${matched}${raw.slice(index)}`
+    state.resumeState = null
+    return { raw: `${matched}${raw.slice(index)}`, resumeState: null }
   }
 
   if (index === raw.length) {
     state.buffered = matched
-    return ''
+    return { raw: '', resumeState: null }
   }
 
-  return raw
-}
-
-function getStartupProbeReplayRemainder(pending: string): string | null {
-  if (!pending || pending === STARTUP_PROBE_OSC11_QUERY) {
-    return null
-  }
-  return STARTUP_PROBE_OSC11_QUERY.startsWith(pending)
-    ? STARTUP_PROBE_OSC11_QUERY.slice(pending.length)
-    : null
+  return { raw, resumeState: null }
 }
 
 function deferTerminalPointerMutation(callback: () => void): void {
@@ -341,6 +342,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
     remainder: null,
     buffered: '',
+    resumeState: null,
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
@@ -955,17 +957,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [attemptOsc52ClipboardWrite])
 
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
-    const pendingProbe = startupProbeStateRef.current.pending
+    const pendingProbe = startupProbeStateRef.current
     if (opts?.discardReplayRemainder) {
-      const remainder = getStartupProbeReplayRemainder(pendingProbe)
+      const boundary = getTerminalStartupProbeReplayBoundary(pendingProbe)
       startupProbeReplayDiscardStateRef.current = {
-        remainder,
+        remainder: boundary.remainder,
         buffered: '',
+        resumeState: boundary.remainder ? boundary.resumeState : null,
       }
+      startupProbeStateRef.current = boundary.remainder
+        ? createTerminalStartupProbeState()
+        : (boundary.resumeState ?? createTerminalStartupProbeState())
     } else {
-      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
+      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '', resumeState: null }
+      startupProbeStateRef.current = createTerminalStartupProbeState()
     }
-    startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
 
   const handleTerminalOutput = useCallback((
@@ -1911,7 +1917,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           ) {
             resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
           }
-          raw = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          if (replayDiscard.resumeState) {
+            startupProbeStateRef.current = replayDiscard.resumeState
+          }
+          raw = replayDiscard.raw
           handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0
