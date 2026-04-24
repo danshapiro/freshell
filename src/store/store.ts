@@ -26,6 +26,7 @@ import { browserPreferencesPersistenceMiddleware } from './browserPreferencesPer
 import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
+import { tabFallbackIdentityMiddleware } from './tabFallbackIdentityMiddleware'
 
 enableMapSet()
 
@@ -60,6 +61,7 @@ export const store = configureStore({
       },
     }).concat(
       perfMiddleware,
+      tabFallbackIdentityMiddleware,
       persistMiddleware,
       serverSettingsSaveStateMiddleware,
       browserPreferencesPersistenceMiddleware,

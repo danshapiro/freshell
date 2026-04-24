@@ -22,6 +22,7 @@ import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
+import { tabFallbackIdentityMiddleware } from '@/store/tabFallbackIdentityMiddleware'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -76,6 +77,7 @@ function makeStoreWithTabs() {
       settings: settingsReducer,
       tabs: tabsReducer,
     },
+    middleware: (getDefault) => getDefault().concat(tabFallbackIdentityMiddleware),
   })
 }
 
@@ -1009,6 +1011,7 @@ describe('AgentChatView reload/restore behavior', () => {
   it('does not loop when two agent-chat panes in one split tab promote different durable ids', async () => {
     const firstDurableSessionId = '00000000-0000-4000-8000-000000000411'
     const secondDurableSessionId = '00000000-0000-4000-8000-000000000412'
+    const staleSharedSessionId = '00000000-0000-4000-8000-000000000410'
     const store = makeStoreWithTabs()
     const dispatchSpy = vi.spyOn(store, 'dispatch')
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -1019,6 +1022,10 @@ describe('AgentChatView reload/restore behavior', () => {
       mode: 'claude',
       codingCliProvider: 'claude',
       status: 'running',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: staleSharedSessionId,
+      },
     }))
     store.dispatch(hydratePanes({
       layouts: {
@@ -1118,8 +1125,12 @@ describe('AgentChatView reload/restore behavior', () => {
     })
 
     const updateTabCalls = dispatchSpy.mock.calls.filter((call) => call[0]?.type === 'tabs/updateTab')
+    const panePromotionCalls = updateTabCalls.filter((call) => {
+      const sessionId = call[0]?.payload?.updates?.sessionRef?.sessionId
+      return sessionId === firstDurableSessionId || sessionId === secondDurableSessionId
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-split')
-    expect(updateTabCalls).toHaveLength(0)
+    expect(panePromotionCalls).toHaveLength(0)
     expect(tab?.sessionRef).toBeUndefined()
 
     consoleErrorSpy.mockRestore()

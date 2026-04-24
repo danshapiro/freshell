@@ -7,6 +7,7 @@ import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
+import { tabFallbackIdentityMiddleware } from '@/store/tabFallbackIdentityMiddleware'
 import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -45,6 +46,7 @@ function makeStore(tabOverrides: Partial<Tab> = {}) {
       settings: settingsReducer,
       tabs: tabsReducer,
     },
+    middleware: (getDefault) => getDefault().concat(tabFallbackIdentityMiddleware),
     preloadedState: {
       tabs: {
         tabs: [
@@ -214,7 +216,13 @@ describe('agent chat restore flow', () => {
   it('restores split agent-chat panes without looping shared tab fallback identity updates', async () => {
     const firstDurableSessionId = '00000000-0000-4000-8000-000000000411'
     const secondDurableSessionId = '00000000-0000-4000-8000-000000000412'
-    const store = makeStore()
+    const staleSharedSessionId = '00000000-0000-4000-8000-000000000410'
+    const store = makeStore({
+      sessionRef: {
+        provider: 'claude',
+        sessionId: staleSharedSessionId,
+      },
+    })
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     store.dispatch(hydratePanes({
