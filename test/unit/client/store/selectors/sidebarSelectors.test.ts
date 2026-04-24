@@ -25,10 +25,20 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
   }
 }
 
-function createFallbackTab(tabId: string, sessionId: string, title: string, cwd: string, mode: 'claude' | 'codex' = 'codex') {
+function createFallbackTab(
+  tabId: string,
+  sessionId: string,
+  title: string,
+  cwd: string,
+  mode: 'claude' | 'codex' = 'codex',
+) {
   const paneId = `pane-${tabId}`
+  const sessionRef = {
+    provider: mode,
+    sessionId,
+  }
   return {
-    tab: { id: tabId, title, mode, resumeSessionId: sessionId, createdAt: 1_000 },
+    tab: { id: tabId, title, mode, resumeSessionId: sessionId, sessionRef, createdAt: 1_000 },
     paneId,
     layout: {
       type: 'leaf',
@@ -39,6 +49,7 @@ function createFallbackTab(tabId: string, sessionId: string, title: string, cwd:
         status: 'running',
         createRequestId: `req-${tabId}`,
         resumeSessionId: sessionId,
+        sessionRef,
         initialCwd: cwd,
       },
     },
@@ -180,7 +191,15 @@ describe('sidebarSelectors', () => {
 
       const tabs = [
         { id: 'tab-layout' },
-        { id: 'tab-no-layout', mode: 'codex', resumeSessionId: 'codex-no-layout' },
+        {
+          id: 'tab-no-layout',
+          mode: 'codex',
+          resumeSessionId: 'codex-no-layout',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-no-layout',
+          },
+        },
         { id: 'tab-invalid', mode: 'claude', resumeSessionId: invalidClaudeSessionId },
       ] as any
 
@@ -204,7 +223,6 @@ describe('sidebarSelectors', () => {
                   sessionRef: {
                     provider: 'codex',
                     sessionId: 'codex-layout',
-                    serverInstanceId: 'srv-local',
                   },
                 },
               },
@@ -220,7 +238,6 @@ describe('sidebarSelectors', () => {
                   sessionRef: {
                     provider: 'claude',
                     sessionId: validClaudeSessionId,
-                    serverInstanceId: 'srv-local',
                   },
                 },
               },
@@ -247,10 +264,10 @@ describe('sidebarSelectors', () => {
       expect(hasTabBySessionId.get('codex-layout')).toBe(true)
       expect(hasTabBySessionId.get('codex-no-layout')).toBe(true)
       expect(hasTabBySessionId.get(validClaudeSessionId)).toBe(true)
-      expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(true)
+      expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(false)
     })
 
-    it('creates a fallback sidebar item for a Claude pane with a human-readable resume name', () => {
+    it('does not create a fallback sidebar item for a Claude pane with a human-readable resume name', () => {
       const tabs = [
         { id: 'tab-named', title: 'Named Resume Session', mode: 'claude', createdAt: 3_000 },
       ] as any
@@ -281,16 +298,10 @@ describe('sidebarSelectors', () => {
 
       const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
 
-      expect(items).toHaveLength(1)
-      expect(items[0]).toMatchObject({
-        sessionId: '137 tour',
-        provider: 'claude',
-        title: 'Named Resume Session',
-        hasTab: true,
-      })
+      expect(items).toEqual([])
     })
 
-    it('creates fallback item for Claude session with special character resume name', () => {
+    it('does not create fallback item for Claude session with special character resume name', () => {
       const tabs = [
         { id: 'tab-special', title: 'Special Name Session', mode: 'claude', createdAt: 3_000 },
       ] as any
@@ -315,15 +326,23 @@ describe('sidebarSelectors', () => {
 
       const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
 
-      expect(items).toHaveLength(1)
-      expect(items[0].sessionId).toBe("fix: can't parse (issue #42)")
-      expect(items[0].hasTab).toBe(true)
+      expect(items).toEqual([])
     })
 
     it('synthesizes a local fallback row for restored open sessions that are not in the current server window', () => {
       const fallbackSessionId = 'codex-restored'
       const tabs = [
-        { id: 'tab-restored', title: 'Restored Session', mode: 'codex', resumeSessionId: fallbackSessionId, createdAt: 2_000 },
+        {
+          id: 'tab-restored',
+          title: 'Restored Session',
+          mode: 'codex',
+          resumeSessionId: fallbackSessionId,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: fallbackSessionId,
+          },
+          createdAt: 2_000,
+        },
       ] as any
 
       const panes = {
@@ -337,6 +356,10 @@ describe('sidebarSelectors', () => {
               status: 'running',
               createRequestId: 'req-restored',
               resumeSessionId: fallbackSessionId,
+              sessionRef: {
+                provider: 'codex',
+                sessionId: fallbackSessionId,
+              },
               initialCwd: '/tmp/restored-project',
             },
           },
@@ -405,6 +428,10 @@ describe('sidebarSelectors', () => {
           title: 'Hidden Session',
           mode: 'codex',
           resumeSessionId: hiddenSessionId,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: hiddenSessionId,
+          },
           createdAt: 2_000,
           sessionMetadataByKey: {
             'codex:codex-hidden': {
@@ -428,6 +455,10 @@ describe('sidebarSelectors', () => {
               status: 'running',
               createRequestId: 'req-hidden',
               resumeSessionId: hiddenSessionId,
+              sessionRef: {
+                provider: 'codex',
+                sessionId: hiddenSessionId,
+              },
               initialCwd: '/tmp/hidden-project',
             },
           },
@@ -473,6 +504,10 @@ describe('sidebarSelectors', () => {
           title: 'Current Session',
           mode: 'claude',
           resumeSessionId: sessionId,
+          sessionRef: {
+            provider: 'claude',
+            sessionId,
+          },
           createdAt: 20_000,
           sessionMetadataByKey: {
             'claude:claude-current': {
@@ -494,6 +529,10 @@ describe('sidebarSelectors', () => {
                 status: 'running',
                 createRequestId: 'req-1',
                 resumeSessionId: sessionId,
+                sessionRef: {
+                  provider: 'claude',
+                  sessionId,
+                },
                 initialCwd: '/repo',
               },
             },

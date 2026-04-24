@@ -317,7 +317,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      await waitForReady(ws)
+      const helloReady = await waitForReady(ws)
 
       const requestId = 'codex-reuse-1'
       const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
@@ -325,7 +325,10 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        liveTerminal: {
+          terminalId: 'term-codex-existing',
+          serverInstanceId: helloReady.serverInstanceId,
+        },
       }))
 
       const created = await createdPromise
@@ -347,8 +350,8 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existing-codex-attach',
       }))
-      const ready = await attachReadyPromise
-      expect(ready.headSeq).toBeGreaterThanOrEqual(0)
+      const attachReady = await attachReadyPromise
+      expect(attachReady.headSeq).toBeGreaterThanOrEqual(0)
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
     } finally {
@@ -370,7 +373,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId: 'reuse-canonical-split',
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
@@ -409,7 +412,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const firstCreated = await firstCreatedPromise
       const firstMsgs = await collectMessages(ws, 150)
@@ -423,7 +426,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const secondCreated = await secondCreatedPromise
       expect(secondCreated.terminalId).toBe(firstCreated.terminalId)
@@ -450,7 +453,7 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
-  it('returns effectiveResumeSessionId from reused codex terminal', async () => {
+  it('does not echo durable session ids from reused codex terminals via terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -462,16 +465,16 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
-      expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
     } finally {
       await closeWebSocket(ws)
     }
   })
 
-  it('returns terminal.created with the exact codex session id for a fresh terminal', async () => {
+  it('creates a fresh codex terminal without persisting a provisional session id', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -489,7 +492,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toBe('term-codex-existing')
-      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
       expect(codexLaunchPlanner.planCreateCalls).toEqual([{
         cwd: '/repo/worktree',
         resumeSessionId: undefined,
@@ -501,8 +504,7 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.createCalls[0]).toMatchObject({
         mode: 'codex',
         cwd: '/repo/worktree',
-        resumeSessionId: 'thread-new-1',
-        sessionBindingReason: 'start',
+        resumeSessionId: undefined,
         providerSettings: {
           codexAppServer: {
             wsUrl: CODEX_REMOTE_WS_URL,
@@ -518,7 +520,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const { WsHandler } = await import('../../server/ws-handler')
     const dupeServer = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     const dupeRegistry = new FakeRegistry(['term-canonical', 'term-duplicate'])
-    new WsHandler(dupeServer, dupeRegistry as any)
+    new WsHandler(dupeServer, dupeRegistry as any, { codexLaunchPlanner: new FakeCodexLaunchPlanner() })
     const info = await listen(dupeServer)
 
     const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
@@ -543,7 +545,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
-        resumeSessionId: CODEX_SESSION_ID,
+        sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
 

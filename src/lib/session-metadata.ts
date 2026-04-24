@@ -58,9 +58,9 @@ export function getSessionMetadata(
   return source?.sessionMetadataByKey?.[sessionMetadataKey(provider, sessionId)]
 }
 
-export function getTabResumeSessionType(tab: Pick<Tab, 'mode' | 'codingCliProvider' | 'resumeSessionId' | 'sessionMetadataByKey'>): string | undefined {
-  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-  const sessionId = tab.resumeSessionId
+export function getTabResumeSessionType(tab: Pick<Tab, 'mode' | 'codingCliProvider' | 'resumeSessionId' | 'sessionRef' | 'sessionMetadataByKey'>): string | undefined {
+  const provider = tab.sessionRef?.provider ?? tab.codingCliProvider ?? (tab.mode !== 'shell' ? tab.mode : undefined)
+  const sessionId = tab.sessionRef?.sessionId ?? tab.resumeSessionId
   if (!provider || !sessionId) return undefined
   return getSessionMetadata(tab, provider, sessionId)?.sessionType ?? provider
 }

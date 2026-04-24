@@ -10,6 +10,7 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
+import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
 
 
 const log = createLogger('PanesSlice')
@@ -21,32 +22,9 @@ type HydratePanesMeta = {
 
 function buildPreservedSessionRef(
   localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
-  preservedResumeSessionId?: string,
+  _preservedResumeSessionId?: string,
 ) {
-  if (!preservedResumeSessionId) {
-    return localContent.sessionRef
-  }
-
-  if (localContent.kind === 'terminal') {
-    if (localContent.mode === 'shell') {
-      return undefined
-    }
-    return {
-      ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
-      provider: localContent.mode,
-      sessionId: preservedResumeSessionId,
-    }
-  }
-
-  if (!isValidClaudeSessionId(preservedResumeSessionId)) {
-    return undefined
-  }
-
-  return {
-    ...(localContent.sessionRef?.serverInstanceId ? { serverInstanceId: localContent.sessionRef.serverInstanceId } : {}),
-    provider: 'claude' as const,
-    sessionId: preservedResumeSessionId,
-  }
+  return sanitizeSessionRef(localContent.sessionRef)
 }
 
 /**
@@ -62,16 +40,8 @@ function normalizePaneContent(
       ? input.resumeSessionId
       : undefined
     const resumeSessionId = inputResumeSessionId
-    const explicitSessionRef = input.sessionRef
-      && typeof input.sessionRef.provider === 'string'
-      && typeof input.sessionRef.sessionId === 'string'
-      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
-      ? input.sessionRef
-      : undefined
-    const sessionRef = explicitSessionRef
-      ?? (resumeSessionId && mode !== 'shell'
-        ? { provider: mode, sessionId: resumeSessionId }
-        : undefined)
+    const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'terminal',
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
@@ -83,6 +53,8 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }
   }
@@ -100,16 +72,8 @@ function normalizePaneContent(
     }
   }
   if (input.kind === 'agent-chat') {
-    const explicitSessionRef = input.sessionRef
-      && typeof input.sessionRef.provider === 'string'
-      && typeof input.sessionRef.sessionId === 'string'
-      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
-      ? input.sessionRef
-      : undefined
-    const sessionRef = explicitSessionRef
-      ?? (input.resumeSessionId && isValidClaudeSessionId(input.resumeSessionId)
-        ? { provider: 'claude' as const, sessionId: input.resumeSessionId }
-        : undefined)
+    const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'agent-chat',
       provider: input.provider,
@@ -118,6 +82,8 @@ function normalizePaneContent(
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
+      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
       model: input.model,

@@ -117,10 +117,12 @@ describe('tabs view flow', () => {
           kind: 'terminal',
           payload: {
             mode: 'codex',
-            resumeSessionId: 'codex-session-123',
             sessionRef: {
               provider: 'codex',
               sessionId: 'codex-session-123',
+            },
+            liveTerminal: {
+              terminalId: 'term-remote-1',
               serverInstanceId: 'srv-remote',
             },
           },
@@ -147,7 +149,74 @@ describe('tabs view flow', () => {
     expect(copiedLayout?.content?.sessionRef).toEqual({
       provider: 'codex',
       sessionId: 'codex-session-123',
-      serverInstanceId: 'srv-remote',
     })
+    expect(copiedLayout?.content?.terminalId).toBeUndefined()
+  })
+
+  it('opens same-server tab copies with an explicit live terminal handle', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+    store.dispatch(setServerInstanceId('srv-local'))
+
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [{
+        tabKey: 'remote:tab-codex-local',
+        tabId: 'tab-codex-local',
+        serverInstanceId: 'srv-local',
+        deviceId: 'remote',
+        deviceLabel: 'remote-device',
+        tabName: 'codex local',
+        status: 'open',
+        revision: 3,
+        createdAt: 10,
+        updatedAt: 20,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-codex-local',
+          kind: 'terminal',
+          payload: {
+            mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'codex-session-456',
+            },
+            liveTerminal: {
+              terminalId: 'term-local-1',
+              serverInstanceId: 'srv-local',
+            },
+          },
+        }],
+      }],
+      closed: [],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const remoteCard = screen.getByLabelText('remote-device: codex local')
+    expect(remoteCard).toBeTruthy()
+    fireEvent.click(remoteCard)
+
+    const copiedTab = store.getState().tabs.tabs[0]
+    expect(copiedTab?.title).toBe('codex local')
+    const copiedLayout = copiedTab ? (store.getState().panes.layouts[copiedTab.id] as any) : undefined
+    expect(copiedLayout?.content?.resumeSessionId).toBeUndefined()
+    expect(copiedLayout?.content?.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-session-456',
+    })
+    expect(copiedLayout?.content?.terminalId).toBe('term-local-1')
+    expect(copiedLayout?.content?.serverInstanceId).toBe('srv-local')
   })
 })

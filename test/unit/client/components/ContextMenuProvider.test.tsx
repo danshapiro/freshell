@@ -830,7 +830,10 @@ describe('ContextMenuProvider', () => {
         expect(newPane.content.kind).toBe('terminal')
         if (newPane.content.kind === 'terminal') {
           expect(newPane.content.mode).toBe('claude')
-          expect(newPane.content.resumeSessionId).toBe(VALID_SESSION_ID)
+          expect(newPane.content.sessionRef).toEqual({
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          })
         }
       }
     }
@@ -873,7 +876,10 @@ describe('ContextMenuProvider', () => {
         expect(newPane.content).toMatchObject({
           kind: 'agent-chat',
           provider: 'freshclaude',
-          resumeSessionId: VALID_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_SESSION_ID,
+          },
         })
       }
     }
@@ -914,7 +920,10 @@ describe('ContextMenuProvider', () => {
     expect(openedTab).toMatchObject({
       title: 'History Terminal Session',
       initialCwd: '/shared/project/history',
-      resumeSessionId: VALID_SESSION_ID,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_SESSION_ID,
+      },
     })
     expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
   })

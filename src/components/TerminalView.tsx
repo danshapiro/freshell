@@ -19,10 +19,10 @@ import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRu
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
-import { buildDurableResumeIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
+import { buildTerminalDurableSessionRefUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
-import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
+import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
@@ -87,6 +87,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
+import { buildRestoreError } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
 
@@ -290,7 +291,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
-  const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
@@ -1767,7 +1767,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
-      const resumeId = getResumeSessionIdFromRef(contentRef)
+      const createSessionState = getCreateSessionStateFromRef(contentRef)
       launchAttemptRef.current = {
         requestId,
         restore,
@@ -1779,7 +1779,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
-        resumeSessionId: resumeId,
+        sessionRef: createSessionState.sessionRef,
+        liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
       })
@@ -1789,7 +1790,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode,
         shell: shell || 'system',
         cwd: initialCwd,
-        resumeSessionId: resumeId,
+        ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
@@ -2046,9 +2048,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             paneId: paneIdRef.current,
             requestId: reqId,
             terminalId: newId,
-            effectiveResumeSessionId: msg.effectiveResumeSessionId,
             currentResumeSessionId: contentRef.current?.resumeSessionId,
-            willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
@@ -2056,20 +2056,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const currentTab = tabRef.current
           if (currentTab) {
             dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
-          }
-          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
-            paneResumeSessionId: contentRef.current?.resumeSessionId,
-            tabResumeSessionId: currentTab?.resumeSessionId,
-            sessionId: msg.effectiveResumeSessionId,
-          })
-          if (durableIdentityUpdate?.paneUpdates) {
-            updateContent(durableIdentityUpdate.paneUpdates)
-          }
-          if (currentTab && durableIdentityUpdate?.tabUpdates) {
-            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
-          }
-          if (durableIdentityUpdate?.shouldFlush) {
-            dispatch(flushPersistedLayoutNow())
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))
@@ -2138,35 +2124,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
         }
 
-        // Handle one-time session association (when Claude creates a new session)
-        // Message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
+        // Handle one-time session association from the authoritative canonical sessionRef.
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
-          const sessionId = msg.sessionId as string
+          const sessionRef = msg.sessionRef
+          if (!sessionRef?.provider || !sessionRef?.sessionId) {
+            return
+          }
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.session.associated', {
             paneId: paneIdRef.current,
             terminalId: tid,
             oldResumeSessionId: contentRef.current?.resumeSessionId,
-            newResumeSessionId: sessionId,
+            sessionRef,
           })
-          const mode = contentRef.current?.mode
-          const sessionRef = mode && mode !== 'shell'
-            ? {
-              provider: mode,
-              sessionId,
-              ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
-            }
-            : undefined
           const currentTab = tabRef.current
-          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
+          const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
+            provider: sessionRef.provider,
+            sessionId: sessionRef.sessionId,
+            paneSessionRef: contentRef.current?.sessionRef,
+            tabSessionRef: currentTab?.sessionRef,
             paneResumeSessionId: contentRef.current?.resumeSessionId,
             tabResumeSessionId: currentTab?.resumeSessionId,
-            sessionId,
           })
-          if (durableIdentityUpdate?.paneUpdates || sessionRef) {
-            updateContent({
-              ...(durableIdentityUpdate?.paneUpdates ?? {}),
-              ...(sessionRef ? { sessionRef } : {}),
-            })
+          if (durableIdentityUpdate?.paneUpdates) {
+            updateContent(durableIdentityUpdate.paneUpdates)
           }
           if (currentTab && durableIdentityUpdate?.tabUpdates) {
             dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
@@ -2235,6 +2215,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
+            if (!current?.sessionRef) {
+              term.writeln('\r\n[Restore unavailable - the live terminal is gone and no durable session identity was saved]\r\n')
+              launchAttemptRef.current = null
+              clearRateLimitRetry()
+              setIsAttaching(false)
+              dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+              updateContent({
+                terminalId: undefined,
+                status: 'error',
+                restoreError: buildRestoreError('dead_live_handle'),
+              })
+              const currentTab = tabRef.current
+              if (currentTab) {
+                dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
+              }
+              return
+            }
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {

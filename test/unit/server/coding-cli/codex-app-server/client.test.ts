@@ -14,6 +14,7 @@ type FakeServerBehavior = {
   closeSocketAfterMethodsOnce?: string[]
   delayMethodsMs?: Record<string, number>
   ignoreMethods?: string[]
+  notifyAfterMethodsOnce?: Record<string, Array<{ method: string; params?: unknown }>>
   requireJsonRpc?: boolean
   requireInitializeBeforeOtherMethods?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
@@ -118,7 +119,29 @@ describe('CodexAppServerClient', () => {
 
     await client.initialize()
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
+    })
+  })
+
+  it('surfaces thread/started notifications to sidecar consumers', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    const startedThread = new Promise<{ id: string; path: string | null; ephemeral: boolean }>((resolve) => {
+      client.onThreadStarted((thread) => resolve(thread))
+    })
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(startedThread).resolves.toEqual({
+      id: 'thread-new-1',
+      path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+      ephemeral: false,
     })
   })
 
@@ -128,7 +151,11 @@ describe('CodexAppServerClient', () => {
 
     await client.initialize()
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -141,7 +168,11 @@ describe('CodexAppServerClient', () => {
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
     })).resolves.toEqual({
-      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      thread: {
+        id: '019d9859-5670-72b1-851f-794ad7fef112',
+        path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -153,7 +184,11 @@ describe('CodexAppServerClient', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -174,8 +209,44 @@ describe('CodexAppServerClient', () => {
       platformOs: expect.any(String),
     })
     await expect(startThreadPromise).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
+  })
+
+  it('sends fs/watch and fs/unwatch envelopes and surfaces fs/changed notifications with the original watchId', async () => {
+    const rolloutPath = '/repo/worktree/.codex/sessions/2026/04/23/rollout-thread-new-1.jsonl'
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        'fs/watch': [
+          {
+            method: 'fs/changed',
+            params: {
+              watchId: 'watch-rollout',
+              changedPaths: [rolloutPath],
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    const changedEvent = new Promise<{ watchId: string; changedPaths: string[] }>((resolve) => {
+      client.onFsChanged((event) => resolve(event))
+    })
+
+    await client.initialize()
+    await expect(client.watchPath(rolloutPath, 'watch-rollout')).resolves.toEqual({
+      path: rolloutPath,
+    })
+    await expect(changedEvent).resolves.toEqual({
+      watchId: 'watch-rollout',
+      changedPaths: [rolloutPath],
+    })
+    await expect(client.unwatchPath('watch-rollout')).resolves.toBeUndefined()
   })
 
   it('fails clearly when the app-server never answers a request', async () => {

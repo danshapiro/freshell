@@ -533,7 +533,19 @@ async function routeAction(
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const tabResult = await c.post('/api/tabs', { name, mode, shell, cwd, browser, editor, resumeSessionId: resume, ...rest })
+      const sessionRef = typeof mode === 'string' && typeof resume === 'string'
+        ? { provider: mode, sessionId: resume }
+        : undefined
+      const tabResult = await c.post('/api/tabs', {
+        name,
+        mode,
+        shell,
+        cwd,
+        browser,
+        editor,
+        ...(sessionRef ? { sessionRef } : {}),
+        ...rest,
+      })
       // Send prompt text to the newly created pane (mirrors CLI behavior: server/cli/index.ts:318)
       if (prompt) {
         const data = unwrapData(tabResult)

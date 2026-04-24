@@ -17,7 +17,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
-import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
+import type { ProjectGroup, BackgroundTerminal, TabMode, Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -84,6 +84,7 @@ function createTestStore(options?: {
   tabs?: Array<{
     id: string
     terminalId?: string
+    sessionRef?: Tab['sessionRef']
     resumeSessionId?: string
     mode?: string
     lastInputAt?: number
@@ -117,7 +118,7 @@ function createTestStore(options?: {
   if (!options?.panes) {
     for (const tab of options?.tabs ?? []) {
       const paneId = `pane-${tab.id}`
-      const mode = (tab.mode as TabMode | undefined) || (tab.resumeSessionId ? 'claude' : 'shell')
+      const mode = (tab.mode as TabMode | undefined) || tab.sessionRef?.provider || (tab.resumeSessionId ? 'claude' : 'shell')
       inferredLayouts[tab.id] = {
         type: 'leaf',
         id: paneId,
@@ -127,6 +128,7 @@ function createTestStore(options?: {
           createRequestId: `req-${tab.id}`,
           status: tab.status || 'running',
           terminalId: tab.terminalId,
+          sessionRef: tab.sessionRef,
           resumeSessionId: tab.resumeSessionId,
         },
       }
@@ -310,6 +312,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           id: 'tab-restored',
           title: 'Restored Session',
           mode: 'codex',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-restored',
+          },
           resumeSessionId: 'codex-restored',
           createdAt: 2_000,
         }],
@@ -323,6 +329,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-restored',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: 'codex-restored',
+                },
                 resumeSessionId: 'codex-restored',
                 cwd: '/tmp/restored-project',
               },
@@ -425,7 +435,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-abc'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-abc'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -540,7 +553,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -581,7 +597,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'exited', // Exited, not running
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-1'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-1'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -621,7 +640,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'shell', // Shell mode, not claude
-          resumeSessionId: sessionId('session-1'),
           cwd: '/home/user/project',
         },
       ]
@@ -694,7 +712,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toHaveClass('bg-muted')
     })
 
-    it('marks non-UUID Claude pane resumeSessionId as hasTab (named resume)', async () => {
+    it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
       const namedResume = 'not-a-uuid'
       const projects: ProjectGroup[] = [
         {
@@ -747,8 +765,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       const button = screen.getByText('Named resume session').closest('button')
       expect(button).not.toBeNull()
-      // Non-UUID Claude resume names are now recognized as valid tabs
-      expect(button).toHaveAttribute('data-has-tab', 'true')
+      expect(button).toHaveAttribute('data-has-tab', 'false')
+      expect(button).not.toHaveClass('bg-muted')
     })
   })
 
@@ -1057,7 +1075,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'codex',
-          resumeSessionId: busySessionId,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: busySessionId,
+          },
         },
       ]
 
@@ -1127,7 +1148,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'codex',
-          resumeSessionId: sid,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: sid,
+          },
         },
         {
           terminalId: newTerminalId,
@@ -1136,7 +1160,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'codex',
-          resumeSessionId: sid,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: sid,
+          },
         },
       ]
 
@@ -1200,11 +1227,19 @@ describe('Sidebar Component - Session-Centric Display', () => {
         {
           id: 'tab-1',
           terminalId,
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: busySessionId,
+          },
           resumeSessionId: busySessionId,
           mode: 'opencode',
         },
         {
           id: 'tab-2',
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: idleSessionId,
+          },
           resumeSessionId: idleSessionId,
           mode: 'opencode',
         },
@@ -1218,7 +1253,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: true,
           mode: 'opencode',
-          resumeSessionId: busySessionId,
+          sessionRef: {
+            provider: 'opencode',
+            sessionId: busySessionId,
+          },
         },
       ]
 
@@ -1410,10 +1448,13 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should navigate to terminal view
       expect(onNavigate).toHaveBeenCalledWith('terminal')
 
-      // Check store has new tab with resumeSessionId
+      // Check store has new tab with canonical durable sessionRef
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('session-to-resume'))
+      expect(state.tabs.tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: sessionId('session-to-resume'),
+      })
       expect(state.tabs.tabs[0].mode).toBe('claude')
     })
 
@@ -1505,7 +1546,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -1592,7 +1636,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
           status: 'running',
           hasClients: false,
           mode: 'claude',
-          resumeSessionId: sessionId('session-running-no-tab'),
+          sessionRef: {
+            provider: 'claude',
+            sessionId: sessionId('session-running-no-tab'),
+          },
           cwd: '/home/user/project',
         },
       ]
@@ -1614,7 +1661,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should create a new tab with the terminalId in pane content
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
-      expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('session-running-no-tab'))
+      expect(state.tabs.tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: sessionId('session-running-no-tab'),
+      })
       expect(state.tabs.tabs[0].mode).toBe('claude')
       // terminalId lives in pane content, not on the tab
       const layout = state.panes.layouts[state.tabs.tabs[0].id]
@@ -3080,7 +3130,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
           (child) =>
             child.type === 'leaf' &&
             child.content.kind === 'terminal' &&
-            child.content.resumeSessionId === sessionId('session-to-split')
+            child.content.sessionRef?.provider === 'claude' &&
+            child.content.sessionRef?.sessionId === sessionId('session-to-split')
         )
         expect(sessionPane).toBeDefined()
       }
@@ -3192,10 +3243,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
               mode: 'codex',
               createRequestId: 'req-foreign',
               status: 'running',
+              serverInstanceId: 'srv-remote',
               sessionRef: {
                 provider: 'codex',
                 sessionId: targetSessionId,
-                serverInstanceId: 'srv-remote',
               },
             },
           },
@@ -3233,7 +3284,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const localPane = collectLeafPanes(layout).find((pane) => (
         pane.type === 'leaf'
         && pane.content.kind === 'terminal'
-        && pane.content.resumeSessionId === targetSessionId
+        && pane.content.sessionRef?.provider === 'codex'
+        && pane.content.sessionRef?.sessionId === targetSessionId
       ))
       expect(localPane).toBeDefined()
     })
@@ -3280,7 +3332,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should create a new tab since active tab has no layout
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(2)
-      const newTab = state.tabs.tabs.find((t: any) => t.resumeSessionId === sessionId('session-no-layout'))
+      const newTab = state.tabs.tabs.find((t: any) => (
+        t.sessionRef?.provider === 'claude'
+        && t.sessionRef?.sessionId === sessionId('session-no-layout')
+      ))
       expect(newTab).toBeDefined()
     })
   })
@@ -3490,6 +3545,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-match',
             title: 'Matching Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: matchingFallbackSessionId,
+            },
             resumeSessionId: matchingFallbackSessionId,
             createdAt: 1_000,
           },
@@ -3497,6 +3556,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-unrelated',
             title: 'Unrelated Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: unrelatedFallbackSessionId,
+            },
             resumeSessionId: unrelatedFallbackSessionId,
             createdAt: 900,
           },
@@ -3511,6 +3574,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-match',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: matchingFallbackSessionId,
+                },
                 resumeSessionId: matchingFallbackSessionId,
                 initialCwd: '/tmp/local/trycycle',
               },
@@ -3523,6 +3590,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-unrelated',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: unrelatedFallbackSessionId,
+                },
                 resumeSessionId: unrelatedFallbackSessionId,
                 initialCwd: '/tmp/local/elsewhere',
               },
@@ -3679,6 +3750,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-alpha-fallback',
             title: 'Alpha Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: alphaFallbackSessionId,
+            },
             resumeSessionId: alphaFallbackSessionId,
             createdAt: 1_000,
           },
@@ -3686,6 +3761,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
             id: 'tab-beta-fallback',
             title: 'Beta Fallback',
             mode: 'codex',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: betaFallbackSessionId,
+            },
             resumeSessionId: betaFallbackSessionId,
             createdAt: 900,
           },
@@ -3700,6 +3779,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-alpha-fallback',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: alphaFallbackSessionId,
+                },
                 resumeSessionId: alphaFallbackSessionId,
                 initialCwd: '/tmp/local/alpha',
               },
@@ -3712,6 +3795,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
                 mode: 'codex',
                 createRequestId: 'req-beta-fallback',
                 status: 'running',
+                sessionRef: {
+                  provider: 'codex',
+                  sessionId: betaFallbackSessionId,
+                },
                 resumeSessionId: betaFallbackSessionId,
                 initialCwd: '/tmp/local/beta',
               },

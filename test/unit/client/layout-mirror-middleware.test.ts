@@ -26,7 +26,7 @@ describe('layoutMirrorMiddleware', () => {
     vi.useRealTimers()
   })
 
-  it('includes fallbackSessionRef for no-layout local session tabs', () => {
+  it('includes fallbackSessionRef for no-layout local session tabs from canonical sessionRef', () => {
     mockSend.mockClear()
     vi.useFakeTimers()
     const store = configureStore({
@@ -38,8 +38,11 @@ describe('layoutMirrorMiddleware', () => {
       id: 'tab-1',
       title: 'alpha',
       mode: 'codex',
-      resumeSessionId: 'older-open',
-    }))
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'older-open',
+      },
+    } as any))
 
     vi.runOnlyPendingTimers()
 

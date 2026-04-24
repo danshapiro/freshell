@@ -102,7 +102,7 @@ describe('SessionRepairService Integration', () => {
 
   describe('waitForSession', () => {
     it('resolves when session is processed', async () => {
-      const sessionId = 'wait-test-session'
+      const sessionId = '00000000-0000-4000-8000-000000000701'
       const sessionFile = path.join(mockClaudeDir, `${sessionId}.jsonl`)
       await fs.copyFile(
         path.join(FIXTURES_DIR, 'healthy.jsonl'),
@@ -119,7 +119,7 @@ describe('SessionRepairService Integration', () => {
 
     it('times out for non-existent session', async () => {
       await expect(
-        service.waitForSession('nonexistent', 100)
+        service.waitForSession('00000000-0000-4000-8000-000000000702', 100)
       ).rejects.toThrow(/not in queue/)
     })
 
@@ -156,7 +156,7 @@ describe('SessionRepairService Integration', () => {
     })
 
     it('resolves canonical sessionId via file path resolver', async () => {
-      const canonicalId = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
+      const canonicalId = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
       const legacyId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
       const sessionFile = path.join(mockClaudeDir, `${legacyId}.jsonl`)
       await fs.copyFile(path.join(FIXTURES_DIR, 'healthy.jsonl'), sessionFile)
@@ -195,7 +195,7 @@ describe('SessionRepairService Integration', () => {
 
   describe('prioritizeSessions', () => {
     it('re-prioritizes existing queue items', async () => {
-      const sessionId = 'priority-test'
+      const sessionId = '00000000-0000-4000-8000-000000000703'
       const sessionFile = path.join(mockClaudeDir, `${sessionId}.jsonl`)
       await fs.copyFile(
         path.join(FIXTURES_DIR, 'healthy.jsonl'),

@@ -81,7 +81,7 @@ function createRuntime(options: ConstructorParameters<typeof CodexAppServerRunti
 }
 
 describe('CodexAppServerRuntime', () => {
-  it('starts one shared loopback app-server runtime on first use', async () => {
+  it('starts one loopback app-server runtime on first use', async () => {
     const runtime = createRuntime()
 
     const ready = await runtime.ensureReady()
@@ -89,6 +89,19 @@ describe('CodexAppServerRuntime', () => {
     expect(ready.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
     expect(ready.processPid).toBeGreaterThan(0)
     expect(runtime.status()).toBe('running')
+  })
+
+  it('keeps separate runtime instances isolated for concurrent codex terminals', async () => {
+    const firstRuntime = createRuntime()
+    const secondRuntime = createRuntime()
+
+    const [first, second] = await Promise.all([
+      firstRuntime.ensureReady(),
+      secondRuntime.ensureReady(),
+    ])
+
+    expect(first.processPid).not.toBe(second.processPid)
+    expect(first.wsUrl).not.toBe(second.wsUrl)
   })
 
   it('reuses the same process for repeated ensureReady calls', async () => {
@@ -124,23 +137,31 @@ describe('CodexAppServerRuntime', () => {
     expect(runtime.status()).toBe('stopped')
   })
 
-  it('proxies thread/start through the shared client after boot', async () => {
+  it('proxies thread/start through the runtime client after boot', async () => {
     const runtime = createRuntime()
 
     await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
   })
 
-  it('proxies thread/resume through the shared client after boot', async () => {
+  it('proxies thread/resume through the runtime client after boot', async () => {
     const runtime = createRuntime()
 
     await expect(runtime.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
     })).resolves.toEqual({
-      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      thread: {
+        id: '019d9859-5670-72b1-851f-794ad7fef112',
+        path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
+        ephemeral: false,
+      },
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
   })
@@ -191,7 +212,11 @@ describe('CodexAppServerRuntime', () => {
     })
 
     await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
   })
@@ -212,8 +237,55 @@ describe('CodexAppServerRuntime', () => {
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
     })).resolves.toEqual({
-      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      thread: {
+        id: '019d9859-5670-72b1-851f-794ad7fef112',
+        path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
+        ephemeral: false,
+      },
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
     })
+  })
+
+  it('passes thread and fs watch notifications through runtime subscribers', async () => {
+    const rolloutPath = '/repo/worktree/.codex/sessions/2026/04/23/rollout-thread-new-1.jsonl'
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          notifyAfterMethodsOnce: {
+            'fs/watch': [
+              {
+                method: 'fs/changed',
+                params: {
+                  watchId: 'watch-rollout',
+                  changedPaths: [rolloutPath],
+                },
+              },
+            ],
+          },
+        }),
+      },
+    })
+
+    const startedThread = new Promise<{ id: string; path: string | null; ephemeral: boolean }>((resolve) => {
+      runtime.onThreadStarted((thread) => resolve(thread))
+    })
+    const changedEvent = new Promise<{ watchId: string; changedPaths: string[] }>((resolve) => {
+      runtime.onFsChanged((event) => resolve(event))
+    })
+
+    await runtime.startThread({ cwd: '/repo/worktree' })
+    await expect(startedThread).resolves.toEqual({
+      id: 'thread-new-1',
+      path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+      ephemeral: false,
+    })
+    await expect(runtime.watchPath(rolloutPath, 'watch-rollout')).resolves.toEqual({
+      path: rolloutPath,
+    })
+    await expect(changedEvent).resolves.toEqual({
+      watchId: 'watch-rollout',
+      changedPaths: [rolloutPath],
+    })
+    await expect(runtime.unwatchPath('watch-rollout')).resolves.toBeUndefined()
   })
 })

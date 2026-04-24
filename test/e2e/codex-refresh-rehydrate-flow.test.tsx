@@ -209,6 +209,12 @@ function sentMessages() {
   return wsHarness.send.mock.calls.map(([msg]) => msg)
 }
 
+function getTerminalPaneContent(store: ReturnType<typeof createStore>, tabId: string): TerminalPaneContent | null {
+  const layout = store.getState().panes.layouts[tabId] as PaneNode | undefined
+  if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'terminal') return null
+  return layout.content
+}
+
 describe('codex refresh rehydrate flow (e2e)', () => {
   beforeEach(() => {
     localStorage.clear()
@@ -279,14 +285,39 @@ describe('codex refresh rehydrate flow (e2e)', () => {
         requestId: 'req-codex-refresh',
         terminalId: 'term-codex-refresh-old',
         createdAt: 1,
-        effectiveResumeSessionId: 'thread-new-1',
       })
     })
 
     await waitFor(() => {
       const persisted = readPersistedLayoutSnapshotForTest()
-      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.resumeSessionId).toBe('thread-new-1')
-      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBe('thread-new-1')
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.resumeSessionId).toBeUndefined()
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.sessionRef).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.terminalId).toBe('term-codex-refresh-old')
+    })
+
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.session.associated',
+        terminalId: 'term-codex-refresh-old',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
+      })
+    })
+
+    await waitFor(() => {
+      const persisted = readPersistedLayoutSnapshotForTest()
+      expect(persisted?.tabs.tabs.find((tab) => tab.id === tabId)?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      })
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      })
     })
 
     const persisted = readPersistedLayoutSnapshotForTest()
@@ -337,8 +368,131 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       expect(recreated).toMatchObject({
         type: 'terminal.create',
         mode: 'codex',
-        resumeSessionId: 'thread-new-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
         restore: true,
+      })
+      expect(recreated?.resumeSessionId).toBeUndefined()
+    })
+  })
+
+  it('reattaches a same-server live Codex terminal before any durable identity exists', async () => {
+    const tabId = 'tab-codex-live'
+    const paneId = 'pane-codex-live'
+    const store = createStore({
+      tabs: {
+        tabs: [{
+          id: tabId,
+          mode: 'codex',
+          status: 'running',
+          title: 'Codex',
+          titleSetByUser: false,
+          createRequestId: 'req-codex-live',
+        }],
+        activeTabId: tabId,
+      },
+      panes: {
+        layouts: {
+          [tabId]: {
+            type: 'leaf',
+            id: paneId,
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-codex-live',
+              status: 'running',
+              mode: 'codex',
+              shell: 'system',
+              terminalId: 'term-codex-live',
+            },
+          },
+        },
+        activePane: { [tabId]: paneId },
+        paneTitles: {},
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => (
+        msg?.type === 'terminal.attach'
+        && msg?.terminalId === 'term-codex-live'
+      ))).toBe(true)
+    })
+
+    expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
+  })
+
+  it('surfaces restore-unavailable instead of starting a fresh Codex session when a live-only terminal is gone', async () => {
+    const tabId = 'tab-codex-live-only'
+    const paneId = 'pane-codex-live-only'
+    const store = createStore({
+      tabs: {
+        tabs: [{
+          id: tabId,
+          mode: 'codex',
+          status: 'running',
+          title: 'Codex',
+          titleSetByUser: false,
+          createRequestId: 'req-codex-live-only',
+        }],
+        activeTabId: tabId,
+      },
+      panes: {
+        layouts: {
+          [tabId]: {
+            type: 'leaf',
+            id: paneId,
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-codex-live-only',
+              status: 'running',
+              mode: 'codex',
+              shell: 'system',
+              terminalId: 'term-codex-live-only',
+            },
+          },
+        },
+        activePane: { [tabId]: paneId },
+        paneTitles: {},
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => (
+        msg?.type === 'terminal.attach'
+        && msg?.terminalId === 'term-codex-live-only'
+      ))).toBe(true)
+    })
+
+    const baselineMessages = sentMessages().length
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId: 'term-codex-live-only',
+      })
+    })
+
+    await waitFor(() => {
+      expect(sentMessages().slice(baselineMessages).some((msg) => msg?.type === 'terminal.create')).toBe(false)
+      expect((getTerminalPaneContent(store, tabId) as any)?.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'dead_live_handle',
       })
     })
   })

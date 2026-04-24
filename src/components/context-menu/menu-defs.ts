@@ -107,11 +107,17 @@ function getTabProvider(tab?: Tab): string | undefined {
   return tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
 }
 
+function getTabSessionId(tab?: Tab): string | undefined {
+  return tab?.sessionRef?.sessionId ?? tab?.resumeSessionId
+}
+
 function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab, extensions?: ClientExtensionEntry[]): ResumeCommandCandidate | null {
   if (content.kind !== 'terminal') return null
   if (!isResumeCommandProvider(content.mode, extensions)) return null
   const tabProvider = getTabProvider(tab)
-  const sessionId = content.resumeSessionId || (tabProvider === content.mode ? tab?.resumeSessionId : undefined)
+  const sessionId = content.sessionRef?.sessionId
+    || content.resumeSessionId
+    || (tabProvider === content.mode ? getTabSessionId(tab) : undefined)
   return {
     provider: content.mode,
     sessionId,
@@ -123,7 +129,7 @@ function getResumeCandidateForLegacyTab(tab?: Tab, extensions?: ClientExtensionE
   if (!isResumeCommandProvider(provider, extensions)) return null
   return {
     provider,
-    sessionId: tab?.resumeSessionId,
+    sessionId: getTabSessionId(tab),
   }
 }
 

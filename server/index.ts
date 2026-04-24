@@ -70,8 +70,8 @@ import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-import { CodexAppServerRuntime } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -288,8 +288,8 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexAppServerRuntime = new CodexAppServerRuntime()
-  const codexLaunchPlanner = new CodexLaunchPlanner(codexAppServerRuntime)
+  await CodexTerminalSidecar.reapOrphanedSidecars()
+  const codexLaunchPlanner = new CodexLaunchPlanner()
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -361,6 +361,24 @@ async function main() {
   })
   opencodeActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastOpencodeActivityUpdated(payload)
+  })
+  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
+    try {
+      wsHandler.broadcast({
+        type: 'terminal.session.associated' as const,
+        terminalId,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId,
+        },
+      })
+      const metaUpsert = terminalMetadata.associateSession(terminalId, 'opencode', sessionId)
+      if (metaUpsert) {
+        broadcastTerminalMetaUpserts([metaUpsert])
+      }
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+    }
   })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -541,7 +559,10 @@ async function main() {
         wsHandler.broadcast({
           type: 'terminal.session.associated' as const,
           terminalId,
-          sessionId: session.sessionId,
+          sessionRef: {
+            provider: session.provider,
+            sessionId: session.sessionId,
+          },
         })
         const metaUpsert = terminalMetadata.associateSession(
           terminalId,
@@ -628,7 +649,10 @@ async function main() {
       wsHandler.broadcast({
         type: 'terminal.session.associated' as const,
         terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
       const metaUpsert = terminalMetadata.associateSession(terminalId, 'claude', session.sessionId)
       if (metaUpsert) {
@@ -776,9 +800,6 @@ async function main() {
 
     // 4. Kill all coding CLI sessions
     codingCliSessionManager.shutdown()
-
-    // 4b. Stop the shared Codex app-server runtime
-    await codexAppServerRuntime.shutdown()
 
     // 5. Close SDK bridge sessions
     sdkBridge.close()

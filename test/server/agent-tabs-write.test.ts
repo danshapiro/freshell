@@ -82,6 +82,88 @@ describe('tab endpoints', () => {
     }))
   })
 
+  it('creates terminal tabs from canonical sessionRef without mirroring legacy resumeSessionId payloads', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const attachPaneContent = vi.fn()
+    const broadcastUiCommand = vi.fn()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent,
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler: { broadcastUiCommand } }))
+
+    const sessionRef = { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' }
+    const res = await request(app).post('/api/tabs').send({
+      mode: 'claude',
+      name: 'resume me',
+      sessionRef,
+    })
+
+    expect(res.body.status).toBe('ok')
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'claude',
+      resumeSessionId: sessionRef.sessionId,
+    }))
+    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+      kind: 'terminal',
+      sessionRef,
+    }))
+    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
+    expect(broadcastUiCommand).toHaveBeenCalledWith(expect.objectContaining({
+      command: 'tab.create',
+      payload: expect.objectContaining({
+        sessionRef,
+      }),
+    }))
+    expect(broadcastUiCommand.mock.calls[0]?.[0]?.payload).not.toHaveProperty('resumeSessionId')
+  })
+
+  it('passes the planned Codex sidecar through /api/tabs terminal creation', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const layoutStore = {
+      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
+
+    expect(res.body.status).toBe('ok')
+    expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+      approvalPolicy: undefined,
+      cwd: undefined,
+      model: undefined,
+      resumeSessionId: undefined,
+      sandbox: undefined,
+    }])
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'codex',
+      codexSidecar: codexLaunchPlanner.sidecar,
+      providerSettings: expect.objectContaining({
+        codexAppServer: expect.objectContaining({
+          wsUrl: expect.any(String),
+        }),
+      }),
+    }))
+  })
+
   it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
     const app = express()
     app.use(express.json())

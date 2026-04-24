@@ -347,13 +347,16 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
 
       expect(created.terminalId).toMatch(/^term_/)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
       expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
@@ -383,13 +386,16 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
 
       expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
       expect(sessionRepairService.waitForSessionCalls).not.toContain(VALID_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
@@ -420,13 +426,16 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
 
       expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
-      expect(created.effectiveResumeSessionId).toBeUndefined()
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
     } finally {
       await closeWebSocket(ws)
     }
@@ -447,14 +456,17 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
 
       // Should still create with the resumeSessionId (repair failed, but we proceed)
       expect(created.terminalId).toMatch(/^term_/)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
     } finally {
       await closeWebSocket(ws)
     }
@@ -477,13 +489,19 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
@@ -516,7 +534,10 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       await new Promise((resolve) => setTimeout(resolve, REPAIR_STAGGER_MS))
@@ -530,7 +551,10 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const [createdOnWs1, createdOnWs2] = await Promise.all([
@@ -564,7 +588,10 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId: 'resume-session-lock-1',
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       await new Promise((resolve) => setTimeout(resolve, REPAIR_STAGGER_MS))
@@ -578,7 +605,10 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId: 'resume-session-lock-2',
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const [createdOnWs1, createdOnWs2] = await Promise.all([
@@ -611,7 +641,10 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       // Close the socket while repair is in progress
@@ -863,13 +896,16 @@ describe('terminal.create session repair wait', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
 
       // Resume should proceed (not be dropped)
-      expect(created.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
       // waitForSession should have been called despite cached result
       expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
     } finally {
@@ -877,7 +913,7 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
-  it('passes non-UUID resumeSessionId through to create and skips session repair wait', async () => {
+  it('fails closed when Claude restore is requested with a non-canonical sessionRef', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -885,22 +921,69 @@ describe('terminal.create session repair wait', () => {
       await waitForReady(ws)
 
       const requestId = 'resume-invalid-1'
-      const createdPromise = waitForCreated(ws, requestId)
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: 'not-a-uuid',
+        restore: true,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: 'not-a-uuid',
+        },
       }))
 
-      const created = await createdPromise
+      const response = await responsePromise
 
-      // Non-UUID name is now passed through to the registry (not stripped)
-      expect(registry.lastCreateOpts?.resumeSessionId).toBe('not-a-uuid')
-      // effectiveResumeSessionId is set because the name is passed through
-      expect(created.effectiveResumeSessionId).toBe('not-a-uuid')
-      // Session repair is still skipped for non-UUID names
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
       expect(sessionRepairService.waitForSessionCalls).not.toContain('not-a-uuid')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('fails closed when restore is requested without a canonical Claude session id', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'restore-missing-canonical-1'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
     } finally {
       await closeWebSocket(ws)
     }

@@ -113,7 +113,10 @@ describe('tabsSlice', () => {
           shell: 'wsl',
           status: 'running',
           initialCwd: '/home/user',
-          resumeSessionId: 'session-123',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'session-123',
+          },
         })
       )
 
@@ -124,7 +127,10 @@ describe('tabsSlice', () => {
       expect(tab.shell).toBe('wsl')
       expect(tab.status).toBe('running')
       expect(tab.initialCwd).toBe('/home/user')
-      expect(tab.resumeSessionId).toBe('session-123')
+      expect(tab.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'session-123',
+      })
     })
 
     it('increments tab number in default title', () => {
@@ -440,7 +446,10 @@ describe('tabsSlice', () => {
         mode: 'codex',
         shell: 'wsl',
         initialCwd: '/custom/path',
-        resumeSessionId: 'session-abc',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'session-abc',
+        },
         createdAt: 5000000,
       }
 
@@ -460,7 +469,10 @@ describe('tabsSlice', () => {
       expect(tab.mode).toBe('codex')
       expect(tab.shell).toBe('wsl')
       expect(tab.initialCwd).toBe('/custom/path')
-      expect(tab.resumeSessionId).toBe('session-abc')
+      expect(tab.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'session-abc',
+      })
       expect(tab.createdAt).toBe(5000000)
     })
   })
@@ -558,7 +570,7 @@ describe('tabsSlice', () => {
   })
 
   describe('openSessionTab', () => {
-    it('creates a new local tab instead of activating a foreign copied tab', async () => {
+    it('activates an existing canonical tab when a copied snapshot already has the durable session identity', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
@@ -578,13 +590,11 @@ describe('tabsSlice', () => {
       await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
 
       const state = store.getState()
-      expect(state.tabs.tabs).toHaveLength(2)
-      const localTab = state.tabs.tabs.find((tab) => tab.id !== 'foreign-tab')
-      expect(localTab?.resumeSessionId).toBe('shared')
-      expect(state.tabs.activeTabId).toBe(localTab?.id)
+      expect(state.tabs.tabs).toHaveLength(1)
+      expect(state.tabs.activeTabId).toBe('foreign-tab')
     })
 
-    it('activates an id-less local fallback before websocket ready instead of a foreign copied tab', async () => {
+    it('activates the first canonical match before websocket ready when multiple tabs share the durable session identity', async () => {
       const store = createOpenSessionStore()
 
       store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
@@ -600,14 +610,21 @@ describe('tabsSlice', () => {
           },
         },
       }))
-      store.dispatch(addTab({ id: 'local-fallback', mode: 'codex', resumeSessionId: 'shared' }))
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'shared',
+        },
+      }))
       store.dispatch(setActiveTab('foreign-tab'))
 
       await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
 
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(2)
-      expect(state.tabs.activeTabId).toBe('local-fallback')
+      expect(state.tabs.activeTabId).toBe('foreign-tab')
     })
 
     it('activates existing tab when a pane already owns the session', async () => {
@@ -644,7 +661,10 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      })
       expect(tabs[0].mode).toBe('claude')
     })
 
@@ -682,7 +702,10 @@ describe('tabsSlice', () => {
       store.dispatch(addTab({
         id: 'local-fallback',
         mode: 'claude',
-        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
       }))
 
       await store.dispatch(openSessionTab({
@@ -743,7 +766,10 @@ describe('tabsSlice', () => {
         content: {
           kind: 'agent-chat',
           provider: 'freshclaude',
-          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          sessionRef: {
+            provider: 'claude',
+            sessionId: VALID_CLAUDE_SESSION_ID,
+          },
         },
       })
     })
@@ -787,7 +813,10 @@ describe('tabsSlice', () => {
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
       expect(tabs[0].status).toBe('running')
-      expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(tabs[0].sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      })
       // terminalId lives in pane content, not on the tab
       const layout = store.getState().panes.layouts[tabs[0].id]
       expect(layout).toBeDefined()

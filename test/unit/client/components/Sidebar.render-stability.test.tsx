@@ -13,7 +13,10 @@ describe('Sidebar render stability', () => {
       status: 'running',
       hasClients: false,
       mode: 'claude',
-      resumeSessionId: 'session-abc',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: 'session-abc',
+      },
       cwd: '/home/user/project',
     }
 
@@ -25,7 +28,10 @@ describe('Sidebar render stability', () => {
       status: 'running',
       hasClients: true,
       mode: 'codex',
-      resumeSessionId: 'session-def',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'session-def',
+      },
       cwd: '/home/user/other',
     }
 
@@ -73,9 +79,15 @@ describe('Sidebar render stability', () => {
       expect(areTerminalsEqual(a, b)).toBe(false)
     })
 
-    it('returns false when resumeSessionId changes', () => {
+    it('returns false when sessionRef changes', () => {
       const a = [terminal1]
-      const b = [{ ...terminal1, resumeSessionId: 'session-new' }]
+      const b = [{
+        ...terminal1,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: 'session-new',
+        },
+      }]
       expect(areTerminalsEqual(a, b)).toBe(false)
     })
 

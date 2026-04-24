@@ -11,6 +11,7 @@ import {
   registerPendingCreate,
   removePermission,
   removeQuestion,
+  sessionError,
 } from '@/store/agentChatSlice'
 import { loadAgentTimelineWindow, loadAgentTurnBody } from '@/store/agentChatThunks'
 import { getWsClient } from '@/lib/ws-client'
@@ -36,8 +37,8 @@ import {
   buildAgentChatPersistedIdentityUpdate,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
-  getPreferredResumeSessionId,
 } from '@/store/persistControl'
+import { buildRestoreError, type RestoreError } from '@shared/session-contract'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -49,6 +50,23 @@ const EARLY_STATES = new Set(['creating', 'starting'])
  */
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
+}
+
+function getRestoreFailureMessage(restoreError: RestoreError): string {
+  switch (restoreError.reason) {
+    case 'dead_live_handle':
+      return 'The live session is gone and no canonical Claude restore identity was saved.'
+    case 'invalid_legacy_restore_target':
+      return 'This saved session used a legacy restore token that cannot be replayed safely.'
+    case 'missing_canonical_identity':
+      return 'No canonical Claude restore identity is available for this session.'
+    case 'provider_runtime_failed':
+      return 'The provider runtime failed before restore could complete.'
+    case 'durable_artifact_missing':
+      return 'The provider did not produce a durable restore artifact for this session.'
+    default:
+      return 'This session can no longer be restored.'
+  }
 }
 
 interface AgentChatViewProps {
@@ -106,18 +124,15 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
-    ? paneContent.resumeSessionId
-    : undefined
+  const persistedTimelineSessionId = (
+    paneContent.sessionRef?.provider === 'claude'
+    && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
+  )
+    ? paneContent.sessionRef.sessionId
+    : (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
-  const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
-  const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
-  const attachResumeSessionId = getPreferredResumeSessionId(session)
-    ?? (
-      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
-        ? paneContent.resumeSessionId
-        : undefined
-    )
+  const restoreHistoryQueryId = canonicalDurableSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = canonicalDurableSessionId
   const attachPayload = useMemo(() => {
     if (!paneContent.sessionId) return null
     return {
@@ -150,18 +165,53 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
   const triggerRecovery = useCallback(() => {
+    const deadSessionId = paneContentRef.current.sessionId
+    const durableResumeSessionId = getCanonicalDurableSessionId(sessionRef.current)
+      ?? (
+        paneContentRef.current.sessionRef?.provider === 'claude'
+        && isValidClaudeSessionId(paneContentRef.current.sessionRef.sessionId)
+          ? paneContentRef.current.sessionRef.sessionId
+          : (isValidClaudeSessionId(paneContentRef.current.resumeSessionId) ? paneContentRef.current.resumeSessionId : undefined)
+      )
+    if (!durableResumeSessionId) {
+      const restoreError = buildRestoreError('dead_live_handle')
+      if (deadSessionId) {
+        dispatch(sessionError({
+          sessionId: deadSessionId,
+          code: 'RESTORE_UNAVAILABLE',
+          message: getRestoreFailureMessage(restoreError),
+        }))
+      }
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...paneContentRef.current,
+          sessionId: undefined,
+          status: 'idle' as const,
+          restoreError,
+        },
+      }))
+      createSentRef.current = false
+      attachSentRef.current = false
+      return
+    }
+
     const newRequestId = nanoid()
-    const resumeSessionId = getPreferredResumeSessionId(sessionRef.current)
-      ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: durableResumeSessionId,
+        },
+        resumeSessionId: undefined,
         createRequestId: newRequestId,
         status: 'creating' as const,
+        restoreError: undefined,
       },
     }))
     createSentRef.current = false
@@ -267,7 +317,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     dispatch(updatePaneContent({
       tabId,
       paneId,
-      content: { ...paneContentRef.current, sessionId: pendingSessionId, status: 'starting' },
+      content: { ...paneContentRef.current, sessionId: pendingSessionId, status: 'starting', restoreError: undefined },
     }))
     dispatch(clearPendingCreate({ requestId: paneContent.createRequestId }))
   }, [pendingSessionId, paneContent.sessionId, paneContent.createRequestId, tabId, paneId, dispatch])
@@ -352,21 +402,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    const preferredResumeSessionId = getPreferredResumeSessionId(session)
-    if (!preferredResumeSessionId) return
-    if (taggedSessionRef.current === preferredResumeSessionId) return
-    taggedSessionRef.current = preferredResumeSessionId
+    if (!canonicalDurableSessionId) return
+    if (taggedSessionRef.current === canonicalDurableSessionId) return
+    taggedSessionRef.current = canonicalDurableSessionId
 
     if (providerConfig?.codingCliProvider) {
       setSessionMetadata(
         providerConfig.codingCliProvider,
-        preferredResumeSessionId,
+        canonicalDurableSessionId,
         paneContent.provider,
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [paneContent.provider, providerConfig?.codingCliProvider, session?.cliSessionId, session?.timelineSessionId, suppressNetworkEffects])
+  }, [canonicalDurableSessionId, paneContent.provider, providerConfig?.codingCliProvider, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -380,11 +429,12 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (suppressNetworkEffects) return
     if (paneContent.sessionId || createSentRef.current) return
     if (paneContent.status !== 'creating') return
+    if (paneContent.restoreError) return
 
     createSentRef.current = true
     dispatch(registerPendingCreate({
       requestId: paneContent.createRequestId,
-      expectsHistoryHydration: Boolean(paneContent.resumeSessionId),
+      expectsHistoryHydration: Boolean(canonicalDurableSessionId || paneContent.resumeSessionId),
     }))
     ws.send({
       type: 'sdk.create',
@@ -393,7 +443,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       permissionMode: paneContent.permissionMode ?? defaultPermissionMode,
       effort: paneContent.effort ?? defaultEffort,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
-      ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
+      ...((canonicalDurableSessionId ?? paneContent.resumeSessionId)
+        ? { resumeSessionId: canonicalDurableSessionId ?? paneContent.resumeSessionId }
+        : {}),
       ...(paneContent.plugins ? { plugins: paneContent.plugins } : {}),
     })
 
@@ -742,6 +794,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         {isRestoring && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p>Restoring session...</p>
+          </div>
+        )}
+
+        {!paneContent.sessionId && paneContent.restoreError && (
+          <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
+            <p className="font-medium text-red-700 dark:text-red-300">Session restore failed</p>
+            <p className="mt-1 text-red-700/90 dark:text-red-200">{getRestoreFailureMessage(paneContent.restoreError)}</p>
           </div>
         )}
 

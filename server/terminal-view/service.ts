@@ -3,6 +3,7 @@ import {
   MAX_DIRECTORY_PAGE_ITEMS,
   type TerminalDirectoryQuery,
 } from '../../shared/read-models.js'
+import type { SessionLocator } from '../../shared/ws-protocol.js'
 import { TerminalViewMirror } from './mirror.js'
 import type {
   TerminalDirectoryItem,
@@ -18,7 +19,18 @@ type CursorPayload = {
   terminalId: string
 }
 
-type TerminalListRecord = TerminalDirectoryItem
+type TerminalListRecord = {
+  terminalId: string
+  title: string
+  description?: string
+  mode: TerminalMode
+  resumeSessionId?: string
+  createdAt: number
+  lastActivityAt: number
+  status: 'running' | 'exited'
+  hasClients: boolean
+  cwd?: string
+}
 
 type TerminalRecord = {
   terminalId: string
@@ -95,6 +107,29 @@ function compareTerminals(a: TerminalDirectoryItem, b: TerminalDirectoryItem): n
   return b.terminalId.localeCompare(a.terminalId)
 }
 
+function buildSessionRef(mode: TerminalMode, resumeSessionId?: string): SessionLocator | undefined {
+  if (mode === 'shell' || !resumeSessionId) return undefined
+  return {
+    provider: mode,
+    sessionId: resumeSessionId,
+  }
+}
+
+function buildDirectoryItem(terminal: TerminalListRecord): TerminalDirectoryItem {
+  return {
+    terminalId: terminal.terminalId,
+    title: terminal.title,
+    description: terminal.description,
+    mode: terminal.mode,
+    sessionRef: buildSessionRef(terminal.mode, terminal.resumeSessionId),
+    createdAt: terminal.createdAt,
+    lastActivityAt: terminal.lastActivityAt,
+    status: terminal.status,
+    hasClients: terminal.hasClients,
+    cwd: terminal.cwd,
+  }
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw signal.reason instanceof Error ? signal.reason : new Error('Terminal view request aborted')
@@ -145,7 +180,7 @@ export function createTerminalViewService(deps: TerminalViewServiceDeps): Termin
       .map((terminal) => {
         const override = config.terminalOverrides?.[terminal.terminalId]
         return {
-          ...terminal,
+          ...buildDirectoryItem(terminal),
           title: override?.titleOverride || terminal.title,
           description: override?.descriptionOverride || terminal.description,
         }

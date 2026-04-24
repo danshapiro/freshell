@@ -320,7 +320,10 @@ describe('terminal.create reuse running claude terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise
@@ -370,7 +373,10 @@ describe('terminal.create reuse running claude terminal', () => {
         type: 'terminal.create',
         requestId: 'reuse-split-existingAfterConfig',
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
       const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
@@ -411,13 +417,19 @@ describe('terminal.create reuse running claude terminal', () => {
         type: 'terminal.create',
         requestId: 'reuse-claude-dup-split',
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-claude-dup-split',
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created = await createdPromise

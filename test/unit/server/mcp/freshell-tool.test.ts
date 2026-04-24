@@ -82,6 +82,26 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({ name: 'Work', mode: 'claude' }))
   })
 
+  it('new-tab maps resume to canonical sessionRef instead of legacy resumeSessionId', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      name: 'Resume Work',
+      mode: 'claude',
+      resume: '550e8400-e29b-41d4-a716-446655440000',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      name: 'Resume Work',
+      mode: 'claude',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')

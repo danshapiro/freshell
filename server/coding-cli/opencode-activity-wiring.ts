@@ -1,10 +1,24 @@
 import { OpencodeActivityTracker } from './opencode-activity-tracker.js'
+import { OpencodeSessionController } from './opencode-session-controller.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
-import type { TerminalRecord } from '../terminal-registry.js'
+import type { BindSessionResult, TerminalRecord } from '../terminal-registry.js'
+import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
 
 type OpencodeActivityRegistry = {
   list: () => Array<{ terminalId: string }>
-  get: (terminalId: string) => TerminalRecord | undefined
+  get: (terminalId: string) => TerminalRecord | undefined | null
+  bindSession: (
+    terminalId: string,
+    provider: 'opencode',
+    sessionId: string,
+    reason?: SessionBindingReason,
+  ) => BindSessionResult
+  rebindSession: (
+    terminalId: string,
+    provider: 'opencode',
+    sessionId: string,
+    reason?: SessionBindingReason,
+  ) => BindSessionResult
   on: (event: string, handler: (...args: any[]) => void) => void
   off: (event: string, handler: (...args: any[]) => void) => void
 }
@@ -27,6 +41,10 @@ export function wireOpencodeActivityTracker(input: {
     setTimeoutFn: input.setTimeoutFn,
     clearTimeoutFn: input.clearTimeoutFn,
     random: input.random,
+  })
+  const controller = new OpencodeSessionController({
+    tracker,
+    registry: input.registry,
   })
 
   const startTracking = (record: TerminalRecord) => {
@@ -58,9 +76,11 @@ export function wireOpencodeActivityTracker(input: {
 
   return {
     tracker,
+    controller,
     dispose(): void {
       input.registry.off('terminal.created', onCreated)
       input.registry.off('terminal.exit', onExit)
+      controller.dispose()
       tracker.dispose()
     },
   }

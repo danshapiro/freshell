@@ -360,7 +360,8 @@ describe('sidebar click opens pane (e2e)', () => {
         (child: any) =>
           child.type === 'leaf' &&
           child.content.kind === 'terminal' &&
-          child.content.resumeSessionId === sessionId('new-session')
+          child.content.sessionRef?.provider === 'claude' &&
+          child.content.sessionRef?.sessionId === sessionId('new-session')
       )
       expect(sessionPane).toBeDefined()
       // The new pane should be in 'creating' status (not running, since no terminalId)
@@ -605,7 +606,10 @@ describe('sidebar click opens pane (e2e)', () => {
 
     // Should create a new tab via openSessionTab fallback
     expect(state.tabs.tabs).toHaveLength(1)
-    expect(state.tabs.tabs[0].resumeSessionId).toBe(sessionId('orphan-session'))
+    expect(state.tabs.tabs[0].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: sessionId('orphan-session'),
+    })
     expect(state.tabs.tabs[0].mode).toBe('claude')
     expect(onNavigate).toHaveBeenCalledWith('terminal')
   })
