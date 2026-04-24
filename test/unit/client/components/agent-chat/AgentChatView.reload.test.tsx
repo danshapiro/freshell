@@ -18,7 +18,7 @@ import agentChatReducer, {
   timelinePageReceived,
   turnBodyReceived,
 } from '@/store/agentChatSlice'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
@@ -1004,6 +1004,125 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
     }))
+  })
+
+  it('does not loop when two agent-chat panes in one split tab promote different durable ids', async () => {
+    const firstDurableSessionId = '00000000-0000-4000-8000-000000000411'
+    const secondDurableSessionId = '00000000-0000-4000-8000-000000000412'
+    const store = makeStoreWithTabs()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.dispatch(addTab({
+      id: 't-split',
+      title: 'Split Agent Chat Tab',
+      mode: 'claude',
+      codingCliProvider: 'claude',
+      status: 'running',
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        't-split': {
+          type: 'split',
+          id: 'split-root',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            {
+              type: 'leaf',
+              id: 'p1',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-1',
+                sessionId: 'sdk-split-1',
+                status: 'idle',
+              },
+            },
+            {
+              type: 'leaf',
+              id: 'p2',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-2',
+                sessionId: 'sdk-split-2',
+                status: 'idle',
+              },
+            },
+          ],
+        } as PaneNode,
+      },
+      activePane: { 't-split': 'p1' },
+      paneTitles: {},
+    }))
+
+    function findPaneContentInState(state: ReturnType<typeof store.getState>, paneId: string): AgentChatPaneContent | undefined {
+      const root = state.panes.layouts['t-split']
+      if (!root) return undefined
+      function visit(node: PaneNode): AgentChatPaneContent | undefined {
+        if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
+          return node.content
+        }
+        if (node.type === 'split') {
+          return visit(node.children[0]) || visit(node.children[1])
+        }
+        return undefined
+      }
+      return visit(root)
+    }
+
+    function Wrapper({ paneId }: { paneId: string }) {
+      const content = useSelector((s: ReturnType<typeof store.getState>) => findPaneContentInState(s, paneId))
+      if (!content) return null
+      return <AgentChatView tabId="t-split" paneId={paneId} paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper paneId="p1" />
+        <Wrapper paneId="p2" />
+      </Provider>,
+    )
+
+    dispatchSpy.mockClear()
+
+    expect(() => {
+      act(() => {
+        store.dispatch(sessionSnapshotReceived({
+          sessionId: 'sdk-split-1',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: firstDurableSessionId,
+          revision: 1,
+        }))
+        store.dispatch(sessionSnapshotReceived({
+          sessionId: 'sdk-split-2',
+          latestTurnId: 'turn-2',
+          status: 'idle',
+          timelineSessionId: secondDurableSessionId,
+          revision: 1,
+        }))
+      })
+    }).not.toThrow()
+
+    await waitFor(() => {
+      expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-split', 'p1')?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: firstDurableSessionId,
+      })
+      expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-split', 'p2')?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: secondDurableSessionId,
+      })
+    })
+
+    const updateTabCalls = dispatchSpy.mock.calls.filter((call) => call[0]?.type === 'tabs/updateTab')
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-split')
+    expect(updateTabCalls).toHaveLength(0)
+    expect(tab?.sessionRef).toBeUndefined()
+
+    consoleErrorSpy.mockRestore()
   })
 
   it('upgrades a named restore to the canonical durable id when sdk.session.metadata arrives after the snapshot', async () => {

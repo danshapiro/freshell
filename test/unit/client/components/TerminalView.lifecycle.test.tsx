@@ -2433,6 +2433,115 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
+  it('keeps canonical durable identity scoped to the pane when the tab has multiple panes', async () => {
+    const tabId = 'tab-session-assoc-split'
+    const paneId = 'pane-session-assoc-split'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-assoc-split',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const siblingPaneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-assoc-sibling',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = {
+      type: 'split',
+      id: 'split-root',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: paneId, content: paneContent },
+        { type: 'leaf', id: 'pane-session-assoc-sibling', content: siblingPaneContent },
+      ],
+    }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude Split',
+            titleSetByUser: false,
+            createRequestId: 'req-assoc-split',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.created',
+      requestId: 'req-assoc-split',
+      terminalId: 'term-assoc-split',
+      createdAt: Date.now(),
+    })
+
+    const sessionId = '550e8400-e29b-41d4-a716-446655440099'
+    messageHandler!({
+      type: 'terminal.session.associated',
+      terminalId: 'term-assoc-split',
+      sessionRef: {
+        provider: 'claude',
+        sessionId,
+      },
+    })
+
+    const layout = store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'split' }>
+    const primaryPane = layout.children[0]
+    expect(primaryPane.type).toBe('leaf')
+    if (primaryPane.type !== 'leaf') {
+      throw new Error('Expected primary split child to be a leaf pane')
+    }
+    expect(primaryPane.content.kind).toBe('terminal')
+    if (primaryPane.content.kind !== 'terminal') {
+      throw new Error('Expected primary split child to be a terminal pane')
+    }
+    expect(primaryPane.content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId,
+    })
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+    expect(tab?.sessionRef).toBeUndefined()
+    expect(tab?.resumeSessionId).toBeUndefined()
+  })
+
   it('persists canonical codex identity only after terminal.session.associated', async () => {
     const tabId = 'tab-codex-durable'
     const paneId = 'pane-codex-durable'
