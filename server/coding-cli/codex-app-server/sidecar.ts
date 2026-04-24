@@ -39,6 +39,7 @@ type CodexTerminalAttachment = {
 }
 
 type CodexTerminalSidecarOptions = {
+  cwd?: string
   runtime?: CodexAppServerRuntime
   createDurableRolloutTracker?: (
     options: CodexDurableRolloutTrackerOptions,
@@ -115,7 +116,9 @@ export class CodexTerminalSidecar {
   private durableSessionId: string | null = null
 
   constructor(options: CodexTerminalSidecarOptions = {}) {
-    this.runtime = options.runtime ?? new CodexAppServerRuntime()
+    this.runtime = options.runtime ?? new CodexAppServerRuntime(
+      options.cwd ? { cwd: options.cwd } : {},
+    )
     const createDurableRolloutTracker = options.createDurableRolloutTracker
       ?? ((trackerOptions: CodexDurableRolloutTrackerOptions) => new CodexDurableRolloutTracker(trackerOptions))
     this.durableRolloutTracker = createDurableRolloutTracker({

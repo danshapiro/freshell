@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import http from 'node:http'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { CodexAppServerRuntime } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
@@ -89,6 +91,22 @@ describe('CodexAppServerRuntime', () => {
     expect(ready.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
     expect(ready.processPid).toBeGreaterThan(0)
     expect(runtime.status()).toBe('running')
+  })
+
+  it('starts the app-server process in the requested cwd', async () => {
+    if (process.platform !== 'linux') {
+      return
+    }
+
+    const runtimeCwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-runtime-cwd-'))
+    const runtime = createRuntime({ cwd: runtimeCwd })
+
+    try {
+      const ready = await runtime.ensureReady()
+      await expect(fsp.readlink(`/proc/${ready.processPid}/cwd`)).resolves.toBe(runtimeCwd)
+    } finally {
+      await fsp.rm(runtimeCwd, { recursive: true, force: true })
+    }
   })
 
   it('keeps separate runtime instances isolated for concurrent codex terminals', async () => {
