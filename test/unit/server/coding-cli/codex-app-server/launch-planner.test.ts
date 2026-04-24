@@ -14,7 +14,8 @@ describe('CodexLaunchPlanner', () => {
 
   it('starts a fresh Codex terminal without preallocating a thread id', async () => {
     const sidecar = createSidecar()
-    const planner = new CodexLaunchPlanner(() => sidecar as any)
+    const createSidecarWithInput = vi.fn(() => sidecar as any)
+    const planner = new CodexLaunchPlanner(createSidecarWithInput)
 
     const plan = await planner.planCreate({
       cwd: '/repo/worktree',
@@ -22,6 +23,11 @@ describe('CodexLaunchPlanner', () => {
       sandbox: 'workspace-write',
     })
 
+    expect(createSidecarWithInput).toHaveBeenCalledWith({
+      cwd: '/repo/worktree',
+      model: 'codex-default',
+      sandbox: 'workspace-write',
+    })
     expect(sidecar.ensureReady).toHaveBeenCalledTimes(1)
     expect(plan.sessionId).toBeUndefined()
     expect(plan.remote.wsUrl).toBe('ws://127.0.0.1:43123')

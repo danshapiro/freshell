@@ -18,12 +18,12 @@ type PlanCreateInput = {
 
 export class CodexLaunchPlanner {
   constructor(
-    private readonly createSidecar: () => Pick<CodexTerminalSidecar, 'ensureReady' | 'attachTerminal' | 'shutdown'>
-      = () => new CodexTerminalSidecar(),
+    private readonly createSidecar: (input: PlanCreateInput) => Pick<CodexTerminalSidecar, 'ensureReady' | 'attachTerminal' | 'shutdown'>
+      = (input) => new CodexTerminalSidecar({ cwd: input.cwd }),
   ) {}
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
-    const sidecar = this.createSidecar()
+    const sidecar = this.createSidecar(input)
     const ready = await sidecar.ensureReady()
 
     if (input.resumeSessionId) {
