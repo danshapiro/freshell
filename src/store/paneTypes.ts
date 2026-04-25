@@ -1,8 +1,43 @@
 import type { TerminalStatus, TabMode, ShellType } from './types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import {
+  AgentChatModelSelectionSchema,
+  type AgentChatModelSelection,
+} from '@shared/agent-chat-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 
 export type SessionLocator = SharedSessionLocator
+
+export function isAgentChatModelSelection(value: unknown): value is AgentChatModelSelection {
+  return AgentChatModelSelectionSchema.safeParse(value).success
+}
+
+export function normalizeAgentChatModelSelection(
+  value: unknown,
+  legacyModel?: unknown,
+): AgentChatModelSelection | undefined {
+  const parsed = AgentChatModelSelectionSchema.safeParse(value)
+  if (parsed.success) {
+    return parsed.data
+  }
+
+  if (typeof legacyModel === 'string' && legacyModel.trim().length > 0) {
+    return {
+      kind: 'exact',
+      modelId: legacyModel,
+    }
+  }
+
+  return undefined
+}
+
+export function normalizeAgentChatEffortOverride(value: unknown): string | undefined {
+  if (typeof value !== 'string') {
+    return undefined
+  }
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
 
 /**
  * Terminal pane content with full lifecycle management.
@@ -96,12 +131,12 @@ export type AgentChatPaneContent = {
   initialCwd?: string
   /** Request-scoped create failure promoted into pane-local visible state. */
   createError?: AgentChatCreateError
-  /** Model to use (default from provider config) */
-  model?: string
+  /** Stored selection strategy; omit to use the provider-default track. */
+  modelSelection?: AgentChatModelSelection
   /** Permission mode (default from provider config) */
   permissionMode?: string
-  /** Effort level (default from provider config, creation-time only) */
-  effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Explicit effort override; omit to use the model default behavior. */
+  effort?: string
   /** Plugin paths to load into this session (absolute paths to plugin directories) */
   plugins?: string[]
   /** Whether the user has dismissed the first-launch settings popover */

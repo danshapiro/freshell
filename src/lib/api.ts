@@ -4,6 +4,10 @@ import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
 import {
+  AgentChatCapabilitiesResponseSchema,
+  type AgentChatCapabilitiesResponse,
+} from '@shared/agent-chat-capabilities'
+import {
   AgentTimelinePageQuerySchema,
   AgentTimelineTurnBodyQuerySchema,
   SessionDirectoryPageSchema,
@@ -29,6 +33,33 @@ export type ApiError = {
 
 export type ApiRequestOptions = {
   signal?: AbortSignal
+}
+
+function getApiErrorMessage(data: unknown, fallback: string): string {
+  if (typeof data === 'object' && data !== null) {
+    const candidate = data as { message?: unknown; error?: unknown }
+    if (typeof candidate.message === 'string' && candidate.message.trim().length > 0) {
+      return candidate.message
+    }
+    if (typeof candidate.error === 'string' && candidate.error.trim().length > 0) {
+      return candidate.error
+    }
+  }
+  return fallback
+}
+
+function getTypedCapabilityFailure(error: unknown): AgentChatCapabilitiesResponse | undefined {
+  if (!error || typeof error !== 'object' || !('details' in error)) {
+    return undefined
+  }
+
+  const parsed = AgentChatCapabilitiesResponseSchema.safeParse(
+    (error as { details?: unknown }).details,
+  )
+  if (!parsed.success || parsed.data.ok) {
+    return undefined
+  }
+  return parsed.data
 }
 
 export function isApiUnauthorizedError(error: unknown): error is ApiError {
@@ -119,7 +150,7 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
   if (!res.ok) {
     const err: ApiError = {
       status: res.status,
-      message: (data && (data.message || data.error)) || res.statusText,
+      message: getApiErrorMessage(data, res.statusText),
       details: data,
     }
     throw err
@@ -158,6 +189,40 @@ function buildQueryString(entries: Array<[string, string | number | undefined]>)
 
 export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any> {
   return api.get('/api/bootstrap', options)
+}
+
+export async function getAgentChatCapabilities(
+  provider: string,
+  options: ApiRequestOptions = {},
+): Promise<AgentChatCapabilitiesResponse> {
+  try {
+    return AgentChatCapabilitiesResponseSchema.parse(
+      await api.get(`/api/agent-chat/capabilities/${encodeURIComponent(provider)}`, options),
+    )
+  } catch (error) {
+    const typedFailure = getTypedCapabilityFailure(error)
+    if (typedFailure) {
+      return typedFailure
+    }
+    throw error
+  }
+}
+
+export async function refreshAgentChatCapabilities(
+  provider: string,
+  options: ApiRequestOptions = {},
+): Promise<AgentChatCapabilitiesResponse> {
+  try {
+    return AgentChatCapabilitiesResponseSchema.parse(
+      await api.post(`/api/agent-chat/capabilities/${encodeURIComponent(provider)}/refresh`, {}, options),
+    )
+  } catch (error) {
+    const typedFailure = getTypedCapabilityFailure(error)
+    if (typedFailure) {
+      return typedFailure
+    }
+    throw error
+  }
 }
 
 export async function getSessionDirectoryPage(

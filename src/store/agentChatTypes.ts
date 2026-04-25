@@ -1,3 +1,8 @@
+import type {
+  AgentChatCapabilities,
+  AgentChatCapabilityError,
+} from '@shared/agent-chat-capabilities'
+
 export interface ChatContentBlock {
   type: 'text' | 'thinking' | 'tool_use' | 'tool_result'
   // text block
@@ -121,12 +126,18 @@ export interface PendingAgentCreate {
   expectsHistoryHydration: boolean
 }
 
+export interface AgentChatProviderCapabilitiesState {
+  status: 'idle' | 'loading' | 'succeeded' | 'failed'
+  capabilities?: AgentChatCapabilities
+  error?: AgentChatCapabilityError
+}
+
 export interface AgentChatState {
   sessions: Record<string, ChatSessionState>
   /** Maps createRequestId -> sessionId for correlating sdk.created responses */
   pendingCreates: Record<string, PendingAgentCreate>
   /** Request-scoped pre-session failures keyed by createRequestId. */
   pendingCreateFailures: Record<string, PendingCreateFailure>
-  /** Available models from SDK supportedModels() */
-  availableModels: Array<{ value: string; displayName: string; description: string }>
+  /** Runtime capability catalogs keyed by provider. */
+  capabilitiesByProvider: Record<string, AgentChatProviderCapabilitiesState>
 }

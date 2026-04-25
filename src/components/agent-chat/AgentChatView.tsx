@@ -12,7 +12,12 @@ import {
   removePermission,
   removeQuestion,
 } from '@/store/agentChatSlice'
-import { loadAgentTimelineWindow, loadAgentTurnBody } from '@/store/agentChatThunks'
+import {
+  fetchAgentChatCapabilities,
+  loadAgentTimelineWindow,
+  loadAgentTurnBody,
+  refreshAgentChatCapabilities,
+} from '@/store/agentChatThunks'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { ChevronDown } from 'lucide-react'
@@ -25,6 +30,16 @@ import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage } from '@/store/agentChatTypes'
+import {
+  getAgentChatSettingsModelOptions,
+  getAgentChatSettingsModelValue,
+  getAgentChatSupportedEffortLevels,
+  isAgentChatCapabilitiesFresh,
+  isAgentChatEffortSupported,
+  parseAgentChatSettingsModelValue,
+  requiresAgentChatCapabilityValidation,
+  resolveAgentChatModelSelection,
+} from '@/lib/agent-chat-capabilities'
 import { setSessionMetadata } from '@/lib/api'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
@@ -54,6 +69,23 @@ function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
 }
 
+function modelSelectionsMatch(
+  left: AgentChatPaneContent['modelSelection'],
+  right: AgentChatPaneContent['modelSelection'],
+): boolean {
+  if (!left && !right) return true
+  if (!left || !right) return false
+  return left.kind === right.kind && left.modelId === right.modelId
+}
+
+function paneMatchesCurrentProviderDefaults(
+  pane: Pick<AgentChatPaneContent, 'modelSelection' | 'effort'>,
+  providerDefaults?: Pick<AgentChatPaneContent, 'modelSelection' | 'effort'>,
+): boolean {
+  return modelSelectionsMatch(pane.modelSelection, providerDefaults?.modelSelection)
+    && pane.effort === providerDefaults?.effort
+}
+
 interface AgentChatViewProps {
   tabId: string
   paneId: string
@@ -63,14 +95,14 @@ interface AgentChatViewProps {
 
 export default function AgentChatView({ tabId, paneId, paneContent, hidden }: AgentChatViewProps) {
   const dispatch = useAppDispatch()
-  const ws = getWsClient()
+  const ws = useMemo(() => getWsClient(), [])
   const isMobile = useMobile()
   const keyboardInsetPx = useKeyboardInset()
   const providerConfig = getAgentChatProviderConfig(paneContent.provider)
-  const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
+  const providerDefaultModelId = providerConfig?.providerDefaultModelId ?? 'opus'
   const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
-  const defaultEffort = providerConfig?.defaultEffort ?? 'high'
   const localSettings = useAppSelector((state) => state.settings.settings)
+  const providerSettings = localSettings.agentChat?.providers?.[paneContent.provider]
   const defaultShowThinking = localSettings.agentChat.showThinking
   const defaultShowTools = localSettings.agentChat.showTools
   const defaultShowTimecodes = localSettings.agentChat.showTimecodes
@@ -105,7 +137,40 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
   ))
   const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
-  const availableModels = useAppSelector((s) => s.agentChat.availableModels)
+  const providerCapabilitiesState = useAppSelector(
+    (s) => s.agentChat.capabilitiesByProvider?.[paneContent.provider],
+  )
+  const providerCapabilities = providerCapabilitiesState?.capabilities
+  const providerCapabilitiesRef = useRef(providerCapabilities)
+  providerCapabilitiesRef.current = providerCapabilities
+  const resolvedModelSelection = useMemo(
+    () => resolveAgentChatModelSelection({
+      providerDefaultModelId,
+      capabilities: providerCapabilities,
+      modelSelection: paneContent.modelSelection,
+    }),
+    [paneContent.modelSelection, providerCapabilities, providerDefaultModelId],
+  )
+  const settingsModelOptions = useMemo(
+    () => getAgentChatSettingsModelOptions({
+      providerDefaultModelId,
+      capabilities: providerCapabilities,
+      modelSelection: paneContent.modelSelection,
+    }),
+    [paneContent.modelSelection, providerCapabilities, providerDefaultModelId],
+  )
+  const settingsModelValue = getAgentChatSettingsModelValue(
+    paneContent.modelSelection,
+    providerCapabilities,
+  )
+  const effortOptions = useMemo(
+    () => getAgentChatSupportedEffortLevels({
+      providerDefaultModelId,
+      capabilities: providerCapabilities,
+      modelSelection: paneContent.modelSelection,
+    }),
+    [paneContent.modelSelection, providerCapabilities, providerDefaultModelId],
+  )
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
@@ -141,6 +206,24 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // don't race the live SDK attach/create lifecycle.
   const suppressNetworkEffects = typeof window !== 'undefined'
     && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
+
+  const clearPersistedProviderEffortIfPaneMatchesDefaults = useCallback((
+    pane: Pick<AgentChatPaneContent, 'modelSelection' | 'effort'>,
+  ) => {
+    if (!paneMatchesCurrentProviderDefaults(pane, providerSettings)) {
+      return
+    }
+
+    void dispatch(saveServerSettingsPatch({
+      agentChat: {
+        providers: {
+          [paneContent.provider]: {
+            effort: undefined,
+          },
+        },
+      },
+    }))
+  }, [dispatch, paneContent.provider, providerSettings])
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
@@ -387,29 +470,155 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (paneContent.sessionId || createSentRef.current) return
     if (paneContent.status !== 'creating') return
 
+    const requestId = paneContent.createRequestId
     createSentRef.current = true
-    dispatch(registerPendingCreate({
-      requestId: paneContent.createRequestId,
-      expectsHistoryHydration: Boolean(paneContent.resumeSessionId),
-    }))
-    ws.send({
-      type: 'sdk.create',
-      requestId: paneContent.createRequestId,
-      model: paneContent.model ?? defaultModel,
-      permissionMode: paneContent.permissionMode ?? defaultPermissionMode,
-      effort: paneContent.effort ?? defaultEffort,
-      ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
-      ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
-      ...(paneContent.plugins ? { plugins: paneContent.plugins } : {}),
-    })
+    let cancelled = false
 
-    // Update status to 'starting'
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: { ...paneContent, status: 'starting' },
-    }))
-  }, [paneContent.createRequestId, paneContent.sessionId, paneContent.status, tabId, paneId, dispatch, suppressNetworkEffects, ws])
+    const failCreate = (error: AgentChatPaneContent['createError']) => {
+      if (cancelled) return
+      createSentRef.current = false
+      attachSentRef.current = false
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...paneContentRef.current,
+          status: 'create-failed',
+          createError: error,
+        },
+      }))
+    }
+
+    void (async () => {
+      let capabilities = providerCapabilitiesRef.current
+
+      if (requiresAgentChatCapabilityValidation({
+        modelSelection: paneContent.modelSelection,
+        effort: paneContent.effort,
+      }) && !isAgentChatCapabilitiesFresh(capabilities)) {
+        const response = await dispatch(fetchAgentChatCapabilities(paneContent.provider))
+        if (cancelled) return
+        if (!response.ok) {
+          failCreate(response.error)
+          return
+        }
+        capabilities = response.capabilities
+      }
+
+      if (cancelled) return
+
+      const currentPane = paneContentRef.current
+      if (
+        currentPane.createRequestId !== requestId
+        || currentPane.sessionId
+        || currentPane.status !== 'creating'
+      ) {
+        return
+      }
+
+      // Create-time resume accepts either the canonical durable Claude id or a
+      // live/named resume token. We persist only canonical ids for reload/attach
+      // flows, but named resumes still need to launch a restoring session that can
+      // later upgrade in place once the canonical timeline id is known.
+      const createResumeSessionId = (
+        currentPane.sessionRef?.provider === 'claude'
+        && isValidClaudeSessionId(currentPane.sessionRef.sessionId)
+      )
+        ? currentPane.sessionRef.sessionId
+        : (typeof currentPane.resumeSessionId === 'string' && currentPane.resumeSessionId.trim().length > 0
+          ? currentPane.resumeSessionId
+          : undefined)
+      const resolvedSelection = resolveAgentChatModelSelection({
+        providerDefaultModelId,
+        capabilities,
+        modelSelection: currentPane.modelSelection,
+      })
+
+      if (!resolvedSelection.resolvedModelId) {
+        const unavailableModelId =
+          resolvedSelection.unavailableExactSelection?.modelId
+          ?? currentPane.modelSelection?.modelId
+          ?? 'the selected model'
+        failCreate({
+          code: 'MODEL_UNAVAILABLE',
+          message: `Selected model ${unavailableModelId} is no longer available.`,
+          retryable: false,
+        })
+        return
+      }
+
+      let resolvedEffort = currentPane.effort
+      let shouldClearPersistedProviderEffort = false
+      if (resolvedEffort) {
+        if (!resolvedSelection.capability) {
+          failCreate({
+            code: 'CAPABILITY_VALIDATION_REQUIRED',
+            message: 'Could not validate the selected effort for this model.',
+            retryable: true,
+          })
+          return
+        }
+
+        if (!isAgentChatEffortSupported(resolvedSelection.capability, resolvedEffort)) {
+          resolvedEffort = undefined
+          shouldClearPersistedProviderEffort = paneMatchesCurrentProviderDefaults(
+            currentPane,
+            providerSettings,
+          )
+        }
+      }
+
+      dispatch(registerPendingCreate({
+        requestId,
+        expectsHistoryHydration: Boolean(createResumeSessionId),
+      }))
+      ws.send({
+        type: 'sdk.create',
+        requestId,
+        model: resolvedSelection.resolvedModelId,
+        permissionMode: currentPane.permissionMode ?? defaultPermissionMode,
+        ...(resolvedEffort ? { effort: resolvedEffort } : {}),
+        ...(currentPane.initialCwd ? { cwd: currentPane.initialCwd } : {}),
+        ...(createResumeSessionId ? { resumeSessionId: createResumeSessionId } : {}),
+        ...(currentPane.plugins ? { plugins: currentPane.plugins } : {}),
+      })
+
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...currentPane,
+          status: 'starting',
+          ...(resolvedEffort ? {} : { effort: undefined }),
+          createError: undefined,
+        },
+      }))
+
+      if (shouldClearPersistedProviderEffort) {
+        clearPersistedProviderEffortIfPaneMatchesDefaults(currentPane)
+      }
+
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    defaultPermissionMode,
+    dispatch,
+    paneContent.createRequestId,
+    paneContent.effort,
+    paneContent.modelSelection,
+    paneContent.provider,
+    paneContent.sessionId,
+    paneContent.status,
+    paneId,
+    providerDefaultModelId,
+    providerSettings,
+    suppressNetworkEffects,
+    tabId,
+    ws,
+  ])
 
   // Attach to existing session on mount (e.g. after page refresh with persisted pane).
   // Skip when session is already fully hydrated (e.g. split-induced remount) — the WS
@@ -574,10 +783,26 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const handleSettingsChange = useCallback((changes: Record<string, unknown>) => {
     const paneChanges: Partial<AgentChatPaneContent> = {}
     const localChanges: Record<string, unknown> = {}
+    const hasModelChange = Object.prototype.hasOwnProperty.call(changes, 'model')
+    const hasPermissionModeChange = Object.prototype.hasOwnProperty.call(changes, 'permissionMode')
+    const hasEffortChange = Object.prototype.hasOwnProperty.call(changes, 'effort')
+    const nextModelValue = typeof changes.model === 'string' && changes.model.trim().length > 0
+      ? changes.model
+      : undefined
+    const nextModelSelection = nextModelValue
+      ? parseAgentChatSettingsModelValue(nextModelValue)
+      : undefined
+    const nextEffort = typeof changes.effort === 'string' && changes.effort.trim().length > 0
+      ? changes.effort
+      : undefined
 
     for (const [key, value] of Object.entries(changes)) {
       if (key === 'showThinking' || key === 'showTools' || key === 'showTimecodes') {
         localChanges[key] = value
+      } else if (key === 'model') {
+        paneChanges.modelSelection = nextModelSelection
+      } else if (key === 'effort') {
+        paneChanges.effort = nextEffort
       } else {
         (paneChanges as Record<string, unknown>)[key] = value
       }
@@ -598,26 +823,111 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     const pc = paneContentRef.current
 
     // Mid-session model change
-    if (changes.model && pc.sessionId && pc.status !== 'creating') {
-      ws.send({ type: 'sdk.set-model', sessionId: pc.sessionId, model: changes.model as string })
+    if (hasModelChange && nextModelValue && pc.sessionId && pc.status !== 'creating') {
+      const resolvedSelection = resolveAgentChatModelSelection({
+        providerDefaultModelId,
+        capabilities: providerCapabilitiesRef.current,
+        modelSelection: nextModelSelection,
+      })
+      if (resolvedSelection.resolvedModelId) {
+        ws.send({ type: 'sdk.set-model', sessionId: pc.sessionId, model: resolvedSelection.resolvedModelId })
+      }
     }
 
     // Mid-session permission mode change
-    if (changes.permissionMode && pc.sessionId && pc.status !== 'creating') {
+    if (hasPermissionModeChange && changes.permissionMode && pc.sessionId && pc.status !== 'creating') {
       ws.send({ type: 'sdk.set-permission-mode', sessionId: pc.sessionId, permissionMode: changes.permissionMode as string })
     }
 
     // Persist as defaults
-    const defaultsPatch: Record<string, string> = {}
-    if (changes.model) defaultsPatch.defaultModel = changes.model as string
-    if (changes.permissionMode) defaultsPatch.defaultPermissionMode = changes.permissionMode as string
-    if (changes.effort) defaultsPatch.defaultEffort = changes.effort as string
-    if (Object.keys(defaultsPatch).length > 0) {
+    if (hasModelChange) {
       void dispatch(saveServerSettingsPatch({
-        agentChat: { providers: { [paneContent.provider]: defaultsPatch } },
+        agentChat: {
+          providers: {
+            [paneContent.provider]: {
+              modelSelection: nextModelSelection,
+            },
+          },
+        },
       }))
     }
-  }, [tabId, paneId, dispatch, ws])
+
+    if (hasPermissionModeChange && changes.permissionMode) {
+      void dispatch(saveServerSettingsPatch({
+        agentChat: {
+          providers: {
+            [paneContent.provider]: {
+              defaultPermissionMode: changes.permissionMode as string,
+            },
+          },
+        },
+      }))
+    }
+
+    if (hasEffortChange) {
+      void dispatch(saveServerSettingsPatch({
+        agentChat: {
+          providers: {
+            [paneContent.provider]: {
+              effort: nextEffort,
+            },
+          },
+        },
+      }))
+    }
+
+    const effectiveEffort = hasEffortChange ? nextEffort : pc.effort
+
+    if (hasModelChange && nextModelValue && effectiveEffort) {
+      void (async () => {
+        let capabilities = providerCapabilitiesRef.current
+        if (!capabilities) {
+          const response = await dispatch(fetchAgentChatCapabilities(pc.provider))
+          if (!response.ok) return
+          capabilities = response.capabilities
+        }
+
+        const resolvedSelection = resolveAgentChatModelSelection({
+          providerDefaultModelId,
+          capabilities,
+          modelSelection: nextModelSelection,
+        })
+        if (!resolvedSelection.capability || isAgentChatEffortSupported(resolvedSelection.capability, effectiveEffort)) {
+          return
+        }
+
+        dispatch(mergePaneContent({
+          tabId,
+          paneId,
+          updates: { effort: undefined },
+        }))
+        clearPersistedProviderEffortIfPaneMatchesDefaults(pc)
+      })()
+    }
+  }, [clearPersistedProviderEffortIfPaneMatchesDefaults, dispatch, paneContent.provider, paneId, providerDefaultModelId, tabId, ws])
+
+  useEffect(() => {
+    if (paneContent.status === 'creating') return
+    if (!paneContent.effort) return
+    if (!resolvedModelSelection.capability) return
+    if (isAgentChatEffortSupported(resolvedModelSelection.capability, paneContent.effort)) return
+
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: { effort: undefined },
+    }))
+    clearPersistedProviderEffortIfPaneMatchesDefaults(paneContent)
+  }, [
+    clearPersistedProviderEffortIfPaneMatchesDefaults,
+    dispatch,
+    paneContent.effort,
+    paneContent.provider,
+    paneContent.status,
+    paneId,
+    resolvedModelSelection.capability,
+    tabId,
+  ])
 
   const handleSettingsDismiss = useCallback(() => {
     dispatch(updatePaneContent({
@@ -762,16 +1072,29 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             <span className="truncate">{paneContent.initialCwd}</span>
           )}
           <AgentChatSettings
-            model={paneContent.model ?? defaultModel}
+            model={settingsModelValue}
             permissionMode={paneContent.permissionMode ?? defaultPermissionMode}
-            effort={paneContent.effort ?? defaultEffort}
+            effort={paneContent.effort ?? ''}
             showThinking={defaultShowThinking}
             showTools={defaultShowTools}
             showTimecodes={defaultShowTimecodes}
             sessionStarted={sessionStarted}
             defaultOpen={shouldShowSettings}
-            modelOptions={availableModels.length > 0 ? availableModels : undefined}
+            modelOptions={settingsModelOptions}
+            effortOptions={effortOptions}
+            capabilitiesStatus={providerCapabilitiesState?.status ?? 'idle'}
+            capabilityError={providerCapabilitiesState?.error}
             settingsVisibility={providerConfig?.settingsVisibility}
+            onRetryCapabilities={() => {
+              void dispatch(refreshAgentChatCapabilities(paneContent.provider))
+            }}
+            onOpenChange={(open) => {
+              if (!open) return
+              const status = providerCapabilitiesState?.status ?? 'idle'
+              if (status === 'loading' || status === 'failed') return
+              if (isAgentChatCapabilitiesFresh(providerCapabilitiesState?.capabilities)) return
+              void dispatch(fetchAgentChatCapabilities(paneContent.provider))
+            }}
             onChange={handleSettingsChange}
             onDismiss={handleSettingsDismiss}
           />

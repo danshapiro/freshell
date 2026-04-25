@@ -1,7 +1,6 @@
 export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
 
 import type {
-  AgentChatEffort,
   AttentionDismiss,
   ClaudePermissionMode,
   CodingCliSettings,
@@ -120,7 +119,6 @@ export interface TerminalOverride {
 }
 
 export type {
-  AgentChatEffort,
   AttentionDismiss,
   ClaudePermissionMode,
   CodingCliSettings,

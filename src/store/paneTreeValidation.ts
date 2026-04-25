@@ -1,4 +1,4 @@
-import type { PaneNode } from './paneTypes'
+import { isAgentChatModelSelection, normalizeAgentChatEffortOverride, type PaneNode } from './paneTypes'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -41,13 +41,9 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.sessionId)
         && isOptionalString(content.resumeSessionId)
         && isOptionalString(content.initialCwd)
-        && isOptionalString(content.model)
+        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
         && isOptionalString(content.permissionMode)
-        && (content.effort === undefined
-          || content.effort === 'low'
-          || content.effort === 'medium'
-          || content.effort === 'high'
-          || content.effort === 'max')
+        && (content.effort === undefined || normalizeAgentChatEffortOverride(content.effort) !== undefined)
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')

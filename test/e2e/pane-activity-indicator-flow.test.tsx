@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup, within, act } from '@testing-library/react'
+import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
+import { render, screen, cleanup, within, act, fireEvent, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '@/components/TabBar'
@@ -29,9 +29,19 @@ import type {
 } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 
+const wsSend = vi.hoisted(() => vi.fn())
+const getAgentChatCapabilities = vi.hoisted(() => vi.fn())
+const refreshAgentChatCapabilities = vi.hoisted(() => vi.fn())
+const setSessionMetadata = vi.hoisted(() => vi.fn(() => Promise.resolve(undefined)))
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: vi.fn(),
+    send: wsSend,
+    onReconnect: vi.fn(() => () => {}),
   }),
 }))
 
@@ -42,6 +52,13 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
+  getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
+  refreshAgentChatCapabilities: (...args: unknown[]) => refreshAgentChatCapabilities(...args),
+  setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
+}))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 vi.mock('@/store/sessionsThunks', () => ({
@@ -82,7 +99,13 @@ type RenderHarnessOptions = {
   paneTitle?: string
   paneRuntimeActivity?: PaneRuntimeActivityState
   agentChat?: AgentChatState
+  settingsOverrides?: Record<string, unknown>
 }
+
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  HTMLElement.prototype.scrollIntoView = vi.fn()
+})
 
 function renderHarness(options: RenderHarnessOptions) {
   const tab: Tab = {
@@ -131,7 +154,10 @@ function renderHarness(options: RenderHarnessOptions) {
         refreshRequestsByPane: {},
       },
       settings: {
-        settings: defaultSettings,
+        settings: {
+          ...defaultSettings,
+          ...(options.settingsOverrides ?? {}),
+        } as typeof defaultSettings,
         loaded: true,
         lastSavedAt: null,
       },
@@ -184,6 +210,11 @@ function getVisibleSinglePaneTab() {
 describe('pane activity indicator flow (e2e)', () => {
   afterEach(() => {
     cleanup()
+    wsSend.mockClear()
+    getAgentChatCapabilities.mockReset()
+    refreshAgentChatCapabilities.mockReset()
+    setSessionMetadata.mockClear()
+    saveServerSettingsPatchSpy.mockClear()
   })
 
   it('shows browser loading activity as blue and clears when the pane returns to idle', () => {
@@ -425,6 +456,132 @@ describe('pane activity indicator flow (e2e)', () => {
       store.dispatch(removePermission({ sessionId: 'sdk-restore-1', requestId: 'perm-1' }))
     })
 
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+  })
+
+  it('keeps FreshClaude activity blue while mid-session model changes send sdk.set-model without rewriting provider defaults', async () => {
+    const ActualAgentChatView = (
+      await vi.importActual<typeof import('@/components/agent-chat/AgentChatView')>('@/components/agent-chat/AgentChatView')
+    ).default
+
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-agent',
+      sessionId: 'sess-1',
+      status: 'running',
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+      effort: 'turbo',
+    }
+
+    const { store } = renderHarness({
+      pane,
+      settingsOverrides: {
+        agentChat: {
+          ...defaultSettings.agentChat,
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+              effort: 'turbo',
+            },
+          },
+        },
+      },
+      agentChat: {
+        sessions: {
+          'sess-1': {
+            sessionId: 'sess-1',
+            status: 'running',
+            messages: [],
+            timelineItems: [],
+            timelineBodies: {},
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        pendingCreateFailures: {},
+        capabilitiesByProvider: {
+          freshclaude: {
+            status: 'succeeded',
+            capabilities: {
+              provider: 'freshclaude',
+              fetchedAt: Date.now(),
+              models: [
+                {
+                  id: 'opus[1m]',
+                  displayName: 'Opus 1M',
+                  description: 'Long context window',
+                  supportsEffort: true,
+                  supportedEffortLevels: ['turbo'],
+                  supportsAdaptiveThinking: true,
+                },
+                {
+                  id: 'haiku',
+                  displayName: 'Haiku',
+                  description: 'Fast path',
+                  supportsEffort: false,
+                  supportedEffortLevels: [],
+                  supportsAdaptiveThinking: false,
+                },
+              ],
+            },
+          },
+        },
+      } as AgentChatState,
+    })
+
+    render(
+      <Provider store={store}>
+        <div data-testid="actual-agent-chat-harness">
+          <ActualAgentChatView tabId="tab-activity" paneId="pane-activity" paneContent={pane} />
+        </div>
+      </Provider>,
+    )
+
+    const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+
+    const agentChatHarness = screen.getByTestId('actual-agent-chat-harness')
+    const modelSelect = await within(agentChatHarness).findByLabelText('Model') as HTMLSelectElement
+    const haikuValue = Array.from(modelSelect.options).find((option) => option.text === 'Haiku')?.value
+    fireEvent.change(modelSelect, { target: { value: haikuValue } })
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith({
+        type: 'sdk.set-model',
+        sessionId: 'sess-1',
+        model: 'haiku',
+      })
+    })
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(2)
+      expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'tracked', modelId: 'haiku' },
+            },
+          },
+        },
+      })
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
+      agentChat: {
+        providers: {
+          freshclaude: {
+            effort: undefined,
+          },
+        },
+      },
+    })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })

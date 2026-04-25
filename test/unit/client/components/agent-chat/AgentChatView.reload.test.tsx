@@ -33,7 +33,12 @@ beforeAll(() => {
 const wsSend = vi.fn()
 const getAgentTimelinePage = vi.fn()
 const getAgentTurnBody = vi.fn()
+const getAgentChatCapabilities = vi.fn()
 const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -42,12 +47,17 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
     getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
     getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
     setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
   }
 })
@@ -145,6 +155,7 @@ describe('AgentChatView reload/restore behavior', () => {
     localStorage.clear()
     getAgentTimelinePage.mockReset()
     getAgentTurnBody.mockReset()
+    getAgentChatCapabilities.mockReset()
     setSessionMetadata.mockReset()
     setSessionMetadata.mockResolvedValue(undefined)
   })
@@ -152,6 +163,7 @@ describe('AgentChatView reload/restore behavior', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    saveServerSettingsPatchSpy.mockClear()
     localStorage.clear()
     delete window.__FRESHELL_TEST_HARNESS__
   })
@@ -327,6 +339,237 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(retriedContent!.sessionId).toBeUndefined()
     expect(retriedContent!.status).toBe('starting')
     expect((retriedContent as AgentChatPaneContent).createError).toBeUndefined()
+  })
+
+  it('sends provider-default creates as the stable opus track alias', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-provider-default',
+      status: 'creating',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-provider-default',
+        model: 'opus',
+      }))
+    })
+    const createCall = wsSend.mock.calls.find((call) => call[0]?.type === 'sdk.create')?.[0]
+    expect(createCall).not.toHaveProperty('effort')
+  })
+
+  it('creates tracked live models directly without a capability fetch when no effort validation is needed', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-tracked',
+      status: 'creating',
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-tracked',
+        model: 'opus[1m]',
+      }))
+    })
+    expect(getAgentChatCapabilities).not.toHaveBeenCalled()
+  })
+
+  it('validates explicit effort overrides before create and clears them when unsupported', async () => {
+    getAgentChatCapabilities.mockResolvedValue({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'haiku',
+            displayName: 'Haiku',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    })
+
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-unsupported-effort',
+      status: 'creating',
+      modelSelection: { kind: 'tracked', modelId: 'haiku' },
+      effort: 'turbo',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentChatCapabilities).toHaveBeenCalledWith('freshclaude', {})
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-unsupported-effort',
+        model: 'haiku',
+      }))
+    })
+    const createCall = wsSend.mock.calls.find((call) => call[0]?.type === 'sdk.create')?.[0]
+    expect(createCall).not.toHaveProperty('effort')
+    expect(getPaneContent(store, 't1', 'p1')?.effort).toBeUndefined()
+  })
+
+  it('passes named resume tokens through sdk.create and keeps the session in restore mode until it upgrades', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-named-resume',
+      status: 'creating',
+      resumeSessionId: 'named-resume',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-named-resume',
+        model: 'opus',
+        resumeSessionId: 'named-resume',
+      }))
+    })
+
+    expect(store.getState().agentChat.pendingCreates['req-named-resume']).toEqual({
+      sessionId: undefined,
+      expectsHistoryHydration: true,
+    })
+  })
+
+  it('blocks create when an exact unavailable selection cannot be launched safely', async () => {
+    getAgentChatCapabilities.mockResolvedValue({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    })
+
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-unavailable-exact',
+      status: 'creating',
+      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Session start failed')).toBeInTheDocument()
+    expect(screen.getByText(/no longer available/i)).toBeInTheDocument()
+    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')).toHaveLength(0)
+    expect(getPaneContent(store, 't1', 'p1')).toEqual(expect.objectContaining({
+      status: 'create-failed',
+      createError: expect.objectContaining({
+        code: 'MODEL_UNAVAILABLE',
+      }),
+    }))
   })
 
   it('shows loading state instead of welcome screen when sessionId is set but messages have not arrived', () => {

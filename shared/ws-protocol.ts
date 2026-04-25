@@ -323,7 +323,7 @@ export const SdkCreateSchema = z.object({
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),
-  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  effort: z.string().trim().min(1).optional(),
   plugins: z.array(z.string()).optional(),
 })
 
@@ -687,7 +687,6 @@ export type SdkServerMessage =
   | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
-  | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
   | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
 // -- Extensions --

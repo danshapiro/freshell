@@ -14,9 +14,8 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
     label: 'Freshclaude',
     codingCliProvider: 'claude',
     icon: FreshclaudeIcon,
-    defaultModel: 'claude-opus-4-6',
+    providerDefaultModelId: 'opus',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -32,9 +31,8 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
     label: 'Kilroy',
     codingCliProvider: 'claude',
     icon: KilroyIcon,
-    defaultModel: 'claude-opus-4-6',
+    providerDefaultModelId: 'opus',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
     settingsVisibility: {
       model: true,
       permissionMode: true,
