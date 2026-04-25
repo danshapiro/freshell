@@ -1,6 +1,7 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
+  AgentChatProviderCapabilitiesState,
   AgentChatState,
   AgentTimelineItem,
   AgentTimelineTurn,
@@ -21,7 +22,7 @@ const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
   pendingCreateFailures: {},
-  availableModels: [],
+  capabilitiesByProvider: {},
 }
 
 /** Create a default empty session if one doesn't already exist. */
@@ -98,6 +99,18 @@ function requestFreshSnapshotRefresh(session: ChatSessionState): void {
 
 function requestRestoreHydrationRestart(session: ChatSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
+}
+
+function ensureCapabilitiesState(
+  state: AgentChatState,
+  provider: string,
+): AgentChatProviderCapabilitiesState {
+  if (!state.capabilitiesByProvider[provider]) {
+    state.capabilitiesByProvider[provider] = {
+      status: 'idle',
+    }
+  }
+  return state.capabilitiesByProvider[provider]
 }
 
 const agentChatSlice = createSlice({
@@ -490,10 +503,30 @@ const agentChatSlice = createSlice({
       delete state.sessions[action.payload.sessionId]
     },
 
-    setAvailableModels(state, action: PayloadAction<{
-      models: Array<{ value: string; displayName: string; description: string }>
+    capabilityFetchStarted(state, action: PayloadAction<{ provider: string }>) {
+      const providerState = ensureCapabilitiesState(state, action.payload.provider)
+      providerState.status = 'loading'
+      providerState.error = undefined
+    },
+
+    capabilityFetchSucceeded(state, action: PayloadAction<{
+      provider: string
+      capabilities: AgentChatProviderCapabilitiesState['capabilities']
     }>) {
-      state.availableModels = action.payload.models
+      state.capabilitiesByProvider[action.payload.provider] = {
+        status: 'succeeded',
+        capabilities: action.payload.capabilities,
+        error: undefined,
+      }
+    },
+
+    capabilityFetchFailed(state, action: PayloadAction<{
+      provider: string
+      error: NonNullable<AgentChatProviderCapabilitiesState['error']>
+    }>) {
+      const providerState = ensureCapabilitiesState(state, action.payload.provider)
+      providerState.status = 'failed'
+      providerState.error = action.payload.error
     },
   },
 })
@@ -527,7 +560,9 @@ export const {
   clearPendingCreateFailure,
   clearPendingCreate,
   removeSession,
-  setAvailableModels,
+  capabilityFetchStarted,
+  capabilityFetchSucceeded,
+  capabilityFetchFailed,
 } = agentChatSlice.actions
 
 export default agentChatSlice.reducer

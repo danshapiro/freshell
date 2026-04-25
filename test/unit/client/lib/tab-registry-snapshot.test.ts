@@ -37,6 +37,46 @@ describe('shouldKeepClosedTab', () => {
 })
 
 describe('collectPaneSnapshots', () => {
+  it('serializes agent-chat selection strategies and explicit effort overrides', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-agent',
+      content: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-agent',
+        status: 'idle',
+        resumeSessionId: '00000000-0000-4000-8000-000000000123',
+        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+        permissionMode: 'default',
+        effort: 'turbo',
+        plugins: ['planner'],
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'server-1')
+
+    expect(snapshots).toEqual([{
+      paneId: 'pane-agent',
+      kind: 'agent-chat',
+      title: undefined,
+      payload: {
+        provider: 'freshclaude',
+        resumeSessionId: '00000000-0000-4000-8000-000000000123',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: '00000000-0000-4000-8000-000000000123',
+          serverInstanceId: 'server-1',
+        },
+        initialCwd: undefined,
+        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+        permissionMode: 'default',
+        effort: 'turbo',
+        plugins: ['planner'],
+      },
+    }])
+  })
+
   describe('extension content', () => {
     it('serializes extension pane content with correct kind and payload', () => {
       const node: PaneNode = {

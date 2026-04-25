@@ -400,4 +400,48 @@ describe('settingsThunks', () => {
     expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBeUndefined()
     expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBeUndefined()
   })
+
+  it('preserves nested agent-chat clears by converting them into API clear sentinels', async () => {
+    const store = makeStore()
+    const initialServerSettings = store.getState().settings.serverSettings
+    store.dispatch(setServerSettings({
+      ...initialServerSettings,
+      agentChat: {
+        ...initialServerSettings.agentChat,
+        providers: {
+          ...initialServerSettings.agentChat.providers,
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            effort: 'turbo',
+          },
+        },
+      },
+    }))
+
+    apiPatch.mockResolvedValue({})
+
+    await store.dispatch(saveServerSettingsPatch({
+      agentChat: {
+        providers: {
+          freshclaude: {
+            modelSelection: undefined,
+            effort: undefined,
+          },
+        },
+      },
+    }))
+
+    expect(apiPatch).toHaveBeenCalledWith('/api/settings', {
+      agentChat: {
+        providers: {
+          freshclaude: {
+            modelSelection: null,
+            effort: null,
+          },
+        },
+      },
+    })
+    expect(store.getState().settings.settings.agentChat.providers.freshclaude?.modelSelection).toBeUndefined()
+    expect(store.getState().settings.settings.agentChat.providers.freshclaude?.effort).toBeUndefined()
+  })
 })

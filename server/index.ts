@@ -51,6 +51,8 @@ import { checkForUpdate, createCachedUpdateChecker } from './updater/version-che
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
+import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
+import { AgentChatCapabilityRegistry } from './agent-chat-capability-registry.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
@@ -193,6 +195,7 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
+  const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
 
   let sdkBridge: SdkBridge
 
@@ -436,6 +439,9 @@ async function main() {
     perfConfig,
     applyDebugLogging,
     validCliProviders: allCliNames,
+  }))
+  app.use('/api/agent-chat/capabilities', createAgentChatCapabilitiesRouter({
+    registry: agentChatCapabilityRegistry,
   }))
 
   // --- Network management endpoints ---

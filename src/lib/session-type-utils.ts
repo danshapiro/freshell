@@ -2,7 +2,7 @@ import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
 import type { AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -46,11 +46,7 @@ export function buildResumeContent(opts: {
   sessionType: string
   sessionId: string
   cwd?: string
-  agentChatProviderSettings?: {
-    defaultModel?: string
-    defaultPermissionMode?: string
-    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
-  }
+  agentChatProviderSettings?: AgentChatProviderSettings
 }): TerminalPaneInput | AgentChatPaneInput {
   const agentConfig = getAgentChatProviderConfig(opts.sessionType)
   if (agentConfig) {
@@ -60,9 +56,9 @@ export function buildResumeContent(opts: {
       provider: agentConfig.name as AgentChatProviderName,
       resumeSessionId: opts.sessionId,
       initialCwd: opts.cwd,
-      model: ps?.defaultModel ?? agentConfig.defaultModel,
+      modelSelection: ps?.modelSelection,
       permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,
-      effort: ps?.defaultEffort ?? agentConfig.defaultEffort,
+      effort: ps?.effort,
     }
   }
   // Terminal pane (claude CLI, codex CLI, or fallback to 'claude')

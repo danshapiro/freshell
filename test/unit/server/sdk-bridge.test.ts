@@ -22,6 +22,7 @@ let mockSupportedModels: any[] = [
 ]
 /** When set, supportedModels() rejects with this error */
 let mockSupportedModelsError: Error | null = null
+let mockSupportedModelsCallCount = 0
 
 vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: vi.fn(({ options }: any) => {
@@ -46,9 +47,13 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     ;(gen as any).streamInput = vi.fn()
     ;(gen as any).setPermissionMode = vi.fn().mockResolvedValue(undefined)
     ;(gen as any).setModel = vi.fn().mockResolvedValue(undefined)
-    ;(gen as any).supportedModels = mockSupportedModelsError
-      ? vi.fn().mockRejectedValue(mockSupportedModelsError)
-      : vi.fn().mockResolvedValue(mockSupportedModels)
+    ;(gen as any).supportedModels = vi.fn(async () => {
+      mockSupportedModelsCallCount += 1
+      if (mockSupportedModelsError) {
+        throw mockSupportedModelsError
+      }
+      return mockSupportedModels
+    })
     return gen
   }),
 }))
@@ -66,6 +71,7 @@ describe('SdkBridge', () => {
     mockInterruptFn = undefined
     mockKeepStreamOpen = false
     mockStreamEndResolve = null
+    mockSupportedModelsCallCount = 0
     mockSupportedModels = [
       { value: 'claude-opus-4-6', displayName: 'Opus 4.6', description: 'Most capable' },
       { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
@@ -857,7 +863,7 @@ describe('SdkBridge', () => {
       const received: any[] = []
       bridge.subscribe(session.sessionId, (msg) => received.push(msg))
 
-      // sdk.session.init + sdk.models (async) + sdk.assistant
+      // sdk.session.init + sdk.assistant
       expect(received.length).toBeGreaterThanOrEqual(2)
       expect(received[0].type).toBe('sdk.session.init')
       expect(received.find(m => m.type === 'sdk.assistant')).toBeDefined()
@@ -1216,8 +1222,8 @@ describe('SdkBridge', () => {
     })
   })
 
-  describe('fetchAndBroadcastModels', () => {
-    it('broadcasts sdk.models after system/init', async () => {
+  describe('model capability broadcasts', () => {
+    it('does not broadcast sdk.models after system/init', async () => {
       mockKeepStreamOpen = true
       mockMessages.push({
         type: 'system',
@@ -1235,100 +1241,30 @@ describe('SdkBridge', () => {
 
       await new Promise(resolve => setTimeout(resolve, 200))
 
-      const modelsMsg = received.find(m => m.type === 'sdk.models')
-      expect(modelsMsg).toBeDefined()
-      expect(modelsMsg.models).toHaveLength(2)
-      expect(modelsMsg.models[0].value).toBe('claude-opus-4-6')
-    })
-
-    it('uses cached models for subsequent sessions', async () => {
-      mockKeepStreamOpen = true
-      const initMsg = {
-        type: 'system',
-        subtype: 'init',
-        session_id: 'cli-123',
-        model: 'claude-sonnet-4-5-20250929',
-        cwd: '/tmp',
-        tools: ['Bash'],
-        uuid: 'test-uuid',
-      }
-
-      // First session — triggers fetch
-      mockMessages.push(initMsg)
-      const s1 = await bridge.createSession({ cwd: '/tmp' })
-      const r1: any[] = []
-      bridge.subscribe(s1.sessionId, (msg) => r1.push(msg))
-      await new Promise(resolve => setTimeout(resolve, 200))
-      expect(r1.find(m => m.type === 'sdk.models')).toBeDefined()
-
-      // Second session — should use cache (change mock to prove it's not re-fetched)
-      mockMessages.length = 0
-      mockMessages.push({ ...initMsg, uuid: 'test-uuid-2' })
-      mockSupportedModels = [{ value: 'different-model', displayName: 'Different', description: 'New' }]
-      const s2 = await bridge.createSession({ cwd: '/tmp' })
-      const r2: any[] = []
-      bridge.subscribe(s2.sessionId, (msg) => r2.push(msg))
-      await new Promise(resolve => setTimeout(resolve, 200))
-
-      const modelsMsg = r2.find(m => m.type === 'sdk.models')
-      expect(modelsMsg).toBeDefined()
-      // Should be cached value, not the new mock
-      expect(modelsMsg.models[0].value).toBe('claude-opus-4-6')
-    })
-
-    it('formats raw model IDs into human-readable display names', async () => {
-      mockKeepStreamOpen = true
-      // Simulate SDK returning raw model IDs as displayName
-      mockSupportedModels = [
-        { value: 'claude-opus-4-6', displayName: 'claude-opus-4-6', description: '' },
-        { value: 'claude-sonnet-4-5-20250929', displayName: 'claude-sonnet-4-5-20250929', description: '' },
-        { value: 'claude-haiku-4-5-20251001', displayName: 'claude-haiku-4-5-20251001', description: '' },
-      ]
-      mockMessages.push({
-        type: 'system',
-        subtype: 'init',
-        session_id: 'cli-123',
-        model: 'claude-sonnet-4-5-20250929',
-        cwd: '/tmp',
-        tools: ['Bash'],
-        uuid: 'test-uuid',
-      })
-
-      const session = await bridge.createSession({ cwd: '/tmp' })
-      const received: any[] = []
-      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
-
-      await new Promise(resolve => setTimeout(resolve, 200))
-
-      const modelsMsg = received.find(m => m.type === 'sdk.models')
-      expect(modelsMsg).toBeDefined()
-      expect(modelsMsg.models[0].displayName).toBe('Opus 4.6')
-      expect(modelsMsg.models[1].displayName).toBe('Sonnet 4.5')
-      expect(modelsMsg.models[2].displayName).toBe('Haiku 4.5')
-    })
-
-    it('handles supportedModels() failure gracefully', async () => {
-      mockKeepStreamOpen = true
-      mockSupportedModelsError = new Error('Not supported')
-      mockMessages.push({
-        type: 'system',
-        subtype: 'init',
-        session_id: 'cli-123',
-        model: 'claude-sonnet-4-5-20250929',
-        cwd: '/tmp',
-        tools: ['Bash'],
-        uuid: 'test-uuid',
-      })
-
-      const session = await bridge.createSession({ cwd: '/tmp' })
-      const received: any[] = []
-      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
-
-      await new Promise(resolve => setTimeout(resolve, 200))
-
-      // Should get sdk.session.init but no sdk.models (failure was swallowed)
       expect(received.find(m => m.type === 'sdk.session.init')).toBeDefined()
       expect(received.find(m => m.type === 'sdk.models')).toBeUndefined()
+    })
+
+    it('does not call supportedModels during session init', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 200))
+
+      expect(received.find(m => m.type === 'sdk.session.init')).toBeDefined()
+      expect(mockSupportedModelsCallCount).toBe(0)
     })
   })
 

@@ -4,7 +4,7 @@ import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './stora
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
 export const TABS_SCHEMA_VERSION = 1
-export const PANES_SCHEMA_VERSION = 6
+export const PANES_SCHEMA_VERSION = 7
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])

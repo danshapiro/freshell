@@ -45,8 +45,9 @@ describe('buildResumeContent', () => {
     expect(content.provider).toBe('freshclaude')
     expect(content.resumeSessionId).toBe('abc-123')
     expect(content.initialCwd).toBe('/home/user/project')
-    expect(content.model).toBe('claude-opus-4-6') // default from provider config
+    expect(content.modelSelection).toBeUndefined()
     expect(content.permissionMode).toBe('bypassPermissions') // default from provider config
+    expect(content.effort).toBeUndefined()
   })
 
   it('returns agent-chat content for kilroy sessionType', () => {
@@ -120,26 +121,26 @@ describe('buildResumeContent', () => {
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
       agentChatProviderSettings: {
-        defaultModel: 'claude-sonnet-4-20250514',
+        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         defaultPermissionMode: 'default',
-        defaultEffort: 'max',
+        effort: 'turbo',
       },
     })
     expect(content.kind).toBe('agent-chat')
     if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
-    expect(content.model).toBe('claude-sonnet-4-20250514')
+    expect(content.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
     expect(content.permissionMode).toBe('default')
-    expect(content.effort).toBe('max')
+    expect(content.effort).toBe('turbo')
   })
 
-  it('applies default effort from provider config', () => {
+  it('does not apply a baked-in provider effort override', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
     })
     expect(content.kind).toBe('agent-chat')
     if (content.kind !== 'agent-chat') throw new Error('expected agent-chat')
-    expect(content.effort).toBe('high') // freshclaude default
+    expect(content.effort).toBeUndefined()
   })
 
   it('preserves unknown sessionType as mode (was validated at creation)', () => {

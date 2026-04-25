@@ -33,6 +33,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
+import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
@@ -543,9 +544,9 @@ function PickerWrapper({
         provider: type,
         createRequestId: nanoid(),
         status: 'creating',
-        model: providerSettings?.defaultModel ?? providerConfig.defaultModel,
+        modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
         permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
-        effort: providerSettings?.defaultEffort ?? providerConfig.defaultEffort,
+        effort: normalizeAgentChatEffortOverride(providerSettings?.effort),
         plugins: agentChatSettings?.defaultPlugins,
         ...(cwd ? { initialCwd: cwd } : {}),
       }

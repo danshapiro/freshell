@@ -1,6 +1,14 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
-import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
+import {
+  normalizeAgentChatEffortOverride,
+  normalizeAgentChatModelSelection,
+  type PanesState,
+  type PaneContent,
+  type PaneContentInput,
+  type PaneNode,
+  type PaneRefreshRequest,
+} from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
@@ -120,9 +128,12 @@ function normalizePaneContent(
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
-      model: input.model,
+      modelSelection: normalizeAgentChatModelSelection(
+        (input as { modelSelection?: unknown }).modelSelection,
+        (input as { model?: unknown }).model,
+      ),
       permissionMode: input.permissionMode,
-      effort: input.effort,
+      effort: normalizeAgentChatEffortOverride(input.effort),
       plugins: input.plugins,
       settingsDismissed: input.settingsDismissed,
     }

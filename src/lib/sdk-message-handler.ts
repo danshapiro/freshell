@@ -19,7 +19,6 @@ import {
   sessionError,
   markSessionLost,
   removeSession,
-  setAvailableModels,
 } from '@/store/agentChatSlice'
 
 /**
@@ -198,13 +197,6 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         sessionId: msg.sessionId as string,
       }))
       return true
-
-    case 'sdk.models':
-      dispatch(setAvailableModels({
-        models: msg.models as Array<{ value: string; displayName: string; description: string }>,
-      }))
-      return true
-
     default:
       return false
   }

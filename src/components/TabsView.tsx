@@ -26,7 +26,12 @@ import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
 import { ContextMenu } from '@/components/context-menu/ContextMenu'
 import type { MenuItem } from '@/components/context-menu/context-menu-types'
-import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
+import {
+  normalizeAgentChatEffortOverride,
+  normalizeAgentChatModelSelection,
+  type PaneContentInput,
+  type SessionLocator,
+} from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 
@@ -135,9 +140,9 @@ function sanitizePaneSnapshot(
       resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
-      model: payload.model as string | undefined,
+      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,
-      effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
+      effort: normalizeAgentChatEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
     }
   }
