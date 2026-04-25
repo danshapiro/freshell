@@ -40,6 +40,8 @@ type CodexTerminalAttachment = {
 
 type CodexTerminalSidecarOptions = {
   cwd?: string
+  commandArgs?: string[]
+  env?: NodeJS.ProcessEnv
   runtime?: CodexAppServerRuntime
   createDurableRolloutTracker?: (
     options: CodexDurableRolloutTrackerOptions,
@@ -117,7 +119,11 @@ export class CodexTerminalSidecar {
 
   constructor(options: CodexTerminalSidecarOptions = {}) {
     this.runtime = options.runtime ?? new CodexAppServerRuntime(
-      options.cwd ? { cwd: options.cwd } : {},
+      {
+        ...(options.cwd ? { cwd: options.cwd } : {}),
+        ...(options.commandArgs ? { commandArgs: options.commandArgs } : {}),
+        ...(options.env ? { env: options.env } : {}),
+      },
     )
     const createDurableRolloutTracker = options.createDurableRolloutTracker
       ?? ((trackerOptions: CodexDurableRolloutTrackerOptions) => new CodexDurableRolloutTracker(trackerOptions))

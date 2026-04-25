@@ -137,6 +137,19 @@ function successResult(method, params) {
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
 const behavior = loadBehavior()
+if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
+  fs.writeFileSync(process.env.FAKE_CODEX_APP_SERVER_ARG_LOG, JSON.stringify({
+    argv: process.argv.slice(2),
+    env: {
+      FRESHELL: process.env.FRESHELL,
+      FRESHELL_URL: process.env.FRESHELL_URL,
+      FRESHELL_TOKEN: process.env.FRESHELL_TOKEN,
+      FRESHELL_TERMINAL_ID: process.env.FRESHELL_TERMINAL_ID,
+      FRESHELL_TAB_ID: process.env.FRESHELL_TAB_ID,
+      FRESHELL_PANE_ID: process.env.FRESHELL_PANE_ID,
+    },
+  }), 'utf8')
+}
 const closeSocketAfterMethodsOnce = new Set(behavior.closeSocketAfterMethodsOnce || [])
 const exitProcessAfterMethodsOnce = new Set(behavior.exitProcessAfterMethodsOnce || [])
 const url = new URL(listenUrl)

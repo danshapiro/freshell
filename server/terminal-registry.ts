@@ -188,6 +188,23 @@ export type ProviderSettings = {
   opencodeServer?: LoopbackServerEndpoint
 }
 
+export type TerminalEnvContext = { tabId?: string; paneId?: string }
+
+export function buildFreshellTerminalEnv(
+  terminalId: string,
+  envContext?: TerminalEnvContext,
+): Record<string, string> {
+  const port = Number(process.env.PORT || 3001)
+  return {
+    FRESHELL: '1',
+    FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
+    FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+    FRESHELL_TERMINAL_ID: terminalId,
+    ...(envContext?.tabId ? { FRESHELL_TAB_ID: envContext.tabId } : {}),
+    ...(envContext?.paneId ? { FRESHELL_PANE_ID: envContext.paneId } : {}),
+  }
+}
+
 function resolveCodingCliCommand(
   mode: TerminalMode,
   resumeSessionId?: string,
@@ -1110,6 +1127,7 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   create(opts: {
+    terminalId?: string
     mode: TerminalMode
     shell?: ShellType
     cwd?: string
@@ -1119,14 +1137,14 @@ export class TerminalRegistry extends EventEmitter {
     sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
     codexSidecar?: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
-    envContext?: { tabId?: string; paneId?: string }
+    envContext?: TerminalEnvContext
   }): TerminalRecord {
     this.reapExitedTerminals()
     if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
     }
 
-    const terminalId = nanoid()
+    const terminalId = opts.terminalId ?? nanoid()
     const createdAt = Date.now()
     const cols = opts.cols || 120
     const rows = opts.rows || 30
@@ -1134,15 +1152,7 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
-    const port = Number(process.env.PORT || 3001)
-    const baseEnv = {
-      FRESHELL: '1',
-      FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
-      FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
-      FRESHELL_TERMINAL_ID: terminalId,
-      ...(opts.envContext?.tabId ? { FRESHELL_TAB_ID: opts.envContext.tabId } : {}),
-      ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
-    }
+    const baseEnv = buildFreshellTerminalEnv(terminalId, opts.envContext)
 
     const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
