@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
+  getAgentChatCapabilities,
+  refreshAgentChatCapabilities,
   fetchSidebarSessionsSnapshot,
   getAgentTimelinePage,
   getAgentTurnBody,
@@ -27,6 +29,15 @@ function mockJson(value: unknown) {
   return {
     ok: true,
     status: 200,
+    text: () => Promise.resolve(JSON.stringify(value)),
+  }
+}
+
+function mockJsonResponse(status: number, value: unknown) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 503 ? 'Service Unavailable' : 'Error',
     text: () => Promise.resolve(JSON.stringify(value)),
   }
 }
@@ -126,6 +137,43 @@ describe('visible-first read-model helpers', () => {
         headers: expect.any(Headers),
       }),
     )
+  })
+
+  it('preserves typed capability errors from non-2xx capability reads and refreshes', async () => {
+    mockFetch
+      .mockResolvedValueOnce(mockJsonResponse(503, {
+        ok: false,
+        error: {
+          code: 'CAPABILITY_PROBE_FAILED',
+          message: 'Probe failed upstream',
+          retryable: true,
+        },
+      }))
+      .mockResolvedValueOnce(mockJsonResponse(503, {
+        ok: false,
+        error: {
+          code: 'CAPABILITY_PAYLOAD_INVALID',
+          message: 'Capability payload invalid',
+          retryable: false,
+        },
+      }))
+
+    await expect(getAgentChatCapabilities('freshclaude')).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'CAPABILITY_PROBE_FAILED',
+        message: 'Probe failed upstream',
+        retryable: true,
+      },
+    })
+    await expect(refreshAgentChatCapabilities('freshclaude')).resolves.toEqual({
+      ok: false,
+      error: {
+        code: 'CAPABILITY_PAYLOAD_INVALID',
+        message: 'Capability payload invalid',
+        retryable: false,
+      },
+    })
   })
 
   it('rejects timeline requests that omit the pinned restore revision', async () => {

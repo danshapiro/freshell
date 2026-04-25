@@ -44,6 +44,27 @@ function normalizeCodingCliProviderPatchForApi(
   return normalizedProviderPatch
 }
 
+function normalizeAgentChatProviderPatchForApi(
+  providerPatch: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalizedProviderPatch = { ...providerPatch }
+
+  if (
+    Object.prototype.hasOwnProperty.call(providerPatch, 'modelSelection')
+    && providerPatch.modelSelection === undefined
+  ) {
+    normalizedProviderPatch.modelSelection = null
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(providerPatch, 'effort')
+    && providerPatch.effort === undefined
+  ) {
+    normalizedProviderPatch.effort = null
+  }
+
+  return normalizedProviderPatch
+}
+
 export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): ServerSettingsPatch | Record<string, unknown> {
   const normalizedPatch = isRecord(patch)
     ? { ...stripLocalSettings(patch) }
@@ -59,6 +80,17 @@ export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): 
       providers: Object.fromEntries(
         Object.entries(normalizedPatch.codingCli.providers).map(([providerName, providerPatch]) => (
           [providerName, isRecord(providerPatch) ? normalizeCodingCliProviderPatchForApi(providerPatch) : providerPatch]
+        )),
+      ),
+    }
+  }
+
+  if (isRecord(normalizedPatch.agentChat) && isRecord(normalizedPatch.agentChat.providers)) {
+    normalizedPatch.agentChat = {
+      ...normalizedPatch.agentChat,
+      providers: Object.fromEntries(
+        Object.entries(normalizedPatch.agentChat.providers).map(([providerName, providerPatch]) => (
+          [providerName, isRecord(providerPatch) ? normalizeAgentChatProviderPatchForApi(providerPatch) : providerPatch]
         )),
       ),
     }

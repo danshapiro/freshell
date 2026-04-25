@@ -32,7 +32,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 3 as const
+export const WS_PROTOCOL_VERSION = 4 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -214,12 +214,19 @@ export const TerminalCreateSchema = z.object({
   paneId: z.string().min(1).optional(),
 }).strict()
 
+export const TerminalAttachIntentSchema = z.enum([
+  'viewport_hydrate',
+  'keepalive_delta',
+  'transport_reconnect',
+])
+
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
+  intent: TerminalAttachIntentSchema,
   cols: z.number().int().min(2).max(1000),
   rows: z.number().int().min(2).max(500),
 })
@@ -317,7 +324,7 @@ export const SdkCreateSchema = z.object({
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),
-  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  effort: z.string().trim().min(1).optional(),
   plugins: z.array(z.string()).optional(),
 })
 
@@ -680,7 +687,6 @@ export type SdkServerMessage =
   | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
-  | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
   | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
 // -- Extensions --

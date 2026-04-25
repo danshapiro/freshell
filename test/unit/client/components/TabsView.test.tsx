@@ -133,6 +133,81 @@ describe('TabsView', () => {
     expect(tabs.some((t) => t.title === 'remote open')).toBe(true)
   })
 
+  it('rehydrates remote agent-chat panes with selection strategies', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+    store.dispatch(setServerInstanceId('srv-local'))
+    store.dispatch(addTab({ id: 'local-tab', title: 'local tab', mode: 'shell' }))
+    store.dispatch(initLayout({
+      tabId: 'local-tab',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [{
+        tabKey: 'remote:agent',
+        tabId: 'agent-1',
+        serverInstanceId: 'srv-remote',
+        deviceId: 'remote',
+        deviceLabel: 'remote-device',
+        tabName: 'remote agent',
+        status: 'open',
+        revision: 1,
+        createdAt: 1,
+        updatedAt: 2,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-agent',
+          kind: 'agent-chat',
+          payload: {
+            provider: 'freshclaude',
+            resumeSessionId: '00000000-0000-4000-8000-000000000444',
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            permissionMode: 'plan',
+            effort: 'turbo',
+            plugins: ['planner'],
+          },
+        }],
+      }],
+      closed: [],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByLabelText('remote-device: remote agent'))
+
+    const copiedTab = store.getState().tabs.tabs.find((tab) => tab.title === 'remote agent')
+    expect(copiedTab).toBeDefined()
+    if (!copiedTab) throw new Error('expected copied tab')
+
+    const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
+    expect(copiedLayout.content).toMatchObject({
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      resumeSessionId: undefined,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '00000000-0000-4000-8000-000000000444',
+        serverInstanceId: 'srv-remote',
+      },
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+      permissionMode: 'plan',
+      effort: 'turbo',
+      plugins: ['planner'],
+    })
+  })
+
   it('shows context menu on right-click with appropriate items', () => {
     const store = createStore()
     render(

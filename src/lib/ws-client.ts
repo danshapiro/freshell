@@ -43,18 +43,25 @@ type TerminalCreateClientMessage = {
   requestId: string
 }
 
+type SdkCreateClientMessage = {
+  type: 'sdk.create'
+  requestId: string
+}
+
 type TerminalAttachClientMessage = {
   type: 'terminal.attach'
   terminalId: string
 }
 
+type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage
+
 type InFlightCreate = {
-  message: unknown
+  message: CreateClientMessage
   lastResendEpoch: number
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const WS_PROTOCOL_VERSION = 3
+const WS_PROTOCOL_VERSION = 4
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
@@ -65,10 +72,12 @@ function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage
     && typeof candidate.data === 'string'
 }
 
-function isTerminalCreateMessage(msg: unknown): msg is TerminalCreateClientMessage {
+function isCreateMessage(msg: unknown): msg is CreateClientMessage {
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; requestId?: unknown }
-  return candidate.type === 'terminal.create' && typeof candidate.requestId === 'string' && candidate.requestId.length > 0
+  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create')
+    && typeof candidate.requestId === 'string'
+    && candidate.requestId.length > 0
 }
 
 function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessage {
@@ -277,7 +286,7 @@ export class WsClient {
           markTerminalOutputSeen(msg.terminalId)
         }
 
-        if (msg.type === 'terminal.created') {
+        if (msg.type === 'terminal.created' || msg.type === 'sdk.created' || msg.type === 'sdk.create.failed') {
           const create = this.inFlightCreates.get(msg.requestId)
           if (create) {
             this.inFlightCreates.delete(msg.requestId)
@@ -477,7 +486,7 @@ export class WsClient {
       markTerminalInputSent(msg.terminalId)
     }
 
-    if (isTerminalCreateMessage(msg)) {
+    if (isCreateMessage(msg)) {
       this.inFlightCreates.set(msg.requestId, {
         message: msg,
         lastResendEpoch: -1,
@@ -489,7 +498,7 @@ export class WsClient {
       return
     }
 
-    if (isTerminalCreateMessage(msg)) {
+    if (isCreateMessage(msg)) {
       if (!this.preReadyCreateQueue.has(msg.requestId) && this.preReadyCreateQueue.size >= this.maxQueueSize) {
         const oldestRequestId = this.preReadyCreateQueue.keys().next().value
         if (typeof oldestRequestId === 'string') {
@@ -505,7 +514,7 @@ export class WsClient {
     if (this.pendingMessages.length >= this.maxQueueSize) {
       // Drop oldest to prevent unbounded memory.
       const dropped = this.pendingMessages.shift()
-      if (isTerminalCreateMessage(dropped)) {
+      if (isCreateMessage(dropped)) {
         this.inFlightCreates.delete(dropped.requestId)
       }
     }

@@ -1124,10 +1124,19 @@ describe('ConfigStore', () => {
       await store.load()
 
       const updated = await store.patchSettings({
-        agentChat: { providers: { freshclaude: { defaultModel: 'claude-sonnet-4-5-20250929' } } },
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            },
+          },
+        },
       })
 
-      expect(updated.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-sonnet-4-5-20250929')
+      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+        kind: 'tracked',
+        modelId: 'opus[1m]',
+      })
     })
 
     it('patchSettings deep-merges agentChat providers without clobbering other keys', async () => {
@@ -1135,15 +1144,54 @@ describe('ConfigStore', () => {
       await store.load()
 
       await store.patchSettings({
-        agentChat: { providers: { freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' } } },
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+              effort: 'high',
+            },
+          },
+        },
       })
       const updated = await store.patchSettings({
         agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
       })
 
-      expect(updated.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
+      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+        kind: 'exact',
+        modelId: 'claude-opus-4-6',
+      })
       expect(updated.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('default')
-      expect(updated.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
+      expect(updated.agentChat?.providers?.freshclaude?.effort).toBe('high')
+    })
+
+    it('patchSettings removes stored model selections and effort overrides when cleared', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSettings({
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+              effort: 'turbo',
+            },
+          },
+        },
+      })
+      const updated = await store.patchSettings({
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: undefined,
+              effort: undefined,
+            },
+          },
+        },
+      })
+
+      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toBeUndefined()
+      expect(updated.agentChat?.providers?.freshclaude?.effort).toBeUndefined()
     })
 
     it('defaultSettings includes empty agentChat providers', () => {
@@ -1168,8 +1216,11 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const loaded = await store.load()
 
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+        kind: 'exact',
+        modelId: 'claude-opus-4-6',
+      })
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.effort).toBe('high')
       expect((loaded.settings as any).freshclaude).toBeUndefined()
     })
 
@@ -1194,8 +1245,11 @@ describe('ConfigStore', () => {
       // agentChat value wins over legacy for overlapping keys
       expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('normal')
       // Legacy-only keys are preserved
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+        kind: 'exact',
+        modelId: 'claude-opus-4-6',
+      })
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.effort).toBe('high')
       // Legacy key removed
       expect((loaded.settings as any).freshclaude).toBeUndefined()
     })

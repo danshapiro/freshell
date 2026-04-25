@@ -1,6 +1,14 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
-import type { PanesState, PaneContent, PaneContentInput, PaneNode, PaneRefreshRequest } from './paneTypes'
+import {
+  normalizeAgentChatEffortOverride,
+  normalizeAgentChatModelSelection,
+  type PanesState,
+  type PaneContent,
+  type PaneContentInput,
+  type PaneNode,
+  type PaneRefreshRequest,
+} from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
@@ -86,9 +94,12 @@ function normalizePaneContent(
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
-      model: input.model,
+      modelSelection: normalizeAgentChatModelSelection(
+        (input as { modelSelection?: unknown }).modelSelection,
+        (input as { model?: unknown }).model,
+      ),
       permissionMode: input.permissionMode,
-      effort: input.effort,
+      effort: normalizeAgentChatEffortOverride(input.effort),
       plugins: input.plugins,
       settingsDismissed: input.settingsDismissed,
     }
@@ -426,16 +437,17 @@ function mergeHydratedPaneMetadata(
   for (const [tabId, layout] of Object.entries(layouts)) {
     const paneIds = collectLeafPaneIds(layout)
     const paneIdSet = new Set(paneIds)
-    const preferredTitleSource = incomingLayoutTabIds.has(tabId)
-      ? incoming.paneTitles
-      : state.paneTitles
-    const preferredTitleSetByUserSource = incomingLayoutTabIds.has(tabId)
-      ? incoming.paneTitleSetByUser
-      : state.paneTitleSetByUser
+    const localLayoutPreserved = !incomingLayoutTabIds.has(tabId)
+    const preferredTitleSource = localLayoutPreserved
+      ? state.paneTitles
+      : incoming.paneTitles
+    const preferredTitleSetByUserSource = localLayoutPreserved
+      ? state.paneTitleSetByUser
+      : incoming.paneTitleSetByUser
 
     const nextActivePane = pickHydratedActivePane(
       paneIds,
-      incoming.activePane?.[tabId],
+      localLayoutPreserved ? undefined : incoming.activePane?.[tabId],
       state.activePane?.[tabId],
     )
     if (nextActivePane) {
@@ -443,8 +455,26 @@ function mergeHydratedPaneMetadata(
     }
 
     const nextPaneTitles = filterPaneMetadataByLayout(preferredTitleSource, tabId, paneIdSet)
+    const fallbackTitles = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitles, tabId, paneIdSet)
+      : undefined
+    const localUserSetTitleFlags = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
+      : undefined
     if (nextPaneTitles) {
-      paneTitles[tabId] = nextPaneTitles
+      if (fallbackTitles && localUserSetTitleFlags) {
+        const merged = { ...nextPaneTitles }
+        for (const [paneId, title] of Object.entries(fallbackTitles)) {
+          if (localUserSetTitleFlags[paneId]) {
+            merged[paneId] = title
+          }
+        }
+        paneTitles[tabId] = merged
+      } else {
+        paneTitles[tabId] = nextPaneTitles
+      }
+    } else if (fallbackTitles) {
+      paneTitles[tabId] = fallbackTitles
     }
 
     const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
@@ -452,8 +482,14 @@ function mergeHydratedPaneMetadata(
       tabId,
       paneIdSet,
     )
-    if (nextPaneTitleSetByUser) {
-      paneTitleSetByUser[tabId] = nextPaneTitleSetByUser
+    const fallbackTitleSetByUser = !localLayoutPreserved
+      ? filterPaneMetadataByLayout(state.paneTitleSetByUser, tabId, paneIdSet)
+      : undefined
+    if (nextPaneTitleSetByUser || fallbackTitleSetByUser) {
+      paneTitleSetByUser[tabId] = {
+        ...(nextPaneTitleSetByUser || {}),
+        ...(fallbackTitleSetByUser || {}),
+      }
     }
   }
 
@@ -617,7 +653,27 @@ function mergeTerminalState(
     }
   }
 
-  // Structure changed (leaf↔split) or malformed children — take incoming
+  // Structure changed (leaf↔split) or malformed children
+  // Cross-tab sync can deliver stale structure changes. Use both timestamps
+  // and content heuristics to decide which side to keep.
+  if (local.type !== incoming.type) {
+    const localAt = meta?.localLayoutPersistedAt
+    const remoteAt = meta?.remoteLayoutPersistedAt
+    const timestampsAvailable = typeof localAt === 'number' && typeof remoteAt === 'number'
+    const localIsNewer = timestampsAvailable && remoteAt < localAt
+    const remoteIsNewer = timestampsAvailable && remoteAt >= localAt
+
+    if (local.type === 'split' && incoming.type === 'leaf') {
+      if (localIsNewer) return local
+      if (remoteIsNewer) return incoming
+    }
+
+    if (local.type === 'leaf' && incoming.type === 'split') {
+      if (localIsNewer) return local
+      if (remoteIsNewer) return incoming
+    }
+  }
+
   return incoming
 }
 

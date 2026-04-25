@@ -1,11 +1,21 @@
 import { createAsyncThunk } from '@reduxjs/toolkit'
 import {
+  getAgentChatCapabilities as getAgentChatCapabilitiesApi,
   getAgentTimelinePage,
   getAgentTurnBody,
+  refreshAgentChatCapabilities as refreshAgentChatCapabilitiesApi,
 } from '@/lib/api'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import {
+  AgentChatCapabilitiesResponseSchema,
+  type AgentChatCapabilitiesResponse,
+  type AgentChatCapabilityError,
+} from '@shared/agent-chat-capabilities'
 import type { AppDispatch, RootState } from './store'
 import {
+  capabilityFetchFailed,
+  capabilityFetchStarted,
+  capabilityFetchSucceeded,
   restoreRetryRequested,
   timelineLoadFailed,
   timelineLoadStarted,
@@ -86,6 +96,73 @@ function requestStaleRestoreRetry(
     code: 'RESTORE_STALE_REVISION',
   }))
   return true
+}
+
+function normalizeCapabilityFetchError(error: unknown): AgentChatCapabilityError {
+  const parsed = AgentChatCapabilitiesResponseSchema.safeParse(
+    typeof error === 'object' && error !== null && 'details' in error
+      ? (error as { details?: unknown }).details
+      : undefined,
+  )
+  if (parsed.success && !parsed.data.ok) {
+    return parsed.data.error
+  }
+
+  return {
+    code: 'CAPABILITY_FETCH_FAILED',
+    message: getTimelineErrorMessage(error, 'Capability request failed'),
+    retryable: true,
+  }
+}
+
+async function loadAgentChatCapabilitiesForProvider(
+  dispatch: AppDispatch,
+  provider: string,
+  refresh: boolean,
+): Promise<AgentChatCapabilitiesResponse> {
+  dispatch(capabilityFetchStarted({ provider }))
+
+  try {
+    const response = refresh
+      ? await refreshAgentChatCapabilitiesApi(provider, {})
+      : await getAgentChatCapabilitiesApi(provider, {})
+
+    if (response.ok) {
+      dispatch(capabilityFetchSucceeded({
+        provider,
+        capabilities: response.capabilities,
+      }))
+    } else {
+      dispatch(capabilityFetchFailed({
+        provider,
+        error: response.error,
+      }))
+    }
+
+    return response
+  } catch (error) {
+    const normalizedError = normalizeCapabilityFetchError(error)
+    dispatch(capabilityFetchFailed({
+      provider,
+      error: normalizedError,
+    }))
+    return {
+      ok: false,
+      error: normalizedError,
+    }
+  }
+}
+
+export function fetchAgentChatCapabilities(provider: string) {
+  return async (dispatch: AppDispatch): Promise<AgentChatCapabilitiesResponse> => {
+    return loadAgentChatCapabilitiesForProvider(dispatch, provider, false)
+  }
+}
+
+export function refreshAgentChatCapabilities(provider: string) {
+  return async (dispatch: AppDispatch): Promise<AgentChatCapabilitiesResponse> => {
+    return loadAgentChatCapabilitiesForProvider(dispatch, provider, true)
+  }
 }
 
 export const loadAgentTurnBody = createAsyncThunk<

@@ -1,8 +1,10 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup, act } from '@testing-library/react'
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
+import { render, screen, waitFor, cleanup, act, fireEvent, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
+import TabBar from '@/components/TabBar'
+import PaneContainer from '@/components/panes/PaneContainer'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -50,6 +52,13 @@ const wsMocks = vi.hoisted(() => {
 
 const apiGet = vi.hoisted(() => vi.fn())
 const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
+const getAgentChatCapabilities = vi.hoisted(() => vi.fn())
+const refreshAgentChatCapabilities = vi.hoisted(() => vi.fn())
+const setSessionMetadata = vi.hoisted(() => vi.fn(() => Promise.resolve(undefined)))
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -76,8 +85,15 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
+  refreshAgentChatCapabilities: (...args: unknown[]) => refreshAgentChatCapabilities(...args),
+  setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
+}))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 vi.mock('@/hooks/useTheme', () => ({
@@ -299,6 +315,11 @@ function createStore(options?: {
   })
 }
 
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  HTMLElement.prototype.scrollIntoView = vi.fn()
+})
+
 describe('pane header runtime metadata flow (e2e)', () => {
   beforeEach(() => {
     cleanup()
@@ -309,6 +330,10 @@ describe('pane header runtime metadata flow (e2e)', () => {
 
     fetchSidebarSessionsSnapshot.mockReset()
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    getAgentChatCapabilities.mockReset()
+    refreshAgentChatCapabilities.mockReset()
+    setSessionMetadata.mockClear()
+    saveServerSettingsPatchSpy.mockClear()
 
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
@@ -767,6 +792,139 @@ describe('pane header runtime metadata flow (e2e)', () => {
     await waitFor(() => {
       expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
     })
+  })
+
+  it('keeps FreshClaude runtime metadata visible while provider-default creates with opus and tracked changes persist', async () => {
+    const ActualAgentChatView = (
+      await vi.importActual<typeof import('@/components/agent-chat/AgentChatView')>('@/components/agent-chat/AgentChatView')
+    ).default
+
+    const freshClaudePane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-fresh-create',
+      resumeSessionId: 'claude-session-1',
+      status: 'creating',
+    }
+
+    const store = createStore({
+      activeTabId: 'tab-fresh',
+      freshClaudeTab: {
+        id: 'tab-fresh',
+        createRequestId: 'req-fresh-create',
+        title: 'FreshClaude Tab',
+        status: 'running',
+        mode: 'claude',
+        resumeSessionId: 'claude-session-1',
+        createdAt: Date.now(),
+      },
+      freshClaudePane,
+      agentChatState: {
+        sessions: {},
+        pendingCreates: {},
+        pendingCreateFailures: {},
+        capabilitiesByProvider: {
+          freshclaude: {
+            status: 'succeeded',
+            capabilities: {
+              provider: 'freshclaude',
+              fetchedAt: Date.now(),
+              models: [
+                {
+                  id: 'opus',
+                  displayName: 'Opus',
+                  description: 'Latest Opus track',
+                  supportsEffort: true,
+                  supportedEffortLevels: ['turbo'],
+                  supportsAdaptiveThinking: true,
+                },
+                {
+                  id: 'opus[1m]',
+                  displayName: 'Opus 1M',
+                  description: 'Long context window',
+                  supportsEffort: true,
+                  supportedEffortLevels: ['warp'],
+                  supportsAdaptiveThinking: true,
+                },
+              ],
+            },
+          },
+        },
+      } satisfies Partial<AgentChatState>,
+    })
+
+    store.dispatch(setProjects([
+      {
+        projectPath: '/home/user/code/freshell',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionType: 'freshclaude',
+            sessionId: 'claude-session-1',
+            projectPath: '/home/user/code/freshell',
+            cwd: '/home/user/code/freshell/.worktrees/issue-163',
+            gitBranch: 'main',
+            isDirty: true,
+            lastActivityAt: 1,
+            tokenUsage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              cachedTokens: 0,
+              totalTokens: 15,
+              contextTokens: 15,
+              compactThresholdTokens: 60,
+              compactPercent: 25,
+            },
+          },
+        ],
+      },
+    ] as any))
+
+    render(
+      <Provider store={store}>
+        <>
+          <TabBar />
+          <PaneContainer tabId="tab-fresh" node={store.getState().panes.layouts['tab-fresh']!} />
+          <div data-testid="actual-agent-chat-harness">
+            <ActualAgentChatView tabId="tab-fresh" paneId="pane-fresh" paneContent={freshClaudePane} />
+          </div>
+        </>
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-fresh-create',
+        model: 'opus',
+      }))
+    })
+
+    const agentChatHarness = screen.getByTestId('actual-agent-chat-harness')
+    const modelSelect = await within(agentChatHarness).findByLabelText('Model') as HTMLSelectElement
+    const opusOneMillionValue = Array.from(modelSelect.options).find(
+      (option) => option.text === 'Opus 1M',
+    )?.value
+    fireEvent.change(modelSelect, {
+      target: { value: opusOneMillionValue },
+    })
+
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+        agentChat: {
+          providers: {
+            freshclaude: {
+              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            },
+          },
+        },
+      })
+    })
+    expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
   })
 
   it('restores FreshClaude pane header metadata from timelineSessionId before cliSessionId exists', async () => {

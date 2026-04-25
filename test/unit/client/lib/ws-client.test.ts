@@ -288,6 +288,64 @@ describe('WsClient.connect', () => {
     expect(secondCreates).toEqual(['reconnect-create-1'])
   })
 
+  it('resends an in-flight sdk.create once after reconnect until sdk.created arrives', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'sdk.create',
+      requestId: 'sdk-reconnect-create-1',
+      cwd: '/tmp/project',
+    } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'drop-after-sdk-create')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const secondCreates = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'sdk.create')
+      .map((m) => m.requestId)
+    expect(secondCreates).toEqual(['sdk-reconnect-create-1'])
+  })
+
+  it('clears sdk.create reconnect tracking when sdk.create.failed arrives', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({
+      type: 'sdk.create',
+      requestId: 'sdk-create-failed-before-reconnect',
+      cwd: '/tmp/project',
+    } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._message({
+      type: 'sdk.create.failed',
+      requestId: 'sdk-create-failed-before-reconnect',
+      code: 'RESTORE_INTERNAL',
+      message: 'failed before reconnect',
+      retryable: true,
+    })
+    MockWebSocket.instances[0]._close(1006, 'drop-after-sdk-create-failed')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const resent = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'sdk.create' && m.requestId === 'sdk-create-failed-before-reconnect')
+    expect(resent).toHaveLength(0)
+  })
+
   it('drops queued terminal.attach messages on reconnect so recovery only attaches once', async () => {
     const c = new WsClient('ws://example/ws')
     const reconnectHandler = vi.fn(() => {

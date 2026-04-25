@@ -51,6 +51,8 @@ import { checkForUpdate, createCachedUpdateChecker } from './updater/version-che
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
+import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
+import { AgentChatCapabilityRegistry } from './agent-chat-capability-registry.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
@@ -72,6 +74,7 @@ import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
+import { registerStaticClientRoutes } from './static-client-routes.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -192,6 +195,7 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
+  const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
 
   let sdkBridge: SdkBridge
 
@@ -454,6 +458,9 @@ async function main() {
     applyDebugLogging,
     validCliProviders: allCliNames,
   }))
+  app.use('/api/agent-chat/capabilities', createAgentChatCapabilitiesRouter({
+    registry: agentChatCapabilityRegistry,
+  }))
 
   // --- Network management endpoints ---
   app.use('/api', createNetworkRouter({
@@ -536,11 +543,9 @@ async function main() {
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')
   const clientDir = path.join(distRoot, 'client')
-  const indexHtml = path.join(clientDir, 'index.html')
 
   if (!isDev) {
-    app.use(express.static(clientDir, { index: false }))
-    app.get('*', (_req, res) => res.sendFile(indexHtml))
+    registerStaticClientRoutes(app, clientDir)
   }
 
   // Coding CLI watcher hooks

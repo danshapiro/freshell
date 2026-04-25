@@ -43,7 +43,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         sessionId: content.sessionId,
         sessionRef: content.sessionRef,
         initialCwd: content.initialCwd,
-        model: content.model,
+        modelSelection: content.modelSelection,
         permissionMode: content.permissionMode,
         effort: content.effort,
         plugins: content.plugins,

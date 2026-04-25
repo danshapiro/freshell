@@ -227,24 +227,24 @@ describe('SDK Protocol Types', () => {
       expect(result.success).toBe(true)
     })
 
-    it('validates sdk.create with effort field', () => {
-      const msg = {
-        type: 'sdk.create',
-        requestId: 'req-1',
-        effort: 'high',
-      }
-      const result = BrowserSdkMessageSchema.safeParse(msg)
-      expect(result.success).toBe(true)
-      if (result.success) {
-        expect(result.data).toHaveProperty('effort', 'high')
-      }
-    })
-
-    it('rejects sdk.create with invalid effort value', () => {
+    it('validates sdk.create with an unfamiliar effort field', () => {
       const msg = {
         type: 'sdk.create',
         requestId: 'req-1',
         effort: 'turbo',
+      }
+      const result = BrowserSdkMessageSchema.safeParse(msg)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data).toHaveProperty('effort', 'turbo')
+      }
+    })
+
+    it('rejects sdk.create with an empty effort value', () => {
+      const msg = {
+        type: 'sdk.create',
+        requestId: 'req-1',
+        effort: '',
       }
       const result = BrowserSdkMessageSchema.safeParse(msg)
       expect(result.success).toBe(false)

@@ -9,12 +9,66 @@ test.describe('Agent Chat', () => {
   // Helper: open the pane picker by splitting a terminal pane.
   // Uses role="menuitem" for "Split horizontally" in the terminal context menu.
   async function openPanePicker(page: any) {
+    const existingPicker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+    if (await existingPicker.isVisible().catch(() => false)) {
+      return existingPicker
+    }
+
     const termContainer = page.locator('.xterm').first()
-    await termContainer.click({ button: 'right' })
-    await page.getByRole('menuitem', { name: /split horizontally/i }).click()
-    // Wait for picker to appear (role="toolbar" aria-label="Pane type picker")
-    await expect(page.getByRole('toolbar', { name: /pane type picker/i }))
-      .toBeVisible({ timeout: 10_000 })
+    if (await termContainer.isVisible().catch(() => false)) {
+      await termContainer.click({ button: 'right' })
+      await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+    } else {
+      await page.getByRole('button', { name: /add pane/i }).click()
+    }
+    const picker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+    await expect(picker).toBeVisible({ timeout: 10_000 })
+    return picker
+  }
+
+  async function openFreshclaudeSettings(page: any) {
+    const pane = page.getByRole('group', { name: /pane: freshclaude/i }).last()
+    await expect(pane).toBeVisible({ timeout: 10_000 })
+
+    const dialog = pane.getByRole('dialog', { name: 'Agent chat settings' })
+    if (!await dialog.isVisible().catch(() => false)) {
+      await pane.getByRole('button', { name: /^settings$/i }).click()
+    }
+
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    return dialog
+  }
+
+  async function confirmFreshclaudeDirectory(page: any, cwd: string) {
+    const directoryInput = page.getByRole('combobox', { name: /starting directory for freshclaude/i }).last()
+    const pickerAppeared = await directoryInput
+      .waitFor({ state: 'visible', timeout: 2_000 })
+      .then(() => true)
+      .catch(() => false)
+    if (!pickerAppeared) {
+      return
+    }
+
+    const waitForDismissal = async (timeout: number) => {
+      try {
+        await directoryInput.waitFor({ state: 'hidden', timeout })
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    const suggestionList = page.getByRole('listbox').last()
+    if (await suggestionList.isVisible().catch(() => false)) {
+      await suggestionList.getByRole('option').first().click({ force: true })
+      if (await waitForDismissal(2_000)) {
+        return
+      }
+    }
+
+    await directoryInput.fill(cwd)
+    await directoryInput.press('Enter')
+    await directoryInput.waitFor({ state: 'hidden', timeout: 10_000 })
   }
 
   async function getActiveLeaf(harness: any) {
@@ -23,6 +77,24 @@ test.describe('Agent Chat', () => {
     const layout = await harness.getPaneLayout(tabId!)
     expect(layout?.type).toBe('leaf')
     return { tabId: tabId!, paneId: layout.id as string }
+  }
+
+  async function enableFreshclaude(page: any) {
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      harness?.dispatch({
+        type: 'connection/setAvailableClis',
+        payload: { claude: true },
+      })
+      harness?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: {
+          codingCli: {
+            enabledProviders: ['claude'],
+          },
+        },
+      })
+    })
   }
 
   test('pane picker shows base pane types', async ({ freshellPage, page, terminal }) => {
@@ -47,24 +119,183 @@ test.describe('Agent Chat', () => {
 
   test('agent chat provider appears when the Claude CLI is available and enabled', async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
-    await page.evaluate(() => {
-      const harness = window.__FRESHELL_TEST_HARNESS__
-      harness?.dispatch({
-        type: 'connection/setAvailableClis',
-        payload: { claude: true },
+    await enableFreshclaude(page)
+
+    const picker = await openPanePicker(page)
+    await expect(picker.getByRole('button', { name: /^Freshclaude$/i })).toBeVisible()
+  })
+
+  test('freshclaude settings render provider-default tracking and create with opus', async ({ freshellPage: _freshellPage, page, harness, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await enableFreshclaude(page)
+
+    await page.route('**/api/agent-chat/capabilities/freshclaude', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ok: true,
+          capabilities: {
+            provider: 'freshclaude',
+            fetchedAt: 1_234,
+            models: [
+              {
+                id: 'opus',
+                displayName: 'Opus',
+                description: 'Latest Opus track',
+                supportsEffort: true,
+                supportedEffortLevels: ['turbo', 'warp'],
+                supportsAdaptiveThinking: true,
+              },
+              {
+                id: 'opus[1m]',
+                displayName: 'Opus 1M',
+                description: 'Long context window',
+                supportsEffort: true,
+                supportedEffortLevels: ['warp'],
+                supportsAdaptiveThinking: true,
+              },
+              {
+                id: 'haiku',
+                displayName: 'Haiku',
+                description: 'Fast path',
+                supportsEffort: false,
+                supportedEffortLevels: [],
+                supportsAdaptiveThinking: false,
+              },
+            ],
+          },
+        }),
       })
-      harness?.dispatch({
-        type: 'settings/updateSettingsLocal',
+    })
+
+    await harness.clearSentWsMessages()
+    const picker = await openPanePicker(page)
+    await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
+    await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
+
+    const dialog = await openFreshclaudeSettings(page)
+
+    const modelLabels = await dialog.getByRole('combobox', { name: /^Model$/i }).locator('option').evaluateAll(
+      (options) => options.map((option) => option.textContent),
+    )
+    expect(modelLabels).toEqual([
+      'Provider default (track latest Opus)',
+      'Opus',
+      'Opus 1M',
+      'Haiku',
+    ])
+    await expect(dialog.getByText('Tracks latest Opus automatically.')).toBeVisible()
+
+    const effortLabels = await dialog.getByRole('combobox', { name: /^Effort$/i }).locator('option').evaluateAll(
+      (options) => options.map((option) => option.textContent),
+    )
+    expect(effortLabels).toEqual(['Model default', 'turbo', 'warp'])
+    await expect(dialog).toHaveScreenshot('freshclaude-settings-surface.png')
+
+    await expect.poll(async () => {
+      const sent = await harness.getSentWsMessages()
+      return sent.find((msg: any) => msg?.type === 'sdk.create') ?? null
+    }).toMatchObject({
+      type: 'sdk.create',
+      model: 'opus',
+    })
+  })
+
+  test('opening freshclaude settings refreshes stale cached capabilities before rendering live options', async ({ freshellPage: _freshellPage, page, harness, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await enableFreshclaude(page)
+
+    let capabilityRequests = 0
+    await page.route('**/api/agent-chat/capabilities/freshclaude', async (route) => {
+      capabilityRequests += 1
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ok: true,
+          capabilities: {
+            provider: 'freshclaude',
+            fetchedAt: Date.now(),
+            models: [
+              {
+                id: 'opus',
+                displayName: 'Opus',
+                description: 'Latest Opus track',
+                supportsEffort: true,
+                supportedEffortLevels: ['turbo', 'warp'],
+                supportsAdaptiveThinking: true,
+              },
+              {
+                id: 'haiku',
+                displayName: 'Haiku',
+                description: 'Fast path',
+                supportsEffort: false,
+                supportedEffortLevels: [],
+                supportsAdaptiveThinking: false,
+              },
+            ],
+          },
+        }),
+      })
+    })
+
+    await harness.clearSentWsMessages()
+    const picker = await openPanePicker(page)
+    await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
+    await confirmFreshclaudeDirectory(page, serverInfo.homeDir)
+
+    await expect.poll(async () => {
+      const sent = await harness.getSentWsMessages()
+      return sent.find((msg: any) => msg?.type === 'sdk.create') ?? null
+    }).toMatchObject({
+      type: 'sdk.create',
+      model: 'opus',
+    })
+
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'agentChat/capabilityFetchSucceeded',
         payload: {
-          codingCli: {
-            enabledProviders: ['claude'],
+          provider: 'freshclaude',
+          capabilities: {
+            provider: 'freshclaude',
+            fetchedAt: 0,
+            models: [
+              {
+                id: 'legacy-default',
+                displayName: 'Legacy Default',
+                description: 'Old cached row',
+                supportsEffort: true,
+                supportedEffortLevels: ['old-effort'],
+                supportsAdaptiveThinking: false,
+              },
+            ],
           },
         },
       })
     })
 
-    await openPanePicker(page)
-    await expect(page.getByRole('button', { name: /^Freshclaude$/i })).toBeVisible()
+    const dialog = await openFreshclaudeSettings(page)
+    await expect.poll(() => capabilityRequests > 0).toBe(true)
+
+    await expect.poll(async () => (
+      dialog.getByRole('combobox', { name: /^Model$/i }).locator('option').evaluateAll(
+        (options) => options.map((option) => option.textContent),
+      )
+    )).toEqual([
+      'Provider default (track latest Opus)',
+      'Opus',
+      'Haiku',
+    ])
+    await expect(dialog.getByText('Old cached row')).toHaveCount(0)
+
+    await expect.poll(async () => (
+      dialog.getByRole('combobox', { name: /^Effort$/i }).locator('option').evaluateAll(
+        (options) => options.map((option) => option.textContent),
+      )
+    )).toEqual(['Model default', 'turbo', 'warp'])
+    await expect(dialog).toHaveScreenshot('freshclaude-stale-capability-refresh.png')
   })
 
   test('agent chat permission banners appear and allow sends a response', async ({ freshellPage, page, harness, terminal }) => {

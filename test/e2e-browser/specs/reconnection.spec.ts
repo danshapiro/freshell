@@ -1,6 +1,13 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('WebSocket Reconnection', () => {
+  async function waitForAppConnectionReady(page: any): Promise<void> {
+    await page.waitForFunction(
+      () => window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.status === 'ready',
+      { timeout: 20_000 },
+    )
+  }
+
   test('reconnects after connection drop', async ({ freshellPage, page, harness }) => {
     await harness.waitForConnection()
 
@@ -14,6 +21,7 @@ test.describe('WebSocket Reconnection', () => {
     // The WS state should briefly leave 'ready'
     // Wait for it to reconnect
     await harness.waitForConnection()
+    await waitForAppConnectionReady(page)
 
     const status = await harness.getConnectionStatus()
     expect(status).toBe('ready')
@@ -68,6 +76,7 @@ test.describe('WebSocket Reconnection', () => {
 
     // After the rapid disconnects, wait for a stable reconnection
     await harness.waitForConnection()
+    await waitForAppConnectionReady(page)
 
     // App should not crash and should be in a connected state
     const status = await harness.getConnectionStatus()

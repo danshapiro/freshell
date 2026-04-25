@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, within, act, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, within, act, fireEvent, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
+  capabilityFetchSucceeded,
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
@@ -21,9 +22,11 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
+const wsSendSpy = vi.hoisted(() => vi.fn())
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: vi.fn(),
+    send: wsSendSpy,
     onReconnect: vi.fn(() => vi.fn()),
   }),
 }))
@@ -58,6 +61,7 @@ function makeStore(settingsOverrides?: Record<string, unknown>) {
 }
 
 afterEach(() => {
+  wsSendSpy.mockClear()
   saveServerSettingsPatchSpy.mockClear()
 })
 
@@ -465,6 +469,31 @@ describe('AgentChatView settings auto-open (#110)', () => {
   it('persists provider defaults through saveServerSettingsPatch when settings change', () => {
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['low', 'medium', 'high'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'claude-sonnet-4-6',
+            displayName: 'Claude Sonnet 4.6',
+            description: 'Balanced path',
+            supportsEffort: true,
+            supportedEffortLevels: ['medium', 'high'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    }))
 
     render(
       <Provider store={store}>
@@ -473,19 +502,422 @@ describe('AgentChatView settings auto-open (#110)', () => {
     )
 
     const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
-    fireEvent.change(within(dialog).getByLabelText('Model'), { target: { value: 'claude-sonnet-4-6' } })
+    const modelSelect = within(dialog).getByLabelText('Model') as HTMLSelectElement
+    const sonnetValue = Array.from(modelSelect.options).find(
+      (option) => option.text === 'Claude Sonnet 4.6',
+    )?.value
+    fireEvent.change(modelSelect, { target: { value: sonnetValue } })
     fireEvent.change(within(dialog).getByLabelText('Permissions'), { target: { value: 'default' } })
     fireEvent.change(within(dialog).getByLabelText('Effort'), { target: { value: 'medium' } })
 
+    expect(wsSendSpy).toHaveBeenCalledWith({
+      type: 'sdk.set-model',
+      sessionId: 'sess-1',
+      model: 'claude-sonnet-4-6',
+    })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
-      agentChat: { providers: { freshclaude: { defaultModel: 'claude-sonnet-4-6' } } },
+      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-sonnet-4-6' } } } },
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
       agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(3, {
-      agentChat: { providers: { freshclaude: { defaultEffort: 'medium' } } },
+      agentChat: { providers: { freshclaude: { effort: 'medium' } } },
     })
+  })
+
+  it('clears unsupported effort overrides from pane state and persisted defaults when switching to a model that does not support them', async () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus[1m]',
+            displayName: 'Opus 1M',
+            description: 'Long context',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'claude-haiku-4-5-20251001',
+            displayName: 'Haiku 4.5',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
+    const modelSelect = within(dialog).getByLabelText('Model') as HTMLSelectElement
+    const haikuValue = Array.from(modelSelect.options).find(
+      (option) => option.text === 'Haiku 4.5',
+    )?.value
+    fireEvent.change(modelSelect, { target: { value: haikuValue } })
+
+    await waitFor(() => {
+      expect(wsSendSpy).toHaveBeenCalledWith({
+        type: 'sdk.set-model',
+        sessionId: 'sess-1',
+        model: 'claude-haiku-4-5-20251001',
+      })
+    })
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(2)
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
+      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-haiku-4-5-20251001' } } } },
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
+      agentChat: { providers: { freshclaude: { effort: undefined } } },
+    })
+  })
+
+  it('does not clear persisted defaults when a stale pane snapshot switches to a model that does not support its local effort', async () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'opus[1m]',
+            displayName: 'Opus 1M',
+            description: 'Long context',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'haiku',
+            displayName: 'Haiku',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
+    const modelSelect = within(dialog).getByLabelText('Model') as HTMLSelectElement
+    const haikuValue = Array.from(modelSelect.options).find(
+      (option) => option.text === 'Haiku',
+    )?.value
+    fireEvent.change(modelSelect, { target: { value: haikuValue } })
+
+    await waitFor(() => {
+      expect(wsSendSpy).toHaveBeenCalledWith({
+        type: 'sdk.set-model',
+        sessionId: 'sess-1',
+        model: 'haiku',
+      })
+    })
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'haiku' } } } },
+    })
+  })
+
+  it('clears persisted provider defaults when create-time cleanup drops an unsupported provider-default effort', async () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            createRequestId: 'req-create-default-effort',
+            sessionId: undefined,
+            status: 'creating',
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-create-default-effort',
+        model: 'opus',
+      }))
+    })
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      agentChat: { providers: { freshclaude: { effort: undefined } } },
+    })
+  })
+
+  it('does not rewrite provider defaults when create-time cleanup drops an unsupported pane-local effort', async () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'haiku',
+            displayName: 'Haiku',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            createRequestId: 'req-create-unsupported-effort',
+            sessionId: undefined,
+            status: 'creating',
+            modelSelection: { kind: 'tracked', modelId: 'haiku' },
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSendSpy).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-create-unsupported-effort',
+        model: 'haiku',
+      }))
+    })
+    expect(saveServerSettingsPatchSpy).not.toHaveBeenCalled()
+  })
+
+  it('clears persisted defaults when passive cleanup drops an unsupported provider-default effort', async () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            sessionId: 'sess-1',
+            status: 'running',
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      agentChat: { providers: { freshclaude: { effort: undefined } } },
+    })
+  })
+
+  it('does not rewrite provider defaults when passive cleanup drops an unsupported pane-local effort', () => {
+    const store = makeStore({
+      agentChat: {
+        ...defaultSettings.agentChat,
+        providers: {
+          freshclaude: {
+            effort: 'turbo',
+          },
+        },
+      },
+    })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+          {
+            id: 'haiku',
+            displayName: 'Haiku',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            ...BASE_PANE,
+            sessionId: 'sess-1',
+            status: 'running',
+            modelSelection: { kind: 'tracked', modelId: 'haiku' },
+            effort: 'turbo',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(saveServerSettingsPatchSpy).not.toHaveBeenCalled()
   })
 
   it('persists initial setup completion through saveServerSettingsPatch when settings are dismissed', () => {

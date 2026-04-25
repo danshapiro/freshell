@@ -16,24 +16,17 @@ describe('sdk-message-handler', () => {
     _resetCancelledCreates()
   })
 
-  it('dispatches setAvailableModels on sdk.models', () => {
-    const { dispatch, calls } = createMockDispatch()
-    const models = [
-      { value: 'claude-opus-4-6', displayName: 'Opus 4.6', description: 'Most capable' },
-      { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
-    ]
+  it('ignores the obsolete sdk.models websocket path', () => {
+    const { dispatch } = createMockDispatch()
 
     const handled = handleSdkMessage(dispatch, {
       type: 'sdk.models',
       sessionId: 's1',
-      models,
+      models: [{ value: 'opus', displayName: 'Opus' }],
     })
 
-    expect(handled).toBe(true)
-    expect(dispatch).toHaveBeenCalledOnce()
-    const action = calls[0]
-    expect(action.type).toBe('agentChat/setAvailableModels')
-    expect(action.payload.models).toEqual(models)
+    expect(handled).toBe(false)
+    expect(dispatch).not.toHaveBeenCalled()
   })
 
   it('dispatches sessionCreated on sdk.created', () => {

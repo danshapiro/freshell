@@ -1,5 +1,10 @@
 import { z } from 'zod'
 
+import {
+  AgentChatModelSelectionSchema,
+  AgentChatOpaqueStringSchema,
+  type AgentChatModelSelection,
+} from './agent-chat-capabilities.js'
 import { sanitizeAgentChatPluginPaths } from './agent-chat-plugins.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from './coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from './string-list.js'
@@ -27,7 +32,6 @@ export const CODEX_SANDBOX_VALUES = ['read-only', 'workspace-write', 'danger-ful
 export const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypassPermissions'] as const
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
 const NETWORK_HOST_VALUES = ['127.0.0.1', '0.0.0.0'] as const
-const AGENT_CHAT_EFFORT_VALUES = ['low', 'medium', 'high', 'max'] as const
 const UI_SCALE_MIN = 0.75
 const UI_SCALE_MAX = 1.5
 const TERMINAL_FONT_SIZE_MIN = 12
@@ -81,7 +85,7 @@ export type CodexSandboxMode = (typeof CODEX_SANDBOX_VALUES)[number]
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODE_VALUES)[number]
 export type ExternalEditor = (typeof EXTERNAL_EDITOR_VALUES)[number]
 export type NetworkHost = (typeof NETWORK_HOST_VALUES)[number]
-export type AgentChatEffort = (typeof AGENT_CHAT_EFFORT_VALUES)[number]
+export type AgentChatEffort = string
 
 export type DeepPartial<T> = T extends readonly (infer U)[]
   ? U[]
@@ -105,9 +109,9 @@ export type CodingCliSettings = {
 }
 
 export type AgentChatProviderDefaults = {
-  defaultModel?: string
+  modelSelection?: AgentChatModelSelection
   defaultPermissionMode?: string
-  defaultEffort?: AgentChatEffort
+  effort?: AgentChatEffort
 }
 
 export type ServerSettings = {
@@ -231,7 +235,6 @@ const AttentionDismissSchema = z.enum(ATTENTION_DISMISS_VALUES)
 const SessionOpenModeSchema = z.enum(SESSION_OPEN_MODE_VALUES)
 const ExternalEditorSchema = z.enum(EXTERNAL_EDITOR_VALUES)
 const NetworkHostSchema = z.enum(NETWORK_HOST_VALUES)
-const AgentChatEffortSchema = z.enum(AGENT_CHAT_EFFORT_VALUES)
 
 function hasOwn<T extends object>(value: T | undefined | null, key: PropertyKey): boolean {
   return !!value && Object.prototype.hasOwnProperty.call(value, key)
@@ -542,12 +545,22 @@ function createCodingCliProviderConfigPatchSchema() {
     .strict()
 }
 
+function createAgentChatProviderDefaultsSchema() {
+  return z
+    .object({
+      modelSelection: AgentChatModelSelectionSchema.optional(),
+      defaultPermissionMode: z.string().optional(),
+      effort: AgentChatOpaqueStringSchema.optional(),
+    })
+    .strict()
+}
+
 function createAgentChatProviderDefaultsPatchSchema() {
   return z
     .object({
-      defaultModel: z.string().optional(),
+      modelSelection: AgentChatModelSelectionSchema.nullable().optional(),
       defaultPermissionMode: z.string().optional(),
-      defaultEffort: AgentChatEffortSchema.optional(),
+      effort: z.union([AgentChatOpaqueStringSchema, z.literal('')]).nullable().optional(),
     })
     .strict()
 }
@@ -584,7 +597,7 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
     agentChat: z.object({
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
+      providers: z.record(z.string(), createAgentChatProviderDefaultsSchema()),
     }).strict(),
     extensions: z.object({
       disabled: z.array(z.string()),
@@ -897,13 +910,29 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     if (isRecord(candidate.agentChat.providers)) {
       const providers: NonNullable<ServerSettingsPatch['agentChat']>['providers'] = {}
       for (const [providerName, providerPatch] of Object.entries(candidate.agentChat.providers)) {
+        const normalizedProviderPatchInput = normalizeLegacyAgentChatProviderDefaultsInput(providerPatch)
         const parsed = agentChatProviderDefaultsPatchSchema.safeParse(
-          isRecord(providerPatch)
-            ? pickKeys(providerPatch, ['defaultModel', 'defaultPermissionMode', 'defaultEffort'])
-            : providerPatch,
+          normalizedProviderPatchInput,
         )
-        if (parsed.success && Object.keys(parsed.data).length > 0) {
-          providers[providerName] = parsed.data
+        if (
+          parsed.success
+          && isRecord(normalizedProviderPatchInput)
+          && Object.keys(normalizedProviderPatchInput).length > 0
+        ) {
+          const normalizedProviderPatch: AgentChatProviderDefaults = {}
+          if (hasOwn(normalizedProviderPatchInput, 'modelSelection')) {
+            normalizedProviderPatch.modelSelection = parsed.data.modelSelection ?? undefined
+          }
+          if (hasOwn(normalizedProviderPatchInput, 'defaultPermissionMode')) {
+            normalizedProviderPatch.defaultPermissionMode = parsed.data.defaultPermissionMode
+          }
+          if (hasOwn(normalizedProviderPatchInput, 'effort')) {
+            const parsedEffort = parsed.data.effort
+            normalizedProviderPatch.effort = typeof parsedEffort === 'string' && parsedEffort.trim().length === 0
+              ? undefined
+              : parsedEffort ?? undefined
+          }
+          providers[providerName] = normalizedProviderPatch
         }
       }
       if (Object.keys(providers).length > 0) {
@@ -946,10 +975,46 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
   return sanitized
 }
 
+function normalizeLegacyAgentChatProviderDefaultsInput(
+  providerPatch: unknown,
+): Record<string, unknown> | unknown {
+  if (!isRecord(providerPatch)) {
+    return providerPatch
+  }
+
+  const normalized = pickOwnKeysPreservingUndefined(
+    providerPatch,
+    ['modelSelection', 'defaultPermissionMode', 'effort'],
+  )
+
+  if (
+    !hasOwn(normalized, 'modelSelection')
+    && typeof providerPatch.defaultModel === 'string'
+    && providerPatch.defaultModel.trim().length > 0
+  ) {
+    normalized.modelSelection = {
+      kind: 'exact',
+      modelId: providerPatch.defaultModel,
+    }
+  }
+
+  if (
+    !hasOwn(normalized, 'effort')
+    && typeof providerPatch.defaultEffort === 'string'
+    && providerPatch.defaultEffort.trim().length > 0
+  ) {
+    normalized.effort = providerPatch.defaultEffort
+  }
+
+  return normalized
+}
+
 export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
   const normalizedPatch = sanitizeServerSettingsPatch(patch)
   const codingCliPatch = normalizedPatch.codingCli
   const agentChatPatch = normalizedPatch.agentChat
+  const normalizedAgentChatPatch = agentChatPatch as Partial<ServerSettings['agentChat']> | undefined
+  const normalizedAgentChatProvidersPatch = agentChatPatch?.providers as Partial<Record<string, AgentChatProviderDefaults>> | undefined
 
   return {
     ...base,
@@ -981,11 +1046,11 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
     },
     editor: mergeDefined(base.editor, normalizedPatch.editor),
     agentChat: {
-      ...mergeDefined(base.agentChat, agentChatPatch),
-      defaultPlugins: hasOwn(agentChatPatch, 'defaultPlugins')
-        ? sanitizeAgentChatPluginPaths(agentChatPatch?.defaultPlugins)
+      ...mergeDefined(base.agentChat, normalizedAgentChatPatch),
+      defaultPlugins: hasOwn(normalizedAgentChatPatch, 'defaultPlugins')
+        ? sanitizeAgentChatPluginPaths(normalizedAgentChatPatch?.defaultPlugins)
         : base.agentChat.defaultPlugins,
-      providers: mergeRecordOfObjects(base.agentChat.providers, agentChatPatch?.providers),
+      providers: mergeRecordOfObjects(base.agentChat.providers, normalizedAgentChatProvidersPatch),
     },
     extensions: {
       disabled: hasOwn(normalizedPatch.extensions, 'disabled')

@@ -103,6 +103,49 @@ describe('collectPaneSnapshots', () => {
       })
     })
 
+    it('preserves explicit agent-chat sessionRef and modelSelection without raw resume mirrors', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-chat',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          status: 'idle',
+          createRequestId: 'req-chat',
+          sessionId: 'sdk-agent-1',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '00000000-0000-4000-8000-000000000123',
+          },
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          permissionMode: 'default',
+          effort: 'turbo',
+          plugins: ['planner'],
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-1')
+
+      expect(snapshots).toEqual([{
+        paneId: 'pane-chat',
+        kind: 'agent-chat',
+        title: undefined,
+        payload: {
+          provider: 'freshclaude',
+          sessionId: 'sdk-agent-1',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '00000000-0000-4000-8000-000000000123',
+          },
+          initialCwd: undefined,
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          permissionMode: 'default',
+          effort: 'turbo',
+          plugins: ['planner'],
+        },
+      }])
+    })
+
     it('does not serialize raw agent-chat resumeSessionId when no canonical sessionRef exists', () => {
       const node: PaneNode = {
         type: 'leaf',
@@ -113,7 +156,7 @@ describe('collectPaneSnapshots', () => {
           status: 'idle',
           createRequestId: 'req-chat-legacy',
           resumeSessionId: 'named-resume',
-          model: 'claude-sonnet',
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         },
       }
 
@@ -124,7 +167,7 @@ describe('collectPaneSnapshots', () => {
         sessionId: undefined,
         sessionRef: undefined,
         initialCwd: undefined,
-        model: 'claude-sonnet',
+        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         permissionMode: undefined,
         effort: undefined,
         plugins: undefined,

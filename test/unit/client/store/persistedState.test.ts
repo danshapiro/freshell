@@ -44,6 +44,10 @@ describe('persistedState parsers', () => {
   })
 
   describe('parsePersistedPanesRaw', () => {
+    it('bumps the panes schema version for selection-strategy persistence', () => {
+      expect(PANES_SCHEMA_VERSION).toBe(7)
+    })
+
     it('returns null for invalid JSON', () => {
       expect(parsePersistedPanesRaw('{')).toBeNull()
     })

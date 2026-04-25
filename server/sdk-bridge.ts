@@ -9,11 +9,12 @@ import {
   type SDKPartialAssistantMessage,
   type SDKStatusMessage,
   type Query as SdkQuery,
+  type Options as SdkOptions,
+  type CanUseTool,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { sanitizeAgentChatPluginPaths } from '../shared/agent-chat-plugins.js'
-import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
 import type { AgentHistorySource } from './agent-timeline/history-source.js'
@@ -45,10 +46,66 @@ interface SessionProcess {
   inputStream: InputStreamHandle
 }
 
+type ClaudeSdkOptionsInput = {
+  cwd?: string
+  resumeSessionId?: string
+  model?: string
+  permissionMode?: string
+  effort?: string
+  plugins?: string[]
+  abortController?: AbortController
+  includePartialMessages?: boolean
+  stderr?: (data: string) => void
+  canUseTool?: CanUseTool
+  env?: NodeJS.ProcessEnv
+}
+
+export function createClaudeSdkCleanEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const { CLAUDECODE: _, ANTHROPIC_API_KEY: __, ...cleanEnv } = env
+  return cleanEnv
+}
+
+export function createClaudeSdkMcpServers(env: NodeJS.ProcessEnv = process.env): NonNullable<SdkOptions['mcpServers']> {
+  return {
+    freshell: {
+      command: 'node',
+      args: buildMcpServerCommandArgs(),
+      env: {
+        FRESHELL_URL: env.FRESHELL_URL || `http://localhost:${Number(env.PORT || 3001)}`,
+        FRESHELL_TOKEN: env.AUTH_TOKEN || '',
+      },
+    },
+  }
+}
+
+export function createClaudeSdkOptions(input: ClaudeSdkOptionsInput): SdkOptions {
+  const options: SdkOptions = {
+    cwd: input.cwd || undefined,
+    resume: input.resumeSessionId,
+    model: input.model,
+    permissionMode: input.permissionMode as any,
+    effort: input.effort as any,
+    pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
+    includePartialMessages: input.includePartialMessages,
+    abortController: input.abortController,
+    env: createClaudeSdkCleanEnv(input.env),
+    mcpServers: createClaudeSdkMcpServers(input.env),
+    stderr: input.stderr,
+    canUseTool: input.canUseTool,
+    settingSources: ['user', 'project', 'local'],
+  }
+
+  if (input.plugins !== undefined) {
+    options.plugins = sanitizeAgentChatPluginPaths(input.plugins)
+      .map((pluginPath) => ({ type: 'local' as const, path: pluginPath }))
+  }
+
+  return options
+}
+
 export class SdkBridge extends EventEmitter {
   private sessions = new Map<string, SdkSessionState>()
   private processes = new Map<string, SessionProcess>()
-  private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
 
   constructor(private readonly agentHistorySource?: AgentHistorySource) {
     super()
@@ -100,7 +157,7 @@ export class SdkBridge extends EventEmitter {
     resumeSessionId?: string
     model?: string
     permissionMode?: string
-    effort?: 'low' | 'medium' | 'high' | 'max'
+    effort?: string
     plugins?: string[]
   }): Promise<SdkCreatedSession> {
     const sessionId = nanoid()
@@ -126,34 +183,17 @@ export class SdkBridge extends EventEmitter {
     const abortController = new AbortController()
     const { iterable: inputIterable, handle: inputStream } = this.createInputStream()
 
-    // Strip env vars that interfere with child Claude Code subprocess behaviour:
-    // - CLAUDECODE: causes child to refuse startup ("nested session" error)
-    // - ANTHROPIC_API_KEY: inherited keys override subscription/OAuth auth,
-    //   causing "Invalid API key" errors when the key is stale or invalid
-    const { CLAUDECODE: _, ANTHROPIC_API_KEY: __, ...cleanEnv } = process.env
-
     const sdkQuery = query({
       prompt: inputIterable as AsyncIterable<any>,
-      options: {
-        cwd: options.cwd || undefined,
-        resume: options.resumeSessionId,
+      options: createClaudeSdkOptions({
+        cwd: options.cwd,
+        resumeSessionId: options.resumeSessionId,
         model: options.model,
-        permissionMode: options.permissionMode as any,
+        permissionMode: options.permissionMode,
         effort: options.effort,
-        pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
-        includePartialMessages: true,
+        plugins: options.plugins,
         abortController,
-        env: cleanEnv,
-        mcpServers: {
-          freshell: {
-            command: 'node',
-            args: buildMcpServerCommandArgs(),
-            env: {
-              FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${Number(process.env.PORT || 3001)}`,
-              FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
-            },
-          },
-        },
+        includePartialMessages: true,
         stderr: (data: string) => {
           log.warn({ sessionId, data: data.trimEnd() }, 'SDK subprocess stderr')
         },
@@ -168,19 +208,7 @@ export class SdkBridge extends EventEmitter {
           }
           return this.handlePermissionRequest(sessionId, toolName, input as Record<string, unknown>, ctx)
         },
-        settingSources: ['user', 'project', 'local'],
-        // Explicit plugins remain supported for non-Freshell Claude SDK bundles.
-        // Freshell orchestration itself is provided by the MCP server above.
-        ...((() => {
-          if (options.plugins !== undefined) {
-            return {
-              plugins: sanitizeAgentChatPluginPaths(options.plugins)
-                .map(p => ({ type: 'local' as const, path: p })),
-            }
-          }
-          return {}
-        })()),
-      },
+      }),
     })
 
     this.processes.set(sessionId, {
@@ -349,9 +377,6 @@ export class SdkBridge extends EventEmitter {
             cwd: state.cwd,
             tools: state.tools,
           })
-
-          // Fetch available models and broadcast to client
-          this.fetchAndBroadcastModels(sessionId)
         } else if (msg.subtype === 'status') {
           const statusMsg = msg as SDKStatusMessage
           if (statusMsg.status === 'compacting') {
@@ -748,41 +773,6 @@ export class SdkBridge extends EventEmitter {
       log.warn({ sessionId, err }, 'setPermissionMode failed')
     })
     return true
-  }
-
-  private fetchAndBroadcastModels(sessionId: string): void {
-    // Use cache if available
-    if (this.cachedModels) {
-      this.broadcastToSession(sessionId, {
-        type: 'sdk.models',
-        sessionId,
-        models: this.cachedModels,
-      })
-      return
-    }
-
-    const sp = this.processes.get(sessionId)
-    if (!sp) return
-
-    sp.query.supportedModels().then((models) => {
-      const mapped = models.map((m: any) => {
-        const value = m.value ?? m.id ?? String(m)
-        const rawName = m.displayName ?? m.display_name ?? value
-        return {
-          value,
-          displayName: formatModelDisplayName(rawName),
-          description: m.description ?? '',
-        }
-      })
-      this.cachedModels = mapped
-      this.broadcastToSession(sessionId, {
-        type: 'sdk.models',
-        sessionId,
-        models: mapped,
-      })
-    }).catch((err) => {
-      log.warn({ sessionId, err }, 'Failed to fetch supported models')
-    })
   }
 
   close(): void {

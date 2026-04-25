@@ -69,6 +69,24 @@ export const normalizeSettingsPatch = (patch: Record<string, any>) => {
     }
   }
 
+  if (patch.agentChat?.providers && typeof patch.agentChat.providers === 'object') {
+    for (const providerPatch of Object.values(patch.agentChat.providers)) {
+      if (!providerPatch || typeof providerPatch !== 'object' || Array.isArray(providerPatch)) {
+        continue
+      }
+      const providerPatchRecord = providerPatch as Record<string, unknown>
+      if (Object.prototype.hasOwnProperty.call(providerPatchRecord, 'modelSelection') && providerPatchRecord.modelSelection === null) {
+        providerPatchRecord.modelSelection = undefined
+      }
+      if (Object.prototype.hasOwnProperty.call(providerPatchRecord, 'effort')) {
+        const raw = providerPatchRecord.effort
+        if (raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+          providerPatchRecord.effort = undefined
+        }
+      }
+    }
+  }
+
   return patch
 }
 

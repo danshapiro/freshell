@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import { MessageCircleQuestion } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useMobile } from '@/hooks/useMobile'
 import type { QuestionRequest, QuestionDefinition } from '@/store/agentChatTypes'
 
 interface QuestionBannerProps {
@@ -13,10 +14,12 @@ function SingleSelectQuestion({
   q,
   onSelect,
   disabled,
+  isMobile,
 }: {
   q: QuestionDefinition
   onSelect: (answer: string) => void
   disabled?: boolean
+  isMobile?: boolean
 }) {
   const [showOther, setShowOther] = useState(false)
   const [otherText, setOtherText] = useState('')
@@ -37,9 +40,10 @@ function SingleSelectQuestion({
             onClick={() => onSelect(opt.label)}
             disabled={disabled}
             className={cn(
-              'px-3 py-1.5 text-xs rounded-md border transition-colors',
+              'px-3 text-xs rounded-md border transition-colors',
               'bg-blue-600/10 border-blue-500/30 hover:bg-blue-600/20 hover:border-blue-500/50',
               'disabled:opacity-50',
+              isMobile ? 'py-2.5 min-h-11' : 'py-1.5',
             )}
             aria-label={opt.label}
           >
@@ -54,9 +58,10 @@ function SingleSelectQuestion({
           onClick={() => setShowOther(true)}
           disabled={disabled}
           className={cn(
-            'px-3 py-1.5 text-xs rounded-md border transition-colors',
+            'px-3 text-xs rounded-md border transition-colors',
             'bg-muted/50 border-border hover:bg-muted',
             'disabled:opacity-50',
+            isMobile ? 'py-2.5 min-h-11' : 'py-1.5',
           )}
           aria-label="Other"
         >
@@ -78,9 +83,10 @@ function SingleSelectQuestion({
             onClick={() => otherText.trim() && onSelect(otherText.trim())}
             disabled={disabled || !otherText.trim()}
             className={cn(
-              'px-3 py-1 text-xs rounded font-medium',
+              'px-3 text-xs rounded font-medium',
               'bg-blue-600 text-white hover:bg-blue-700',
               'disabled:opacity-50',
+              isMobile ? 'py-2.5 min-h-11' : 'py-1',
             )}
             aria-label="Submit"
           >
@@ -96,10 +102,12 @@ function MultiSelectQuestion({
   q,
   onSelect,
   disabled,
+  isMobile,
 }: {
   q: QuestionDefinition
   onSelect: (answer: string) => void
   disabled?: boolean
+  isMobile?: boolean
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set())
 
@@ -129,11 +137,12 @@ function MultiSelectQuestion({
             onClick={() => toggle(opt.label)}
             disabled={disabled}
             className={cn(
-              'px-3 py-1.5 text-xs rounded-md border transition-colors',
+              'px-3 text-xs rounded-md border transition-colors',
               selected.has(opt.label)
                 ? 'bg-blue-600/30 border-blue-500/60 ring-1 ring-blue-500/40'
                 : 'bg-blue-600/10 border-blue-500/30 hover:bg-blue-600/20',
               'disabled:opacity-50',
+              isMobile ? 'py-2.5 min-h-11' : 'py-1.5',
             )}
             aria-label={opt.label}
             aria-pressed={selected.has(opt.label)}
@@ -150,9 +159,10 @@ function MultiSelectQuestion({
         onClick={handleSubmit}
         disabled={disabled || selected.size === 0}
         className={cn(
-          'px-3 py-1 text-xs rounded font-medium',
+          'px-3 text-xs rounded font-medium',
           'bg-blue-600 text-white hover:bg-blue-700',
           'disabled:opacity-50',
+          isMobile ? 'py-2.5 min-h-11' : 'py-1',
         )}
         aria-label="Submit"
       >
@@ -163,6 +173,7 @@ function MultiSelectQuestion({
 }
 
 function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
+  const isMobile = useMobile()
   const [answered, setAnswered] = useState<Record<string, string>>({})
   const questions = question.questions
 
@@ -201,6 +212,7 @@ function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
             q={q}
             onSelect={(answer) => handleAnswer(idx, q.question, answer)}
             disabled={disabled}
+            isMobile={isMobile}
           />
         ) : (
           <SingleSelectQuestion
@@ -208,6 +220,7 @@ function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
             q={q}
             onSelect={(answer) => handleAnswer(idx, q.question, answer)}
             disabled={disabled}
+            isMobile={isMobile}
           />
         )
       ))}

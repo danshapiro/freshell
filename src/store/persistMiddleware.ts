@@ -10,6 +10,7 @@ import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
+import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
 
 
 const log = createLogger('PanesPersist')
@@ -131,6 +132,14 @@ export function loadPersistedTabs(): any | null {
 function migratePaneContent(content: any): any {
   if (!content || typeof content !== 'object') {
     return content
+  }
+  if (content.kind === 'agent-chat') {
+    const { model: _legacyModel, ...rest } = content
+    return {
+      ...rest,
+      modelSelection: normalizeAgentChatModelSelection(content.modelSelection, content.model),
+      effort: normalizeAgentChatEffortOverride(content.effort),
+    }
   }
   if (content.kind === 'browser') {
     return {
@@ -348,6 +357,15 @@ function migratePanesData(parsed: any): any | null {
 
     // Version 5 -> 6: assign stable browser instance ids.
     if (currentVersion < 6) {
+      const migratedLayouts: Record<string, any> = {}
+      for (const [tabId, node] of Object.entries(layouts)) {
+        migratedLayouts[tabId] = migrateNode(node)
+      }
+      layouts = migratedLayouts
+    }
+
+    // Version 6 -> 7: migrate agent-chat model/effort persistence to selection strategies.
+    if (currentVersion < 7) {
       const migratedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {
         migratedLayouts[tabId] = migrateNode(node)

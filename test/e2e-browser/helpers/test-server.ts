@@ -273,16 +273,40 @@ export class TestServer {
       await fsp.mkdir(freshellDir, { recursive: true })
 
       // Pre-seed config.json so the SetupWizard does not block the UI.
-      // On non-WSL systems (including CI), the client shows a SetupWizard modal
-      // when config.json is missing, blocking all interaction. This minimal config
-      // marks the network as already configured, bypassing the wizard.
+      // Preserve any setupHome-provided config and only ensure the network
+      // bootstrap fields needed for the browser harness are present.
       const configPath = path.join(freshellDir, 'config.json')
+      let existingConfig: Record<string, unknown> | null = null
+      try {
+        existingConfig = JSON.parse(await fsp.readFile(configPath, 'utf8')) as Record<string, unknown>
+      } catch {
+        existingConfig = null
+      }
+
+      const existingSettings =
+        existingConfig && typeof existingConfig.settings === 'object' && !Array.isArray(existingConfig.settings)
+          ? existingConfig.settings as Record<string, unknown>
+          : {}
+      const existingNetwork =
+        typeof existingSettings.network === 'object' && !Array.isArray(existingSettings.network)
+          ? existingSettings.network as Record<string, unknown>
+          : {}
+
       await fsp.writeFile(configPath, JSON.stringify({
-        version: 1,
+        ...(existingConfig ?? {}),
+        version:
+          existingConfig && typeof existingConfig.version === 'number'
+            ? existingConfig.version
+            : 1,
         settings: {
+          ...existingSettings,
           network: {
+            ...existingNetwork,
             configured: true,
-            host: '127.0.0.1',
+            host:
+              typeof existingNetwork.host === 'string' && existingNetwork.host.length > 0
+                ? existingNetwork.host
+                : '127.0.0.1',
           },
         },
       }, null, 2))

@@ -7,13 +7,17 @@ import agentChatReducer, {
   turnBodyReceived,
 } from '@/store/agentChatSlice'
 import {
+  fetchAgentChatCapabilities,
   loadAgentTimelineWindow,
   loadAgentTurnBody,
+  refreshAgentChatCapabilities,
   _resetAgentChatThunkControllers,
 } from '@/store/agentChatThunks'
 
 const getAgentTimelinePage = vi.fn()
 const getAgentTurnBody = vi.fn()
+const getAgentChatCapabilities = vi.fn()
+const refreshAgentChatCapabilitiesApi = vi.fn()
 
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
@@ -21,6 +25,8 @@ vi.mock('@/lib/api', async () => {
     ...actual,
     getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
     getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
+    refreshAgentChatCapabilities: (...args: unknown[]) => refreshAgentChatCapabilitiesApi(...args),
   }
 })
 
@@ -97,7 +103,102 @@ describe('agentChatThunks', () => {
   beforeEach(() => {
     getAgentTimelinePage.mockReset()
     getAgentTurnBody.mockReset()
+    getAgentChatCapabilities.mockReset()
+    refreshAgentChatCapabilitiesApi.mockReset()
     _resetAgentChatThunkControllers()
+  })
+
+  it('fetches capability catalogs into provider-scoped loading and success state', async () => {
+    let resolveResponse: (value: unknown) => void
+    getAgentChatCapabilities.mockReturnValue(new Promise((resolve) => {
+      resolveResponse = resolve
+    }))
+
+    const store = makeStore()
+    const promise = store.dispatch(fetchAgentChatCapabilities('freshclaude') as any)
+
+    expect(store.getState().agentChat.capabilitiesByProvider.freshclaude).toEqual({
+      status: 'loading',
+      capabilities: undefined,
+      error: undefined,
+    })
+
+    resolveResponse!({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo', 'warp'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    })
+
+    await promise
+
+    expect(getAgentChatCapabilities).toHaveBeenCalledWith('freshclaude', {})
+    expect(store.getState().agentChat.capabilitiesByProvider.freshclaude).toEqual({
+      status: 'succeeded',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo', 'warp'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+      error: undefined,
+    })
+  })
+
+  it('preserves typed failures from non-2xx capability refresh responses', async () => {
+    refreshAgentChatCapabilitiesApi.mockRejectedValue({
+      status: 503,
+      message: 'Service Unavailable',
+      details: {
+        ok: false,
+        error: {
+          code: 'CAPABILITY_PAYLOAD_INVALID',
+          message: 'Capability payload invalid',
+          retryable: false,
+        },
+      },
+    })
+
+    const store = makeStore()
+    const response = await store.dispatch(refreshAgentChatCapabilities('kilroy') as any)
+
+    expect(response).toEqual({
+      ok: false,
+      error: {
+        code: 'CAPABILITY_PAYLOAD_INVALID',
+        message: 'Capability payload invalid',
+        retryable: false,
+      },
+    })
+    expect(refreshAgentChatCapabilitiesApi).toHaveBeenCalledWith('kilroy', {})
+    expect(store.getState().agentChat.capabilitiesByProvider.kilroy).toEqual({
+      status: 'failed',
+      capabilities: undefined,
+      error: {
+        code: 'CAPABILITY_PAYLOAD_INVALID',
+        message: 'Capability payload invalid',
+        retryable: false,
+      },
+    })
   })
 
   it('loads a visible timeline window and hydrates the most recent turn body', async () => {
