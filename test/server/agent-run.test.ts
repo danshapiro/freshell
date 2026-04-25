@@ -4,6 +4,9 @@ import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
+const expectedFreshellToken = process.env.AUTH_TOKEN || ''
+const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
+
 it('runs a command and returns captured output', async () => {
   let buffer = ''
   const registry = {
@@ -98,8 +101,8 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
     env: expect.objectContaining({
       FRESHELL: '1',
       FRESHELL_TERMINAL_ID: expect.any(String),
-      FRESHELL_TOKEN: '',
-      FRESHELL_URL: 'http://localhost:3001',
+      FRESHELL_TOKEN: expectedFreshellToken,
+      FRESHELL_URL: expectedFreshellUrl,
     }),
   }))
   expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)

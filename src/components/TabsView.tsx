@@ -34,6 +34,7 @@ import {
 } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -138,12 +139,18 @@ function sanitizePaneSnapshot(
     }
   }
   if (snapshot.kind === 'agent-chat') {
-    const sessionRef = resolveSessionRef({ payload })
+    const durableState = migrateLegacyAgentChatDurableState({
+      sessionRef: payload.sessionRef,
+      cliSessionId: typeof payload.cliSessionId === 'string' ? payload.cliSessionId : undefined,
+      timelineSessionId: typeof payload.timelineSessionId === 'string' ? payload.timelineSessionId : undefined,
+      resumeSessionId: typeof payload.resumeSessionId === 'string' ? payload.resumeSessionId : undefined,
+    })
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
       sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
-      sessionRef,
+      ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+      ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),

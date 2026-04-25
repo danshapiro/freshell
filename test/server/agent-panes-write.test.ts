@@ -4,6 +4,9 @@ import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
+const expectedFreshellToken = process.env.AUTH_TOKEN || ''
+const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
+
 it('splits a pane horizontally', async () => {
   const app = express()
   app.use(express.json())
@@ -56,8 +59,8 @@ it('passes the planned Codex sidecar when splitting a pane in codex mode', async
       FRESHELL_TAB_ID: 'tab_1',
       FRESHELL_PANE_ID: 'pane_new',
       FRESHELL_TERMINAL_ID: expect.any(String),
-      FRESHELL_TOKEN: '',
-      FRESHELL_URL: 'http://localhost:3001',
+      FRESHELL_TOKEN: expectedFreshellToken,
+      FRESHELL_URL: expectedFreshellUrl,
     }),
   }))
   expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
@@ -179,8 +182,8 @@ it('passes the planned Codex sidecar when respawning a pane in codex mode', asyn
       FRESHELL_TAB_ID: 'tab_1',
       FRESHELL_PANE_ID: 'pane_1',
       FRESHELL_TERMINAL_ID: expect.any(String),
-      FRESHELL_TOKEN: '',
-      FRESHELL_URL: 'http://localhost:3001',
+      FRESHELL_TOKEN: expectedFreshellToken,
+      FRESHELL_URL: expectedFreshellUrl,
     }),
   }))
   expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)

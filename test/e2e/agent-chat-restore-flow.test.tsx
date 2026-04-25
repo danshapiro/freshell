@@ -458,13 +458,13 @@ describe('agent chat restore flow', () => {
     )
 
     await waitFor(() => {
-      expect(wsSend).toHaveBeenCalledWith({
+      expect(wsHarness.send).toHaveBeenCalledWith({
         type: 'sdk.attach',
         sessionId: 'sdk-live-only',
       })
     })
 
-    wsSend.mockClear()
+    wsHarness.send.mockClear()
 
     act(() => {
       handleSdkMessage(store.dispatch, {
@@ -483,7 +483,7 @@ describe('agent chat restore flow', () => {
       })
     })
 
-    expect(wsSend.mock.calls.some(([msg]) => msg?.type === 'sdk.create')).toBe(false)
+    expect(wsHarness.send.mock.calls.some(([msg]) => msg?.type === 'sdk.create')).toBe(false)
   })
 
   it('reconnect after sdk.create but before sdk.created resends the same request and binds one session without a retry loop', async () => {

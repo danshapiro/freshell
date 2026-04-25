@@ -567,12 +567,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         return
       }
 
+      // Create-time resume accepts either the canonical durable Claude id or a
+      // live/named resume token. We persist only canonical ids for reload/attach
+      // flows, but named resumes still need to launch a restoring session that can
+      // later upgrade in place once the canonical timeline id is known.
       const createResumeSessionId = (
         currentPane.sessionRef?.provider === 'claude'
         && isValidClaudeSessionId(currentPane.sessionRef.sessionId)
       )
         ? currentPane.sessionRef.sessionId
-        : (isValidClaudeSessionId(currentPane.resumeSessionId) ? currentPane.resumeSessionId : undefined)
+        : (typeof currentPane.resumeSessionId === 'string' && currentPane.resumeSessionId.trim().length > 0
+          ? currentPane.resumeSessionId
+          : undefined)
 
       const resolvedSelection = resolveAgentChatModelSelection({
         providerDefaultModelId,

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
-import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const HOOK_TIMEOUT_MS = 30_000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -20,9 +20,10 @@ const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   projectColors: {},
 }))
 
-vi.mock('../../server/config-store', () => ({
+vi.mock('../../../server/config-store.js', () => ({
   configStore: {
     snapshot: vi.fn().mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT),
+    pushRecentDirectory: vi.fn().mockResolvedValue(undefined),
   },
 }))
 
@@ -76,9 +77,9 @@ function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeout
       reject(error)
     }
 
-    const onClose = () => {
+    const onClose = (code: number, reason: Buffer) => {
       cleanup()
-      reject(new Error('Socket closed before the expected message arrived'))
+      reject(new Error(`Socket closed before the expected message arrived (${code}: ${reason.toString()})`))
     }
 
     ws.on('message', handler)

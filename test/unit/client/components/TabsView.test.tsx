@@ -133,7 +133,7 @@ describe('TabsView', () => {
     expect(tabs.some((t) => t.title === 'remote open')).toBe(true)
   })
 
-  it('rehydrates remote agent-chat panes with selection strategies', () => {
+  it('rehydrates remote agent-chat panes with selection strategies and preserves restore-unavailable for legacy raw resume ids', () => {
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -196,11 +196,11 @@ describe('TabsView', () => {
       kind: 'agent-chat',
       provider: 'freshclaude',
       resumeSessionId: undefined,
-      sessionRef: {
-        provider: 'claude',
-        sessionId: '00000000-0000-4000-8000-000000000444',
-        serverInstanceId: 'srv-remote',
+      restoreError: {
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'invalid_legacy_restore_target',
       },
+      serverInstanceId: 'srv-remote',
       modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
       permissionMode: 'plan',
       effort: 'turbo',
