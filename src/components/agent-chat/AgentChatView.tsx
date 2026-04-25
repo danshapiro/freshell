@@ -95,7 +95,7 @@ interface AgentChatViewProps {
 
 export default function AgentChatView({ tabId, paneId, paneContent, hidden }: AgentChatViewProps) {
   const dispatch = useAppDispatch()
-  const ws = getWsClient()
+  const ws = useMemo(() => getWsClient(), [])
   const isMobile = useMobile()
   const keyboardInsetPx = useKeyboardInset()
   const providerConfig = getAgentChatProviderConfig(paneContent.provider)
