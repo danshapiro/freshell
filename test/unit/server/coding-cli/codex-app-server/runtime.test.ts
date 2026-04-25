@@ -109,6 +109,28 @@ describe('CodexAppServerRuntime', () => {
     }
   })
 
+  it('disables Codex apps while starting Freshell-managed app-server processes', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-runtime-args-'))
+    const argLogPath = path.join(tempDir, 'argv.json')
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_ARG_LOG: argLogPath,
+      },
+    })
+
+    try {
+      await runtime.ensureReady()
+      const args = JSON.parse(await fsp.readFile(argLogPath, 'utf8')) as string[]
+
+      expect(args).toContain('-c')
+      expect(args).toContain('features.apps=false')
+      expect(args.indexOf('features.apps=false')).toBeLessThan(args.indexOf('app-server'))
+      expect(args).toContain('--listen')
+    } finally {
+      await fsp.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   it('keeps separate runtime instances isolated for concurrent codex terminals', async () => {
     const firstRuntime = createRuntime()
     const secondRuntime = createRuntime()

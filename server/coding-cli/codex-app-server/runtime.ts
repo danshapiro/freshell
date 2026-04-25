@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { convertWindowsPathToWslPath, isWslEnvironment, sanitizeUserPathInput } from '../../path-utils.js'
+import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../codex-managed-config.js'
 import { CodexAppServerClient } from './client.js'
 import type {
   CodexFsWatchResult,
@@ -171,6 +172,7 @@ export class CodexAppServerRuntime {
       const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
       const child = spawn(this.command, [
         ...this.commandArgs,
+        ...CODEX_MANAGED_REMOTE_CONFIG_ARGS,
         'app-server',
         '--listen',
         wsUrl,

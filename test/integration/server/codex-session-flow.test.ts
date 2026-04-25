@@ -437,6 +437,7 @@ describe('Codex Session Flow Integration', () => {
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
+      expect(recordedArgs).toContain('features.apps=false')
       expect(recordedArgs).not.toContain('resume')
       expect(recordedArgs).not.toContain('thread-new-1')
       expect(recordedArgs).toContain('tui.notification_method=bel')

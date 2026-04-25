@@ -12,6 +12,7 @@ import type { ServerSettings } from '../shared/settings.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { LoopbackServerEndpoint } from './local-port.js'
+import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 import type {
@@ -219,7 +220,7 @@ function resolveCodingCliCommand(
     if (parsed.protocol !== 'ws:' || parsed.hostname !== '127.0.0.1') {
       throw new Error('Codex launch requires a loopback app-server websocket URL.')
     }
-    remoteArgs.push('--remote', wsUrl)
+    remoteArgs.push('--remote', wsUrl, ...CODEX_MANAGED_REMOTE_CONFIG_ARGS)
   }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
