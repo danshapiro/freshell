@@ -4,11 +4,6 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { WebSocketServer } from 'ws'
 
-const argLogPath = process.env.FAKE_CODEX_APP_SERVER_ARG_LOG
-if (argLogPath) {
-  fs.writeFileSync(argLogPath, JSON.stringify(process.argv.slice(2)), 'utf8')
-}
-
 function parseListenUrl(argv) {
   const listenIndex = argv.indexOf('--listen')
   if (listenIndex === -1 || listenIndex === argv.length - 1) {
