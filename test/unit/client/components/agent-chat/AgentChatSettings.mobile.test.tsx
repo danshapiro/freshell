@@ -10,8 +10,6 @@ vi.mock('lucide-react', () => ({
   Settings: (props: any) => <svg data-testid="settings-icon" {...props} />,
 }))
 
-import AgentChatSettings from '@/components/agent-chat/AgentChatSettings'
-
 describe('AgentChatSettings mobile layout', () => {
   const defaults = {
     model: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE,
