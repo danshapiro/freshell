@@ -705,7 +705,6 @@ test.describe('Settings Persistence Split', () => {
       (options) => options.map((option) => option.textContent),
     )
     expect(effortLabels).toEqual(['Model default', 'warp-core', 'plaid'])
-    await expect(effortSelect).toBeDisabled()
     await expect(effortSelect.locator('option:checked')).toHaveText('warp-core')
 
     await expect.poll(async () => {
@@ -721,6 +720,7 @@ test.describe('Settings Persistence Split', () => {
       model: 'opus[1m]',
       effort: 'warp-core',
     })
+    await expect(effortSelect).toBeDisabled()
 
     const configPath = path.join(serverInfo.homeDir, '.freshell', 'config.json')
     const config = JSON.parse(await fs.readFile(configPath, 'utf8'))
