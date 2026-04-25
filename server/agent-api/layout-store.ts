@@ -363,24 +363,45 @@ export class LayoutStore {
     return resolveTarget(target, this.snapshot)
   }
 
-  createTab({ title, terminalId, browser, editor }: { title?: string; terminalId?: string; browser?: string; editor?: string }) {
+  createTab({
+    title,
+    terminalId,
+    browser,
+    editor,
+    tabId,
+    paneId,
+  }: {
+    title?: string
+    terminalId?: string
+    browser?: string
+    editor?: string
+    tabId?: string
+    paneId?: string
+  }) {
     const snapshot = this.ensureSnapshot()
-    const tabId = nanoid()
-    const paneId = nanoid()
+    const resolvedTabId = tabId ?? nanoid()
+    const resolvedPaneId = paneId ?? nanoid()
     const content = this.buildContent({ terminalId, browser, editor })
-    snapshot.tabs.push({ id: tabId, title })
-    snapshot.layouts[tabId] = {
+    snapshot.tabs.push({ id: resolvedTabId, title })
+    snapshot.layouts[resolvedTabId] = {
       type: 'leaf',
-      id: paneId,
+      id: resolvedPaneId,
       content,
     }
-    snapshot.activeTabId = tabId
-    snapshot.activePane[tabId] = paneId
-    this.seedPaneTitle(tabId, paneId, content)
-    return { tabId, paneId }
+    snapshot.activeTabId = resolvedTabId
+    snapshot.activePane[resolvedTabId] = resolvedPaneId
+    this.seedPaneTitle(resolvedTabId, resolvedPaneId, content)
+    return { tabId: resolvedTabId, paneId: resolvedPaneId }
   }
 
-  splitPane(opts: { paneId: string; direction: 'horizontal' | 'vertical'; terminalId?: string; browser?: string; editor?: string }) {
+  splitPane(opts: {
+    paneId: string
+    direction: 'horizontal' | 'vertical'
+    terminalId?: string
+    browser?: string
+    editor?: string
+    newPaneId?: string
+  }) {
     const snapshot = this.ensureSnapshot()
     for (const tab of snapshot.tabs) {
       const root = snapshot.layouts?.[tab.id]
@@ -388,7 +409,7 @@ export class LayoutStore {
       const leaves = this.collectLeaves(root, [])
       if (!leaves.find((leaf) => leaf.id === opts.paneId)) continue
 
-      const newPaneId = nanoid()
+      const newPaneId = opts.newPaneId ?? nanoid()
       const newContent = this.buildContent({ terminalId: opts.terminalId, browser: opts.browser, editor: opts.editor })
       const splitNode = {
         type: 'split',

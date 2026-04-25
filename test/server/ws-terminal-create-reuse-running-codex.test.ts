@@ -493,15 +493,26 @@ describe('terminal.create reuse running codex terminal', () => {
 
       expect(created.terminalId).toBe('term-codex-existing')
       expect(created).not.toHaveProperty('effectiveResumeSessionId')
-      expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+      const planCreate = codexLaunchPlanner.planCreateCalls[0]
+      expect(planCreate).toEqual(expect.objectContaining({
         cwd: '/repo/worktree',
         resumeSessionId: undefined,
         model: undefined,
         sandbox: undefined,
         approvalPolicy: undefined,
-      }])
+        terminalId: expect.any(String),
+        env: expect.objectContaining({
+          FRESHELL: '1',
+          FRESHELL_TERMINAL_ID: expect.any(String),
+          FRESHELL_TOKEN: 'testtoken-testtoken',
+          FRESHELL_URL: 'http://localhost:3001',
+        }),
+      }))
+      expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
       expect(registry.createCalls).toHaveLength(1)
       expect(registry.createCalls[0]).toMatchObject({
+        terminalId: planCreate.terminalId,
         mode: 'codex',
         cwd: '/repo/worktree',
         resumeSessionId: undefined,

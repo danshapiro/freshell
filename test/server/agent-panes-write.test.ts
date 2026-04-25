@@ -31,7 +31,7 @@ it('passes the planned Codex sidecar when splitting a pane in codex mode', async
   app.use(express.json())
   const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
   const attachPaneContent = vi.fn()
-  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   app.use('/api', createAgentApiRouter({
     layoutStore: { splitPane, attachPaneContent },
@@ -42,15 +42,28 @@ it('passes the planned Codex sidecar when splitting a pane in codex mode', async
   const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
 
   expect(res.body.status).toBe('ok')
-  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+  const planCreate = codexLaunchPlanner.planCreateCalls[0]
+  expect(planCreate).toEqual(expect.objectContaining({
     approvalPolicy: undefined,
     cwd: undefined,
     model: undefined,
     resumeSessionId: undefined,
     sandbox: undefined,
-  }])
+    terminalId: expect.any(String),
+    env: expect.objectContaining({
+      FRESHELL: '1',
+      FRESHELL_TAB_ID: 'tab_1',
+      FRESHELL_PANE_ID: 'pane_new',
+      FRESHELL_TERMINAL_ID: expect.any(String),
+      FRESHELL_TOKEN: '',
+      FRESHELL_URL: 'http://localhost:3001',
+    }),
+  }))
+  expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
   expect(registryCreate).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
+    terminalId: planCreate.terminalId,
     codexSidecar: codexLaunchPlanner.sidecar,
     providerSettings: expect.objectContaining({
       codexAppServer: expect.objectContaining({
@@ -100,7 +113,7 @@ it('rejects invalid Codex settings when respawning a pane before spawning', asyn
   const app = express()
   app.use(express.json())
   const attachPaneContent = vi.fn()
-  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   app.use('/api', createAgentApiRouter({
     layoutStore: {
@@ -138,7 +151,7 @@ it('passes the planned Codex sidecar when respawning a pane in codex mode', asyn
   const app = express()
   app.use(express.json())
   const attachPaneContent = vi.fn()
-  const registryCreate = vi.fn(() => ({ terminalId: 'term_new' }))
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
   app.use('/api', createAgentApiRouter({
     layoutStore: {
@@ -152,15 +165,28 @@ it('passes the planned Codex sidecar when respawning a pane in codex mode', asyn
   const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
 
   expect(res.body.status).toBe('ok')
-  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+  const planCreate = codexLaunchPlanner.planCreateCalls[0]
+  expect(planCreate).toEqual(expect.objectContaining({
     approvalPolicy: undefined,
     cwd: undefined,
     model: undefined,
     resumeSessionId: undefined,
     sandbox: undefined,
-  }])
+    terminalId: expect.any(String),
+    env: expect.objectContaining({
+      FRESHELL: '1',
+      FRESHELL_TAB_ID: 'tab_1',
+      FRESHELL_PANE_ID: 'pane_1',
+      FRESHELL_TERMINAL_ID: expect.any(String),
+      FRESHELL_TOKEN: '',
+      FRESHELL_URL: 'http://localhost:3001',
+    }),
+  }))
+  expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
   expect(registryCreate).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
+    terminalId: planCreate.terminalId,
     codexSidecar: codexLaunchPlanner.sidecar,
     providerSettings: expect.objectContaining({
       codexAppServer: expect.objectContaining({
@@ -170,7 +196,7 @@ it('passes the planned Codex sidecar when respawning a pane in codex mode', asyn
   }))
   expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
     kind: 'terminal',
-    terminalId: 'term_new',
+    terminalId: planCreate.terminalId,
     mode: 'codex',
   }))
 })

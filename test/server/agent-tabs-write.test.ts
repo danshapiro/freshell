@@ -5,7 +5,7 @@ import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 class FakeRegistry {
-  create = vi.fn(() => ({ terminalId: 'term_1' }))
+  create = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_1' }))
 }
 
 describe('tab endpoints', () => {
@@ -131,8 +131,12 @@ describe('tab endpoints', () => {
     app.use(express.json())
     const registry = new FakeRegistry()
     const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
+      tabId: input.tabId,
+      paneId: input.paneId,
+    }))
     const layoutStore = {
-      createTab: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      createTab,
       attachPaneContent: vi.fn(),
       selectTab: () => ({}),
       renameTab: () => ({}),
@@ -146,15 +150,28 @@ describe('tab endpoints', () => {
     const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
 
     expect(res.body.status).toBe('ok')
-    expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+    const planCreate = codexLaunchPlanner.planCreateCalls[0]
+    expect(planCreate).toEqual(expect.objectContaining({
       approvalPolicy: undefined,
       cwd: undefined,
       model: undefined,
       resumeSessionId: undefined,
       sandbox: undefined,
-    }])
+      terminalId: expect.any(String),
+      env: expect.objectContaining({
+        FRESHELL: '1',
+        FRESHELL_TERMINAL_ID: expect.any(String),
+        FRESHELL_TOKEN: '',
+        FRESHELL_URL: 'http://localhost:3001',
+      }),
+    }))
+    expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
+    expect(planCreate.env.FRESHELL_TAB_ID).toBe(createTab.mock.calls[0]?.[0]?.tabId)
+    expect(planCreate.env.FRESHELL_PANE_ID).toBe(createTab.mock.calls[0]?.[0]?.paneId)
     expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
       mode: 'codex',
+      terminalId: planCreate.terminalId,
       codexSidecar: codexLaunchPlanner.sidecar,
       providerSettings: expect.objectContaining({
         codexAppServer: expect.objectContaining({

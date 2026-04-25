@@ -307,27 +307,53 @@ export function createAgentApiRouter({
       } else {
         const effectiveMode = mode || 'shell'
         const requestedSessionRef = resolveRequestedSessionRef(effectiveMode, sessionRef)
-        const preallocatedTerminalId = nanoid()
-        const { tabId, paneId } = layoutStore.createTab({
-          title: name,
-          terminalId: preallocatedTerminalId,
-        })
-        rollbackTabId = tabId
-        const launch = await resolveSpawnProviderSettings(
-          effectiveMode,
-          configStore,
-          { permissionMode, model, sandbox },
-          {
-            cwd,
+        const isCodexMode = effectiveMode === 'codex'
+        const preallocatedTerminalId = isCodexMode ? nanoid() : undefined
+        let tabId: string
+        let paneId: string
+        let launch: Awaited<ReturnType<typeof resolveSpawnProviderSettings>>
+        if (isCodexMode) {
+          tabId = nanoid()
+          paneId = nanoid()
+          launch = await resolveSpawnProviderSettings(
+            effectiveMode,
+            configStore,
+            { permissionMode, model, sandbox },
+            {
+              cwd,
+              terminalId: preallocatedTerminalId,
+              envContext: { tabId, paneId },
+              sessionRef: requestedSessionRef,
+              codexLaunchPlanner,
+            },
+          )
+          layoutStore.createTab({
+            title: name,
             terminalId: preallocatedTerminalId,
-            envContext: { tabId, paneId },
-            sessionRef: requestedSessionRef,
-            codexLaunchPlanner,
-          },
-        )
+            tabId,
+            paneId,
+          })
+          rollbackTabId = tabId
+        } else {
+          const created = layoutStore.createTab({ title: name })
+          tabId = created.tabId
+          paneId = created.paneId
+          rollbackTabId = tabId
+          launch = await resolveSpawnProviderSettings(
+            effectiveMode,
+            configStore,
+            { permissionMode, model, sandbox },
+            {
+              cwd,
+              envContext: { tabId, paneId },
+              sessionRef: requestedSessionRef,
+              codexLaunchPlanner,
+            },
+          )
+        }
         const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedSessionRef?.sessionId)
         const terminal = registry.create({
-          terminalId: preallocatedTerminalId,
+          ...(preallocatedTerminalId ? { terminalId: preallocatedTerminalId } : {}),
           mode: effectiveMode,
           shell,
           cwd,
@@ -391,7 +417,7 @@ export function createAgentApiRouter({
       res.json(ok({ tabId, paneId, terminalId }, 'tab created'))
     } catch (err: any) {
       if (rollbackTabId) {
-        layoutStore.closeTab(rollbackTabId)
+        layoutStore.closeTab?.(rollbackTabId)
       }
       const status = agentRouteErrorStatus(err)
       res.status(status).json(fail(err?.message || 'Failed to create tab'))
@@ -679,20 +705,36 @@ export function createAgentApiRouter({
     const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
     let rollbackTabId: string | undefined
     try {
-      const created = layoutStore.createTab?.({ title })
-      const tabId = created?.tabId || nanoid()
-      const paneId = created?.paneId || nanoid()
-      rollbackTabId = created?.tabId
-      const preallocatedTerminalId = nanoid()
-      const launch = await resolveSpawnProviderSettings(mode, configStore, {}, {
-        cwd,
-        terminalId: preallocatedTerminalId,
-        envContext: { tabId, paneId },
-        codexLaunchPlanner,
-      })
+      const isCodexMode = mode === 'codex'
+      const preallocatedTerminalId = isCodexMode ? nanoid() : undefined
+      let tabId: string
+      let paneId: string
+      let launch: Awaited<ReturnType<typeof resolveSpawnProviderSettings>>
+      if (isCodexMode) {
+        tabId = nanoid()
+        paneId = nanoid()
+        launch = await resolveSpawnProviderSettings(mode, configStore, {}, {
+          cwd,
+          terminalId: preallocatedTerminalId,
+          envContext: { tabId, paneId },
+          codexLaunchPlanner,
+        })
+        const created = layoutStore.createTab?.({ title, terminalId: preallocatedTerminalId, tabId, paneId })
+        rollbackTabId = created?.tabId
+      } else {
+        const created = layoutStore.createTab?.({ title })
+        tabId = created?.tabId || nanoid()
+        paneId = created?.paneId || nanoid()
+        rollbackTabId = created?.tabId
+        launch = await resolveSpawnProviderSettings(mode, configStore, {}, {
+          cwd,
+          envContext: { tabId, paneId },
+          codexLaunchPlanner,
+        })
+      }
       const sessionBindingReason = getCodexSessionBindingReason(mode, launch.sessionRef?.sessionId)
       const terminal = registry.create({
-        terminalId: preallocatedTerminalId,
+        ...(preallocatedTerminalId ? { terminalId: preallocatedTerminalId } : {}),
         mode,
         shell,
         cwd,
@@ -731,7 +773,7 @@ export function createAgentApiRouter({
       return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
     } catch (err: any) {
       if (rollbackTabId) {
-        layoutStore.closeTab(rollbackTabId)
+        layoutStore.closeTab?.(rollbackTabId)
       }
       const status = agentRouteErrorStatus(err)
       return res.status(status).json(fail(err?.message || 'Failed to run command'))
