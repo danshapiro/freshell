@@ -3,6 +3,16 @@ import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegi
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import * as fs from 'fs'
 import os from 'os'
+import {
+  CODEX_STARTUP_EXPECTED_REPLIES,
+  CODEX_STARTUP_QUERY_FRAMES,
+} from '../../helpers/codex-startup-probes'
+
+const SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES = [
+  CODEX_STARTUP_EXPECTED_REPLIES[0],
+  CODEX_STARTUP_EXPECTED_REPLIES[1],
+  '\u001b]10;rgb:c9c9/d1d1/d9d9\u001b\\',
+] as const
 
 // Mock fs.existsSync for shell existence checks
 // Need to provide both named export and default export since the implementation uses `import fs from 'fs'`
@@ -2498,6 +2508,41 @@ describe('TerminalRegistry', () => {
 
       expect(createdTerminalId).toBe(term.terminalId)
       expect(registry.get(term.terminalId)?.status).toBe('exited')
+    })
+  })
+
+  describe('pre-attach codex startup probes', () => {
+    it('answers codex startup probes before the first client attaches', async () => {
+      registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+
+      onDataCallback(CODEX_STARTUP_QUERY_FRAMES.join(''))
+
+      expect(mockPty.write.mock.calls.map(([data]: [string]) => data)).toEqual(SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES)
+    })
+
+    it('stops server-side startup probe replies after a client has attached once', async () => {
+      const record = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+      const client = {} as any
+
+      registry.attach(record.terminalId, client)
+      registry.detach(record.terminalId, client)
+      onDataCallback(CODEX_STARTUP_QUERY_FRAMES.join(''))
+
+      expect(mockPty.write).not.toHaveBeenCalled()
     })
   })
 

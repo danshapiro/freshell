@@ -63,16 +63,20 @@ it('allocates and passes an OpenCode control endpoint for /api/run in opencode m
 
 it('uses the shared Codex planner and marks fresh /api/run sessions as starts', async () => {
   const registry = {
-    create: vi.fn(() => ({ terminalId: 'term1' })),
+    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
     input: vi.fn(() => true),
   }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
+    tabId: input.tabId,
+    paneId: input.paneId,
+  }))
 
   const app = express()
   app.use(express.json())
   app.use('/api', createAgentApiRouter({
     layoutStore: {
-      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
+      createTab,
       attachPaneContent: () => {},
     },
     registry,
@@ -82,15 +86,28 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.body.status).toBe('ok')
-  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+  const planCreate = codexLaunchPlanner.planCreateCalls[0]
+  expect(planCreate).toEqual(expect.objectContaining({
     approvalPolicy: undefined,
     cwd: undefined,
     model: undefined,
     resumeSessionId: undefined,
     sandbox: undefined,
-  }])
+    terminalId: expect.any(String),
+    env: expect.objectContaining({
+      FRESHELL: '1',
+      FRESHELL_TERMINAL_ID: expect.any(String),
+      FRESHELL_TOKEN: '',
+      FRESHELL_URL: 'http://localhost:3001',
+    }),
+  }))
+  expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
+  expect(planCreate.env.FRESHELL_TAB_ID).toBe(createTab.mock.calls[0]?.[0]?.tabId)
+  expect(planCreate.env.FRESHELL_PANE_ID).toBe(createTab.mock.calls[0]?.[0]?.paneId)
   expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
+    terminalId: planCreate.terminalId,
     codexSidecar: codexLaunchPlanner.sidecar,
     resumeSessionId: undefined,
     sessionBindingReason: 'start',

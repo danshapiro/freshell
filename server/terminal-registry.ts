@@ -25,6 +25,12 @@ import type {
 import type { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
+import {
+  createTerminalStartupProbeState,
+  extractTerminalStartupProbes,
+  type TerminalStartupProbeColors,
+  type TerminalStartupProbeState,
+} from '../shared/terminal-startup-probes.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
@@ -37,6 +43,11 @@ const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE
 const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
 const perfConfig = getPerfConfig()
+const PREATTACH_CODEX_STARTUP_PROBE_COLORS: TerminalStartupProbeColors = {
+  foreground: '#c9d1d9',
+  background: '#0d1117',
+  cursor: '#c9d1d9',
+}
 
 // TerminalMode is now a wider type -- any string is valid as a mode name.
 // 'shell' is the only built-in; all CLI modes come from registered extensions.
@@ -175,6 +186,23 @@ export type ProviderSettings = {
     wsUrl: string
   }
   opencodeServer?: LoopbackServerEndpoint
+}
+
+export type TerminalEnvContext = { tabId?: string; paneId?: string }
+
+export function buildFreshellTerminalEnv(
+  terminalId: string,
+  envContext?: TerminalEnvContext,
+): Record<string, string> {
+  const port = Number(process.env.PORT || 3001)
+  return {
+    FRESHELL: '1',
+    FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
+    FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+    FRESHELL_TERMINAL_ID: terminalId,
+    ...(envContext?.tabId ? { FRESHELL_TAB_ID: envContext.tabId } : {}),
+    ...(envContext?.paneId ? { FRESHELL_PANE_ID: envContext.paneId } : {}),
+  }
 }
 
 function resolveCodingCliCommand(
@@ -378,6 +406,7 @@ export type TerminalRecord = {
   clients: Set<WebSocket>
   suppressedOutputClients: Set<WebSocket>
   pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
+  preAttachStartupProbeState?: TerminalStartupProbeState
 
   buffer: ChunkRingBuffer
   pty: pty.IPty
@@ -1098,6 +1127,7 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   create(opts: {
+    terminalId?: string
     mode: TerminalMode
     shell?: ShellType
     cwd?: string
@@ -1107,14 +1137,14 @@ export class TerminalRegistry extends EventEmitter {
     sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
     codexSidecar?: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
-    envContext?: { tabId?: string; paneId?: string }
+    envContext?: TerminalEnvContext
   }): TerminalRecord {
     this.reapExitedTerminals()
     if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
     }
 
-    const terminalId = nanoid()
+    const terminalId = opts.terminalId ?? nanoid()
     const createdAt = Date.now()
     const cols = opts.cols || 120
     const rows = opts.rows || 30
@@ -1122,15 +1152,7 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
-    const port = Number(process.env.PORT || 3001)
-    const baseEnv = {
-      FRESHELL: '1',
-      FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
-      FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
-      FRESHELL_TERMINAL_ID: terminalId,
-      ...(opts.envContext?.tabId ? { FRESHELL_TAB_ID: opts.envContext.tabId } : {}),
-      ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
-    }
+    const baseEnv = buildFreshellTerminalEnv(terminalId, opts.envContext)
 
     const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
@@ -1192,6 +1214,7 @@ export class TerminalRegistry extends EventEmitter {
       clients: new Set(),
       suppressedOutputClients: new Set(),
       pendingSnapshotClients: new Map(),
+      preAttachStartupProbeState: opts.mode === 'codex' ? createTerminalStartupProbeState() : undefined,
 
       buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
       pty: ptyProc,
@@ -1213,6 +1236,7 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     ptyProc.onData((data) => {
+      this.handlePreAttachStartupProbes(record, data)
       const now = Date.now()
       record.lastActivityAt = now
       record.buffer.append(data)
@@ -1351,6 +1375,7 @@ export class TerminalRegistry extends EventEmitter {
   attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean; suppressOutput?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
+    term.preAttachStartupProbeState = undefined
     term.clients.add(client)
     if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
     if (opts?.suppressOutput) term.suppressedOutputClients.add(client)
@@ -1401,6 +1426,30 @@ export class TerminalRegistry extends EventEmitter {
       at: now,
     } satisfies TerminalInputRawEvent)
     return true
+  }
+
+  private handlePreAttachStartupProbes(term: TerminalRecord, data: string): void {
+    if (term.mode !== 'codex') return
+    if (term.clients.size > 0) return
+    const state = term.preAttachStartupProbeState
+    if (!state) return
+
+    const { replies } = extractTerminalStartupProbes(data, state, PREATTACH_CODEX_STARTUP_PROBE_COLORS)
+    if (!state.armed && !state.pending) {
+      term.preAttachStartupProbeState = undefined
+    }
+    if (replies.length === 0) {
+      return
+    }
+
+    for (const reply of replies) {
+      try {
+        term.pty.write(reply)
+      } catch (err) {
+        logger.debug({ err, terminalId: term.terminalId }, 'pre-attach codex startup probe reply failed')
+        break
+      }
+    }
   }
 
   resize(terminalId: string, cols: number, rows: number): boolean {

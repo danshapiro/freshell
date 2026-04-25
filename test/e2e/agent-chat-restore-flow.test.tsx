@@ -4,9 +4,10 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
+import { tabFallbackIdentityMiddleware } from '@/store/tabFallbackIdentityMiddleware'
 import type { AgentChatPaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -45,6 +46,7 @@ function makeStore(tabOverrides: Partial<Tab> = {}) {
       settings: settingsReducer,
       tabs: tabsReducer,
     },
+    middleware: (getDefault) => getDefault().concat(tabFallbackIdentityMiddleware),
     preloadedState: {
       tabs: {
         tabs: [
@@ -82,6 +84,18 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
 
   if (!content) return null
   return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+}
+
+function ReactivePaneById({ store, paneId }: { store: ReturnType<typeof makeStore>; paneId: string }) {
+  const content = useSelector((s: ReturnType<typeof store.getState>) => {
+    const root = s.panes.layouts.t1
+    if (!root) return undefined
+    const leaf = findLeaf(root, paneId)
+    return leaf?.content.kind === 'agent-chat' ? leaf.content : undefined
+  })
+
+  if (!content) return null
+  return <AgentChatView tabId="t1" paneId={paneId} paneContent={content} />
 }
 
 describe('agent chat restore flow', () => {
@@ -197,6 +211,104 @@ describe('agent chat restore flow', () => {
         firstUserMessage: 'Continue from the old tab',
       }))
     })
+  })
+
+  it('restores split agent-chat panes without looping shared tab fallback identity updates', async () => {
+    const firstDurableSessionId = '00000000-0000-4000-8000-000000000411'
+    const secondDurableSessionId = '00000000-0000-4000-8000-000000000412'
+    const staleSharedSessionId = '00000000-0000-4000-8000-000000000410'
+    const store = makeStore({
+      sessionRef: {
+        provider: 'claude',
+        sessionId: staleSharedSessionId,
+      },
+    })
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        t1: {
+          type: 'split',
+          id: 'split-root',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            {
+              type: 'leaf',
+              id: 'p1',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-1',
+                sessionId: 'sdk-split-1',
+                status: 'idle',
+              },
+            },
+            {
+              type: 'leaf',
+              id: 'p2',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-2',
+                sessionId: 'sdk-split-2',
+                status: 'idle',
+              },
+            },
+          ],
+        } as PaneNode,
+      },
+      activePane: { t1: 'p1' },
+      paneTitles: {},
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePaneById store={store} paneId="p1" />
+        <ReactivePaneById store={store} paneId="p2" />
+      </Provider>,
+    )
+
+    expect(() => {
+      act(() => {
+        handleSdkMessage(store.dispatch, {
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-split-1',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: firstDurableSessionId,
+          revision: 1,
+        })
+        handleSdkMessage(store.dispatch, {
+          type: 'sdk.session.snapshot',
+          sessionId: 'sdk-split-2',
+          latestTurnId: 'turn-2',
+          status: 'idle',
+          timelineSessionId: secondDurableSessionId,
+          revision: 1,
+        })
+      })
+    }).not.toThrow()
+
+    await waitFor(() => {
+      const root = store.getState().panes.layouts.t1
+      expect(findLeaf(root as PaneNode, 'p1')?.content.kind === 'agent-chat'
+        ? findLeaf(root as PaneNode, 'p1')?.content.sessionRef
+        : undefined).toEqual({
+        provider: 'claude',
+        sessionId: firstDurableSessionId,
+      })
+      expect(findLeaf(root as PaneNode, 'p2')?.content.kind === 'agent-chat'
+        ? findLeaf(root as PaneNode, 'p2')?.content.sessionRef
+        : undefined).toEqual({
+        provider: 'claude',
+        sessionId: secondDurableSessionId,
+      })
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
+      expect(tab?.sessionRef).toBeUndefined()
+    })
+
+    consoleErrorSpy.mockRestore()
   })
 
   it('retries stale-revision restore once, then surfaces a visible failure on the second stale response', async () => {

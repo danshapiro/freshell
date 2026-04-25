@@ -117,6 +117,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const currentTab = useAppSelector((s) => (
     (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
   ))
+  const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const availableModels = useAppSelector((s) => s.agentChat.availableModels)
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
@@ -371,7 +372,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     const identityUpdate = buildAgentChatPersistedIdentityUpdate({
       session,
       paneContent: paneContentRef.current,
-      currentTab,
+      currentTab: tabHasSinglePane ? currentTab : undefined,
       metadataProvider,
     })
     if (!identityUpdate) return
@@ -394,7 +395,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (identityUpdate.shouldFlush) {
       dispatch(flushPersistedLayoutNow())
     }
-  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabId])
+  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabHasSinglePane, tabId])
 
   // Tag this Claude Code session as belonging to this agent-chat provider.
   // Fires once when cliSessionId first becomes available (including resumes).

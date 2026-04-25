@@ -23,6 +23,7 @@ import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
+import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 
 
 const log = createLogger('TabsSlice')
@@ -185,7 +186,10 @@ function loadInitialTabsState(): TabsState {
     }
     log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t: Tab) => t.id), persistedAt ? `(${ageHours}h old)` : '(no timestamp)')
 
-    const mappedTabs = tabsState.tabs.map(migrateTabFields)
+    const mappedTabs = sanitizeTabsAgainstLayouts(
+      tabsState.tabs.map(migrateTabFields),
+      (layout.panes?.layouts || {}) as Record<string, PaneNode | undefined>,
+    )
     const desired = tabsState.activeTabId
     const has = desired && mappedTabs.some((t: Tab) => t.id === desired)
 

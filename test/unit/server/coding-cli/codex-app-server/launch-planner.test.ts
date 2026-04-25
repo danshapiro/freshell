@@ -19,12 +19,26 @@ describe('CodexLaunchPlanner', () => {
 
     const plan = await planner.planCreate({
       cwd: '/repo/worktree',
+      terminalId: 'term-codex-1',
+      env: {
+        FRESHELL_TERMINAL_ID: 'term-codex-1',
+      },
       model: 'codex-default',
       sandbox: 'workspace-write',
     })
 
     expect(createSidecarWithInput).toHaveBeenCalledWith({
       cwd: '/repo/worktree',
+      terminalId: 'term-codex-1',
+      env: {
+        FRESHELL_TERMINAL_ID: 'term-codex-1',
+      },
+      commandArgs: [
+        '-c',
+        expect.stringMatching(/^mcp_servers\.freshell\.command=/),
+        '-c',
+        expect.stringMatching(/^mcp_servers\.freshell\.args=\[/),
+      ],
       model: 'codex-default',
       sandbox: 'workspace-write',
     })
@@ -40,6 +54,10 @@ describe('CodexLaunchPlanner', () => {
 
     const plan = await planner.planCreate({
       cwd: '/repo/worktree',
+      terminalId: 'term-codex-restore',
+      env: {
+        FRESHELL_TERMINAL_ID: 'term-codex-restore',
+      },
       resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef112',
     })
 
@@ -59,7 +77,13 @@ describe('CodexLaunchPlanner', () => {
     }
     const planner = new CodexLaunchPlanner(() => sidecar as any)
 
-    const plan = await planner.planCreate({ cwd: '/repo/worktree' })
+    const plan = await planner.planCreate({
+      cwd: '/repo/worktree',
+      terminalId: 'term-codex-handoff',
+      env: {
+        FRESHELL_TERMINAL_ID: 'term-codex-handoff',
+      },
+    })
 
     expect(plan).toEqual({
       remote: {

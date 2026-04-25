@@ -288,6 +288,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
@@ -1480,6 +1481,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     tabRef.current = tab
   }, [tab])
+  const tabHasSinglePaneRef = useRef(tabHasSinglePane)
+  useEffect(() => {
+    tabHasSinglePaneRef.current = tabHasSinglePane
+  }, [tabHasSinglePane])
 
   // Ref for paneId to avoid stale closures in title handlers
   const paneIdRef = useRef(paneId)
@@ -2146,7 +2151,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             oldResumeSessionId: contentRef.current?.resumeSessionId,
             sessionRef,
           })
-          const currentTab = tabRef.current
+          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
           const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
             provider: sessionRef.provider,
             sessionId: sessionRef.sessionId,

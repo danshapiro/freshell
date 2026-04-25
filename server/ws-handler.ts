@@ -1,12 +1,13 @@
 import type http from 'http'
 import { randomUUID } from 'crypto'
+import { nanoid } from 'nanoid'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
-import { modeSupportsResume } from './terminal-registry.js'
-import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
+import { buildFreshellTerminalEnv, modeSupportsResume } from './terminal-registry.js'
+import type { TerminalEnvContext, TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
@@ -679,12 +680,16 @@ export class WsHandler {
     cwd: string | undefined,
     resumeSessionId: string | undefined,
     providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
   ) {
     if (!this.codexLaunchPlanner) {
       throw new Error('Codex terminal launch requires the per-terminal app-server sidecar planner.')
     }
     return this.codexLaunchPlanner.planCreate({
       cwd,
+      terminalId,
+      env: buildFreshellTerminalEnv(terminalId, envContext),
       resumeSessionId,
       model: providerSettings?.model,
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
@@ -1742,9 +1747,17 @@ export class WsHandler {
                 ? canonicalSessionId
                 : undefined
               let codexPlan: Awaited<ReturnType<WsHandler['planCodexLaunch']>> | undefined
+              const preallocatedTerminalId = nanoid()
+              const terminalEnvContext = { tabId: m.tabId, paneId: m.paneId }
               try {
                 codexPlan = m.mode === 'codex'
-                  ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
+                  ? await this.planCodexLaunch(
+                    m.cwd,
+                    requestedCodexResumeSessionId,
+                    providerSettings,
+                    preallocatedTerminalId,
+                    terminalEnvContext,
+                  )
                   : undefined
 
                 const spawnProviderSettings = (
@@ -1768,6 +1781,7 @@ export class WsHandler {
                 )
 
                 const record = this.registry.create({
+                  terminalId: preallocatedTerminalId,
                   mode: m.mode as TerminalMode,
                   shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                   cwd: m.cwd,
@@ -1777,7 +1791,7 @@ export class WsHandler {
                         sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
                       }
                     : {}),
-                  envContext: { tabId: m.tabId, paneId: m.paneId },
+                  envContext: terminalEnvContext,
                   providerSettings: spawnProviderSettings,
                   ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
                 })

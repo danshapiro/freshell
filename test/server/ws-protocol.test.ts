@@ -493,13 +493,24 @@ describe('ws protocol', () => {
     )
 
     expect(registry.createCalls).toHaveLength(1)
-    expect(codexLaunchPlanner.planCreateCalls).toEqual([{
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+    const planCreate = codexLaunchPlanner.planCreateCalls[0]
+    expect(planCreate).toEqual(expect.objectContaining({
       approvalPolicy: undefined,
       cwd: undefined,
       model: 'gpt-5-codex',
       resumeSessionId: undefined,
       sandbox: 'workspace-write',
-    }])
+      terminalId: expect.any(String),
+      env: expect.objectContaining({
+        FRESHELL: '1',
+        FRESHELL_TERMINAL_ID: expect.any(String),
+        FRESHELL_TOKEN: 'testtoken-testtoken',
+        FRESHELL_URL: 'http://localhost:3001',
+      }),
+    }))
+    expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
+    expect(registry.createCalls[0]?.terminalId).toBe(planCreate.terminalId)
     expect(registry.createCalls[0]?.resumeSessionId).toBeUndefined()
     expect(registry.createCalls[0]?.providerSettings).toEqual({
       codexAppServer: {

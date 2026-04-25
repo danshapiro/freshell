@@ -301,10 +301,12 @@ describe('Codex Session Flow Integration', () => {
   let tempDir: string
   let fakeCodexPath: string
   let argLogPath: string
+  let appServerArgLogPath: string
   let remoteThreadLogPath: string
   let codexHomePath: string
   let previousCodexCmd: string | undefined
   let previousFakeCodexArgLog: string | undefined
+  let previousFakeCodexAppServerArgLog: string | undefined
   let previousFakeCodexRemoteBehavior: string | undefined
   let previousCodexHome: string | undefined
   let server: http.Server
@@ -317,25 +319,29 @@ describe('Codex Session Flow Integration', () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-flow-'))
     fakeCodexPath = path.join(tempDir, 'fake-codex')
     argLogPath = path.join(tempDir, 'args.json')
+    appServerArgLogPath = path.join(tempDir, 'app-server-args.json')
     remoteThreadLogPath = path.join(tempDir, 'remote-thread.txt')
     codexHomePath = path.join(tempDir, '.codex-home')
     await writeFakeCodexExecutable(fakeCodexPath)
 
     previousCodexCmd = process.env.CODEX_CMD
     previousFakeCodexArgLog = process.env.FAKE_CODEX_ARG_LOG
+    previousFakeCodexAppServerArgLog = process.env.FAKE_CODEX_APP_SERVER_ARG_LOG
     previousFakeCodexRemoteBehavior = process.env.FAKE_CODEX_REMOTE_BEHAVIOR
     previousCodexHome = process.env.CODEX_HOME
     process.env.CODEX_CMD = fakeCodexPath
     process.env.FAKE_CODEX_ARG_LOG = argLogPath
+    process.env.FAKE_CODEX_APP_SERVER_ARG_LOG = appServerArgLogPath
     process.env.CODEX_HOME = codexHomePath
 
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    planner = new CodexLaunchPlanner(() => new CodexTerminalSidecar({
+    planner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
       runtime: new CodexAppServerRuntime({
         command: process.execPath,
-        commandArgs: [FAKE_APP_SERVER_PATH],
+        commandArgs: [FAKE_APP_SERVER_PATH, ...input.commandArgs],
+        env: input.env,
       }),
     }))
     wsHandler = new WsHandler(server, registry, { codexLaunchPlanner: planner })
@@ -367,6 +373,7 @@ describe('Codex Session Flow Integration', () => {
       },
     })
     await fsp.rm(argLogPath, { force: true })
+    await fsp.rm(appServerArgLogPath, { force: true })
     await fsp.rm(remoteThreadLogPath, { force: true })
   })
 
@@ -380,6 +387,11 @@ describe('Codex Session Flow Integration', () => {
       delete process.env.FAKE_CODEX_ARG_LOG
     } else {
       process.env.FAKE_CODEX_ARG_LOG = previousFakeCodexArgLog
+    }
+    if (previousFakeCodexAppServerArgLog === undefined) {
+      delete process.env.FAKE_CODEX_APP_SERVER_ARG_LOG
+    } else {
+      process.env.FAKE_CODEX_APP_SERVER_ARG_LOG = previousFakeCodexAppServerArgLog
     }
     if (previousFakeCodexRemoteBehavior === undefined) {
       delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
@@ -442,6 +454,17 @@ describe('Codex Session Flow Integration', () => {
       expect(recordedArgs).toContain('tui.notification_method=bel')
       expect(recordedArgs).not.toContain('--model')
       expect(recordedArgs).not.toContain('--sandbox')
+
+      await waitForFile(appServerArgLogPath)
+      const appServerLaunch = JSON.parse(await fsp.readFile(appServerArgLogPath, 'utf8'))
+      expect(appServerLaunch.argv).toContain('app-server')
+      expect(appServerLaunch.argv).toContain('mcp_servers.freshell.command="node"')
+      expect(appServerLaunch.argv.some((arg: string) => arg.startsWith('mcp_servers.freshell.args=['))).toBe(true)
+      expect(appServerLaunch.argv.indexOf('mcp_servers.freshell.command="node"')).toBeLessThan(
+        appServerLaunch.argv.indexOf('app-server'),
+      )
+      expect(appServerLaunch.env.FRESHELL_TERMINAL_ID).toBe(created.terminalId)
+      expect(appServerLaunch.env.FRESHELL_TOKEN).toBe('test-token')
     } finally {
       await closeWebSocket(ws)
     }
