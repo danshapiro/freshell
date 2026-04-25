@@ -4,9 +4,6 @@ import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
-const expectedFreshellToken = process.env.AUTH_TOKEN || ''
-const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
-
 it('runs a command and returns captured output', async () => {
   let buffer = ''
   const registry = {
@@ -65,7 +62,6 @@ it('allocates and passes an OpenCode control endpoint for /api/run in opencode m
 })
 
 it('uses the shared Codex planner and marks fresh /api/run sessions as starts', async () => {
-  const createTab = vi.fn(() => ({ tabId: 't1', paneId: 'p1' }))
   const registry = {
     create: vi.fn(() => ({ terminalId: 'term1' })),
     input: vi.fn(() => true),
@@ -76,7 +72,7 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
   app.use(express.json())
   app.use('/api', createAgentApiRouter({
     layoutStore: {
-      createTab,
+      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
       attachPaneContent: () => {},
     },
     registry,
@@ -86,25 +82,13 @@ it('uses the shared Codex planner and marks fresh /api/run sessions as starts', 
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.body.status).toBe('ok')
-  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
-  const planCreate = codexLaunchPlanner.planCreateCalls[0]
-  expect(planCreate).toEqual(expect.objectContaining({
+  expect(codexLaunchPlanner.planCreateCalls).toEqual([{
     approvalPolicy: undefined,
     cwd: undefined,
     model: undefined,
     resumeSessionId: undefined,
     sandbox: undefined,
-    terminalId: expect.any(String),
-    env: expect.objectContaining({
-      FRESHELL: '1',
-      FRESHELL_TERMINAL_ID: expect.any(String),
-      FRESHELL_TOKEN: expectedFreshellToken,
-      FRESHELL_URL: expectedFreshellUrl,
-    }),
-  }))
-  expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
-  expect(planCreate.env.FRESHELL_TAB_ID).toBe(createTab.mock.calls[0]?.[0]?.tabId)
-  expect(planCreate.env.FRESHELL_PANE_ID).toBe(createTab.mock.calls[0]?.[0]?.paneId)
+  }])
   expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
     mode: 'codex',
     resumeSessionId: 'thread-new-1',
