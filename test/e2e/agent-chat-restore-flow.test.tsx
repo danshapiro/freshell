@@ -315,6 +315,56 @@ describe('agent chat restore flow', () => {
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
   })
 
+  it('surfaces restore-unavailable instead of recreating a live-only FreshClaude session after INVALID_SESSION_ID', async () => {
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-live-only',
+      sessionId: 'sdk-live-only',
+      status: 'idle',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsHarness.send).toHaveBeenCalledWith({
+        type: 'sdk.attach',
+        sessionId: 'sdk-live-only',
+      })
+    })
+
+    wsHarness.send.mockClear()
+
+    act(() => {
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.error',
+        sessionId: 'sdk-live-only',
+        code: 'INVALID_SESSION_ID',
+        message: 'Live SDK session not found',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().agentChat.sessions['sdk-live-only']).toMatchObject({
+        restoreFailureCode: 'RESTORE_UNAVAILABLE',
+        restoreFailureMessage: expect.any(String),
+        historyLoaded: true,
+      })
+    })
+
+    expect(wsHarness.send.mock.calls.some(([msg]) => msg?.type === 'sdk.create')).toBe(false)
+  })
   it('reconnect after sdk.create but before sdk.created resends the same request and binds one session without a retry loop', async () => {
     const store = makeStore()
     const pane = {

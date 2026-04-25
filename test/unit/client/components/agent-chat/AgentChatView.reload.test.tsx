@@ -474,6 +474,48 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(getPaneContent(store, 't1', 'p1')?.effort).toBeUndefined()
   })
 
+  it('passes named resume tokens through sdk.create and keeps the session in restore mode until it upgrades', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-named-resume',
+      status: 'creating',
+      resumeSessionId: 'named-resume',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-named-resume',
+        model: 'opus',
+        resumeSessionId: 'named-resume',
+      }))
+    })
+
+    expect(store.getState().agentChat.pendingCreates['req-named-resume']).toEqual({
+      sessionId: undefined,
+      expectsHistoryHydration: true,
+    })
+  })
+
   it('blocks create when an exact unavailable selection cannot be launched safely', async () => {
     getAgentChatCapabilities.mockResolvedValue({
       ok: true,

@@ -516,6 +516,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         return
       }
 
+      // Create-time resume accepts either the canonical durable Claude id or a
+      // live/named resume token. We persist only canonical ids for reload/attach
+      // flows, but named resumes still need to launch a restoring session that can
+      // later upgrade in place once the canonical timeline id is known.
+      const createResumeSessionId = (
+        currentPane.sessionRef?.provider === 'claude'
+        && isValidClaudeSessionId(currentPane.sessionRef.sessionId)
+      )
+        ? currentPane.sessionRef.sessionId
+        : (typeof currentPane.resumeSessionId === 'string' && currentPane.resumeSessionId.trim().length > 0
+          ? currentPane.resumeSessionId
+          : undefined)
       const resolvedSelection = resolveAgentChatModelSelection({
         providerDefaultModelId,
         capabilities,
@@ -558,7 +570,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       dispatch(registerPendingCreate({
         requestId,
-        expectsHistoryHydration: Boolean(currentPane.resumeSessionId),
+        expectsHistoryHydration: Boolean(createResumeSessionId),
       }))
       ws.send({
         type: 'sdk.create',
@@ -567,7 +579,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         permissionMode: currentPane.permissionMode ?? defaultPermissionMode,
         ...(resolvedEffort ? { effort: resolvedEffort } : {}),
         ...(currentPane.initialCwd ? { cwd: currentPane.initialCwd } : {}),
-        ...(currentPane.resumeSessionId ? { resumeSessionId: currentPane.resumeSessionId } : {}),
+        ...(createResumeSessionId ? { resumeSessionId: createResumeSessionId } : {}),
         ...(currentPane.plugins ? { plugins: currentPane.plugins } : {}),
       })
 
