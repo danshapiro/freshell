@@ -69,12 +69,17 @@ function isAgentChatBusy(
 
 function resolveTerminalSessionKey(
   content: TerminalPaneContent,
+  fallbackSessionRef?: Tab['sessionRef'],
   fallbackSessionId?: string,
   fallbackMode?: Tab['mode'],
 ): string | undefined {
   const explicit = content.sessionRef
   if (explicit?.provider && explicit.sessionId) {
     return `${explicit.provider}:${explicit.sessionId}`
+  }
+
+  if (fallbackSessionRef?.provider && fallbackSessionRef.sessionId) {
+    return `${fallbackSessionRef.provider}:${fallbackSessionRef.sessionId}`
   }
 
   const provider = content.mode !== 'shell' ? content.mode : fallbackMode
@@ -95,6 +100,7 @@ function buildSyntheticTerminalContent(tab: Tab): TerminalPaneContent | null {
     status: tab.status,
     mode: tab.mode,
     shell: tab.shell,
+    sessionRef: tab.sessionRef,
     resumeSessionId: tab.resumeSessionId,
     initialCwd: tab.initialCwd,
   }
@@ -234,7 +240,7 @@ export function collectBusySessionKeys(input: {
       }).isBusy
       if (!busy) continue
 
-      const sessionKey = resolveTerminalSessionKey(syntheticContent, tab.resumeSessionId, tab.mode)
+      const sessionKey = resolveTerminalSessionKey(syntheticContent, tab.sessionRef, tab.resumeSessionId, tab.mode)
       if (sessionKey) busySessionKeys.add(sessionKey)
       continue
     }
@@ -261,7 +267,7 @@ export function collectBusySessionKeys(input: {
             : undefined,
         )
         : entry.content.kind === 'terminal'
-          ? resolveTerminalSessionKey(entry.content, tab.resumeSessionId, tab.mode)
+          ? resolveTerminalSessionKey(entry.content, tab.sessionRef, tab.resumeSessionId, tab.mode)
           : undefined
       if (sessionKey) busySessionKeys.add(sessionKey)
     }

@@ -40,11 +40,17 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
 }
 
 class FakeRegistry {
+  private terminals: any[] = []
+
   detach() {
     return true
   }
   list() {
-    return []
+    return [...this.terminals]
+  }
+
+  setTerminals(terminals: any[]) {
+    this.terminals = [...terminals]
   }
 }
 
@@ -142,6 +148,7 @@ describe('ws handshake snapshot', () => {
   let server: http.Server | undefined
   let port: number
   let snapshot: Snapshot
+  let registry: FakeRegistry
   let originalNodeEnv: string | undefined
   let originalAuthToken: string | undefined
   let originalHelloTimeoutMs: string | undefined
@@ -185,7 +192,9 @@ describe('ws handshake snapshot', () => {
       res.end()
     })
 
-    new (WsHandler as any)(server, new FakeRegistry() as any, {
+    registry = new FakeRegistry()
+
+    new (WsHandler as any)(server, registry as any, {
       handshakeSnapshotProvider: async () => snapshot,
     })
 
@@ -313,6 +322,18 @@ describe('ws handshake snapshot', () => {
   })
 
   it('sends terminal inventory in handshake snapshot', async () => {
+    registry.setTerminals([
+      {
+        terminalId: 'term-inventory-1',
+        title: 'Claude CLI',
+        mode: 'claude',
+        resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+        createdAt: 1,
+        lastActivityAt: 2,
+        status: 'running',
+      },
+    ])
+
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -326,6 +347,94 @@ describe('ws handshake snapshot', () => {
       expect(inventory).toHaveProperty('bootId')
       expect(Array.isArray(inventory.terminals)).toBe(true)
       expect(Array.isArray(inventory.terminalMeta)).toBe(true)
+      expect(inventory.terminals).toContainEqual(expect.objectContaining({
+        terminalId: 'term-inventory-1',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: '550e8400-e29b-41d4-a716-446655440000',
+        },
+      }))
+      expect(inventory.terminals[0]).not.toHaveProperty('resumeSessionId')
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
+  it('keeps inventory lifetime status separate from runtime recovery status', async () => {
+    registry.setTerminals([
+      {
+        terminalId: 'term-runtime-running',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef112',
+        createdAt: 10,
+        lastActivityAt: 20,
+        status: 'running',
+        runtimeStatus: 'running',
+      },
+      {
+        terminalId: 'term-runtime-recovering',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef113',
+        createdAt: 11,
+        lastActivityAt: 21,
+        status: 'running',
+        runtimeStatus: 'recovering',
+      },
+      {
+        terminalId: 'term-runtime-failed',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef114',
+        createdAt: 12,
+        lastActivityAt: 22,
+        status: 'running',
+        runtimeStatus: 'recovery_failed',
+      },
+      {
+        terminalId: 'term-runtime-exited',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef115',
+        createdAt: 13,
+        lastActivityAt: 23,
+        status: 'exited',
+      },
+    ])
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const inventoryPromise = waitForMessage(ws, (m) => m.type === 'terminal.inventory', 10_000)
+      await waitForReady(ws, 10_000)
+
+      const inventory = await inventoryPromise
+      const byId = new Map(inventory.terminals.map((terminal: any) => [terminal.terminalId, terminal]))
+      expect(byId.get('term-runtime-running')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'running',
+      })
+      expect(byId.get('term-runtime-recovering')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'recovering',
+      })
+      expect(byId.get('term-runtime-failed')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'recovery_failed',
+      })
+      expect(byId.get('term-runtime-exited')).toMatchObject({
+        status: 'exited',
+      })
+      expect(byId.get('term-runtime-exited')).not.toHaveProperty('runtimeStatus')
+      expect(inventory.terminals.map((terminal: any) => terminal.status)).toEqual([
+        'running',
+        'running',
+        'running',
+        'exited',
+      ])
     } finally {
       await closeWs(ws)
     }

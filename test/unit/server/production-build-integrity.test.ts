@@ -1,20 +1,27 @@
 import { beforeAll, describe, expect, it } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import express from 'express'
 import fs from 'fs'
 import path from 'path'
 import request from 'supertest'
 import { registerStaticClientRoutes } from '../../../server/static-client-routes.js'
 
+const repoRoot = path.resolve(__dirname, '../../..')
 const distClientDir = path.resolve(__dirname, '../../../dist/client')
-const hasBuild = fs.existsSync(path.join(distClientDir, 'index.html'))
 
-describe.skipIf(!hasBuild)('production build integrity', () => {
+describe('production build integrity', () => {
   let indexHtml: string
   let mainJsUrl: string | null = null
   let mainJsContent = ''
   let app: express.Express
 
   beforeAll(() => {
+    if (!fs.existsSync(path.join(distClientDir, 'index.html'))) {
+      execFileSync('npm', ['run', 'build:client'], {
+        cwd: repoRoot,
+        stdio: 'pipe',
+      })
+    }
     indexHtml = fs.readFileSync(path.join(distClientDir, 'index.html'), 'utf8')
     const scriptMatch = indexHtml.match(/src="(\/assets\/index-[A-Za-z0-9_-]+\.js)"/)
     if (scriptMatch) mainJsUrl = scriptMatch[1]

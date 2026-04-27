@@ -3596,11 +3596,11 @@ describe('WS Handler SDK Integration', () => {
           type: 'sdk.create',
           requestId: 'req-effort',
           cwd: '/tmp',
-          effort: 'max',
+          effort: 'turbo',
         }, 'sdk.created')
 
         expect(mockSdkBridge.createSession).toHaveBeenCalledWith(
-          expect.objectContaining({ effort: 'max' }),
+          expect.objectContaining({ effort: 'turbo' }),
         )
       } finally {
         ws.close()
@@ -3620,11 +3620,11 @@ describe('WS Handler SDK Integration', () => {
         ws.send(JSON.stringify({
           type: 'sdk.set-model',
           sessionId: 'sdk-sess-1',
-          model: 'claude-sonnet-4-5-20250929',
+          model: 'opus[1m]',
         }))
 
         await vi.waitFor(
-          () => expect(mockSdkBridge.setModel).toHaveBeenCalledWith('sdk-sess-1', 'claude-sonnet-4-5-20250929'),
+          () => expect(mockSdkBridge.setModel).toHaveBeenCalledWith('sdk-sess-1', 'opus[1m]'),
           { timeout: 3000 },
         )
       } finally {

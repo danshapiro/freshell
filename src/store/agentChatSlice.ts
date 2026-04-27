@@ -1,6 +1,7 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
+  AgentChatProviderCapabilitiesState,
   AgentChatState,
   AgentTimelineItem,
   AgentTimelineTurn,
@@ -21,7 +22,7 @@ const initialState: AgentChatState = {
   sessions: {},
   pendingCreates: {},
   pendingCreateFailures: {},
-  availableModels: [],
+  capabilitiesByProvider: {},
 }
 
 /** Create a default empty session if one doesn't already exist. */
@@ -47,8 +48,7 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
 
 function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'timelineSessionId'>): string | undefined {
   return (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
-    ?? session.timelineSessionId
-    ?? session.cliSessionId
+    ?? (isValidClaudeSessionId(session.timelineSessionId) ? session.timelineSessionId : undefined)
 }
 
 function isRestoreFailureCode(code?: string): code is string {
@@ -100,6 +100,18 @@ function requestRestoreHydrationRestart(session: ChatSessionState): void {
   session.restoreHydrationRequestId = (session.restoreHydrationRequestId ?? 0) + 1
 }
 
+function ensureCapabilitiesState(
+  state: AgentChatState,
+  provider: string,
+): AgentChatProviderCapabilitiesState {
+  if (!state.capabilitiesByProvider[provider]) {
+    state.capabilitiesByProvider[provider] = {
+      status: 'idle',
+    }
+  }
+  return state.capabilitiesByProvider[provider]
+}
+
 const agentChatSlice = createSlice({
   name: 'agentChat',
   initialState,
@@ -145,7 +157,7 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      if (action.payload.cliSessionId) {
+      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
         session.awaitingDurableHistory = false
       }
       if (session.status === 'creating' || session.status === 'starting') {
@@ -202,9 +214,12 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       const previousRestoreQueryId = getRestoreQueryId(session)
+      const nextTimelineSessionId = isValidClaudeSessionId(action.payload.timelineSessionId)
+        ? action.payload.timelineSessionId
+        : undefined
       const nextRestoreQueryId = getRestoreQueryId({
         cliSessionId: session.cliSessionId,
-        timelineSessionId: action.payload.timelineSessionId ?? session.timelineSessionId,
+        timelineSessionId: nextTimelineSessionId ?? session.timelineSessionId,
       })
       const shouldRestartHydration = Boolean(
         session.historyLoaded
@@ -224,7 +239,7 @@ const agentChatSlice = createSlice({
 
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
-      session.timelineSessionId = action.payload.timelineSessionId
+      session.timelineSessionId = nextTimelineSessionId
       session.timelineRevision = action.payload.revision
       session.streamingActive = action.payload.streamingActive ?? false
       session.streamingText = action.payload.streamingText ?? ''
@@ -232,7 +247,7 @@ const agentChatSlice = createSlice({
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
-        const hasDurableHistoryIdentity = isValidClaudeSessionId(session.timelineSessionId)
+        const hasDurableHistoryIdentity = isValidClaudeSessionId(nextTimelineSessionId)
           || isValidClaudeSessionId(session.cliSessionId)
         if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
           session.historyLoaded = true
@@ -490,10 +505,30 @@ const agentChatSlice = createSlice({
       delete state.sessions[action.payload.sessionId]
     },
 
-    setAvailableModels(state, action: PayloadAction<{
-      models: Array<{ value: string; displayName: string; description: string }>
+    capabilityFetchStarted(state, action: PayloadAction<{ provider: string }>) {
+      const providerState = ensureCapabilitiesState(state, action.payload.provider)
+      providerState.status = 'loading'
+      providerState.error = undefined
+    },
+
+    capabilityFetchSucceeded(state, action: PayloadAction<{
+      provider: string
+      capabilities: AgentChatProviderCapabilitiesState['capabilities']
     }>) {
-      state.availableModels = action.payload.models
+      state.capabilitiesByProvider[action.payload.provider] = {
+        status: 'succeeded',
+        capabilities: action.payload.capabilities,
+        error: undefined,
+      }
+    },
+
+    capabilityFetchFailed(state, action: PayloadAction<{
+      provider: string
+      error: NonNullable<AgentChatProviderCapabilitiesState['error']>
+    }>) {
+      const providerState = ensureCapabilitiesState(state, action.payload.provider)
+      providerState.status = 'failed'
+      providerState.error = action.payload.error
     },
   },
 })
@@ -527,7 +562,9 @@ export const {
   clearPendingCreateFailure,
   clearPendingCreate,
   removeSession,
-  setAvailableModels,
+  capabilityFetchStarted,
+  capabilityFetchSucceeded,
+  capabilityFetchFailed,
 } = agentChatSlice.actions
 
 export default agentChatSlice.reducer

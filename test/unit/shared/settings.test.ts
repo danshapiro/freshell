@@ -25,6 +25,56 @@ describe('shared settings contract', () => {
     })
   })
 
+  it('accepts tracked and exact agent-chat model selections with dynamic effort strings', () => {
+    const parsed = buildServerSettingsPatchSchema().parse({
+      agentChat: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            effort: 'ultra',
+          },
+          kilroy: {
+            modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+            defaultPermissionMode: 'plan',
+          },
+        },
+      },
+    })
+
+    expect(parsed.agentChat?.providers?.freshclaude).toEqual({
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+      effort: 'ultra',
+    })
+    expect(parsed.agentChat?.providers?.kilroy).toEqual({
+      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+      defaultPermissionMode: 'plan',
+    })
+  })
+
+  it('accepts empty effort clear sentinels while allowing omitted model selections', () => {
+    const schema = buildServerSettingsPatchSchema()
+
+    expect(schema.safeParse({
+      agentChat: {
+        providers: {
+          freshclaude: {
+            defaultPermissionMode: 'plan',
+            effort: 'ultra',
+          },
+        },
+      },
+    }).success).toBe(true)
+    expect(schema.safeParse({
+      agentChat: {
+        providers: {
+          freshclaude: {
+            effort: '',
+          },
+        },
+      },
+    }).success).toBe(true)
+  })
+
   it('rejects representative local-only fields in the server patch schema', () => {
     const schema = buildServerSettingsPatchSchema()
 
@@ -73,6 +123,24 @@ describe('shared settings contract', () => {
     })
 
     expect(merged.agentChat.defaultPlugins).toEqual(['/custom/plugins/local-tools'])
+  })
+
+  it('migrates legacy defaultModel/defaultEffort values into exact selections and explicit effort overrides', () => {
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      agentChat: {
+        providers: {
+          freshclaude: {
+            defaultModel: 'claude-opus-4-6',
+            defaultEffort: 'high',
+          } as any,
+        },
+      },
+    })
+
+    expect(merged.agentChat.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+      effort: 'high',
+    })
   })
 
   it('mergeServerSettings preserves runtime CLI providers outside the built-in defaults', () => {

@@ -30,6 +30,15 @@ const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
+function sameSessionRef(
+  a?: BackgroundTerminal['sessionRef'],
+  b?: BackgroundTerminal['sessionRef'],
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.provider === b.provider && a.sessionId === b.sessionId
+}
+
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores terminal `lastActivityAt` since it changes frequently but doesn't affect rendering. */
 export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
@@ -44,7 +53,7 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
       ai.status !== bi.status ||
       ai.hasClients !== bi.hasClients ||
       ai.mode !== bi.mode ||
-      ai.resumeSessionId !== bi.resumeSessionId
+      !sameSessionRef(ai.sessionRef, bi.sessionRef)
     ) return false
   }
   return true

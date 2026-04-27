@@ -7,18 +7,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
-
-type BackgroundTerminal = {
-  terminalId: string
-  title: string
-  createdAt: number
-  lastActivityAt: number
-  cwd?: string
-  status: 'running' | 'exited'
-  hasClients: boolean
-  mode?: string
-  resumeSessionId?: string
-}
+import type { BackgroundTerminal } from '@/store/types'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
@@ -101,8 +90,23 @@ export default function BackgroundSessions() {
                     onClick={() => {
                       const tabId = nanoid()
                       const mode = ((t.mode as any) || 'shell') as string
-                      dispatch(addTab({ id: tabId, title: t.title, status: 'running', mode: mode as any, resumeSessionId: t.resumeSessionId }))
-                      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: mode as any, terminalId: t.terminalId, status: 'running', resumeSessionId: t.resumeSessionId } }))
+                      dispatch(addTab({
+                        id: tabId,
+                        title: t.title,
+                        status: 'running',
+                        mode: mode as any,
+                        sessionRef: t.sessionRef,
+                      }))
+                      dispatch(initLayout({
+                        tabId,
+                        content: {
+                          kind: 'terminal',
+                          mode: mode as any,
+                          terminalId: t.terminalId,
+                          status: 'running',
+                          sessionRef: t.sessionRef,
+                        },
+                      }))
                     }}
                   >
                     Attach

@@ -277,14 +277,65 @@ describe('hydrateTabs merge', () => {
 
     expect(result.tabs[0]).toEqual(expect.objectContaining({
       title: 'Renamed elsewhere',
-      resumeSessionId: canonicalSessionId,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      },
     }))
     expect(result.tabs[0].sessionMetadataByKey).toEqual(expect.objectContaining({
       [sessionMetadataKey('claude', canonicalSessionId)]: expect.objectContaining({
         sessionType: 'freshclaude',
       }),
     }))
+    expect((result.tabs[0] as any).resumeSessionId).toBeUndefined()
     expect(result.tabs[0].sessionMetadataByKey).not.toHaveProperty(sessionMetadataKey('claude', 'named-resume'))
+  })
+
+  it('preserves canonical tab sessionRef when newer remote state only carries a raw legacy resume string', () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000654'
+    const localTab = makeTab({
+      id: 'tab-1',
+      title: 'Local durable tab',
+      mode: 'shell',
+      codingCliProvider: 'claude',
+      updatedAt: 100,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      },
+    } as any)
+    const remoteTab = makeTab({
+      id: 'tab-1',
+      title: 'Remote renamed tab',
+      mode: 'shell',
+      updatedAt: 200,
+      resumeSessionId: 'named-resume',
+    })
+
+    const result = tabsReducer(
+      makeState([localTab], 'tab-1'),
+      {
+        ...hydrateTabs({
+          tabs: [remoteTab],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+          tombstones: [],
+        }),
+        meta: {
+          localLayoutPersistedAt: 200,
+          remoteLayoutPersistedAt: 250,
+        },
+      } as any,
+    )
+
+    expect(result.tabs[0]).toEqual(expect.objectContaining({
+      title: 'Remote renamed tab',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      },
+    }))
+    expect((result.tabs[0] as any).resumeSessionId).toBeUndefined()
   })
 })
 

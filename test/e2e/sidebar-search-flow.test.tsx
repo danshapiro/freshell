@@ -309,6 +309,10 @@ describe('sidebar search flow (e2e)', () => {
         title: 'Open Matching Tab',
         mode: 'codex',
         resumeSessionId: matchingFallbackSessionId,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: matchingFallbackSessionId,
+        },
         createdAt: 1_000,
       }],
       panes: {
@@ -322,6 +326,10 @@ describe('sidebar search flow (e2e)', () => {
               status: 'running',
               createRequestId: 'req-fallback',
               resumeSessionId: matchingFallbackSessionId,
+              sessionRef: {
+                provider: 'codex',
+                sessionId: matchingFallbackSessionId,
+              },
               initialCwd: '/tmp/code/trycycle',
             },
           },

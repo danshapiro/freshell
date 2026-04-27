@@ -83,6 +83,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         mode: msg.payload.mode,
         shell: msg.payload.shell,
         initialCwd: msg.payload.initialCwd,
+        sessionRef: msg.payload.sessionRef,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
       }))
@@ -99,6 +100,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
             status: msg.payload.status || 'running',
             shell: msg.payload.shell,
             initialCwd: msg.payload.initialCwd,
+            sessionRef: msg.payload.sessionRef,
             resumeSessionId: msg.payload.resumeSessionId,
           },
         }))

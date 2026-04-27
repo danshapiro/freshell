@@ -742,6 +742,45 @@ describe('version 5 migration (drop claude-chat panes)', () => {
     const result = loadPersistedPanes()
     expect(result!.layouts.tab1.content.kind).toBe('terminal')
   })
+
+  it('migrates legacy agent-chat model and effort fields into selection strategies', () => {
+    localStorage.setItem('freshell.layout.v3', JSON.stringify({
+      version: 3,
+      tabs: { tabs: [{ id: 'tab1', title: 'Tab 1' }], activeTabId: 'tab1' },
+      panes: {
+        version: 6,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'agent-chat',
+              provider: 'freshclaude',
+              createRequestId: 'req1',
+              status: 'idle',
+              model: 'claude-opus-4-6',
+              effort: 'high',
+            },
+          },
+        },
+        activePane: { tab1: 'pane1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    const persisted = loadPersistedPanes()
+    const content = (persisted!.layouts.tab1 as any).content
+
+    expect(persisted!.version).toBe(PANES_SCHEMA_VERSION)
+    expect(content.model).toBeUndefined()
+    expect(content.modelSelection).toEqual({
+      kind: 'exact',
+      modelId: 'claude-opus-4-6',
+    })
+    expect(content.effort).toBe('high')
+  })
 })
 
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '../../../../src/store/storage-keys'

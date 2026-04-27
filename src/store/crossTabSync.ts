@@ -65,7 +65,6 @@ function findLeafContentById(node: unknown, paneId: string): any | undefined {
 function buildCanonicalClaudeSessionRef(localContent: any, localResumeSessionId: string): {
   provider: 'claude'
   sessionId: string
-  serverInstanceId?: string
 } | undefined {
   const explicit = localContent?.sessionRef
   if (
@@ -77,7 +76,6 @@ function buildCanonicalClaudeSessionRef(localContent: any, localResumeSessionId:
     return {
       provider: 'claude',
       sessionId: localResumeSessionId,
-      ...(typeof explicit.serverInstanceId === 'string' ? { serverInstanceId: explicit.serverInstanceId } : {}),
     }
   }
 

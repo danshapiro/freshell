@@ -1,6 +1,13 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { AgentChatModelSelection } from '@shared/agent-chat-capabilities'
 
 export type AgentChatProviderName = 'freshclaude' | 'kilroy'
+
+export type AgentChatProviderSettings = {
+  modelSelection?: AgentChatModelSelection
+  defaultPermissionMode?: string
+  effort?: string
+}
 
 export interface AgentChatProviderConfig {
   /** Unique identifier for this agent chat provider */
@@ -11,12 +18,10 @@ export interface AgentChatProviderConfig {
   codingCliProvider: CodingCliProviderName
   /** React component for the pane icon */
   icon: React.ComponentType<{ className?: string }>
-  /** Default model ID */
-  defaultModel: string
+  /** Stable provider-default track alias used when no selection is stored */
+  providerDefaultModelId: string
   /** Default permission mode */
   defaultPermissionMode: string
-  /** Default effort level */
-  defaultEffort: 'low' | 'medium' | 'high' | 'max'
   /** Which settings are visible in the settings popover */
   settingsVisibility: {
     model: boolean

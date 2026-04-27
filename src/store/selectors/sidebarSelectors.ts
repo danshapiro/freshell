@@ -2,7 +2,7 @@ import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/session-utils'
+import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
@@ -74,8 +74,8 @@ export function buildSessionItems(
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
-    if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
-      const sessionKey = `${terminal.mode}:${terminal.resumeSessionId}`
+    if (terminal.status === 'running' && terminal.sessionRef) {
+      const sessionKey = `${terminal.sessionRef.provider}:${terminal.sessionRef.sessionId}`
       const existing = runningSessionMap.get(sessionKey)
       if (existing) {
         existing.allTerminalIds.push(terminal.terminalId)
@@ -220,12 +220,12 @@ export function buildSessionItems(
     const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
 
     if (node.content.kind === 'agent-chat') {
-      const sessionId = node.content.resumeSessionId
-      if (!sessionId || !isValidClaudeSessionId(sessionId)) return
-      const metadata = getSessionMetadata(tab, 'claude', sessionId)
+      const sessionRef = node.content.sessionRef
+      if (sessionRef?.provider !== 'claude' || !isValidClaudeSessionId(sessionRef.sessionId)) return
+      const metadata = getSessionMetadata(tab, 'claude', sessionRef.sessionId)
       pushFallbackItem({
         provider: 'claude',
-        sessionId,
+        sessionId: sessionRef.sessionId,
         sessionType: node.content.provider || 'claude',
         title: paneTitle || tab.title,
         cwd: undefined,
@@ -236,13 +236,15 @@ export function buildSessionItems(
     }
 
     if (node.content.kind !== 'terminal') return
-    if (node.content.mode === 'shell' || !node.content.resumeSessionId) return
+    if (node.content.mode === 'shell') return
+    const sessionRef = node.content.sessionRef
+    if (!sessionRef) return
 
-    const metadata = getSessionMetadata(tab, node.content.mode, node.content.resumeSessionId)
+    const metadata = getSessionMetadata(tab, sessionRef.provider, sessionRef.sessionId)
     pushFallbackItem({
-      provider: node.content.mode,
-      sessionId: node.content.resumeSessionId,
-      sessionType: node.content.mode,
+      provider: sessionRef.provider,
+      sessionId: sessionRef.sessionId,
+      sessionType: sessionRef.provider,
       title: paneTitle || tab.title,
       cwd: node.content.initialCwd,
       timestamp: fallbackTimestamp,
@@ -253,15 +255,12 @@ export function buildSessionItems(
   for (const tab of tabs || []) {
     const layout = panes.layouts?.[tab.id]
     if (layout) {
-      const refs = collectSessionRefsFromNode(layout)
-      if (refs.length > 0) {
-        collectFallbackItemsFromNode(layout, tab)
-      }
+      collectFallbackItemsFromNode(layout, tab)
       continue
     }
 
-    const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-    const sessionId = tab.resumeSessionId
+    const provider = tab.sessionRef?.provider
+    const sessionId = tab.sessionRef?.sessionId
     if (!provider || !sessionId) continue
 
     const metadata = getSessionMetadata(tab, provider, sessionId)

@@ -8,6 +8,7 @@ import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
+import { buildRestoreError } from '@shared/session-contract'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -69,7 +70,7 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
     vi.useRealTimers()
   })
 
-  it('recovers immediately when session is marked as lost (INVALID_SESSION_ID)', async () => {
+  it('does not restart from a mutable named resume token when session is marked as lost', async () => {
     const store = makeStore()
     const pane: AgentChatPaneContent = {
       kind: 'agent-chat', provider: 'freshclaude',
@@ -109,10 +110,8 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
       store.dispatch(markSessionLost({ sessionId: 'dead-session-id' }))
     })
 
-    // Should recover IMMEDIATELY — clear the dead sessionId and begin creating
-    // a new SDK session, without waiting for the 5-second timeout.
-    // The recovery goes through a useEffect chain (markSessionLost → re-render →
-    // sessionLost effect → triggerRecovery dispatch → re-render → sdk.create effect).
+    // The dead live SDK session should be cleared, but the client must not
+    // restart from a mutable named resume token once no canonical durable id exists.
     await waitFor(() => {
       const content = getPaneContent(store, 't1', 'p1')
       expect(content).toBeDefined()
@@ -120,20 +119,19 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
     })
 
     const content = getPaneContent(store, 't1', 'p1')!
-    // Status will be 'starting' because the sdk.create effect fires immediately
-    // after recovery sets status to 'creating', transitioning to 'starting'
-    expect(content.status).toBe('starting')
-    // resumeSessionId should be preserved so the new session resumes the CLI session
+    expect(content.status).toBe('idle')
+    expect(content.restoreError).toEqual(buildRestoreError('dead_live_handle'))
+    // The pane may still carry the original mutable name for display, but it
+    // must not be used as a restore target.
     expect(content.resumeSessionId).toBe('cli-session-to-resume')
-    // Should have sent sdk.create with the resumeSessionId
     const createCalls = wsSend.mock.calls.filter(
       (c: any[]) => c[0]?.type === 'sdk.create',
     )
-    expect(createCalls).toHaveLength(1)
-    expect(createCalls[0][0].resumeSessionId).toBe('cli-session-to-resume')
+    expect(createCalls).toHaveLength(0)
   })
 
   it('recovers with timelineSessionId from sdk.session.snapshot even when the session is marked lost before sdk.session.init', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000211'
     let resolveTimelinePage: ((value: {
       sessionId: string
       items: Array<Record<string, unknown>>
@@ -177,7 +175,7 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
         sessionId: 'sdk-stale-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-session-abc-123',
+        timelineSessionId: canonicalSessionId,
         revision: 2,
       }))
       store.dispatch(markSessionLost({ sessionId: 'sdk-stale-1' }))
@@ -185,7 +183,7 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-session-abc-123',
+        canonicalSessionId,
         expect.objectContaining({ priority: 'visible', revision: 2, includeBodies: true }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
@@ -195,11 +193,11 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
 
     await act(async () => {
       resolveTimelinePage?.({
-        sessionId: 'cli-session-abc-123',
+        sessionId: canonicalSessionId,
         items: [
           {
             turnId: 'turn-2',
-            sessionId: 'cli-session-abc-123',
+            sessionId: canonicalSessionId,
             role: 'assistant',
             summary: 'Recovered answer',
             timestamp: '2026-03-10T10:00:20.000Z',
@@ -209,7 +207,7 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
         revision: 2,
         bodies: {
           'turn-2': {
-            sessionId: 'cli-session-abc-123',
+            sessionId: canonicalSessionId,
             turnId: 'turn-2',
             message: {
               role: 'assistant',
@@ -224,7 +222,7 @@ describe('AgentChatView — immediate recovery when session is lost', () => {
 
     await waitFor(() => {
       const createCalls = wsSend.mock.calls.filter((call: any[]) => call[0]?.type === 'sdk.create')
-      expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe('cli-session-abc-123')
+      expect(createCalls.at(-1)?.[0]?.resumeSessionId).toBe(canonicalSessionId)
     })
   })
 })

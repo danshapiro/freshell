@@ -538,6 +538,113 @@ describe('TerminalView lifecycle updates', () => {
     expect(layout.content.status).toBe('running')
   })
 
+  it('keeps the terminal id when recoverable terminal.status messages arrive', async () => {
+    const tabId = 'tab-status'
+    const paneId = 'pane-status'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-status',
+      terminalId: 'term-status',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(persistMiddleware),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-status',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+        turnCompletion: { terminalStates: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'recovering',
+        reason: 'codex_worker_failure',
+      })
+    })
+
+    let layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('recovering')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'running',
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('running')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'recovery_failed',
+        reason: 'retry_exhausted',
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('recovery_failed')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.exit',
+        terminalId: 'term-status',
+        exitCode: 0,
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBeUndefined()
+    expect(layout.content.status).toBe('exited')
+  })
+
   it('focuses the remembered active pane terminal when tab becomes active', async () => {
     const paneA: TerminalPaneContent = {
       kind: 'terminal',
@@ -1707,7 +1814,7 @@ describe('TerminalView lifecycle updates', () => {
     }))
   })
 
-  it('recreates terminal once after INVALID_TERMINAL_ID for the current terminal', async () => {
+  it('recreates terminal once after INVALID_TERMINAL_ID when canonical durable identity exists', async () => {
     const tabId = 'tab-3'
     const paneId = 'pane-3'
 
@@ -1718,6 +1825,10 @@ describe('TerminalView lifecycle updates', () => {
       mode: 'claude',
       shell: 'system',
       terminalId: 'term-3',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
       initialCwd: '/tmp',
     }
 
@@ -1804,7 +1915,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(createCalls).toHaveLength(1)
   })
 
-  it('always marks INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {
+  it('marks durable INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {
     // consumeTerminalRestoreRequestId returns false by default (non-restore terminal)
     // This is the common case: terminals created fresh, not from localStorage restore
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
@@ -1815,9 +1926,13 @@ describe('TerminalView lifecycle updates', () => {
       kind: 'terminal',
       createRequestId: 'req-reconnect-restore',
       status: 'running',
-      mode: 'shell',
+      mode: 'claude',
       shell: 'system',
       terminalId: 'term-reconnect-restore',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440000',
+      },
       initialCwd: '/tmp',
     }
 
@@ -1834,9 +1949,9 @@ describe('TerminalView lifecycle updates', () => {
         tabs: {
           tabs: [{
             id: tabId,
-            mode: 'shell',
+            mode: 'claude',
             status: 'running',
-            title: 'Shell',
+            title: 'Claude',
             titleSetByUser: false,
             terminalId: 'term-reconnect-restore',
             createRequestId: 'req-reconnect-restore',
@@ -2334,7 +2449,7 @@ describe('TerminalView lifecycle updates', () => {
     expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 
-  it('mirrors resumeSessionId to tab on terminal.session.associated', async () => {
+  it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'
 
@@ -2402,24 +2517,139 @@ describe('TerminalView lifecycle updates', () => {
     messageHandler!({
       type: 'terminal.session.associated',
       terminalId: 'term-assoc',
-      sessionId,
+      sessionRef: {
+        provider: 'claude',
+        sessionId,
+      },
     })
 
-    // Verify pane content has resumeSessionId + sessionRef
+    // Verify pane content keeps only the canonical sessionRef
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-    expect(layout.content.resumeSessionId).toBe(sessionId)
+    expect(layout.content.resumeSessionId).toBeUndefined()
     expect(layout.content.sessionRef).toEqual({
       provider: 'claude',
       sessionId,
-      serverInstanceId: 'srv-local',
     })
 
-    // Verify tab also has resumeSessionId mirrored
+    // Verify tab also keeps only the canonical sessionRef
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-    expect(tab?.resumeSessionId).toBe(sessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId,
+    })
   })
 
-  it('persists the durable codex session id immediately on terminal.created', async () => {
+  it('keeps canonical durable identity scoped to the pane when the tab has multiple panes', async () => {
+    const tabId = 'tab-session-assoc-split'
+    const paneId = 'pane-session-assoc-split'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-assoc-split',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const siblingPaneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-assoc-sibling',
+      status: 'creating',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = {
+      type: 'split',
+      id: 'split-root',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: paneId, content: paneContent },
+        { type: 'leaf', id: 'pane-session-assoc-sibling', content: siblingPaneContent },
+      ],
+    }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude Split',
+            titleSetByUser: false,
+            createRequestId: 'req-assoc-split',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.created',
+      requestId: 'req-assoc-split',
+      terminalId: 'term-assoc-split',
+      createdAt: Date.now(),
+    })
+
+    const sessionId = '550e8400-e29b-41d4-a716-446655440099'
+    messageHandler!({
+      type: 'terminal.session.associated',
+      terminalId: 'term-assoc-split',
+      sessionRef: {
+        provider: 'claude',
+        sessionId,
+      },
+    })
+
+    const layout = store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'split' }>
+    const primaryPane = layout.children[0]
+    expect(primaryPane.type).toBe('leaf')
+    if (primaryPane.type !== 'leaf') {
+      throw new Error('Expected primary split child to be a leaf pane')
+    }
+    expect(primaryPane.content.kind).toBe('terminal')
+    if (primaryPane.content.kind !== 'terminal') {
+      throw new Error('Expected primary split child to be a terminal pane')
+    }
+    expect(primaryPane.content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId,
+    })
+
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+    expect(tab?.sessionRef).toBeUndefined()
+    expect(tab?.resumeSessionId).toBeUndefined()
+  })
+
+  it('persists canonical codex identity only after terminal.session.associated', async () => {
     const tabId = 'tab-codex-durable'
     const paneId = 'pane-codex-durable'
 
@@ -2475,30 +2705,63 @@ describe('TerminalView lifecycle updates', () => {
       expect(messageHandler).not.toBeNull()
     })
 
-    const sessionId = 'thread-new-1'
     messageHandler!({
       type: 'terminal.created',
       requestId: 'req-codex-durable',
       terminalId: 'term-codex-durable',
       createdAt: 123,
-      effectiveResumeSessionId: sessionId,
     })
 
     await waitFor(() => {
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-      expect(layout.content.resumeSessionId).toBe(sessionId)
+      expect(layout.content.resumeSessionId).toBeUndefined()
 
       const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
-      expect(tab?.resumeSessionId).toBe(sessionId)
+      expect(tab?.resumeSessionId).toBeUndefined()
+      expect(dispatchSpy.mock.calls.some(([action]) => action?.type === flushPersistedLayoutNow.type)).toBe(false)
+
+      const persisted = readPersistedLayoutSnapshotForTest()
+      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.resumeSessionId).toBeUndefined()
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBeUndefined()
+    })
+
+    const sessionId = 'codex-session-1'
+    messageHandler!({
+      type: 'terminal.session.associated',
+      terminalId: 'term-codex-durable',
+      sessionRef: {
+        provider: 'codex',
+        sessionId,
+      },
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+      expect(layout.content.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+      expect(tab?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
       expect(dispatchSpy.mock.calls.some(([action]) => action?.type === flushPersistedLayoutNow.type)).toBe(true)
 
       const persisted = readPersistedLayoutSnapshotForTest()
-      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.resumeSessionId).toBe(sessionId)
-      expect((persisted?.panes.layouts[tabId] as any)?.content?.resumeSessionId).toBe(sessionId)
+      expect(persisted?.tabs.tabs.find((entry) => entry.id === tabId)?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
+      expect((persisted?.panes.layouts[tabId] as any)?.content?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId,
+      })
     })
   })
 
-  it('clears tab terminalId and sets status to creating on INVALID_TERMINAL_ID reconnect', async () => {
+  it('surfaces restore-unavailable for a live-only INVALID_TERMINAL_ID reconnect', async () => {
     const tabId = 'tab-clear-tid'
     const paneId = 'pane-clear-tid'
 
@@ -2567,14 +2830,18 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.content.terminalId).toBeUndefined()
     })
 
-    // Verify tab status was set to 'creating'
+    // Verify tab status was set to an explicit restore failure
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-    expect(tab?.status).toBe('creating')
+    expect(tab?.status).toBe('error')
 
     // Verify pane content was also updated
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBeUndefined()
-    expect(layout.content.status).toBe('creating')
+    expect(layout.content.status).toBe('error')
+    expect(layout.content.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'dead_live_handle',
+    })
   })
 
   describe('non-blocking reconnect', () => {

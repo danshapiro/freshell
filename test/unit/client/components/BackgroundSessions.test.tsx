@@ -51,7 +51,10 @@ describe('BackgroundSessions', () => {
           terminalId: 'term-codex-1',
           title: 'Codex',
           mode: 'codex',
-          resumeSessionId: 'codex-sess-abc',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-sess-abc',
+          },
           createdAt: Date.now() - 60000,
           lastActivityAt: Date.now() - 30000,
           status: 'running',
@@ -80,7 +83,10 @@ describe('BackgroundSessions', () => {
     const tabs = store.getState().tabs.tabs
     expect(tabs).toHaveLength(1)
     expect(tabs[0].mode).toBe('codex')
-    expect(tabs[0].resumeSessionId).toBe('codex-sess-abc')
+    expect(tabs[0].sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'codex-sess-abc',
+    })
     // terminalId is in pane content, not on the tab
     const layout = store.getState().panes.layouts[tabs[0].id]
     expect(layout).toBeDefined()
@@ -89,6 +95,10 @@ describe('BackgroundSessions', () => {
       expect(layout.content.kind).toBe('terminal')
       if (layout.content.kind === 'terminal') {
         expect(layout.content.terminalId).toBe('term-codex-1')
+        expect(layout.content.sessionRef).toEqual({
+          provider: 'codex',
+          sessionId: 'codex-sess-abc',
+        })
       }
     }
   })

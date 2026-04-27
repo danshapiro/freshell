@@ -1,4 +1,4 @@
-import type { PaneNode } from './paneTypes'
+import { isAgentChatModelSelection, normalizeAgentChatEffortOverride, type PaneNode } from './paneTypes'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -6,6 +6,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === 'string'
+}
+
+function isSessionRefShape(value: unknown): boolean {
+  if (value === undefined) return true
+  return !!value
+    && typeof value === 'object'
+    && typeof (value as any).provider === 'string'
+    && typeof (value as any).sessionId === 'string'
+    && !('serverInstanceId' in (value as Record<string, unknown>))
+}
+
+function isRestoreErrorShape(value: unknown): boolean {
+  if (value === undefined) return true
+  return !!value
+    && typeof value === 'object'
+    && (value as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (value as any).reason === 'string'
 }
 
 function isPaneContentShape(content: unknown): boolean {
@@ -21,6 +38,8 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.terminalId)
         && isOptionalString(content.shell)
         && isOptionalString(content.resumeSessionId)
+        && isSessionRefShape(content.sessionRef)
+        && isRestoreErrorShape(content.restoreError)
         && isOptionalString(content.initialCwd)
     case 'browser':
       return typeof content.browserInstanceId === 'string'
@@ -40,14 +59,12 @@ function isPaneContentShape(content: unknown): boolean {
         && typeof content.status === 'string'
         && isOptionalString(content.sessionId)
         && isOptionalString(content.resumeSessionId)
+        && isSessionRefShape(content.sessionRef)
+        && isRestoreErrorShape(content.restoreError)
         && isOptionalString(content.initialCwd)
-        && isOptionalString(content.model)
+        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
         && isOptionalString(content.permissionMode)
-        && (content.effort === undefined
-          || content.effort === 'low'
-          || content.effort === 'medium'
-          || content.effort === 'high'
-          || content.effort === 'max')
+        && (content.effort === undefined || normalizeAgentChatEffortOverride(content.effort) !== undefined)
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')

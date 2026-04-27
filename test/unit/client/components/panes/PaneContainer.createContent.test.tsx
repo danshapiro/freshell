@@ -316,9 +316,9 @@ describe('createContentForType with ext: prefix', () => {
           defaultPlugins: ['planner', 'sandbox'],
           providers: {
             freshclaude: {
-              defaultModel: 'claude-sonnet-4-6',
+              modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
               defaultPermissionMode: 'default',
-              defaultEffort: 'medium',
+              effort: 'turbo',
             },
           },
         },
@@ -353,9 +353,9 @@ describe('createContentForType with ext: prefix', () => {
       if (paneContent.kind === 'agent-chat') {
         expect(paneContent.provider).toBe('freshclaude')
         expect(paneContent.plugins).toEqual(['planner', 'sandbox'])
-        expect(paneContent.model).toBe('claude-sonnet-4-6')
+        expect(paneContent.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
         expect(paneContent.permissionMode).toBe('default')
-        expect(paneContent.effort).toBe('medium')
+        expect(paneContent.effort).toBe('turbo')
       }
     })
   })

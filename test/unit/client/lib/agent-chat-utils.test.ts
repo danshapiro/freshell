@@ -27,9 +27,9 @@ describe('agent-chat-utils', () => {
     const config = getAgentChatProviderConfig('freshclaude')
     expect(config).toBeDefined()
     expect(config!.label).toBe('Freshclaude')
-    expect(config!.defaultModel).toBe('claude-opus-4-6')
+    expect(config!.providerDefaultModelId).toBe('opus')
     expect(config!.defaultPermissionMode).toBe('bypassPermissions')
-    expect(config!.defaultEffort).toBe('high')
+    expect('defaultEffort' in config!).toBe(false)
   })
 
   it('returns undefined for unknown provider', () => {
@@ -54,9 +54,9 @@ describe('agent-chat-utils', () => {
     expect(config!.name).toBe('kilroy')
     expect(config!.label).toBe('Kilroy')
     expect(config!.codingCliProvider).toBe('claude')
-    expect(config!.defaultModel).toBe('claude-opus-4-6')
+    expect(config!.providerDefaultModelId).toBe('opus')
     expect(config!.defaultPermissionMode).toBe('bypassPermissions')
-    expect(config!.defaultEffort).toBe('high')
+    expect('defaultEffort' in config!).toBe(false)
     expect(config!.pickerShortcut).not.toBe('A') // must differ from freshclaude
   })
 

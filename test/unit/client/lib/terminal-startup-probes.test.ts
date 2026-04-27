@@ -5,6 +5,12 @@ import {
   extractTerminalStartupProbes,
 } from '@/lib/terminal-startup-probes'
 import {
+  CODEX_STARTUP_EXPECTED_CLEANED_FRAMES,
+  CODEX_STARTUP_EXPECTED_REPLIES,
+  CODEX_STARTUP_QUERY_FRAMES,
+  CODEX_STARTUP_TITLE_FRAME,
+} from '@test/helpers/codex-startup-probes'
+import {
   OPEN_CODE_STARTUP_EXPECTED_CLEANED,
   OPEN_CODE_STARTUP_EXPECTED_REPLIES,
   OPEN_CODE_STARTUP_POST_REPLY_FRAMES,
@@ -77,6 +83,16 @@ describe('terminal-startup-probes', () => {
     expect(result.replies).toEqual([])
   })
 
+  it('passes a standalone cursor-position query through unchanged until the Codex startup prefix is matched', () => {
+    const state = createTerminalStartupProbeState()
+    const input = '\u001b[6n'
+
+    const result = extractTerminalStartupProbes(input, state, COLORS)
+
+    expect(result.cleaned).toBe(input)
+    expect(result.replies).toEqual([])
+  })
+
   it('passes OSC 11 queries through unchanged when they are embedded in ordinary output', () => {
     const state = createTerminalStartupProbeState()
     const input = `before${OPEN_CODE_STARTUP_PROBE_FRAME}after`
@@ -97,5 +113,33 @@ describe('terminal-startup-probes', () => {
     const second = extractTerminalStartupProbes('\u0007after', state, COLORS)
     expect(second.cleaned).toBe('\u001b]0;Window title\u0007after')
     expect(second.replies).toEqual([])
+  })
+
+  it('extracts the captured Codex startup queries and preserves the non-query control prefix', () => {
+    const state = createTerminalStartupProbeState()
+
+    const cleaned = CODEX_STARTUP_QUERY_FRAMES.map((frame, index) => {
+      const result = extractTerminalStartupProbes(frame, state, COLORS)
+      expect(result.replies).toEqual([CODEX_STARTUP_EXPECTED_REPLIES[index]])
+      return result.cleaned
+    }).join('')
+
+    expect(cleaned).toBe(CODEX_STARTUP_EXPECTED_CLEANED_FRAMES.join(''))
+  })
+
+  it('keeps later title updates intact while the Codex startup prefix is still armed', () => {
+    const state = createTerminalStartupProbeState()
+
+    const first = extractTerminalStartupProbes(CODEX_STARTUP_QUERY_FRAMES[0], state, COLORS)
+    expect(first.cleaned).toBe(CODEX_STARTUP_EXPECTED_CLEANED_FRAMES[0])
+    expect(first.replies).toEqual([CODEX_STARTUP_EXPECTED_REPLIES[0]])
+
+    const title = extractTerminalStartupProbes(CODEX_STARTUP_TITLE_FRAME, state, COLORS)
+    expect(title.cleaned).toBe(CODEX_STARTUP_TITLE_FRAME)
+    expect(title.replies).toEqual([])
+
+    const second = extractTerminalStartupProbes(CODEX_STARTUP_QUERY_FRAMES[1], state, COLORS)
+    expect(second.cleaned).toBe(CODEX_STARTUP_EXPECTED_CLEANED_FRAMES[1])
+    expect(second.replies).toEqual([CODEX_STARTUP_EXPECTED_REPLIES[1]])
   })
 })

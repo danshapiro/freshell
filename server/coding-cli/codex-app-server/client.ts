@@ -1,13 +1,21 @@
 import WebSocket from 'ws'
 import {
+  CodexFsChangedNotificationSchema,
+  CodexFsUnwatchParamsSchema,
+  CodexFsWatchParamsSchema,
+  CodexFsWatchResultSchema,
   CodexInitializeParamsSchema,
   CodexInitializeResultSchema,
   CodexRpcErrorEnvelopeSchema,
   CodexRpcNotificationEnvelopeSchema,
   CodexRpcSuccessEnvelopeSchema,
+  CodexThreadLifecycleNotificationSchema,
+  CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
   type CodexInitializeResult,
   type CodexRpcError,
+  type CodexThreadHandle,
+  type CodexThreadOperationResult,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
 } from './protocol.js'
@@ -29,6 +37,31 @@ type PendingRequest = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
 
+export type CodexThreadLifecycleEvent = {
+  kind: 'thread_started'
+  thread: CodexThreadHandle
+} | {
+  kind: 'thread_closed'
+  threadId: string
+} | {
+  kind: 'thread_status_changed'
+  threadId: string
+  status: { type: string } & Record<string, unknown>
+}
+
+export type CodexAppServerDisconnectEvent = {
+  reason: 'close' | 'error'
+  error?: Error
+}
+
+function normalizeThread(thread: CodexThreadHandle): CodexThreadHandle {
+  return {
+    ...thread,
+    path: thread.path ?? null,
+    ephemeral: thread.ephemeral ?? false,
+  }
+}
+
 export class CodexAppServerClient {
   private readonly requestTimeoutMs: number
   private socket: WebSocket | null = null
@@ -36,6 +69,10 @@ export class CodexAppServerClient {
   private initializePromise: Promise<CodexInitializeResult> | null = null
   private nextRequestId = 1
   private pendingRequests = new Map<number, PendingRequest>()
+  private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
+  private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
+  private readonly disconnectHandlers = new Set<(event: CodexAppServerDisconnectEvent) => void>()
+  private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
 
   constructor(
     private readonly endpoint: CodexAppServerEndpoint,
@@ -51,7 +88,6 @@ export class CodexAppServerClient {
       clientInfo: { name: 'freshell', version: '1.0.0' },
       capabilities: {
         experimentalApi: true,
-        optOutNotificationMethods: ['thread/started'],
       },
     })).then((result) => {
       const parsed = CodexInitializeResultSchema.safeParse(result)
@@ -67,7 +103,9 @@ export class CodexAppServerClient {
     return this.initializePromise
   }
 
-  async startThread(params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>): Promise<{ threadId: string }> {
+  async startThread(
+    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult> {
     const result = await this.request('thread/start', {
       ...params,
       // Freshell attaches the visible TUI over `codex --remote`, so it does not
@@ -79,10 +117,14 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/start payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    return {
+      thread: normalizeThread(parsed.data.thread),
+    }
   }
 
-  async resumeThread(params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>): Promise<{ threadId: string }> {
+  async resumeThread(
+    params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult> {
     // Intentionally preserve Codex's default raw-event behavior for resume calls.
     const result = await this.request('thread/resume', {
       ...params,
@@ -92,7 +134,27 @@ export class CodexAppServerClient {
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/resume payload.')
     }
-    return { threadId: parsed.data.thread.id }
+    return {
+      thread: normalizeThread(parsed.data.thread),
+    }
+  }
+
+  async watchPath(targetPath: string, watchId: string): Promise<{ path: string }> {
+    const result = await this.request('fs/watch', CodexFsWatchParamsSchema.parse({
+      path: targetPath,
+      watchId,
+    }))
+    const parsed = CodexFsWatchResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid fs/watch payload.')
+    }
+    return parsed.data
+  }
+
+  async unwatchPath(watchId: string): Promise<void> {
+    await this.request('fs/unwatch', CodexFsUnwatchParamsSchema.parse({
+      watchId,
+    }))
   }
 
   async close(): Promise<void> {
@@ -124,6 +186,34 @@ export class CodexAppServerClient {
       socket.once('error', onClose)
       socket.close()
     })
+  }
+
+  onThreadStarted(handler: (thread: CodexThreadHandle) => void): () => void {
+    this.threadStartedHandlers.add(handler)
+    return () => {
+      this.threadStartedHandlers.delete(handler)
+    }
+  }
+
+  onThreadLifecycle(handler: (event: CodexThreadLifecycleEvent) => void): () => void {
+    this.threadLifecycleHandlers.add(handler)
+    return () => {
+      this.threadLifecycleHandlers.delete(handler)
+    }
+  }
+
+  onDisconnect(handler: (event: CodexAppServerDisconnectEvent) => void): () => void {
+    this.disconnectHandlers.add(handler)
+    return () => {
+      this.disconnectHandlers.delete(handler)
+    }
+  }
+
+  onFsChanged(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void {
+    this.fsChangedHandlers.add(handler)
+    return () => {
+      this.fsChangedHandlers.delete(handler)
+    }
   }
 
   private async ensureSocket(): Promise<WebSocket> {
@@ -165,8 +255,11 @@ export class CodexAppServerClient {
 
   private installSocketHandlers(socket: WebSocket): void {
     socket.on('message', (raw) => this.handleSocketMessage(raw))
-    socket.on('close', () => this.handleSocketClose())
-    socket.on('error', () => this.handleSocketClose())
+    socket.on('close', () => this.handleSocketClose(socket, { reason: 'close' }))
+    socket.on('error', (error) => this.handleSocketClose(socket, {
+      reason: 'error',
+      error: error instanceof Error ? error : new Error(String(error)),
+    }))
   }
 
   private handleSocketMessage(raw: WebSocket.RawData): void {
@@ -180,6 +273,26 @@ export class CodexAppServerClient {
     if (!this.hasIdField(parsed)) {
       const notification = CodexRpcNotificationEnvelopeSchema.safeParse(parsed)
       if (notification.success) {
+        const lifecycle = CodexThreadLifecycleNotificationSchema.safeParse(notification.data)
+        if (lifecycle.success) {
+          this.emitThreadLifecycle(lifecycle.data)
+          return
+        }
+
+        const threadStarted = CodexThreadStartedNotificationSchema.safeParse(notification.data)
+        if (threadStarted.success) {
+          for (const handler of this.threadStartedHandlers) {
+            handler(normalizeThread(threadStarted.data.params.thread))
+          }
+          return
+        }
+
+        const fsChanged = CodexFsChangedNotificationSchema.safeParse(notification.data)
+        if (fsChanged.success) {
+          for (const handler of this.fsChangedHandlers) {
+            handler(fsChanged.data.params)
+          }
+        }
         return
       }
     }
@@ -209,7 +322,10 @@ export class CodexAppServerClient {
     pending.reject(new Error(this.formatRpcError(pending.method, failure.data.error)))
   }
 
-  private handleSocketClose(): void {
+  private handleSocketClose(socket: WebSocket, event: CodexAppServerDisconnectEvent): void {
+    if (this.socket !== socket) {
+      return
+    }
     this.socket = null
     this.connectPromise = null
     this.initializePromise = null
@@ -218,6 +334,47 @@ export class CodexAppServerClient {
       clearTimeout(pending.timeout)
       pending.reject(new Error(`Codex app-server connection closed before ${pending.method} completed.`))
       this.pendingRequests.delete(id)
+    }
+
+    for (const handler of this.disconnectHandlers) {
+      handler(event)
+    }
+  }
+
+  private emitThreadLifecycle(notification: import('./protocol.js').CodexThreadLifecycleNotification): void {
+    if (notification.method === 'thread/started') {
+      const thread = normalizeThread(notification.params.thread)
+      const event: CodexThreadLifecycleEvent = {
+        kind: 'thread_started',
+        thread,
+      }
+      for (const handler of this.threadLifecycleHandlers) {
+        handler(event)
+      }
+      for (const handler of this.threadStartedHandlers) {
+        handler(thread)
+      }
+      return
+    }
+
+    if (notification.method === 'thread/closed') {
+      const event: CodexThreadLifecycleEvent = {
+        kind: 'thread_closed',
+        threadId: notification.params.threadId,
+      }
+      for (const handler of this.threadLifecycleHandlers) {
+        handler(event)
+      }
+      return
+    }
+
+    const event: CodexThreadLifecycleEvent = {
+      kind: 'thread_status_changed',
+      threadId: notification.params.threadId,
+      status: notification.params.status,
+    }
+    for (const handler of this.threadLifecycleHandlers) {
+      handler(event)
     }
   }
 

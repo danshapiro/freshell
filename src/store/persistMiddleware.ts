@@ -9,6 +9,8 @@ import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } 
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
+import { sanitizeSessionRef } from '@shared/session-contract'
+import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
 
 
 const log = createLogger('PanesPersist')
@@ -54,8 +56,11 @@ function registerFlushCallback(cb: () => void) {
 }
 
 function stripTabVolatileFields(tab: Tab) {
+  const sessionRef = sanitizeSessionRef(tab.sessionRef)
   return {
     ...tab,
+    sessionRef,
+    resumeSessionId: undefined,
     lastInputAt: undefined,
   }
 }
@@ -128,6 +133,14 @@ function migratePaneContent(content: any): any {
   if (!content || typeof content !== 'object') {
     return content
   }
+  if (content.kind === 'agent-chat') {
+    const { model: _legacyModel, ...rest } = content
+    return {
+      ...rest,
+      modelSelection: normalizeAgentChatModelSelection(content.modelSelection, content.model),
+      effort: normalizeAgentChatEffortOverride(content.effort),
+    }
+  }
   if (content.kind === 'browser') {
     return {
       ...content,
@@ -161,11 +174,28 @@ function stripEditorContent(content: any): any {
   }
 }
 
+function stripTransientSessionFields(content: any): any {
+  if (!content || typeof content !== 'object') return content
+  if (content.kind !== 'terminal' && content.kind !== 'agent-chat') return content
+
+  const sessionRef = sanitizeSessionRef(content.sessionRef)
+  const {
+    resumeSessionId: _resumeSessionId,
+    sessionRef: _legacySessionRef,
+    ...rest
+  } = content
+
+  return {
+    ...rest,
+    ...(sessionRef ? { sessionRef } : {}),
+  }
+}
+
 function stripEditorContentFromNode(node: any): any {
   if (!node) return node
 
   if (node.type === 'leaf') {
-    const nextContent = stripEditorContent(node.content)
+    const nextContent = stripTransientSessionFields(stripEditorContent(node.content))
     if (nextContent === node.content) return node
     return {
       ...node,
@@ -327,6 +357,15 @@ function migratePanesData(parsed: any): any | null {
 
     // Version 5 -> 6: assign stable browser instance ids.
     if (currentVersion < 6) {
+      const migratedLayouts: Record<string, any> = {}
+      for (const [tabId, node] of Object.entries(layouts)) {
+        migratedLayouts[tabId] = migrateNode(node)
+      }
+      layouts = migratedLayouts
+    }
+
+    // Version 6 -> 7: migrate agent-chat model/effort persistence to selection strategies.
+    if (currentVersion < 7) {
       const migratedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {
         migratedLayouts[tabId] = migrateNode(node)

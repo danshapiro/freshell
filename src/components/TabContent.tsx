@@ -36,11 +36,13 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   // Build default content based on setting
   let defaultContent: PaneContentInput
   const resumeSessionType = getTabResumeSessionType(tab)
+  const tabSessionId = tab.sessionRef?.sessionId
+  const tabSessionRef = tab.sessionRef
 
-  if (tab.resumeSessionId && resumeSessionType) {
+  if (tabSessionId && resumeSessionType) {
     defaultContent = buildResumeContent({
       sessionType: resumeSessionType,
-      sessionId: tab.resumeSessionId,
+      sessionId: tabSessionId,
       cwd: tab.initialCwd,
     })
   } else if (tab.mode !== 'shell') {
@@ -48,7 +50,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       kind: 'terminal',
       mode: tab.mode,
       shell: tab.shell,
-      resumeSessionId: tab.resumeSessionId,
+      sessionRef: tabSessionRef,
       initialCwd: tab.initialCwd,
     }
   } else if (defaultNewPane === 'ask') {
@@ -70,7 +72,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
       kind: 'terminal',
       mode: tab.mode,
       shell: tab.shell,
-      resumeSessionId: tab.resumeSessionId,
+      sessionRef: tabSessionRef,
       initialCwd: tab.initialCwd,
     }
   }

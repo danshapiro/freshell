@@ -58,7 +58,7 @@ describe('SessionRepairService', () => {
     const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const sessionId = 'priority-session'
+    const sessionId = '00000000-0000-4000-8000-000000000711'
     const sessionFile = path.join(projectDir, `${sessionId}.jsonl`)
     await fs.writeFile(sessionFile, createTranscript(sessionId, '/tmp/project'))
 
@@ -95,8 +95,8 @@ describe('SessionRepairService', () => {
     const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const slowSessionId = 'slow-session'
-    const targetSessionId = 'target-session'
+    const slowSessionId = '00000000-0000-4000-8000-000000000712'
+    const targetSessionId = '00000000-0000-4000-8000-000000000713'
     const slowFile = path.join(projectDir, `${slowSessionId}.jsonl`)
     const targetFile = path.join(projectDir, `${targetSessionId}.jsonl`)
     await fs.writeFile(slowFile, createTranscript(slowSessionId, '/tmp/slow-project'))
@@ -208,7 +208,7 @@ describe('SessionRepairService', () => {
     const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const sessionId = 'stop-drain-session'
+    const sessionId = '00000000-0000-4000-8000-000000000714'
     const sessionFile = path.join(projectDir, `${sessionId}.jsonl`)
     await fs.writeFile(sessionFile, createTranscript(sessionId, '/tmp/project'))
 
@@ -265,7 +265,7 @@ describe('SessionRepairService', () => {
     const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const sessionId = 'history-failure-session'
+    const sessionId = '00000000-0000-4000-8000-000000000715'
     const sessionFile = path.join(projectDir, `${sessionId}.jsonl`)
     await fs.writeFile(sessionFile, createTranscript(sessionId, '/tmp/project'))
 
@@ -325,7 +325,7 @@ describe('SessionRepairService', () => {
     const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const targetSessionId = 'target-session'
+    const targetSessionId = '00000000-0000-4000-8000-000000000716'
     const targetFile = path.join(projectDir, `${targetSessionId}.jsonl`)
     await fs.writeFile(targetFile, createTranscript(targetSessionId, '/tmp/target'))
 

@@ -18,10 +18,11 @@ import agentChatReducer, {
   timelinePageReceived,
   turnBodyReceived,
 } from '@/store/agentChatSlice'
-import panesReducer, { initLayout } from '@/store/panesSlice'
+import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import settingsReducer from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
+import { tabFallbackIdentityMiddleware } from '@/store/tabFallbackIdentityMiddleware'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -30,10 +31,21 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
+const DURABLE_SESSION_ID = '00000000-0000-4000-8000-000000000201'
+const DURABLE_SESSION_ID_ALT = '00000000-0000-4000-8000-000000000202'
+const DURABLE_SHELL_SESSION_ID = '00000000-0000-4000-8000-000000000203'
+const DURABLE_RUNNING_SESSION_ID = '00000000-0000-4000-8000-000000000204'
+const DURABLE_SESSION_ID_NEXT = '00000000-0000-4000-8000-000000000205'
+
 const wsSend = vi.fn()
 const getAgentTimelinePage = vi.fn()
 const getAgentTurnBody = vi.fn()
+const getAgentChatCapabilities = vi.fn()
 const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -42,12 +54,17 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
     getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
     getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    getAgentChatCapabilities: (...args: unknown[]) => getAgentChatCapabilities(...args),
     setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
   }
 })
@@ -70,6 +87,7 @@ function makeStoreWithTabs() {
       settings: settingsReducer,
       tabs: tabsReducer,
     },
+    middleware: (getDefault) => getDefault().concat(tabFallbackIdentityMiddleware),
   })
 }
 
@@ -132,7 +150,10 @@ const RELOAD_PANE: AgentChatPaneContent = {
 
 const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
-  resumeSessionId: '00000000-0000-4000-8000-000000000321',
+  sessionRef: {
+    provider: 'claude',
+    sessionId: '00000000-0000-4000-8000-000000000321',
+  },
 }
 
 const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
@@ -145,6 +166,7 @@ describe('AgentChatView reload/restore behavior', () => {
     localStorage.clear()
     getAgentTimelinePage.mockReset()
     getAgentTurnBody.mockReset()
+    getAgentChatCapabilities.mockReset()
     setSessionMetadata.mockReset()
     setSessionMetadata.mockResolvedValue(undefined)
   })
@@ -152,6 +174,7 @@ describe('AgentChatView reload/restore behavior', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    saveServerSettingsPatchSpy.mockClear()
     localStorage.clear()
     delete window.__FRESHELL_TEST_HARNESS__
   })
@@ -189,7 +212,7 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('includes the named resumeSessionId when attaching a persisted pane before the canonical durable id exists', () => {
+  it('does not send a mutable named resume token when attaching a persisted pane', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -204,7 +227,6 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(wsSend).toHaveBeenCalledWith({
       type: 'sdk.attach',
       sessionId: 'sess-reload-1',
-      resumeSessionId: 'named-resume-token',
     })
   })
 
@@ -327,6 +349,237 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(retriedContent!.sessionId).toBeUndefined()
     expect(retriedContent!.status).toBe('starting')
     expect((retriedContent as AgentChatPaneContent).createError).toBeUndefined()
+  })
+
+  it('sends provider-default creates as the stable opus track alias', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-provider-default',
+      status: 'creating',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-provider-default',
+        model: 'opus',
+      }))
+    })
+    const createCall = wsSend.mock.calls.find((call) => call[0]?.type === 'sdk.create')?.[0]
+    expect(createCall).not.toHaveProperty('effort')
+  })
+
+  it('creates tracked live models directly without a capability fetch when no effort validation is needed', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-tracked',
+      status: 'creating',
+      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-tracked',
+        model: 'opus[1m]',
+      }))
+    })
+    expect(getAgentChatCapabilities).not.toHaveBeenCalled()
+  })
+
+  it('validates explicit effort overrides before create and clears them when unsupported', async () => {
+    getAgentChatCapabilities.mockResolvedValue({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'haiku',
+            displayName: 'Haiku',
+            description: 'Fast path',
+            supportsEffort: false,
+            supportedEffortLevels: [],
+            supportsAdaptiveThinking: false,
+          },
+        ],
+      },
+    })
+
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-unsupported-effort',
+      status: 'creating',
+      modelSelection: { kind: 'tracked', modelId: 'haiku' },
+      effort: 'turbo',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentChatCapabilities).toHaveBeenCalledWith('freshclaude', {})
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-unsupported-effort',
+        model: 'haiku',
+      }))
+    })
+    const createCall = wsSend.mock.calls.find((call) => call[0]?.type === 'sdk.create')?.[0]
+    expect(createCall).not.toHaveProperty('effort')
+    expect(getPaneContent(store, 't1', 'p1')?.effort).toBeUndefined()
+  })
+
+  it('passes named resume tokens through sdk.create and keeps the session in restore mode until it upgrades', async () => {
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-named-resume',
+      status: 'creating',
+      resumeSessionId: 'named-resume',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-named-resume',
+        model: 'opus',
+        resumeSessionId: 'named-resume',
+      }))
+    })
+
+    expect(store.getState().agentChat.pendingCreates['req-named-resume']).toEqual({
+      sessionId: undefined,
+      expectsHistoryHydration: true,
+    })
+  })
+
+  it('blocks create when an exact unavailable selection cannot be launched safely', async () => {
+    getAgentChatCapabilities.mockResolvedValue({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    })
+
+    const store = makeStore()
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-unavailable-exact',
+      status: 'creating',
+      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    expect(await screen.findByText('Session start failed')).toBeInTheDocument()
+    expect(screen.getByText(/no longer available/i)).toBeInTheDocument()
+    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')).toHaveLength(0)
+    expect(getPaneContent(store, 't1', 'p1')).toEqual(expect.objectContaining({
+      status: 'create-failed',
+      createError: expect.objectContaining({
+        code: 'MODEL_UNAVAILABLE',
+      }),
+    }))
   })
 
   it('shows loading state instead of welcome screen when sessionId is set but messages have not arrived', () => {
@@ -597,7 +850,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 12,
     }))
 
@@ -613,14 +866,14 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(attachCalls[1]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sess-reload-1',
-        resumeSessionId: 'cli-sess-1',
+        resumeSessionId: DURABLE_SESSION_ID,
       })
     })
   })
 
   it('clears stale hydrated timeline content and waits for a fresh snapshot before rereading after a stale restore retry', async () => {
     getAgentTimelinePage.mockResolvedValue({
-      sessionId: 'cli-sess-1',
+      sessionId: DURABLE_SESSION_ID,
       items: [],
       nextCursor: null,
       revision: 13,
@@ -631,14 +884,14 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 12,
     }))
     store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
       items: [
         makeTimelineItem('turn-2', 'assistant', 'Old stale summary', {
-          sessionId: 'cli-sess-1',
+          sessionId: DURABLE_SESSION_ID,
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -648,7 +901,7 @@ describe('AgentChatView reload/restore behavior', () => {
       replace: true,
       bodies: {
         'turn-2': makeTimelineTurn('turn-2', 'assistant', 'Old hydrated body', {
-          sessionId: 'cli-sess-1',
+          sessionId: DURABLE_SESSION_ID,
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -696,7 +949,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 12,
     }))
 
@@ -711,7 +964,7 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sess-reload-1',
         items: [
           makeTimelineItem('turn-2', 'user', 'Hydrated summary', {
-            sessionId: 'cli-sess-1',
+            sessionId: DURABLE_SESSION_ID,
             ordinal: 2,
             timestamp: '2026-03-10T10:01:00.000Z',
           }),
@@ -723,7 +976,7 @@ describe('AgentChatView reload/restore behavior', () => {
       store.dispatch(turnBodyReceived({
         sessionId: 'sess-reload-1',
         turn: makeTimelineTurn('turn-2', 'user', 'Hydrated body', {
-          sessionId: 'cli-sess-1',
+          sessionId: DURABLE_SESSION_ID,
           ordinal: 2,
           timestamp: '2026-03-10T10:01:00.000Z',
         }),
@@ -737,7 +990,7 @@ describe('AgentChatView reload/restore behavior', () => {
     await act(async () => {
       await store.dispatch(loadAgentTurnBody({
         sessionId: 'sess-reload-1',
-        timelineSessionId: 'cli-sess-1',
+        timelineSessionId: DURABLE_SESSION_ID,
         turnId: 'turn-7',
       }))
     })
@@ -834,14 +1087,14 @@ describe('AgentChatView reload/restore behavior', () => {
   })
 
   it('uses timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
-    getAgentTimelinePage.mockResolvedValue({ sessionId: 'cli-sess-1', items: [], nextCursor: null, revision: 1 })
+    getAgentTimelinePage.mockResolvedValue({ sessionId: DURABLE_SESSION_ID, items: [], nextCursor: null, revision: 1 })
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 2,
     }))
 
@@ -853,7 +1106,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-sess-1',
+        DURABLE_SESSION_ID,
         expect.objectContaining({ includeBodies: true, revision: 2 }),
         expect.anything(),
       )
@@ -921,15 +1174,22 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-session-abc-123',
+        timelineSessionId: DURABLE_SESSION_ID_ALT,
         revision: 2,
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.resumeSessionId).toBe('cli-session-abc-123')
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBe('cli-session-abc-123')
-    expect(tab?.sessionMetadataByKey?.['claude:cli-session-abc-123']).toEqual(expect.objectContaining({
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
+    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SESSION_ID_ALT}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from the old tab',
     }))
@@ -969,32 +1229,167 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-shell-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-shell-abc-123',
+        timelineSessionId: DURABLE_SHELL_SESSION_ID,
         revision: 2,
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.resumeSessionId).toBe('cli-shell-abc-123')
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-shell')
-    expect(tab?.resumeSessionId).toBe('cli-shell-abc-123')
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     expect(tab?.codingCliProvider).toBe('claude')
-    expect(tab?.sessionMetadataByKey?.['claude:cli-shell-abc-123']).toEqual(expect.objectContaining({
+    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SHELL_SESSION_ID}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
     }))
+  })
+
+  it('does not loop when two agent-chat panes in one split tab promote different durable ids', async () => {
+    const firstDurableSessionId = '00000000-0000-4000-8000-000000000411'
+    const secondDurableSessionId = '00000000-0000-4000-8000-000000000412'
+    const staleSharedSessionId = '00000000-0000-4000-8000-000000000410'
+    const store = makeStoreWithTabs()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    store.dispatch(addTab({
+      id: 't-split',
+      title: 'Split Agent Chat Tab',
+      mode: 'claude',
+      codingCliProvider: 'claude',
+      status: 'running',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: staleSharedSessionId,
+      },
+    }))
+    store.dispatch(hydratePanes({
+      layouts: {
+        't-split': {
+          type: 'split',
+          id: 'split-root',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            {
+              type: 'leaf',
+              id: 'p1',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-1',
+                sessionId: 'sdk-split-1',
+                status: 'idle',
+              },
+            },
+            {
+              type: 'leaf',
+              id: 'p2',
+              content: {
+                kind: 'agent-chat',
+                provider: 'freshclaude',
+                createRequestId: 'req-split-2',
+                sessionId: 'sdk-split-2',
+                status: 'idle',
+              },
+            },
+          ],
+        } as PaneNode,
+      },
+      activePane: { 't-split': 'p1' },
+      paneTitles: {},
+    }))
+
+    function findPaneContentInState(state: ReturnType<typeof store.getState>, paneId: string): AgentChatPaneContent | undefined {
+      const root = state.panes.layouts['t-split']
+      if (!root) return undefined
+      function visit(node: PaneNode): AgentChatPaneContent | undefined {
+        if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
+          return node.content
+        }
+        if (node.type === 'split') {
+          return visit(node.children[0]) || visit(node.children[1])
+        }
+        return undefined
+      }
+      return visit(root)
+    }
+
+    function Wrapper({ paneId }: { paneId: string }) {
+      const content = useSelector((s: ReturnType<typeof store.getState>) => findPaneContentInState(s, paneId))
+      if (!content) return null
+      return <AgentChatView tabId="t-split" paneId={paneId} paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper paneId="p1" />
+        <Wrapper paneId="p2" />
+      </Provider>,
+    )
+
+    dispatchSpy.mockClear()
+
+    expect(() => {
+      act(() => {
+        store.dispatch(sessionSnapshotReceived({
+          sessionId: 'sdk-split-1',
+          latestTurnId: 'turn-1',
+          status: 'idle',
+          timelineSessionId: firstDurableSessionId,
+          revision: 1,
+        }))
+        store.dispatch(sessionSnapshotReceived({
+          sessionId: 'sdk-split-2',
+          latestTurnId: 'turn-2',
+          status: 'idle',
+          timelineSessionId: secondDurableSessionId,
+          revision: 1,
+        }))
+      })
+    }).not.toThrow()
+
+    await waitFor(() => {
+      expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-split', 'p1')?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: firstDurableSessionId,
+      })
+      expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-split', 'p2')?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: secondDurableSessionId,
+      })
+    })
+
+    const updateTabCalls = dispatchSpy.mock.calls.filter((call) => call[0]?.type === 'tabs/updateTab')
+    const panePromotionCalls = updateTabCalls.filter((call) => {
+      const sessionId = call[0]?.payload?.updates?.sessionRef?.sessionId
+      return sessionId === firstDurableSessionId || sessionId === secondDurableSessionId
+    })
+    const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-split')
+    expect(panePromotionCalls).toHaveLength(0)
+    expect(tab?.sessionRef).toBeUndefined()
+
+    consoleErrorSpy.mockRestore()
   })
 
   it('upgrades a named restore to the canonical durable id when sdk.session.metadata arrives after the snapshot', async () => {
     const canonicalSessionId = '00000000-0000-4000-8000-000000000321'
     getAgentTimelinePage
       .mockResolvedValueOnce({
-        sessionId: 'named-resume',
+        sessionId: 'sdk-meta-upgrade-1',
         items: [{
           turnId: 'turn-live-1',
           messageId: 'message-live-1',
           ordinal: 0,
           source: 'live',
-          sessionId: 'named-resume',
+          sessionId: 'sdk-meta-upgrade-1',
           role: 'assistant',
           summary: 'Live-only summary',
         }],
@@ -1004,7 +1399,7 @@ describe('AgentChatView reload/restore behavior', () => {
             messageId: 'message-live-1',
             ordinal: 0,
             source: 'live',
-            sessionId: 'named-resume',
+            sessionId: 'sdk-meta-upgrade-1',
             message: {
               role: 'assistant',
               content: [{ type: 'text', text: 'Live-only full body' }],
@@ -1119,14 +1514,13 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-meta-upgrade-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'named-resume',
         revision: 1,
       }))
     })
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'named-resume',
+        'sdk-meta-upgrade-1',
         expect.objectContaining({ includeBodies: true, revision: 1 }),
         expect.anything(),
       )
@@ -1197,9 +1591,16 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
     expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000321']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from metadata upgrade',
@@ -1260,7 +1661,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-1',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       streamingActive: true,
       streamingText: 'partial reply',
     }))
@@ -1281,7 +1682,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-running',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-sess-running',
+      timelineSessionId: DURABLE_RUNNING_SESSION_ID,
       streamingActive: true,
       streamingText: 'partial reply',
     }))
@@ -1297,7 +1698,7 @@ describe('AgentChatView reload/restore behavior', () => {
     act(() => {
       store.dispatch(sessionInit({
         sessionId: 'sdk-sess-running',
-        cliSessionId: 'cli-sess-running',
+        cliSessionId: DURABLE_RUNNING_SESSION_ID,
         model: 'claude-opus-4-6',
       }))
     })
@@ -1315,7 +1716,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sdk-sess-2',
       latestTurnId: 'turn-3',
       status: 'running',
-      timelineSessionId: 'cli-sess-2',
+      timelineSessionId: DURABLE_SESSION_ID_NEXT,
       streamingActive: false,
       streamingText: 'partial reply',
     }))
@@ -1650,14 +2051,17 @@ describe('AgentChatView server-restart recovery', () => {
       store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sdk-sess-1' }))
       store.dispatch(sessionInit({
         sessionId: 'sdk-sess-1',
-        cliSessionId: 'cli-session-abc-123',
+        cliSessionId: DURABLE_SESSION_ID_ALT,
         model: 'claude-opus-4-6',
       }))
     })
 
-    // Pane content should now have resumeSessionId persisted
+    // Pane content should now have canonical sessionRef persisted
     const content = getPaneContent(store, 't1', 'p1')
-    expect(content?.resumeSessionId).toBe('cli-session-abc-123')
+    expect(content?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
   })
 
   it('does not reset the pane or send sdk.create when restore remains pending past the legacy timeout window', () => {

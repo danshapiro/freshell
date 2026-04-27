@@ -737,10 +737,9 @@ describe('WebSocket edge cases', () => {
       close()
     })
 
-    it('handles messages with extra unexpected fields', async () => {
+    it('rejects messages with extra unexpected fields', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
-      // Extra fields should be ignored (Zod strips unknown keys)
       ws.send(
         JSON.stringify({
           type: 'terminal.create',
@@ -751,10 +750,11 @@ describe('WebSocket edge cases', () => {
         })
       )
 
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'with-extra')
-      expect(created.terminalId).toMatch(/^term_/)
-      expect(created.snapshot).toBeUndefined()
-      expect(created.snapshotChunked).toBeUndefined()
+      const error = await waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.requestId === 'with-extra',
+      )
+      expect(error.code).toBe('INVALID_MESSAGE')
 
       close()
     })
@@ -1580,7 +1580,10 @@ describe('WebSocket edge cases', () => {
         type: 'terminal.create',
         requestId: requestId1,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created1 = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId1)
@@ -1590,13 +1593,16 @@ describe('WebSocket edge cases', () => {
         type: 'terminal.create',
         requestId: requestId2,
         mode: 'claude',
-        resumeSessionId: VALID_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
       }))
 
       const created2 = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId2)
 
       expect(created2.terminalId).toBe(created1.terminalId)
-      expect(created2.effectiveResumeSessionId).toBe(VALID_SESSION_ID)
+      expect(created2).not.toHaveProperty('effectiveResumeSessionId')
 
       close()
     })
@@ -1662,7 +1668,7 @@ describe('WebSocket edge cases', () => {
       close()
     })
 
-    it('terminal.create ignores stale attachOnCreate payloads and still does not auto-attach', async () => {
+    it('terminal.create rejects stale attachOnCreate payloads', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       ws.send(JSON.stringify({
@@ -1671,11 +1677,11 @@ describe('WebSocket edge cases', () => {
         mode: 'shell',
         attachOnCreate: false,
       }))
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-no-auto')
-      const msgs = await collectMessages(ws, 150)
-      const autoReadySeen = msgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)
-
-      expect(autoReadySeen).toBe(false)
+      const error = await waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.requestId === 'split-no-auto',
+      )
+      expect(error.code).toBe('INVALID_MESSAGE')
       close()
     })
 

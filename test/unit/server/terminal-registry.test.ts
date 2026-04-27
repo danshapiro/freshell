@@ -3,6 +3,16 @@ import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegi
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import * as fs from 'fs'
 import os from 'os'
+import {
+  CODEX_STARTUP_EXPECTED_REPLIES,
+  CODEX_STARTUP_QUERY_FRAMES,
+} from '../../helpers/codex-startup-probes'
+
+const SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES = [
+  CODEX_STARTUP_EXPECTED_REPLIES[0],
+  CODEX_STARTUP_EXPECTED_REPLIES[1],
+  '\u001b]10;rgb:c9c9/d1d1/d9d9\u001b\\',
+] as const
 
 // Mock fs.existsSync for shell existence checks
 // Need to provide both named export and default export since the implementation uses `import fs from 'fs'`
@@ -1775,6 +1785,63 @@ describe('TerminalRegistry', () => {
     registry.shutdown()
   })
 
+  describe('worker lifecycle regression coverage', () => {
+    it('emits terminal.created for normal create', () => {
+      const created = vi.fn()
+      registry.on('terminal.created', created)
+
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+
+      expect(created).toHaveBeenCalledWith(record)
+    })
+
+    it('normal PTY exit emits one terminal.exit and marks the record exited', async () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+
+      onExitCallback({ exitCode: 7, signal: 0 })
+      onExitCallback({ exitCode: 7, signal: 0 })
+
+      expect(registry.get(record.terminalId)?.status).toBe('exited')
+      expect(exited).toHaveBeenCalledTimes(1)
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 7 })
+    })
+
+    it('explicit kill emits one terminal.exit', () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+
+      registry.kill(record.terminalId)
+      registry.kill(record.terminalId)
+
+      expect(exited).toHaveBeenCalledTimes(1)
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    })
+
+    it('clients and buffer receive PTY output', async () => {
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const client = { send: vi.fn(), bufferedAmount: 0 } as any
+      registry.attach(record.terminalId, client)
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+
+      onDataCallback('hello from pty')
+
+      expect(record.buffer.snapshot()).toContain('hello from pty')
+      expect(client.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'terminal.output',
+        terminalId: record.terminalId,
+        data: 'hello from pty',
+      }))
+    })
+  })
+
   describe('reaping exited terminals', () => {
     it('does not count exited terminals against MAX_TERMINALS', () => {
       const reg = new TerminalRegistry(undefined, 2)
@@ -2457,6 +2524,86 @@ describe('TerminalRegistry', () => {
       const reg = new TerminalRegistry()
       expect(reg.getMaxListeners()).toBeGreaterThan(10)
       reg.shutdown()
+    })
+  })
+
+  describe('codex sidecar callbacks during create', () => {
+    it('registers the terminal before a synchronous durable-session callback fires', () => {
+      let terminalSeenDuringAttach: string | undefined
+
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          attachTerminal: ({ terminalId, onDurableSession }) => {
+            terminalSeenDuringAttach = registry.get(terminalId)?.terminalId
+            onDurableSession('codex-session-sync')
+          },
+          shutdown: vi.fn().mockResolvedValue(undefined),
+        },
+      })
+
+      expect(terminalSeenDuringAttach).toBe(term.terminalId)
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-sync')
+      expect(registry.isSessionBound('codex', 'codex-session-sync')).toBe(true)
+    })
+
+    it('keeps the newly created terminal alive when a synchronous fatal callback starts recovery', () => {
+      let createdTerminalId: string | undefined
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          attachTerminal: ({ terminalId, onFatal }) => {
+            createdTerminalId = terminalId
+            onFatal(new Error('sidecar failed during attach'))
+          },
+          shutdown: vi.fn().mockResolvedValue(undefined),
+        },
+      })
+
+      expect(createdTerminalId).toBe(term.terminalId)
+      expect(registry.get(term.terminalId)?.status).toBe('running')
+      expect(registry.get(term.terminalId)?.codex?.recoveryState).toBe('recovering_pre_durable')
+      expect(exited).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('pre-attach codex startup probes', () => {
+    it('answers codex startup probes before the first client attaches', async () => {
+      registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+
+      onDataCallback(CODEX_STARTUP_QUERY_FRAMES.join(''))
+
+      expect(mockPty.write.mock.calls.map(([data]: [string]) => data)).toEqual(SERVER_PREATTACH_CODEX_STARTUP_EXPECTED_REPLIES)
+    })
+
+    it('stops server-side startup probe replies after a client has attached once', async () => {
+      const record = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+      const client = {} as any
+
+      registry.attach(record.terminalId, client)
+      registry.detach(record.terminalId, client)
+      onDataCallback(CODEX_STARTUP_QUERY_FRAMES.join(''))
+
+      expect(mockPty.write).not.toHaveBeenCalled()
     })
   })
 
