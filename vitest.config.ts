@@ -31,7 +31,6 @@ export default defineConfig({
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',
-      ...(process.env.FRESHELL_REAL_PROVIDER_CONTRACTS === '1' ? [] : ['test/integration/real/**']),
       // Server tests run under vitest.server.config.ts (node environment)
       'test/server/**',
       'test/unit/server/**',

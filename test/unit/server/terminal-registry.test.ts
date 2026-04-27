@@ -1785,6 +1785,63 @@ describe('TerminalRegistry', () => {
     registry.shutdown()
   })
 
+  describe('worker lifecycle regression coverage', () => {
+    it('emits terminal.created for normal create', () => {
+      const created = vi.fn()
+      registry.on('terminal.created', created)
+
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+
+      expect(created).toHaveBeenCalledWith(record)
+    })
+
+    it('normal PTY exit emits one terminal.exit and marks the record exited', async () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onExitCallback = mockPty.onExit.mock.calls[0][0]
+
+      onExitCallback({ exitCode: 7, signal: 0 })
+      onExitCallback({ exitCode: 7, signal: 0 })
+
+      expect(registry.get(record.terminalId)?.status).toBe('exited')
+      expect(exited).toHaveBeenCalledTimes(1)
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 7 })
+    })
+
+    it('explicit kill emits one terminal.exit', () => {
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+
+      registry.kill(record.terminalId)
+      registry.kill(record.terminalId)
+
+      expect(exited).toHaveBeenCalledTimes(1)
+      expect(exited).toHaveBeenCalledWith({ terminalId: record.terminalId, exitCode: 0 })
+    })
+
+    it('clients and buffer receive PTY output', async () => {
+      const record = registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      const client = { send: vi.fn(), bufferedAmount: 0 } as any
+      registry.attach(record.terminalId, client)
+      const pty = await import('node-pty')
+      const mockPty = vi.mocked(pty.spawn).mock.results.at(-1)?.value
+      const onDataCallback = mockPty.onData.mock.calls[0][0]
+
+      onDataCallback('hello from pty')
+
+      expect(record.buffer.snapshot()).toContain('hello from pty')
+      expect(client.send).toHaveBeenCalledWith(JSON.stringify({
+        type: 'terminal.output',
+        terminalId: record.terminalId,
+        data: 'hello from pty',
+      }))
+    })
+  })
+
   describe('reaping exited terminals', () => {
     it('does not count exited terminals against MAX_TERMINALS', () => {
       const reg = new TerminalRegistry(undefined, 2)
@@ -2491,8 +2548,10 @@ describe('TerminalRegistry', () => {
       expect(registry.isSessionBound('codex', 'codex-session-sync')).toBe(true)
     })
 
-    it('lets a synchronous fatal callback terminate the newly created terminal', () => {
+    it('keeps the newly created terminal alive when a synchronous fatal callback starts recovery', () => {
       let createdTerminalId: string | undefined
+      const exited = vi.fn()
+      registry.on('terminal.exit', exited)
 
       const term = registry.create({
         mode: 'codex',
@@ -2507,7 +2566,9 @@ describe('TerminalRegistry', () => {
       })
 
       expect(createdTerminalId).toBe(term.terminalId)
-      expect(registry.get(term.terminalId)?.status).toBe('exited')
+      expect(registry.get(term.terminalId)?.status).toBe('running')
+      expect(registry.get(term.terminalId)?.codex?.recoveryState).toBe('recovering_pre_durable')
+      expect(exited).not.toHaveBeenCalled()
     })
   })
 

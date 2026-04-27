@@ -435,6 +435,88 @@ describe('agent chat restore flow', () => {
     expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
   })
 
+  it('reconnect after sdk.create but before sdk.created resends the same request and binds one session without a retry loop', async () => {
+    const store = makeStore()
+    const pane = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-reconnect-create',
+      status: 'creating',
+    } satisfies AgentChatPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsHarness.sdkCreates()).toEqual([
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    await waitFor(() => {
+      expect(wsHarness.sdkCreates()).toEqual([
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+        expect.objectContaining({
+          type: 'sdk.create',
+          requestId: 'req-reconnect-create',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.clearInFlight('req-reconnect-create')
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.created',
+        requestId: 'req-reconnect-create',
+        sessionId: 'sdk-reconnected-1',
+      })
+      handleSdkMessage(store.dispatch, {
+        type: 'sdk.session.init',
+        sessionId: 'sdk-reconnected-1',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp/project',
+        tools: [],
+      })
+    })
+
+    await waitFor(() => {
+      const root = store.getState().panes.layouts.t1
+      const leaf = root && findLeaf(root, 'p1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionId : undefined).toBe('sdk-reconnected-1')
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    expect(wsHarness.sdkCreates()).toHaveLength(2)
+    const root = store.getState().panes.layouts.t1
+    const leaf = root && findLeaf(root, 'p1')
+    expect(leaf?.content.kind === 'agent-chat' ? leaf.content : undefined).toEqual(expect.objectContaining({
+      sessionId: 'sdk-reconnected-1',
+      status: 'connected',
+    }))
+  })
+
   it('surfaces restore-unavailable instead of recreating a live-only FreshClaude session after INVALID_SESSION_ID', async () => {
     const store = makeStore()
     const pane = {

@@ -26,11 +26,19 @@ function statusLabel(status: TerminalStatus): string {
       return 'Exited'
     case 'creating':
       return 'Creating...'
+    case 'recovering':
+      return 'Recovering'
     case 'error':
       return 'Error'
+    case 'recovery_failed':
+      return 'Recovery failed'
     default:
       return ''
   }
+}
+
+function isDestructiveStatus(status: TerminalStatus): boolean {
+  return status === 'exited' || status === 'error' || status === 'recovery_failed'
 }
 
 export function TabSwitcher({ onClose }: TabSwitcherProps) {
@@ -93,6 +101,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId
             const title = getDisplayTitle(tab)
+            const tabStatusLabel = statusLabel(tab.status)
             const isBusy = getBusyPaneIdsForTab({
               tab,
               paneLayouts,
@@ -110,7 +119,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
                     : 'border-border bg-card hover:bg-accent/50'
                 }`}
                 onClick={() => handleCardClick(tab.id)}
-                aria-label={`Switch to ${title}`}
+                aria-label={tabStatusLabel ? `Switch to ${title} (${tabStatusLabel})` : `Switch to ${title}`}
               >
                 <div className="flex w-full items-start justify-between gap-2">
                   <span className="text-sm font-medium truncate flex-1">
@@ -127,12 +136,12 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
                 </div>
                 <span
                   className={`text-xs ${
-                    tab.status === 'exited' || tab.status === 'error'
+                    isDestructiveStatus(tab.status)
                       ? 'text-destructive'
                       : 'text-muted-foreground'
                   }`}
                 >
-                  {statusLabel(tab.status)}
+                  {tabStatusLabel}
                 </span>
               </button>
             )

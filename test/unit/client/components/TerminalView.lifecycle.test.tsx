@@ -538,6 +538,113 @@ describe('TerminalView lifecycle updates', () => {
     expect(layout.content.status).toBe('running')
   })
 
+  it('keeps the terminal id when recoverable terminal.status messages arrive', async () => {
+    const tabId = 'tab-status'
+    const paneId = 'pane-status'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-status',
+      terminalId: 'term-status',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(persistMiddleware),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            createRequestId: 'req-status',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+        turnCompletion: { terminalStates: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'recovering',
+        reason: 'codex_worker_failure',
+      })
+    })
+
+    let layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('recovering')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'running',
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('running')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-status',
+        status: 'recovery_failed',
+        reason: 'retry_exhausted',
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBe('term-status')
+    expect(layout.content.status).toBe('recovery_failed')
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.exit',
+        terminalId: 'term-status',
+        exitCode: 0,
+      })
+    })
+    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
+    expect(layout.content.terminalId).toBeUndefined()
+    expect(layout.content.status).toBe('exited')
+  })
+
   it('focuses the remembered active pane terminal when tab becomes active', async () => {
     const paneA: TerminalPaneContent = {
       kind: 'terminal',

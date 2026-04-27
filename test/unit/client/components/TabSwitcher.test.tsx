@@ -354,6 +354,34 @@ describe('TabSwitcher', () => {
     expect(screen.getByText('Creating...')).toBeInTheDocument()
   })
 
+  it('shows accessible recovery status text and tone', async () => {
+    const { TabSwitcher } = await import('@/components/TabSwitcher')
+    const store = createStore(
+      [
+        createTab('tab-1', 'Recovering Codex', { status: 'recovering' }),
+        createTab('tab-2', 'Failed Codex', { status: 'recovery_failed' }),
+      ],
+      'tab-1'
+    )
+    render(
+      <Provider store={store}>
+        <TabSwitcher onClose={() => {}} />
+      </Provider>
+    )
+
+    const recoveringCard = screen.getByRole('button', {
+      name: /switch to recovering codex \(recovering\)/i,
+    })
+    const failedCard = screen.getByRole('button', {
+      name: /switch to failed codex \(recovery failed\)/i,
+    })
+    const recoveringStatus = within(recoveringCard).getByText('Recovering')
+    const failedStatus = within(failedCard).getByText('Recovery failed')
+
+    expect(recoveringStatus.className).toContain('text-muted-foreground')
+    expect(failedStatus.className).toContain('text-destructive')
+  })
+
   it('is rendered as a fullscreen overlay', async () => {
     const { TabSwitcher } = await import('@/components/TabSwitcher')
     const store = createStore(

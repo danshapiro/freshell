@@ -132,6 +132,7 @@ describe('CodexTerminalSidecar durable rollout tracking', () => {
           threadStartedHandler = null
         }
       }),
+      onThreadLifecycle: vi.fn(() => () => undefined),
       shutdown: vi.fn(async () => undefined),
       ensureReady: vi.fn(async () => ({
         wsUrl: 'ws://127.0.0.1:4567',
@@ -159,6 +160,7 @@ describe('CodexTerminalSidecar durable rollout tracking', () => {
     sidecar.attachTerminal({
       terminalId: 'term-1',
       onDurableSession,
+      onThreadLifecycle: vi.fn(),
       onFatal: vi.fn(),
     })
 
@@ -174,11 +176,165 @@ describe('CodexTerminalSidecar durable rollout tracking', () => {
     expect(onDurableSession).toHaveBeenCalledWith('thread-new-1')
   })
 
+  it('forwards current thread lifecycle evidence to the attached terminal', () => {
+    let threadLifecycleHandler: ((event: {
+      kind: 'thread_started'
+      thread: { id: string; path: string | null; ephemeral: boolean }
+    }) => void) | null = null
+    const runtime = {
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn(() => () => undefined),
+      onThreadLifecycle: vi.fn((handler) => {
+        threadLifecycleHandler = handler
+        return () => {
+          threadLifecycleHandler = null
+        }
+      }),
+      shutdown: vi.fn(async () => undefined),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+    const sidecar = new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: () => ({
+        trackThread: vi.fn(),
+        dispose: vi.fn(async () => undefined),
+      }),
+    })
+    const onThreadLifecycle = vi.fn()
+    sidecar.attachTerminal({
+      terminalId: 'term-1',
+      onDurableSession: vi.fn(),
+      onThreadLifecycle,
+      onFatal: vi.fn(),
+    })
+
+    threadLifecycleHandler?.({
+      kind: 'thread_started',
+      thread: { id: 'thread-1', path: '/tmp/rollout.jsonl', ephemeral: false },
+    })
+
+    expect(onThreadLifecycle).toHaveBeenCalledWith({
+      kind: 'thread_started',
+      thread: expect.objectContaining({ id: 'thread-1' }),
+    })
+  })
+
+  it('replays lifecycle evidence observed before terminal attachment', () => {
+    let threadLifecycleHandler: ((event: {
+      kind: 'thread_started'
+      thread: { id: string; path: string | null; ephemeral: boolean }
+    }) => void) | null = null
+    const runtime = {
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn(() => () => undefined),
+      onThreadLifecycle: vi.fn((handler) => {
+        threadLifecycleHandler = handler
+        return () => {
+          threadLifecycleHandler = null
+        }
+      }),
+      shutdown: vi.fn(async () => undefined),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+    const sidecar = new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: () => ({
+        trackThread: vi.fn(),
+        dispose: vi.fn(async () => undefined),
+      }),
+    })
+
+    threadLifecycleHandler?.({
+      kind: 'thread_started',
+      thread: { id: 'thread-1', path: '/tmp/rollout.jsonl', ephemeral: false },
+    })
+
+    const onThreadLifecycle = vi.fn()
+    sidecar.attachTerminal({
+      terminalId: 'term-1',
+      onDurableSession: vi.fn(),
+      onThreadLifecycle,
+      onFatal: vi.fn(),
+    })
+
+    expect(onThreadLifecycle).toHaveBeenCalledWith({
+      kind: 'thread_started',
+      thread: expect.objectContaining({ id: 'thread-1' }),
+    })
+  })
+
+  it('replays durable promotion before pending lifecycle evidence on terminal attachment', () => {
+    let threadLifecycleHandler: ((event: {
+      kind: 'thread_started'
+      thread: { id: string; path: string | null; ephemeral: boolean }
+    }) => void) | null = null
+    let trackerOptions:
+      | {
+        onDurableRollout: (sessionId: string) => void
+      }
+      | null = null
+    const runtime = {
+      onExit: vi.fn(() => () => undefined),
+      onThreadStarted: vi.fn(() => () => undefined),
+      onThreadLifecycle: vi.fn((handler) => {
+        threadLifecycleHandler = handler
+        return () => {
+          threadLifecycleHandler = null
+        }
+      }),
+      shutdown: vi.fn(async () => undefined),
+      ensureReady: vi.fn(async () => ({
+        wsUrl: 'ws://127.0.0.1:4567',
+        processPid: 101,
+        codexHome: '/tmp/fake-codex-home',
+      })),
+    }
+    const sidecar = new CodexTerminalSidecar({
+      runtime: runtime as any,
+      createDurableRolloutTracker: (options) => {
+        trackerOptions = { onDurableRollout: options.onDurableRollout }
+        return {
+          trackThread: vi.fn(),
+          dispose: vi.fn(async () => undefined),
+        }
+      },
+    })
+
+    threadLifecycleHandler?.({
+      kind: 'thread_started',
+      thread: { id: 'thread-fast', path: '/tmp/rollout.jsonl', ephemeral: false },
+    })
+    trackerOptions?.onDurableRollout('thread-fast')
+
+    const replayOrder: string[] = []
+    sidecar.attachTerminal({
+      terminalId: 'term-1',
+      onDurableSession: (sessionId) => replayOrder.push(`durable:${sessionId}`),
+      onThreadLifecycle: (event) => {
+        if (event.kind === 'thread_started') {
+          replayOrder.push(`lifecycle:${event.thread.id}`)
+        }
+      },
+      onFatal: vi.fn(),
+    })
+
+    expect(replayOrder).toEqual(['durable:thread-fast', 'lifecycle:thread-fast'])
+  })
+
   it('disposes the rollout tracker before shutting the runtime down', async () => {
     const lifecycle: string[] = []
     const runtime = {
       onExit: vi.fn(() => () => undefined),
       onThreadStarted: vi.fn(() => () => undefined),
+      onThreadLifecycle: vi.fn(() => () => undefined),
       shutdown: vi.fn(async () => {
         lifecycle.push('runtime')
       }),
@@ -217,6 +373,7 @@ describe('CodexTerminalSidecar durable rollout tracking', () => {
       unwatchPath: vi.fn(async () => undefined),
       onExit: vi.fn(() => () => undefined),
       onThreadStarted: vi.fn(() => () => undefined),
+      onThreadLifecycle: vi.fn(() => () => undefined),
       shutdown: vi.fn(async () => undefined),
       ensureReady: vi.fn(async () => ({
         wsUrl: 'ws://127.0.0.1:4567',

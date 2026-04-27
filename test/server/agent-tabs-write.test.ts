@@ -184,6 +184,101 @@ describe('tab endpoints', () => {
     }))
   })
 
+  it('retries initial Codex launch before creating a Codex tab terminal', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    codexLaunchPlanner.failNext(2)
+    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
+      tabId: input.tabId,
+      paneId: input.paneId,
+    }))
+    const layoutStore = {
+      createTab,
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
+
+    expect(res.body.status).toBe('ok')
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(3)
+    expect(createTab).toHaveBeenCalledTimes(1)
+    expect(registry.create).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails Codex tab creation without mutating layout when launch retries are exhausted', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    codexLaunchPlanner.failNext(5)
+    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
+      tabId: input.tabId,
+      paneId: input.paneId,
+    }))
+    const layoutStore = {
+      createTab,
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab: () => ({}),
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
+
+    expect(res.status).toBe(500)
+    expect(res.body).toEqual({ status: 'error', message: 'fake Codex launch failed' })
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(5)
+    expect(createTab).not.toHaveBeenCalled()
+    expect(registry.create).not.toHaveBeenCalled()
+  }, 15_000)
+
+  it('shuts down the planned Codex sidecar when tab terminal creation fails before registry ownership', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    registry.create.mockImplementation(() => {
+      throw new Error('spawn failed')
+    })
+    const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+    const createTab = vi.fn((input: { tabId: string; paneId: string }) => ({
+      tabId: input.tabId,
+      paneId: input.paneId,
+    }))
+    const closeTab = vi.fn()
+    const layoutStore = {
+      createTab,
+      attachPaneContent: vi.fn(),
+      selectTab: () => ({}),
+      renameTab: () => ({}),
+      closeTab,
+      hasTab: () => true,
+      selectNextTab: () => ({ tabId: 'tab_1' }),
+      selectPrevTab: () => ({ tabId: 'tab_1' }),
+    }
+    app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
+
+    const res = await request(app).post('/api/tabs').send({ mode: 'codex', name: 'Codex' })
+
+    expect(res.status).toBe(500)
+    expect(res.body).toEqual({ status: 'error', message: 'spawn failed' })
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(closeTab).toHaveBeenCalledWith(createTab.mock.calls[0]?.[0]?.tabId)
+  })
+
   it('rejects invalid Codex sandbox values with a 400 before spawning', async () => {
     const app = express()
     app.use(express.json())

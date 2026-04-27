@@ -31,10 +31,6 @@ import {
   waitForOpencodeDbSession,
 } from '../../helpers/coding-cli/real-session-contract-harness.js'
 
-if (process.env.FRESHELL_REAL_PROVIDER_CONTRACTS !== '1') {
-  throw new Error('This opt-in suite must run with FRESHELL_REAL_PROVIDER_CONTRACTS=1.')
-}
-
 const note = await loadCodingCliSessionContractNote()
 const noteMarkdown = await readCodingCliSessionContractMarkdown()
 const providerBinaries = await resolveProviderBinaries(['codex', 'claude', 'opencode'] as const)
@@ -55,9 +51,9 @@ function requireResolvedBinary(binary: { executable: string; resolvedPath: strin
 
 describe.sequential('coding cli real provider session contract', () => {
   it('loads the checked-in lab note facts and date rationale', async () => {
-    expect(note.capturedOn).toBe('2026-04-23')
+    expect(note.capturedOn).toBe('2026-04-26')
     expect(note.planCreatedOn).toBe('2026-04-19')
-    expect(note.dateReason).toContain('2026-04-23')
+    expect(note.dateReason).toContain('2026-04-26')
     expect(note.dateReason).toContain('2026-04-19')
     expect(noteMarkdown).toContain('The implementation plan file is dated `2026-04-19`')
     expect(note.cleanup.ownershipReportFields).toEqual([
@@ -109,7 +105,7 @@ describe.sequential('coding cli real provider session contract', () => {
       }
     }, 60_000)
 
-    it('surfaces the exact rollout path before it exists and emits fs/changed when the first turn materializes it', async () => {
+    it('surfaces the exact rollout path before it exists and materializes the artifact there', async () => {
       const codexPath = requireResolvedBinary(codexBinary)
       const workspace = await ProbeWorkspace.create('codex-rollout-watch')
       const rolloutWatchId = 'probe-rollout-path'
@@ -144,16 +140,18 @@ describe.sequential('coding cli real provider session contract', () => {
         const artifactPath = await waitForCodexSessionArtifact(workspace)
         expect(artifactPath).toBe(rolloutPath)
 
-        const changed = await client.waitForNotification(
-          'fs/changed',
-          (notification) => (
-            Array.isArray(notification.params?.changedPaths)
-            && notification.params.changedPaths.includes(rolloutPath)
-            && [rolloutWatchId, parentWatchId].includes(notification.params?.watchId)
-          ),
-          120_000,
-        )
-        expect(changed.params.watchId).toBeOneOf([rolloutWatchId, parentWatchId])
+        if (note.providers.codex.appServerChangedPathsMentionRolloutPath) {
+          const changed = await client.waitForNotification(
+            'fs/changed',
+            (notification) => (
+              Array.isArray(notification.params?.changedPaths)
+              && notification.params.changedPaths.includes(rolloutPath)
+              && [rolloutWatchId, parentWatchId].includes(notification.params?.watchId)
+            ),
+            120_000,
+          )
+          expect(changed.params.watchId).toBeOneOf([rolloutWatchId, parentWatchId])
+        }
 
         await client.fsUnwatch(rolloutWatchId)
         await client.fsUnwatch(parentWatchId)

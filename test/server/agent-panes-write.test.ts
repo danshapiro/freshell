@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { LayoutStore } from '../../server/agent-api/layout-store'
 import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const expectedFreshellToken = process.env.AUTH_TOKEN || ''
@@ -68,6 +69,7 @@ it('passes the planned Codex sidecar when splitting a pane in codex mode', async
     mode: 'codex',
     terminalId: planCreate.terminalId,
     codexSidecar: codexLaunchPlanner.sidecar,
+    codexLaunchFactory: expect.any(Function),
     providerSettings: expect.objectContaining({
       codexAppServer: expect.objectContaining({
         wsUrl: expect.any(String),
@@ -75,6 +77,89 @@ it('passes the planned Codex sidecar when splitting a pane in codex mode', async
     }),
   }))
 })
+
+it('shuts down the planned Codex sidecar when split terminal creation fails before registry ownership', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => {
+    throw new Error('spawn failed')
+  })
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body).toEqual({ status: 'error', message: 'spawn failed' })
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(attachPaneContent).not.toHaveBeenCalled()
+})
+
+it('retries initial Codex launch before splitting a pane creates a terminal', async () => {
+  const app = express()
+  app.use(express.json())
+  const splitPane = vi.fn(() => ({ newPaneId: 'pane_new', tabId: 'tab_1' }))
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  codexLaunchPlanner.failNext(2)
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { splitPane, attachPaneContent },
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
+
+  expect(res.body.status).toBe('ok')
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(3)
+  expect(registryCreate).toHaveBeenCalledTimes(1)
+})
+
+it('rolls back the layout mirror when Codex pane split launch retries are exhausted', async () => {
+  const app = express()
+  app.use(express.json())
+  const layoutStore = new LayoutStore()
+  layoutStore.createTab({ tabId: 'tab_1', paneId: 'pane_1', terminalId: 'term_1' })
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
+  const broadcastUiCommand = vi.fn()
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  codexLaunchPlanner.failNext(5)
+  app.use('/api', createAgentApiRouter({
+    layoutStore,
+    registry: { create: registryCreate },
+    wsHandler: { broadcastUiCommand },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/split').send({ direction: 'horizontal', mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body).toEqual({ status: 'error', message: 'fake Codex launch failed' })
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(5)
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(broadcastUiCommand).not.toHaveBeenCalled()
+  expect(layoutStore.listPanes('tab_1')).toEqual([
+    expect.objectContaining({
+      id: 'pane_1',
+      kind: 'terminal',
+      terminalId: 'term_1',
+    }),
+  ])
+  expect(layoutStore.listTabs()).toEqual([
+    expect.objectContaining({
+      id: 'tab_1',
+      activePaneId: 'pane_1',
+    }),
+  ])
+}, 15_000)
 
 it('rejects invalid Codex settings when splitting a pane before spawning', async () => {
   const app = express()
@@ -202,6 +287,81 @@ it('passes the planned Codex sidecar when respawning a pane in codex mode', asyn
     terminalId: planCreate.terminalId,
     mode: 'codex',
   }))
+})
+
+it('retries initial Codex launch before respawning a Codex pane terminal', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  codexLaunchPlanner.failNext(2)
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
+
+  expect(res.body.status).toBe('ok')
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(3)
+  expect(registryCreate).toHaveBeenCalledTimes(1)
+  expect(attachPaneContent).toHaveBeenCalledTimes(1)
+})
+
+it('fails Codex pane respawn before replacing content when launch retries are exhausted', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_new' }))
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  codexLaunchPlanner.failNext(5)
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body).toEqual({ status: 'error', message: 'fake Codex launch failed' })
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(5)
+  expect(registryCreate).not.toHaveBeenCalled()
+  expect(attachPaneContent).not.toHaveBeenCalled()
+}, 15_000)
+
+it('shuts down the planned Codex sidecar when respawn terminal creation fails before registry ownership', async () => {
+  const app = express()
+  app.use(express.json())
+  const attachPaneContent = vi.fn()
+  const registryCreate = vi.fn(() => {
+    throw new Error('spawn failed')
+  })
+  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+    } as any,
+    registry: { create: registryCreate },
+    codexLaunchPlanner,
+  }))
+
+  const res = await request(app).post('/api/panes/pane_1/respawn').send({ mode: 'codex' })
+
+  expect(res.status).toBe(500)
+  expect(res.body).toEqual({ status: 'error', message: 'spawn failed' })
+  expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
+  expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+  expect(attachPaneContent).not.toHaveBeenCalled()
 })
 
 it('resolves tmux-style pane targets for close', async () => {

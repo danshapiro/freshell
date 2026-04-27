@@ -714,16 +714,8 @@ export async function seedOpencodeHomes(workspace: ProbeWorkspace): Promise<{
 }> {
   const dataHome = workspace.inTemp('.local', 'share')
   const configHome = workspace.inTemp('.config')
-  await copyFileStrict(
-    path.join(os.homedir(), '.local', 'share', 'opencode', 'auth.json'),
-    path.join(dataHome, 'opencode', 'auth.json'),
-    'OpenCode auth.json',
-  )
-  await copyFileStrict(
-    path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
-    path.join(configHome, 'opencode', 'opencode.json'),
-    'OpenCode opencode.json',
-  )
+  await fsp.mkdir(path.join(dataHome, 'opencode'), { recursive: true })
+  await fsp.mkdir(path.join(configHome, 'opencode'), { recursive: true })
   return {
     dataHome,
     configHome,

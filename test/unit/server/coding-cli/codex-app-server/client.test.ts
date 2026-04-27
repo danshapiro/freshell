@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -96,6 +96,24 @@ async function stopFakeCodexAppServer(handle: FakeServerHandle): Promise<void> {
   })
 }
 
+async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+
+  while (Date.now() < deadline) {
+    try {
+      await assertion()
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
+  if (lastError instanceof Error) throw lastError
+  throw new Error('Timed out waiting for assertion')
+}
+
 afterEach(async () => {
   await Promise.all([...fakeServers].map((server) => stopFakeCodexAppServer(server)))
 })
@@ -143,6 +161,104 @@ describe('CodexAppServerClient', () => {
       path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
       ephemeral: false,
     })
+  })
+
+  it('emits thread lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/started',
+            params: {
+              thread: {
+                id: 'thread-resume-1',
+                path: '/tmp/codex/rollout-thread-resume-1.jsonl',
+                ephemeral: false,
+              },
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_started',
+      thread: {
+        id: 'thread-resume-1',
+        path: '/tmp/codex/rollout-thread-resume-1.jsonl',
+        ephemeral: false,
+      },
+    }))
+  })
+
+  it('emits thread closed lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/closed',
+            params: {
+              threadId: 'thread-resume-1',
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_closed',
+      threadId: 'thread-resume-1',
+    }))
+  })
+
+  it('emits thread status lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/status/changed',
+            params: {
+              threadId: 'thread-resume-1',
+              status: { type: 'notLoaded' },
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_status_changed',
+      threadId: 'thread-resume-1',
+      status: { type: 'notLoaded' },
+    }))
+  })
+
+  it('emits a disconnect callback when the app-server client socket closes unexpectedly', async () => {
+    const server = await startFakeCodexAppServer({ closeSocketAfterMethodsOnce: ['initialize'] })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const onDisconnect = vi.fn()
+    client.onDisconnect(onDisconnect)
+
+    await client.initialize()
+
+    await waitFor(() => expect(onDisconnect).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'close',
+    })))
   })
 
   it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {

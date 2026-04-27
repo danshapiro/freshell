@@ -73,8 +73,8 @@ import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
-import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
+import { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
 
 function compileArgTemplate(
   template: string[] | undefined,

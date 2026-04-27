@@ -292,6 +292,7 @@ describe('ws protocol', () => {
     registry.resizeCalls = []
     registry.killCalls = []
     codexLaunchPlanner.planCreateCalls = []
+    codexLaunchPlanner.failNext(0)
   })
 
   afterAll(async () => {
@@ -518,10 +519,60 @@ describe('ws protocol', () => {
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
       },
     })
+    expect(registry.createCalls[0]?.codexLaunchBaseProviderSettings).toEqual({
+      model: 'gpt-5-codex',
+      sandbox: 'workspace-write',
+      permissionMode: undefined,
+    })
     expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
     await closeWebSocket(ws)
   })
+
+  it('retries initial Codex launch before terminal.created', async () => {
+    codexLaunchPlanner.failNext(2)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-codex-launch-retry'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
+
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(created.terminalId).toMatch(/^term_/)
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(3)
+    expect(registry.createCalls).toHaveLength(1)
+    await closeWebSocket(ws)
+  })
+
+  it('returns one create error and creates no record when initial Codex launch retries are exhausted', async () => {
+    codexLaunchPlanner.failNext(5)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-codex-launch-exhausted'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
+
+    const error = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.requestId === requestId,
+      12_000,
+    )
+
+    expect(error.code).toBe('PTY_SPAWN_FAILED')
+    expect(error.message).toContain('fake Codex launch failed')
+    expect(codexLaunchPlanner.planCreateCalls).toHaveLength(5)
+    expect(registry.createCalls).toHaveLength(0)
+    await closeWebSocket(ws)
+  }, 15_000)
 
   it('passes canonical Claude sessionRef through to registry.create without echoing a legacy durable id', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
@@ -822,6 +873,35 @@ describe('ws protocol', () => {
     expect(registry.inputCalls[0].terminalId).toBe(terminalId)
     expect(registry.inputCalls[0].data).toBe('echo hello')
 
+    await close()
+  })
+
+  it('terminal.input does not send INVALID_TERMINAL_ID when Codex recovery input is handled locally', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const terminalId = await createTerminal(ws, 'create-for-recovery-input')
+    const record = registry.get(terminalId)
+    record.mode = 'codex'
+    record.codex = { recoveryState: 'recovering_durable' }
+
+    const observed: any[] = []
+    const onMessage = (data: WebSocket.Data) => {
+      observed.push(JSON.parse(data.toString()))
+    }
+    ws.on('message', onMessage)
+
+    ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'while recovering' }))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    expect(registry.inputCalls).toContainEqual({ terminalId, data: 'while recovering' })
+    expect(observed).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        terminalId,
+      }),
+    ]))
+
+    ws.off('message', onMessage)
     await close()
   })
 

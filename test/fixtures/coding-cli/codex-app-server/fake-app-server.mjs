@@ -53,6 +53,7 @@ function ensureDurableArtifact(threadId) {
     thread,
   }
 }
+
 function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
     return Promise.resolve()
@@ -152,10 +153,12 @@ if (process.env.FAKE_CODEX_APP_SERVER_ARG_LOG) {
 }
 const closeSocketAfterMethodsOnce = new Set(behavior.closeSocketAfterMethodsOnce || [])
 const exitProcessAfterMethodsOnce = new Set(behavior.exitProcessAfterMethodsOnce || [])
+const threadClosedAfterMethodsOnce = new Set(behavior.threadClosedAfterMethodsOnce || [])
 const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
 const watches = new Map()
+const activeThreadIds = new Set()
 
 const wss = new WebSocketServer({ host, port })
 
@@ -181,6 +184,61 @@ function emitConfiguredNotifications(method) {
   for (const notification of notifications) {
     broadcastNotification(notification.method, notification.params)
   }
+}
+
+function appendThreadOperation(method, params, result) {
+  const logPath = behavior.appendThreadOperationLogPath
+  if (!logPath || !method.startsWith('thread/')) {
+    return
+  }
+  const threadId = result?.thread?.id || params?.threadId || null
+  fs.mkdirSync(path.dirname(logPath), { recursive: true })
+  fs.appendFileSync(logPath, JSON.stringify({
+    method,
+    threadId,
+    params,
+    listenUrl,
+    at: new Date().toISOString(),
+  }) + '\n', 'utf8')
+}
+
+function claimCrossProcessOnce(markerPath, key) {
+  if (!markerPath) {
+    return true
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true })
+    fs.writeFileSync(markerPath, `${key}\n`, { flag: 'wx' })
+    return true
+  } catch (error) {
+    if (error && error.code === 'EEXIST') {
+      return false
+    }
+    throw error
+  }
+}
+
+function emitConfiguredThreadStatusChanges(method) {
+  const byMethod = behavior.threadStatusChangedAfterMethodsOnce
+  const entries = byMethod?.[method]
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return
+  }
+  if (!claimCrossProcessOnce(behavior.threadStatusChangedAfterMethodsOnceMarkerPath, `thread-status:${method}`)) {
+    return
+  }
+  delete byMethod[method]
+  for (const entry of entries) {
+    broadcastNotification('thread/status/changed', {
+      threadId: entry.threadId,
+      status: entry.status,
+    })
+  }
+}
+
+function claimCrossProcessCloseSocketOnce(method) {
+  return claimCrossProcessOnce(behavior.closeSocketAfterMethodsOnceMarkerPath, `close-socket:${method}`)
 }
 
 wss.on('connection', (socket) => {
@@ -214,6 +272,17 @@ wss.on('connection', (socket) => {
       return
     }
 
+    if (behavior.assertNoDuplicateActiveThread && method === 'thread/start' && activeThreadIds.size > 0) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32001,
+          message: `Duplicate active thread start attempted while ${[...activeThreadIds].join(', ')} is active`,
+        },
+      }))
+      return
+    }
+
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
@@ -236,11 +305,20 @@ wss.on('connection', (socket) => {
         id: message.id,
         result,
       }))
+      appendThreadOperation(method, message.params, result)
       if (method === 'initialize') {
         initialized = true
       }
       if (method === 'thread/start') {
         const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
+        activeThreadIds.add(thread.id)
+        broadcastNotification('thread/started', {
+          thread,
+        })
+      }
+      if (method === 'thread/resume') {
+        const thread = result?.thread || getThreadHandle(message.params?.threadId || 'thread-new-1')
+        activeThreadIds.add(thread.id)
         broadcastNotification('thread/started', {
           thread,
         })
@@ -273,11 +351,28 @@ wss.on('connection', (socket) => {
         }
       }
       emitConfiguredNotifications(method)
-      if (closeSocketAfterMethodsOnce.delete(method)) {
+      if (
+        threadClosedAfterMethodsOnce.delete(method)
+        && claimCrossProcessOnce(behavior.threadClosedAfterMethodsOnceMarkerPath, `thread-closed:${method}`)
+      ) {
+        const threadId = result?.thread?.id || message.params?.threadId || 'thread-new-1'
+        activeThreadIds.delete(threadId)
+        broadcastNotification('thread/closed', { threadId })
+      }
+      emitConfiguredThreadStatusChanges(method)
+      if (closeSocketAfterMethodsOnce.delete(method) && claimCrossProcessCloseSocketOnce(method)) {
         setTimeout(() => socket.close(), 0)
       }
       if (exitProcessAfterMethodsOnce.delete(method)) {
-        setTimeout(() => process.exit(0), 0)
+        setTimeout(() => {
+          if (behavior.stdoutBeforeExit) {
+            process.stdout.write(String(behavior.stdoutBeforeExit))
+          }
+          if (behavior.stderrBeforeExit) {
+            process.stderr.write(String(behavior.stderrBeforeExit))
+          }
+          process.exit(0)
+        }, 0)
       }
     }, delayMs)
   })

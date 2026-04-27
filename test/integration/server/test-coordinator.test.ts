@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { buildCoordinatorEndpoint, tryListen } from '../../../scripts/testing/coordinator-endpoint.js'
 import {
   buildReusableSuccessKey,
+  type HolderRecord,
   type LatestRunRecord,
   type ReusableSuccessRecord,
 } from '../../../scripts/testing/coordinator-schema.js'
@@ -354,7 +355,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_SUMMARY: 'Nightly full suite',
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'npm:test:balanced': { holdMs: 1_000 },
+          'npm:test:balanced': { holdMs: 5_000 },
         }),
       },
     )
@@ -462,7 +463,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'npm:typecheck': { stdout: 'TYPECHECK_MARKER\n', holdMs: 1_000 },
+          'npm:typecheck': { stdout: 'TYPECHECK_MARKER\n', holdMs: 5_000 },
         }),
       },
     )
@@ -534,9 +535,8 @@ describe('test coordinator CLI', () => {
       expect(queuedCaptures.map((entry) => entry.selector)).not.toContain(prePhaseSelector)
 
       expect((await waitForExit(holder)).code).toBe(0)
-      await waitForRunningStatus(fixture.checkoutRoot, new RegExp(`commandKey: ${commandKey}`))
 
-      const activeHolder = await readHolder(fixture.storeDir)
+      const activeHolder = await waitForHolder(fixture.storeDir, (holder) => holder.entrypoint.commandKey === commandKey)
       expect(activeHolder).toMatchObject({
         entrypoint: {
           commandKey,
@@ -854,7 +854,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:server:--config vitest.server.config.ts --run': { holdMs: 1_000 },
+          'vitest:server:--config vitest.server.config.ts --run': { holdMs: 5_000 },
         }),
       },
     )
@@ -1230,4 +1230,23 @@ async function waitForStatusOutput(cwd: string, pattern: RegExp, timeoutMs = 5_0
   }
 
   throw new Error(`Timed out waiting for status ${pattern}. Last output:\n${lastOutput}`)
+}
+
+async function waitForHolder(
+  storeDir: string,
+  predicate: (holder: HolderRecord) => boolean,
+  timeoutMs = 5_000,
+): Promise<HolderRecord> {
+  const deadline = Date.now() + timeoutMs
+  let lastHolder: HolderRecord | undefined
+
+  while (Date.now() < deadline) {
+    lastHolder = await readHolder(storeDir)
+    if (lastHolder && predicate(lastHolder)) {
+      return lastHolder
+    }
+    await delay(50)
+  }
+
+  throw new Error(`Timed out waiting for holder. Last holder:\n${JSON.stringify(lastHolder, null, 2)}`)
 }

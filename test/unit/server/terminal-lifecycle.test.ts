@@ -182,10 +182,11 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('emits terminal.session.unbound with exit reason when a bound PTY exits', () => {
+      const sessionId = '123e4567-e89b-12d3-a456-426614174000'
       const term = registry.create({
-        mode: 'codex',
+        mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'codex-session-123',
+        resumeSessionId: sessionId,
       })
       const pty = mockPtyProcess.instances[0]
       const onUnbound = vi.fn()
@@ -195,8 +196,8 @@ describe('TerminalRegistry Lifecycle', () => {
 
       expect(onUnbound).toHaveBeenCalledWith({
         terminalId: term.terminalId,
-        provider: 'codex',
-        sessionId: 'codex-session-123',
+        provider: 'claude',
+        sessionId,
         reason: 'exit',
       })
     })

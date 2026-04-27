@@ -360,6 +360,86 @@ describe('ws handshake snapshot', () => {
     }
   })
 
+  it('keeps inventory lifetime status separate from runtime recovery status', async () => {
+    registry.setTerminals([
+      {
+        terminalId: 'term-runtime-running',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef112',
+        createdAt: 10,
+        lastActivityAt: 20,
+        status: 'running',
+        runtimeStatus: 'running',
+      },
+      {
+        terminalId: 'term-runtime-recovering',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef113',
+        createdAt: 11,
+        lastActivityAt: 21,
+        status: 'running',
+        runtimeStatus: 'recovering',
+      },
+      {
+        terminalId: 'term-runtime-failed',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef114',
+        createdAt: 12,
+        lastActivityAt: 22,
+        status: 'running',
+        runtimeStatus: 'recovery_failed',
+      },
+      {
+        terminalId: 'term-runtime-exited',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef115',
+        createdAt: 13,
+        lastActivityAt: 23,
+        status: 'exited',
+      },
+    ])
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const inventoryPromise = waitForMessage(ws, (m) => m.type === 'terminal.inventory', 10_000)
+      await waitForReady(ws, 10_000)
+
+      const inventory = await inventoryPromise
+      const byId = new Map(inventory.terminals.map((terminal: any) => [terminal.terminalId, terminal]))
+      expect(byId.get('term-runtime-running')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'running',
+      })
+      expect(byId.get('term-runtime-recovering')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'recovering',
+      })
+      expect(byId.get('term-runtime-failed')).toMatchObject({
+        status: 'running',
+        runtimeStatus: 'recovery_failed',
+      })
+      expect(byId.get('term-runtime-exited')).toMatchObject({
+        status: 'exited',
+      })
+      expect(byId.get('term-runtime-exited')).not.toHaveProperty('runtimeStatus')
+      expect(inventory.terminals.map((terminal: any) => terminal.status)).toEqual([
+        'running',
+        'running',
+        'running',
+        'exited',
+      ])
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
   it('still omits websocket sessions payloads when no projects exist', async () => {
     snapshot = {
       ...snapshot,

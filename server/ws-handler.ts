@@ -22,6 +22,7 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalStatusMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -33,7 +34,7 @@ import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-reg
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
-import type { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { runCodexLaunchWithRetry, type CodexLaunchFactory, type CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
@@ -407,6 +408,13 @@ export class WsHandler {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
   }
+  private onTerminalStatusBound = (payload: Omit<TerminalStatusMessage, 'type'>) => {
+    if (!payload?.terminalId) return
+    this.broadcast({
+      type: 'terminal.status',
+      ...payload,
+    } satisfies TerminalStatusMessage)
+  }
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
     repaired: (result: SessionRepairResult) => void
@@ -530,6 +538,7 @@ export class WsHandler {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.on?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.on?.('terminal.status', this.onTerminalStatusBound)
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -698,6 +707,43 @@ export class WsHandler {
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
       approvalPolicy: providerSettings?.permissionMode,
     })
+  }
+
+  private createCodexLaunchFactory(
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+  ): CodexLaunchFactory {
+    return async (input) => this.planCodexLaunch(
+      input.cwd,
+      input.resumeSessionId,
+      input.providerSettings ?? providerSettings,
+      input.terminalId,
+      input.envContext ?? {},
+    )
+  }
+
+  private async planCodexLaunchWithRetry(
+    cwd: string | undefined,
+    resumeSessionId: string | undefined,
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
+    requestId: string,
+  ): ReturnType<WsHandler['planCodexLaunch']> {
+    return runCodexLaunchWithRetry(
+      () => this.planCodexLaunch(cwd, resumeSessionId, providerSettings, terminalId, envContext),
+      {
+        shouldRetry: (error) => !(error instanceof CodexLaunchConfigError),
+        onFailedAttempt: ({ attempt, delayMs, error }) => {
+          log.warn({
+            err: error,
+            requestId,
+            terminalId,
+            attempt,
+            nextDelayMs: delayMs,
+          }, 'Codex initial launch planning failed; retrying before terminal.create')
+        },
+      },
+    )
   }
 
   private terminalCreateLockKey(
@@ -1628,6 +1674,7 @@ export class WsHandler {
           createdAt: terminal.createdAt,
           lastActivityAt: terminal.lastActivityAt,
           status: terminal.status,
+          ...(terminal.runtimeStatus ? { runtimeStatus: terminal.runtimeStatus } : {}),
           cwd: terminal.cwd,
         }
       })
@@ -2069,14 +2116,18 @@ export class WsHandler {
               let codexPlan: Awaited<ReturnType<WsHandler['planCodexLaunch']>> | undefined
               const preallocatedTerminalId = nanoid()
               const terminalEnvContext = { tabId: m.tabId, paneId: m.paneId }
+              const codexLaunchFactory = m.mode === 'codex'
+                ? this.createCodexLaunchFactory(providerSettings)
+                : undefined
               try {
                 codexPlan = m.mode === 'codex'
-                  ? await this.planCodexLaunch(
+                  ? await this.planCodexLaunchWithRetry(
                     m.cwd,
                     requestedCodexResumeSessionId,
                     providerSettings,
                     preallocatedTerminalId,
                     terminalEnvContext,
+                    m.requestId,
                   )
                   : undefined
 
@@ -2113,7 +2164,9 @@ export class WsHandler {
                     : {}),
                   envContext: terminalEnvContext,
                   providerSettings: spawnProviderSettings,
+                  ...(m.mode === 'codex' ? { codexLaunchBaseProviderSettings: providerSettings } : {}),
                   ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
+                  ...(codexLaunchFactory ? { codexLaunchFactory } : {}),
                 })
                 if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
                   const recentDirectory = m.cwd.trim()
@@ -3138,6 +3191,7 @@ export class WsHandler {
       off?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.off?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.off?.('terminal.status', this.onTerminalStatusBound)
 
     if (this.sessionRepairService && this.sessionRepairListeners) {
       this.sessionRepairService.off('scanned', this.sessionRepairListeners.scanned)

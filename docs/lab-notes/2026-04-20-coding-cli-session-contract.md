@@ -1,15 +1,15 @@
 # Coding CLI Session Contract Lab Note
 
-This note records the real-binary provider probes rerun on `2026-04-23` inside `/home/user/code/freshell/.worktrees/exact-durable-session-contract`.
+This note records the real-binary provider probes rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`.
 
-The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-23` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
+The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-26` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
 
 ## Machine-readable contract
 ```json
 {
-  "capturedOn": "2026-04-23",
+  "capturedOn": "2026-04-26",
   "planCreatedOn": "2026-04-19",
-  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-23 because that is when the real binaries were re-proved on the implementation machine and the earlier 2026-04-20 Codex note was superseded by the newer contract capture.",
+  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the real binaries were re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior.",
   "cleanup": {
     "liveProcessAuditCommand": "ps -eo pid,ppid,stat,cmd --sort=pid | rg \"codex|claude|opencode\"",
     "ownershipReportFields": [
@@ -37,7 +37,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "codex": {
       "executable": "codex",
       "resolvedPath": "/home/user/.npm-global/bin/codex",
-      "version": "codex-cli 0.123.0",
+      "version": "codex-cli 0.125.0",
       "freshRemoteBootstrapCommand": "codex --remote <ws>",
       "freshRemoteBootstrapEventsBeforeUserTurn": [
         "connection",
@@ -71,9 +71,9 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "appServerThreadPathAvailableBeforeArtifact": true,
       "appServerMissingPathWatchAccepted": true,
       "appServerMissingParentWatchAccepted": true,
-      "appServerWatchEchoesCallerWatchId": true,
+      "appServerWatchEchoesCallerWatchId": false,
       "appServerArtifactMaterializesAtReportedPath": true,
-      "appServerChangedPathsMentionRolloutPath": true,
+      "appServerChangedPathsMentionRolloutPath": false,
       "resumeCommandTemplate": "codex --remote <ws> --no-alt-screen resume <sessionId>",
       "mutableNameSurface": "absent"
     },
@@ -81,7 +81,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "executable": "claude",
       "resolvedPath": "/home/user/bin/claude",
       "isolatedBinaryPath": "/home/user/.local/bin/claude",
-      "version": "2.1.116 (Claude Code)",
+      "version": "2.1.119 (Claude Code)",
       "exactIdCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --session-id <uuid> <prompt>",
       "namedResumeCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --resume <title-or-uuid> [--name <title>] <prompt>",
       "transcriptGlob": ".claude/projects/*/<uuid>.jsonl",
@@ -94,7 +94,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.14.20",
+      "version": "1.14.25",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -138,10 +138,10 @@ command -v codex
 # /home/user/.npm-global/bin/codex
 
 codex --version
-# codex-cli 0.123.0
+# codex-cli 0.125.0
 ```
 
-This 2026-04-23 rerun supersedes the older `codex-cli 0.121.0` capture. The current version of record on this machine is `codex-cli 0.123.0`.
+This 2026-04-26 rerun supersedes the older `codex-cli 0.123.0` capture. The current version of record on this machine is `codex-cli 0.125.0`.
 
 Fresh remote bootstrap was probed with a loopback websocket stub and:
 
@@ -179,11 +179,12 @@ Observed provider-owned artifacts:
 - After `thread/start` and before `turn/start`: no `.codex/sessions/**.jsonl` durable artifact.
 - `thread/start` already returned `thread.ephemeral: false` and a concrete `thread.path` under `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
 - Immediately after `thread/start`, neither the rollout file nor its date directory existed yet.
-- `fs/watch` accepted caller-supplied `watchId` values for both the missing rollout path and the missing parent directory, returned only the canonicalized watched `path`, and later `fs/changed` echoed the original caller-supplied `watchId`.
+- `fs/watch` accepted caller-supplied `watchId` values for both the missing rollout path and the missing parent directory and returned only the canonicalized watched `path`.
 - After the first real `turn/start`: a durable artifact under `.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`.
-- After the first real `turn/start`: the durable artifact appeared at the exact `thread.path`, and `fs/changed.changedPaths` mentioned that exact rollout path.
+- After the first real `turn/start`: the durable artifact appeared at the exact `thread.path`.
+- In the 2026-04-26 rerun, no `fs/changed` notification was observed for the newly materialized rollout path within the historical timeout, so durable detection must not depend on that notification.
 
-Short JSON-ish transcript from the 2026-04-23 rerun:
+Short JSON-ish transcript from the 2026-04-26 rerun:
 
 ```json
 {
@@ -208,10 +209,7 @@ Short JSON-ish transcript from the 2026-04-23 rerun:
       "result": { "path": "<same parent directory>" }
     }
   ],
-  "fs/changed": {
-    "watchId": "probe-rollout-path|probe-rollout-parent",
-    "changedPaths": ["<same rollout path>"]
-  }
+  "fs/changed": null
 }
 ```
 
@@ -240,7 +238,7 @@ command -v claude
 # /home/user/bin/claude
 
 claude --version
-# 2.1.116 (Claude Code)
+# 2.1.119 (Claude Code)
 ```
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.
@@ -289,7 +287,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.14.20
+# 1.14.25
 ```
 
 Fresh isolated runs were probed with:
@@ -300,6 +298,7 @@ XDG_DATA_HOME=<temp-home>/.local/share XDG_CONFIG_HOME=<temp-home>/.config openc
 
 Observed durable identity rule:
 
+- The 2026-04-26 rerun used isolated empty OpenCode data/config roots for the session-identity probes so stale user-local provider configuration could not affect the contract.
 - The first JSON `step_start` event carried a `sessionID`.
 - That exact `sessionID` matched the `session.id` row written into the isolated OpenCode database.
 
@@ -313,7 +312,7 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.20`.
+- `/global/health` returned a healthy payload with version `1.14.25`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
 

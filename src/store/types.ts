@@ -1,4 +1,4 @@
-export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
+export type TerminalStatus = 'creating' | 'running' | 'recovering' | 'recovery_failed' | 'exited' | 'error'
 
 import type {
   AttentionDismiss,
@@ -73,6 +73,7 @@ export interface BackgroundTerminal {
   lastActivityAt: number
   cwd?: string
   status: 'running' | 'exited'
+  runtimeStatus?: 'running' | 'recovering' | 'recovery_failed'
   hasClients: boolean
   mode?: TabMode
   sessionRef?: SessionLocator

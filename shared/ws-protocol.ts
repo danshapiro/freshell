@@ -485,6 +485,14 @@ export type TerminalExitMessage = {
   exitCode: number
 }
 
+export type TerminalStatusMessage = {
+  type: 'terminal.status'
+  terminalId: string
+  status: 'running' | 'recovering' | 'recovery_failed'
+  reason?: string
+  attempt?: number
+}
+
 export type TerminalOutputMessage = {
   type: 'terminal.output'
   terminalId: string
@@ -730,6 +738,7 @@ export type TerminalInventoryMessage = {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
+    runtimeStatus?: 'running' | 'recovering' | 'recovery_failed'
     cwd?: string
   }>
   terminalMeta: TerminalMetaRecord[]
@@ -745,6 +754,7 @@ export type ServerMessage =
   | TerminalAttachReadyMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
+  | TerminalStatusMessage
   | TerminalOutputMessage
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage

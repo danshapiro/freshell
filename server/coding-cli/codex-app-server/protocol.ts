@@ -88,6 +88,31 @@ export const CodexThreadStartedNotificationSchema = z.object({
   }).passthrough(),
 }).passthrough()
 
+export const CodexThreadStartedLifecycleNotificationSchema = CodexThreadStartedNotificationSchema
+
+export const CodexThreadClosedNotificationSchema = z.object({
+  method: z.literal('thread/closed'),
+  params: z.object({
+    threadId: z.string().min(1),
+  }).passthrough(),
+}).passthrough()
+
+export const CodexThreadStatusChangedNotificationSchema = z.object({
+  method: z.literal('thread/status/changed'),
+  params: z.object({
+    threadId: z.string().min(1),
+    status: z.object({
+      type: z.string().min(1),
+    }).passthrough(),
+  }).passthrough(),
+}).passthrough()
+
+export const CodexThreadLifecycleNotificationSchema = z.union([
+  CodexThreadStartedLifecycleNotificationSchema,
+  CodexThreadClosedNotificationSchema,
+  CodexThreadStatusChangedNotificationSchema,
+])
+
 export const CodexFsChangedNotificationSchema = z.object({
   method: z.literal('fs/changed'),
   params: z.object({
@@ -108,4 +133,7 @@ export type CodexFsWatchResult = z.infer<typeof CodexFsWatchResultSchema>
 export type CodexFsUnwatchParams = z.infer<typeof CodexFsUnwatchParamsSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>
 export type CodexThreadStartedNotification = z.infer<typeof CodexThreadStartedNotificationSchema>
+export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNotificationSchema>
+export type CodexThreadStatusChangedNotification = z.infer<typeof CodexThreadStatusChangedNotificationSchema>
+export type CodexThreadLifecycleNotification = z.infer<typeof CodexThreadLifecycleNotificationSchema>
 export type CodexFsChangedNotification = z.infer<typeof CodexFsChangedNotificationSchema>

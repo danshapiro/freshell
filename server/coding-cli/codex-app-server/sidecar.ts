@@ -8,14 +8,21 @@ import {
   type CodexDurableRolloutTrackerOptions,
 } from './durable-rollout-tracker.js'
 import type { CodexThreadHandle } from './protocol.js'
-import { CodexAppServerRuntime } from './runtime.js'
+import type { CodexThreadLifecycleEvent } from './client.js'
+import {
+  CodexAppServerRuntime,
+  type CodexAppServerRuntimeFailureSource,
+} from './runtime.js'
 const SIDECAR_OWNERSHIP_DIR = path.join(os.tmpdir(), 'freshell-codex-sidecars')
+const MAX_PENDING_LIFECYCLE_EVENTS = 10
 
 type CodexSidecarReady = {
   wsUrl: string
   processPid: number
   codexHome: string
 }
+
+type CodexTerminalFatalSource = CodexAppServerRuntimeFailureSource | 'sidecar_fatal'
 
 type SidecarProcessIdentity = {
   commandLine: string[]
@@ -35,7 +42,8 @@ type SidecarOwnershipMetadata = {
 type CodexTerminalAttachment = {
   terminalId: string
   onDurableSession: (sessionId: string) => void
-  onFatal: (error: Error) => void
+  onThreadLifecycle: (event: CodexThreadLifecycleEvent) => void
+  onFatal: (error: Error, source: CodexTerminalFatalSource) => void
 }
 
 type CodexTerminalSidecarOptions = {
@@ -109,13 +117,16 @@ export class CodexTerminalSidecar {
   private readonly metadataPath = path.join(SIDECAR_OWNERSHIP_DIR, `${this.metadataId}.json`)
   private readonly cleanupRuntimeExit: () => void
   private readonly cleanupThreadStarted: () => void
+  private readonly cleanupThreadLifecycle: () => void
 
   private ready: CodexSidecarReady | null = null
   private readyPromise: Promise<CodexSidecarReady> | null = null
   private attachedTerminal: CodexTerminalAttachment | null = null
   private shuttingDown = false
-  private pendingFatalError: Error | null = null
+  private pendingFatal: { error: Error; source: CodexTerminalFatalSource } | null = null
   private durableSessionId: string | null = null
+  private readonly pendingLifecycleEvents: CodexThreadLifecycleEvent[] = []
+  private readonly observedThreadStartedIds = new Set<string>()
 
   constructor(options: CodexTerminalSidecarOptions = {}) {
     this.runtime = options.runtime ?? new CodexAppServerRuntime(
@@ -140,11 +151,17 @@ export class CodexTerminalSidecar {
         this.promoteDurableSession(sessionId)
       },
     })
-    this.cleanupRuntimeExit = this.runtime.onExit((error) => {
+    this.cleanupRuntimeExit = this.runtime.onExit((error, source) => {
       if (this.shuttingDown) {
         return
       }
-      this.handleFatal(error ?? new Error('Codex app-server sidecar exited unexpectedly.'))
+      this.handleFatal(
+        error ?? new Error('Codex app-server sidecar exited unexpectedly.'),
+        source ?? 'app_server_exit',
+      )
+    })
+    this.cleanupThreadLifecycle = this.runtime.onThreadLifecycle((event) => {
+      this.noteThreadLifecycle(event)
     })
     this.cleanupThreadStarted = this.runtime.onThreadStarted((thread) => {
       this.noteThreadStarted(thread)
@@ -175,19 +192,24 @@ export class CodexTerminalSidecar {
   attachTerminal(input: CodexTerminalAttachment): void {
     this.attachedTerminal = input
     void this.writeOwnershipMetadata()
-    if (this.pendingFatalError) {
-      input.onFatal(this.pendingFatalError)
-      return
-    }
     if (this.durableSessionId) {
       input.onDurableSession(this.durableSessionId)
+    }
+    for (const event of this.pendingLifecycleEvents) {
+      input.onThreadLifecycle(event)
+    }
+    if (this.pendingFatal) {
+      input.onFatal(this.pendingFatal.error, this.pendingFatal.source)
+      return
     }
   }
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true
     this.cleanupRuntimeExit()
+    this.cleanupThreadLifecycle()
     this.cleanupThreadStarted()
+    this.pendingLifecycleEvents.length = 0
     await this.durableRolloutTracker.dispose()
     await this.runtime.shutdown()
     this.ready = null
@@ -197,10 +219,48 @@ export class CodexTerminalSidecar {
   }
 
   private noteThreadStarted(thread: CodexThreadHandle): void {
-    if (!thread.id || this.shuttingDown || this.durableSessionId) {
+    if (!this.recordThreadStarted(thread)) {
       return
     }
-    this.durableRolloutTracker.trackThread(thread)
+    this.forwardThreadLifecycle({
+      kind: 'thread_started',
+      thread,
+    })
+  }
+
+  private noteThreadLifecycle(event: CodexThreadLifecycleEvent): void {
+    if (this.shuttingDown) {
+      return
+    }
+    if (event.kind === 'thread_started') {
+      if (!this.recordThreadStarted(event.thread)) {
+        return
+      }
+    }
+    this.forwardThreadLifecycle(event)
+  }
+
+  private recordThreadStarted(thread: CodexThreadHandle): boolean {
+    if (!thread.id || this.shuttingDown || this.observedThreadStartedIds.has(thread.id)) {
+      return false
+    }
+    this.observedThreadStartedIds.add(thread.id)
+    if (!this.durableSessionId) {
+      this.durableRolloutTracker.trackThread(thread)
+    }
+    return true
+  }
+
+  private forwardThreadLifecycle(event: CodexThreadLifecycleEvent): void {
+    const terminal = this.attachedTerminal
+    if (terminal) {
+      terminal.onThreadLifecycle(event)
+      return
+    }
+    this.pendingLifecycleEvents.push(event)
+    if (this.pendingLifecycleEvents.length > MAX_PENDING_LIFECYCLE_EVENTS) {
+      this.pendingLifecycleEvents.splice(0, this.pendingLifecycleEvents.length - MAX_PENDING_LIFECYCLE_EVENTS)
+    }
   }
 
   private promoteDurableSession(threadId: string): void {
@@ -211,9 +271,9 @@ export class CodexTerminalSidecar {
     this.attachedTerminal?.onDurableSession(threadId)
   }
 
-  private handleFatal(error: Error): void {
-    this.pendingFatalError = error
-    this.attachedTerminal?.onFatal(error)
+  private handleFatal(error: Error, source: CodexTerminalFatalSource = 'sidecar_fatal'): void {
+    this.pendingFatal = { error, source }
+    this.attachedTerminal?.onFatal(error, source)
   }
 
   private async writeOwnershipMetadata(): Promise<void> {

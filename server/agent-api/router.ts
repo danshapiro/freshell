@@ -3,7 +3,12 @@ import fs from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
 import { allocateLocalhostPort } from '../local-port.js'
-import type { CodexLaunchPlan, CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
+import {
+  runCodexLaunchWithRetry,
+  type CodexLaunchFactory,
+  type CodexLaunchPlan,
+  type CodexLaunchPlanner,
+} from '../coding-cli/codex-app-server/launch-planner.js'
 import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
@@ -23,6 +28,11 @@ const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini'
 
 function agentRouteErrorStatus(error: unknown): number {
   return error instanceof CodexLaunchConfigError ? 400 : 500
+}
+
+async function shutdownUnownedCodexSidecar(sidecar: CodexLaunchPlan['sidecar'] | undefined): Promise<void> {
+  if (!sidecar) return
+  await sidecar.shutdown().catch(() => undefined)
 }
 
 /**
@@ -59,7 +69,13 @@ async function resolveSpawnProviderSettings(
 ): Promise<{
   sessionRef?: SessionRef
   providerSettings?: ProviderSettings
+  codexLaunchBaseProviderSettings?: {
+    model?: string
+    sandbox?: string
+    permissionMode?: string
+  }
   codexSidecar?: CodexLaunchPlan['sidecar']
+  codexLaunchFactory?: CodexLaunchFactory
 }> {
   const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
   const sessionRef = opts.sessionRef?.provider === mode ? opts.sessionRef : undefined
@@ -70,15 +86,30 @@ async function resolveSpawnProviderSettings(
     if (!opts.terminalId) {
       throw new Error('Codex terminal launch requires a preallocated terminal id.')
     }
-    const plan = await opts.codexLaunchPlanner.planCreate({
-      cwd: opts.cwd,
-      terminalId: opts.terminalId,
-      env: buildFreshellTerminalEnv(opts.terminalId, opts.envContext),
-      resumeSessionId: sessionRef?.sessionId,
-      model: providerSettings?.model,
-      sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
-      approvalPolicy: providerSettings?.permissionMode,
+    const terminalId = opts.terminalId
+    const codexLaunchFactory: CodexLaunchFactory = async (input) => opts.codexLaunchPlanner!.planCreate({
+      cwd: input.cwd,
+      terminalId: input.terminalId,
+      env: buildFreshellTerminalEnv(input.terminalId, input.envContext),
+      resumeSessionId: input.resumeSessionId,
+      model: input.providerSettings?.model ?? providerSettings?.model,
+      sandbox: normalizeCodexSandboxSetting(input.providerSettings?.sandbox ?? providerSettings?.sandbox),
+      approvalPolicy: input.providerSettings?.permissionMode ?? providerSettings?.permissionMode,
     })
+    const plan = await runCodexLaunchWithRetry(
+      () => opts.codexLaunchPlanner!.planCreate({
+        cwd: opts.cwd,
+        terminalId,
+        env: buildFreshellTerminalEnv(terminalId, opts.envContext),
+        resumeSessionId: sessionRef?.sessionId,
+        model: providerSettings?.model,
+        sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
+        approvalPolicy: providerSettings?.permissionMode,
+      }),
+      {
+        shouldRetry: (error) => !(error instanceof CodexLaunchConfigError),
+      },
+    )
     return {
       ...(plan.sessionId ? {
         sessionRef: {
@@ -87,6 +118,8 @@ async function resolveSpawnProviderSettings(
         },
       } : {}),
       codexSidecar: plan.sidecar,
+      codexLaunchFactory,
+      codexLaunchBaseProviderSettings: providerSettings,
       providerSettings: {
         codexAppServer: plan.remote,
       },
@@ -295,6 +328,7 @@ export function createAgentApiRouter({
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let rollbackTabId: string | undefined
+    let unownedCodexSidecar: CodexLaunchPlan['sidecar'] | undefined
 
     try {
       let paneContent: any
@@ -327,6 +361,7 @@ export function createAgentApiRouter({
               codexLaunchPlanner,
             },
           )
+          unownedCodexSidecar = launch.codexSidecar
           layoutStore.createTab({
             title: name,
             terminalId: preallocatedTerminalId,
@@ -351,6 +386,7 @@ export function createAgentApiRouter({
             },
           )
         }
+        unownedCodexSidecar = launch.codexSidecar
         const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedSessionRef?.sessionId)
         const terminal = registry.create({
           ...(preallocatedTerminalId ? { terminalId: preallocatedTerminalId } : {}),
@@ -360,9 +396,14 @@ export function createAgentApiRouter({
           resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
           ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
+          ...(launch.codexLaunchFactory ? { codexLaunchFactory: launch.codexLaunchFactory } : {}),
+          ...(launch.codexLaunchBaseProviderSettings
+            ? { codexLaunchBaseProviderSettings: launch.codexLaunchBaseProviderSettings }
+            : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId },
         })
+        unownedCodexSidecar = undefined
         terminalId = terminal.terminalId
         paneContent = {
           kind: 'terminal',
@@ -416,6 +457,7 @@ export function createAgentApiRouter({
 
       res.json(ok({ tabId, paneId, terminalId }, 'tab created'))
     } catch (err: any) {
+      await shutdownUnownedCodexSidecar(unownedCodexSidecar)
       if (rollbackTabId) {
         layoutStore.closeTab?.(rollbackTabId)
       }
@@ -704,6 +746,7 @@ export function createAgentApiRouter({
     const timeoutSeconds = typeof rawTimeout === 'number' ? rawTimeout : Number(rawTimeout)
     const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
     let rollbackTabId: string | undefined
+    let unownedCodexSidecar: CodexLaunchPlan['sidecar'] | undefined
     try {
       const isCodexMode = mode === 'codex'
       const preallocatedTerminalId = isCodexMode ? nanoid() : undefined
@@ -719,6 +762,7 @@ export function createAgentApiRouter({
           envContext: { tabId, paneId },
           codexLaunchPlanner,
         })
+        unownedCodexSidecar = launch.codexSidecar
         const created = layoutStore.createTab?.({ title, terminalId: preallocatedTerminalId, tabId, paneId })
         rollbackTabId = created?.tabId
       } else {
@@ -732,6 +776,7 @@ export function createAgentApiRouter({
           codexLaunchPlanner,
         })
       }
+      unownedCodexSidecar = launch.codexSidecar
       const sessionBindingReason = getCodexSessionBindingReason(mode, launch.sessionRef?.sessionId)
       const terminal = registry.create({
         ...(preallocatedTerminalId ? { terminalId: preallocatedTerminalId } : {}),
@@ -741,9 +786,14 @@ export function createAgentApiRouter({
         resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
         ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
+        ...(launch.codexLaunchFactory ? { codexLaunchFactory: launch.codexLaunchFactory } : {}),
+        ...(launch.codexLaunchBaseProviderSettings
+          ? { codexLaunchBaseProviderSettings: launch.codexLaunchBaseProviderSettings }
+          : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
       })
+      unownedCodexSidecar = undefined
       layoutStore.attachPaneContent?.(tabId, paneId, { kind: 'terminal', terminalId: terminal.terminalId })
       rollbackTabId = undefined
       wsHandler?.broadcastUiCommand({
@@ -772,6 +822,7 @@ export function createAgentApiRouter({
       const message = result.matched ? 'run complete' : 'timeout waiting for command'
       return res.json(responder({ terminalId: terminal.terminalId, tabId, paneId, output }, message))
     } catch (err: any) {
+      await shutdownUnownedCodexSidecar(unownedCodexSidecar)
       if (rollbackTabId) {
         layoutStore.closeTab?.(rollbackTabId)
       }
@@ -781,6 +832,8 @@ export function createAgentApiRouter({
   })
 
   router.post('/panes/:id/split', async (req, res) => {
+    let unownedCodexSidecar: CodexLaunchPlan['sidecar'] | undefined
+    let rollbackPaneId: string | undefined
     try {
       const rawPaneId = req.params.id
       const resolved = resolvePaneTarget(rawPaneId)
@@ -804,6 +857,7 @@ export function createAgentApiRouter({
 
       const tabId = result.tabId
       const newPaneId = result.newPaneId
+      rollbackPaneId = newPaneId
 
       let content: any
       let terminalId: string | undefined
@@ -826,6 +880,7 @@ export function createAgentApiRouter({
             codexLaunchPlanner,
           },
         )
+        unownedCodexSidecar = launch.codexSidecar
         const sessionBindingReason = getCodexSessionBindingReason(splitMode, launch.sessionRef?.sessionId)
         const terminal = registry.create({
           terminalId: preallocatedTerminalId,
@@ -835,9 +890,14 @@ export function createAgentApiRouter({
           resumeSessionId: launch.sessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
           ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
+          ...(launch.codexLaunchFactory ? { codexLaunchFactory: launch.codexLaunchFactory } : {}),
+          ...(launch.codexLaunchBaseProviderSettings
+            ? { codexLaunchBaseProviderSettings: launch.codexLaunchBaseProviderSettings }
+            : {}),
           providerSettings: launch.providerSettings,
           envContext: { tabId, paneId: newPaneId },
         })
+        unownedCodexSidecar = undefined
         terminalId = terminal.terminalId
         content = {
           kind: 'terminal',
@@ -850,6 +910,7 @@ export function createAgentApiRouter({
       }
 
       layoutStore.attachPaneContent(tabId, newPaneId, content)
+      rollbackPaneId = undefined
 
       wsHandler?.broadcastUiCommand({
         command: 'pane.split',
@@ -865,6 +926,10 @@ export function createAgentApiRouter({
       const message = wantsBrowser || wantsEditor ? 'pane split (non-terminal)' : 'pane split'
       res.json(ok({ paneId: newPaneId, terminalId }, message))
     } catch (err: any) {
+      await shutdownUnownedCodexSidecar(unownedCodexSidecar)
+      if (rollbackPaneId) {
+        layoutStore.closePane?.(rollbackPaneId)
+      }
       res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to split pane'))
     }
   })
@@ -1020,6 +1085,7 @@ export function createAgentApiRouter({
   })
 
   router.post('/panes/:id/respawn', async (req, res) => {
+    let unownedCodexSidecar: CodexLaunchPlan['sidecar'] | undefined
     try {
       const resolved = resolvePaneTarget(req.params.id)
       if (rejectPaneTargetError(res, resolved)) return
@@ -1041,6 +1107,7 @@ export function createAgentApiRouter({
           codexLaunchPlanner,
         },
       )
+      unownedCodexSidecar = launch.codexSidecar
       const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, launch.sessionRef?.sessionId)
       const terminal = registry.create({
         terminalId: preallocatedTerminalId,
@@ -1050,9 +1117,14 @@ export function createAgentApiRouter({
         resumeSessionId: launch.sessionRef?.sessionId,
         ...(sessionBindingReason ? { sessionBindingReason } : {}),
         ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
+        ...(launch.codexLaunchFactory ? { codexLaunchFactory: launch.codexLaunchFactory } : {}),
+        ...(launch.codexLaunchBaseProviderSettings
+          ? { codexLaunchBaseProviderSettings: launch.codexLaunchBaseProviderSettings }
+          : {}),
         providerSettings: launch.providerSettings,
         envContext: { tabId, paneId },
       })
+      unownedCodexSidecar = undefined
       const content = {
         kind: 'terminal',
         terminalId: terminal.terminalId,
@@ -1066,6 +1138,7 @@ export function createAgentApiRouter({
       wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
       res.json(ok({ terminalId: terminal.terminalId }, 'pane respawned'))
     } catch (err: any) {
+      await shutdownUnownedCodexSidecar(unownedCodexSidecar)
       res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'Failed to respawn pane'))
     }
   })

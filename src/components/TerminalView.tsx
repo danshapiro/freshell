@@ -1995,7 +1995,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             persistCursor: !nextSeqState.pendingReplay,
           })
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
-          updateContent({ status: 'running' })
           if (!nextSeqState.pendingReplay) {
             markAttachComplete()
           }
@@ -2052,6 +2051,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           } else {
             attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
           }
+        }
+
+        if (msg.type === 'terminal.status' && msg.terminalId === tid) {
+          if (
+            msg.status === 'running'
+            || msg.status === 'recovering'
+            || msg.status === 'recovery_failed'
+          ) {
+            updateContent({ status: msg.status })
+            const statusTab = tabRef.current
+            if (statusTab) {
+              dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+            }
+          }
+          return
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {

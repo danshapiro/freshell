@@ -54,9 +54,9 @@ import {
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
 } from '@/store/persistControl'
-import { buildRestoreError, type RestoreError } from '@shared/session-contract'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
+import { buildRestoreError, type RestoreError } from '@shared/session-contract'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])

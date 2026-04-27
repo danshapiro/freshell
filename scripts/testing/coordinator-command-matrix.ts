@@ -123,7 +123,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
 
   if (input.commandKey === 'test:vitest') {
-    return passthrough([vitestPhase(inferVitestConfig(normalizedArgs), normalizedArgs)])
+    return passthrough([buildVitestPassthroughPhase(normalizedArgs)])
   }
 
   if (hasExplicitConfigOverride(normalizedArgs)) {
@@ -150,7 +150,7 @@ export function isCommandKey(value: string): value is CommandKey {
 
 function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[]): CommandDisposition {
   if (commandKey === 'test:vitest') {
-    return passthrough([vitestPhase(inferVitestConfig(normalizedArgs), normalizedArgs)])
+    return passthrough([buildVitestPassthroughPhase(normalizedArgs)])
   }
 
   if (COMPOSITE_COMMANDS.has(commandKey)) {
@@ -523,6 +523,19 @@ function delegated(phases: UpstreamPhase[]): CommandDisposition {
 
 function passthrough(phases: UpstreamPhase[]): CommandDisposition {
   return { kind: 'passthrough', phases }
+}
+
+function buildVitestPassthroughPhase(args: string[]): UpstreamPhase {
+  if (hasExplicitConfigOverride(args)) {
+    return vitestPhase(inferVitestConfig(args), args)
+  }
+
+  const owner = classifyTargetOwnership(args)
+  if (owner === 'server') {
+    return vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...args])
+  }
+
+  return vitestPhase('default', args)
 }
 
 function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhase {
