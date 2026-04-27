@@ -26,9 +26,15 @@ import { copyText } from '@/lib/clipboard'
 import { cn } from '@/lib/utils'
 import { ContextMenu } from '@/components/context-menu/ContextMenu'
 import type { MenuItem } from '@/components/context-menu/context-menu-types'
-import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
+import {
+  normalizeAgentChatEffortOverride,
+  normalizeAgentChatModelSelection,
+  type PaneContentInput,
+  type SessionLocator,
+} from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -51,7 +57,7 @@ type DeviceGroupData = {
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
-  const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown }
+  const candidate = value as { provider?: unknown; sessionId?: unknown }
   if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
     return undefined
   }
@@ -59,7 +65,6 @@ function parseSessionLocator(value: unknown): SessionLocator | undefined {
   return {
     provider: candidate.provider as CodingCliProviderName,
     sessionId: candidate.sessionId,
-    ...(typeof candidate.serverInstanceId === 'string' ? { serverInstanceId: candidate.serverInstanceId } : {}),
   }
 }
 
@@ -67,7 +72,6 @@ function resolveSessionRef(options: {
   payload: Record<string, unknown>
   fallbackProvider?: CodingCliProviderName
   fallbackSessionId?: string
-  fallbackServerInstanceId?: string
 }): SessionLocator | undefined {
   const explicit = parseSessionLocator(options.payload.sessionRef)
   if (explicit) return explicit
@@ -75,7 +79,24 @@ function resolveSessionRef(options: {
   return {
     provider: options.fallbackProvider,
     sessionId: options.fallbackSessionId,
-    ...(options.fallbackServerInstanceId ? { serverInstanceId: options.fallbackServerInstanceId } : {}),
+  }
+}
+
+function parseLiveTerminalHandle(
+  value: unknown,
+  recordServerInstanceId: string,
+): { terminalId: string; serverInstanceId: string } | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as { terminalId?: unknown; serverInstanceId?: unknown }
+  if (typeof candidate.terminalId !== 'string' || typeof candidate.serverInstanceId !== 'string') {
+    return undefined
+  }
+  if (candidate.serverInstanceId !== recordServerInstanceId) {
+    return undefined
+  }
+  return {
+    terminalId: candidate.terminalId,
+    serverInstanceId: candidate.serverInstanceId,
   }
 }
 
@@ -88,19 +109,15 @@ function sanitizePaneSnapshot(
   const sameServer = !!localServerInstanceId && record.serverInstanceId === localServerInstanceId
   if (snapshot.kind === 'terminal') {
     const mode = (payload.mode as TabMode) || 'shell'
-    const resumeSessionId = payload.resumeSessionId as string | undefined
-    const sessionRef = resolveSessionRef({
-      payload,
-      fallbackProvider: mode !== 'shell' ? mode : undefined,
-      fallbackSessionId: resumeSessionId,
-      fallbackServerInstanceId: record.serverInstanceId,
-    })
+    const sessionRef = resolveSessionRef({ payload })
+    const liveTerminal = parseLiveTerminalHandle(payload.liveTerminal, record.serverInstanceId)
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
+      terminalId: sameServer ? liveTerminal?.terminalId : undefined,
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
     }
   }
@@ -122,22 +139,23 @@ function sanitizePaneSnapshot(
     }
   }
   if (snapshot.kind === 'agent-chat') {
-    const resumeSessionId = payload.resumeSessionId as string | undefined
-    const sessionRef = resolveSessionRef({
-      payload,
-      fallbackProvider: 'claude',
-      fallbackSessionId: resumeSessionId,
-      fallbackServerInstanceId: record.serverInstanceId,
+    const durableState = migrateLegacyAgentChatDurableState({
+      sessionRef: payload.sessionRef,
+      cliSessionId: typeof payload.cliSessionId === 'string' ? payload.cliSessionId : undefined,
+      timelineSessionId: typeof payload.timelineSessionId === 'string' ? payload.timelineSessionId : undefined,
+      resumeSessionId: typeof payload.resumeSessionId === 'string' ? payload.resumeSessionId : undefined,
     })
     return {
       kind: 'agent-chat',
       provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
-      resumeSessionId: sameServer ? resumeSessionId : undefined,
-      sessionRef,
+      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
+      ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+      ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
+      serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
-      model: payload.model as string | undefined,
+      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
       permissionMode: payload.permissionMode as string | undefined,
-      effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
+      effort: normalizeAgentChatEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
     }
   }
@@ -553,6 +571,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         title: record.tabName,
         mode: deriveModeFromRecord(record),
         status: 'creating',
+        serverInstanceId: record.serverInstanceId,
       }),
     )
     dispatch(initLayout({ tabId, content: firstContent }))
@@ -570,6 +589,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
         title: `${record.tabName} · ${pane.title || pane.kind}`,
         mode: deriveModeFromRecord(record),
         status: 'creating',
+        serverInstanceId: record.serverInstanceId,
       }),
     )
     dispatch(

@@ -366,12 +366,11 @@ describe('App WS bootstrap recovery', () => {
 
     await waitFor(() => {
       expect(store.getState().settings.serverSettings.defaultCwd).toBe('/workspace')
+      expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+      expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+      expect(store.getState().settings.settings.theme).toBe('dark')
+      expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
     })
-
-    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
-    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
-    expect(store.getState().settings.settings.theme).toBe('dark')
-    expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
   })
 
   it('keeps browser-local overrides when websocket settings.updated replaces server settings', async () => {

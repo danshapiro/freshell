@@ -22,8 +22,25 @@ import type {
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
+import type { CodexTerminalSidecar } from './coding-cli/codex-app-server/sidecar.js'
+import type { CodexThreadLifecycleEvent } from './coding-cli/codex-app-server/client.js'
+import type { CodexLaunchFactory, CodexLaunchPlan } from './coding-cli/codex-app-server/launch-planner.js'
+import {
+  CODEX_RECOVERY_INPUT_BUFFER_TTL_MS,
+  CodexRecoveryPolicy,
+  type CodexRecoveryState,
+  type CodexWorkerCloseReason,
+  type CodexWorkerFailureSource,
+} from './coding-cli/codex-app-server/recovery-policy.js'
+import { CodexRemoteTuiFailureDetector } from './coding-cli/codex-app-server/remote-tui-failure-detector.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
+import {
+  createTerminalStartupProbeState,
+  extractTerminalStartupProbes,
+  type TerminalStartupProbeColors,
+  type TerminalStartupProbeState,
+} from '../shared/terminal-startup-probes.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
@@ -36,6 +53,17 @@ const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE
 const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
 const perfConfig = getPerfConfig()
+const PREATTACH_CODEX_STARTUP_PROBE_COLORS: TerminalStartupProbeColors = {
+  foreground: '#c9d1d9',
+  background: '#0d1117',
+  cursor: '#c9d1d9',
+}
+const CODEX_RECOVERY_READINESS_TIMEOUT_MS = Number(process.env.CODEX_RECOVERY_READINESS_TIMEOUT_MS || 5_000)
+const CODEX_PRE_DURABLE_STABILITY_MS = Number(process.env.CODEX_PRE_DURABLE_STABILITY_MS || 1_500)
+const CODEX_RECOVERY_INPUT_NOT_SENT_MESSAGE =
+  '\r\n[Freshell] Codex is reconnecting; input was not sent because recovery is still in progress.\r\n'
+const CODEX_RECOVERY_FAILED_INPUT_MESSAGE =
+  '\r\n[Freshell] Codex recovery failed. Close this pane or refresh after checking the server logs.\r\n'
 
 // TerminalMode is now a wider type -- any string is valid as a mode name.
 // 'shell' is the only built-in; all CLI modes come from registered extensions.
@@ -174,6 +202,23 @@ export type ProviderSettings = {
     wsUrl: string
   }
   opencodeServer?: LoopbackServerEndpoint
+}
+
+export type TerminalEnvContext = { tabId?: string; paneId?: string }
+
+export function buildFreshellTerminalEnv(
+  terminalId: string,
+  envContext?: TerminalEnvContext,
+): Record<string, string> {
+  const port = Number(process.env.PORT || 3001)
+  return {
+    FRESHELL: '1',
+    FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
+    FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+    FRESHELL_TERMINAL_ID: terminalId,
+    ...(envContext?.tabId ? { FRESHELL_TAB_ID: envContext.tabId } : {}),
+    ...(envContext?.paneId ? { FRESHELL_PANE_ID: envContext.paneId } : {}),
+  }
 }
 
 function resolveCodingCliCommand(
@@ -360,6 +405,7 @@ export type TerminalRecord = {
   title: string
   description?: string
   mode: TerminalMode
+  codexSidecar?: Pick<CodexTerminalSidecar, 'shutdown'>
   opencodeServer?: LoopbackServerEndpoint
   resumeSessionId?: string
   pendingResumeName?: string
@@ -376,6 +422,7 @@ export type TerminalRecord = {
   clients: Set<WebSocket>
   suppressedOutputClients: Set<WebSocket>
   pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
+  preAttachStartupProbeState?: TerminalStartupProbeState
 
   buffer: ChunkRingBuffer
   pty: pty.IPty
@@ -392,6 +439,72 @@ export type TerminalRecord = {
     lastInputToOutputMs?: number
     maxInputToOutputMs: number
   }
+  codex?: {
+    recoveryState: CodexRecoveryState
+    workerGeneration: number
+    nextWorkerGeneration: number
+    retiringGenerations: Set<number>
+    closeReasonByGeneration: Map<number, CodexWorkerCloseReason>
+    durableSessionId?: string
+    originalResumeSessionId?: string
+    currentWsUrl?: string
+    currentAppServerPid?: number
+    launchFactory?: CodexLaunchFactory
+    launchBaseProviderSettings?: {
+      model?: string
+      sandbox?: string
+      permissionMode?: string
+    }
+    envContext?: TerminalEnvContext
+    recoveryPolicy: CodexRecoveryPolicy
+    inputExpiryTimer?: NodeJS.Timeout
+    remoteTuiFailureDetector: CodexRemoteTuiFailureDetector
+    activeReplacement?: CodexActiveReplacement
+  }
+}
+
+type TerminalLaunchSpec = {
+  terminalId: string
+  mode: TerminalMode
+  shell: ShellType
+  cwd?: string
+  cols: number
+  rows: number
+  resumeSessionId?: string
+  providerSettings?: ProviderSettings
+  envContext?: TerminalEnvContext
+  baseEnv: Record<string, string>
+}
+
+type SpawnedTerminalWorker = {
+  pty: pty.IPty
+  procCwd?: string
+  mcpCwd?: string
+}
+
+type TerminalRuntimeStatus = 'running' | 'recovering' | 'recovery_failed'
+
+type CodexActiveReplacement = {
+  id: string
+  attempt: number
+  source: CodexWorkerFailureSource
+  retiringGeneration: number
+  candidateGeneration: number
+  candidatePublished: boolean
+  aborted: boolean
+  retiringWsUrl?: string
+  retiringAppServerPid?: number
+  retiringPtyPid?: number
+  pendingReadinessSessionId?: string
+  pendingDurableSessionId?: string
+  readinessTimer?: NodeJS.Timeout
+  preDurableTimer?: NodeJS.Timeout
+  backoffTimer?: NodeJS.Timeout
+  candidateSidecar?: CodexLaunchPlan['sidecar']
+  candidatePty?: pty.IPty
+  candidateMcpCwd?: string
+  candidateWsUrl?: string
+  candidateAppServerPid?: number
 }
 
 export type BindSessionResult =
@@ -1056,6 +1169,7 @@ export class TerminalRegistry extends EventEmitter {
     for (const term of this.terminals.values()) {
       if (term.status !== 'running') continue
       if (term.clients.size > 0) continue // only detached
+      if (term.mode === 'codex' && this.isCodexRecoveryProtected(term)) continue
 
       const idleMs = now - term.lastActivityAt
       const idleMinutes = idleMs / 60000
@@ -1095,7 +1209,934 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
+  private spawnTerminalWorker(spec: TerminalLaunchSpec): SpawnedTerminalWorker {
+    const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
+      spec.mode,
+      spec.cwd,
+      spec.shell,
+      spec.resumeSessionId,
+      spec.providerSettings,
+      spec.baseEnv,
+      spec.terminalId,
+    )
+
+    const endSpawnTimer = startPerfTimer(
+      'terminal_spawn',
+      { terminalId: spec.terminalId, mode: spec.mode, shell: spec.shell },
+      { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
+    )
+
+    logger.info({
+      terminalId: spec.terminalId,
+      file,
+      args,
+      cwd: procCwd,
+      mode: spec.mode,
+      shell: spec.shell,
+    }, 'Spawning terminal')
+
+    try {
+      const ptyProc = pty.spawn(file, args, {
+        name: 'xterm-256color',
+        cols: spec.cols,
+        rows: spec.rows,
+        cwd: procCwd,
+        env: env as any,
+      })
+      endSpawnTimer({ cwd: procCwd })
+      return {
+        pty: ptyProc,
+        procCwd,
+        mcpCwd,
+      }
+    } catch (err) {
+      // Clean up MCP config temp files that were created before the spawn attempt.
+      // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
+      // (which may be undefined for WSL cmd/powershell paths).
+      cleanupMcpConfig(spec.terminalId, spec.mode, mcpCwd)
+      throw wrapTerminalSpawnError(err, {
+        mode: spec.mode,
+        file,
+        resumeSessionId: spec.resumeSessionId,
+      })
+    }
+  }
+
+  private installTerminalWorkerHandlers(record: TerminalRecord, generation: number, attemptId?: string): void {
+    record.pty.onData((data) => {
+      if (record.mode === 'codex') {
+        if (!this.isCurrentCodexGeneration(record, generation)) return
+        if (record.codex?.retiringGenerations.has(generation)) return
+      }
+      this.handleTerminalWorkerData(record, generation, data)
+      if (record.mode === 'codex') {
+        const fatal = record.codex?.remoteTuiFailureDetector.push(data)
+        if (fatal?.fatal) {
+          void this.handleCodexWorkerFailure(
+            record,
+            generation,
+            'remote_tui_fatal_output',
+            new Error(`Codex remote TUI reported a fatal ${fatal.reason} condition.`),
+            attemptId,
+          )
+        }
+      }
+    })
+
+    record.pty.onExit((e) => {
+      if (record.mode === 'codex') {
+        const codex = record.codex
+        if (!codex) return
+        if (!this.isCurrentCodexGeneration(record, generation)) return
+        if (codex.retiringGenerations.has(generation)) return
+        const closeReason = codex.closeReasonByGeneration.get(generation)
+        if (closeReason === 'recovery_retire') return
+        if (closeReason === 'user_final_close') {
+          this.finalizeTerminalExit(record, e.exitCode, 'user_final_close')
+          return
+        }
+        void this.handleCodexWorkerFailure(
+          record,
+          generation,
+          'pty_exit',
+          new Error(`Codex worker PTY exited with code ${e.exitCode}.`),
+          attemptId,
+        )
+        return
+      }
+      this.finalizeTerminalExit(record, e.exitCode, 'pty_exit')
+    })
+  }
+
+  private isCurrentCodexGeneration(record: TerminalRecord, generation: number): boolean {
+    return record.codex?.workerGeneration === generation
+  }
+
+  private isActiveCodexCandidate(record: TerminalRecord, generation: number, attemptId?: string): boolean {
+    const active = record.codex?.activeReplacement
+    return Boolean(
+      active
+      && !active.aborted
+      && active.candidateGeneration === generation
+      && attemptId !== undefined
+      && active.id === attemptId,
+    )
+  }
+
+  private isCodexRecoveryState(record: TerminalRecord): boolean {
+    return record.codex?.recoveryState === 'recovering_durable'
+      || record.codex?.recoveryState === 'recovering_pre_durable'
+  }
+
+  private isCodexRecoveryProtected(record: TerminalRecord): boolean {
+    return this.isCodexRecoveryState(record) || record.codex?.recoveryState === 'recovery_failed'
+  }
+
+  private clearCodexInputExpiryTimer(record: TerminalRecord): void {
+    const codex = record.codex
+    if (!codex?.inputExpiryTimer) return
+    clearTimeout(codex.inputExpiryTimer)
+    codex.inputExpiryTimer = undefined
+  }
+
+  private scheduleCodexInputExpiryTimer(record: TerminalRecord): void {
+    const codex = record.codex
+    if (!codex || codex.inputExpiryTimer) return
+    codex.inputExpiryTimer = setTimeout(() => {
+      codex.inputExpiryTimer = undefined
+      if (record.status !== 'running' || !this.isCodexRecoveryState(record)) {
+        codex.recoveryPolicy.clearBufferedInput()
+        return
+      }
+      const drain = codex.recoveryPolicy.drainBufferedInput()
+      if (!drain.ok && drain.reason === 'expired') {
+        this.appendLocalTerminalMessage(record, CODEX_RECOVERY_INPUT_NOT_SENT_MESSAGE)
+      }
+    }, CODEX_RECOVERY_INPUT_BUFFER_TTL_MS + 1)
+    codex.inputExpiryTimer.unref?.()
+  }
+
+  private codexRecoveryLogContext(record: TerminalRecord, active?: CodexActiveReplacement): Record<string, unknown> {
+    const codex = record.codex
+    return {
+      terminalId: record.terminalId,
+      hasDurableSession: Boolean(codex?.durableSessionId),
+      oldWsUrl: active?.retiringWsUrl ?? codex?.currentWsUrl,
+      newWsUrl: active?.candidateWsUrl,
+      oldPtyPid: active?.retiringPtyPid ?? record.pty?.pid,
+      newPtyPid: active?.candidatePty?.pid,
+      oldAppServerPid: active?.retiringAppServerPid ?? codex?.currentAppServerPid,
+      newAppServerPid: active?.candidateAppServerPid,
+    }
+  }
+
+  private resizePublishedCodexRecoveryCandidate(record: TerminalRecord, generation?: number): void {
+    const active = record.codex?.activeReplacement
+    if (!active || active.aborted || !active.candidatePublished) return
+    if (generation !== undefined && active.candidateGeneration !== generation) return
+    if (!this.isCurrentCodexGeneration(record, active.candidateGeneration)) return
+    const candidatePty = active.candidatePty ?? record.pty
+    try {
+      candidatePty.resize(record.cols, record.rows)
+    } catch (err) {
+      logger.debug({ err, terminalId: record.terminalId }, 'codex recovery resize failed')
+    }
+  }
+
+  private getRuntimeStatus(record: TerminalRecord): TerminalRuntimeStatus | undefined {
+    if (record.status === 'exited') return undefined
+    if (record.mode !== 'codex') return 'running'
+    const state = record.codex?.recoveryState
+    if (state === 'recovering_durable' || state === 'recovering_pre_durable') return 'recovering'
+    if (state === 'recovery_failed') return 'recovery_failed'
+    return 'running'
+  }
+
+  private async handleCodexWorkerFailure(
+    record: TerminalRecord,
+    generation: number,
+    source: CodexWorkerFailureSource,
+    error: Error,
+    attemptId?: string,
+  ): Promise<void> {
+    const codex = record.codex
+    if (!codex || record.status === 'exited') {
+      return
+    }
+    const isCurrent = this.isCurrentCodexGeneration(record, generation)
+    const isActiveCandidate = this.isActiveCodexCandidate(record, generation, attemptId)
+    if (!isCurrent && !isActiveCandidate) {
+      logger.info({
+        terminalId: record.terminalId,
+        source,
+        generation,
+        currentGeneration: codex.workerGeneration,
+      }, 'codex_recovery_abandoned_stale_generation')
+      return
+    }
+    if (codex.retiringGenerations.has(generation) && !isActiveCandidate) {
+      codex.recoveryPolicy.noteRecoveryRetireCallback()
+      return
+    }
+    if (codex.closeReasonByGeneration.get(generation) === 'user_final_close') {
+      this.finalizeTerminalExit(record, record.exitCode ?? 0, 'user_final_close')
+      return
+    }
+
+    logger.warn({
+      err: error,
+      terminalId: record.terminalId,
+      source,
+      generation,
+      recoveryState: codex.recoveryState,
+      hasDurableSession: Boolean(codex.durableSessionId),
+    }, 'codex_worker_failure')
+
+    if (isActiveCandidate) {
+      await this.failActiveCodexReplacementAttempt(record, attemptId!, source, error)
+      return
+    }
+
+    await this.startCodexBundleReplacement(record, source, error)
+  }
+
+  private attachCodexSidecar(
+    record: TerminalRecord,
+    sidecar: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>,
+    generation: number,
+    attemptId?: string,
+  ): void {
+    sidecar.attachTerminal({
+      terminalId: record.terminalId,
+      onDurableSession: (sessionId) => {
+        this.noteCodexDurableSession(record, sessionId, generation, attemptId)
+      },
+      onThreadLifecycle: (event) => {
+        this.handleCodexThreadLifecycle(record, generation, attemptId, event)
+      },
+      onFatal: (error, source = 'sidecar_fatal') => {
+        void this.handleCodexWorkerFailure(record, generation, source, error, attemptId)
+      },
+    })
+  }
+
+  private handleCodexThreadLifecycle(
+    record: TerminalRecord,
+    generation: number,
+    attemptId: string | undefined,
+    event: CodexThreadLifecycleEvent,
+  ): void {
+    const codex = record.codex
+    if (!codex || record.status === 'exited') return
+    const isCurrent = this.isCurrentCodexGeneration(record, generation)
+    const isActiveCandidate = this.isActiveCodexCandidate(record, generation, attemptId)
+    if (!isCurrent && !isActiveCandidate) return
+
+    const active = codex.activeReplacement
+    const expectedSessionId = codex.durableSessionId
+      ?? (isActiveCandidate ? active?.pendingDurableSessionId : undefined)
+    if (
+      expectedSessionId
+      && event.kind === 'thread_closed'
+      && event.threadId === expectedSessionId
+    ) {
+      void this.handleCodexWorkerFailure(
+        record,
+        generation,
+        'provider_thread_lifecycle_loss',
+        new Error('Codex provider reported the active thread closed.'),
+        attemptId,
+      )
+      return
+    }
+
+    if (
+      expectedSessionId
+      && event.kind === 'thread_status_changed'
+      && event.threadId === expectedSessionId
+      && (event.status.type === 'notLoaded' || event.status.type === 'systemError')
+    ) {
+      void this.handleCodexWorkerFailure(
+        record,
+        generation,
+        'provider_thread_lifecycle_loss',
+        new Error(`Codex provider reported the active thread status ${event.status.type}.`),
+        attemptId,
+      )
+      return
+    }
+
+    if (
+      event.kind === 'thread_started'
+      && (expectedSessionId ? event.thread.id === expectedSessionId : isActiveCandidate)
+      && this.isCodexRecoveryState(record)
+    ) {
+      this.noteCodexReadinessEvidence(record, generation, attemptId, event.thread.id)
+      return
+    }
+
+    if (
+      expectedSessionId
+      && event.kind === 'thread_status_changed'
+      && event.threadId === expectedSessionId
+      && event.status.type === 'idle'
+      && this.isCodexRecoveryState(record)
+    ) {
+      this.noteCodexReadinessEvidence(record, generation, attemptId, event.threadId)
+    }
+  }
+
+  private promoteCodexDurableSession(record: TerminalRecord, sessionId: string, generation: number): void {
+    const codex = record.codex
+    if (!codex || !this.isCurrentCodexGeneration(record, generation)) {
+      return
+    }
+    if (codex.retiringGenerations.has(generation)) {
+      return
+    }
+    if (codex.durableSessionId && codex.durableSessionId !== sessionId) {
+      logger.warn({
+        terminalId: record.terminalId,
+        existingSessionId: codex.durableSessionId,
+        nextSessionId: sessionId,
+        generation,
+      }, 'Ignoring conflicting Codex durable session promotion')
+      return
+    }
+
+    codex.durableSessionId = sessionId
+    if (codex.recoveryState === 'running_live_only') {
+      codex.recoveryState = 'running_durable'
+    } else if (codex.recoveryState === 'recovering_pre_durable') {
+      const active = codex.activeReplacement
+      if (
+        active
+        && active.candidateGeneration === generation
+        && active.candidatePublished
+        && !active.aborted
+      ) {
+        if (active.preDurableTimer) {
+          clearTimeout(active.preDurableTimer)
+          active.preDurableTimer = undefined
+        }
+        codex.recoveryState = 'recovering_durable'
+        if (!active.readinessTimer) {
+          active.readinessTimer = setTimeout(() => {
+            void this.failActiveCodexReplacementAttempt(
+              record,
+              active.id,
+              'readiness_timeout',
+              new Error('Timed out waiting for Codex durable session readiness evidence.'),
+            )
+          }, CODEX_RECOVERY_READINESS_TIMEOUT_MS)
+          active.readinessTimer.unref?.()
+        }
+        if (active.pendingReadinessSessionId === sessionId) {
+          this.markCodexRecoveryReady(record, generation, active.id)
+        }
+      }
+    }
+    const rebound = this.rebindSession(record.terminalId, 'codex', sessionId, 'association')
+    if (!rebound.ok) {
+      logger.warn(
+        { terminalId: record.terminalId, sessionId, reason: rebound.reason },
+        'Failed to promote Codex durable session from sidecar notification',
+      )
+    }
+  }
+
+  private noteCodexDurableSession(
+    record: TerminalRecord,
+    sessionId: string,
+    generation: number,
+    attemptId?: string,
+  ): void {
+    const codex = record.codex
+    if (!codex || record.status === 'exited') return
+
+    const active = codex.activeReplacement
+    if (
+      active
+      && active.id === attemptId
+      && active.candidateGeneration === generation
+      && !active.candidatePublished
+    ) {
+      if (codex.durableSessionId && codex.durableSessionId !== sessionId) {
+        logger.warn({
+          terminalId: record.terminalId,
+          existingSessionId: codex.durableSessionId,
+          candidateSessionId: sessionId,
+          generation,
+        }, 'Ignoring conflicting unpublished Codex durable session promotion')
+        return
+      }
+      active.pendingDurableSessionId = sessionId
+      return
+    }
+
+    this.promoteCodexDurableSession(record, sessionId, generation)
+  }
+
+  private emitTerminalStatus(
+    record: TerminalRecord,
+    status: TerminalRuntimeStatus,
+    reason?: string,
+    attempt?: number,
+  ): void {
+    const event = {
+      terminalId: record.terminalId,
+      status,
+      ...(reason ? { reason } : {}),
+      ...(attempt !== undefined ? { attempt } : {}),
+    }
+    this.emit('terminal.status', event)
+  }
+
+  private async startCodexBundleReplacement(
+    record: TerminalRecord,
+    source: CodexWorkerFailureSource,
+    error: Error,
+  ): Promise<void> {
+    const codex = record.codex
+    if (!codex || record.status === 'exited') return
+    const existing = codex.activeReplacement
+    if (existing && !existing.aborted) {
+      logger.warn({
+        terminalId: record.terminalId,
+        source,
+        generation: codex.workerGeneration,
+        attempt: existing.attempt,
+        err: error,
+      }, 'codex_recovery_attempt_coalesced')
+      return
+    }
+
+    const retiringGeneration = codex.workerGeneration
+    const attempt = codex.recoveryPolicy.nextAttempt()
+    if (!attempt.ok) {
+      await this.retireCodexWorkerBundle(record, retiringGeneration)
+      this.enterCodexRecoveryFailed(record, source, error)
+      return
+    }
+
+    const recoveryState: CodexRecoveryState = codex.durableSessionId ? 'recovering_durable' : 'recovering_pre_durable'
+    codex.recoveryState = recoveryState
+    const candidateGeneration = codex.nextWorkerGeneration
+    codex.nextWorkerGeneration += 1
+    const active: CodexActiveReplacement = {
+      id: nanoid(),
+      attempt: attempt.attempt,
+      source,
+      retiringGeneration,
+      candidateGeneration,
+      candidatePublished: false,
+      aborted: false,
+      retiringWsUrl: codex.currentWsUrl,
+      retiringAppServerPid: codex.currentAppServerPid,
+      retiringPtyPid: record.pty.pid,
+    }
+    codex.activeReplacement = active
+
+    logger.warn({
+      ...this.codexRecoveryLogContext(record, active),
+      terminalId: record.terminalId,
+      source,
+      state: recoveryState,
+      generation: retiringGeneration,
+      candidateGeneration,
+      attempt: attempt.attempt,
+      err: error,
+    }, 'codex_recovery_started')
+    this.emitTerminalStatus(record, 'recovering', source, attempt.attempt)
+    await this.retireCodexWorkerBundle(record, retiringGeneration)
+
+    const launch = () => {
+      void this.runCodexReplacementAttempt(record, active.id).catch((err) => {
+        void this.failActiveCodexReplacementAttempt(
+          record,
+          active.id,
+          'replacement_launch_failure',
+          err instanceof Error ? err : new Error(String(err)),
+        )
+      })
+    }
+
+    if (attempt.delayMs > 0) {
+      active.backoffTimer = setTimeout(launch, attempt.delayMs)
+      active.backoffTimer.unref?.()
+      return
+    }
+    launch()
+  }
+
+  private async runCodexReplacementAttempt(record: TerminalRecord, attemptId: string): Promise<void> {
+    const codex = record.codex
+    const active = codex?.activeReplacement
+    if (!codex || !active || active.id !== attemptId || active.aborted || record.status === 'exited') return
+    const launchFactory = codex.launchFactory
+    if (!launchFactory) {
+      await this.failActiveCodexReplacementAttempt(
+        record,
+        attemptId,
+        'replacement_launch_failure',
+        new Error('Codex recovery cannot continue because no launch factory is stored for this terminal.'),
+      )
+      return
+    }
+
+    const resumeSessionId = codex.durableSessionId ?? codex.originalResumeSessionId
+    logger.warn({
+      ...this.codexRecoveryLogContext(record, active),
+      terminalId: record.terminalId,
+      attempt: active.attempt,
+      generation: active.retiringGeneration,
+      candidateGeneration: active.candidateGeneration,
+    }, 'codex_recovery_attempt')
+
+    let plan: CodexLaunchPlan | undefined
+    let worker: SpawnedTerminalWorker | undefined
+    let spawnStarted = false
+    try {
+      plan = await launchFactory({
+        terminalId: record.terminalId,
+        cwd: record.cwd,
+        envContext: codex.envContext,
+        resumeSessionId,
+        providerSettings: codex.launchBaseProviderSettings,
+      })
+
+      if (!this.isActiveAttempt(record, attemptId)) {
+        await plan.sidecar.shutdown().catch(() => undefined)
+        return
+      }
+
+      active.candidateSidecar = plan.sidecar
+      active.candidateWsUrl = plan.remote.wsUrl
+      active.candidateAppServerPid = plan.remote.processPid
+      this.attachCodexSidecar(record, plan.sidecar, active.candidateGeneration, attemptId)
+
+      if (codex.durableSessionId) {
+        active.readinessTimer = setTimeout(() => {
+          void this.failActiveCodexReplacementAttempt(
+            record,
+            attemptId,
+            'readiness_timeout',
+            new Error('Timed out waiting for Codex durable session readiness evidence.'),
+          )
+        }, CODEX_RECOVERY_READINESS_TIMEOUT_MS)
+        active.readinessTimer.unref?.()
+      }
+
+      spawnStarted = true
+      worker = this.spawnTerminalWorker({
+        terminalId: record.terminalId,
+        mode: record.mode,
+        shell: 'system',
+        cwd: record.cwd,
+        cols: record.cols,
+        rows: record.rows,
+        resumeSessionId: plan.sessionId ?? resumeSessionId,
+        providerSettings: {
+          ...codex.launchBaseProviderSettings,
+          codexAppServer: { wsUrl: plan.remote.wsUrl },
+        },
+        envContext: codex.envContext,
+        baseEnv: buildFreshellTerminalEnv(record.terminalId, codex.envContext),
+      })
+
+      if (!this.isActiveAttempt(record, attemptId)) {
+        try { worker.pty.kill() } catch {}
+        await plan.sidecar.shutdown().catch(() => undefined)
+        cleanupMcpConfig(record.terminalId, record.mode, worker.mcpCwd)
+        return
+      }
+
+      active.candidatePty = worker.pty
+      active.candidateMcpCwd = worker.mcpCwd
+      record.pty = worker.pty
+      record.mcpCwd = worker.mcpCwd
+      record.codexSidecar = plan.sidecar
+      codex.currentWsUrl = plan.remote.wsUrl
+      codex.currentAppServerPid = plan.remote.processPid
+      if (record.clients.size === 0) {
+        record.preAttachStartupProbeState = createTerminalStartupProbeState()
+      }
+      this.installTerminalWorkerHandlers(record, active.candidateGeneration, attemptId)
+      codex.workerGeneration = active.candidateGeneration
+      codex.remoteTuiFailureDetector.reset()
+      active.candidatePublished = true
+      codex.closeReasonByGeneration.delete(active.candidateGeneration)
+
+      if (active.pendingDurableSessionId) {
+        this.promoteCodexDurableSession(record, active.pendingDurableSessionId, active.candidateGeneration)
+      }
+      if (codex.durableSessionId) {
+        if (active.pendingReadinessSessionId === codex.durableSessionId) {
+          this.markCodexRecoveryReady(record, active.candidateGeneration, attemptId)
+        }
+      } else {
+        this.startCodexPreDurableStabilityTimer(record, active.candidateGeneration, attemptId)
+      }
+    } catch (err) {
+      if (worker) {
+        try { worker.pty.kill() } catch {}
+        cleanupMcpConfig(record.terminalId, record.mode, worker.mcpCwd)
+      }
+      if (plan) {
+        await plan.sidecar.shutdown().catch(() => undefined)
+      }
+      await this.failActiveCodexReplacementAttempt(
+        record,
+        attemptId,
+        spawnStarted ? 'replacement_spawn_failure' : 'replacement_launch_failure',
+        err instanceof Error ? err : new Error(String(err)),
+      )
+    }
+  }
+
+  private isActiveAttempt(record: TerminalRecord, attemptId: string): boolean {
+    const active = record.codex?.activeReplacement
+    return Boolean(active && active.id === attemptId && !active.aborted && record.status === 'running')
+  }
+
+  private async retireCodexWorkerBundle(record: TerminalRecord, generation: number): Promise<void> {
+    const codex = record.codex
+    if (!codex || codex.retiringGenerations.has(generation)) return
+    codex.retiringGenerations.add(generation)
+    codex.closeReasonByGeneration.set(generation, 'recovery_retire')
+    const sidecar = record.codexSidecar
+    record.codexSidecar = undefined
+    if (sidecar) {
+      await sidecar.shutdown().catch((err) => {
+        logger.warn({ err, terminalId: record.terminalId, generation }, 'Failed to shut down retiring Codex sidecar')
+      })
+    }
+    try {
+      record.pty.kill()
+    } catch (err) {
+      logger.warn({ err, terminalId: record.terminalId, generation }, 'Failed to kill retiring Codex PTY')
+    }
+    cleanupMcpConfig(record.terminalId, record.mode, record.mcpCwd)
+    logger.warn({ terminalId: record.terminalId, generation }, 'codex_recovery_bundle_retired')
+  }
+
+  private async failActiveCodexReplacementAttempt(
+    record: TerminalRecord,
+    attemptId: string,
+    source: CodexWorkerFailureSource,
+    error: Error,
+  ): Promise<void> {
+    const codex = record.codex
+    const active = codex?.activeReplacement
+    if (!codex || !active || active.id !== attemptId || active.aborted) return
+    active.aborted = true
+    if (active.readinessTimer) clearTimeout(active.readinessTimer)
+    if (active.preDurableTimer) clearTimeout(active.preDurableTimer)
+    if (active.backoffTimer) clearTimeout(active.backoffTimer)
+    codex.retiringGenerations.add(active.candidateGeneration)
+    codex.closeReasonByGeneration.set(active.candidateGeneration, 'recovery_retire')
+    const candidateSidecar = active.candidatePublished ? record.codexSidecar : active.candidateSidecar
+    if (candidateSidecar) {
+      await candidateSidecar.shutdown().catch(() => undefined)
+    }
+    const candidatePty = active.candidatePublished ? record.pty : active.candidatePty
+    if (candidatePty) {
+      try { candidatePty.kill() } catch {}
+    }
+    if (active.candidateMcpCwd) {
+      cleanupMcpConfig(record.terminalId, record.mode, active.candidateMcpCwd)
+    }
+    codex.activeReplacement = undefined
+    logger.warn({
+      ...this.codexRecoveryLogContext(record, active),
+      err: error,
+      terminalId: record.terminalId,
+      source,
+      attempt: active.attempt,
+      generation: active.candidateGeneration,
+    }, 'codex_recovery_attempt_failed')
+    await this.startCodexBundleReplacement(record, source, error)
+  }
+
+  private noteCodexReadinessEvidence(
+    record: TerminalRecord,
+    generation: number,
+    attemptId: string | undefined,
+    sessionId: string,
+  ): void {
+    const codex = record.codex
+    if (!codex) return
+    const active = codex.activeReplacement
+    if (
+      active
+      && active.id === attemptId
+      && active.candidateGeneration === generation
+      && !active.candidatePublished
+    ) {
+      if (
+        (codex.durableSessionId || active.pendingDurableSessionId)
+        && codex.durableSessionId !== sessionId
+        && active.pendingDurableSessionId !== sessionId
+      ) {
+        return
+      }
+      active.pendingReadinessSessionId = sessionId
+      return
+    }
+    if (
+      active
+      && active.id === attemptId
+      && active.candidateGeneration === generation
+      && active.candidatePublished
+      && !codex.durableSessionId
+    ) {
+      active.pendingReadinessSessionId = sessionId
+      return
+    }
+    if (codex.durableSessionId !== sessionId) return
+    if (this.isCurrentCodexGeneration(record, generation)) {
+      this.markCodexRecoveryReady(record, generation, attemptId)
+    }
+  }
+
+  private markCodexRecoveryReady(record: TerminalRecord, generation: number, attemptId: string | undefined): void {
+    const codex = record.codex
+    const active = codex?.activeReplacement
+    if (!codex || !active || active.id !== attemptId || !active.candidatePublished) return
+    if (!this.isCurrentCodexGeneration(record, generation)) return
+    if (active.readinessTimer) clearTimeout(active.readinessTimer)
+    if (active.preDurableTimer) clearTimeout(active.preDurableTimer)
+    this.resizePublishedCodexRecoveryCandidate(record, generation)
+    codex.activeReplacement = undefined
+    codex.recoveryState = 'running_durable'
+    codex.recoveryPolicy.markStableRunning()
+    this.emitTerminalStatus(record, 'running', 'codex_recovery_ready', active.attempt)
+    this.flushCodexBufferedInput(record)
+    logger.warn({
+      ...this.codexRecoveryLogContext(record, active),
+      terminalId: record.terminalId,
+      generation,
+      attempt: active.attempt,
+    }, 'codex_recovery_ready')
+  }
+
+  private startCodexPreDurableStabilityTimer(
+    record: TerminalRecord,
+    generation: number,
+    attemptId: string,
+  ): void {
+    const active = record.codex?.activeReplacement
+    if (!active || active.id !== attemptId || active.candidateGeneration !== generation) return
+    active.preDurableTimer = setTimeout(() => {
+      const codex = record.codex
+      if (!codex || codex.activeReplacement?.id !== attemptId || record.status !== 'running') return
+      if (!this.isCurrentCodexGeneration(record, generation)) return
+      if (codex.durableSessionId) return
+      this.resizePublishedCodexRecoveryCandidate(record, generation)
+      codex.activeReplacement = undefined
+      codex.recoveryState = 'running_live_only'
+      codex.recoveryPolicy.markStableRunning()
+      this.emitTerminalStatus(record, 'running', 'codex_recovery_ready', active.attempt)
+      this.flushCodexBufferedInput(record)
+    }, CODEX_PRE_DURABLE_STABILITY_MS)
+    active.preDurableTimer.unref?.()
+  }
+
+  private enterCodexRecoveryFailed(
+    record: TerminalRecord,
+    source: CodexWorkerFailureSource,
+    error: Error,
+  ): void {
+    const codex = record.codex
+    if (!codex || record.status === 'exited') return
+    if (codex.activeReplacement?.readinessTimer) clearTimeout(codex.activeReplacement.readinessTimer)
+    if (codex.activeReplacement?.preDurableTimer) clearTimeout(codex.activeReplacement.preDurableTimer)
+    if (codex.activeReplacement?.backoffTimer) clearTimeout(codex.activeReplacement.backoffTimer)
+    this.clearCodexInputExpiryTimer(record)
+    codex.recoveryPolicy.clearBufferedInput()
+    codex.activeReplacement = undefined
+    codex.recoveryState = 'recovery_failed'
+    this.emitTerminalStatus(record, 'recovery_failed', source)
+    logger.warn({
+      ...this.codexRecoveryLogContext(record),
+      err: error,
+      terminalId: record.terminalId,
+      source,
+    }, 'codex_recovery_failed')
+  }
+
+  private flushCodexBufferedInput(record: TerminalRecord): void {
+    this.clearCodexInputExpiryTimer(record)
+    const drain = record.codex?.recoveryPolicy.drainBufferedInput()
+    if (!drain) return
+    if (!drain.ok) {
+      if (drain.reason === 'expired') {
+        this.appendLocalTerminalMessage(record, CODEX_RECOVERY_INPUT_NOT_SENT_MESSAGE)
+      }
+      return
+    }
+    record.pty.write(drain.data)
+    this.emit('terminal.input.raw', {
+      terminalId: record.terminalId,
+      data: drain.data,
+      at: Date.now(),
+    } satisfies TerminalInputRawEvent)
+  }
+
+  private appendLocalTerminalMessage(record: TerminalRecord, message: string): void {
+    const terminalId = record.terminalId
+    const now = Date.now()
+    record.lastActivityAt = now
+    record.buffer.append(message)
+    this.emit('terminal.output.raw', {
+      terminalId,
+      data: message,
+      at: now,
+    } satisfies TerminalOutputRawEvent)
+    this.deliverTerminalOutputToClients(record, terminalId, message)
+  }
+
+  private deliverTerminalOutputToClients(record: TerminalRecord, terminalId: string, data: string): void {
+    for (const client of record.clients) {
+      if (record.suppressedOutputClients.has(client)) continue
+      const pending = record.pendingSnapshotClients.get(client)
+      if (pending) {
+        const nextChars = pending.queuedChars + data.length
+        if (data.length > this.maxPendingSnapshotChars || nextChars > this.maxPendingSnapshotChars) {
+          try {
+            client.close(4008, 'Attach snapshot queue overflow')
+          } catch {
+            // ignore
+          }
+          record.pendingSnapshotClients.delete(client)
+          record.clients.delete(client)
+          continue
+        }
+        pending.chunks.push(data)
+        pending.queuedChars = nextChars
+        continue
+      }
+      this.sendTerminalOutput(client, terminalId, data, record.perf)
+    }
+  }
+
+  private handleTerminalWorkerData(record: TerminalRecord, _generation: number, data: string): void {
+    const terminalId = record.terminalId
+    this.handlePreAttachStartupProbes(record, data)
+    const now = Date.now()
+    record.lastActivityAt = now
+    record.buffer.append(data)
+    this.emit('terminal.output.raw', {
+      terminalId,
+      data,
+      at: now,
+    } satisfies TerminalOutputRawEvent)
+    if (record.perf) {
+      record.perf.outBytes += data.length
+      record.perf.outChunks += 1
+      if (record.perf.pendingInputAt !== undefined) {
+        const lagMs = now - record.perf.pendingInputAt
+        record.perf.lastInputToOutputMs = lagMs
+        if (lagMs > record.perf.maxInputToOutputMs) {
+          record.perf.maxInputToOutputMs = lagMs
+        }
+        if (lagMs >= perfConfig.terminalInputLagMs) {
+          const key = `terminal_input_lag_${terminalId}`
+          if (shouldLog(key, perfConfig.rateLimitMs)) {
+            logPerfEvent(
+              'terminal_input_lag',
+              {
+                terminalId,
+                mode: record.mode,
+                status: record.status,
+                lagMs,
+                pendingInputBytes: record.perf.pendingInputBytes,
+                pendingInputCount: record.perf.pendingInputCount,
+                lastInputBytes: record.perf.lastInputBytes,
+              },
+              'warn',
+            )
+          }
+        }
+        record.perf.pendingInputAt = undefined
+        record.perf.pendingInputBytes = 0
+        record.perf.pendingInputCount = 0
+      }
+    }
+    this.deliverTerminalOutputToClients(record, terminalId, data)
+  }
+
+  private finalizeTerminalExit(
+    record: TerminalRecord,
+    exitCode: number | undefined,
+    _reason: 'pty_exit' | 'user_final_close',
+  ): void {
+    if (record.status === 'exited') {
+      return
+    }
+    const terminalId = record.terminalId
+    const finalExitCode = exitCode ?? 0
+    record.status = 'exited'
+    record.exitCode = finalExitCode
+    const now = Date.now()
+    record.lastActivityAt = now
+    record.exitedAt = now
+    cleanupMcpConfig(terminalId, record.mode, record.mcpCwd)
+    this.shutdownCodexSidecar(record)
+    for (const client of record.clients) {
+      this.flushOutputBuffer(client)
+      this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: finalExitCode }, { terminalId, perf: record.perf })
+    }
+    record.clients.clear()
+    record.suppressedOutputClients.clear()
+    record.pendingSnapshotClients.clear()
+    this.releaseBinding(terminalId, 'exit')
+    this.emit('terminal.exit', { terminalId, exitCode: finalExitCode })
+    this.reapExitedTerminals()
+  }
+
   create(opts: {
+    terminalId?: string
     mode: TerminalMode
     shell?: ShellType
     cwd?: string
@@ -1104,14 +2145,21 @@ export class TerminalRegistry extends EventEmitter {
     resumeSessionId?: string
     sessionBindingReason?: SessionBindingReason
     providerSettings?: ProviderSettings
-    envContext?: { tabId?: string; paneId?: string }
+    codexLaunchBaseProviderSettings?: {
+      model?: string
+      sandbox?: string
+      permissionMode?: string
+    }
+    codexSidecar?: Pick<CodexTerminalSidecar, 'attachTerminal' | 'shutdown'>
+    codexLaunchFactory?: CodexLaunchFactory
+    envContext?: TerminalEnvContext
   }): TerminalRecord {
     this.reapExitedTerminals()
     if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
     }
 
-    const terminalId = nanoid()
+    const terminalId = opts.terminalId ?? nanoid()
     const createdAt = Date.now()
     const cols = opts.cols || 120
     const rows = opts.rows || 30
@@ -1119,55 +2167,19 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const resumeForSpawn = normalizeResumeForSpawn(opts.mode, opts.resumeSessionId)
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
-    const port = Number(process.env.PORT || 3001)
-    const baseEnv = {
-      FRESHELL: '1',
-      FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
-      FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
-      FRESHELL_TERMINAL_ID: terminalId,
-      ...(opts.envContext?.tabId ? { FRESHELL_TAB_ID: opts.envContext.tabId } : {}),
-      ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
-    }
-
-    const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
-      opts.mode,
-      cwd,
-      opts.shell || 'system',
-      resumeForSpawn,
-      opts.providerSettings,
-      baseEnv,
+    const baseEnv = buildFreshellTerminalEnv(terminalId, opts.envContext)
+    const worker = this.spawnTerminalWorker({
       terminalId,
-    )
-
-    const endSpawnTimer = startPerfTimer(
-      'terminal_spawn',
-      { terminalId, mode: opts.mode, shell: opts.shell || 'system' },
-      { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
-    )
-
-    logger.info({ terminalId, file, args, cwd: procCwd, mode: opts.mode, shell: opts.shell || 'system' }, 'Spawning terminal')
-
-    let ptyProc: ReturnType<typeof pty.spawn>
-    try {
-      ptyProc = pty.spawn(file, args, {
-        name: 'xterm-256color',
-        cols,
-        rows,
-        cwd: procCwd,
-        env: env as any,
-      })
-    } catch (err) {
-      // Clean up MCP config temp files that were created before the spawn attempt.
-      // Use mcpCwd (the Linux path passed to generateMcpInjection), not procCwd
-      // (which may be undefined for WSL cmd/powershell paths).
-      cleanupMcpConfig(terminalId, opts.mode, mcpCwd)
-      throw wrapTerminalSpawnError(err, {
-        mode: opts.mode,
-        file,
-        resumeSessionId: resumeForSpawn,
-      })
-    }
-    endSpawnTimer({ cwd: procCwd })
+      mode: opts.mode,
+      shell: opts.shell || 'system',
+      cwd,
+      cols,
+      rows,
+      resumeSessionId: resumeForSpawn,
+      providerSettings: opts.providerSettings,
+      envContext: opts.envContext,
+      baseEnv,
+    })
 
     const title = getModeLabel(opts.mode)
 
@@ -1176,21 +2188,23 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
+      codexSidecar: opts.mode === 'codex' ? opts.codexSidecar : undefined,
       opencodeServer: opts.mode === 'opencode' ? opts.providerSettings?.opencodeServer : undefined,
       resumeSessionId: undefined,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
       cwd,
-      mcpCwd,
+      mcpCwd: worker.mcpCwd,
       cols,
       rows,
       clients: new Set(),
       suppressedOutputClients: new Set(),
       pendingSnapshotClients: new Map(),
+      preAttachStartupProbeState: opts.mode === 'codex' ? createTerminalStartupProbeState() : undefined,
 
       buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
-      pty: ptyProc,
+      pty: worker.pty,
       perf: perfConfig.enabled
         ? {
             outBytes: 0,
@@ -1206,99 +2220,42 @@ export class TerminalRegistry extends EventEmitter {
             maxInputToOutputMs: 0,
           }
         : undefined,
+      codex: opts.mode === 'codex'
+        ? {
+            recoveryState: resumeForBinding ? 'running_durable' : 'running_live_only',
+            workerGeneration: 1,
+            nextWorkerGeneration: 2,
+            retiringGenerations: new Set(),
+            closeReasonByGeneration: new Map(),
+            durableSessionId: resumeForBinding,
+            originalResumeSessionId: resumeForBinding,
+            currentWsUrl: opts.providerSettings?.codexAppServer?.wsUrl,
+            launchFactory: opts.codexLaunchFactory,
+            launchBaseProviderSettings: opts.codexLaunchBaseProviderSettings
+              ? {
+                  model: opts.codexLaunchBaseProviderSettings.model,
+                  sandbox: opts.codexLaunchBaseProviderSettings.sandbox,
+                  permissionMode: opts.codexLaunchBaseProviderSettings.permissionMode,
+                }
+              : {
+                  model: opts.providerSettings?.model,
+                  sandbox: opts.providerSettings?.sandbox,
+                  permissionMode: opts.providerSettings?.permissionMode,
+                },
+            envContext: opts.envContext,
+            recoveryPolicy: new CodexRecoveryPolicy(),
+            remoteTuiFailureDetector: new CodexRemoteTuiFailureDetector(),
+          }
+        : undefined,
     }
 
-    ptyProc.onData((data) => {
-      const now = Date.now()
-      record.lastActivityAt = now
-      record.buffer.append(data)
-      this.emit('terminal.output.raw', {
-        terminalId,
-        data,
-        at: now,
-      } satisfies TerminalOutputRawEvent)
-      if (record.perf) {
-        record.perf.outBytes += data.length
-        record.perf.outChunks += 1
-        if (record.perf.pendingInputAt !== undefined) {
-          const lagMs = now - record.perf.pendingInputAt
-          record.perf.lastInputToOutputMs = lagMs
-          if (lagMs > record.perf.maxInputToOutputMs) {
-            record.perf.maxInputToOutputMs = lagMs
-          }
-          if (lagMs >= perfConfig.terminalInputLagMs) {
-            const key = `terminal_input_lag_${terminalId}`
-            if (shouldLog(key, perfConfig.rateLimitMs)) {
-              logPerfEvent(
-                'terminal_input_lag',
-                {
-                  terminalId,
-                  mode: record.mode,
-                  status: record.status,
-                  lagMs,
-                  pendingInputBytes: record.perf.pendingInputBytes,
-                  pendingInputCount: record.perf.pendingInputCount,
-                  lastInputBytes: record.perf.lastInputBytes,
-                },
-                'warn',
-              )
-            }
-          }
-          record.perf.pendingInputAt = undefined
-          record.perf.pendingInputBytes = 0
-          record.perf.pendingInputCount = 0
-        }
-      }
-      for (const client of record.clients) {
-        if (record.suppressedOutputClients.has(client)) continue
-        // Legacy snapshot ordering path. Broker cutover destination:
-        // - pendingSnapshotClients ordering -> broker attach-staging queue.
-        const pending = record.pendingSnapshotClients.get(client)
-        if (pending) {
-          const nextChars = pending.queuedChars + data.length
-          if (data.length > this.maxPendingSnapshotChars || nextChars > this.maxPendingSnapshotChars) {
-            // If a terminal spews output while we're sending a snapshot, queueing unboundedly can OOM the server.
-            // Prefer explicit resync: drop the client and let it reconnect/reattach for a fresh snapshot.
-            try {
-              client.close(4008, 'Attach snapshot queue overflow')
-            } catch {
-              // ignore
-            }
-            record.pendingSnapshotClients.delete(client)
-            record.clients.delete(client)
-            continue
-          }
-          pending.chunks.push(data)
-          pending.queuedChars = nextChars
-          continue
-        }
-        this.sendTerminalOutput(client, terminalId, data, record.perf)
-      }
-    })
-
-    ptyProc.onExit((e) => {
-      if (record.status === 'exited') {
-        return
-      }
-      record.status = 'exited'
-      record.exitCode = e.exitCode
-      const now = Date.now()
-      record.lastActivityAt = now
-      record.exitedAt = now
-      cleanupMcpConfig(terminalId, opts.mode, record.mcpCwd)
-      for (const client of record.clients) {
-        this.flushOutputBuffer(client)
-        this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
-      }
-      record.clients.clear()
-      record.suppressedOutputClients.clear()
-      record.pendingSnapshotClients.clear()
-      this.releaseBinding(terminalId, 'exit')
-      this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
-      this.reapExitedTerminals()
-    })
+    this.installTerminalWorkerHandlers(record, 1)
 
     this.terminals.set(terminalId, record)
+    if (opts.mode === 'codex' && opts.codexSidecar) {
+      const generation = record.codex?.workerGeneration ?? 1
+      this.attachCodexSidecar(record, opts.codexSidecar, generation)
+    }
     const exactSessionId = resumeForBinding
     if (modeSupportsResume(opts.mode) && exactSessionId) {
       const bound = this.bindSession(
@@ -1328,6 +2285,7 @@ export class TerminalRegistry extends EventEmitter {
   attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean; suppressOutput?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
+    term.preAttachStartupProbeState = undefined
     term.clients.add(client)
     if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
     if (opts?.suppressOutput) term.suppressedOutputClients.add(client)
@@ -1361,6 +2319,20 @@ export class TerminalRegistry extends EventEmitter {
     if (!term || term.status !== 'running') return false
     const now = Date.now()
     term.lastActivityAt = now
+    if (term.mode === 'codex' && this.isCodexRecoveryState(term)) {
+      const buffered = term.codex?.recoveryPolicy.bufferInput(data)
+      if (!buffered?.ok) {
+        this.clearCodexInputExpiryTimer(term)
+        this.appendLocalTerminalMessage(term, CODEX_RECOVERY_INPUT_NOT_SENT_MESSAGE)
+      } else {
+        this.scheduleCodexInputExpiryTimer(term)
+      }
+      return true
+    }
+    if (term.mode === 'codex' && term.codex?.recoveryState === 'recovery_failed') {
+      this.appendLocalTerminalMessage(term, CODEX_RECOVERY_FAILED_INPUT_MESSAGE)
+      return true
+    }
     if (term.perf) {
       term.perf.inBytes += data.length
       term.perf.inChunks += 1
@@ -1380,12 +2352,40 @@ export class TerminalRegistry extends EventEmitter {
     return true
   }
 
+  private handlePreAttachStartupProbes(term: TerminalRecord, data: string): void {
+    if (term.mode !== 'codex') return
+    if (term.clients.size > 0) return
+    const state = term.preAttachStartupProbeState
+    if (!state) return
+
+    const { replies } = extractTerminalStartupProbes(data, state, PREATTACH_CODEX_STARTUP_PROBE_COLORS)
+    if (!state.armed && !state.pending) {
+      term.preAttachStartupProbeState = undefined
+    }
+    if (replies.length === 0) {
+      return
+    }
+
+    for (const reply of replies) {
+      try {
+        term.pty.write(reply)
+      } catch (err) {
+        logger.debug({ err, terminalId: term.terminalId }, 'pre-attach codex startup probe reply failed')
+        break
+      }
+    }
+  }
+
   resize(terminalId: string, cols: number, rows: number): boolean {
     const term = this.terminals.get(terminalId)
     if (!term || term.status !== 'running') return false
     if (term.cols === cols && term.rows === rows) return true
     term.cols = cols
     term.rows = rows
+    if (term.mode === 'codex' && this.isCodexRecoveryProtected(term)) {
+      this.resizePublishedCodexRecoveryCandidate(term)
+      return true
+    }
     try {
       term.pty.resize(cols, rows)
     } catch (err) {
@@ -1398,28 +2398,43 @@ export class TerminalRegistry extends EventEmitter {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     if (term.status === 'exited') return true
-    cleanupMcpConfig(terminalId, term.mode, term.mcpCwd)
+    this.markCodexFinalClose(term)
     try {
       term.pty.kill()
     } catch (err) {
       logger.warn({ err, terminalId }, 'kill failed')
     }
-    term.status = 'exited'
-    term.exitCode = term.exitCode ?? 0
-    const now = Date.now()
-    term.lastActivityAt = now
-    term.exitedAt = now
-    for (const client of term.clients) {
-      this.flushOutputBuffer(client)
-      this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
-    }
-    term.clients.clear()
-    term.suppressedOutputClients.clear()
-    term.pendingSnapshotClients.clear()
-    this.releaseBinding(terminalId, 'exit')
-    this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
-    this.reapExitedTerminals()
+    this.finalizeTerminalExit(term, term.exitCode ?? 0, 'user_final_close')
     return true
+  }
+
+  private markCodexWorkerCloseReason(record: TerminalRecord, reason: CodexWorkerCloseReason): void {
+    const codex = record.codex
+    if (!codex) return
+    codex.closeReasonByGeneration.set(codex.workerGeneration, reason)
+  }
+
+  private markCodexFinalClose(record: TerminalRecord): void {
+    const codex = record.codex
+    if (!codex) return
+    this.markCodexWorkerCloseReason(record, 'user_final_close')
+    this.clearCodexInputExpiryTimer(record)
+    const active = codex.activeReplacement
+    if (active) {
+      active.aborted = true
+      if (active.readinessTimer) clearTimeout(active.readinessTimer)
+      if (active.preDurableTimer) clearTimeout(active.preDurableTimer)
+      if (active.backoffTimer) clearTimeout(active.backoffTimer)
+      codex.closeReasonByGeneration.set(active.candidateGeneration, 'user_final_close')
+      if (active.candidateSidecar && !active.candidatePublished) {
+        void active.candidateSidecar.shutdown().catch(() => undefined)
+      }
+      if (active.candidatePty && !active.candidatePublished) {
+        try { active.candidatePty.kill() } catch {}
+      }
+      codex.activeReplacement = undefined
+    }
+    codex.recoveryPolicy.clearBufferedInput()
   }
 
   remove(terminalId: string): boolean {
@@ -1428,6 +2443,17 @@ export class TerminalRegistry extends EventEmitter {
     this.kill(terminalId)
     this.terminals.delete(terminalId)
     return true
+  }
+
+  private shutdownCodexSidecar(term: TerminalRecord): void {
+    const sidecar = term.codexSidecar
+    if (!sidecar) {
+      return
+    }
+    term.codexSidecar = undefined
+    void sidecar.shutdown().catch((error) => {
+      logger.warn({ err: error, terminalId: term.terminalId }, 'Failed to shut down Codex sidecar')
+    })
   }
 
   list(): Array<{
@@ -1439,6 +2465,7 @@ export class TerminalRegistry extends EventEmitter {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
+    runtimeStatus?: TerminalRuntimeStatus
     hasClients: boolean
     cwd?: string
   }> {
@@ -1451,6 +2478,7 @@ export class TerminalRegistry extends EventEmitter {
       createdAt: t.createdAt,
       lastActivityAt: t.lastActivityAt,
       status: t.status,
+      runtimeStatus: this.getRuntimeStatus(t),
       hasClients: t.clients.size > 0,
       cwd: t.cwd,
     }))
@@ -2044,6 +3072,7 @@ export class TerminalRegistry extends EventEmitter {
     // Send SIGTERM (or plain kill on Windows where signal args are unsupported)
     const isWindows = process.platform === 'win32'
     for (const term of running) {
+      this.markCodexFinalClose(term)
       try {
         if (isWindows) {
           term.pty.kill()

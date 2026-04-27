@@ -19,10 +19,10 @@ import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRu
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
-import { buildDurableResumeIdentityUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
+import { buildTerminalDurableSessionRefUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
-import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
+import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
@@ -59,6 +59,8 @@ import {
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
+  getTerminalStartupProbeReplayBoundary,
+  type TerminalStartupProbeState,
 } from '@/lib/terminal-startup-probes'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
@@ -88,6 +90,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
+import { buildRestoreError } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
 
@@ -97,8 +100,6 @@ export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
-const STARTUP_PROBE_OSC11_QUERY = '\u001b]11;?\u0007'
-
 function isClaudeTurnSubmit(data: string): boolean {
   return data.includes('\r') || data.includes('\n')
 }
@@ -114,17 +115,24 @@ const TRUNCATED_REPLAY_BYTES = 128 * 1024
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
+  resumeState: TerminalStartupProbeState | null
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
 }
 
-function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplayDiscardState): string {
+function consumeStartupProbeReplayDiscard(
+  raw: string,
+  state: StartupProbeReplayDiscardState,
+): {
+  raw: string
+  resumeState: TerminalStartupProbeState | null
+} {
   const remainder = state.remainder
   if (!remainder) {
     state.buffered = ''
-    return raw
+    return { raw, resumeState: null }
   }
 
   let matched = state.buffered
@@ -139,32 +147,26 @@ function consumeStartupProbeReplayDiscard(raw: string, state: StartupProbeReplay
   }
 
   if (matched.length === remainder.length) {
+    const resumeState = state.resumeState
     state.remainder = null
     state.buffered = ''
-    return raw.slice(index)
+    state.resumeState = null
+    return { raw: raw.slice(index), resumeState }
   }
 
   if (index < raw.length) {
     state.remainder = null
     state.buffered = ''
-    return `${matched}${raw.slice(index)}`
+    state.resumeState = null
+    return { raw: `${matched}${raw.slice(index)}`, resumeState: null }
   }
 
   if (index === raw.length) {
     state.buffered = matched
-    return ''
+    return { raw: '', resumeState: null }
   }
 
-  return raw
-}
-
-function getStartupProbeReplayRemainder(pending: string): string | null {
-  if (!pending || pending === STARTUP_PROBE_OSC11_QUERY) {
-    return null
-  }
-  return STARTUP_PROBE_OSC11_QUERY.startsWith(pending)
-    ? STARTUP_PROBE_OSC11_QUERY.slice(pending.length)
-    : null
+  return { raw, resumeState: null }
 }
 
 function deferTerminalPointerMutation(callback: () => void): void {
@@ -286,11 +288,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const tabOrder = useAppSelector((s) => s.tabs.tabs.map((t) => t.id), shallowEqual)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
-  const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
@@ -341,6 +343,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const startupProbeReplayDiscardStateRef = useRef<StartupProbeReplayDiscardState>({
     remainder: null,
     buffered: '',
+    resumeState: null,
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
@@ -922,17 +925,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [attemptOsc52ClipboardWrite])
 
   const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
-    const pendingProbe = startupProbeStateRef.current.pending
+    const pendingProbe = startupProbeStateRef.current
     if (opts?.discardReplayRemainder) {
-      const remainder = getStartupProbeReplayRemainder(pendingProbe)
+      const boundary = getTerminalStartupProbeReplayBoundary(pendingProbe)
       startupProbeReplayDiscardStateRef.current = {
-        remainder,
+        remainder: boundary.remainder,
         buffered: '',
+        resumeState: boundary.remainder ? boundary.resumeState : null,
       }
+      startupProbeStateRef.current = boundary.remainder
+        ? createTerminalStartupProbeState()
+        : (boundary.resumeState ?? createTerminalStartupProbeState())
     } else {
-      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '' }
+      startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '', resumeState: null }
+      startupProbeStateRef.current = createTerminalStartupProbeState()
     }
-    startupProbeStateRef.current = createTerminalStartupProbeState()
   }, [])
 
   const handleTerminalOutput = useCallback((
@@ -1441,6 +1448,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     tabRef.current = tab
   }, [tab])
+  const tabHasSinglePaneRef = useRef(tabHasSinglePane)
+  useEffect(() => {
+    tabHasSinglePaneRef.current = tabHasSinglePane
+  }, [tabHasSinglePane])
 
   // Ref for paneId to avoid stale closures in title handlers
   const paneIdRef = useRef(paneId)
@@ -1735,7 +1746,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
-      const resumeId = getResumeSessionIdFromRef(contentRef)
+      const createSessionState = getCreateSessionStateFromRef(contentRef)
       launchAttemptRef.current = {
         requestId,
         restore,
@@ -1747,7 +1758,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
-        resumeSessionId: resumeId,
+        sessionRef: createSessionState.sessionRef,
+        liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
       })
@@ -1757,7 +1769,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         mode,
         shell: shell || 'system',
         cwd: initialCwd,
-        resumeSessionId: resumeId,
+        ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
@@ -1877,7 +1890,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           ) {
             resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
           }
-          raw = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          if (replayDiscard.resumeState) {
+            startupProbeStateRef.current = replayDiscard.resumeState
+          }
+          raw = replayDiscard.raw
           handleTerminalOutput(raw, mode, tid, !frameOverlapsReplay)
           if (
             raw.length > 0
@@ -1978,7 +1995,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             persistCursor: !nextSeqState.pendingReplay,
           })
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
-          updateContent({ status: 'running' })
           if (!nextSeqState.pendingReplay) {
             markAttachComplete()
           }
@@ -2014,9 +2030,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             paneId: paneIdRef.current,
             requestId: reqId,
             terminalId: newId,
-            effectiveResumeSessionId: msg.effectiveResumeSessionId,
             currentResumeSessionId: contentRef.current?.resumeSessionId,
-            willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
@@ -2024,20 +2038,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const currentTab = tabRef.current
           if (currentTab) {
             dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
-          }
-          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
-            paneResumeSessionId: contentRef.current?.resumeSessionId,
-            tabResumeSessionId: currentTab?.resumeSessionId,
-            sessionId: msg.effectiveResumeSessionId,
-          })
-          if (durableIdentityUpdate?.paneUpdates) {
-            updateContent(durableIdentityUpdate.paneUpdates)
-          }
-          if (currentTab && durableIdentityUpdate?.tabUpdates) {
-            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
-          }
-          if (durableIdentityUpdate?.shouldFlush) {
-            dispatch(flushPersistedLayoutNow())
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))
@@ -2051,6 +2051,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           } else {
             attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
           }
+        }
+
+        if (msg.type === 'terminal.status' && msg.terminalId === tid) {
+          if (
+            msg.status === 'running'
+            || msg.status === 'recovering'
+            || msg.status === 'recovery_failed'
+          ) {
+            updateContent({ status: msg.status })
+            const statusTab = tabRef.current
+            if (statusTab) {
+              dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+            }
+          }
+          return
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
@@ -2106,35 +2121,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
         }
 
-        // Handle one-time session association (when Claude creates a new session)
-        // Message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
+        // Handle one-time session association from the authoritative canonical sessionRef.
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
-          const sessionId = msg.sessionId as string
+          const sessionRef = msg.sessionRef
+          if (!sessionRef?.provider || !sessionRef?.sessionId) {
+            return
+          }
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.session.associated', {
             paneId: paneIdRef.current,
             terminalId: tid,
             oldResumeSessionId: contentRef.current?.resumeSessionId,
-            newResumeSessionId: sessionId,
+            sessionRef,
           })
-          const mode = contentRef.current?.mode
-          const sessionRef = mode && mode !== 'shell'
-            ? {
-              provider: mode,
-              sessionId,
-              ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
-            }
-            : undefined
-          const currentTab = tabRef.current
-          const durableIdentityUpdate = buildDurableResumeIdentityUpdate({
+          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
+          const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
+            provider: sessionRef.provider,
+            sessionId: sessionRef.sessionId,
+            paneSessionRef: contentRef.current?.sessionRef,
+            tabSessionRef: currentTab?.sessionRef,
             paneResumeSessionId: contentRef.current?.resumeSessionId,
             tabResumeSessionId: currentTab?.resumeSessionId,
-            sessionId,
           })
-          if (durableIdentityUpdate?.paneUpdates || sessionRef) {
-            updateContent({
-              ...(durableIdentityUpdate?.paneUpdates ?? {}),
-              ...(sessionRef ? { sessionRef } : {}),
-            })
+          if (durableIdentityUpdate?.paneUpdates) {
+            updateContent(durableIdentityUpdate.paneUpdates)
           }
           if (currentTab && durableIdentityUpdate?.tabUpdates) {
             dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
@@ -2203,6 +2212,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
+            if (!current?.sessionRef) {
+              term.writeln('\r\n[Restore unavailable - the live terminal is gone and no durable session identity was saved]\r\n')
+              launchAttemptRef.current = null
+              clearRateLimitRetry()
+              setIsAttaching(false)
+              dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+              updateContent({
+                terminalId: undefined,
+                status: 'error',
+                restoreError: buildRestoreError('dead_live_handle'),
+              })
+              const currentTab = tabRef.current
+              if (currentTab) {
+                dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
+              }
+              return
+            }
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {

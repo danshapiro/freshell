@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { Settings } from 'lucide-react'
-import { cn } from '@/lib/utils'
+
 import { Switch } from '@/components/ui/switch'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatSettingsModelOption } from '@/lib/agent-chat-capabilities'
 import type { AgentChatProviderConfig } from '@/lib/agent-chat-types'
-import { formatModelDisplayName } from '../../../shared/format-model-name'
+import { cn } from '@/lib/utils'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatProviderCapabilitiesState } from '@/store/agentChatTypes'
 
-type SettingsFields = Pick<AgentChatPaneContent, 'model' | 'permissionMode' | 'effort'> & {
+type SettingsFields = Pick<AgentChatPaneContent, 'permissionMode' | 'effort'> & {
+  model?: string
   showThinking?: boolean
   showTools?: boolean
   showTimecodes?: boolean
@@ -23,30 +26,20 @@ interface AgentChatSettingsProps {
   showTimecodes: boolean
   sessionStarted: boolean
   defaultOpen?: boolean
-  modelOptions?: Array<{ value: string; displayName: string }>
+  modelOptions?: AgentChatSettingsModelOption[]
+  effortOptions?: string[]
+  capabilitiesStatus?: AgentChatProviderCapabilitiesState['status']
+  capabilityError?: AgentChatProviderCapabilitiesState['error']
   settingsVisibility?: AgentChatProviderConfig['settingsVisibility']
   onChange: (changes: Partial<SettingsFields>) => void
   onDismiss?: () => void
+  onRetryCapabilities?: () => void
+  onOpenChange?: (open: boolean) => void
 }
-
-const MODEL_OPTIONS = [
-  { value: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
-  { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
-  { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5' },
-  { value: 'claude-opus-4-5', label: 'Opus 4.5' },
-]
 
 const PERMISSION_OPTIONS = [
   { value: 'bypassPermissions', label: 'Skip permissions' },
   { value: 'default', label: 'Default (ask)' },
-]
-
-const EFFORT_OPTIONS = [
-  { value: 'low', label: 'Low' },
-  { value: 'medium', label: 'Medium' },
-  { value: 'high', label: 'High' },
-  { value: 'max', label: 'Max' },
 ]
 
 export default function AgentChatSettings({
@@ -59,9 +52,14 @@ export default function AgentChatSettings({
   sessionStarted,
   defaultOpen = false,
   modelOptions,
+  effortOptions,
+  capabilitiesStatus = 'idle',
+  capabilityError,
   settingsVisibility,
   onChange,
   onDismiss,
+  onRetryCapabilities,
+  onOpenChange,
 }: AgentChatSettingsProps) {
   const instanceId = useId()
   const isMobile = useMobile()
@@ -70,11 +68,13 @@ export default function AgentChatSettings({
   const popoverRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
 
-  // Sync open state when defaultOpen changes (e.g. after settings load,
-  // or when initialSetupDone arrives after the 2s timeout fallback)
   useEffect(() => {
     setOpen(defaultOpen)
   }, [defaultOpen])
+
+  useEffect(() => {
+    onOpenChange?.(open)
+  }, [onOpenChange, open])
 
   const handleClose = useCallback(() => {
     setOpen(false)
@@ -84,76 +84,49 @@ export default function AgentChatSettings({
   const handleToggle = useCallback(() => {
     if (open) {
       handleClose()
-    } else {
-      setOpen(true)
+      return
     }
-  }, [open, handleClose])
+    setOpen(true)
+  }, [handleClose, open])
 
-  // Close on click outside
   useEffect(() => {
     if (!open) return
-    const handleMouseDown = (e: MouseEvent) => {
-      const target = e.target as Node
+
+    const handleMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node
       if (
-        popoverRef.current && !popoverRef.current.contains(target) &&
-        buttonRef.current && !buttonRef.current.contains(target)
+        popoverRef.current && !popoverRef.current.contains(target)
+        && buttonRef.current && !buttonRef.current.contains(target)
       ) {
         handleClose()
       }
     }
+
     document.addEventListener('mousedown', handleMouseDown)
     return () => document.removeEventListener('mousedown', handleMouseDown)
-  }, [open, handleClose])
+  }, [handleClose, open])
 
-  // Close on Escape key — uses document listener so it works regardless of focus location
   useEffect(() => {
     if (!open) return
-    const handleEscape = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation()
-        handleClose()
-      }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      handleClose()
     }
+
     document.addEventListener('keydown', handleEscape)
     return () => document.removeEventListener('keydown', handleEscape)
-  }, [open, handleClose])
+  }, [handleClose, open])
 
-  // Start with the hardcoded list, then append any dynamic models not already present.
-  // When the SDK provides a model whose normalized label matches a hardcoded entry
-  // (e.g. a newer dated ID like claude-sonnet-4-5-20251101 → "Sonnet 4.5"), replace
-  // the hardcoded value so users get the current model ID without duplicates.
-  const resolvedModelOptions = (() => {
-    if (!modelOptions) return MODEL_OPTIONS
-
-    // Map normalized label → SDK value for models with full claude-* IDs.
-    // When multiple dated IDs map to the same label, keep the latest one.
-    const sdkByLabel = new Map<string, string>()
-    for (const m of modelOptions) {
-      if (m.value.startsWith('claude-')) {
-        const label = formatModelDisplayName(m.displayName)
-        const existing = sdkByLabel.get(label)
-        if (!existing || m.value > existing) {
-          sdkByLabel.set(label, m.value)
-        }
-      }
-    }
-
-    // Replace hardcoded values with SDK values when labels match
-    const usedLabels = new Set<string>()
-    const base = MODEL_OPTIONS.map((m) => {
-      usedLabels.add(m.label)
-      const sdkValue = sdkByLabel.get(m.label)
-      return sdkValue ? { value: sdkValue, label: m.label } : m
-    })
-
-    // Append genuinely new SDK models not matching any hardcoded label
-    const extras = modelOptions
-      .filter((m) => m.value.startsWith('claude-'))
-      .map((m) => ({ value: m.value, label: formatModelDisplayName(m.displayName) }))
-      .filter((m) => !usedLabels.has(m.label))
-
-    return [...base, ...extras]
-  })()
+  const resolvedModelOptions = modelOptions ?? []
+  const selectedModelOption = useMemo(
+    () => resolvedModelOptions.find((option) => option.value === model),
+    [model, resolvedModelOptions],
+  )
+  const resolvedEffortOptions = effortOptions ?? []
+  const showCapabilityControls = capabilitiesStatus !== 'failed'
+  const showEffortControl = resolvedEffortOptions.length > 0
 
   return (
     <div className="relative">
@@ -195,95 +168,134 @@ export default function AgentChatSettings({
             aria-label="Agent chat settings"
           >
             <div className="space-y-3">
-            {/* Model */}
-            {settingsVisibility?.model !== false && (
-            <div className="space-y-1">
-              <label htmlFor={`${instanceId}-model`} className="text-xs font-medium">Model</label>
-              <select
-                id={`${instanceId}-model`}
-                aria-label="Model"
-                value={model}
-                onChange={(e) => onChange({ model: e.target.value })}
-                className="w-full rounded border bg-background px-2 py-1 text-xs"
-              >
-                {resolvedModelOptions.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
+              {capabilitiesStatus === 'loading' && (
+                <div role="status" className="text-xs text-muted-foreground">
+                  Loading available models...
+                </div>
+              )}
+
+              {capabilitiesStatus === 'failed' && capabilityError && (
+                <div
+                  role="alert"
+                  className="rounded-md border border-red-300/60 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-200"
+                >
+                  <p>{capabilityError.message}</p>
+                  {(capabilityError.retryable ?? true) && onRetryCapabilities && (
+                    <button
+                      type="button"
+                      className="mt-2 rounded-md border border-red-400/60 px-2 py-1 text-xs font-medium hover:bg-red-500/10"
+                      onClick={onRetryCapabilities}
+                    >
+                      Retry model load
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {showCapabilityControls && settingsVisibility?.model !== false && (
+                <div className="space-y-1">
+                  <label htmlFor={`${instanceId}-model`} className="text-xs font-medium">Model</label>
+                  <select
+                    id={`${instanceId}-model`}
+                    aria-label="Model"
+                    value={model}
+                    onChange={(event) => onChange({ model: event.target.value })}
+                    className="w-full rounded border bg-background px-2 py-1 text-xs"
+                  >
+                    {resolvedModelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedModelOption?.description && (
+                    <p className="text-[11px] text-muted-foreground">
+                      {selectedModelOption.description}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {settingsVisibility?.permissionMode !== false && (
+                <div className="space-y-1">
+                  <label htmlFor={`${instanceId}-permissions`} className="text-xs font-medium">Permissions</label>
+                  <select
+                    id={`${instanceId}-permissions`}
+                    aria-label="Permissions"
+                    value={permissionMode}
+                    onChange={(event) => onChange({ permissionMode: event.target.value })}
+                    className="w-full rounded border bg-background px-2 py-1 text-xs"
+                  >
+                    {PERMISSION_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {showCapabilityControls && settingsVisibility?.effort !== false && showEffortControl && (
+                <div className="space-y-1">
+                  <label htmlFor={`${instanceId}-effort`} className="text-xs font-medium">Effort</label>
+                  <select
+                    id={`${instanceId}-effort`}
+                    aria-label="Effort"
+                    value={effort}
+                    disabled={sessionStarted}
+                    onChange={(event) => onChange({ effort: event.target.value || undefined })}
+                    className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-50"
+                  >
+                    <option value="">Model default</option>
+                    {resolvedEffortOptions.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {showCapabilityControls && settingsVisibility?.effort !== false && !showEffortControl && (
+                <p className="text-[11px] text-muted-foreground">
+                  This model uses its own default effort behavior.
+                </p>
+              )}
+
+              <hr className="border-border" />
+
+              {settingsVisibility?.thinking !== false && (
+                <ToggleRow
+                  label="Show thinking"
+                  checked={showThinking}
+                  onChange={(checked) => onChange({ showThinking: checked })}
+                />
+              )}
+              {settingsVisibility?.tools !== false && (
+                <ToggleRow
+                  label="Show tools"
+                  checked={showTools}
+                  onChange={(checked) => onChange({ showTools: checked })}
+                />
+              )}
+              {settingsVisibility?.timecodes !== false && (
+                <ToggleRow
+                  label="Show timecodes & model"
+                  checked={showTimecodes}
+                  onChange={(checked) => onChange({ showTimecodes: checked })}
+                />
+              )}
+
+              {isMobile && (
+                <button
+                  type="button"
+                  className="mt-2 min-h-11 w-full rounded-md border border-border px-3 text-sm font-medium"
+                  onClick={handleClose}
+                >
+                  Done
+                </button>
+              )}
             </div>
-            )}
-
-            {/* Permission mode */}
-            {settingsVisibility?.permissionMode !== false && (
-            <div className="space-y-1">
-              <label htmlFor={`${instanceId}-permissions`} className="text-xs font-medium">Permissions</label>
-              <select
-                id={`${instanceId}-permissions`}
-                aria-label="Permissions"
-                value={permissionMode}
-                onChange={(e) => onChange({ permissionMode: e.target.value })}
-                className="w-full rounded border bg-background px-2 py-1 text-xs"
-              >
-                {PERMISSION_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </div>
-            )}
-
-            {/* Effort — locked after session starts */}
-            {settingsVisibility?.effort !== false && (
-            <div className="space-y-1">
-              <label htmlFor={`${instanceId}-effort`} className="text-xs font-medium">Effort</label>
-              <select
-                id={`${instanceId}-effort`}
-                aria-label="Effort"
-                value={effort}
-                disabled={sessionStarted}
-                onChange={(e) => onChange({ effort: e.target.value as AgentChatPaneContent['effort'] })}
-                className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-50"
-              >
-                {EFFORT_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </div>
-            )}
-
-            <hr className="border-border" />
-
-            {/* Display toggles using existing Switch component */}
-            {settingsVisibility?.thinking !== false && (
-            <ToggleRow
-              label="Show thinking"
-              checked={showThinking}
-              onChange={(v) => onChange({ showThinking: v })}
-            />
-            )}
-            {settingsVisibility?.tools !== false && (
-            <ToggleRow
-              label="Show tools"
-              checked={showTools}
-              onChange={(v) => onChange({ showTools: v })}
-            />
-            )}
-            {settingsVisibility?.timecodes !== false && (
-            <ToggleRow
-              label="Show timecodes & model"
-              checked={showTimecodes}
-              onChange={(v) => onChange({ showTimecodes: v })}
-            />
-            )}
-            {isMobile && (
-              <button
-                type="button"
-                className="mt-2 min-h-11 w-full rounded-md border border-border px-3 text-sm font-medium"
-                onClick={handleClose}
-              >
-                Done
-              </button>
-            )}
-          </div>
           </div>
         </>
       )}
@@ -291,7 +303,15 @@ export default function AgentChatSettings({
   )
 }
 
-function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
+function ToggleRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  onChange: (value: boolean) => void
+}) {
   return (
     <div className="flex items-center justify-between">
       <span className="text-xs">{label}</span>

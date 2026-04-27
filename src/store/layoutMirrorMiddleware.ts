@@ -5,12 +5,10 @@ const INITIAL_LAYOUT_SYNC_DEBOUNCE_MS = 1000
 const LAYOUT_SYNC_DEBOUNCE_MS = 200
 
 function buildTabFallbackSessionRef(tab: {
-  mode?: string
-  codingCliProvider?: string
-  resumeSessionId?: string
+  sessionRef?: { provider?: string; sessionId?: string }
 }): { provider: string; sessionId: string } | undefined {
-  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-  const sessionId = tab.resumeSessionId
+  const provider = tab.sessionRef?.provider
+  const sessionId = tab.sessionRef?.sessionId
   if (!provider || !sessionId) return undefined
   return { provider, sessionId }
 }

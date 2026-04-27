@@ -92,6 +92,11 @@ describe('ws opencode activity protocol', () => {
     phase: 'busy',
     updatedAt: 1234,
   }]
+  const liveOnlyActivity = [{
+    terminalId: 'term-opencode-live-only',
+    phase: 'busy',
+    updatedAt: 4321,
+  }]
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
@@ -148,6 +153,26 @@ describe('ws opencode activity protocol', () => {
     expect(updated).toEqual({
       type: 'opencode.activity.updated',
       upsert: sampleActivity,
+      remove: [],
+    })
+    ws.close()
+  })
+
+  it('preserves live-only opencode activity records without inventing a session id', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'opencode-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready')
+
+    wsHandler.broadcastOpencodeActivityUpdated({
+      upsert: liveOnlyActivity as any,
+      remove: [],
+    })
+
+    const updated = await waitForMessage(ws, (msg) => msg.type === 'opencode.activity.updated')
+    expect(updated).toEqual({
+      type: 'opencode.activity.updated',
+      upsert: liveOnlyActivity,
       remove: [],
     })
     ws.close()

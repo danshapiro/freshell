@@ -187,7 +187,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           shell: tab.shell,
           createRequestId: tab.createRequestId,
           status: tab.status,
-          resumeSessionId: tab.resumeSessionId,
+          sessionRef: tab.sessionRef,
           initialCwd: tab.initialCwd,
         },
       }]

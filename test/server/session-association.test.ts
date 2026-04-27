@@ -90,6 +90,36 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
+  it('keeps the canonical Claude association stable when the terminal title changes', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+
+    const terminal = registry.create({
+      mode: 'claude',
+      cwd: '/home/user/project',
+    })
+
+    registry.updateTitle(terminal.terminalId, 'Release prep')
+
+    const result = coordinator.associateSingleSession({
+      provider: 'claude',
+      sessionId: SESSION_ID_ONE,
+      projectPath: '/home/user/project',
+      lastActivityAt: Date.now(),
+      cwd: '/home/user/project',
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.updateTitle(terminal.terminalId, 'Renamed after attach')
+
+    expect(registry.get(terminal.terminalId)?.title).toBe('Renamed after attach')
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.shutdown()
+  })
+
   it('does not heuristically associate codex sessions', () => {
     const registry = new TerminalRegistry()
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)
@@ -216,7 +246,10 @@ describe('Session-Terminal metadata broadcasts', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
 
       const associatedMeta = metadata.associateSession(term.terminalId, 'claude', session.sessionId)
@@ -255,7 +288,10 @@ describe('Session-Terminal metadata broadcasts', () => {
     expect(broadcasts).toContainEqual({
       type: 'terminal.session.associated',
       terminalId: terminal.terminalId,
-      sessionId: SESSION_ID_TWO,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: SESSION_ID_TWO,
+      },
     })
 
     const latestMeta = broadcasts.filter((m) => m.type === 'terminal.meta.updated').at(-1)
@@ -294,7 +330,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -321,7 +360,10 @@ describe('Session-Terminal Association Integration', () => {
     expect(broadcasts[0]).toEqual({
       type: 'terminal.session.associated',
       terminalId: term.terminalId,
-      sessionId: SESSION_ID_ONE,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: SESSION_ID_ONE,
+      },
     })
 
     // Cleanup
@@ -379,7 +421,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -423,7 +468,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -462,9 +510,15 @@ describe('Session-Terminal Association Integration', () => {
     // Two broadcasts total, one per terminal
     expect(broadcasts).toHaveLength(2)
     expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(broadcasts[0].sessionId).toBe(SESSION_ID_ONE)
+    expect(broadcasts[0].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_ONE,
+    })
     expect(broadcasts[1].terminalId).toBe(term2.terminalId)
-    expect(broadcasts[1].sessionId).toBe(SESSION_ID_THREE)
+    expect(broadcasts[1].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_THREE,
+    })
 
     // Cleanup
     registry.shutdown()
@@ -596,7 +650,10 @@ describe('Session-Terminal Association Platform-specific', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -617,7 +674,10 @@ describe('Session-Terminal Association Platform-specific', () => {
     // Should match after normalization removes trailing slash
     expect(broadcasts).toHaveLength(1)
     expect(broadcasts[0].terminalId).toBe(term.terminalId)
-    expect(broadcasts[0].sessionId).toBe(SESSION_ID_SEVEN)
+    expect(broadcasts[0].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_SEVEN,
+    })
 
     registry.shutdown()
   })
@@ -637,7 +697,10 @@ describe('Session-Terminal Association Platform-specific', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -681,7 +744,10 @@ describe('Session-Terminal Association via onUpdate', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: session.provider,
+          sessionId: session.sessionId,
+        },
       })
     }
   }

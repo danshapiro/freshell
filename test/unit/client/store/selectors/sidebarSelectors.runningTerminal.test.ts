@@ -82,7 +82,10 @@ describe('sidebarSelectors running session mapping', () => {
         status: 'running',
         hasClients: true,
         mode: 'codex',
-        resumeSessionId: 'session-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'session-1',
+        },
       },
       {
         terminalId: 'older-terminal',
@@ -92,7 +95,10 @@ describe('sidebarSelectors running session mapping', () => {
         status: 'running',
         hasClients: true,
         mode: 'codex',
-        resumeSessionId: 'session-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'session-1',
+        },
       },
     ]
 

@@ -109,9 +109,9 @@ describe('agent timeline history source', () => {
       timelineSessionId: undefined,
     })
 
-    await expect(source.resolve('named-only')).resolves.toMatchObject({
-      kind: 'resolved',
-      readiness: 'live_only',
+    await expect(source.resolve('named-only')).resolves.toEqual({
+      kind: 'missing',
+      code: 'RESTORE_NOT_FOUND',
     })
 
     source.teardownLiveSession('sdk-gone', { recoverable: false })

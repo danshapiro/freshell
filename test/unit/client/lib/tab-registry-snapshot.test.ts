@@ -37,6 +37,144 @@ describe('shouldKeepClosedTab', () => {
 })
 
 describe('collectPaneSnapshots', () => {
+  describe('terminal and agent-chat durable identity', () => {
+    it('preserves explicit terminal sessionRef and liveTerminal without raw resume mirrors', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-terminal',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          status: 'running',
+          terminalId: 'term-codex-1',
+          createRequestId: 'req-terminal',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-1',
+          },
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots).toEqual([{
+        paneId: 'pane-terminal',
+        kind: 'terminal',
+        title: undefined,
+        payload: {
+          mode: 'codex',
+          shell: 'system',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'codex-session-1',
+          },
+          liveTerminal: {
+            terminalId: 'term-codex-1',
+            serverInstanceId: 'server-local',
+          },
+          initialCwd: undefined,
+        },
+      }])
+    })
+
+    it('does not serialize raw terminal resumeSessionId when no canonical sessionRef exists', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-terminal-legacy',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          shell: 'system',
+          status: 'running',
+          createRequestId: 'req-terminal-legacy',
+          resumeSessionId: 'codex-session-legacy',
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots[0]?.payload).toEqual({
+        mode: 'codex',
+        shell: 'system',
+        sessionRef: undefined,
+        liveTerminal: undefined,
+        initialCwd: undefined,
+      })
+    })
+
+    it('preserves explicit agent-chat sessionRef and modelSelection without raw resume mirrors', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-chat',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          status: 'idle',
+          createRequestId: 'req-chat',
+          sessionId: 'sdk-agent-1',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '00000000-0000-4000-8000-000000000123',
+          },
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          permissionMode: 'default',
+          effort: 'turbo',
+          plugins: ['planner'],
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-1')
+
+      expect(snapshots).toEqual([{
+        paneId: 'pane-chat',
+        kind: 'agent-chat',
+        title: undefined,
+        payload: {
+          provider: 'freshclaude',
+          sessionId: 'sdk-agent-1',
+          sessionRef: {
+            provider: 'claude',
+            sessionId: '00000000-0000-4000-8000-000000000123',
+          },
+          initialCwd: undefined,
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+          permissionMode: 'default',
+          effort: 'turbo',
+          plugins: ['planner'],
+        },
+      }])
+    })
+
+    it('does not serialize raw agent-chat resumeSessionId when no canonical sessionRef exists', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-chat-legacy',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          status: 'idle',
+          createRequestId: 'req-chat-legacy',
+          resumeSessionId: 'named-resume',
+          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+        },
+      }
+
+      const snapshots = collectPaneSnapshots(node, 'server-local')
+
+      expect(snapshots[0]?.payload).toEqual({
+        provider: 'freshclaude',
+        sessionId: undefined,
+        sessionRef: undefined,
+        initialCwd: undefined,
+        modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+        permissionMode: undefined,
+        effort: undefined,
+        plugins: undefined,
+      })
+    })
+  })
+
   describe('extension content', () => {
     it('serializes extension pane content with correct kind and payload', () => {
       const node: PaneNode = {

@@ -3,6 +3,9 @@ import agentChatReducer, {
   sessionCreated,
   registerPendingCreate,
   createFailed,
+  capabilityFetchFailed,
+  capabilityFetchStarted,
+  capabilityFetchSucceeded,
   clearPendingCreateFailure,
   sessionInit,
   sessionMetadataReceived,
@@ -22,7 +25,6 @@ import agentChatReducer, {
   sessionError,
   clearPendingCreate,
   removeSession,
-  setAvailableModels,
 } from '../../../src/store/agentChatSlice'
 
 function makeChatMessage(role: 'user' | 'assistant', text: string) {
@@ -83,7 +85,8 @@ describe('agentChatSlice', () => {
 
   it('has empty initial state', () => {
     expect(initial.sessions).toEqual({})
-    expect(initial.availableModels).toEqual([])
+    expect(initial.capabilitiesByProvider).toEqual({})
+    expect(initial).not.toHaveProperty('availableModels')
   })
 
   it('creates a session', () => {
@@ -396,18 +399,19 @@ describe('agentChatSlice', () => {
   })
 
   it('stores timelineSessionId, timelineRevision, and stream snapshot from sdk.session.snapshot', () => {
+    const canonicalTimelineSessionId = '00000000-0000-4000-8000-000000000123'
     const state = agentChatReducer(initial, sessionSnapshotReceived({
       sessionId: 'sdk-1',
       latestTurnId: 'turn-2',
       status: 'running',
-      timelineSessionId: 'cli-1',
+      timelineSessionId: canonicalTimelineSessionId,
       revision: 12,
       streamingActive: true,
       streamingText: 'partial reply',
     }))
 
     expect(state.sessions['sdk-1']).toMatchObject({
-      timelineSessionId: 'cli-1',
+      timelineSessionId: canonicalTimelineSessionId,
       timelineRevision: 12,
       streamingActive: true,
       streamingText: 'partial reply',
@@ -502,7 +506,7 @@ describe('agentChatSlice', () => {
 
     expect(state.sessions['sdk-live']).toMatchObject({
       historyLoaded: true,
-      timelineSessionId: 'named-resume',
+      timelineSessionId: undefined,
       timelineRevision: 1,
     })
 
@@ -827,14 +831,126 @@ describe('agentChatSlice', () => {
     expect(state.sessions['s1']).toBeUndefined()
   })
 
-  it('setAvailableModels populates models', () => {
-    const models = [
-      { value: 'claude-opus-4-6', displayName: 'Opus 4.6', description: 'Most capable' },
-      { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
-    ]
-    const state = agentChatReducer(initial, setAvailableModels({ models }))
-    expect(state.availableModels).toEqual(models)
-    expect(state.availableModels).toHaveLength(2)
+  it('tracks capability fetch lifecycle by provider', () => {
+    let state = agentChatReducer(initial, capabilityFetchStarted({
+      provider: 'freshclaude',
+    }))
+
+    expect(state.capabilitiesByProvider.freshclaude).toEqual({
+      status: 'loading',
+      capabilities: undefined,
+      error: undefined,
+    })
+
+    state = agentChatReducer(state, capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo', 'warp'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    }))
+
+    expect(state.capabilitiesByProvider.freshclaude).toEqual({
+      status: 'succeeded',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo', 'warp'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+      error: undefined,
+    })
+  })
+
+  it('stores typed capability failures by provider', () => {
+    const state = agentChatReducer(initial, capabilityFetchFailed({
+      provider: 'kilroy',
+      error: {
+        code: 'CAPABILITY_PROBE_FAILED',
+        message: 'probe failed',
+        retryable: true,
+      },
+    }))
+
+    expect(state.capabilitiesByProvider.kilroy).toEqual({
+      status: 'failed',
+      capabilities: undefined,
+      error: {
+        code: 'CAPABILITY_PROBE_FAILED',
+        message: 'probe failed',
+        retryable: true,
+      },
+    })
+  })
+
+  it('preserves previously loaded capabilities when a later fetch fails', () => {
+    const succeeded = agentChatReducer(initial, capabilityFetchSucceeded({
+      provider: 'freshclaude',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    }))
+
+    const failed = agentChatReducer(succeeded, capabilityFetchFailed({
+      provider: 'freshclaude',
+      error: {
+        code: 'CAPABILITY_PROBE_FAILED',
+        message: 'probe failed',
+        retryable: true,
+      },
+    }))
+
+    expect(failed.capabilitiesByProvider.freshclaude).toEqual({
+      status: 'failed',
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: 1_234,
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+      error: {
+        code: 'CAPABILITY_PROBE_FAILED',
+        message: 'probe failed',
+        retryable: true,
+      },
+    })
   })
 
   it('accumulates cost when costUsd is 0', () => {

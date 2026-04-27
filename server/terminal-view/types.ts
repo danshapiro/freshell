@@ -1,12 +1,13 @@
 import type { TerminalMode } from '../terminal-registry.js'
 import type { TerminalDirectoryQuery } from '../../shared/read-models.js'
+import type { SessionLocator } from '../../shared/ws-protocol.js'
 
 export type TerminalDirectoryItem = {
   terminalId: string
   title: string
   description?: string
   mode: TerminalMode
-  resumeSessionId?: string
+  sessionRef?: SessionLocator
   createdAt: number
   lastActivityAt: number
   status: 'running' | 'exited'

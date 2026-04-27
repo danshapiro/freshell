@@ -13,22 +13,17 @@ export function countPaneLeaves(node: PaneNode | undefined): number {
 function stripPanePayload(content: PaneContent, serverInstanceId: string): Record<string, unknown> {
   switch (content.kind) {
     case 'terminal':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId && content.mode !== 'shell'
-            ? {
-                provider: content.mode,
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          mode: content.mode,
-          shell: content.shell,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-        }
+      return {
+        mode: content.mode,
+        shell: content.shell,
+        sessionRef: content.sessionRef,
+        liveTerminal: content.terminalId
+          ? {
+              terminalId: content.terminalId,
+              serverInstanceId: content.serverInstanceId ?? serverInstanceId,
+            }
+          : undefined,
+        initialCwd: content.initialCwd,
       }
     case 'browser':
       return {
@@ -43,25 +38,15 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         viewMode: content.viewMode,
       }
     case 'agent-chat':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId
-            ? {
-                provider: 'claude',
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          provider: content.provider,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-          model: content.model,
-          permissionMode: content.permissionMode,
-          effort: content.effort,
-          plugins: content.plugins,
-        }
+      return {
+        provider: content.provider,
+        sessionId: content.sessionId,
+        sessionRef: content.sessionRef,
+        initialCwd: content.initialCwd,
+        modelSelection: content.modelSelection,
+        permissionMode: content.permissionMode,
+        effort: content.effort,
+        plugins: content.plugins,
       }
     case 'extension':
       return {

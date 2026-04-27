@@ -73,7 +73,7 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
-describe('TerminalView resumeSessionId', () => {
+describe('TerminalView durable session contract', () => {
   beforeEach(() => {
     wsMocks.send.mockClear()
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
@@ -84,7 +84,7 @@ describe('TerminalView resumeSessionId', () => {
     vi.unstubAllGlobals()
   })
 
-  it('includes resumeSessionId when creating a terminal', async () => {
+  it('includes canonical sessionRef when creating a durable restore terminal', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'
 
@@ -94,7 +94,10 @@ describe('TerminalView resumeSessionId', () => {
       status: 'creating',
       mode: 'claude',
       shell: 'system',
-      resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      },
       initialCwd: '/tmp',
     }
 
@@ -139,12 +142,15 @@ describe('TerminalView resumeSessionId', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.create',
         requestId: 'req-1',
-        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
       }))
     })
   })
 
-  it('updates pane resumeSessionId from effectiveResumeSessionId', async () => {
+  it('keeps terminal.created live-only until an explicit terminal.session.associated arrives', async () => {
     const tabId = 'tab-1'
     const paneId = 'pane-1'
     let messageHandler: ((msg: any) => void) | null = null
@@ -211,14 +217,110 @@ describe('TerminalView resumeSessionId', () => {
       type: 'terminal.created',
       requestId: 'req-1',
       terminalId: 'term-1',
-      effectiveResumeSessionId: VALID_CLAUDE_SESSION_ID,
     })
 
     await waitFor(() => {
       const content = store.getState().panes.layouts[tabId]
       if (content?.type !== 'leaf') throw new Error('unexpected layout')
       if (content.content.kind !== 'terminal') throw new Error('unexpected content')
-      expect(content.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(content.content.terminalId).toBe('term-1')
+      expect(content.content.resumeSessionId).toBeUndefined()
+      expect(content.content.sessionRef).toBeUndefined()
+    })
+  })
+
+  it('persists canonical durable sessionRef only after terminal.session.associated', async () => {
+    const tabId = 'tab-1'
+    const paneId = 'pane-1'
+    let messageHandler: ((msg: any) => void) | null = null
+
+    wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
+      messageHandler = handler
+      return () => {}
+    })
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-1',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-1',
+      }))
+    })
+
+    messageHandler?.({
+      type: 'terminal.created',
+      requestId: 'req-1',
+      terminalId: 'term-1',
+    })
+
+    messageHandler?.({
+      type: 'terminal.session.associated',
+      terminalId: 'term-1',
+      sessionRef: {
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      },
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId]
+      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+      expect(layout.content.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      })
+
+      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
+      expect(tab?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: VALID_CLAUDE_SESSION_ID,
+      })
     })
   })
 })

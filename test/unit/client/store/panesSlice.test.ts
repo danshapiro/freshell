@@ -312,6 +312,22 @@ describe('panesSlice', () => {
       }
     })
 
+    it('does not synthesize canonical sessionRef from raw terminal resumeSessionId', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', mode: 'claude', resumeSessionId: VALID_CLAUDE_SESSION_ID },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind !== 'terminal') throw new Error('expected terminal')
+
+      expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(leaf.content.sessionRef).toBeUndefined()
+    })
+
     it('does not assign resumeSessionId for shell panes', () => {
       const state = panesReducer(
         initialState,
@@ -338,6 +354,26 @@ describe('panesSlice', () => {
         // Non-UUID resume names are valid for Claude (named resume support)
         expect(leaf.content.resumeSessionId).toBe('not-a-uuid')
       }
+    })
+
+    it('does not synthesize canonical sessionRef from raw agent-chat resumeSessionId', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind !== 'agent-chat') throw new Error('expected agent-chat')
+
+      expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(leaf.content.sessionRef).toBeUndefined()
     })
   })
 

@@ -133,3 +133,28 @@ describe('vite config', () => {
     }
   }, TEST_TIMEOUT_MS)
 })
+
+describe('vitest config', () => {
+  const originalRealProviderContracts = process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+
+  beforeEach(() => {
+    vi.resetModules()
+    delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+  })
+
+  afterEach(() => {
+    if (originalRealProviderContracts !== undefined) {
+      process.env.FRESHELL_REAL_PROVIDER_CONTRACTS = originalRealProviderContracts
+    } else {
+      delete process.env.FRESHELL_REAL_PROVIDER_CONTRACTS
+    }
+  })
+
+  it('does not exclude real-provider integration contracts from the default suite', async () => {
+    const configModule = await import('../../vitest.config.ts')
+    const config = configModule.default
+    const excluded = config.test?.exclude ?? []
+
+    expect(excluded).not.toContain('test/integration/real/**')
+  })
+})

@@ -71,6 +71,35 @@ describe('TestServer', () => {
     expect(res.status).toBe(200)
   })
 
+  it('preserves setupHome config seeds while adding the network bootstrap defaults', async () => {
+    server = new TestServer({
+      preserveHomeOnStop: true,
+      setupHome: async (homeDir) => {
+        const freshellDir = path.join(homeDir, '.freshell')
+        await fs.mkdir(freshellDir, { recursive: true })
+        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+          version: 1,
+          settings: {
+            defaultCwd: '/tmp/freshell-seeded',
+          },
+          legacyLocalSettingsSeed: {
+            theme: 'light',
+          },
+        }, null, 2))
+      },
+    })
+
+    const info = await server.start()
+    const config = JSON.parse(await fs.readFile(path.join(info.homeDir, '.freshell', 'config.json'), 'utf8'))
+
+    expect(config.settings.defaultCwd).toBe('/tmp/freshell-seeded')
+    expect(config.legacyLocalSettingsSeed).toMatchObject({ theme: 'light' })
+    expect(config.settings.network).toMatchObject({
+      configured: true,
+      host: '127.0.0.1',
+    })
+  })
+
   it('rejects bootstrap auth against the project runtime root', () => {
     expect(() => new TestServer({
       authStrategy: 'bootstrap',

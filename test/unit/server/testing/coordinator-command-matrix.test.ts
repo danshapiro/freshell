@@ -726,6 +726,26 @@ describe('classifyCommand()', () => {
       config: 'server',
       args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: [
+        'test/unit/server/coding-cli/codex-app-server',
+        'test/unit/server/terminal-registry.test.ts',
+        'test/unit/server/terminal-registry.codex-recovery.test.ts',
+      ],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: [
+        'run',
+        '--config',
+        'vitest.server.config.ts',
+        'test/unit/server/coding-cli/codex-app-server',
+        'test/unit/server/terminal-registry.test.ts',
+        'test/unit/server/terminal-registry.codex-recovery.test.ts',
+      ],
+    })
   })
 
   it('rewires coordinated public test scripts through the coordinator entrypoint while preserving newer direct suite helpers', async () => {
