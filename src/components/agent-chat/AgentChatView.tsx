@@ -104,6 +104,13 @@ function paneMatchesCurrentProviderDefaults(
     && pane.effort === providerDefaults?.effort
 }
 
+function paneModelSelectionMatchesCurrentProviderDefault(
+  pane: Pick<AgentChatPaneContent, 'modelSelection'>,
+  providerDefaults?: Pick<AgentChatPaneContent, 'modelSelection'>,
+): boolean {
+  return modelSelectionsMatch(pane.modelSelection, providerDefaults?.modelSelection)
+}
+
 interface AgentChatViewProps {
   tabId: string
   paneId: string
@@ -235,6 +242,24 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         providers: {
           [paneContent.provider]: {
             effort: undefined,
+          },
+        },
+      },
+    }))
+  }, [dispatch, paneContent.provider, providerSettings])
+
+  const clearPersistedProviderModelSelectionIfPaneMatchesDefault = useCallback((
+    pane: Pick<AgentChatPaneContent, 'modelSelection'>,
+  ) => {
+    if (!paneModelSelectionMatchesCurrentProviderDefault(pane, providerSettings)) {
+      return
+    }
+
+    void dispatch(saveServerSettingsPatch({
+      agentChat: {
+        providers: {
+          [paneContent.provider]: {
+            modelSelection: undefined,
           },
         },
       },
@@ -580,11 +605,26 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           ? currentPane.resumeSessionId
           : undefined)
 
-      const resolvedSelection = resolveAgentChatModelSelection({
+      let resolvedSelection = resolveAgentChatModelSelection({
         providerDefaultModelId,
         capabilities,
         modelSelection: currentPane.modelSelection,
       })
+      let shouldClearPersistedProviderModelSelection = false
+
+      if (!resolvedSelection.resolvedModelId) {
+        if (
+          resolvedSelection.unavailableExactSelection
+          && paneModelSelectionMatchesCurrentProviderDefault(currentPane, providerSettings)
+        ) {
+          shouldClearPersistedProviderModelSelection = true
+          resolvedSelection = resolveAgentChatModelSelection({
+            providerDefaultModelId,
+            capabilities,
+            modelSelection: undefined,
+          })
+        }
+      }
 
       if (!resolvedSelection.resolvedModelId) {
         const unavailableModelId =
@@ -641,6 +681,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         content: {
           ...currentPane,
           status: 'starting',
+          ...(shouldClearPersistedProviderModelSelection ? { modelSelection: undefined } : {}),
           ...(resolvedEffort ? {} : { effort: undefined }),
           createError: undefined,
         },
@@ -648,6 +689,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       if (shouldClearPersistedProviderEffort) {
         clearPersistedProviderEffortIfPaneMatchesDefaults(currentPane)
+      }
+      if (shouldClearPersistedProviderModelSelection) {
+        clearPersistedProviderModelSelectionIfPaneMatchesDefault(currentPane)
       }
 
     })()
@@ -657,11 +701,14 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }
   }, [
     defaultPermissionMode,
+    clearPersistedProviderEffortIfPaneMatchesDefaults,
+    clearPersistedProviderModelSelectionIfPaneMatchesDefault,
     dispatch,
     paneContent.createRequestId,
     paneContent.effort,
     paneContent.modelSelection,
     paneContent.provider,
+    paneContent.restoreError,
     paneContent.sessionId,
     paneContent.status,
     paneId,

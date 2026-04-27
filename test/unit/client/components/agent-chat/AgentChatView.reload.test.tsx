@@ -20,11 +20,12 @@ import agentChatReducer, {
 } from '@/store/agentChatSlice'
 import panesReducer, { hydratePanes, initLayout } from '@/store/panesSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { setServerSettings } from '@/store/settingsSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import { tabFallbackIdentityMiddleware } from '@/store/tabFallbackIdentityMiddleware'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
+import { createDefaultServerSettings } from '@shared/settings'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -580,6 +581,86 @@ describe('AgentChatView reload/restore behavior', () => {
         code: 'MODEL_UNAVAILABLE',
       }),
     }))
+  })
+
+  it('clears an unavailable exact provider default and creates with the provider default model', async () => {
+    getAgentChatCapabilities.mockResolvedValue({
+      ok: true,
+      capabilities: {
+        provider: 'freshclaude',
+        fetchedAt: Date.now(),
+        models: [
+          {
+            id: 'opus',
+            displayName: 'Opus',
+            description: 'Latest Opus track',
+            supportsEffort: true,
+            supportedEffortLevels: ['turbo'],
+            supportsAdaptiveThinking: true,
+          },
+        ],
+      },
+    })
+
+    const staleSelection = { kind: 'exact' as const, modelId: 'claude-opus-4-6' }
+    const store = makeStore()
+    const serverSettings = createDefaultServerSettings()
+    store.dispatch(setServerSettings({
+      ...serverSettings,
+      agentChat: {
+        ...serverSettings.agentChat,
+        providers: {
+          freshclaude: {
+            modelSelection: staleSelection,
+          },
+        },
+      },
+    }))
+
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-stale-provider-default',
+      status: 'creating',
+      modelSelection: staleSelection,
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts.t1)
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentChatCapabilities).toHaveBeenCalledWith('freshclaude', {})
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-stale-provider-default',
+        model: 'opus',
+      }))
+    })
+    expect(screen.queryByText('Session start failed')).not.toBeInTheDocument()
+    expect(getPaneContent(store, 't1', 'p1')?.modelSelection).toBeUndefined()
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      agentChat: {
+        providers: {
+          freshclaude: {
+            modelSelection: undefined,
+          },
+        },
+      },
+    })
   })
 
   it('shows loading state instead of welcome screen when sessionId is set but messages have not arrived', () => {

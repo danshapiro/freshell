@@ -47,7 +47,20 @@ vi.mock('@/store/settingsThunks', () => ({
   }),
 }))
 
-function makeStore(preloadedAgentChat: Record<string, unknown> = {}) {
+function makeStore(
+  preloadedAgentChat: Record<string, unknown> = {},
+  agentChatSettings: Partial<typeof defaultSettings.agentChat> = {},
+) {
+  const mergedAgentChatSettings = {
+    ...defaultSettings.agentChat,
+    initialSetupDone: true,
+    ...agentChatSettings,
+    providers: {
+      ...defaultSettings.agentChat.providers,
+      ...(agentChatSettings.providers ?? {}),
+    },
+  }
+
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
@@ -58,10 +71,7 @@ function makeStore(preloadedAgentChat: Record<string, unknown> = {}) {
       settings: {
         settings: {
           ...defaultSettings,
-          agentChat: {
-            ...defaultSettings.agentChat,
-            initialSetupDone: true,
-          },
+          agentChat: mergedAgentChatSettings,
         },
         loaded: true,
         lastSavedAt: 0,
@@ -88,8 +98,9 @@ const BASE_PANE: AgentChatPaneContent = {
 function renderStoreBackedPane(
   paneContent: AgentChatPaneContent,
   preloadedAgentChat: Record<string, unknown> = {},
+  agentChatSettings: Partial<typeof defaultSettings.agentChat> = {},
 ) {
-  const store = makeStore(preloadedAgentChat)
+  const store = makeStore(preloadedAgentChat, agentChatSettings)
   store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: paneContent }))
 
   function Wrapper() {
@@ -317,6 +328,58 @@ describe('agent chat capability settings flow', () => {
         model: 'opus',
       }))
     })
+  })
+
+  it('clears an inherited unavailable exact default and starts on the provider-default track', async () => {
+    const staleSelection = { kind: 'exact' as const, modelId: 'claude-opus-4-6' }
+    const store = renderStoreBackedPane({
+      ...BASE_PANE,
+      sessionId: undefined,
+      createRequestId: 'req-inherited-unavailable-default',
+      status: 'creating',
+      modelSelection: staleSelection,
+    }, {
+      capabilitiesByProvider: {
+        freshclaude: {
+          status: 'succeeded',
+          capabilities: {
+            provider: 'freshclaude',
+            fetchedAt: freshFetchedAt(),
+            models: [
+              {
+                id: 'opus',
+                displayName: 'Opus',
+                description: 'Latest Opus track',
+                supportsEffort: true,
+                supportedEffortLevels: ['turbo'],
+                supportsAdaptiveThinking: true,
+              },
+            ],
+          },
+        },
+      },
+    }, {
+      providers: {
+        freshclaude: {
+          modelSelection: staleSelection,
+        },
+      },
+    })
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-inherited-unavailable-default',
+        model: 'opus',
+      }))
+    })
+
+    expect(screen.queryByText('Session start failed')).not.toBeInTheDocument()
+    expect(getRenderedPaneContent(store)).toEqual(expect.objectContaining({
+      status: 'starting',
+      modelSelection: undefined,
+      createError: undefined,
+    }))
   })
 
   it('shows a retryable capability error and keeps a persisted tracked selection visible after retry', async () => {
