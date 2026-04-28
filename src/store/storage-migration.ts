@@ -64,6 +64,14 @@ function normalizeLayoutTab(tab: Record<string, unknown>): Record<string, unknow
   }
 }
 
+function isCodexSessionRef(sessionRef: unknown): sessionRef is { provider: 'codex'; sessionId: string } {
+  return !!sessionRef
+    && typeof sessionRef === 'object'
+    && (sessionRef as { provider?: unknown }).provider === 'codex'
+    && typeof (sessionRef as { sessionId?: unknown }).sessionId === 'string'
+    && (sessionRef as { sessionId: string }).sessionId.length > 0
+}
+
 function normalizeLegacyRecoveryFailedTerminal(
   content: Record<string, unknown>,
   durableState: { sessionRef?: unknown },
@@ -78,7 +86,7 @@ function normalizeLegacyRecoveryFailedTerminal(
     restoreError: _restoreError,
     ...rest
   } = content
-  if (durableState.sessionRef) {
+  if (isCodexSessionRef(durableState.sessionRef)) {
     return {
       ...rest,
       status: 'creating',
@@ -111,11 +119,14 @@ function normalizeLayoutNode(node: unknown): unknown {
         && rest.mode === 'codex'
         && rest.status === 'recovery_failed'
       )
+      const normalizedSessionRef = isLegacyRecoveryFailed && !isCodexSessionRef(durableState.sessionRef)
+        ? undefined
+        : durableState.sessionRef
       return {
         ...candidate,
         content: {
           ...normalizedRuntime,
-          ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+          ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
           ...(!isLegacyRecoveryFailed && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },
       }

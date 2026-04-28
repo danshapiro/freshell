@@ -288,6 +288,62 @@ describe('storage-migration', () => {
     })
   })
 
+  it('migrates mismatched legacy Codex recovery_failed session refs to restore-unavailable errors', async () => {
+    localStorage.setItem('freshell_version', '3')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      tabs: {
+        activeTabId: 'tab-codex',
+        tabs: [{
+          id: 'tab-codex',
+          title: 'Codex terminal',
+          createdAt: 1,
+          mode: 'codex',
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-codex': {
+            type: 'leaf',
+            id: 'pane-codex',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: VALID_CLAUDE_SESSION_ID,
+              },
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: { 'tab-codex': 'pane-codex' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    const content = ((parsed!.panes.layouts['tab-codex'] as any)?.content) ?? {}
+    expect(content.status).toBe('error')
+    expect(content.terminalId).toBeUndefined()
+    expect(content.sessionRef).toBeUndefined()
+    expect(content.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'invalid_legacy_restore_target',
+    })
+  })
+
   it('migrates recoverable v2 tabs and panes into the v3 layout key before clearing legacy storage', async () => {
     localStorage.setItem('freshell_version', '3')
     localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify({

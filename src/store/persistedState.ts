@@ -50,6 +50,14 @@ export type ParsedPersistedTabs = {
 
 type PersistedTab = z.infer<typeof zTab>
 
+function isCodexSessionRef(sessionRef: unknown): sessionRef is { provider: 'codex'; sessionId: string } {
+  return !!sessionRef
+    && typeof sessionRef === 'object'
+    && (sessionRef as { provider?: unknown }).provider === 'codex'
+    && typeof (sessionRef as { sessionId?: unknown }).sessionId === 'string'
+    && (sessionRef as { sessionId: string }).sessionId.length > 0
+}
+
 function normalizeLegacyRecoveryFailedTerminal(
   content: Record<string, unknown>,
   durableState: { sessionRef?: unknown },
@@ -64,7 +72,7 @@ function normalizeLegacyRecoveryFailedTerminal(
     restoreError: _restoreError,
     ...rest
   } = content
-  if (durableState.sessionRef) {
+  if (isCodexSessionRef(durableState.sessionRef)) {
     return {
       ...rest,
       status: 'creating',
@@ -165,10 +173,13 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
   const normalizedRestoreError = isLegacyRecoveryFailed
     ? undefined
     : durableState.restoreError ?? existingRestoreError
+  const normalizedSessionRef = isLegacyRecoveryFailed && !isCodexSessionRef(durableState.sessionRef)
+    ? undefined
+    : durableState.sessionRef
 
   return {
     ...normalizedRuntime,
-    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
     ...(normalizedRestoreError
       ? { restoreError: normalizedRestoreError }
       : {}),

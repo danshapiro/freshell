@@ -148,5 +148,42 @@ describe('persistedState parsers', () => {
         reason: 'invalid_legacy_restore_target',
       })
     })
+
+    it('does not treat mismatched legacy Codex recovery_failed session refs as resumable', () => {
+      const parsed = parsePersistedPanesRaw(JSON.stringify({
+        version: 1,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              sessionRef: {
+                provider: 'claude',
+                sessionId: '550e8400-e29b-41d4-a716-446655440000',
+              },
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      }))
+
+      expect(parsed).not.toBeNull()
+      const content = (parsed!.layouts.tab1 as any).content
+      expect(content.status).toBe('error')
+      expect(content.terminalId).toBeUndefined()
+      expect(content.sessionRef).toBeUndefined()
+      expect(content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'invalid_legacy_restore_target',
+      })
+    })
   })
 })
