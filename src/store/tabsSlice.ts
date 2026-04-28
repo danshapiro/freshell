@@ -45,6 +45,19 @@ type HydrateTabsMeta = {
   remoteLayoutPersistedAt?: number
 }
 
+function normalizePersistedTerminalStatus(status: unknown): TerminalStatus {
+  if (
+    status === 'running'
+    || status === 'recovering'
+    || status === 'exited'
+    || status === 'error'
+    || status === 'creating'
+  ) {
+    return status
+  }
+  return 'creating'
+}
+
 function migrateTabFields(t: Tab): Tab {
   const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
   // Strip legacy terminalId field from persisted data
@@ -62,7 +75,7 @@ function migrateTabFields(t: Tab): Tab {
     codingCliProvider,
     createdAt: t.createdAt || Date.now(),
     createRequestId: (t as any).createRequestId || t.id,
-    status: t.status || 'creating',
+    status: normalizePersistedTerminalStatus(t.status),
     mode: t.mode || 'shell',
     shell: t.shell || 'system',
     sessionRef: durableState.sessionRef,
@@ -688,13 +701,19 @@ export const openSessionTab = createAsyncThunk(
       return
     }
 
+    const tabId = nanoid()
     dispatch(addTab({
+      id: tabId,
       title: title || getProviderLabel(resolvedProvider, extensions),
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
       sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
       sessionMetadataByKey: buildSessionMetadataByKey(),
+    }))
+    dispatch(initLayout({
+      tabId,
+      content: desiredResumeContent,
     }))
   }
 )

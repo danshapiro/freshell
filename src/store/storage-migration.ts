@@ -17,6 +17,7 @@ import { clearAuthCookie } from '@/lib/auth'
 import { LAYOUT_SCHEMA_VERSION, PANES_SCHEMA_VERSION, migrateV2ToV3 } from './persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
 import {
+  buildRestoreError,
   migrateLegacyAgentChatDurableState,
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
@@ -63,6 +64,34 @@ function normalizeLayoutTab(tab: Record<string, unknown>): Record<string, unknow
   }
 }
 
+function normalizeLegacyRecoveryFailedTerminal(
+  content: Record<string, unknown>,
+  durableState: { sessionRef?: unknown },
+): Record<string, unknown> {
+  if (content.kind !== 'terminal' || content.mode !== 'codex' || content.status !== 'recovery_failed') {
+    return content
+  }
+
+  const {
+    terminalId: _terminalId,
+    status: _status,
+    restoreError: _restoreError,
+    ...rest
+  } = content
+  if (durableState.sessionRef) {
+    return {
+      ...rest,
+      status: 'creating',
+    }
+  }
+
+  return {
+    ...rest,
+    status: 'error',
+    restoreError: buildRestoreError('invalid_legacy_restore_target'),
+  }
+}
+
 function normalizeLayoutNode(node: unknown): unknown {
   if (!node || typeof node !== 'object') return node
   const candidate = node as Record<string, unknown>
@@ -76,12 +105,18 @@ function normalizeLayoutNode(node: unknown): unknown {
         resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
       })
       const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+      const normalizedRuntime = normalizeLegacyRecoveryFailedTerminal(rest, durableState)
+      const isLegacyRecoveryFailed = (
+        rest.kind === 'terminal'
+        && rest.mode === 'codex'
+        && rest.status === 'recovery_failed'
+      )
       return {
         ...candidate,
         content: {
-          ...rest,
+          ...normalizedRuntime,
           ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-          ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
+          ...(!isLegacyRecoveryFailed && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },
       }
     }

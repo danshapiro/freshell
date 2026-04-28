@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import {
+  buildRestoreError,
   migrateLegacyAgentChatDurableState,
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
@@ -48,6 +49,34 @@ export type ParsedPersistedTabs = {
 }
 
 type PersistedTab = z.infer<typeof zTab>
+
+function normalizeLegacyRecoveryFailedTerminal(
+  content: Record<string, unknown>,
+  durableState: { sessionRef?: unknown },
+): Record<string, unknown> {
+  if (content.kind !== 'terminal' || content.mode !== 'codex' || content.status !== 'recovery_failed') {
+    return content
+  }
+
+  const {
+    terminalId: _terminalId,
+    status: _status,
+    restoreError: _restoreError,
+    ...rest
+  } = content
+  if (durableState.sessionRef) {
+    return {
+      ...rest,
+      status: 'creating',
+    }
+  }
+
+  return {
+    ...rest,
+    status: 'error',
+    restoreError: buildRestoreError('invalid_legacy_restore_target'),
+  }
+}
 
 function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
   const mode = typeof tab.mode === 'string' ? tab.mode : undefined
@@ -127,12 +156,21 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
     ? content.restoreError
     : undefined
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+  const isLegacyRecoveryFailed = (
+    rest.kind === 'terminal'
+    && rest.mode === 'codex'
+    && rest.status === 'recovery_failed'
+  )
+  const normalizedRuntime = normalizeLegacyRecoveryFailedTerminal(rest, durableState)
+  const normalizedRestoreError = isLegacyRecoveryFailed
+    ? undefined
+    : durableState.restoreError ?? existingRestoreError
 
   return {
-    ...rest,
+    ...normalizedRuntime,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-    ...((durableState.restoreError ?? existingRestoreError)
-      ? { restoreError: durableState.restoreError ?? existingRestoreError }
+    ...(normalizedRestoreError
+      ? { restoreError: normalizedRestoreError }
       : {}),
   }
 }
