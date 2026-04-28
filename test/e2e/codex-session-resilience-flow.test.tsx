@@ -307,6 +307,19 @@ describe('Codex session resilience flow', () => {
 
     act(() => {
       messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-codex-reattach',
+        attachRequestId: reattachRequestId,
+        headSeq: 0,
+        replayFromSeq: 0,
+        replayToSeq: 0,
+      })
+    })
+    expect(contentFor(store, tabId).terminalId).toBe('term-codex-reattach')
+    expect(contentFor(store, tabId).status).toBe('recovering')
+
+    act(() => {
+      messageHandler!({
         type: 'terminal.status',
         terminalId: 'term-codex-reattach',
         status: 'running',
