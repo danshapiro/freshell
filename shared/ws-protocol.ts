@@ -488,7 +488,7 @@ export type TerminalExitMessage = {
 export type TerminalStatusMessage = {
   type: 'terminal.status'
   terminalId: string
-  status: 'running' | 'recovering' | 'recovery_failed'
+  status: 'running' | 'recovering'
   reason?: string
   attempt?: number
 }
@@ -738,7 +738,7 @@ export type TerminalInventoryMessage = {
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
-    runtimeStatus?: 'running' | 'recovering' | 'recovery_failed'
+    runtimeStatus?: 'running' | 'recovering'
     cwd?: string
   }>
   terminalMeta: TerminalMetaRecord[]

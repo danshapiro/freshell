@@ -383,14 +383,14 @@ describe('ws handshake snapshot', () => {
         runtimeStatus: 'recovering',
       },
       {
-        terminalId: 'term-runtime-failed',
+        terminalId: 'term-runtime-recovering-detached',
         title: 'Codex CLI',
         mode: 'codex',
         resumeSessionId: '019d9859-5670-72b1-851f-794ad7fef114',
         createdAt: 12,
         lastActivityAt: 22,
         status: 'running',
-        runtimeStatus: 'recovery_failed',
+        runtimeStatus: 'recovering',
       },
       {
         terminalId: 'term-runtime-exited',
@@ -421,9 +421,9 @@ describe('ws handshake snapshot', () => {
         status: 'running',
         runtimeStatus: 'recovering',
       })
-      expect(byId.get('term-runtime-failed')).toMatchObject({
+      expect(byId.get('term-runtime-recovering-detached')).toMatchObject({
         status: 'running',
-        runtimeStatus: 'recovery_failed',
+        runtimeStatus: 'recovering',
       })
       expect(byId.get('term-runtime-exited')).toMatchObject({
         status: 'exited',
