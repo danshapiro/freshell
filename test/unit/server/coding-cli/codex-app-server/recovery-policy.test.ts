@@ -46,7 +46,7 @@ describe('CodexRecoveryPolicy', () => {
 
     policy.noteRecoveryRetireCallback()
 
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 1, delayMs: 0 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 1, delayMs: 0 })
   })
 
   it('buffers input during recovery and expires it after the ttl', () => {

@@ -4,7 +4,6 @@ export type CodexRecoveryState =
   | 'running_durable'
   | 'recovering_pre_durable'
   | 'recovering_durable'
-  | 'recovery_failed'
 
 export type CodexWorkerCloseReason =
   | 'spontaneous_worker_failure'
@@ -22,9 +21,7 @@ export type CodexWorkerFailureSource =
   | 'replacement_launch_failure'
   | 'replacement_spawn_failure'
 
-export type CodexRecoveryAttemptResult =
-  | { ok: true; attempt: number; delayMs: number }
-  | { ok: false; reason: 'exhausted' }
+export type CodexRecoveryAttempt = { attempt: number; delayMs: number }
 
 export type CodexRecoveryInputBufferResult =
   | { ok: true }
@@ -54,18 +51,15 @@ export class CodexRecoveryPolicy {
     this.now = options.now ?? Date.now
   }
 
-  nextAttempt(): CodexRecoveryAttemptResult {
+  nextAttempt(): CodexRecoveryAttempt {
     this.resetIfStableWindowElapsed()
     this.stableSince = undefined
 
-    if (this.attemptsUsed >= RETRY_DELAYS_MS.length) {
-      return { ok: false, reason: 'exhausted' }
-    }
-
     const attempt = this.attemptsUsed + 1
-    const delayMs = RETRY_DELAYS_MS[this.attemptsUsed]
+    const delayIndex = Math.min(this.attemptsUsed, RETRY_DELAYS_MS.length - 1)
+    const delayMs = RETRY_DELAYS_MS[delayIndex]
     this.attemptsUsed = attempt
-    return { ok: true, attempt, delayMs }
+    return { attempt, delayMs }
   }
 
   markStableRunning(): void {
