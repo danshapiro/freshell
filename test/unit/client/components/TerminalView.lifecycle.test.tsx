@@ -290,7 +290,7 @@ describe('TerminalView lifecycle updates', () => {
     installPerfAuditBridge(null)
   })
 
-  function setupThemeTerminal() {
+  function setupThemeTerminal(overrides: Partial<TerminalPaneContent> = {}) {
     const tabId = 'tab-theme'
     const paneId = 'pane-theme'
 
@@ -301,6 +301,7 @@ describe('TerminalView lifecycle updates', () => {
       mode: 'claude',
       shell: 'system',
       initialCwd: '/tmp',
+      ...overrides,
     }
 
     const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -316,8 +317,8 @@ describe('TerminalView lifecycle updates', () => {
         tabs: {
           tabs: [{
             id: tabId,
-            mode: 'claude',
-            status: 'running',
+            mode: paneContent.mode,
+            status: paneContent.status,
             title: 'Claude',
             titleSetByUser: false,
             createRequestId: 'req-theme',
@@ -337,6 +338,16 @@ describe('TerminalView lifecycle updates', () => {
     return { store, tabId, paneId, paneContent }
   }
 
+  function getLeafTerminalContent(
+    store: ReturnType<typeof setupThemeTerminal>['store'],
+    tabId: string,
+  ): TerminalPaneContent {
+    const layout = store.getState().panes.layouts[tabId]
+    expect(layout.type).toBe('leaf')
+    expect(layout.content.kind).toBe('terminal')
+    return layout.content
+  }
+
   it('enables minimum contrast ratio when terminal theme is light', async () => {
     terminalThemeMocks.getTerminalTheme.mockReturnValue({ isDark: false })
     const { store, tabId, paneId, paneContent } = setupThemeTerminal()
@@ -350,6 +361,44 @@ describe('TerminalView lifecycle updates', () => {
     await waitFor(() => {
       expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(4.5)
     })
+  })
+
+  it('ignores legacy recovery_failed terminal.status for durable Codex panes', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      mode: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(messageHandler).not.toBeNull())
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: paneContent.createRequestId,
+        terminalId: 'term-theme',
+        createdAt: Date.now(),
+      })
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-theme',
+        status: 'running',
+      })
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-theme',
+        status: 'recovery_failed',
+      } as any)
+    })
+
+    const content = getLeafTerminalContent(store, tabId)
+    expect(content.terminalId).toBe('term-theme')
+    expect(content.status).toBe('running')
   })
 
   it('skips terminal create when the e2e harness suppresses terminal network effects for the pane', () => {
@@ -620,18 +669,6 @@ describe('TerminalView lifecycle updates', () => {
     layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
     expect(layout.content.terminalId).toBe('term-status')
     expect(layout.content.status).toBe('running')
-
-    act(() => {
-      messageHandler!({
-        type: 'terminal.status',
-        terminalId: 'term-status',
-        status: 'recovery_failed',
-        reason: 'retry_exhausted',
-      })
-    })
-    layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: TerminalPaneContent }
-    expect(layout.content.terminalId).toBe('term-status')
-    expect(layout.content.status).toBe('recovery_failed')
 
     act(() => {
       messageHandler!({

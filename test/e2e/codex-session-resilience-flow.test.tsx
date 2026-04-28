@@ -255,16 +255,6 @@ describe('Codex session resilience flow', () => {
 
     act(() => {
       messageHandler!({
-        type: 'terminal.status',
-        terminalId: 'term-codex-resilience',
-        status: 'recovery_failed',
-      })
-    })
-    expect(contentFor(store, tabId).terminalId).toBe('term-codex-resilience')
-    expect(contentFor(store, tabId).status).toBe('recovery_failed')
-
-    act(() => {
-      messageHandler!({
         type: 'terminal.exit',
         terminalId: 'term-codex-resilience',
         exitCode: 0,
@@ -274,7 +264,7 @@ describe('Codex session resilience flow', () => {
     expect(contentFor(store, tabId).status).toBe('exited')
   })
 
-  it('keeps server runtime status authoritative when reattach becomes ready', async () => {
+  it('keeps recovering status through reattach until the server reports running', async () => {
     const { store, tabId, paneId, paneContent } = createStore()
 
     render(
@@ -304,10 +294,10 @@ describe('Codex session resilience flow', () => {
       messageHandler!({
         type: 'terminal.status',
         terminalId: 'term-codex-reattach',
-        status: 'recovery_failed',
+        status: 'recovering',
       })
     })
-    expect(contentFor(store, tabId).status).toBe('recovery_failed')
+    expect(contentFor(store, tabId).status).toBe('recovering')
 
     act(() => {
       reconnectHandler!()
@@ -317,16 +307,13 @@ describe('Codex session resilience flow', () => {
 
     act(() => {
       messageHandler!({
-        type: 'terminal.attach.ready',
+        type: 'terminal.status',
         terminalId: 'term-codex-reattach',
-        attachRequestId: reattachRequestId,
-        headSeq: 0,
-        replayFromSeq: 0,
-        replayToSeq: 0,
+        status: 'running',
       })
     })
 
     expect(contentFor(store, tabId).terminalId).toBe('term-codex-reattach')
-    expect(contentFor(store, tabId).status).toBe('recovery_failed')
+    expect(contentFor(store, tabId).status).toBe('running')
   })
 })
