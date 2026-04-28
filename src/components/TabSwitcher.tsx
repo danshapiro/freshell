@@ -30,15 +30,13 @@ function statusLabel(status: TerminalStatus): string {
       return 'Recovering'
     case 'error':
       return 'Error'
-    case 'recovery_failed':
-      return 'Recovery failed'
     default:
       return ''
   }
 }
 
 function isDestructiveStatus(status: TerminalStatus): boolean {
-  return status === 'exited' || status === 'error' || status === 'recovery_failed'
+  return status === 'exited' || status === 'error'
 }
 
 export function TabSwitcher({ onClose }: TabSwitcherProps) {

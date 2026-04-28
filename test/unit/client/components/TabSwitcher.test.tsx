@@ -359,7 +359,7 @@ describe('TabSwitcher', () => {
     const store = createStore(
       [
         createTab('tab-1', 'Recovering Codex', { status: 'recovering' }),
-        createTab('tab-2', 'Failed Codex', { status: 'recovery_failed' }),
+        createTab('tab-2', 'Failed Codex', { status: 'error' }),
       ],
       'tab-1'
     )
@@ -373,10 +373,10 @@ describe('TabSwitcher', () => {
       name: /switch to recovering codex \(recovering\)/i,
     })
     const failedCard = screen.getByRole('button', {
-      name: /switch to failed codex \(recovery failed\)/i,
+      name: /switch to failed codex \(error\)/i,
     })
     const recoveringStatus = within(recoveringCard).getByText('Recovering')
-    const failedStatus = within(failedCard).getByText('Recovery failed')
+    const failedStatus = within(failedCard).getByText('Error')
 
     expect(recoveringStatus.className).toContain('text-muted-foreground')
     expect(failedStatus.className).toContain('text-destructive')

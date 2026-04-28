@@ -2057,7 +2057,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (
             msg.status === 'running'
             || msg.status === 'recovering'
-            || msg.status === 'recovery_failed'
           ) {
             updateContent({ status: msg.status })
             const statusTab = tabRef.current

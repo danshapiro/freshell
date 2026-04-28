@@ -6,8 +6,6 @@ export function getTerminalStatusIconClassName(status: TerminalStatus): string {
       return 'text-success'
     case 'recovering':
       return 'text-warning'
-    case 'recovery_failed':
-      return 'text-destructive'
     case 'exited':
       return 'text-muted-foreground/40'
     case 'error':
@@ -24,8 +22,6 @@ export function getTerminalStatusDotClassName(status: TerminalStatus): string {
       return 'fill-success text-success'
     case 'recovering':
       return 'fill-warning text-warning'
-    case 'recovery_failed':
-      return 'fill-destructive text-destructive'
     case 'exited':
       return 'text-muted-foreground/40'
     case 'error':
