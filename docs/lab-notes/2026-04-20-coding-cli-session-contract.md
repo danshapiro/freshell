@@ -81,7 +81,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "executable": "claude",
       "resolvedPath": "/home/user/bin/claude",
       "isolatedBinaryPath": "/home/user/.local/bin/claude",
-      "version": "2.1.119 (Claude Code)",
+      "version": "2.1.121 (Claude Code)",
       "exactIdCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --session-id <uuid> <prompt>",
       "namedResumeCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --resume <title-or-uuid> [--name <title>] <prompt>",
       "transcriptGlob": ".claude/projects/*/<uuid>.jsonl",
@@ -238,7 +238,7 @@ command -v claude
 # /home/user/bin/claude
 
 claude --version
-# 2.1.119 (Claude Code)
+# 2.1.121 (Claude Code)
 ```
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.

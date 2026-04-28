@@ -925,7 +925,19 @@ describe('ContextMenuProvider', () => {
         sessionId: VALID_SESSION_ID,
       },
     })
-    expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
+    expect(store.getState().panes.layouts[openedTab!.id]).toMatchObject({
+      type: 'leaf',
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        initialCwd: '/shared/project/history',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+        status: 'creating',
+      },
+    })
   })
 
   it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
