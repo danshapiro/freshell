@@ -76,5 +76,77 @@ describe('persistedState parsers', () => {
       expect(parsed!.version).toBe(1)
       expect(Object.keys(parsed!.layouts)).toEqual(['tab-1'])
     })
+
+    it('normalizes legacy Codex recovery_failed panes to creating resume panes', () => {
+      const parsed = parsePersistedPanesRaw(JSON.stringify({
+        version: 1,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+              restoreError: {
+                code: 'RESTORE_UNAVAILABLE',
+                reason: 'provider_runtime_failed',
+              },
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      }))
+
+      expect(parsed).not.toBeNull()
+      const content = (parsed!.layouts.tab1 as any).content
+      expect(content).toMatchObject({
+        kind: 'terminal',
+        mode: 'codex',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+        initialCwd: '/repo',
+      })
+      expect(content.terminalId).toBeUndefined()
+      expect(content.restoreError).toBeUndefined()
+    })
+
+    it('does not create a fresh Codex pane for non-resumable legacy recovery_failed state', () => {
+      const parsed = parsePersistedPanesRaw(JSON.stringify({
+        version: 1,
+        layouts: {
+          tab1: {
+            type: 'leaf',
+            id: 'pane1',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      }))
+
+      expect(parsed).not.toBeNull()
+      const content = (parsed!.layouts.tab1 as any).content
+      expect(content.status).toBe('error')
+      expect(content.terminalId).toBeUndefined()
+      expect(content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'invalid_legacy_restore_target',
+      })
+    })
   })
 })

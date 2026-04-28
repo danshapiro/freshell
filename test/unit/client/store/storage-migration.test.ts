@@ -177,6 +177,117 @@ describe('storage-migration', () => {
     })
   })
 
+  it('migrates durable legacy Codex recovery_failed panes to creating resume panes', async () => {
+    localStorage.setItem('freshell_version', '3')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      tabs: {
+        activeTabId: 'tab-codex',
+        tabs: [{
+          id: 'tab-codex',
+          title: 'Codex terminal',
+          createdAt: 1,
+          mode: 'codex',
+          sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-codex': {
+            type: 'leaf',
+            id: 'pane-codex',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+              restoreError: {
+                code: 'RESTORE_UNAVAILABLE',
+                reason: 'provider_runtime_failed',
+              },
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: { 'tab-codex': 'pane-codex' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    const content = ((parsed!.panes.layouts['tab-codex'] as any)?.content) ?? {}
+    expect(content).toMatchObject({
+      kind: 'terminal',
+      mode: 'codex',
+      status: 'creating',
+      sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+      initialCwd: '/repo',
+    })
+    expect(content.terminalId).toBeUndefined()
+    expect(content.restoreError).toBeUndefined()
+  })
+
+  it('migrates non-resumable legacy Codex recovery_failed panes to restore-unavailable errors', async () => {
+    localStorage.setItem('freshell_version', '3')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+      version: 3,
+      tabs: {
+        activeTabId: 'tab-codex',
+        tabs: [{
+          id: 'tab-codex',
+          title: 'Codex terminal',
+          createdAt: 1,
+          mode: 'codex',
+        }],
+      },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-codex': {
+            type: 'leaf',
+            id: 'pane-codex',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-old',
+              terminalId: 'term-old',
+              status: 'recovery_failed',
+              initialCwd: '/repo',
+            },
+          },
+        },
+        activePane: { 'tab-codex': 'pane-codex' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    await importFreshStorageMigration()
+
+    const migratedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(migratedRaw).not.toBeNull()
+    const parsed = parsePersistedLayoutRaw(migratedRaw!)
+    expect(parsed).not.toBeNull()
+    const content = ((parsed!.panes.layouts['tab-codex'] as any)?.content) ?? {}
+    expect(content.status).toBe('error')
+    expect(content.terminalId).toBeUndefined()
+    expect(content.restoreError).toEqual({
+      code: 'RESTORE_UNAVAILABLE',
+      reason: 'invalid_legacy_restore_target',
+    })
+  })
+
   it('migrates recoverable v2 tabs and panes into the v3 layout key before clearing legacy storage', async () => {
     localStorage.setItem('freshell_version', '3')
     localStorage.setItem(TABS_STORAGE_KEY, JSON.stringify({

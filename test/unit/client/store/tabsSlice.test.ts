@@ -475,6 +475,33 @@ describe('tabsSlice', () => {
       })
       expect(tab.createdAt).toBe(5000000)
     })
+
+    it('normalizes legacy recovery_failed tab status to creating during hydration', () => {
+      const legacyTab = {
+        id: 'legacy-codex',
+        createRequestId: 'legacy-codex',
+        title: 'Legacy Codex',
+        status: 'recovery_failed',
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-durable-1',
+        },
+        createdAt: 5000001,
+      } as any
+
+      const state = tabsReducer(
+        initialState,
+        hydrateTabs({
+          tabs: [legacyTab],
+          activeTabId: 'legacy-codex',
+        }),
+      )
+
+      const tab = state.tabs[0]
+      expect(tab.status).toBe('creating')
+      expect(tab.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-durable-1' })
+    })
   })
 
   describe('closeTab with multiple panes', () => {
@@ -666,6 +693,33 @@ describe('tabsSlice', () => {
         sessionId: VALID_CLAUDE_SESSION_ID,
       })
       expect(tabs[0].mode).toBe('claude')
+    })
+
+    it('opens a completed Codex history row as a terminal resume pane, not a transcript-only tab', async () => {
+      const store = createOpenSessionStore()
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'thread-durable-1',
+        title: 'Existing Codex session',
+        cwd: '/repo',
+        provider: 'codex',
+        sessionType: 'codex',
+      }) as any)
+
+      const state = store.getState()
+      const tab = state.tabs.tabs.find((candidate) => candidate.title === 'Existing Codex session')
+      expect(tab).toBeTruthy()
+      expect(tab?.codingCliSessionId).toBeUndefined()
+      expect(tab?.sessionRef).toEqual({ provider: 'codex', sessionId: 'thread-durable-1' })
+
+      const layout = state.panes.layouts[tab!.id]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content).toMatchObject({
+        kind: 'terminal',
+        mode: 'codex',
+        sessionRef: { provider: 'codex', sessionId: 'thread-durable-1' },
+        status: 'creating',
+      })
     })
 
     it('persists session metadata on newly opened tabs for fallback filtering and restored session type', async () => {
