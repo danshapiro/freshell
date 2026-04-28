@@ -2,38 +2,43 @@ import { describe, expect, it } from 'vitest'
 import { CodexRecoveryPolicy } from '../../../../../server/coding-cli/codex-app-server/recovery-policy.js'
 
 describe('CodexRecoveryPolicy', () => {
-  it('uses the documented immediate retry and backoff sequence', () => {
+  it('keeps issuing attempts with capped delay instead of exhausting', () => {
     const policy = new CodexRecoveryPolicy({ now: () => 0 })
 
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 1, delayMs: 0 })
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 2, delayMs: 250 })
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 3, delayMs: 1000 })
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 4, delayMs: 2000 })
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 5, delayMs: 5000 })
-    expect(policy.nextAttempt()).toEqual({ ok: false, reason: 'exhausted' })
+    expect(policy.nextAttempt()).toEqual({ attempt: 1, delayMs: 0 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 2, delayMs: 250 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 3, delayMs: 1000 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 4, delayMs: 2000 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 5, delayMs: 5000 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 6, delayMs: 5000 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 7, delayMs: 5000 })
   })
 
-  it('does not replenish attempts merely because time passes while recovery continues', () => {
+  it('keeps capped attempts while time passes during ongoing recovery', () => {
     let now = 0
     const policy = new CodexRecoveryPolicy({ now: () => now })
 
     for (let index = 0; index < 5; index += 1) {
-      expect(policy.nextAttempt().ok).toBe(true)
+      policy.nextAttempt()
     }
     now += 2 * 60 * 1000
 
-    expect(policy.nextAttempt()).toEqual({ ok: false, reason: 'exhausted' })
+    expect(policy.nextAttempt()).toEqual({ attempt: 6, delayMs: 5000 })
+    expect(policy.nextAttempt()).toEqual({ attempt: 7, delayMs: 5000 })
   })
 
-  it('resets attempts after ten stable running minutes', () => {
+  it('resets the retry sequence after a stable running window', () => {
     let now = 0
     const policy = new CodexRecoveryPolicy({ now: () => now })
 
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 1, delayMs: 0 })
-    policy.markStableRunning()
-    now += 10 * 60 * 1000
+    for (let index = 0; index < 8; index += 1) {
+      policy.nextAttempt()
+    }
 
-    expect(policy.nextAttempt()).toEqual({ ok: true, attempt: 1, delayMs: 0 })
+    policy.markStableRunning()
+    now += 10 * 60 * 1000 + 1
+
+    expect(policy.nextAttempt()).toEqual({ attempt: 1, delayMs: 0 })
   })
 
   it('does not consume retry budget for recovery-retire cleanup callbacks', () => {
