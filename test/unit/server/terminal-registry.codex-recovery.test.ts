@@ -656,23 +656,18 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     expect(replacementPty.write).toHaveBeenCalledWith('abc')
   })
 
-  it('handles recovery_failed input locally instead of reporting a missing terminal', async () => {
-    const output = vi.fn()
-    registry.on('terminal.output.raw', output)
+  it('buffers input while durable Codex recovery is active', async () => {
     const record = registry.create({
       mode: 'codex',
       cwd: '/repo',
       resumeSessionId: 'thread-durable-1',
     })
-    record.codex!.recoveryState = 'recovery_failed'
+    const pty = await lastPty()
+    record.codex!.recoveryState = 'recovering_durable'
 
     expect(registry.input(record.terminalId, 'abc')).toBe(true)
 
-    expect(record.buffer.snapshot()).toContain('Codex recovery failed')
-    expect(output).toHaveBeenCalledWith(expect.objectContaining({
-      terminalId: record.terminalId,
-      data: expect.stringContaining('Codex recovery failed'),
-    }))
+    expect(pty.write).not.toHaveBeenCalledWith('abc')
   })
 
   it('handles recovery input overflow locally so ws-handler does not see an invalid terminal', async () => {
@@ -965,7 +960,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     expect(replacementPty.write).toHaveBeenCalledWith('fast')
   })
 
-  it('enters recovery_failed after bounded replacement launch failures without emitting terminal.exit', async () => {
+  it('keeps retrying durable Codex resume after repeated replacement launch failures', async () => {
     vi.useFakeTimers()
     const exited = vi.fn()
     const status = vi.fn()
@@ -981,55 +976,56 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const oldPty = await lastPty()
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
 
-    for (let i = 0; i < 12; i += 1) {
+    for (let index = 0; index < 16; index += 1) {
       await vi.runOnlyPendingTimersAsync()
       await Promise.resolve()
     }
 
-    await vi.waitFor(() => expect(record.codex?.recoveryState).toBe('recovery_failed'))
-    expect(launchFactory).toHaveBeenCalledTimes(5)
+    expect(launchFactory.mock.calls.length).toBeGreaterThan(5)
+    expect(record.status).toBe('running')
+    expect(record.codex?.recoveryState).toBe('recovering_durable')
     expect(exited).not.toHaveBeenCalled()
     expect(status).toHaveBeenCalledWith(expect.objectContaining({
       terminalId: record.terminalId,
+      status: 'recovering',
+    }))
+    expect(status).not.toHaveBeenCalledWith(expect.objectContaining({
+      terminalId: record.terminalId,
       status: 'recovery_failed',
     }))
+    expect(launchFactory.mock.calls.every(([input]) => input.resumeSessionId === 'thread-durable-1')).toBe(true)
   })
 
-  it('retires the current failed Codex worker when retry budget is already exhausted', async () => {
+  it('retires the failed worker and schedules another durable resume attempt after many failures', async () => {
+    vi.useFakeTimers()
     const sidecar = createMockSidecar()
-    const output = vi.fn()
     const status = vi.fn()
-    registry.on('terminal.output.raw', output)
     registry.on('terminal.status', status)
+    const launchFactory = vi.fn().mockRejectedValue(new Error('still unavailable'))
     const record = registry.create({
       mode: 'codex',
       cwd: '/repo',
       resumeSessionId: 'thread-durable-1',
       codexSidecar: sidecar.api,
+      codexLaunchFactory: launchFactory,
     })
     const failedPty = await lastPty()
+
     for (let index = 0; index < 5; index += 1) {
-      expect(record.codex!.recoveryPolicy.nextAttempt().ok).toBe(true)
+      record.codex!.recoveryPolicy.nextAttempt()
     }
 
     failedPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
+    await vi.runOnlyPendingTimersAsync()
+    await Promise.resolve()
 
-    await vi.waitFor(() => expect(record.codex?.recoveryState).toBe('recovery_failed'))
     expect(record.codex?.retiringGenerations.has(1)).toBe(true)
     expect(record.codex?.closeReasonByGeneration.get(1)).toBe('recovery_retire')
     expect(sidecar.api.shutdown).toHaveBeenCalledTimes(1)
     expect(failedPty.kill).toHaveBeenCalledTimes(1)
-    expect(status).toHaveBeenCalledWith(expect.objectContaining({
-      terminalId: record.terminalId,
-      status: 'recovery_failed',
-    }))
-
-    failedPty.onData.mock.calls[0][0]('late failed worker output')
-    expect(record.buffer.snapshot()).not.toContain('late failed worker output')
-    expect(output).not.toHaveBeenCalledWith(expect.objectContaining({
-      terminalId: record.terminalId,
-      data: expect.stringContaining('late failed worker output'),
-    }))
+    expect(record.codex?.recoveryState).toBe('recovering_durable')
+    expect(status).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'recovery_failed' }))
+    expect(launchFactory).toHaveBeenCalled()
   })
 
   it('does not commit durable identity from a failed unpublished replacement candidate', async () => {
@@ -1099,21 +1095,25 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     registry.shutdown()
     registry = new TerminalRegistry(settings, 10)
 
-    const recovering = registry.create({ mode: 'codex', cwd: '/repo' })
-    recovering.codex!.recoveryState = 'recovering_pre_durable'
-    recovering.lastActivityAt = Date.now() - 120_000
+    const recoveringPreDurable = registry.create({ mode: 'codex', cwd: '/repo' })
+    recoveringPreDurable.codex!.recoveryState = 'recovering_pre_durable'
+    recoveringPreDurable.lastActivityAt = Date.now() - 120_000
 
-    const failed = registry.create({ mode: 'codex', cwd: '/repo' })
-    failed.codex!.recoveryState = 'recovery_failed'
-    failed.lastActivityAt = Date.now() - 120_000
+    const recoveringDurable = registry.create({
+      mode: 'codex',
+      cwd: '/repo',
+      resumeSessionId: 'thread-durable-1',
+    })
+    recoveringDurable.codex!.recoveryState = 'recovering_durable'
+    recoveringDurable.lastActivityAt = Date.now() - 120_000
 
     const shell = registry.create({ mode: 'shell', cwd: '/repo' })
     shell.lastActivityAt = Date.now() - 120_000
 
     await registry.enforceIdleKillsForTest()
 
-    expect(recovering.status).toBe('running')
-    expect(failed.status).toBe('running')
+    expect(recoveringPreDurable.status).toBe('running')
+    expect(recoveringDurable.status).toBe('running')
     expect(shell.status).toBe('exited')
   })
 })
