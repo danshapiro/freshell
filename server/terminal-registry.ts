@@ -62,8 +62,6 @@ const CODEX_RECOVERY_READINESS_TIMEOUT_MS = Number(process.env.CODEX_RECOVERY_RE
 const CODEX_PRE_DURABLE_STABILITY_MS = Number(process.env.CODEX_PRE_DURABLE_STABILITY_MS || 1_500)
 const CODEX_RECOVERY_INPUT_NOT_SENT_MESSAGE =
   '\r\n[Freshell] Codex is reconnecting; input was not sent because recovery is still in progress.\r\n'
-const CODEX_RECOVERY_FAILED_INPUT_MESSAGE =
-  '\r\n[Freshell] Codex recovery failed. Close this pane or refresh after checking the server logs.\r\n'
 
 // TerminalMode is now a wider type -- any string is valid as a mode name.
 // 'shell' is the only built-in; all CLI modes come from registered extensions.
@@ -482,7 +480,7 @@ type SpawnedTerminalWorker = {
   mcpCwd?: string
 }
 
-type TerminalRuntimeStatus = 'running' | 'recovering' | 'recovery_failed'
+type TerminalRuntimeStatus = 'running' | 'recovering'
 
 type CodexActiveReplacement = {
   id: string
@@ -1329,7 +1327,7 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   private isCodexRecoveryProtected(record: TerminalRecord): boolean {
-    return this.isCodexRecoveryState(record) || record.codex?.recoveryState === 'recovery_failed'
+    return this.isCodexRecoveryState(record)
   }
 
   private clearCodexInputExpiryTimer(record: TerminalRecord): void {
@@ -1386,10 +1384,7 @@ export class TerminalRegistry extends EventEmitter {
   private getRuntimeStatus(record: TerminalRecord): TerminalRuntimeStatus | undefined {
     if (record.status === 'exited') return undefined
     if (record.mode !== 'codex') return 'running'
-    const state = record.codex?.recoveryState
-    if (state === 'recovering_durable' || state === 'recovering_pre_durable') return 'recovering'
-    if (state === 'recovery_failed') return 'recovery_failed'
-    return 'running'
+    return this.isCodexRecoveryState(record) ? 'recovering' : 'running'
   }
 
   private async handleCodexWorkerFailure(
@@ -1653,11 +1648,6 @@ export class TerminalRegistry extends EventEmitter {
 
     const retiringGeneration = codex.workerGeneration
     const attempt = codex.recoveryPolicy.nextAttempt()
-    if (!attempt.ok) {
-      await this.retireCodexWorkerBundle(record, retiringGeneration)
-      this.enterCodexRecoveryFailed(record, source, error)
-      return
-    }
 
     const recoveryState: CodexRecoveryState = codex.durableSessionId ? 'recovering_durable' : 'recovering_pre_durable'
     codex.recoveryState = recoveryState
@@ -1725,6 +1715,16 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     const resumeSessionId = codex.durableSessionId ?? codex.originalResumeSessionId
+    if (codex.recoveryState === 'recovering_durable' && !resumeSessionId) {
+      await this.failActiveCodexReplacementAttempt(
+        record,
+        attemptId,
+        'replacement_launch_failure',
+        new Error('Codex durable recovery cannot continue without a durable session id.'),
+      )
+      return
+    }
+
     logger.warn({
       ...this.codexRecoveryLogContext(record, active),
       terminalId: record.terminalId,
@@ -1980,29 +1980,6 @@ export class TerminalRegistry extends EventEmitter {
       this.flushCodexBufferedInput(record)
     }, CODEX_PRE_DURABLE_STABILITY_MS)
     active.preDurableTimer.unref?.()
-  }
-
-  private enterCodexRecoveryFailed(
-    record: TerminalRecord,
-    source: CodexWorkerFailureSource,
-    error: Error,
-  ): void {
-    const codex = record.codex
-    if (!codex || record.status === 'exited') return
-    if (codex.activeReplacement?.readinessTimer) clearTimeout(codex.activeReplacement.readinessTimer)
-    if (codex.activeReplacement?.preDurableTimer) clearTimeout(codex.activeReplacement.preDurableTimer)
-    if (codex.activeReplacement?.backoffTimer) clearTimeout(codex.activeReplacement.backoffTimer)
-    this.clearCodexInputExpiryTimer(record)
-    codex.recoveryPolicy.clearBufferedInput()
-    codex.activeReplacement = undefined
-    codex.recoveryState = 'recovery_failed'
-    this.emitTerminalStatus(record, 'recovery_failed', source)
-    logger.warn({
-      ...this.codexRecoveryLogContext(record),
-      err: error,
-      terminalId: record.terminalId,
-      source,
-    }, 'codex_recovery_failed')
   }
 
   private flushCodexBufferedInput(record: TerminalRecord): void {
@@ -2327,10 +2304,6 @@ export class TerminalRegistry extends EventEmitter {
       } else {
         this.scheduleCodexInputExpiryTimer(term)
       }
-      return true
-    }
-    if (term.mode === 'codex' && term.codex?.recoveryState === 'recovery_failed') {
-      this.appendLocalTerminalMessage(term, CODEX_RECOVERY_FAILED_INPUT_MESSAGE)
       return true
     }
     if (term.perf) {
