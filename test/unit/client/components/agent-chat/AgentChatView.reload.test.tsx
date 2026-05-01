@@ -527,7 +527,7 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('blocks create when an exact unavailable selection cannot be launched safely', async () => {
+  it('clears an unavailable exact pane selection and creates with the provider default model', async () => {
     getAgentChatCapabilities.mockResolvedValue({
       ok: true,
       capabilities: {
@@ -572,15 +572,21 @@ describe('AgentChatView reload/restore behavior', () => {
       </Provider>,
     )
 
-    expect(await screen.findByText('Session start failed')).toBeInTheDocument()
-    expect(screen.getByText(/no longer available/i)).toBeInTheDocument()
-    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')).toHaveLength(0)
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'sdk.create',
+        requestId: 'req-unavailable-exact',
+        model: 'opus',
+      }))
+    })
+
+    expect(screen.queryByText('Session start failed')).not.toBeInTheDocument()
     expect(getPaneContent(store, 't1', 'p1')).toEqual(expect.objectContaining({
-      status: 'create-failed',
-      createError: expect.objectContaining({
-        code: 'MODEL_UNAVAILABLE',
-      }),
+      status: 'starting',
+      modelSelection: undefined,
+      createError: undefined,
     }))
+    expect(saveServerSettingsPatchSpy).not.toHaveBeenCalled()
   })
 
   it('clears an unavailable exact provider default and creates with the provider default model', async () => {

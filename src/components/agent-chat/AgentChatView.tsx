@@ -610,20 +610,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         capabilities,
         modelSelection: currentPane.modelSelection,
       })
+      let shouldClearPaneModelSelection = false
       let shouldClearPersistedProviderModelSelection = false
 
-      if (!resolvedSelection.resolvedModelId) {
-        if (
-          resolvedSelection.unavailableExactSelection
-          && paneModelSelectionMatchesCurrentProviderDefault(currentPane, providerSettings)
-        ) {
-          shouldClearPersistedProviderModelSelection = true
-          resolvedSelection = resolveAgentChatModelSelection({
-            providerDefaultModelId,
-            capabilities,
-            modelSelection: undefined,
-          })
-        }
+      if (!resolvedSelection.resolvedModelId && resolvedSelection.unavailableExactSelection) {
+        shouldClearPaneModelSelection = true
+        shouldClearPersistedProviderModelSelection = paneModelSelectionMatchesCurrentProviderDefault(
+          currentPane,
+          providerSettings,
+        )
+        resolvedSelection = resolveAgentChatModelSelection({
+          providerDefaultModelId,
+          capabilities,
+          modelSelection: undefined,
+        })
       }
 
       if (!resolvedSelection.resolvedModelId) {
@@ -681,7 +681,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         content: {
           ...currentPane,
           status: 'starting',
-          ...(shouldClearPersistedProviderModelSelection ? { modelSelection: undefined } : {}),
+          ...(shouldClearPaneModelSelection ? { modelSelection: undefined } : {}),
           ...(resolvedEffort ? {} : { effort: undefined }),
           createError: undefined,
         },
