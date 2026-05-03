@@ -49,6 +49,7 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - Creating, resuming, and refreshing Freshcodex uses Codex app-server thread APIs only over a dedicated stdio app-server runtime. No terminal scraping, no Freshcodex websocket production dependency, and no Claude state path. Existing raw Codex terminal panes keep their loopback websocket app-server launch path because terminal `--remote` attach currently requires a websocket URL.
 - Freshcodex honors Codex runtime settings at create and turn time, including model, sandbox, permission/approval policy, and effort where supported by the generated local app-server schema.
 - Freshcodex can send text and image inputs, interrupt an active turn, fork a thread into a new freshcodex pane, answer Codex command/file/permission approval requests, answer request-user-input prompts, answer MCP elicitations, and reject unsupported dynamic tool calls with a clear response that unblocks the turn.
+- Freshcodex receives Codex app-server notifications live. Turn started/completed, item started/completed, token usage, status, diff, review, compaction, child-agent/collaboration, and thread metadata notifications invalidate or patch the normalized read model and reach subscribed browsers as `freshAgent.event` without requiring a manual refresh.
 - Unsupported Codex capabilities are disabled with clear labels. Do not silently fall back to raw terminal mode.
 - The Freshcodex transcript renders normalized item cards for user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, image generations, review mode, context compaction, dynamic tool calls, errors, and tool/request prompts.
 - Long transcripts page through `thread/turns/list`, hydrate bodies on demand, and render through virtualization so mobile remains responsive.
@@ -72,6 +73,7 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - Codex request ids must round-trip as `string | number`; never coerce server-initiated request ids to numbers before responding.
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
+- Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
 - Freshcodex tests must be able to render without `state.agentChat.sessions` or Claude restore helpers.
 - Main-branch fixes for auto-title, mobile keyboard/touch target behavior, stale pane hydration, reconnect recovery, and app-server stdio/init hardening must survive the cutover.
@@ -817,6 +819,26 @@ it('surfaces server-initiated approval requests and responds on the same JSON-RP
 })
 ```
 
+Add notification forwarding tests in `client.test.ts` and `rich-runtime.test.ts`:
+
+```ts
+it('forwards app-server notifications without treating them as request responses', async () => {
+  const notifications: unknown[] = []
+  client.onNotification((notification) => notifications.push(notification))
+  await fakeServer.sendNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1' } } })
+  expect(notifications).toContainEqual({ method: 'turn/started', params: expect.objectContaining({ threadId: 'thread-1' }) })
+  expect(client.pendingRequestCountForTest()).toBe(0)
+})
+
+it('lets the rich stdio runtime subscribe to notifications and server requests for a specific Freshcodex session', async () => {
+  const seen: unknown[] = []
+  const unsubscribe = await richRuntime.subscribe('thread-1', (event) => seen.push(event))
+  await fakeServer.sendNotification({ method: 'item/completed', params: { threadId: 'thread-1', item: { id: 'item-1' } } })
+  expect(seen).toContainEqual(expect.objectContaining({ method: 'item/completed' }))
+  unsubscribe()
+})
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run:
@@ -970,6 +992,15 @@ spawn(command, [...commandArgs, 'app-server', '--listen', 'stdio://'], {
 ```
 
 and use `CodexStdioJsonlTransport` internally. Proxy the new rich methods after `ensureReady()`. Freshcodex adapter dependencies must use this rich runtime and must not receive or depend on `wsUrl`.
+
+`rich-runtime.ts` must also expose:
+
+```ts
+subscribe(threadId: string, listener: (event: CodexRuntimeEvent) => void): Promise<() => void>
+onServerRequest(listener: (request: CodexServerRequest) => void): () => void
+```
+
+The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by `threadId` only when the generated params contain a thread id; notifications without a thread id but with visible global impact, such as app-server errors, should still reach subscribers as typed runtime events.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1139,6 +1170,38 @@ expect(await adapter.getSnapshot?.({ provider: 'codex', threadId: 'thread-1' }))
 
 Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit unsupported dynamic-tool response; `account/chatgptAuthTokens/refresh` receives an explicit unsupported auth-refresh response with a clear message; deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state.
 
+Add table-driven notification coverage for every local generated `ServerNotification` method that can change visible Freshcodex state:
+
+```ts
+it.each([
+  ['turn/started'],
+  ['turn/completed'],
+  ['item/started'],
+  ['item/completed'],
+  ['thread/statusChanged'],
+  ['thread/tokenUsageUpdated'],
+  ['turn/diffUpdated'],
+  ['turn/planUpdated'],
+  ['context/compacted'],
+  ['thread/nameUpdated'],
+  ['thread/closed'],
+  ['thread/archived'],
+  ['thread/realtime/error'],
+])('invalidates the Freshcodex snapshot for %s notifications', async (method) => {
+  const listener = vi.fn()
+  await adapter.subscribe?.('thread-1', listener)
+  emitNotification(method, { threadId: 'thread-1' })
+  expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'freshAgent.snapshot.invalidate',
+    provider: 'codex',
+    threadId: 'thread-1',
+    reason: method,
+  }))
+})
+```
+
+If the generated schema uses different method names, use the generated names in the test table. The executor must add every visible-state notification method present in `ServerNotification.json`; do not shrink the table to the example above.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run:
@@ -1212,6 +1275,24 @@ type CodexLiveThreadState = {
   latestRevision?: number
 }
 ```
+
+Implement `adapter.subscribe(sessionId, listener)` for Codex by subscribing to the rich runtime notification stream and translating visible app-server events into fresh-agent events:
+
+```ts
+return await runtime.subscribe(sessionId, (event) => {
+  if (isCodexServerRequest(event)) {
+    updatePendingRequestState(sessionId, event)
+    listener({ type: 'freshAgent.snapshot.invalidate', provider: 'codex', threadId: sessionId, reason: event.method })
+    return
+  }
+  if (isVisibleCodexNotification(event)) {
+    updateLiveThreadStateFromNotification(sessionId, event)
+    listener({ type: 'freshAgent.snapshot.invalidate', provider: 'codex', threadId: sessionId, reason: event.method })
+  }
+})
+```
+
+`turn/started` and `turn/completed` must update `activeTurnId`; status, token, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
 
 Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(sessionId)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
 
@@ -2043,6 +2124,7 @@ Add tests for:
 
 ```ts
 it('keeps two clients subscribed to the same Freshcodex thread without dropping either on event refresh', ...)
+it('refreshes both clients when a Codex turn/item/token/diff notification invalidates the Freshcodex snapshot', ...)
 it('emits a freshAgent.error message instead of generic sdk error for freshcodex action failures', ...)
 it('recovers a stopped Codex app-server by surfacing runtime unavailable and enabling retry, not by clearing pane state', ...)
 it('does not create duplicate turn starts when the browser reconnects and reattaches a pane', ...)
@@ -2079,6 +2161,7 @@ In the controller:
 - do not re-send create for a pane with an in-flight request unless retry explicitly changes `createRequestId`
 - attach on reconnect if `sessionId` exists
 - refresh snapshot on `freshAgent.event`, `freshAgent.error` when recoverable, and `freshAgent.forked`
+- debounce notification-driven snapshot refresh per session so a burst of Codex item/token/diff events causes one near-term refresh, not one REST request per raw app-server notification
 - keep action errors in shell state until dismissed or superseded
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -2226,6 +2309,7 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - Client API parses fresh-agent payloads and surfaces controlled errors.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
+- Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
 - Freshcodex renders without `agentChat` session state.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
