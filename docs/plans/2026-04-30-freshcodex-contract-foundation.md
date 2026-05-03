@@ -49,12 +49,15 @@ Schema-grounded protocol facts to preserve:
 - JSON-RPC envelopes omit `"jsonrpc": "2.0"`. Request ids are `string | number`; server-initiated request ids must round-trip unchanged.
 - JSON-RPC requests are `{ id, method, params?, trace? }`; responses are `{ id, result }`; errors are `{ id, error: { code, message, data? } }`; notifications are `{ method, params? }`.
 - Initialization is `initialize` with `{ clientInfo, capabilities }`, followed by exactly one client notification `{ method: 'initialized' }` after a valid response. `InitializeCapabilities` has `experimentalApi` and optional `optOutNotificationMethods`. `InitializeResponse` has `userAgent`, `codexHome`, `platformFamily`, and `platformOs`; there is no `protocolVersion` field in this local schema.
-- Relevant client methods include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `thread/compact/start`, `thread/rollback`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`. There is no `thread/turn/read` method.
+- Generated client methods relevant enough to classify include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `thread/compact/start`, `thread/rollback`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`; Task 4 defines which of these Freshcodex implements now versus disables with a clear unsupported path. There is no `thread/turn/read` method.
 - `thread/start` accepts runtime settings such as `model`, `modelProvider`, `serviceTier`, `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`, `config`, instructions/personality, `ephemeral`, and `sessionStartSource`; it does not accept `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 - `thread/resume` accepts `threadId`, the same major runtime overrides, and `excludeTurns?: boolean`; it does not accept `persistExtendedHistory`.
 - `thread/read` params are exactly `{ threadId: string, includeTurns: boolean }`. `includeTurns` is required in the generated TypeScript. The response is `{ thread }`.
 - `thread/turns/list` params are `{ threadId, cursor?, limit?, sortDirection? }`. It does not accept `revision` or `includeBodies`. The response is `{ data, nextCursor, backwardsCursor }`.
-- `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, and local images are `{ type: 'localImage', path }`.
+- `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, local images are `{ type: 'localImage', path }`, skills are `{ type: 'skill', name, path }`, and mentions are `{ type: 'mention', name, path }`.
+- Codex reasoning effort values are generated as `"none" | "minimal" | "low" | "medium" | "high" | "xhigh"`. Freshcodex must not reuse Claude's legacy `"max"` effort value; if `"max"` is present in migrated settings, show a controlled unsupported Freshcodex settings error or map only through an explicit user-visible migration rule added in this plan.
+- Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`.
+- Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. Do not send the thread-level `sandbox` string to `turn/start`.
 - `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
 - `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
 - `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, `startedAt`, `completedAt`, and `durationMs`.
@@ -62,12 +65,13 @@ Schema-grounded protocol facts to preserve:
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`.
+- `account/chatgptAuthTokens/refresh` expects real token fields in a successful result. Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh error in the pane.
 - Generated `ServerNotification` method names are slash-delimited and must be copied exactly from `ServerNotification.ts`; examples include `thread/status/changed`, `thread/tokenUsage/updated`, `turn/diff/updated`, `turn/plan/updated`, `thread/compacted`, `item/agentMessage/delta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `thread/realtime/error`, and `thread/realtime/closed`.
 - Any per-turn body API in Freshell must be an internal facade over `thread/turns/list`, `thread/read { includeTurns: true }`, or a server-side page/body cache until Codex exposes a direct turn-read request.
 
 Generated method inventory the executor must keep aligned with the local schema:
 
-- Freshcodex client-request methods to implement or intentionally leave unsupported: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unsubscribe`, `thread/name/set`, `thread/metadata/update`, `thread/unarchive`, `thread/compact/start`, `thread/rollback`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`.
+- Freshcodex client-request methods to implement or intentionally leave unsupported must be generated from `ClientRequest.ts` during Task 4, not copied by hand. The implementation-required Freshcodex subset is `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`. The explicit unsupported/disabled subset for this plan is every other generated client method, including `thread/archive`, `thread/unsubscribe`, `thread/name/set`, `thread/metadata/update`, `thread/unarchive`, `thread/compact/start`, `thread/shellCommand`, `thread/approveGuardianDeniedAction`, `thread/rollback`, `thread/inject_items`, skills/plugin/marketplace/app/fs/config/account/device/feedback/fuzzy-file-search methods, standalone `command/exec*`, `turn/steer`, MCP direct-call methods, and Windows sandbox setup. Unsupported methods must have clear server/client capability labels if exposed by UI; do not silently proxy arbitrary generated methods through Freshcodex.
 - Server-request methods requiring pending UI state or explicit unblock responses: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
 - Visible-state notification methods that must invalidate or patch Freshcodex read models: `error`, `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/closed`, `thread/name/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/tokenUsage/updated`, `turn/started`, `hook/started`, `turn/completed`, `hook/completed`, `turn/diff/updated`, `turn/plan/updated`, `item/started`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `item/completed`, `rawResponseItem/completed`, `item/agentMessage/delta`, `item/plan/delta`, `command/exec/outputDelta`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `item/mcpToolCall/progress`, `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `fs/changed`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta`, `thread/compacted`, `model/rerouted`, `model/verification`, `warning`, `guardianWarning`, `configWarning`, `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, `thread/realtime/closed`, `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`.
 - Generated notifications that may be ignored only by an explicit non-visible allowlist: `skills/changed`, `account/updated`, `account/rateLimits/updated`, `app/list/updated`, `remoteControl/status/changed`, `externalAgentConfig/import/completed`, `deprecationNotice`, `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`, and `account/login/completed`.
@@ -103,6 +107,8 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
 - A normalized turn is a lifecycle/container boundary, not a single message role. Codex `Turn` objects contain mixed user, assistant, tool, and system items, so role belongs on message transcript items and turn-level `role` must be optional/legacy-only. Do not invent a turn role to satisfy the contract.
 - A Codex app-server item may normalize to zero, one, or many fresh-agent transcript items. In particular, `userMessage.content` can contain multiple text/image/localImage parts. Codex item normalization must return an array and turn normalization must `flatMap` item output while preserving stable derived ids for split content parts.
+- Codex `UserInput` content parts include text, image, localImage, skill, and mention. Freshcodex message content and renderers must preserve every generated part type; do not silently drop skill or mention references from existing threads.
+- Freshcodex runtime settings use Codex-shaped values at the app-server boundary. Shared UI/state may keep the historical field name `permissionMode`, but the value sent to Codex must parse as generated `AskForApproval`; `effort` must parse as generated `ReasoningEffort`; and turn-time sandbox overrides must be converted to generated `SandboxPolicy` with a clear error if the selected mode cannot be represented.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
@@ -375,6 +381,8 @@ expect(FreshAgentTranscriptItemSchema.parse({
   content: [
     { kind: 'text', text: 'Use this mockup' },
     { kind: 'image', url: 'https://example.test/mockup.png', mediaType: 'image/png' },
+    { kind: 'mention', name: 'README.md', path: '/repo/README.md' },
+    { kind: 'skill', name: 'reviewer', path: '/repo/.codex/skills/reviewer/SKILL.md' },
   ],
 })).toMatchObject({
   kind: 'message',
@@ -382,12 +390,14 @@ expect(FreshAgentTranscriptItemSchema.parse({
   content: [
     { kind: 'text' },
     { kind: 'image' },
+    { kind: 'mention' },
+    { kind: 'skill' },
   ],
 })
 ```
 
 Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures.
-Also assert that `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, permission, and effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code.
+Also assert that `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, Codex approval policy, and Codex effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code. The test must prove Freshcodex accepts generated Codex effort values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and rejects sending legacy Claude-only effort values such as `max` through the Codex adapter. It must also prove Freshcodex accepts generated Codex approval policies (`untrusted`, `on-failure`, `on-request`, `never`, and granular policy objects) and rejects Claude permission modes such as `bypassPermissions` at the Codex boundary.
 
 Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
 
@@ -469,6 +479,16 @@ export const FreshAgentMessageContentPartSchema = z.discriminatedUnion('kind', [
     alt: z.string().optional(),
   }).refine((value) => Boolean(value.url || value.path || value.data), {
     message: 'image message content requires url, path, or data',
+  }),
+  z.object({
+    kind: z.literal('mention'),
+    name: NonEmptyString,
+    path: NonEmptyString,
+  }),
+  z.object({
+    kind: z.literal('skill'),
+    name: NonEmptyString,
+    path: NonEmptyString,
   }),
 ])
 
@@ -586,11 +606,29 @@ export const FreshAgentInputImageSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('data'), data: z.string().min(1), mediaType: z.string().min(1) }),
 ])
 
+export const FreshAgentCodexReasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+export const FreshAgentLegacyClaudeEffortSchema = z.enum(['low', 'medium', 'high', 'max'])
+export const FreshAgentCodexApprovalPolicySchema = z.union([
+  z.enum(['untrusted', 'on-failure', 'on-request', 'never']),
+  z.object({
+    granular: z.object({
+      sandbox_approval: z.boolean(),
+      rules: z.boolean(),
+      skill_approval: z.boolean(),
+      request_permissions: z.boolean(),
+      mcp_elicitations: z.boolean(),
+    }),
+  }),
+])
+export const FreshAgentLegacyClaudePermissionModeSchema = z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions'])
+
 export const FreshAgentRuntimeSettingsSchema = z.object({
   model: z.string().min(1).optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-  permissionMode: z.string().min(1).optional(),
-  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  // Historical field name retained for pane/settings compatibility. Provider
+  // adapters must validate against their own generated runtime schema before sending.
+  permissionMode: z.union([FreshAgentCodexApprovalPolicySchema, FreshAgentLegacyClaudePermissionModeSchema]).optional(),
+  effort: z.union([FreshAgentCodexReasoningEffortSchema, FreshAgentLegacyClaudeEffortSchema]).optional(),
 })
 
 export const FreshAgentThreadSnapshotSchema = z.object({
@@ -840,6 +878,13 @@ find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSON
 
 Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
+Add a generated client-method inventory assertion. Parse method names from the generated `ClientRequest.ts` or `ClientRequest.json` and compare them to two explicit sets:
+
+- implemented in Freshcodex rich runtime: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, `modelProvider/capabilities/read`
+- explicitly unsupported in Freshcodex rich runtime: every other generated method
+
+The test must fail if a new generated client method appears without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request.
+
 Add transport tests requiring stdio JSONL framing and websocket preservation:
 
 ```ts
@@ -977,6 +1022,22 @@ export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string(), text_elements: z.array(z.unknown()).default([]) }),
   z.object({ type: z.literal('image'), url: z.string().url() }),
   z.object({ type: z.literal('localImage'), path: z.string().min(1) }),
+  z.object({ type: z.literal('skill'), name: z.string().min(1), path: z.string().min(1) }),
+  z.object({ type: z.literal('mention'), name: z.string().min(1), path: z.string().min(1) }),
+])
+
+export const CodexReasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+export const CodexApprovalPolicySchema = z.union([
+  z.enum(['untrusted', 'on-failure', 'on-request', 'never']),
+  z.object({
+    granular: z.object({
+      sandbox_approval: z.boolean(),
+      rules: z.boolean(),
+      skill_approval: z.boolean(),
+      request_permissions: z.boolean(),
+      mcp_elicitations: z.boolean(),
+    }),
+  }),
 ])
 
 export const CodexTurnStartParamsSchema = z.object({
@@ -1052,6 +1113,7 @@ type ServerRequest = { id: CodexRequestId; method: string; params: unknown }
 onNotification(listener: (notification: { method: string; params?: unknown }) => void): () => void
 onServerRequest(listener: (request: ServerRequest) => void): () => void
 respondToServerRequest(id: CodexRequestId, result: unknown): Promise<void>
+respondToServerRequestError(id: CodexRequestId, error: { code: number; message: string; data?: unknown }): Promise<void>
 readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult>
 listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult>
 startTurn(params: CodexTurnStartParams): Promise<CodexTurnStartResult>
@@ -1059,7 +1121,7 @@ interruptTurn(params: CodexTurnInterruptParams): Promise<CodexTurnInterruptResul
 forkThread(params: CodexThreadForkParams): Promise<CodexThreadForkResult>
 ```
 
-Update message handling so app-server requests with `id` and `method` are not ignored, and so notifications without `id` reach subscribers. Keep request timeout behavior for client-initiated calls. After a successful `initialize`, send exactly one `initialized` notification on the same transport before non-initialize requests. The client constructor should receive a `CodexAppServerTransport` instead of a `{ wsUrl }` endpoint.
+Update message handling so app-server requests with `id` and `method` are not ignored, and so notifications without `id` reach subscribers. Keep request timeout behavior for client-initiated calls. After a successful `initialize`, send exactly one `initialized` notification on the same transport before non-initialize requests. The client constructor should receive a `CodexAppServerTransport` instead of a `{ wsUrl }` endpoint. Server-request responses must support both result and error envelopes so unsupported required requests such as auth-token refresh can unblock the app-server without sending an invalid success shape.
 
 Keep `runtime.ts` as the websocket remote runtime for raw Codex terminal panes and `CodexLaunchPlanner`. It should spawn:
 
@@ -1177,6 +1239,8 @@ expect(normalizeCodexItem({
     { type: 'text', text: 'Use this mockup', text_elements: [] },
     { type: 'image', url: 'https://example.test/mockup.png' },
     { type: 'localImage', path: '/tmp/mockup.png' },
+    { type: 'mention', name: 'README.md', path: '/repo/README.md' },
+    { type: 'skill', name: 'reviewer', path: '/repo/.codex/skills/reviewer/SKILL.md' },
   ],
 })).toEqual([{
   id: 'u2',
@@ -1186,6 +1250,8 @@ expect(normalizeCodexItem({
     { kind: 'text', text: 'Use this mockup' },
     { kind: 'image', url: 'https://example.test/mockup.png' },
     { kind: 'image', path: '/tmp/mockup.png' },
+    { kind: 'mention', name: 'README.md', path: '/repo/README.md' },
+    { kind: 'skill', name: 'reviewer', path: '/repo/.codex/skills/reviewer/SKILL.md' },
   ],
 }])
 
@@ -1233,7 +1299,7 @@ await adapter.send?.('thread-1', {
     model: 'configured-model',
     sandbox: 'workspace-write',
     permissionMode: 'on-request',
-    effort: 'high',
+    effort: 'xhigh',
   },
 })
 expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
@@ -1241,12 +1307,17 @@ expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   model: 'configured-model',
   sandboxPolicy: expect.anything(),
   approvalPolicy: expect.anything(),
-  effort: 'high',
+  effort: 'xhigh',
   input: [
     { type: 'text', text: 'Use this mockup', text_elements: [] },
     { type: 'image', url: 'https://example.test/mockup.png' },
   ],
 }))
+
+await expect(adapter.send?.('thread-1', {
+  text: 'Invalid codex settings',
+  runtimeSettings: { permissionMode: 'bypassPermissions', effort: 'max' },
+})).rejects.toMatchObject({ code: 'FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING' })
 
 await adapter.interrupt?.('thread-1')
 expect(runtime.interruptTurn).toHaveBeenCalledWith({ threadId: 'thread-1', turnId: 'turn-1' })
@@ -1289,7 +1360,7 @@ expect(await adapter.getSnapshot?.({ provider: 'codex', threadId: 'thread-1' }))
   .toMatchObject({ pendingApprovals: [{ requestId: expect.stringContaining('cmd-1') }] })
 ```
 
-Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit unsupported dynamic-tool response; `account/chatgptAuthTokens/refresh` receives an explicit unsupported auth-refresh response with a clear message; deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state.
+Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields; deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state.
 
 Add table-driven notification coverage for every local generated `ServerNotification` method that can change visible Freshcodex state:
 
@@ -1432,7 +1503,48 @@ return await runtime.subscribe(sessionId, (event) => {
 
 Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(sessionId)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
 
-Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, `permissionMode` as Codex `approvalPolicy`, and `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them.
+Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, Codex-shaped `permissionMode` as generated `approvalPolicy`, and Codex-shaped `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them. Tests must also prove Freshcodex rejects legacy Claude-only values (`permissionMode: 'bypassPermissions'`, `effort: 'max'`) before calling Codex app-server.
+
+Implement explicit runtime-setting mappers:
+
+```ts
+import path from 'node:path'
+
+export function mapFreshcodexApprovalPolicy(value: FreshAgentRuntimeSettings['permissionMode']): CodexApprovalPolicy | undefined {
+  if (value === undefined) return undefined
+  return CodexApprovalPolicySchema.parse(value)
+}
+
+export function mapFreshcodexReasoningEffort(value: FreshAgentRuntimeSettings['effort']): CodexReasoningEffort | undefined {
+  if (value === undefined) return undefined
+  return CodexReasoningEffortSchema.parse(value)
+}
+
+export function mapFreshcodexSandboxModeToTurnPolicy(
+  sandbox: FreshAgentRuntimeSettings['sandbox'],
+  cwd: string | undefined,
+): CodexSandboxPolicy | undefined {
+  switch (sandbox) {
+    case undefined:
+      return undefined
+    case 'danger-full-access':
+      return { type: 'dangerFullAccess' }
+    case 'read-only':
+      return { type: 'readOnly', networkAccess: false }
+    case 'workspace-write':
+      if (!cwd || !path.isAbsolute(cwd)) throw new FreshAgentUnsupportedRuntimeSettingError('workspace-write turn sandbox requires an absolute cwd')
+      return {
+        type: 'workspaceWrite',
+        writableRoots: [cwd],
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+      }
+  }
+}
+```
+
+Use `sandbox` only for `thread/start`, `thread/resume`, and `thread/fork`; use `mapFreshcodexSandboxModeToTurnPolicy()` for `turn/start`. Do not pass the string `sandbox` field to `turn/start`.
 
 Extend `FreshAgentSendSchema`, `FreshAgentRuntimeAdapter.send`, `FreshAgentRuntimeManager.send`, and `server/ws-handler.ts` so turn-time runtime settings and typed image inputs cross the browser/server boundary. Import `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` from `shared/fresh-agent-contract.ts`; do not duplicate those schemas in WebSocket protocol code:
 
@@ -1448,7 +1560,7 @@ export const FreshAgentSendSchema = z.object({
 })
 ```
 
-Map image input explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert data URLs or remote URLs to Codex `{ type: 'image', url }` input and local file paths to `{ type: 'localImage', path }`. If an image input cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
+Map input content explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert data URLs or remote URLs to Codex `{ type: 'image', url }` input and local file paths to `{ type: 'localImage', path }`. Existing Codex transcripts may contain `{ type: 'skill' }` and `{ type: 'mention' }` content parts; preserve them in normalized message content. If a new outbound input part cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
 
 Convert `thread/fork -> { thread, ...metadata }` to the fresh-agent fork result at the adapter boundary:
 
@@ -1584,7 +1696,7 @@ it('sends Freshcodex text, images, and runtime settings without reading Claude s
       model: 'configured-model',
       sandbox: 'workspace-write',
       permissionMode: 'on-request',
-      effort: 'high',
+      effort: 'xhigh',
     },
   })
   await user.type(screen.getByRole('textbox', { name: /chat message input/i }), 'Use this mockup')
@@ -1594,13 +1706,13 @@ it('sends Freshcodex text, images, and runtime settings without reading Claude s
     type: 'freshAgent.send',
     text: 'Use this mockup',
     images: [{ kind: 'url', url: 'https://example.test/mockup.png', mediaType: 'image/png' }],
-    runtimeSettings: {
-      model: 'configured-model',
-      sandbox: 'workspace-write',
-      permissionMode: 'on-request',
-      effort: 'high',
-    },
-  }))
+  runtimeSettings: {
+    model: 'configured-model',
+    sandbox: 'workspace-write',
+    permissionMode: 'on-request',
+    effort: 'xhigh',
+  },
+}))
 })
 ```
 
@@ -1665,10 +1777,12 @@ type FreshAgentShellProps = {
 type FreshAgentRuntimeSettings = {
   model?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
-  permissionMode?: string
-  effort?: 'low' | 'medium' | 'high' | 'max'
+  permissionMode?: CodexApprovalPolicy | ClaudePermissionMode
+  effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 }
 ```
+
+Provider policy helpers must validate these union fields before action dispatch. Freshcodex may dispatch only generated Codex `approvalPolicy` and `effort` values; Freshclaude may keep its existing Claude-specific permission/effort values. The shell should show a controlled settings error if a migrated Freshcodex pane still contains Claude-only values.
 
 `fresh-agent-policy.ts` owns small pure helpers:
 
@@ -1920,6 +2034,8 @@ expect(screen.getByRole('region', { name: /review current changes/i })).toHaveTe
 expect(screen.getByRole('region', { name: /worktree/i })).toHaveTextContent('feature/freshcodex')
 expect(screen.getByRole('region', { name: /fork lineage/i })).toHaveTextContent('thread-parent-1')
 expect(screen.getByRole('region', { name: /child threads/i })).toHaveTextContent('Review shell')
+expect(screen.getByRole('button', { name: /mentioned file README.md/i })).toHaveTextContent('/repo/README.md')
+expect(screen.getByRole('button', { name: /skill reviewer/i })).toHaveTextContent('reviewer')
 ```
 
 Browser e2e should seed a Freshcodex snapshot with a file-change diff and verify the diff is expandable without relying on selectors.
@@ -1943,6 +2059,7 @@ Expected: FAIL because normalized Codex item rendering and workspace panel are i
 `FreshAgentItemCard.tsx` renders one contract item with semantic labels:
 
 - `message`: role-labelled user/assistant/system message with ordered text and image parts, preserving mixed Codex input content.
+- `message` mention/skill parts: render preserved Codex `mention` and `skill` content parts as accessible inline chips with their names and paths.
 - `text`: markdown/plain text with wrapping.
 - `hook_prompt`: hook/context prompt fragments without exposing raw JSON.
 - `reasoning`: collapsed by default, with summary visible and accessible toggle.
@@ -2157,7 +2274,7 @@ expect(createFreshcodexPaneFromSettings({
   },
   agentChat: {
     freshcodex: {
-      defaultEffort: 'high',
+      defaultEffort: 'xhigh',
     },
   },
 })).toMatchObject({
@@ -2167,7 +2284,25 @@ expect(createFreshcodexPaneFromSettings({
   model: 'configured-model',
   sandbox: 'workspace-write',
   permissionMode: 'on-request',
-  effort: 'high',
+  effort: 'xhigh',
+})
+
+expect(createFreshcodexPaneFromSettings({
+  codex: {
+    model: 'configured-model',
+    sandbox: 'workspace-write',
+    permissionMode: 'bypassPermissions',
+  },
+  agentChat: {
+    freshcodex: {
+      defaultEffort: 'max',
+    },
+  },
+})).toMatchObject({
+  kind: 'fresh-agent',
+  provider: 'codex',
+  sessionType: 'freshcodex',
+  createError: expect.objectContaining({ code: 'FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING' }),
 })
 ```
 
@@ -2195,6 +2330,8 @@ Rules:
 - `freshcodex` title defaults to `Freshcodex`, then updates from the first user message or thread name when available.
 - `provider: 'codex'` plus `sessionType: 'freshcodex'` is the session ref identity.
 - `sandbox` is stored on fresh-agent pane content and comes from Codex provider settings, not from Claude/Freshclaude settings.
+- `freshcodex` default permission/effort settings must be Codex-shaped. Replace any Freshcodex registry/default value that still uses Claude-specific permission modes such as `bypassPermissions` with a generated Codex approval policy such as `on-request`; replace any Freshcodex default effort that still uses Claude-only `max` with a generated Codex effort value. Do not mutate Freshclaude or Kilroy defaults.
+- Split settings types so Codex and Claude defaults cannot be accidentally interchanged. In `shared/settings.ts`, stop typing `codingCli.providers.codex.permissionMode` and `freshAgent.providers.freshcodex.defaultEffort` with Claude-only aliases. Introduce Codex-specific approval/effort schemas based on the generated app-server values, keep Claude-specific settings for Freshclaude/Kilroy, and migrate invalid legacy Freshcodex values into a visible `createError` rather than silently coercing them.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
 - `freshopencode` remains disabled and cannot be created.
 - Settings and history labels use `sessionType`; runtime behavior uses `provider`.
