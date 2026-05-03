@@ -46,10 +46,6 @@ export const CodexThreadOperationResultSchema = z.object({
   thread: CodexThreadSchema,
 })
 
-export const CodexLoadedThreadListResultSchema = z.object({
-  data: z.array(z.string().min(1)),
-})
-
 export const CodexRpcErrorSchema = z.object({
   code: z.number(),
   message: z.string().min(1),
@@ -76,5 +72,4 @@ export type CodexInitializeResult = z.infer<typeof CodexInitializeResultSchema>
 export type CodexThreadStartParams = z.infer<typeof CodexThreadStartParamsSchema>
 export type CodexThreadResumeParams = z.infer<typeof CodexThreadResumeParamsSchema>
 export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResultSchema>
-export type CodexLoadedThreadListResult = z.infer<typeof CodexLoadedThreadListResultSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>

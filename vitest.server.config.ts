@@ -33,7 +33,6 @@ export default defineConfig({
     ],
     exclude: [
       'docs/plans/**',
-      'test/integration/server/codex-real-provider-smoke.test.ts',
       'test/unit/visible-first/slow-network-controller.test.ts',
     ],
     testTimeout: 30000,

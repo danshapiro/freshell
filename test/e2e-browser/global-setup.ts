@@ -15,30 +15,21 @@ function findProjectRoot(): string {
   throw new Error('Could not find project root')
 }
 
-interface EnsureFreshE2eBuildDeps {
-  execSync: typeof execSync
-  env: NodeJS.ProcessEnv
-  log: Pick<Console, 'log'>
-}
-
-export function ensureFreshE2eBuild(
-  root: string,
-  deps: EnsureFreshE2eBuildDeps = {
-    execSync,
-    env: process.env,
-    log: console,
-  },
-): void {
-  deps.log.log('[e2e-setup] Building client and server...')
-  deps.execSync('npm run build:client && npm run build:server', {
-    cwd: root,
-    stdio: 'inherit',
-    env: { ...deps.env, NODE_ENV: 'production' },
-  })
-  deps.log.log('[e2e-setup] Build complete.')
-}
-
 export default async function globalSetup() {
   const root = findProjectRoot()
-  ensureFreshE2eBuild(root)
+  const clientDir = path.join(root, 'dist', 'client')
+  const serverEntry = path.join(root, 'dist', 'server', 'index.js')
+
+  // Build if dist doesn't exist
+  if (!fs.existsSync(clientDir) || !fs.existsSync(serverEntry)) {
+    console.log('[e2e-setup] Building client and server...')
+    execSync('npm run build:client && npm run build:server', {
+      cwd: root,
+      stdio: 'inherit',
+      env: { ...process.env, NODE_ENV: 'production' },
+    })
+    console.log('[e2e-setup] Build complete.')
+  } else {
+    console.log('[e2e-setup] Using existing build in dist/')
+  }
 }

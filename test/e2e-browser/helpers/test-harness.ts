@@ -21,8 +21,7 @@ export class TestHarness {
       () => {
         const harness = window.__FRESHELL_TEST_HARNESS__
         if (!harness) return false
-        const reduxStatus = harness.getState()?.connection?.status
-        return harness.getWsReadyState() === 'ready' && reduxStatus === 'ready'
+        return harness.getWsReadyState() === 'ready'
       },
       { timeout: timeoutMs + 1000 },
     )
@@ -34,24 +33,9 @@ export class TestHarness {
    * so the client will attempt to reconnect automatically.
    */
   async forceDisconnect(): Promise<void> {
-    const previousLastReadyAt = await this.page.evaluate(() => {
-      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
-      return state?.connection?.lastReadyAt ?? null
-    })
     await this.page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
     })
-    await this.page.waitForFunction(
-      (lastReadyAt) => {
-        const harness = window.__FRESHELL_TEST_HARNESS__
-        if (!harness) return false
-        const state = harness.getState()
-        return harness.getWsReadyState() !== 'ready'
-          || (state?.connection?.lastReadyAt ?? null) !== lastReadyAt
-      },
-      previousLastReadyAt,
-      { timeout: 5_000 },
-    )
   }
 
   /** Get the current Redux state */

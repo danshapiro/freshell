@@ -14,11 +14,8 @@ type FakeServerBehavior = {
   closeSocketAfterMethodsOnce?: string[]
   delayMethodsMs?: Record<string, number>
   ignoreMethods?: string[]
-  loadedThreadIds?: string[]
-  notificationsAfterMethods?: Record<string, unknown[]>
   requireJsonRpc?: boolean
   requireInitializeBeforeOtherMethods?: boolean
-  requireInitializedNotification?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
 }
 
@@ -179,73 +176,6 @@ describe('CodexAppServerClient', () => {
     await expect(startThreadPromise).resolves.toEqual({
       threadId: 'thread-new-1',
     })
-  })
-
-  it('sends initialized after initialize before later requests', async () => {
-    const server = await startFakeCodexAppServer({
-      requireInitializeBeforeOtherMethods: true,
-      requireInitializedNotification: true,
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-
-    await client.initialize()
-
-    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
-    })
-  })
-
-  it('lists loaded in-memory thread ids', async () => {
-    const server = await startFakeCodexAppServer({
-      loadedThreadIds: ['019d9859-5670-72b1-851f-794ad7fef112', 'thread-new-1'],
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-
-    await client.initialize()
-
-    await expect(client.listLoadedThreads()).resolves.toEqual([
-      '019d9859-5670-72b1-851f-794ad7fef112',
-      'thread-new-1',
-    ])
-  })
-
-  it('emits lifecycle-loss events for closed, notLoaded, and systemError notifications', async () => {
-    const server = await startFakeCodexAppServer({
-      notificationsAfterMethods: {
-        'thread/loaded/list': [
-          {
-            method: 'thread/closed',
-            params: { threadId: 'thread-closed' },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { threadId: 'thread-not-loaded', status: { type: 'notLoaded' } },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { thread: { id: 'thread-system-error', status: { type: 'systemError' } } },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { threadId: 'thread-running', status: { type: 'running' } },
-          },
-        ],
-      },
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-    const events: unknown[] = []
-    const unsubscribe = client.onThreadLifecycleLoss((event) => events.push(event))
-
-    await client.initialize()
-    await client.listLoadedThreads()
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    unsubscribe()
-
-    expect(events).toEqual([
-      { method: 'thread/closed', threadId: 'thread-closed' },
-      { method: 'thread/status/changed', threadId: 'thread-not-loaded', status: 'notLoaded' },
-      { method: 'thread/status/changed', threadId: 'thread-system-error', status: 'systemError' },
-    ])
   })
 
   it('fails clearly when the app-server never answers a request', async () => {

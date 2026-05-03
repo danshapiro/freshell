@@ -522,9 +522,7 @@ describe('test coordinator CLI', () => {
           FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
           FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
           FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-            'npm:typecheck': { holdMs: 1_000 },
-            'npm:build': { holdMs: 1_000 },
-            'npm:test:balanced': { holdMs: 2_000 },
+            'npm:test:balanced': { holdMs: 1_000 },
           }),
         },
       )
@@ -559,7 +557,7 @@ describe('test coordinator CLI', () => {
           isDirty: true,
         },
       })
-      expect(latest.durationMs).toBeLessThan(5_000)
+      expect(latest.durationMs).toBeLessThan(2_000)
     },
   )
 

@@ -47,10 +47,6 @@ function isWindowsStylePath(filePath: string): boolean {
   return /^[A-Za-z]:\\/.test(filePath.replace(/\//g, '\\'))
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value)
-}
-
 function applyAppDataIsolation(
   env: Record<string, string>,
   homeDir: string,
@@ -183,35 +179,6 @@ async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
   }
 }
 
-async function readJsonFileIfPresent(filePath: string): Promise<Record<string, unknown> | null> {
-  try {
-    const parsed = JSON.parse(await fsp.readFile(filePath, 'utf8'))
-    return isRecord(parsed) ? parsed : null
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-}
-
-async function ensureSetupWizardBypassConfig(configPath: string): Promise<void> {
-  const existing = await readJsonFileIfPresent(configPath)
-  const existingSettings = isRecord(existing?.settings) ? existing.settings : {}
-  const existingNetwork = isRecord(existingSettings.network) ? existingSettings.network : {}
-
-  await fsp.writeFile(configPath, JSON.stringify({
-    ...(existing ?? {}),
-    version: 1,
-    settings: {
-      ...existingSettings,
-      network: {
-        configured: true,
-        host: '127.0.0.1',
-        ...existingNetwork,
-      },
-    },
-  }, null, 2))
-}
-
 function readAuthTokenFromEnvFile(envText: string): string {
   const match = envText.match(/^AUTH_TOKEN=(.+)$/m)
   if (!match) {
@@ -310,7 +277,15 @@ export class TestServer {
       // when config.json is missing, blocking all interaction. This minimal config
       // marks the network as already configured, bypassing the wizard.
       const configPath = path.join(freshellDir, 'config.json')
-      await ensureSetupWizardBypassConfig(configPath)
+      await fsp.writeFile(configPath, JSON.stringify({
+        version: 1,
+        settings: {
+          network: {
+            configured: true,
+            host: '127.0.0.1',
+          },
+        },
+      }, null, 2))
 
       // Create a logs dir
       const logsDir = path.join(homeDir, '.freshell', 'logs')
