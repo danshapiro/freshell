@@ -39,7 +39,7 @@ These facts come from the official Codex app-server README and must be verified 
 - Current documented item variants include user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes, MCP tool calls, collaboration tool calls, web searches, image views, image generations, entered review mode, exited review mode, context compaction, deprecated compacted markers, and dynamic tool calls.
 - Current documented server-request variants include command approvals, file-change approvals, permission-profile approvals, request-user-input prompts, MCP elicitations, and dynamic tool calls; `serverRequest/resolved` clears any pending UI state.
 - `thread/turns/list` is experimental and supports cursor pagination, `nextCursor`, and `backwardsCursor`; local generated schemas decide exact field names such as `sortDirection`.
-- Local schema check for `codex-cli 0.128.0` confirms JSON-RPC request ids are `string | integer`, `thread/read` returns `{ thread }`, `thread/read` accepts `includeTurns` but no `revision`, `thread/turns/list` accepts `cursor`, `limit`, and `sortDirection` but no `revision` or `includeBodies`, and there is no `thread/turn/read` method. Any per-turn body API in Freshell must therefore be an internal facade over `thread/turns/list`, `thread/read includeTurns: true`, or a server-side page/body cache until Codex exposes a direct turn-read request.
+- Local schema check for `codex-cli 0.128.0` confirms JSON-RPC request ids are `string | integer`, `thread/read` returns `{ thread }`, `thread/read` accepts `includeTurns` but no `revision`, `thread/turns/list` returns `{ data, nextCursor, backwardsCursor }`, `thread/turns/list` accepts `cursor`, `limit`, and `sortDirection` but no `revision` or `includeBodies`, `turn/start` returns `{ turn }`, `turn/interrupt` requires both `threadId` and `turnId`, `thread/fork` returns `{ thread, cwd, model, modelProvider, approvalPolicy, approvalsReviewer, sandbox, ... }`, and there is no `thread/turn/read` method. Any per-turn body API in Freshell must therefore be an internal facade over `thread/turns/list`, `thread/read includeTurns: true`, or a server-side page/body cache until Codex exposes a direct turn-read request.
 
 Source checked while writing this plan: https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
 
@@ -743,7 +743,7 @@ codex app-server generate-json-schema --out /tmp/freshell-codex-app-server-schem
 find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSONRPC|Initialize|Thread|Turn|Approval|Request|Item|Fork|Interrupt|ServerRequest'
 ```
 
-Use the generated schema to verify exact parameter names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns?: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API.
+Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns?: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API.
 
 Add transport tests requiring stdio JSONL framing:
 
@@ -777,15 +777,15 @@ await expect(client.listThreadTurns({ threadId: 'thread-1', limit: 25, sortDirec
 await expect(client.startTurn({
   threadId: 'thread-1',
   input: [{ type: 'text', text: 'Implement this' }],
-})).resolves.toMatchObject({ turnId: expect.any(String) })
+})).resolves.toMatchObject({ turn: { id: expect.any(String) } })
 
-await expect(client.interruptTurn({ threadId: 'thread-1' })).resolves.toEqual({})
+await expect(client.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' })).resolves.toEqual({})
 
 await expect(client.forkThread({ threadId: 'thread-1', excludeTurns: true }))
-  .resolves.toMatchObject({ threadId: expect.any(String), forkedFromId: 'thread-1' })
+  .resolves.toMatchObject({ thread: { id: expect.any(String) } })
 
 await expect(runtime.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'Hello' }] }))
-  .resolves.toMatchObject({ turnId: expect.any(String) })
+  .resolves.toMatchObject({ turn: { id: expect.any(String) } })
 
 expect('readThreadTurn' in client).toBe(false) // no public method; direct turn read is not in the generated schema
 ```
@@ -872,6 +872,28 @@ export const CodexThreadForkParamsSchema = z.object({
 
 Use generated schema field names. Do not guess against tests. Delete the stale `CodexThreadTurnRead*` schemas unless a future generated schema actually contains a direct turn-read client request.
 
+Model the response schemas with the generated shapes, not Freshell convenience shapes:
+
+```ts
+export const CodexTurnStartResultSchema = z.object({
+  turn: CodexTurnSchema,
+})
+
+export const CodexTurnInterruptParamsSchema = z.object({
+  threadId: z.string().min(1),
+  turnId: z.string().min(1),
+})
+
+export const CodexTurnInterruptResultSchema = z.object({}).passthrough()
+
+export const CodexThreadForkResultSchema = z.object({
+  thread: CodexThreadSchema,
+  cwd: z.string().min(1),
+  model: z.string().min(1),
+  modelProvider: z.string().min(1),
+}).passthrough()
+```
+
 Create `transport.ts` as the only stdio JSONL framing owner:
 
 ```ts
@@ -904,7 +926,7 @@ respondToServerRequest(id: CodexRequestId, result: unknown): Promise<void>
 readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult>
 listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult>
 startTurn(params: CodexTurnStartParams): Promise<CodexTurnStartResult>
-interruptTurn(params: CodexTurnInterruptParams): Promise<Record<string, never>>
+interruptTurn(params: CodexTurnInterruptParams): Promise<CodexTurnInterruptResult>
 forkThread(params: CodexThreadForkParams): Promise<CodexThreadForkResult>
 ```
 
@@ -1022,6 +1044,7 @@ Add table-driven coverage for every local generated `ThreadItem` type: `userMess
 Require adapter methods:
 
 ```ts
+runtime.startTurn.mockResolvedValue({ turn: { id: 'turn-1' } })
 await adapter.send?.('thread-1', { text: 'Ship it' })
 expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   threadId: 'thread-1',
@@ -1029,8 +1052,12 @@ expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
 }))
 
 await adapter.interrupt?.('thread-1')
-expect(runtime.interruptTurn).toHaveBeenCalledWith(expect.objectContaining({ threadId: 'thread-1' }))
+expect(runtime.interruptTurn).toHaveBeenCalledWith({ threadId: 'thread-1', turnId: 'turn-1' })
 
+await expect(adapter.interrupt?.('thread-without-active-turn'))
+  .rejects.toMatchObject({ code: 'FRESH_AGENT_NO_ACTIVE_TURN' })
+
+runtime.forkThread.mockResolvedValue({ thread: { id: 'thread-fork-1' }, cwd: '/repo', model: 'fixture', modelProvider: 'fixture' })
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
   .resolves.toMatchObject({ sessionId: 'thread-fork-1', parentThreadId: 'thread-1' })
 
@@ -1122,11 +1149,25 @@ In `adapter.ts`, track per-thread ephemeral live state:
 type CodexLiveThreadState = {
   pendingApprovals: Map<string, PendingCodexApproval>
   pendingQuestions: Map<string, PendingCodexQuestion>
+  activeTurnId?: string
   latestRevision?: number
 }
 ```
 
-Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the app-server runtime/client methods from Task 4. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
+Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the app-server runtime/client methods from Task 4. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(sessionId)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
+
+Convert `thread/fork -> { thread, ...metadata }` to the fresh-agent fork result at the adapter boundary:
+
+```ts
+const forked = await runtime.forkThread({ threadId: sessionId, excludeTurns: true })
+return {
+  sessionId: forked.thread.id,
+  sessionType: 'freshcodex',
+  runtimeProvider: 'codex',
+  parentThreadId: sessionId,
+  extensions: { codex: { fork: { parentThreadId: sessionId } } },
+}
+```
 
 Implement `getTurnBody` as a fresh-agent compatibility facade, not a Codex RPC method:
 
@@ -1424,7 +1465,7 @@ Expected: FAIL because transcript paging and virtualization are not implemented.
 
 - [ ] **Step 3: Implement virtualized transcript state**
 
-Use `react-window` already present in the repo. The controller should:
+Use `react-window` already present in the repo. This repo has `react-window@2.x`, which exports `List`, not the old v1 `FixedSizeList`. The controller should:
 
 - Use snapshot `turns` as initial visible bodies.
 - If `snapshot.capabilities.turnPaging`, call `getFreshAgentTurnPage(provider, threadId, { revision, priority: 'visible', limit, sortDirection })`; the server adapter maps this to Codex `thread/turns/list` without sending unsupported `revision` or `includeBodies` fields to app-server.
@@ -1435,14 +1476,39 @@ Use `react-window` already present in the repo. The controller should:
 `FreshAgentTranscriptVirtualList.tsx` should render:
 
 ```tsx
-<FixedSizeList
-  height={availableHeight}
-  itemCount={turns.length}
-  itemSize={estimatedTurnHeight}
-  width="100%"
->
-  {Row}
-</FixedSizeList>
+import { List } from 'react-window'
+
+function Row({
+  ariaAttributes,
+  index,
+  style,
+  turns,
+  hydrateTurn,
+}: {
+  ariaAttributes: { 'aria-posinset': number; 'aria-setsize': number; role: 'listitem' }
+  index: number
+  style: React.CSSProperties
+  turns: FreshAgentTurnSummary[]
+  hydrateTurn: (turnId: string) => void
+}) {
+  const turn = turns[index]
+  return (
+    <div {...ariaAttributes} style={style}>
+      <FreshAgentTurnRow turn={turn} onHydrate={hydrateTurn} />
+    </div>
+  )
+}
+
+<List
+  className="min-h-0 flex-1"
+  defaultHeight={availableHeight}
+  rowComponent={Row}
+  rowCount={turns.length}
+  rowHeight={estimatedTurnHeight}
+  rowProps={{ turns, hydrateTurn }}
+  overscanCount={4}
+  style={{ height: availableHeight, width: '100%' }}
+/>
 ```
 
 Keep accessible markup inside each row: role/heading labels must remain visible to browser-use automation.
