@@ -51,7 +51,7 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - Freshcodex can send text and image inputs, interrupt an active turn, fork a thread into a new freshcodex pane, answer Codex command/file/permission approval requests, answer request-user-input prompts, answer MCP elicitations, and reject unsupported dynamic tool calls with a clear response that unblocks the turn.
 - Freshcodex receives Codex app-server notifications live. Turn started/completed, item started/completed, token usage, status, diff, review, compaction, child-agent/collaboration, and thread metadata notifications invalidate or patch the normalized read model and reach subscribed browsers as `freshAgent.event` without requiring a manual refresh.
 - Unsupported Codex capabilities are disabled with clear labels. Do not silently fall back to raw terminal mode.
-- The Freshcodex transcript renders normalized item cards for user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, image generations, review mode, context compaction, dynamic tool calls, errors, and tool/request prompts.
+- The Freshcodex transcript renders normalized item cards for user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, image generations, review mode, context compaction, dynamic tool calls, errors, and tool/request prompts. Codex user-message content is preserved as multi-part message content, including mixed text and images; do not collapse a multi-part Codex `userMessage.content` array into a single text-only item.
 - Long transcripts page through `thread/turns/list`, hydrate bodies on demand, and render through virtualization so mobile remains responsive.
 - Diff/review/worktree/fork metadata is usable, not just listed. Users can inspect file-change diffs, see review status/output, see fork lineage, see child threads, and identify worktree branch/path.
 - Freshcodex has typed load/create/action errors that point to the failing boundary: app-server unavailable, app-server protocol invalid, fresh-agent contract invalid, stale revision, unsupported capability, unauthorized session, or lost session.
@@ -72,6 +72,8 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - Codex JSON-RPC messages omit the `jsonrpc` property on the wire and emit `initialized` exactly once after successful `initialize`.
 - Codex request ids must round-trip as `string | number`; never coerce server-initiated request ids to numbers before responding.
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
+- A normalized turn is a lifecycle/container boundary, not a single message role. Codex `Turn` objects contain mixed user, assistant, tool, and system items, so role belongs on message transcript items and turn-level `role` must be optional/legacy-only. Do not invent a turn role to satisfy the contract.
+- A Codex app-server item may normalize to zero, one, or many fresh-agent transcript items. In particular, `userMessage.content` can contain multiple text/image/localImage parts. Codex item normalization must return an array and turn normalization must `flatMap` item output while preserving stable derived ids for split content parts.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
@@ -336,9 +338,27 @@ expect(() => FreshAgentTranscriptItemSchema.parse({
   kind: 'raw',
   payload: {},
 })).toThrow(/kind/i)
+
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'user-message-1',
+  kind: 'message',
+  role: 'user',
+  content: [
+    { kind: 'text', text: 'Use this mockup' },
+    { kind: 'image', url: 'https://example.test/mockup.png', mediaType: 'image/png' },
+  ],
+})).toMatchObject({
+  kind: 'message',
+  role: 'user',
+  content: [
+    { kind: 'text' },
+    { kind: 'image' },
+  ],
+})
 ```
 
 Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures.
+Also assert that `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, permission, and effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code.
 
 Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
 
@@ -403,6 +423,31 @@ export const FreshAgentTextItemSchema = z.object({
   id: NonEmptyString,
   kind: z.literal('text'),
   text: z.string(),
+  role: FreshAgentRoleSchema.optional(),
+})
+
+export const FreshAgentMessageContentPartSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('text'),
+    text: z.string(),
+  }),
+  z.object({
+    kind: z.literal('image'),
+    url: z.string().url().optional(),
+    path: z.string().optional(),
+    data: z.string().optional(),
+    mediaType: z.string().optional(),
+    alt: z.string().optional(),
+  }).refine((value) => Boolean(value.url || value.path || value.data), {
+    message: 'image message content requires url, path, or data',
+  }),
+])
+
+export const FreshAgentMessageItemSchema = z.object({
+  id: NonEmptyString,
+  kind: z.literal('message'),
+  role: FreshAgentRoleSchema,
+  content: z.array(FreshAgentMessageContentPartSchema).min(1),
 })
 
 export const FreshAgentReasoningItemSchema = z.object({
@@ -445,6 +490,7 @@ export const FreshAgentToolItemSchema = z.object({
 })
 
 export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
+  FreshAgentMessageItemSchema,
   FreshAgentTextItemSchema,
   FreshAgentReasoningItemSchema,
   FreshAgentCommandItemSchema,
@@ -470,10 +516,10 @@ export const FreshAgentTurnBodySchema = z.object({
   revision: z.number().int().nonnegative(),
   ordinal: z.number().int().nonnegative().optional(),
   source: FreshAgentTurnSourceSchema.optional(),
-  role: FreshAgentRoleSchema,
   summary: z.string().optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
+  role: FreshAgentRoleSchema.optional(), // legacy compatibility only; Codex role lives on message items
   items: z.array(FreshAgentTranscriptItemSchema),
 })
 
@@ -503,6 +549,19 @@ export const FreshAgentCapabilitiesSchema = z.object({
   childThreads: z.boolean(),
   turnPaging: z.boolean(),
   turnBodies: z.boolean(),
+})
+
+export const FreshAgentInputImageSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('url'), url: z.string().url(), mediaType: z.string().optional() }),
+  z.object({ kind: z.literal('local'), path: z.string().min(1), mediaType: z.string().optional() }),
+  z.object({ kind: z.literal('data'), data: z.string().min(1), mediaType: z.string().min(1) }),
+])
+
+export const FreshAgentRuntimeSettingsSchema = z.object({
+  model: z.string().min(1).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  permissionMode: z.string().min(1).optional(),
+  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
 })
 
 export const FreshAgentThreadSnapshotSchema = z.object({
@@ -1080,31 +1139,50 @@ Require all documented Codex item variants to normalize into `FreshAgentTranscri
 
 ```ts
 expect(normalizeCodexItem({ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'Do it' }] }))
-  .toEqual({ id: 'u1', kind: 'text', text: 'Do it' })
+  .toEqual([{ id: 'u1', kind: 'message', role: 'user', content: [{ kind: 'text', text: 'Do it' }] }])
+
+expect(normalizeCodexItem({
+  type: 'userMessage',
+  id: 'u2',
+  content: [
+    { type: 'text', text: 'Use this mockup' },
+    { type: 'image', url: 'https://example.test/mockup.png' },
+    { type: 'localImage', path: '/tmp/mockup.png' },
+  ],
+})).toEqual([{
+  id: 'u2',
+  kind: 'message',
+  role: 'user',
+  content: [
+    { kind: 'text', text: 'Use this mockup' },
+    { kind: 'image', url: 'https://example.test/mockup.png' },
+    { kind: 'image', path: '/tmp/mockup.png' },
+  ],
+}])
 
 expect(normalizeCodexItem({ type: 'hookPrompt', id: 'h1', fragments: [{ text: 'Preflight' }] }))
-  .toMatchObject({ id: 'h1', kind: 'hook_prompt' })
+  .toEqual([expect.objectContaining({ id: 'h1', kind: 'hook_prompt' })])
 
 expect(normalizeCodexItem({ type: 'agentMessage', id: 'a1', text: 'Done' }))
-  .toEqual({ id: 'a1', kind: 'text', text: 'Done' })
+  .toEqual([{ id: 'a1', kind: 'message', role: 'assistant', content: [{ kind: 'text', text: 'Done' }] }])
 
 expect(normalizeCodexItem({ type: 'commandExecution', id: 'c1', command: 'npm test', status: 'completed', aggregatedOutput: 'ok' }))
-  .toMatchObject({ id: 'c1', kind: 'command', command: 'npm test', status: 'completed', output: 'ok' })
+  .toEqual([expect.objectContaining({ id: 'c1', kind: 'command', command: 'npm test', status: 'completed', output: 'ok' })])
 
 expect(normalizeCodexItem({ type: 'fileChange', id: 'f1', status: 'completed', changes: [{ path: 'src/a.ts', kind: 'modify', diff: '@@' }] }))
-  .toMatchObject({ id: 'f1', kind: 'file_change', changes: [{ path: 'src/a.ts', diff: '@@' }] })
+  .toEqual([expect.objectContaining({ id: 'f1', kind: 'file_change', changes: [{ path: 'src/a.ts', diff: '@@' }] })])
 
 expect(() => normalizeCodexItem({ type: 'newUnknownItem', id: 'u1' }))
   .toThrow(/unsupported Codex item/i)
 
 expect(normalizeCodexItem({ type: 'contextCompaction', id: 'compact-1', status: 'completed', summary: 'Compacted' }))
-  .toMatchObject({ id: 'compact-1', kind: 'context_compaction', status: 'completed' })
+  .toEqual([expect.objectContaining({ id: 'compact-1', kind: 'context_compaction', status: 'completed' })])
 
 expect(normalizeCodexItem({ type: 'dynamicToolCall', id: 'dyn-1', name: 'tool-x', status: 'declined' }))
-  .toMatchObject({ id: 'dyn-1', kind: 'dynamic_tool', status: 'declined' })
+  .toEqual([expect.objectContaining({ id: 'dyn-1', kind: 'dynamic_tool', status: 'declined' })])
 
 expect(normalizeCodexItem({ type: 'imageGeneration', id: 'img-gen-1', prompt: 'diagram', status: 'completed' }))
-  .toMatchObject({ id: 'img-gen-1', kind: 'image_generation' })
+  .toEqual([expect.objectContaining({ id: 'img-gen-1', kind: 'image_generation' })])
 ```
 
 Add table-driven coverage for every local generated `ThreadItem` type: `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
@@ -1146,6 +1224,20 @@ expect(runtime.interruptTurn).toHaveBeenCalledWith({ threadId: 'thread-1', turnI
 
 await expect(adapter.interrupt?.('thread-without-active-turn'))
   .rejects.toMatchObject({ code: 'FRESH_AGENT_NO_ACTIVE_TURN' })
+
+runtime.readThread.mockResolvedValue({
+  thread: {
+    id: 'thread-resumed-running',
+    status: { type: 'active', activeFlags: [] },
+    turns: [{ id: 'turn-running-1', status: 'inProgress', items: [] }],
+  },
+})
+await adapter.getSnapshot?.({ provider: 'codex', threadId: 'thread-resumed-running' })
+await adapter.interrupt?.('thread-resumed-running')
+expect(runtime.interruptTurn).toHaveBeenCalledWith({
+  threadId: 'thread-resumed-running',
+  turnId: 'turn-running-1',
+})
 
 runtime.forkThread.mockResolvedValue({ thread: { id: 'thread-fork-1' }, cwd: '/repo', model: 'fixture', modelProvider: 'fixture' })
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
@@ -1223,26 +1315,27 @@ In `normalize.ts`, expose focused pure helpers:
 
 ```ts
 export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus
-export function normalizeCodexItem(raw: unknown): FreshAgentTranscriptItem
+export function normalizeCodexItem(raw: unknown): FreshAgentTranscriptItem[]
 export function normalizeCodexTurnBody(input: { provider: 'codex'; threadId: string; revision: number; rawTurn: CodexThreadTurn }): FreshAgentTurnBody
 export function normalizeCodexTurnPage(input: { threadId: string; revision: number; page: CodexThreadTurnsListResult }): FreshAgentTurnPage
 export function normalizeCodexThreadSnapshot(input: ...): FreshAgentThreadSnapshot
 ```
 
-Map statuses explicitly:
+Map generated Codex status objects explicitly. The current app-server schema represents thread status as `{ type: 'notLoaded' | 'idle' | 'systemError' | 'active', activeFlags?: [...] }`, not as a bare string. Preserve active flags such as `waitingOnApproval` and `waitingOnUserInput` under the Codex extension while mapping them to a shared running status:
 
 ```ts
-const CODEX_STATUS_MAP = new Map<string, FreshAgentThreadStatus>([
-  ['idle', 'idle'],
-  ['running', 'running'],
-  ['busy', 'running'],
-  ['compacting', 'compacting'],
-  ['interrupted', 'idle'],
-  ['failed', 'error'],
-  ['completed', 'idle'],
-  ['closed', 'exited'],
-  ['notLoaded', 'idle'],
-])
+export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus {
+  const parsed = CodexThreadStatusSchema.parse(raw)
+  switch (parsed.type) {
+    case 'notLoaded':
+    case 'idle':
+      return 'idle'
+    case 'systemError':
+      return 'error'
+    case 'active':
+      return 'running'
+  }
+}
 ```
 
 Throw a clear `UnsupportedCodexItemError` for item types not intentionally modeled. Normalize actual app-server shapes from the generated `Thread` / `Turn` / `ThreadItem` schemas:
@@ -1264,6 +1357,19 @@ export function normalizeCodexTurnPage(input: {
 ```
 
 Do not read `rawSnapshot.revision`, `rawSnapshot.turns`, or `page.turns`; those are stale assumptions from Freshell's provisional protocol. Use `raw.thread.turns` from `thread/read { includeTurns: true }` and `page.data` from `thread/turns/list`.
+Do not require or synthesize a turn-level role for Codex. `normalizeCodexTurnBody` must set `role` only when a legacy provider supplies one, and must preserve Codex user/assistant roles on `message` transcript items. `normalizeCodexItem` must return an array and `normalizeCodexTurnBody` must flatten those arrays:
+
+```ts
+const items = rawTurn.items.flatMap((item) => normalizeCodexItem(item))
+return FreshAgentTurnBodySchema.parse({
+  provider: 'codex',
+  threadId,
+  turnId: rawTurn.id,
+  revision,
+  source: 'durable',
+  items,
+})
+```
 
 In `adapter.ts`, track per-thread ephemeral live state:
 
@@ -1293,10 +1399,25 @@ return await runtime.subscribe(sessionId, (event) => {
 ```
 
 `turn/started` and `turn/completed` must update `activeTurnId`; status, token, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
+`getSnapshot` and `resume` must also recover `activeTurnId` from `thread/read` output by selecting the latest turn with `status: 'inProgress'`. This is required for interrupt to work after a browser reconnect, server restart, or adapter resubscription that missed the original `turn/started` notification.
 
 Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(sessionId)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
 
 Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, `permissionMode` as Codex `approvalPolicy`, and `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them.
+
+Extend `FreshAgentSendSchema`, `FreshAgentRuntimeAdapter.send`, `FreshAgentRuntimeManager.send`, and `server/ws-handler.ts` so turn-time runtime settings and typed image inputs cross the browser/server boundary. Import `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` from `shared/fresh-agent-contract.ts`; do not duplicate those schemas in WebSocket protocol code:
+
+```ts
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  sessionId: z.string().min(1),
+  text: z.string().optional(),
+  images: z.array(FreshAgentInputImageSchema).optional(),
+  runtimeSettings: FreshAgentRuntimeSettingsSchema.optional(),
+}).refine((value) => Boolean(value.text?.trim() || value.images?.length), {
+  message: 'Fresh-agent send requires text or an image',
+})
+```
 
 Map image input explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert data URLs or remote URLs to Codex `{ type: 'image', url }` input and local file paths to `{ type: 'localImage', path }`. If an image input cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
 
@@ -1792,6 +1913,7 @@ Expected: FAIL because normalized Codex item rendering and workspace panel are i
 
 `FreshAgentItemCard.tsx` renders one contract item with semantic labels:
 
+- `message`: role-labelled user/assistant/system message with ordered text and image parts, preserving mixed Codex input content.
 - `text`: markdown/plain text with wrapping.
 - `hook_prompt`: hook/context prompt fragments without exposing raw JSON.
 - `reasoning`: collapsed by default, with summary visible and accessible toggle.
