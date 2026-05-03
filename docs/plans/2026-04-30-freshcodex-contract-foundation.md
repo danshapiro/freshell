@@ -12,7 +12,7 @@
 
 ## Current State
 
-The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation`, currently clean at `23fe41aa` (`Surface Codex shared-shell metadata`). It already contains the first fresh-agent platform cutover:
+The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation`, based on `a0a2d18d` (`docs: plan freshcodex contract foundation`) on top of `23fe41aa` (`Surface Codex shared-shell metadata`). It already contains the first fresh-agent platform cutover:
 
 - `kind: 'fresh-agent'` pane content with `sessionType` separate from runtime `provider`.
 - Claude and Codex runtime adapters under `server/fresh-agent/adapters/*`.
@@ -28,21 +28,29 @@ The branch is behind `origin/main` by commits that touch exactly the areas this 
 These facts come from the official Codex app-server README and must be verified against the locally installed Codex schema before implementation:
 
 - Codex app-server supports generating version-specific TypeScript or JSON Schema with `codex app-server generate-ts --out DIR` and `codex app-server generate-json-schema --out DIR`.
+- The JSON-RPC wire format intentionally omits the `"jsonrpc": "2.0"` header. Freshell's Codex app-server client must not emit that field unless the generated local schema proves the local version requires it.
+- App-server initialization is a two-step handshake: request `initialize`, validate the result, then emit an `initialized` notification on the same connection before sending non-initialize requests.
+- The current documented `initialize` result includes `userAgent`, `codexHome`, `platformFamily`, and `platformOs`.
+- Supported transports include `stdio://`, websocket, unix socket, and off; the README calls websocket experimental/unsupported for production. Freshcodex production runtime should use stdio unless local generated docs prove that is no longer supported.
 - Thread lifecycle primitives include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/read`, and `thread/turns/list`.
 - User input starts a turn through `turn/start`; interruption uses `turn/interrupt`.
 - App-server streams `turn/*`, `item/*`, token, status, approval, and tool/request events over JSON-RPC.
 - Approval flows can arrive as server-initiated JSON-RPC requests. Freshell must retain their request ids and answer on the same app-server connection.
-- Current documented item variants include user messages, agent messages, plans, reasoning, command executions, file changes, MCP tool calls, collaboration tool calls, web searches, image views, entered review mode, and exited review mode.
+- Current documented item variants include user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes, MCP tool calls, collaboration tool calls, web searches, image views, image generations, entered review mode, exited review mode, context compaction, deprecated compacted markers, and dynamic tool calls.
+- Current documented server-request variants include command approvals, file-change approvals, permission-profile approvals, request-user-input prompts, MCP elicitations, and dynamic tool calls; `serverRequest/resolved` clears any pending UI state.
+- `thread/turns/list` is experimental and supports cursor pagination, `nextCursor`, and `backwardsCursor`; local generated schemas decide exact field names such as `sortDirection`.
+- Local schema check for `codex-cli 0.128.0` confirms JSON-RPC request ids are `string | integer`, `thread/read` returns `{ thread }`, `thread/read` accepts `includeTurns` but no `revision`, `thread/turns/list` accepts `cursor`, `limit`, and `sortDirection` but no `revision` or `includeBodies`, and there is no `thread/turn/read` method. Any per-turn body API in Freshell must therefore be an internal facade over `thread/turns/list`, `thread/read includeTurns: true`, or a server-side page/body cache until Codex exposes a direct turn-read request.
 
 Source checked while writing this plan: https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
 
 ## User-Visible End State
 
 - The Freshcodex pane picker entry creates a `fresh-agent` pane with `sessionType: 'freshcodex'` and `provider: 'codex'`.
-- Creating, resuming, and refreshing Freshcodex uses Codex app-server thread APIs only. No terminal scraping and no Claude state path.
-- Freshcodex can send text and image inputs, interrupt an active turn, fork a thread into a new freshcodex pane, answer Codex approval requests, and answer Codex user-input questions when Codex app-server exposes those requests.
+- Creating, resuming, and refreshing Freshcodex uses Codex app-server thread APIs only over the stable stdio app-server transport. No terminal scraping, no websocket production dependency, and no Claude state path.
+- Freshcodex honors Codex runtime settings at create and turn time, including model, sandbox, permission/approval policy, and effort where supported by the generated local app-server schema.
+- Freshcodex can send text and image inputs, interrupt an active turn, fork a thread into a new freshcodex pane, answer Codex command/file/permission approval requests, answer request-user-input prompts, answer MCP elicitations, and reject unsupported dynamic tool calls with a clear response that unblocks the turn.
 - Unsupported Codex capabilities are disabled with clear labels. Do not silently fall back to raw terminal mode.
-- The Freshcodex transcript renders normalized item cards for user messages, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, review mode, errors, and tool/request prompts.
+- The Freshcodex transcript renders normalized item cards for user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, image generations, review mode, context compaction, dynamic tool calls, errors, and tool/request prompts.
 - Long transcripts page through `thread/turns/list`, hydrate bodies on demand, and render through virtualization so mobile remains responsive.
 - Diff/review/worktree/fork metadata is usable, not just listed. Users can inspect file-change diffs, see review status/output, see fork lineage, see child threads, and identify worktree branch/path.
 - Freshcodex has typed load/create/action errors that point to the failing boundary: app-server unavailable, app-server protocol invalid, fresh-agent contract invalid, stale revision, unsupported capability, unauthorized session, or lost session.
@@ -57,10 +65,13 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - All fresh-agent server adapter outputs parse before leaving `server/fresh-agent/runtime-manager.ts`.
 - All fresh-agent REST payloads parse again in `src/lib/api.ts` before UI state sees them.
 - A snapshot, turn page, or turn body with an invalid contract is a controlled error, not partially rendered data.
-- Turn page and turn body revisions must match the requested/snapshot revision. If a body is stale, return and render a clear stale-revision error.
+- Fresh-agent `revision` is a Freshell normalized read-model revision, not a Codex app-server revision. For Codex, derive it from runtime-manager event ordering and stable thread metadata such as `thread.updatedAt`; preserve the app-server source version separately in `extensions.codex.sourceVersion`. Turn page and turn body requests compare against the Freshell normalized revision. Do not send nonexistent Codex `revision` fields to app-server requests.
 - Codex app-server protocol schemas are owned by `server/coding-cli/codex-app-server/protocol.ts`, and must be cross-checked with `codex app-server generate-json-schema` during implementation.
+- Codex app-server transport is owned by `server/coding-cli/codex-app-server/client.ts` plus focused transport helpers. The production Freshcodex runtime uses stdio JSONL; websocket remains only for legacy terminal launch behavior if still required outside Freshcodex and must not be the Freshcodex fallback.
+- Codex JSON-RPC messages omit the `jsonrpc` property on the wire and emit `initialized` exactly once after successful `initialize`.
+- Codex request ids must round-trip as `string | number`; never coerce server-initiated request ids to numbers before responding.
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
-- Unknown app-server item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
+- Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
 - Freshcodex tests must be able to render without `state.agentChat.sessions` or Claude restore helpers.
 - Main-branch fixes for auto-title, mobile keyboard/touch target behavior, stale pane hydration, reconnect recovery, and app-server stdio/init hardening must survive the cutover.
@@ -71,6 +82,7 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 
 - `shared/fresh-agent-contract.ts` - Zod schemas and exported types for snapshots, turn pages, turn bodies, items, provider extensions, action responses, and contract errors.
 - `src/lib/fresh-agent-api-error.ts` - typed client error helper for contract parse failures and fresh-agent API errors.
+- `server/coding-cli/codex-app-server/transport.ts` - stdio JSONL transport abstraction that owns app-server process stdin/stdout framing, close/error handling, and request/notification delivery.
 - `src/components/fresh-agent/useFreshAgentThreadController.ts` - controller hook for create/attach/snapshot/action/pagination state.
 - `src/components/fresh-agent/FreshAgentShell.tsx` - pure presentational shell for header, banners, transcript, composer, sidebar, and workspace panel.
 - `src/components/fresh-agent/FreshAgentTranscriptVirtualList.tsx` - virtualized transcript list backed by turn summaries and hydrated bodies.
@@ -86,6 +98,7 @@ Source checked while writing this plan: https://github.com/openai/codex/blob/mai
 - `test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx`
 - `test/unit/client/components/fresh-agent/useFreshAgentThreadController.test.tsx`
 - `test/unit/server/fresh-agent/contract-boundary.test.ts`
+- `test/unit/server/coding-cli/codex-app-server/transport.test.ts` - stdio JSONL transport, framing, request/notification delivery, and close/error behavior.
 
 ### Modify
 
@@ -159,7 +172,8 @@ The correct route is:
 - Merge current main first because main contains fixes in exactly the cutover surfaces.
 - Lock shared Zod contracts for all read-model payloads and action responses.
 - Enforce those contracts on both server and client boundaries.
-- Normalize Codex app-server data fully, using app-server generated schemas to avoid guessing method shapes.
+- Replace Freshcodex's app-server dependency on the experimental websocket transport with stdio JSONL, then normalize Codex app-server data fully using app-server generated schemas to avoid guessing method shapes.
+- Model every currently documented app-server item and server-request surface before choosing to fail unknown future variants.
 - Split controller from presentation only after contract fixtures exist.
 - Implement Freshcodex actions through app-server thread/turn primitives and explicit server-request response handling.
 - Finish transcript virtualization and workspace UX so the foundation is good enough for long-term feature growth, not just a thin demo.
@@ -322,6 +336,33 @@ expect(() => FreshAgentTranscriptItemSchema.parse({
 
 Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures.
 
+Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
+
+```ts
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'compact-1',
+  kind: 'context_compaction',
+  status: 'completed',
+  summary: 'Compacted prior context',
+})).toMatchObject({ kind: 'context_compaction' })
+
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'dyn-1',
+  kind: 'dynamic_tool',
+  name: 'unsupported-local-tool',
+  status: 'declined',
+  reason: 'Dynamic tool calls are not supported by Freshell yet.',
+})).toMatchObject({ kind: 'dynamic_tool', status: 'declined' })
+
+expect(FreshAgentQuestionRequestSchema.parse({
+  requestId: 'server-request-1',
+  kind: 'mcp_elicitation',
+  title: 'Confirm MCP input',
+  prompt: 'Choose a value',
+  fields: [],
+})).toMatchObject({ kind: 'mcp_elicitation' })
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run:
@@ -408,8 +449,13 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({ id: NonEmptyString, kind: z.literal('plan'), text: z.string(), status: z.enum(['pending', 'running', 'completed']).optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('review'), phase: z.enum(['entered', 'exited']), label: z.string().optional(), text: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('web_search'), query: z.string(), status: z.enum(['pending', 'running', 'completed', 'failed']).optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('hook_prompt'), fragments: z.array(z.string()).default([]), text: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('image'), path: z.string().optional(), url: z.string().optional(), alt: z.string().optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('image_generation'), prompt: z.string().optional(), status: z.enum(['pending', 'running', 'completed', 'failed']).optional(), imageUrl: z.string().optional(), path: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('collaboration'), tool: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed']), senderThreadId: z.string().optional(), receiverThreadId: z.string().optional(), newThreadId: z.string().optional(), prompt: z.string().optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('context_compaction'), status: z.enum(['pending', 'running', 'completed', 'failed', 'deprecated']), summary: z.string().optional(), beforeTokens: z.number().int().nonnegative().optional(), afterTokens: z.number().int().nonnegative().optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('dynamic_tool'), name: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed', 'declined']), input: z.record(z.string(), JsonValue).optional(), result: JsonValue.optional(), reason: z.string().optional(), error: z.string().optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('request_prompt'), requestId: NonEmptyString, requestKind: z.enum(['approval', 'question', 'mcp_elicitation', 'dynamic_tool', 'auth_refresh']), title: z.string().optional(), prompt: z.string().optional(), status: z.enum(['pending', 'resolved', 'declined']) }),
   z.object({ id: NonEmptyString, kind: z.literal('error'), message: z.string(), code: z.string().optional() }),
 ])
 
@@ -482,6 +528,8 @@ export const FreshAgentThreadSnapshotSchema = z.object({
 ```
 
 Define the referenced approval, question, worktree, diff, child-thread, Claude extension, Codex extension, and action-result schemas in the same file. Export inferred types for every schema. Keep provider extension schemas typed and narrow:
+
+Define referenced schemas before any schema that uses them, or wrap recursive references in `z.lazy`, so module evaluation cannot hit a temporal-dead-zone `ReferenceError`.
 
 ```ts
 export type FreshAgentThreadSnapshot = z.infer<typeof FreshAgentThreadSnapshotSchema>
@@ -679,7 +727,9 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Modify: `server/coding-cli/codex-app-server/client.ts`
 - Modify: `server/coding-cli/codex-app-server/runtime.ts`
 - Modify: `server/coding-cli/codex-app-server/launch-planner.ts`
+- Create: `server/coding-cli/codex-app-server/transport.ts`
 - Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`
+- Test: `test/unit/server/coding-cli/codex-app-server/transport.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/client.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/runtime.test.ts`
 
@@ -690,12 +740,40 @@ Run this inspection command before editing code:
 ```bash
 rm -rf /tmp/freshell-codex-app-server-schema
 codex app-server generate-json-schema --out /tmp/freshell-codex-app-server-schema
-find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'Thread|Turn|Approval|Request|Item|Fork|Interrupt'
+find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSONRPC|Initialize|Thread|Turn|Approval|Request|Item|Fork|Interrupt|ServerRequest'
 ```
 
-Use the generated schema to verify exact parameter names for `turn/start`, `turn/interrupt`, `thread/fork`, approval server requests, and user-input server requests. Then add tests requiring:
+Use the generated schema to verify exact parameter names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns?: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API.
+
+Add transport tests requiring stdio JSONL framing:
 
 ```ts
+const transport = new CodexStdioJsonlTransport(fakeChildProcess)
+await transport.send({ id: 1, method: 'initialize', params: initializeParams })
+expect(fakeChild.stdinLines).toEqual([
+  JSON.stringify({ id: 1, method: 'initialize', params: initializeParams }),
+])
+fakeChild.stdout.push(JSON.stringify({ id: 1, result: initializeResponse }) + '\n')
+expect(await transport.nextMessage()).toEqual({ id: 1, result: initializeResponse })
+```
+
+Then add client/runtime tests requiring:
+
+```ts
+await expect(client.initialize()).resolves.toMatchObject({
+  userAgent: expect.any(String),
+  codexHome: expect.any(String),
+  platformFamily: expect.any(String),
+  platformOs: expect.any(String),
+})
+expect(fakeTransport.sent).toContainEqual({ method: 'initialized' })
+
+await expect(client.readThread({ threadId: 'thread-1', includeTurns: true }))
+  .resolves.toMatchObject({ thread: { id: 'thread-1' } })
+
+await expect(client.listThreadTurns({ threadId: 'thread-1', limit: 25, sortDirection: 'desc' }))
+  .resolves.toMatchObject({ data: expect.any(Array), nextCursor: null })
+
 await expect(client.startTurn({
   threadId: 'thread-1',
   input: [{ type: 'text', text: 'Implement this' }],
@@ -708,6 +786,8 @@ await expect(client.forkThread({ threadId: 'thread-1', excludeTurns: true }))
 
 await expect(runtime.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'Hello' }] }))
   .resolves.toMatchObject({ turnId: expect.any(String) })
+
+expect('readThreadTurn' in client).toBe(false) // no public method; direct turn read is not in the generated schema
 ```
 
 Add server-request tests in `client.test.ts`:
@@ -716,9 +796,9 @@ Add server-request tests in `client.test.ts`:
 it('surfaces server-initiated approval requests and responds on the same JSON-RPC id', async () => {
   const seen: unknown[] = []
   client.onServerRequest((request) => seen.push(request))
-  await fakeServer.sendRequest({ id: 99, method: 'item/commandExecution/requestApproval', params: approvalParams })
-  await client.respondToServerRequest(99, { decision: { type: 'accept' } })
-  expect(fakeServer.responses).toContainEqual({ id: 99, result: { decision: { type: 'accept' } } })
+  await fakeServer.sendRequest({ id: 'approval-99', method: 'item/commandExecution/requestApproval', params: approvalParams })
+  await client.respondToServerRequest('approval-99', { decision: { type: 'accept' } })
+  expect(fakeServer.responses).toContainEqual({ id: 'approval-99', result: { decision: { type: 'accept' } } })
 })
 ```
 
@@ -728,17 +808,45 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts
 ```
 
-Expected: FAIL because the client/runtime lack turn, fork, interrupt, and server-request response methods.
+Expected: FAIL because the client/runtime still use WebSocket, emit `"jsonrpc": "2.0"`, do not send `initialized`, parse the old initialize result, expose stale turn-read behavior, and lack turn, fork, interrupt, and server-request response methods.
 
 - [ ] **Step 3: Implement app-server protocol methods**
 
 Update `protocol.ts` with schema names matching the generated app-server schema. The implementation must include, at minimum:
 
 ```ts
+export const CodexRequestIdSchema = z.union([z.string().min(1), z.number().int()])
+
+export const CodexInitializeResultSchema = z.object({
+  userAgent: z.string().min(1),
+  codexHome: z.string().min(1),
+  platformFamily: z.string().min(1),
+  platformOs: z.string().min(1),
+})
+
+export const CodexThreadReadParamsSchema = z.object({
+  threadId: z.string().min(1),
+  includeTurns: z.boolean().optional(),
+})
+
+export const CodexThreadTurnsListParamsSchema = z.object({
+  threadId: z.string().min(1),
+  cursor: z.string().nullable().optional(),
+  limit: z.number().int().nonnegative().optional(),
+  sortDirection: z.enum(['asc', 'desc']).nullable().optional(),
+})
+
+export const CodexThreadTurnsListResultSchema = z.object({
+  data: z.array(CodexTurnSchema),
+  nextCursor: z.string().nullable().optional(),
+  backwardsCursor: z.string().nullable().optional(),
+})
+
 export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string() }),
   z.object({ type: z.literal('image'), url: z.string().url() }),
@@ -750,8 +858,9 @@ export const CodexTurnStartParamsSchema = z.object({
   input: z.array(CodexTurnInputItemSchema).min(1),
   cwd: z.string().optional(),
   model: z.string().optional(),
-  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-  approvalPolicy: z.string().optional(),
+  sandboxPolicy: CodexSandboxPolicySchema.nullable().optional(),
+  approvalPolicy: CodexApprovalPolicySchema.nullable().optional(),
+  effort: CodexReasoningEffortSchema.nullable().optional(),
 }).passthrough()
 
 export const CodexThreadForkParamsSchema = z.object({
@@ -761,24 +870,55 @@ export const CodexThreadForkParamsSchema = z.object({
 }).passthrough()
 ```
 
-Use generated schema field names if they differ. Do not guess against tests.
+Use generated schema field names. Do not guess against tests. Delete the stale `CodexThreadTurnRead*` schemas unless a future generated schema actually contains a direct turn-read client request.
+
+Create `transport.ts` as the only stdio JSONL framing owner:
+
+```ts
+export type CodexRpcMessage = {
+  id?: string | number
+  method?: string
+  params?: unknown
+  result?: unknown
+  error?: unknown
+}
+
+export class CodexStdioJsonlTransport {
+  send(message: CodexRpcMessage): Promise<void>
+  onMessage(listener: (message: CodexRpcMessage) => void): () => void
+  close(): Promise<void>
+}
+```
+
+It should split stdout on newlines, parse one JSON message per line, reject malformed app-server output with a clear transport error, and never add a `jsonrpc` property.
 
 Update `client.ts`:
 
 ```ts
-type ServerRequest = { id: number; method: string; params: unknown }
+type CodexRequestId = string | number
+type ServerRequest = { id: CodexRequestId; method: string; params: unknown }
 
 onNotification(listener: (notification: { method: string; params?: unknown }) => void): () => void
 onServerRequest(listener: (request: ServerRequest) => void): () => void
-respondToServerRequest(id: number, result: unknown): Promise<void>
+respondToServerRequest(id: CodexRequestId, result: unknown): Promise<void>
+readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult>
+listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult>
 startTurn(params: CodexTurnStartParams): Promise<CodexTurnStartResult>
 interruptTurn(params: CodexTurnInterruptParams): Promise<Record<string, never>>
 forkThread(params: CodexThreadForkParams): Promise<CodexThreadForkResult>
 ```
 
-Update `handleSocketMessage` so JSON-RPC server requests with `id` and `method` are not ignored. Keep request timeout behavior for client-initiated calls.
+Update message handling so app-server requests with `id` and `method` are not ignored, and so notifications without `id` reach subscribers. Keep request timeout behavior for client-initiated calls. After a successful `initialize`, send exactly one `initialized` notification on the same transport before non-initialize requests.
 
-Update `runtime.ts` to proxy the new methods after `ensureReady()`.
+Update `runtime.ts` to spawn:
+
+```ts
+spawn(command, [...commandArgs, 'app-server', '--listen', 'stdio://'], {
+  stdio: ['pipe', 'pipe', 'pipe'],
+})
+```
+
+Proxy the new methods after `ensureReady()`. Keep WebSocket launch-planner behavior only outside Freshcodex if another code path still requires it; Freshcodex runtime creation must not return or depend on `wsUrl`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -786,6 +926,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts
 ```
@@ -800,6 +941,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
   test/integration/server/codex-session-flow.test.ts
@@ -813,10 +955,12 @@ Expected: PASS.
 ```bash
 git add \
   server/coding-cli/codex-app-server/protocol.ts \
+  server/coding-cli/codex-app-server/transport.ts \
   server/coding-cli/codex-app-server/client.ts \
   server/coding-cli/codex-app-server/runtime.ts \
   server/coding-cli/codex-app-server/launch-planner.ts \
   test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs \
+  test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
   test/integration/server/codex-session-flow.test.ts
@@ -845,6 +989,12 @@ git commit -m "Extend Codex app-server client for rich turns"
 Require all documented Codex item variants to normalize into `FreshAgentTranscriptItemSchema` variants:
 
 ```ts
+expect(normalizeCodexItem({ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'Do it' }] }))
+  .toEqual({ id: 'u1', kind: 'text', text: 'Do it' })
+
+expect(normalizeCodexItem({ type: 'hookPrompt', id: 'h1', fragments: [{ text: 'Preflight' }] }))
+  .toMatchObject({ id: 'h1', kind: 'hook_prompt' })
+
 expect(normalizeCodexItem({ type: 'agentMessage', id: 'a1', text: 'Done' }))
   .toEqual({ id: 'a1', kind: 'text', text: 'Done' })
 
@@ -856,7 +1006,18 @@ expect(normalizeCodexItem({ type: 'fileChange', id: 'f1', status: 'completed', c
 
 expect(() => normalizeCodexItem({ type: 'newUnknownItem', id: 'u1' }))
   .toThrow(/unsupported Codex item/i)
+
+expect(normalizeCodexItem({ type: 'contextCompaction', id: 'compact-1', status: 'completed', summary: 'Compacted' }))
+  .toMatchObject({ id: 'compact-1', kind: 'context_compaction', status: 'completed' })
+
+expect(normalizeCodexItem({ type: 'dynamicToolCall', id: 'dyn-1', name: 'tool-x', status: 'declined' }))
+  .toMatchObject({ id: 'dyn-1', kind: 'dynamic_tool', status: 'declined' })
+
+expect(normalizeCodexItem({ type: 'imageGeneration', id: 'img-gen-1', prompt: 'diagram', status: 'completed' }))
+  .toMatchObject({ id: 'img-gen-1', kind: 'image_generation' })
 ```
+
+Add table-driven coverage for every local generated `ThreadItem` type: `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 
 Require adapter methods:
 
@@ -872,6 +1033,13 @@ expect(runtime.interruptTurn).toHaveBeenCalledWith(expect.objectContaining({ thr
 
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
   .resolves.toMatchObject({ sessionId: 'thread-fork-1', parentThreadId: 'thread-1' })
+
+await expect(adapter.getTurnPage?.({ provider: 'codex', threadId: 'thread-new-1' }, { revision: 7, limit: 25, sortDirection: 'desc' }))
+  .resolves.toMatchObject({ provider: 'codex', threadId: 'thread-new-1' })
+
+await expect(adapter.getTurnBody?.({ provider: 'codex', threadId: 'thread-new-1', turnId: 'turn-1' }, 7))
+  .resolves.toMatchObject({ provider: 'codex', threadId: 'thread-new-1', turnId: 'turn-1' })
+expect(runtime.readThread).toHaveBeenCalledWith({ threadId: 'thread-new-1', includeTurns: true })
 ```
 
 Require server-request approval mapping:
@@ -882,6 +1050,8 @@ expect(listener).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgen
 expect(await adapter.getSnapshot?.({ provider: 'codex', threadId: 'thread-1' }))
   .toMatchObject({ pendingApprovals: [{ requestId: expect.stringContaining('cmd-1') }] })
 ```
+
+Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit unsupported dynamic-tool response; `account/chatgptAuthTokens/refresh` receives an explicit unsupported auth-refresh response with a clear message; deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -906,7 +1076,7 @@ In `normalize.ts`, expose focused pure helpers:
 export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus
 export function normalizeCodexItem(raw: unknown): FreshAgentTranscriptItem
 export function normalizeCodexTurnBody(input: { provider: 'codex'; threadId: string; revision: number; rawTurn: CodexThreadTurn }): FreshAgentTurnBody
-export function normalizeCodexTurnPage(input: { threadId: string; page: CodexThreadTurnsListResult }): FreshAgentTurnPage
+export function normalizeCodexTurnPage(input: { threadId: string; revision: number; page: CodexThreadTurnsListResult }): FreshAgentTurnPage
 export function normalizeCodexThreadSnapshot(input: ...): FreshAgentThreadSnapshot
 ```
 
@@ -926,7 +1096,25 @@ const CODEX_STATUS_MAP = new Map<string, FreshAgentThreadStatus>([
 ])
 ```
 
-Throw a clear `UnsupportedCodexItemError` for item types not intentionally modeled.
+Throw a clear `UnsupportedCodexItemError` for item types not intentionally modeled. Normalize actual app-server shapes from the generated `Thread` / `Turn` / `ThreadItem` schemas:
+
+```ts
+export function normalizeCodexThreadSnapshot(input: {
+  thread: CodexThread
+  normalizedRevision: number
+  pendingApprovals: PendingCodexApproval[]
+  pendingQuestions: PendingCodexQuestion[]
+}): FreshAgentThreadSnapshot
+
+export function normalizeCodexTurnPage(input: {
+  provider: 'codex'
+  threadId: string
+  revision: number
+  page: CodexThreadTurnsListResult // { data, nextCursor, backwardsCursor }
+}): FreshAgentTurnPage
+```
+
+Do not read `rawSnapshot.revision`, `rawSnapshot.turns`, or `page.turns`; those are stale assumptions from Freshell's provisional protocol. Use `raw.thread.turns` from `thread/read { includeTurns: true }` and `page.data` from `thread/turns/list`.
 
 In `adapter.ts`, track per-thread ephemeral live state:
 
@@ -939,6 +1127,21 @@ type CodexLiveThreadState = {
 ```
 
 Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the app-server runtime/client methods from Task 4. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
+
+Implement `getTurnBody` as a fresh-agent compatibility facade, not a Codex RPC method:
+
+```ts
+async getTurnBody(thread, revision) {
+  const currentRevision = getNormalizedRevisionFor(thread.threadId)
+  if (revision !== currentRevision) throw new FreshAgentStaleThreadRevisionError(currentRevision)
+  const raw = await runtime.readThread({ threadId: thread.threadId, includeTurns: true })
+  const turn = raw.thread.turns.find((candidate) => candidate.id === thread.turnId)
+  if (!turn) throw new FreshAgentTurnNotFoundError(thread.threadId, thread.turnId)
+  return normalizeCodexTurnBody({ provider: 'codex', threadId: thread.threadId, revision, rawTurn: turn })
+}
+```
+
+If a later generated schema adds a direct turn-read method, replace this facade in a focused follow-up. Do not add a nonexistent `thread/turn/read` call.
 
 Extend WS protocol with `freshAgent.forked`:
 
@@ -1224,9 +1427,9 @@ Expected: FAIL because transcript paging and virtualization are not implemented.
 Use `react-window` already present in the repo. The controller should:
 
 - Use snapshot `turns` as initial visible bodies.
-- If `snapshot.capabilities.turnPaging`, call `getFreshAgentTurnPage(provider, threadId, { revision, priority: 'visible', includeBodies: false })`.
+- If `snapshot.capabilities.turnPaging`, call `getFreshAgentTurnPage(provider, threadId, { revision, priority: 'visible', limit, sortDirection })`; the server adapter maps this to Codex `thread/turns/list` without sending unsupported `revision` or `includeBodies` fields to app-server.
 - Store turn summaries keyed by `turnId`.
-- Hydrate body through `getFreshAgentTurnBody` when a visible row needs full content.
+- Hydrate body through `getFreshAgentTurnBody` when a visible row needs full content. For Codex this calls the Fresh-agent server facade from Task 5, not a nonexistent Codex `thread/turn/read` method.
 - Refresh the snapshot and first page on stale revision errors.
 
 `FreshAgentTranscriptVirtualList.tsx` should render:
@@ -1340,15 +1543,20 @@ Expected: FAIL because normalized Codex item rendering and workspace panel are i
 `FreshAgentItemCard.tsx` renders one contract item with semantic labels:
 
 - `text`: markdown/plain text with wrapping.
+- `hook_prompt`: hook/context prompt fragments without exposing raw JSON.
 - `reasoning`: collapsed by default, with summary visible and accessible toggle.
 - `plan`: plan card.
 - `command`: command, cwd, status, output, exit code.
 - `file_change`: list changed files and expandable diff using shared `DiffView`.
 - `tool`: MCP/tool card with input/result/error.
+- `dynamic_tool`: unsupported or completed dynamic tool call state with the user-visible response.
 - `collaboration`: child-agent action card with thread ids.
 - `review`: entered/exited review cards.
 - `web_search`: query and status.
 - `image`: path/url card.
+- `image_generation`: prompt/status and generated image metadata when available.
+- `context_compaction`: compaction status and token before/after summary when available.
+- `request_prompt`: pending/resolved approval/question/tool prompt state.
 - `error`: alert card.
 
 `FreshAgentWorkspacePanel.tsx` replaces sidebar-only listing for:
