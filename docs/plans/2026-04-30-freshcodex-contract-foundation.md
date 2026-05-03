@@ -23,25 +23,54 @@ The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-
 
 The branch is behind `origin/main` by commits that touch exactly the areas this project depends on: agent-chat auto-title, mobile keyboard/touch behavior, stale pane hydration, two-browser reconnect recovery, and Codex app-server startup/init hardening. Those changes must be merged into this worktree before contract work so the implementation does not reintroduce known fixed bugs.
 
-## Protocol Facts To Preserve
+## Local Codex Schema Audit
 
-These facts come from the official Codex app-server README and must be verified against the locally installed Codex schema before implementation:
+These facts were verified in this worktree against the locally installed CLI, not from memory:
 
-- Codex app-server supports generating version-specific TypeScript or JSON Schema with `codex app-server generate-ts --out DIR` and `codex app-server generate-json-schema --out DIR`.
-- The JSON-RPC wire format intentionally omits the `"jsonrpc": "2.0"` header. Freshell's Codex app-server client must not emit that field unless the generated local schema proves the local version requires it.
-- App-server initialization is a two-step handshake: request `initialize`, validate the result, then emit an `initialized` notification on the same connection before sending non-initialize requests.
-- The current documented `initialize` result includes `userAgent`, `codexHome`, `platformFamily`, and `platformOs`.
-- Supported transports include `stdio://`, websocket, unix socket, and off; the README calls websocket experimental/unsupported for production. Freshcodex production runtime should use stdio unless local generated docs prove that is no longer supported.
-- Thread lifecycle primitives include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/read`, and `thread/turns/list`.
-- User input starts a turn through `turn/start`; interruption uses `turn/interrupt`.
-- App-server streams `turn/*`, `item/*`, token, status, approval, and tool/request events over JSON-RPC.
-- Approval flows can arrive as server-initiated JSON-RPC requests. Freshell must retain their request ids and answer on the same app-server connection.
-- Current documented item variants include user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes, MCP tool calls, collaboration tool calls, web searches, image views, image generations, entered review mode, exited review mode, context compaction, deprecated compacted markers, and dynamic tool calls.
-- Current documented server-request variants include command approvals, file-change approvals, permission-profile approvals, request-user-input prompts, MCP elicitations, and dynamic tool calls; `serverRequest/resolved` clears any pending UI state.
-- `thread/turns/list` is experimental and supports cursor pagination, `nextCursor`, and `backwardsCursor`; local generated schemas decide exact field names such as `sortDirection`.
-- Local schema check for `codex-cli 0.128.0` confirms JSON-RPC request ids are `string | integer`, `thread/read` returns `{ thread }`, `thread/read` accepts `includeTurns` but no `revision`, `thread/turns/list` returns `{ data, nextCursor, backwardsCursor }`, `thread/turns/list` accepts `cursor`, `limit`, and `sortDirection` but no `revision` or `includeBodies`, `turn/start` returns `{ turn }`, `turn/interrupt` requires both `threadId` and `turnId`, `thread/fork` returns `{ thread, cwd, model, modelProvider, approvalPolicy, approvalsReviewer, sandbox, ... }`, and there is no `thread/turn/read` method. Any per-turn body API in Freshell must therefore be an internal facade over `thread/turns/list`, `thread/read includeTurns: true`, or a server-side page/body cache until Codex exposes a direct turn-read request.
+```bash
+codex --version
+# codex-cli 0.128.0
+rm -rf /tmp/freshell-codex-schema-0.128.0
+mkdir -p /tmp/freshell-codex-schema-0.128.0/ts /tmp/freshell-codex-schema-0.128.0/json
+codex app-server generate-ts --out /tmp/freshell-codex-schema-0.128.0/ts
+codex app-server generate-json-schema --out /tmp/freshell-codex-schema-0.128.0/json
+```
 
-Source checked while writing this plan: https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md
+The generated sources that matter most are:
+
+- `/tmp/freshell-codex-schema-0.128.0/json/JSONRPCRequest.json`, `JSONRPCResponse.json`, `JSONRPCError.json`, `JSONRPCNotification.json`, and `JSONRPCMessage.json`.
+- `/tmp/freshell-codex-schema-0.128.0/ts/RequestId.ts`, `ClientRequest.ts`, `ClientNotification.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `InitializeParams.ts`, `InitializeResponse.ts`, and `InitializeCapabilities.ts`.
+- `/tmp/freshell-codex-schema-0.128.0/ts/v2/ThreadStartParams.ts`, `ThreadStartResponse.ts`, `ThreadResumeParams.ts`, `ThreadReadParams.ts`, `ThreadReadResponse.ts`, `ThreadTurnsListParams.ts`, `ThreadTurnsListResponse.ts`, `ThreadForkParams.ts`, `ThreadForkResponse.ts`, `TurnStartParams.ts`, `TurnStartResponse.ts`, `TurnInterruptParams.ts`, and `TurnInterruptResponse.ts`.
+- `/tmp/freshell-codex-schema-0.128.0/ts/v2/Thread.ts`, `Turn.ts`, `ThreadItem.ts`, `UserInput.ts`, `ThreadStatus.ts`, `TurnStatus.ts`, the approval/request param and response files, and `DynamicToolCallResponse.ts`.
+
+Schema-grounded protocol facts to preserve:
+
+- Codex app-server supports `--listen stdio://`, `unix://`, `ws://IP:PORT`, and `off`; `stdio://` is the default. Freshcodex rich runtime should use stdio; keep the existing websocket runtime only for raw Codex terminal `--remote` attach.
+- JSON-RPC envelopes omit `"jsonrpc": "2.0"`. Request ids are `string | number`; server-initiated request ids must round-trip unchanged.
+- JSON-RPC requests are `{ id, method, params?, trace? }`; responses are `{ id, result }`; errors are `{ id, error: { code, message, data? } }`; notifications are `{ method, params? }`.
+- Initialization is `initialize` with `{ clientInfo, capabilities }`, followed by exactly one client notification `{ method: 'initialized' }` after a valid response. `InitializeCapabilities` has `experimentalApi` and optional `optOutNotificationMethods`. `InitializeResponse` has `userAgent`, `codexHome`, `platformFamily`, and `platformOs`; there is no `protocolVersion` field in this local schema.
+- Relevant client methods include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `thread/compact/start`, `thread/rollback`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`. There is no `thread/turn/read` method.
+- `thread/start` accepts runtime settings such as `model`, `modelProvider`, `serviceTier`, `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`, `config`, instructions/personality, `ephemeral`, and `sessionStartSource`; it does not accept `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
+- `thread/resume` accepts `threadId`, the same major runtime overrides, and `excludeTurns?: boolean`; it does not accept `persistExtendedHistory`.
+- `thread/read` params are exactly `{ threadId: string, includeTurns: boolean }`. `includeTurns` is required in the generated TypeScript. The response is `{ thread }`.
+- `thread/turns/list` params are `{ threadId, cursor?, limit?, sortDirection? }`. It does not accept `revision` or `includeBodies`. The response is `{ data, nextCursor, backwardsCursor }`.
+- `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, and local images are `{ type: 'localImage', path }`.
+- `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
+- `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
+- `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, `startedAt`, `completedAt`, and `durationMs`.
+- `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
+- Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
+- Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
+- Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`.
+- Generated `ServerNotification` method names are slash-delimited and must be copied exactly from `ServerNotification.ts`; examples include `thread/status/changed`, `thread/tokenUsage/updated`, `turn/diff/updated`, `turn/plan/updated`, `thread/compacted`, `item/agentMessage/delta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `thread/realtime/error`, and `thread/realtime/closed`.
+- Any per-turn body API in Freshell must be an internal facade over `thread/turns/list`, `thread/read { includeTurns: true }`, or a server-side page/body cache until Codex exposes a direct turn-read request.
+
+Generated method inventory the executor must keep aligned with the local schema:
+
+- Freshcodex client-request methods to implement or intentionally leave unsupported: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unsubscribe`, `thread/name/set`, `thread/metadata/update`, `thread/unarchive`, `thread/compact/start`, `thread/rollback`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`.
+- Server-request methods requiring pending UI state or explicit unblock responses: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
+- Visible-state notification methods that must invalidate or patch Freshcodex read models: `error`, `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/closed`, `thread/name/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/tokenUsage/updated`, `turn/started`, `hook/started`, `turn/completed`, `hook/completed`, `turn/diff/updated`, `turn/plan/updated`, `item/started`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `item/completed`, `rawResponseItem/completed`, `item/agentMessage/delta`, `item/plan/delta`, `command/exec/outputDelta`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `item/mcpToolCall/progress`, `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `fs/changed`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta`, `thread/compacted`, `model/rerouted`, `model/verification`, `warning`, `guardianWarning`, `configWarning`, `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, `thread/realtime/closed`, `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`.
+- Generated notifications that may be ignored only by an explicit non-visible allowlist: `skills/changed`, `account/updated`, `account/rateLimits/updated`, `app/list/updated`, `remoteControl/status/changed`, `externalAgentConfig/import/completed`, `deprecationNotice`, `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`, and `account/login/completed`.
 
 ## User-Visible End State
 
@@ -809,7 +838,7 @@ codex app-server generate-json-schema --out /tmp/freshell-codex-app-server-schem
 find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSONRPC|Initialize|Thread|Turn|Approval|Request|Item|Fork|Interrupt|ServerRequest'
 ```
 
-Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns?: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API.
+Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
 Add transport tests requiring stdio JSONL framing and websocket preservation:
 
@@ -846,7 +875,7 @@ await expect(client.listThreadTurns({ threadId: 'thread-1', limit: 25, sortDirec
 
 await expect(client.startTurn({
   threadId: 'thread-1',
-  input: [{ type: 'text', text: 'Implement this' }],
+  input: [{ type: 'text', text: 'Implement this', text_elements: [] }],
 })).resolves.toMatchObject({ turn: { id: expect.any(String) } })
 
 await expect(client.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' })).resolves.toEqual({})
@@ -854,14 +883,14 @@ await expect(client.interruptTurn({ threadId: 'thread-1', turnId: 'turn-1' })).r
 await expect(client.forkThread({ threadId: 'thread-1', excludeTurns: true }))
   .resolves.toMatchObject({ thread: { id: expect.any(String) } })
 
-await expect(runtime.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'Hello' }] }))
+await expect(runtime.startTurn({ threadId: 'thread-1', input: [{ type: 'text', text: 'Hello', text_elements: [] }] }))
   .resolves.toMatchObject({ turn: { id: expect.any(String) } })
 
 expect('readThreadTurn' in client).toBe(false) // no public method; direct turn read is not in the generated schema
 
-await expect(websocketRuntime.startThread({ cwd: '/repo', richClient: false }))
+await expect(websocketRuntime.startThread({ cwd: '/repo' }))
   .resolves.toMatchObject({ threadId: expect.any(String), wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/) })
-await expect(richRuntime.startThread({ cwd: '/repo', richClient: true }))
+await expect(richRuntime.startThread({ cwd: '/repo' }))
   .resolves.toMatchObject({ threadId: expect.any(String) })
 expect(await richRuntime.ensureReady()).not.toHaveProperty('wsUrl')
 ```
@@ -873,8 +902,8 @@ it('surfaces server-initiated approval requests and responds on the same JSON-RP
   const seen: unknown[] = []
   client.onServerRequest((request) => seen.push(request))
   await fakeServer.sendRequest({ id: 'approval-99', method: 'item/commandExecution/requestApproval', params: approvalParams })
-  await client.respondToServerRequest('approval-99', { decision: { type: 'accept' } })
-  expect(fakeServer.responses).toContainEqual({ id: 'approval-99', result: { decision: { type: 'accept' } } })
+  await client.respondToServerRequest('approval-99', { decision: 'accept' })
+  expect(fakeServer.responses).toContainEqual({ id: 'approval-99', result: { decision: 'accept' } })
 })
 ```
 
@@ -928,7 +957,7 @@ export const CodexInitializeResultSchema = z.object({
 
 export const CodexThreadReadParamsSchema = z.object({
   threadId: z.string().min(1),
-  includeTurns: z.boolean().optional(),
+  includeTurns: z.boolean(),
 })
 
 export const CodexThreadTurnsListParamsSchema = z.object({
@@ -945,7 +974,7 @@ export const CodexThreadTurnsListResultSchema = z.object({
 })
 
 export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('text'), text: z.string() }),
+  z.object({ type: z.literal('text'), text: z.string(), text_elements: z.array(z.unknown()).default([]) }),
   z.object({ type: z.literal('image'), url: z.string().url() }),
   z.object({ type: z.literal('localImage'), path: z.string().min(1) }),
 ])
@@ -1138,14 +1167,14 @@ git commit -m "Extend Codex app-server client for rich turns"
 Require all documented Codex item variants to normalize into `FreshAgentTranscriptItemSchema` variants:
 
 ```ts
-expect(normalizeCodexItem({ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'Do it' }] }))
+expect(normalizeCodexItem({ type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'Do it', text_elements: [] }] }))
   .toEqual([{ id: 'u1', kind: 'message', role: 'user', content: [{ kind: 'text', text: 'Do it' }] }])
 
 expect(normalizeCodexItem({
   type: 'userMessage',
   id: 'u2',
   content: [
-    { type: 'text', text: 'Use this mockup' },
+    { type: 'text', text: 'Use this mockup', text_elements: [] },
     { type: 'image', url: 'https://example.test/mockup.png' },
     { type: 'localImage', path: '/tmp/mockup.png' },
   ],
@@ -1194,7 +1223,7 @@ runtime.startTurn.mockResolvedValue({ turn: { id: 'turn-1' } })
 await adapter.send?.('thread-1', { text: 'Ship it' })
 expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   threadId: 'thread-1',
-  input: [{ type: 'text', text: 'Ship it' }],
+  input: [{ type: 'text', text: 'Ship it', text_elements: [] }],
 }))
 
 await adapter.send?.('thread-1', {
@@ -1214,7 +1243,7 @@ expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   approvalPolicy: expect.anything(),
   effort: 'high',
   input: [
-    { type: 'text', text: 'Use this mockup' },
+    { type: 'text', text: 'Use this mockup', text_elements: [] },
     { type: 'image', url: 'https://example.test/mockup.png' },
   ],
 }))
@@ -1270,12 +1299,12 @@ it.each([
   ['turn/completed'],
   ['item/started'],
   ['item/completed'],
-  ['thread/statusChanged'],
-  ['thread/tokenUsageUpdated'],
-  ['turn/diffUpdated'],
-  ['turn/planUpdated'],
-  ['context/compacted'],
-  ['thread/nameUpdated'],
+  ['thread/status/changed'],
+  ['thread/tokenUsage/updated'],
+  ['turn/diff/updated'],
+  ['turn/plan/updated'],
+  ['thread/compacted'],
+  ['thread/name/updated'],
   ['thread/closed'],
   ['thread/archived'],
   ['thread/realtime/error'],
