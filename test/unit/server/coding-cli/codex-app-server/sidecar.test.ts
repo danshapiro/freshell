@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import fsp from 'node:fs/promises'
 import { spawn, type ChildProcess } from 'node:child_process'
-import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { CodexTerminalSidecar } from '../../../../../server/coding-cli/codex-app-server/sidecar.js'
+import {
+  DEFAULT_CODEX_SIDECAR_METADATA_DIR,
+  type CodexSidecarOwnershipMetadata,
+} from '../../../../../server/coding-cli/codex-app-server/runtime.js'
 
-const SIDECAR_OWNERSHIP_DIR = path.join(os.tmpdir(), 'freshell-codex-sidecars')
+const SIDECAR_OWNERSHIP_DIR = DEFAULT_CODEX_SIDECAR_METADATA_DIR
 const children = new Set<ChildProcess>()
 
 async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
@@ -27,19 +30,22 @@ async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void>
 
 async function readLinuxProcessIdentity(pid: number): Promise<{
   commandLine: string[]
-  cwd: string
-  startTimeTicks: string
+  cwd: string | null
+  startTimeTicks: number | null
 }> {
   const [cmdlineRaw, cwd, statRaw] = await Promise.all([
     fsp.readFile(`/proc/${pid}/cmdline`, 'utf8'),
     fsp.readlink(`/proc/${pid}/cwd`),
     fsp.readFile(`/proc/${pid}/stat`, 'utf8'),
   ])
-  const statFields = statRaw.trim().split(' ')
+  const closeParen = statRaw.lastIndexOf(')')
+  const statFields = closeParen >= 0
+    ? statRaw.slice(closeParen + 2).trim().split(/\s+/)
+    : statRaw.trim().split(/\s+/)
   return {
     commandLine: cmdlineRaw.split('\0').filter(Boolean),
     cwd,
-    startTimeTicks: statFields[21] ?? '',
+    startTimeTicks: Number(statFields[19]),
   }
 }
 
@@ -52,6 +58,7 @@ afterEach(async () => {
     child.kill('SIGKILL')
     await new Promise<void>((resolve) => child.once('exit', () => resolve()))
   }))
+  vi.restoreAllMocks()
 
   const entries = await fsp.readdir(SIDECAR_OWNERSHIP_DIR, { withFileTypes: true }).catch(() => [])
   await Promise.all(entries.map(async (entry) => {
@@ -80,8 +87,9 @@ describe('CodexTerminalSidecar orphan reaper', () => {
     expect(killSpy).not.toHaveBeenCalledWith(process.pid, 'SIGTERM')
   })
 
-  it('SIGTERMs only a pid whose command line, cwd, and start time still match the recorded sidecar', async () => {
+  it('SIGTERMs only a process group whose command line, cwd, and start time still match the recorded sidecar', async () => {
     const wsUrl = 'ws://127.0.0.1:4546'
+    const ownershipId = `test-sidecar-${randomUUID()}`
     const child = spawn(process.execPath, [
       '-e',
       'setInterval(() => {}, 1000)',
@@ -90,6 +98,11 @@ describe('CodexTerminalSidecar orphan reaper', () => {
       wsUrl,
     ], {
       cwd: process.cwd(),
+      detached: true,
+      env: {
+        ...process.env,
+        FRESHELL_CODEX_SIDECAR_ID: ownershipId,
+      },
       stdio: 'ignore',
     })
     children.add(child)
@@ -100,15 +113,24 @@ describe('CodexTerminalSidecar orphan reaper', () => {
 
     const identity = await readLinuxProcessIdentity(child.pid)
     await fsp.mkdir(SIDECAR_OWNERSHIP_DIR, { recursive: true })
-    const metadataPath = path.join(SIDECAR_OWNERSHIP_DIR, `${randomUUID()}.json`)
-    await fsp.writeFile(metadataPath, JSON.stringify({
-      pid: child.pid,
+    const metadataPath = path.join(SIDECAR_OWNERSHIP_DIR, `${ownershipId}.json`)
+    const now = new Date().toISOString()
+    const metadata: CodexSidecarOwnershipMetadata = {
+      schemaVersion: 1,
+      ownershipId,
+      serverInstanceId: 'test-dead-server',
+      ownerServerPid: 999_999_999,
       wsUrl,
+      wrapperPid: child.pid,
+      processGroupId: child.pid,
       codexHome: '/tmp/test-codex-home',
       terminalId: 'term-owned',
-      createdAt: new Date().toISOString(),
-      process: identity,
-    }), 'utf8')
+      generation: 2,
+      wrapperIdentity: identity,
+      createdAt: now,
+      updatedAt: now,
+    }
+    await fsp.writeFile(metadataPath, JSON.stringify(metadata), 'utf8')
 
     await CodexTerminalSidecar.reapOrphanedSidecars()
     await waitForProcessExit(child.pid)

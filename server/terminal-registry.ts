@@ -41,6 +41,7 @@ import {
   type TerminalStartupProbeColors,
   type TerminalStartupProbeState,
 } from '../shared/terminal-startup-probes.js'
+import { collectShutdownFailures, throwShutdownFailures } from './shutdown-join.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
@@ -503,6 +504,14 @@ type CodexActiveReplacement = {
   candidateMcpCwd?: string
   candidateWsUrl?: string
   candidateAppServerPid?: number
+}
+
+type SidecarShutdownEntry = {
+  promise: Promise<void>
+  status: 'pending' | 'failed'
+  terminalId: string
+  shutdownSidecar: () => Promise<void>
+  failureMessage: string
 }
 
 export type BindSessionResult =
@@ -1046,6 +1055,7 @@ export class TerminalRegistry extends EventEmitter {
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
+  private sidecarShutdowns = new Map<string, SidecarShutdownEntry>()
   // Legacy transport batching path. Broker cutover destination:
   // - outputBuffers/flush timers/mobile batching -> broker client-output queue.
   private outputBuffers = new Map<WebSocket, PendingOutput>()
@@ -1847,9 +1857,12 @@ export class TerminalRegistry extends EventEmitter {
     const sidecar = record.codexSidecar
     record.codexSidecar = undefined
     if (sidecar) {
-      await sidecar.shutdown().catch((err) => {
-        logger.warn({ err, terminalId: record.terminalId, generation }, 'Failed to shut down retiring Codex sidecar')
-      })
+      await this.trackSidecarShutdown(
+        record.terminalId,
+        `recovery-retiring:${generation}`,
+        () => sidecar.shutdown(),
+        'Failed to shut down retiring Codex sidecar',
+      ).catch(() => undefined)
     }
     try {
       record.pty.kill()
@@ -1877,7 +1890,12 @@ export class TerminalRegistry extends EventEmitter {
     codex.closeReasonByGeneration.set(active.candidateGeneration, 'recovery_retire')
     const candidateSidecar = active.candidatePublished ? record.codexSidecar : active.candidateSidecar
     if (candidateSidecar) {
-      await candidateSidecar.shutdown().catch(() => undefined)
+      await this.trackSidecarShutdown(
+        record.terminalId,
+        `candidate:${active.candidateGeneration}`,
+        () => candidateSidecar.shutdown(),
+        'Failed to shut down failed Codex recovery candidate sidecar',
+      ).catch(() => undefined)
     }
     const candidatePty = active.candidatePublished ? record.pty : active.candidatePty
     if (candidatePty) {
@@ -2099,7 +2117,7 @@ export class TerminalRegistry extends EventEmitter {
     record.lastActivityAt = now
     record.exitedAt = now
     cleanupMcpConfig(terminalId, record.mode, record.mcpCwd)
-    this.shutdownCodexSidecar(record)
+    void this.releaseCodexSidecar(record).catch(() => undefined)
     for (const client of record.clients) {
       this.flushOutputBuffer(client)
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: finalExitCode }, { terminalId, perf: record.perf })
@@ -2400,7 +2418,13 @@ export class TerminalRegistry extends EventEmitter {
       if (active.backoffTimer) clearTimeout(active.backoffTimer)
       codex.closeReasonByGeneration.set(active.candidateGeneration, 'user_final_close')
       if (active.candidateSidecar && !active.candidatePublished) {
-        void active.candidateSidecar.shutdown().catch(() => undefined)
+        const candidateSidecar = active.candidateSidecar
+        void this.trackSidecarShutdown(
+          record.terminalId,
+          `candidate:${active.candidateGeneration}`,
+          () => candidateSidecar.shutdown(),
+          'Failed to shut down final-closed Codex recovery candidate sidecar',
+        ).catch(() => undefined)
       }
       if (active.candidatePty && !active.candidatePublished) {
         try { active.candidatePty.kill() } catch {}
@@ -2418,15 +2442,104 @@ export class TerminalRegistry extends EventEmitter {
     return true
   }
 
-  private shutdownCodexSidecar(term: TerminalRecord): void {
+  private releaseCodexSidecar(term: TerminalRecord): Promise<void> {
+    const existing = this.sidecarShutdowns.get(this.sidecarShutdownKey(term.terminalId))
+    if (existing?.status === 'pending') return existing.promise
+
     const sidecar = term.codexSidecar
-    if (!sidecar) {
-      return
+    if (!sidecar) return existing?.promise ?? Promise.resolve()
+
+    return this.trackSidecarShutdown(
+      term.terminalId,
+      'current',
+      async () => {
+        await sidecar.shutdown()
+        if (term.codexSidecar === sidecar) {
+          term.codexSidecar = undefined
+        }
+      },
+      'Codex sidecar shutdown failed',
+    )
+  }
+
+  private sidecarShutdownKey(terminalId: string, scope = 'current'): string {
+    return scope === 'current' ? terminalId : `${terminalId}:${scope}`
+  }
+
+  private sidecarShutdownPromisesForTerminal(terminalId: string): Promise<void>[] {
+    const prefix = `${terminalId}:`
+    return [...this.sidecarShutdowns.entries()]
+      .filter(([key]) => key === terminalId || key.startsWith(prefix))
+      .map(([key, entry]) => this.runSidecarShutdownEntry(key, entry))
+  }
+
+  private trackSidecarShutdown(
+    terminalId: string,
+    scope: string,
+    shutdownSidecar: () => Promise<void>,
+    failureMessage: string,
+  ): Promise<void> {
+    const key = this.sidecarShutdownKey(terminalId, scope)
+    const existing = this.sidecarShutdowns.get(key)
+    if (existing?.status === 'pending') return existing.promise
+
+    const entry: SidecarShutdownEntry = existing ?? {
+      promise: Promise.resolve(),
+      status: 'failed',
+      terminalId,
+      shutdownSidecar,
+      failureMessage,
     }
-    term.codexSidecar = undefined
-    void sidecar.shutdown().catch((error) => {
-      logger.warn({ err: error, terminalId: term.terminalId }, 'Failed to shut down Codex sidecar')
-    })
+    entry.terminalId = terminalId
+    entry.shutdownSidecar = shutdownSidecar
+    entry.failureMessage = failureMessage
+    this.sidecarShutdowns.set(key, entry)
+    return this.runSidecarShutdownEntry(key, entry)
+  }
+
+  private runSidecarShutdownEntry(key: string, entry: SidecarShutdownEntry): Promise<void> {
+    if (entry.status === 'pending') return entry.promise
+    entry.status = 'pending'
+    const shutdown = Promise.resolve()
+      .then(() => entry.shutdownSidecar())
+      .then(() => {
+        if (this.sidecarShutdowns.get(key) === entry) {
+          this.sidecarShutdowns.delete(key)
+        }
+      })
+      .catch((err) => {
+        if (this.sidecarShutdowns.get(key) === entry) {
+          entry.status = 'failed'
+        }
+        logger.error({ err, terminalId: entry.terminalId }, entry.failureMessage)
+        throw err
+      })
+    entry.promise = shutdown
+    return shutdown
+  }
+
+  private async waitForSidecarShutdown(terminalId: string): Promise<void> {
+    const term = this.terminals.get(terminalId)
+    const promises = new Set<Promise<void>>()
+    if (term) promises.add(this.releaseCodexSidecar(term))
+    for (const promise of this.sidecarShutdownPromisesForTerminal(terminalId)) {
+      promises.add(promise)
+    }
+    const failures = await collectShutdownFailures([...promises])
+    throwShutdownFailures(failures, 'Codex terminal sidecar shutdown failed.')
+  }
+
+  private async waitForCodexShutdownWork(records: Iterable<TerminalRecord>): Promise<void> {
+    const recordList = Array.from(records)
+    const sidecarShutdowns = new Set<Promise<void>>()
+    for (const term of recordList) {
+      sidecarShutdowns.add(this.releaseCodexSidecar(term))
+    }
+    for (const [key, entry] of [...this.sidecarShutdowns.entries()]) {
+      sidecarShutdowns.add(this.runSidecarShutdownEntry(key, entry))
+    }
+    const failures = await collectShutdownFailures([...sidecarShutdowns])
+    throwShutdownFailures(failures, 'Codex registry shutdown work failed.')
   }
 
   list(): Array<{
@@ -3014,6 +3127,7 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     if (running.length === 0) {
+      await this.waitForCodexShutdownWork(this.terminals.values())
       logger.info('No running terminals to shut down')
       return
     }
@@ -3081,6 +3195,8 @@ export class TerminalRegistry extends EventEmitter {
     if (forceKilled > 0) {
       logger.warn({ forceKilled }, 'Force-killed terminals after graceful timeout')
     }
+
+    await this.waitForCodexShutdownWork(this.terminals.values())
 
     logger.info({ count: running.length, forceKilled }, 'All terminals shut down')
   }

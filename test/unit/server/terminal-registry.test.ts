@@ -2528,6 +2528,16 @@ describe('TerminalRegistry', () => {
   })
 
   describe('codex sidecar callbacks during create', () => {
+    function deferred<T = void>() {
+      let resolve!: (value: T | PromiseLike<T>) => void
+      let reject!: (reason?: unknown) => void
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return { promise, resolve, reject }
+    }
+
     it('registers the terminal before a synchronous durable-session callback fires', () => {
       let terminalSeenDuringAttach: string | undefined
 
@@ -2569,6 +2579,35 @@ describe('TerminalRegistry', () => {
       expect(registry.get(term.terminalId)?.status).toBe('running')
       expect(registry.get(term.terminalId)?.codex?.recoveryState).toBe('recovering_pre_durable')
       expect(exited).not.toHaveBeenCalled()
+    })
+
+    it('waits for pending Codex sidecar shutdown work during graceful shutdown', async () => {
+      const sidecarShutdown = deferred()
+      const sidecar = {
+        attachTerminal: vi.fn(),
+        shutdown: vi.fn(() => sidecarShutdown.promise),
+      }
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: sidecar,
+      })
+
+      registry.kill(term.terminalId)
+      await vi.waitFor(() => expect(sidecar.shutdown).toHaveBeenCalledTimes(1))
+
+      const joined = registry.shutdownGracefully(1)
+      let settled = false
+      void joined.then(
+        () => { settled = true },
+        () => { settled = true },
+      )
+
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(settled).toBe(false)
+
+      sidecarShutdown.resolve()
+      await expect(joined).resolves.toBeUndefined()
     })
   })
 
