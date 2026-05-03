@@ -327,6 +327,37 @@ describe('TestServer', () => {
     expect(info.configDir).not.toContain('.freshell')
   })
 
+  it('preserves config values written by setupHome while adding the setup-wizard bypass', async () => {
+    server = new TestServer({
+      preserveHomeOnStop: true,
+      setupHome: async (homeDir) => {
+        const freshellDir = path.join(homeDir, '.freshell')
+        await fs.mkdir(freshellDir, { recursive: true })
+        await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+          version: 1,
+          settings: {
+            defaultCwd: '/repo',
+          },
+          legacyLocalSettingsSeed: {
+            theme: 'light',
+          },
+        }, null, 2))
+      },
+    })
+
+    const info = await server.start()
+    const config = JSON.parse(await fs.readFile(path.join(info.homeDir, '.freshell', 'config.json'), 'utf8'))
+
+    expect(config.settings.defaultCwd).toBe('/repo')
+    expect(config.settings.network).toMatchObject({
+      configured: true,
+      host: '127.0.0.1',
+    })
+    expect(config.legacyLocalSettingsSeed).toEqual({
+      theme: 'light',
+    })
+  })
+
   it('exposes HOME, logs, and debug-log paths and can preserve them for audit collection', async () => {
     server = new TestServer({
       preserveHomeOnStop: true,

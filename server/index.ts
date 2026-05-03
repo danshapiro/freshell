@@ -70,9 +70,13 @@ import { createAgentHistorySource } from './agent-timeline/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { shouldPromoteSessionTitle } from './session-title-sync.js'
-import { CodexAppServerRuntime } from './coding-cli/codex-app-server/runtime.js'
+import {
+  CodexAppServerRuntime,
+  runCodexStartupReaper,
+} from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
+import { joinCodexShutdownOwners } from './shutdown-join.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -193,6 +197,7 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
+  await runCodexStartupReaper({ serverInstanceId })
 
   let sdkBridge: SdkBridge
 
@@ -289,8 +294,7 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexAppServerRuntime = new CodexAppServerRuntime()
-  const codexLaunchPlanner = new CodexLaunchPlanner(codexAppServerRuntime)
+  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
   const wsHandler = new WsHandler(
     server,
     registry,
@@ -329,6 +333,12 @@ async function main() {
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
+  let terminalCreateAdmissionOpen = true
+  const assertTerminalCreateAccepted = () => {
+    if (!terminalCreateAdmissionOpen) {
+      throw new Error('Server is shutting down; terminal creation is not accepted.')
+    }
+  }
   app.use('/api', createAgentApiRouter({
     layoutStore,
     registry,
@@ -338,6 +348,7 @@ async function main() {
     codingCliIndexer,
     codexActivityTracker: codexActivity.tracker,
     codexLaunchPlanner,
+    assertTerminalCreateAccepted,
   }))
 
   // --- Extension lifecycle broadcasts ---
@@ -760,51 +771,59 @@ async function main() {
 
     log.info({ signal }, 'Shutting down...')
 
-    // 1. Stop accepting new connections by closing the HTTP server
-    server.close((err) => {
-      if (err) {
-        log.warn({ err }, 'Error closing HTTP server')
-      }
-    })
-
-    // 2. Stop any coalesced sessions publish timers
-    sessionsSync.shutdown()
-
-    // 3. Gracefully shut down terminals (gives Claude time to flush JSONL writes)
-    await registry.shutdownGracefully(5000)
-
-    // 4. Kill all coding CLI sessions
-    codingCliSessionManager.shutdown()
-
-    // 4b. Stop the shared Codex app-server runtime
-    await codexAppServerRuntime.shutdown()
-
-    // 5. Close SDK bridge sessions
-    sdkBridge.close()
-
-    // 5b. Stop extension servers
-    await extensionManager.stopAll()
-
-    // 6. Stop NetworkManager
-    await networkManager.stop()
-
-    // 7. Close WebSocket connections gracefully
+    // 1. Establish terminal creation admission barriers before waiting on terminal teardown.
+    terminalCreateAdmissionOpen = false
     wsHandler.close()
 
-    // 7. Close port forwards
+    // 2. Stop accepting new connections by closing the HTTP server
+    const httpServerClosed = new Promise<void>((resolve) => {
+      server.close((err) => {
+        if (err) {
+          log.warn({ err }, 'Error closing HTTP server')
+        }
+        resolve()
+      })
+    })
+
+    // 3. Stop any coalesced sessions publish timers
+    sessionsSync.shutdown()
+
+    // 4. Gracefully shut down terminals and planner-owned Codex app-server sidecars.
+    try {
+      await httpServerClosed
+      await joinCodexShutdownOwners({
+        registry,
+        codexLaunchPlanner,
+        terminalShutdownTimeoutMs: 5000,
+      })
+    } finally {
+      // 5. Kill all coding CLI sessions
+      codingCliSessionManager.shutdown()
+    }
+
+    // 6. Close SDK bridge sessions
+    sdkBridge.close()
+
+    // 6b. Stop extension servers
+    await extensionManager.stopAll()
+
+    // 7. Stop NetworkManager
+    await networkManager.stop()
+
+    // 8. Close port forwards
     await portForwardManager.closeAll()
 
-    // 8. Stop session indexer
+    // 9. Stop session indexer
     await codingCliIndexer.stop()
 
-    // 8b. Stop Codex activity tracker listeners and sweep timer
+    // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
     opencodeActivity.dispose()
 
-    // 9. Stop session repair service
+    // 10. Stop session repair service
     await sessionRepairService.stop()
 
-    // 10. Exit cleanly
+    // 11. Exit cleanly
     log.info('Shutdown complete')
     process.exit(0)
   }

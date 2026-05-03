@@ -23,33 +23,16 @@ export default defineConfig({
     environment: 'node',
     globalSetup: ['./test/setup/server-global-setup.ts'],
     include: [
-      'test/server/**/*.test.ts',
-      'test/unit/server/**/*.test.ts',
-      'test/unit/visible-first/**/*.test.ts',
-      'test/integration/server/**/*.test.ts',
-      'test/integration/session-repair.test.ts',
-      'test/integration/session-search-e2e.test.ts',
-      'test/integration/extension-system.test.ts',
-    ],
-    exclude: [
-      'docs/plans/**',
       'test/integration/server/codex-real-provider-smoke.test.ts',
-      'test/unit/visible-first/slow-network-controller.test.ts',
     ],
-    testTimeout: 30000,
+    testTimeout: 60000,
     hookTimeout: 30000,
-    // Maximum parallelization settings
     pool: 'threads',
     poolOptions: {
       threads: {
         singleThread: false,
         isolate: true,
       },
-    },
-    fileParallelism: true,
-    maxConcurrency: 10,
-    sequence: {
-      shuffle: true, // Detect order-dependent tests
     },
   },
 })

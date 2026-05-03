@@ -2,7 +2,11 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
-import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
+import {
+  FakeCodexLaunchPlanner,
+  FakeCodexLaunchSidecar,
+  DEFAULT_CODEX_REMOTE_WS_URL,
+} from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -25,6 +29,16 @@ function defaultConfigSnapshot() {
     terminalOverrides: {},
     projectColors: {},
   }
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
@@ -115,6 +129,7 @@ class FakeRegistry {
   inputCalls: { terminalId: string; data: string }[] = []
   resizeCalls: { terminalId: string; cols: number; rows: number }[] = []
   killCalls: string[] = []
+  publishCalls: string[] = []
 
   create(opts: any) {
     this.createCalls.push(opts)
@@ -176,6 +191,14 @@ class FakeRegistry {
     return true
   }
 
+  async killAndWait(terminalId: string) {
+    return this.kill(terminalId)
+  }
+
+  publishCodexSidecar(terminalId: string) {
+    this.publishCalls.push(terminalId)
+  }
+
   list() {
     return Array.from(this.records.values()).map((r) => ({
       terminalId: r.terminalId,
@@ -195,6 +218,49 @@ class FakeRegistry {
       if (rec.resumeSessionId === sessionId) return rec
     }
     return undefined
+  }
+
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string) {
+    for (const rec of this.records.values()) {
+      if (rec.mode !== mode) continue
+      if (rec.status !== 'running') continue
+      if (rec.resumeSessionId === sessionId) return rec
+    }
+    return undefined
+  }
+
+  repairLegacySessionOwners() {
+    return { repaired: false, clearedTerminalIds: [] }
+  }
+}
+
+function createAuthenticatedState() {
+  return {
+    authenticated: true,
+    supportsUiScreenshotV1: false,
+    attachedTerminalIds: new Set(),
+    createdByRequestId: new Map(),
+    terminalCreateTimestamps: [],
+    codingCliSessions: new Set(),
+    codingCliSubscriptions: new Map(),
+    sdkSessions: new Set(),
+    sdkSubscriptions: new Map(),
+    sdkSessionTargets: new Map(),
+    interestedSessions: new Set(),
+    sidebarOpenSessionKeys: new Set(),
+  }
+}
+
+function createOpenFakeWs(connectionId: string, sent: any[]) {
+  return {
+    readyState: WebSocket.OPEN,
+    bufferedAmount: 0,
+    connectionId,
+    send: vi.fn((payload: string, cb?: (err?: Error) => void) => {
+      sent.push(JSON.parse(payload))
+      cb?.()
+    }),
+    close: vi.fn(),
   }
 }
 
@@ -268,7 +334,14 @@ describe('ws protocol', () => {
     registry.inputCalls = []
     registry.resizeCalls = []
     registry.killCalls = []
+    registry.publishCalls = []
     codexLaunchPlanner.planCreateCalls = []
+    codexLaunchPlanner.sidecar.adoptCalls = []
+    codexLaunchPlanner.sidecar.shutdownCalls = 0
+    codexLaunchPlanner.sidecar.shutdownStarted = false
+    codexLaunchPlanner.sidecar.shutdownError = null
+    codexLaunchPlanner.sidecar.waitForLoadedThreadCalls = []
+    codexLaunchPlanner.sidecar.waitForLoadedThreadError = null
   })
 
   afterAll(async () => {
@@ -434,12 +507,432 @@ describe('ws protocol', () => {
     }])
     expect(registry.createCalls[0]?.resumeSessionId).toBe('thread-new-1')
     expect(registry.createCalls[0]?.providerSettings).toEqual({
-      codexAppServer: {
+      codexAppServer: expect.objectContaining({
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
-      },
+      }),
     })
 
     await closeWebSocket(ws)
+  })
+
+  it('shuts down a pending Codex sidecar when terminal.create fails after planning', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const originalCreate = registry.create.bind(registry)
+    registry.create = vi.fn((opts: any) => {
+      registry.createCalls.push(opts)
+      throw new Error('spawn failed after planning')
+    }) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'codex-create-fails', mode: 'codex' }))
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === 'codex-create-fails',
+        5000,
+      )
+
+      expect(error.message).toContain('spawn failed after planning')
+      expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+      expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
+    } finally {
+      registry.create = originalCreate as any
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('reports terminal.create cleanup failure when pending Codex sidecar shutdown fails', async () => {
+    codexLaunchPlanner.sidecar.shutdownError = new Error('verified sidecar teardown failed')
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const originalCreate = registry.create.bind(registry)
+    registry.create = vi.fn((opts: any) => {
+      registry.createCalls.push(opts)
+      throw new Error('spawn failed after planning')
+    }) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'codex-cleanup-fails', mode: 'codex' }))
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === 'codex-cleanup-fails',
+        5000,
+      )
+
+      expect(error.message).toContain('spawn failed after planning')
+      expect(error.message).toContain('verified sidecar teardown failed')
+      expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+      expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([])
+    } finally {
+      registry.create = originalCreate as any
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('kills the inserted terminal when terminal.create fails before registry.create returns', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const originalCreate = registry.create.bind(registry)
+    registry.create = vi.fn((opts: any) => {
+      registry.createCalls.push(opts)
+      const terminalId = 'term_inserted_before_emit_failure'
+      registry.records.set(terminalId, {
+        terminalId,
+        createdAt: Date.now(),
+        buffer: new FakeBuffer(),
+        title: 'Codex',
+        mode: opts.mode || 'codex',
+        shell: opts.shell || 'system',
+        status: 'running',
+        resumeSessionId: opts.resumeSessionId,
+        clients: new Set(),
+      })
+      const error = new Error('terminal.created listener failed') as Error & { terminalId?: string }
+      error.terminalId = terminalId
+      throw error
+    }) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'codex-create-emit-fails', mode: 'codex' }))
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === 'codex-create-emit-fails',
+        5000,
+      )
+
+      expect(error.message).toContain('terminal.created listener failed')
+      expect(registry.killCalls).toContain('term_inserted_before_emit_failure')
+      expect(registry.records.has('term_inserted_before_emit_failure')).toBe(false)
+      expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    } finally {
+      registry.create = originalCreate as any
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('rejects late terminal.create after the WebSocket handler starts closing', async () => {
+    const localServer = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    const localRegistry = new FakeRegistry()
+    const localPlanner = new FakeCodexLaunchPlanner()
+    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner })
+    const sent: any[] = []
+    const ws = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      connectionId: 'late-create-after-close',
+      send: vi.fn((payload: string, cb?: (err?: Error) => void) => {
+        sent.push(JSON.parse(payload))
+        cb?.()
+      }),
+      close: vi.fn(),
+    }
+    const state = {
+      authenticated: true,
+      supportsUiScreenshotV1: false,
+      attachedTerminalIds: new Set(),
+      createdByRequestId: new Map(),
+      terminalCreateTimestamps: [],
+      codingCliSessions: new Set(),
+      codingCliSubscriptions: new Map(),
+      sdkSessions: new Set(),
+      sdkSubscriptions: new Map(),
+      sdkSessionTargets: new Map(),
+      interestedSessions: new Set(),
+      sidebarOpenSessionKeys: new Set(),
+    }
+
+    localHandler.close()
+    await (localHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({ type: 'terminal.create', requestId: 'after-close', mode: 'codex' })),
+    )
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'error',
+      requestId: 'after-close',
+    }))
+    expect(localRegistry.createCalls).toEqual([])
+    expect(localPlanner.planCreateCalls).toEqual([])
+  })
+
+  it('aborts in-flight Codex terminal.create when shutdown starts after planning before registry create', async () => {
+    const localServer = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    const localRegistry = new FakeRegistry()
+    const sidecar = new FakeCodexLaunchSidecar()
+    const plan = deferred<any>()
+    const localPlanner = {
+      planCreateCalls: [] as any[],
+      planCreate: vi.fn((input: any) => {
+        localPlanner.planCreateCalls.push(input)
+        return plan.promise
+      }),
+    }
+    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner as any })
+    const sent: any[] = []
+    const ws = createOpenFakeWs('shutdown-after-plan', sent)
+    const state = createAuthenticatedState()
+
+    const message = (localHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({ type: 'terminal.create', requestId: 'shutdown-after-plan', mode: 'codex' })),
+    )
+    await vi.waitFor(() => expect(localPlanner.planCreate).toHaveBeenCalledTimes(1))
+    localHandler.close()
+    plan.resolve({
+      sessionId: 'thread-after-plan',
+      remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+      sidecar,
+    })
+    await message
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'error',
+      requestId: 'shutdown-after-plan',
+    }))
+    expect(localRegistry.createCalls).toEqual([])
+    expect(sidecar.shutdownCalls).toBe(1)
+  })
+
+  it('aborts in-flight Codex terminal.create when shutdown starts after registry create before adoption', async () => {
+    const localServer = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    const localRegistry = new FakeRegistry()
+    const sidecar = new FakeCodexLaunchSidecar()
+    const localPlanner = new FakeCodexLaunchPlanner({
+      sessionId: 'thread-after-registry-create',
+      remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+      sidecar,
+    })
+    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner })
+    const originalCreate = localRegistry.create.bind(localRegistry)
+    localRegistry.create = vi.fn((opts: any) => {
+      const record = originalCreate(opts)
+      localHandler.close()
+      return record
+    }) as any
+    const sent: any[] = []
+    const ws = createOpenFakeWs('shutdown-after-registry-create', sent)
+    const state = createAuthenticatedState()
+
+    await (localHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({ type: 'terminal.create', requestId: 'shutdown-after-registry-create', mode: 'codex' })),
+    )
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'error',
+      requestId: 'shutdown-after-registry-create',
+    }))
+    expect(sidecar.adoptCalls).toEqual([])
+    expect(sidecar.shutdownCalls).toBe(1)
+    expect(localRegistry.killCalls).toHaveLength(1)
+    expect(localRegistry.records.size).toBe(0)
+  })
+
+  it('aborts in-flight Codex terminal.create when shutdown starts after adoption before publication', async () => {
+    const localServer = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    const localRegistry = new FakeRegistry()
+    const sidecar = new FakeCodexLaunchSidecar()
+    const originalAdopt = sidecar.adopt.bind(sidecar)
+    const localPlanner = new FakeCodexLaunchPlanner({
+      sessionId: 'thread-after-adoption',
+      remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+      sidecar,
+    })
+    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner })
+    vi.spyOn(sidecar, 'adopt').mockImplementation(async (input) => {
+      await originalAdopt(input)
+      localHandler.close()
+    })
+    const sent: any[] = []
+    const ws = createOpenFakeWs('shutdown-after-adoption', sent)
+    const state = createAuthenticatedState()
+
+    await (localHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({ type: 'terminal.create', requestId: 'shutdown-after-adoption', mode: 'codex' })),
+    )
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'error',
+      requestId: 'shutdown-after-adoption',
+    }))
+    expect(sidecar.adoptCalls).toHaveLength(1)
+    expect(localRegistry.publishCalls).toEqual([])
+    expect(localRegistry.killCalls).toHaveLength(1)
+    expect(sidecar.shutdownCalls).toBe(1)
+    expect(localRegistry.records.size).toBe(0)
+  })
+
+  it('aborts in-flight Codex resume terminal.create when shutdown starts during loaded-list readiness', async () => {
+    const localServer = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    const localRegistry = new FakeRegistry()
+    const sidecar = new FakeCodexLaunchSidecar()
+    const readiness = deferred()
+    const originalWaitForLoadedThread = sidecar.waitForLoadedThread.bind(sidecar)
+    const localPlanner = new FakeCodexLaunchPlanner({
+      sessionId: 'thread-during-readiness',
+      remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
+      sidecar,
+    })
+    const localHandler = new WsHandler(localServer, localRegistry as any, { codexLaunchPlanner: localPlanner })
+    vi.spyOn(sidecar, 'waitForLoadedThread').mockImplementation(async (threadId, options) => {
+      await originalWaitForLoadedThread(threadId, options)
+      localHandler.close()
+      await readiness.promise
+    })
+    const sent: any[] = []
+    const ws = createOpenFakeWs('shutdown-during-readiness', sent)
+    const state = createAuthenticatedState()
+
+    const message = (localHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'shutdown-during-readiness',
+        mode: 'codex',
+        resumeSessionId: 'thread-during-readiness',
+      })),
+    )
+    await vi.waitFor(() => expect(sidecar.waitForLoadedThreadCalls).toHaveLength(1))
+    readiness.resolve()
+    await message
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'error',
+      requestId: 'shutdown-during-readiness',
+    }))
+    expect(sidecar.adoptCalls).toHaveLength(1)
+    expect(localRegistry.publishCalls).toEqual([])
+    expect(localRegistry.killCalls).toHaveLength(1)
+    expect(sidecar.shutdownCalls).toBe(1)
+    expect(localRegistry.records.size).toBe(0)
+  })
+
+  it('waits for candidate-local loaded-thread readiness before reporting Codex resume create success', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'codex-resume-loaded-list'
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'codex',
+      resumeSessionId: 'thread-resume-1',
+    }))
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
+      resumeSessionId: 'thread-resume-1',
+    }))
+    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([{
+      threadId: 'thread-resume-1',
+      options: undefined,
+    }])
+    expect(registry.publishCalls).toEqual([created.terminalId])
+
+    await closeWebSocket(ws)
+  })
+
+  it('kills the created terminal and sidecar when Codex resume loaded-list readiness fails', async () => {
+    codexLaunchPlanner.sidecar.waitForLoadedThreadError = new Error('resume thread never loaded')
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'codex-resume-loaded-list-fails'
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'codex',
+      resumeSessionId: 'thread-missing',
+    }))
+    const error = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(error.message).toContain('resume thread never loaded')
+    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toHaveLength(1)
+    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+    expect(registry.killCalls).toHaveLength(1)
+    expect(registry.records.size).toBe(0)
+
+    await closeWebSocket(ws)
+  })
+
+  it('kills the created terminal and sidecar when the Codex resume PTY exits before publication', async () => {
+    const originalWaitForLoadedThread = codexLaunchPlanner.sidecar.waitForLoadedThread.bind(codexLaunchPlanner.sidecar)
+    const waitSpy = vi.spyOn(codexLaunchPlanner.sidecar, 'waitForLoadedThread').mockImplementation(async (threadId, options) => {
+      await originalWaitForLoadedThread(threadId, options)
+      const terminalId = codexLaunchPlanner.sidecar.adoptCalls[0]?.terminalId
+      const record = terminalId ? registry.get(terminalId) : null
+      if (record) record.status = 'exited'
+    })
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'codex-resume-pty-exits-before-publication'
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        resumeSessionId: 'thread-resume-exits',
+      }))
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === requestId,
+        5000,
+      )
+
+      expect(error.message).toContain('Codex terminal PTY exited before create completed')
+      expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toHaveLength(1)
+      expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
+      expect(registry.killCalls).toHaveLength(1)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      waitSpy.mockRestore()
+      await closeWebSocket(ws)
+    }
   })
 
   it('returns INVALID_MESSAGE when persisted Codex settings are invalid', async () => {
@@ -810,6 +1303,30 @@ describe('ws protocol', () => {
     expect(error.terminalId).toBe('nonexistent_terminal')
 
     await close()
+  })
+
+  it('terminal.kill returns a protocol error when verified Codex teardown fails', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+    const originalKillAndWait = registry.killAndWait.bind(registry)
+    registry.killAndWait = vi.fn(async () => {
+      throw new Error('verified Codex teardown failed')
+    }) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.kill', terminalId: 'codex-terminal-with-failed-teardown' }))
+
+      const error = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.terminalId === 'codex-terminal-with-failed-teardown',
+        5000,
+      )
+
+      expect(error.code).toBe('INTERNAL_ERROR')
+      expect(error.message).toContain('verified Codex teardown failed')
+    } finally {
+      registry.killAndWait = originalKillAndWait as any
+      await close()
+    }
   })
 
   it('rejects legacy terminal.list commands', async () => {

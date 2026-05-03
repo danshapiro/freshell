@@ -11,14 +11,20 @@ test.describe('Settings', () => {
     await expect(page.getByText('Terminal').first()).toBeVisible({ timeout: 5_000 })
   }
 
+  async function openSettingsSection(page: any, section: string) {
+    await openSettings(page)
+    await page.getByRole('tab', { name: section }).click()
+    await expect(page.getByRole('tabpanel', { name: new RegExp(`${section} settings`, 'i') })).toBeVisible()
+  }
+
   test('settings view is accessible from sidebar', async ({ freshellPage, page }) => {
     await openSettings(page)
 
-    // Verify multiple settings sections are visible
-    // SettingsSection titles: "Appearance", "Terminal", "Debugging" (from SettingsView.tsx)
-    await expect(page.getByText('Appearance').first()).toBeVisible()
-    await expect(page.getByText('Terminal').first()).toBeVisible()
-    await expect(page.getByText('Debugging').first()).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'Appearance' })).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'Workspace' })).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'AI' })).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'Safety' })).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'Advanced' })).toBeVisible()
   })
 
   test('terminal font size slider changes setting', async ({ freshellPage, page, harness }) => {
@@ -120,7 +126,7 @@ test.describe('Settings', () => {
   })
 
   test('scrollback lines slider changes setting', async ({ freshellPage, page, harness }) => {
-    await openSettings(page)
+    await openSettingsSection(page, 'Advanced')
 
     // "Scrollback lines" row with RangeSlider
     const scrollbackRow = page.getByText('Scrollback lines')
@@ -138,9 +144,9 @@ test.describe('Settings', () => {
   })
 
   test('debug logging toggle', async ({ freshellPage, page, harness }) => {
-    await openSettings(page)
+    await openSettingsSection(page, 'Advanced')
 
-    // Scroll down to "Debugging" section, find "Debug logging" row
+    // Advanced section contains the debug logging row.
     const debugLoggingRow = page.getByText('Debug logging')
     await expect(debugLoggingRow).toBeVisible()
 
