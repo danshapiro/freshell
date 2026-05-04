@@ -32,6 +32,181 @@ Tests depending on it: Section 6 (E2E browser tests) and mobile E2E tests.
 
 ## Test Plan
 
+### Priority 0 — E2E Browser Tests: Full UI Drive-Through With Screenshots
+
+**This is the most important section.** These Playwright E2E tests run against a real Freshell server, use Redux state injection to seed every visual state, exercise the full UI through orchestration where applicable, and capture screenshots at key checkpoints. All tests that exercise a real Codex runtime use the cheapest available model (e.g., `gpt-4o-mini`) with reasoning effort `none` or `minimal` for cost control; one dedicated test toggles thinking from low to high and back to validate the effort toggle end-to-end.
+
+**Harness:** Playwright E2E (`page`, `harness`, `testServer`, `api` fixtures from `test/e2e-browser/helpers/fixtures.ts`). Server is an isolated `TestServer` per worker. Redux state injected via `window.__FRESHELL_TEST_HARNESS__`. API responses for fresh-agent endpoints mocked with `page.route()` using contract-valid fixtures from `test/fixtures/fresh-agent/`. Orchestration actions use the MCP REST API at `POST /api/orchestrate`.
+
+**Cost control for real Codex tests (E2E-13):** All tests use `model: 'gpt-4o-mini'` (or cheapest available), `effort: 'none'` or `'minimal'`. The effort toggle test (E2E-13.6) is the sole exception — it switches to `effort: 'high'` for one turn, then back to `'minimal'`. Total estimated cost per full E2E-13 run: $1-2.
+
+#### E2E-1: Pane Picker — Freshcodex Entry Creation (4 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-1.1 | Picker shows Freshcodex when codex CLI enabled, hides kilroy and freshopencode | Enable `codex` CLI via Redux. Open PanePicker via context menu on terminal. Assert "Freshcodex" button with icon, label, shortcut hint. Assert `freshopencode` absent. Assert `kilroy` absent. Assert "Freshclaude" present if Claude enabled. Screenshot the picker open. | Picker open with Freshcodex entry |
+| E2E-1.2 | Picker supports keyboard nav to Freshcodex, Enter creates pane | Open PanePicker. Press ArrowDown until Freshcodex focused (check aria focus ring). Press Enter. Assert fresh-agent pane appears in layout with `kind: 'fresh-agent'`, `sessionType: 'freshcodex'`. Press Escape on another picker open — assert picker closes, no pane created. | Focus ring on entry; pane created |
+| E2E-1.3 | Picker hides Freshcodex when codex CLI disabled | Disable `codex` CLI in settings. Assert "Freshcodex" entry gone from picker. Re-enable. Assert it returns. Screenshot before/after. | Before/after toggle |
+| E2E-1.4 | Picker creates pane with correct defaults from Codex provider settings | Seed settings with `codingCli.providers.codex: { model: 'gpt-4o-mini', sandbox: 'workspace-write', permissionMode: 'on-request' }` and `freshAgent.providers.freshcodex: { defaultEffort: 'low' }`. Click Freshcodex. Inspect Redux state: assert new pane has `model: 'gpt-4o-mini'`, `sandbox: 'workspace-write'`, `permissionMode: 'on-request'`, `effort: 'low'`, `status: 'creating'`. Assert pane header shows "Freshcodex" title. | Pane header with Freshcodex badge |
+
+#### E2E-2: Freshcodex Shell — All Lifecycle States (9 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-2.1 | Creating state shows spinner and disables composer | Inject `updatePaneContent` with `status: 'creating'`. Assert "Creating session..." text visible. Assert composer input disabled or hidden. Assert no transcript content. Screenshot creating state. | Shell creating state |
+| E2E-2.2 | Create failed with runtime unavailable shows error + retry | Inject `status: 'create-failed'`, `createError: { code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE', message: 'Codex app-server not found', retryable: true }`. Assert red error banner with message. Assert "Retry" button. Click Retry — assert new `freshAgent.create` WS message sent with incremented `createRequestId`. Assert error banner cleared and status returns to `creating`. | Error banner with retry |
+| E2E-2.3 | Create failed with unsupported settings shows non-retryable error | Inject `createError: { code: 'FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING', message: '...', retryable: false }`. Assert error message mentions the invalid setting. Assert NO Retry button. Screenshot. | Settings error (no retry) |
+| E2E-2.4 | Idle state: composer enabled, empty transcript welcome | Inject `freshAgent.created` then `freshAgentSnapshotReceived` with `status: 'idle'`, `summary: 'Ready'`, `capabilities: { send: true, interrupt: false, ... }`, `initialTurnPage.turns: []`. Assert composer enabled with placeholder "Send a message...". Assert empty transcript shows welcome text. Assert Interrupt button not visible. Assert Send button enabled only when text present. | Idle shell with empty transcript |
+| E2E-2.5 | Running state: interrupt button active, composer disabled, items streaming | Inject snapshot with `status: 'running'`, `capabilities.interrupt: true`, active turn with `status: 'inProgress'` items. Assert composer shows Interrupt button (not Send). Assert "Running..." status badge. Assert transcript items visible (agent message with streaming indicator). Assert Send button not shown. | Shell running with items |
+| E2E-2.6 | Compacting state shows compaction indicator | Inject snapshot with `status: 'compacting'`, `tokenUsage.compactPercent: 45`. Assert "Compacting..." status visible. Assert composer disabled. Assert transcript still shows prior items. | Compacting indicator |
+| E2E-2.7 | Exited state shows ended status, composer offers new session | Inject snapshot with `status: 'exited'`, completed turns. Assert "Session ended" status. Assert composer area shows "Session ended — create a new one" or equivalent end-state message. Assert all transcript items still scrollable and readable. | Exited state |
+| E2E-2.8 | Lost session error with retry | Emit WS `freshAgent.error` with `code: 'FRESH_AGENT_LOST_SESSION'`, `retryable: true`. Assert error banner visible. Assert compose area disabled. Click Retry — assert attach WS message sent. | Lost session error |
+| E2E-2.9 | Runtime unavailable error with retry | Emit WS `freshAgent.error` with `code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE'`. Assert "runtime unavailable" message. Assert retry restarts connection. | Runtime unavailable |
+
+#### E2E-3: Composer — Text, Images, Interrupt, Keyboard (9 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-3.1 | Text compose and send dispatches correct WS message | Inject idle snapshot. Find composer textbox by accessible label. Type "Build a React component". Click "Send" button. Assert WS message captured by harness contains `type: 'freshAgent.send'`, `sessionType: 'freshcodex'`, `provider: 'codex'`, `text: 'Build a React component'`. Assert composer is empty after send. | Before send (text in composer); after (empty) |
+| E2E-3.2 | Send carries runtime settings from pane content | Create pane with `model: 'gpt-4o-mini'`, `effort: 'minimal'`. Type "hi" and send. Assert WS message has `runtimeSettings: { model: 'gpt-4o-mini', effort: 'minimal' }`. | — |
+| E2E-3.3 | Image attachment via URL input | Click "Attach image" (accessible button). Enter URL `https://example.test/screenshot.png`. Assert image preview thumbnail visible in composer. Assert media type inferred as `image/png`. Type "Review this" and send. Assert WS message `images: [{ kind: 'url', url: 'https://example.test/screenshot.png', mediaType: 'image/png' }]`. | Image preview in composer |
+| E2E-3.4 | Image attachment via file upload converts to data URI | Use `page.setInputFiles` on file input to upload a 1x1 PNG. Assert image preview rendered. Assert WS message `images: [{ kind: 'data', mediaType: 'image/png', data: <base64> }]`. | Uploaded image preview |
+| E2E-3.5 | Remove attached image before send | Attach image via URL. Assert preview shown. Click remove/delete button on preview. Assert preview gone. Assert "Send" button now disabled (no text either). Type text without image. Send. Assert NO `images` in WS message. | Before/after remove |
+| E2E-3.6 | Send button disabled when empty, enabled with text or image | Assert Send button is `disabled` when composer empty. Type text — assert enabled. Clear text — assert disabled. Attach image (no text) — assert enabled. Remove image — assert disabled again. | Disabled/enabled states |
+| E2E-3.7 | Interrupt active turn dispatches interrupt WS message | Inject snapshot with `status: 'running'`, `capabilities.interrupt: true`. Assert "Interrupt" button visible (replaces Send button). Click Interrupt. Assert WS `freshAgent.interrupt` sent with `sessionType: 'freshcodex'`. Assert button shows spinner while awaiting response. | Interrupt button active |
+| E2E-3.8 | Enter sends, Shift+Enter inserts newline | Focus composer. Type "line1", press Shift+Enter, type "line2". Assert composer shows two lines. Press Enter. Assert WS send dispatched with multiline text. | Newline in composer |
+| E2E-3.9 | Composer disabled during create/attach | Inject `status: 'creating'` — assert composer input is disabled. Inject `freshAgent.created` with `status: 'idle'` — assert composer enables. | Disabled→enabled |
+
+#### E2E-4: Transcript — All Item Kinds, Paging, Virtualization (19 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-4.1 | All item kinds render with correct semantic labels | Seed snapshot with one body turn containing all 17 normalized item kinds. Assert each renders: message with role, command with output, file_change with path, reasoning with summary, plan, review, web_search, hook_prompt, image, image_generation, collaboration, context_compaction, dynamic_tool, request_prompt, error, tool. Screenshot full transcript. | Full transcript with all items |
+| E2E-4.2 | User message multi-part: text + image + mention + skill | Inject message with content parts: text "Use this", image URL, mention "README.md" at "/repo/README.md", skill "reviewer" at "/repo/.codex/skills/reviewer/SKILL.md". Assert text, image, mention chip with path, skill chip with path all rendered. | Multi-part user message |
+| E2E-4.3 | Agent message markdown rendering | Inject agent message with markdown: headers, code blocks, bold, lists. Assert rendered with proper formatting (code blocks monospace, bold text bold). | Formatted agent response |
+| E2E-4.4 | Command item: all 5 status variants | Inject command items in each status: pending (spinner), running (spinner + partial output), completed (checkmark + output + exitCode 0), failed (X + output + exitCode 1), declined (declined badge). Assert each shows correct status badge and content. | Command status variants |
+| E2E-4.5 | File change with expandable diff | Inject file_change with changes: `{ path: 'src/app.ts', diff: '@@ -1 +1 @@ ...' }`. Assert path visible. Assert diff collapsed by default. Click "View diff" toggle — assert diff content rendered. Click again — assert collapsed. | Collapsed/expanded diff |
+| E2E-4.6 | Reasoning: collapsed by default, expand to reveal full text | Inject reasoning with `summary: ['Let me think...']`, `text: 'Detailed reasoning...'`. Assert summary visible, not full text. Click expand — assert full text visible. Click collapse — assert hidden. | Collapsed/expanded reasoning |
+| E2E-4.7 | Context compaction shows token deltas | Inject `context_compaction` with `beforeTokens: 50000`, `afterTokens: 20000`. Assert "Compacted context" badge with token reduction visible. | Compaction item |
+| E2E-4.8 | Review entered/exited items | Inject review items for `entered` and `exited` phases. Assert "Entered review mode" and "Exited review mode" badges. | Review transitions |
+| E2E-4.9 | Error item renders message and code | Inject error item with `message: 'Connection lost'`, `code: 'TIMEOUT'`. Assert error message and code badge visible. | Error transcript item |
+| E2E-4.10 | Request prompt item — pending shows prompt, no action in transcript | Inject `request_prompt` with `requestKind: 'approval'`, `status: 'pending'`. Assert prompt text, pending badge. Assert action is in banner (not card). | Pending request in transcript |
+| E2E-4.11 | Request prompt item — resolved shows no actions | Same item with `status: 'resolved'`. Assert "Resolved" badge. Assert no action buttons. | Resolved request |
+| E2E-4.12 | Turn page: load more turns via cursor pagination | Mock API to return page with `nextCursor: 'c2'`. Seed 3 turn summaries. Assert 3 rows visible. Click "Load more" or scroll to bottom. Assert API called with `cursor: 'c2'`. Assert 6 rows after load. | Before/after page load |
+| E2E-4.13 | Virtualized list: 1000 turns but only visible rows in DOM | Seed 1000 turn summaries. Render at 600px container. Query DOM for turn rows — assert <25 rendered. Scroll to middle — assert only visible rows in DOM. Assert `aria-setsize: 1000` on list. | Virtualized scroll position |
+| E2E-4.14 | Body hydration from page-provided items (no separate request) | Seed page where turn-2 has `body` popuplated. Assert turn-2 items render directly. Turn-1 has no body — assert "Load body" button. Click it — assert API `getFreshAgentTurnBody` called. Assert body renders. | Page body; loaded body |
+| E2E-4.15 | Stale revision error during body load | Mock body API rejects with `{ code: 'FRESH_AGENT_STALE_THREAD_REVISION' }`. Click "Load body" on turn-1. Assert "session changed" error toast/message. Assert snapshot refresh triggered. | Stale revision error |
+| E2E-4.16 | Dynamic tool item — declined with reason | Inject `dynamic_tool` with `status: 'declined'`, `name: 'unsupported-tool'`, `reason: 'Not supported'`. Assert decline reason visible. | Declined dynamic tool |
+| E2E-4.17 | Collaboration item shows cross-thread metadata | Inject `collaboration` with `tool: 'code-reviewer'`, `senderThreadId: 't1'`, `receiverThreadId: 't2'`, `newThreadId: 't3'`. Assert thread IDs and tool name visible. | Collaboration item |
+| E2E-4.18 | Image generation item shows result | Inject `image_generation` with `prompt: 'diagram'`, `status: 'completed'`, `imageUrl: 'https://example.test/gen.png'`. Assert generated image renders. | Generated image |
+| E2E-4.19 | Web search item shows query | Inject `web_search` with `query: 'React hooks'`, `status: 'completed'`. Assert query and status visible. | Web search result |
+
+#### E2E-5: Workspace Panel — Worktrees, Child Threads, Diffs, Review, Fork, Tokens (11 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-5.1 | Panel toggle: open sidebar button, click panel content | Click workspace panel toggle (icon in shell header). Assert panel slides open. Assert panel has accessible `region` role with label. Click overlay or toggle again — assert panel closes. | Panel open; closed |
+| E2E-5.2 | Worktree list rendered from snapshot | Inject snapshot with `worktrees: [{ name: 'feature/freshcodex', path: '/repo', branch: 'feature/freshcodex' }]`. Open panel. Assert worktree section with branch name and path. | Worktree section |
+| E2E-5.3 | Child threads section with clickable entries | Inject `childThreads: [{ threadId: 'thread-child-1', title: 'Review shell', source: 'review' }]`. Assert child thread entry with title and source badge. Click — assert navigates to that pane if in layout. | Child thread entry |
+| E2E-5.4 | Fork lineage shows parent thread | Inject extensions codex fork: `{ parentThreadId: 'thread-parent-1' }`. Open panel. Assert fork lineage section shows "Forked from" with parent thread ID. | Fork lineage |
+| E2E-5.5 | Diff list shows file paths with change kind badges | Inject `diffs: [{ path: 'src/app.ts', changeKind: 'modify', summary: 'Updated logic' }]`. Assert diff entry with file path and "modified" badge. | Diff list |
+| E2E-5.6 | Review status section with output | Inject review metadata with status "complete" and output text. Assert review section shows status and output rendered. | Review output |
+| E2E-5.7 | Start review button: enabled dispatches WS | Inject `capabilities.review: true`, `status: 'idle'`. Click "Start review" in panel. Assert WS `freshAgent.review.start` with `target: { type: 'uncommittedChanges' }`, `delivery: 'inline'`. Assert button shows loading. | Review start → loading |
+| E2E-5.8 | Start review button: disabled with reason label | Inject `capabilities.review: false`. Assert "Start review" button disabled. Assert tooltip/label "Review not supported by this provider." | Disabled review |
+| E2E-5.9 | Token usage display | Inject `tokenUsage: { inputTokens: 5000, outputTokens: 1200, totalTokens: 6200, contextTokens: 45000, compactPercent: 30 }`. Assert token counts in panel with labels. | Token section |
+| E2E-5.10 | Fork action: button → WS → new pane | Inject `capabilities.fork: true`. Click "Fork session" in panel. Assert WS `freshAgent.fork` sent. Simulate WS response `freshAgent.forked` with `sessionId: 'thread-fork-1'`, `parentThreadId: 'thread-1'`. Assert new sibling pane appears with `sessionId: 'thread-fork-1'`. Screenshot layout with two panes. | Fork → sibling pane |
+| E2E-5.11 | Panel collapses to compact sidebar on narrow viewport | Resize pane to 350px wide. Assert panel collapses to icon-only buttons (worktree, diff, child, fork, review icons). Resize to 800px. Assert full panel returns. | Compact sidebar; full panel |
+
+#### E2E-6: Approval Banners — All Request Types (6 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-6.1 | Command approval: accept/decline/acceptForSession | Inject `pendingApprovals: [{ requestId: 'cmd-1', kind: 'command_approval', title: 'Run: npm test', command: 'npm test' }]`. Assert banner with command text. Click "Accept" — assert WS response `kind: 'command_approval'`, `decision: 'accept'`. Banner dismissed. | Banner; after accept |
+| E2E-6.2 | File change approval: three decision options | Inject file_change_approval with file path. Assert "Accept", "Accept for session", "Decline" buttons. Test each dispatches correct WS response. | File change approval |
+| E2E-6.3 | Permissions approval: turn vs session scope | Inject permission approval banner. Click "Grant for turn" — assert WS `scope: 'turn'`. Repeat with "Grant for session" — assert `scope: 'session'`. Assert `strictAutoReview` toggle if present. | Permissions with scope |
+| E2E-6.4 | Multiple stacked banners render in order | Inject 2 pending approvals. Assert both rendered in order. Resolve first — assert first removed, second remains. | Stacked banners |
+| E2E-6.5 | Banner dismisses on snapshot refresh | Inject pending approval. Assert banner visible. Refresh snapshot via WS event with empty `pendingApprovals`. Assert banner removed. | Banner dismissed |
+| E2E-6.6 | Banner handles cancel response | Inject approval. Click "Cancel" — assert WS response `decision: 'cancel'`. Assert banner dismissed. | Cancel action |
+
+#### E2E-7: Question Banners — User Input and MCP Elicitation (5 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-7.1 | Tool user input: select option, submit with array answers | Inject `pendingQuestions: [{ requestId: 'ui-1', kind: 'tool_user_input', title: 'Choose', prompt: 'Select:', fields: [{ name: 'choice', options: ['a', 'b', 'c'], multi: true }] }]`. Select 'a' and 'b'. Click Submit. Assert WS response `kind: 'tool_user_input'`, `answers: { choice: { answers: ['a', 'b'] } }`. | Question with selection |
+| E2E-7.2 | Tool user input: multiple fields | Inject question with fields `name` (text input) and `description` (text area). Fill both. Assert response has answers for both keys. | Multi-field question |
+| E2E-7.3 | MCP elicitation: accept with content | Inject `kind: 'mcp_elicitation'`, `title: 'Confirm', prompt: 'Approve?'`. Click "Accept". Assert WS `kind: 'mcp_elicitation'`, `action: 'accept'`, `content: expect.any(Object)`, `_meta: null`. | MCP accept |
+| E2E-7.4 | MCP elicitation: decline | Click "Decline". Assert WS `action: 'decline'`. Assert banner dismissed. | Decline |
+| E2E-7.5 | Banners have accessible labels and keyboard operable | Tab through all interactive elements in question banner. Assert each field/button receives focus with visible ring. Assert each action button has `aria-label`. | Keyboard focus |
+
+#### E2E-8: Fork, Review, and Cross-Pane Lifecycle via Orchestration (6 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-8.1 | Full fork flow: source pane → sibling pane appears | Seed Freshcodex pane with `sessionId: 'thread-1'`, `capabilities.fork: true`. Open workspace panel, click Fork. Assert WS `freshAgent.fork` sent. Inject WS `freshAgent.forked` with `sessionId: 'thread-fork-1'`, `parentThreadId: 'thread-1'`. Assert new sibling pane in layout. Assert new pane `sessionId: 'thread-fork-1'`, `sessionType: 'freshcodex'`. Inspect Redux for correct pane tree. Screenshot layout. | Layout with two Freshcodex panes |
+| E2E-8.2 | Forked pane loads independent snapshot | After fork, inject `freshAgent.created` + `freshAgentSnapshotReceived` for forked pane with different turn content than parent. Assert forked pane shows its own turns, not parent's. Assert forked workspace panel shows `parentThreadId` in fork lineage. | Forked pane with own content |
+| E2E-8.3 | Review flow: start → started → panel shows results | Inject `capabilities.review: true`. Click "Start review". Assert WS sent. Inject `freshAgent.review.started`. Assert "Review started" indicator. Inject snapshot update with review items in transcript. Assert workspace panel shows review output. | Review started; results in panel |
+| E2E-8.4 | Review with commit target | Select commit SHA target in review options (if UI exposes it). Assert WS includes `target: { type: 'commit', sha: ... }`. | Custom review target |
+| E2E-8.5 | Fork via orchestration MCP API | POST `/api/orchestrate { action: 'fork', params: { target: 'thread-1' } }`. Assert new pane created. Assert `freshAgent.forked` emitted. | MCP-orchestrated fork |
+| E2E-8.6 | Send input via orchestration MCP | POST `/api/orchestrate { action: 'send-keys', params: { target: 'thread-1', keys: 'Implement login', literal: true } }`. Assert text appears in composer and send is dispatched. | Orchestration input |
+
+#### E2E-9: Mobile Viewport — Keyboard, Touch, Layout (5 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-9.1 | Composer sticky above keyboard | Set iPhone 14 viewport (390x844). Inject idle snapshot. Simulate software keyboard via CSS variable `--keyboard-inset-bottom: 300px`. Assert composer is sticky at viewport bottom, not hidden behind keyboard. Assert `enterkeyhint='send'`. | Mobile with keyboard |
+| E2E-9.2 | Transcript scrollable with keyboard open | Seed 10 items. Simulate keyboard open. Assert transcript container adjusts height. Assert last item scrollable into view. | Mobile transcript with keyboard |
+| E2E-9.3 | Approval buttons meet 44px minimum touch target | Inject approval at mobile viewport. Measure button heights — assert ≥44px or equivalent padding. Assert accessible labels on all buttons. | Mobile approval buttons |
+| E2E-9.4 | Workspace panel as bottom sheet on mobile | Open workspace panel on mobile. Assert it appears as bottom sheet (not side panel). Assert swipe-down handle or close button. | Mobile bottom sheet |
+| E2E-9.5 | PanePicker full-width on mobile | Open PanePicker on mobile viewport. Assert near-full width. Assert scrollable if many entries. | Mobile picker |
+
+#### E2E-10: Multi-Client and Reconnect Resilience (4 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-10.1 | Two clients subscribed to same thread both refresh on notification | Open two browser contexts connected to same TestServer. Both create panes for same thread. Inject `turn/completed` notification via server WS. Assert both clients receive snapshot invalidation and refresh. Assert both show updated content. | Two clients side-by-side |
+| E2E-10.2 | Reconnect after WS drop preserves state, sends attach not create | Seed pane with `sessionId: 'thread-1'`. Force-disconnect WS via `harness.forceDisconnect()`. Wait for reconnect. Assert pane sends `freshAgent.attach` with existing `sessionId`, NOT `freshAgent.create`. Assert snapshot reloads. Assert turn history still visible. | After reconnect |
+| E2E-10.3 | Notification burst debounces to single refresh | Inject 5 `turn/started` notifications in rapid succession (<100ms). Poll harness for sent REST requests — assert only 1 snapshot fetch. Assert final state reflects latest notification. | Debounced refresh |
+| E2E-10.4 | Server restart recovery: error state → retry → reloaded | Stop TestServer. Assert all panes show disconnected/error. Restart server. Click Retry on Freshcodex pane. Assert pane reattaches and reloads snapshot with same turns. | Before/after recovery |
+
+#### E2E-11: Settings — Model, Effort, Sandbox, Capabilities (6 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-11.1 | Settings dialog shows Codex model list from mocked app-server | Mock `/api/fresh-agent/models/codex` with model list. Open Settings → Freshcodex section. Assert model dropdown populated with model names. Assert currently selected model highlighted. | Settings dialog |
+| E2E-11.2 | Effort dropdown shows only Codex values (no 'max') | Open effort dropdown. Assert options: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`. Assert `max` NOT present. Assert current selection matches persisted value. | Effort dropdown |
+| E2E-11.3 | Sandbox selector: read-only, workspace-write, danger-full-access | Cycle through sandbox options. Assert each value reflected in Redux after save. Reload page — assert sandbox persisted. | Sandbox selector |
+| E2E-11.4 | Freshcodex settings independent from Claude settings | Open Freshcodex settings, set model to "gpt-4o-mini". Switch to Freshclaude settings — assert different model visible. Switch back — assert Freshcodex values preserved. | Independent settings |
+| E2E-11.5 | Unavailable saved model shows "(Unavailable)" | Mock capabilities where saved model is absent. Assert "(Unavailable)" label next to model. Assert info text about fallback. | Unavailable model |
+| E2E-11.6 | Settings on mobile as bottom sheet | Open settings on iPhone 14 viewport. Assert full-height bottom sheet. Assert scrollable. Assert Save/Cancel sticky at bottom. | Mobile settings sheet |
+
+#### E2E-12: Session Persistence and Restore (4 tests)
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-12.1 | Full settings survive page reload | Create full Freshcodex pane: `model: 'gpt-4o-mini'`, `sandbox: 'workspace-write'`, `permissionMode: 'on-request'`, `effort: 'low'`, `initialCwd: '/repo'`. Reload page. Assert pane restored with ALL fields intact. Assert attach WS sent with `cwd` and `runtimeSettings`. | After reload |
+| E2E-12.2 | Legacy pane with Claude-only values shows controlled createError, not dropped | Pre-populate localStorage with a pane having `permissionMode: 'bypassPermissions'`, `effort: 'max'`. Load page. Assert pane renders (not dropped). Assert createError banner with `FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING`. Assert pane header still shows "Freshcodex". | Legacy pane error |
+| E2E-12.3 | Granular approval policy survives persistence round-trip | Set `permissionMode: { granular: { sandbox_approval: true, rules: false, skill_approval: true, request_permissions: true, mcp_elicitations: false } }`. Reload. Assert full object preserved (not cast to string, not narrowed to enum). | Granular policy preserved |
+| E2E-12.4 | Tab snapshot captures Freshcodex metadata for remote sessions | Create Freshcodex pane with settings. Trigger tab snapshot via Redux (`collectPaneSnapshots`). Assert snapshot payload includes `sandbox`, `permissionMode`, `effort`, `sessionType`, `provider`. Assert effort is `'xhigh'` not `'max'` if xhigh was set. | Tab snapshot content |
+
+#### E2E-13: Real Codex Runtime Integration — Cost-Controlled (10 tests)
+
+These tests connect to a real `codex` app-server via the rich stdio runtime. Each uses `model: 'gpt-4o-mini'` with `effort: 'none'` or `'minimal'` except E2E-13.6 which toggles effort to `'high'` once. All cost ~$0.01-0.05 per turn. Skip gracefully (`test.skip(!codexAvailable)`) in CI without Codex.
+
+| # | Name | What It Drives | Screenshot States |
+|---|------|----------------|-------------------|
+| E2E-13.1 | Real: create pane → real thread created, snapshot loads | Create Freshcodex pane with `model: 'gpt-4o-mini'`, `effort: 'minimal'`. Wait for `freshAgent.created` + snapshot load. Assert snapshot `status: 'idle'`. Assert `threadId` is a real UUID. Assert pane header shows "Freshcodex". Screenshot the connected pane. | Real connected pane |
+| E2E-13.2 | Real: send message → turn runs → items appear → idle again | Type "Say hello in exactly one short sentence." Send. Assert composer disabled, status → "Running". Wait for turn items: user message and agent message. Assert agent message content visible. Wait for status → "idle". Assert composer re-enabled. Screenshot the completed turn. | Real turn complete |
+| E2E-13.3 | Real: interrupt mid-execution | Send: "List recursively all files in the current directory and describe each one." Wait for turn to start (status → "Running"). Click Interrupt. Assert WS `freshAgent.interrupt` sent. Wait for status → "idle" with turn showing interrupted status. Assert last turn has items from before interrupt. | Interrupted turn |
+| E2E-13.4 | Real: fork creates new pane with real forked thread | After E2E-13.2 turn completes, click Fork. Wait for `freshAgent.forked`. Assert new sibling pane appears with new thread ID. Assert forked pane loads independently. Assert workspace panel shows `parentThreadId`. | Forked panes |
+| E2E-13.5 | Real: send with image input | Attach a small test PNG. Type "Describe this image very briefly." Send. Wait for turn. Assert user message content includes image part. Assert agent responds. | Image input turn complete |
+| E2E-13.6 | Real: effort toggle low → high → low | Create pane with `effort: 'minimal'`, `model: 'gpt-4o-mini'`. Send "What is 2+2?" — completes with minimal effort. Change settings to `effort: 'high'`. Send "What is 3+3?" — completes with high effort (verify via metadata). Change back to `effort: 'minimal'`. Send "What is 4+4?" — back to minimal. Screenshot each state. | Effort toggle: low, high, low |
+| E2E-13.7 | Real: approval flow — command approval banner and respond | Set `permissionMode: 'on-request'`. Send "Run: ls -la" or a command that triggers approval. Wait for `pendingApprovals` in snapshot. Assert command approval banner with command text. Click "Accept". Assert command executes and output appears in turn. | Approval banner → executed |
+| E2E-13.8 | Real: runtime unavailable → restart → recovery | Kill the Codex app-server child process. Assert pane shows `FRESH_AGENT_RUNTIME_UNAVAILABLE` error. Restart app-server (or click Retry). Assert pane reconnects, attaches to same thread, reloads snapshot with prior turns visible. | Error → recovered |
+| E2E-13.9 | Real: token usage updates after turn | After E2E-13.2 completes, check snapshot or WS for `tokenUsage` update with non-zero tokens. Assert `totalTokens > 0`. Assert workspace panel shows token counts. | Token counts |
+| E2E-13.10 | Real: model list fetches from live app-server | Open settings. Fetch model list from real app-server. Assert list includes entries with `id`, `displayName`, `defaultReasoningEffort`. Screenshot settings with real models. | Real model list |
+
+---
+
 ### Priority 1 — Existing red checks that must go green
 
 The current suite has no known CI-blocking red tests in this worktree, but the following characterization checks must be verified green after Task 1 (main merge) before proceeding.
@@ -248,38 +423,52 @@ These tests cover behavior gaps where the existing suite does not test the right
 
 ### Covered areas
 
-| Area | Test count | Priority |
-|------|-----------|----------|
-| Shared contract schemas | 8 tests (8-15) | P3 |
-| Provider registry & session routing | 8 tests (16-23) | P3 |
-| Codex app-server protocol | 13 tests (24-36) | P3 |
-| Codex normalization & adapter | 22 tests (37-58) | P3 |
-| Controller, shell, composer | 8 tests (59-66) | P3 |
-| Differential/reference | 2 tests (67-68) | P4 |
-| Invariants | 3 tests (69-71) | P5 |
-| Boundary & edge cases | 9 tests (72-80) | P6 |
-| Regression (Claude, Kilroy, raw terminal) | 5 tests (81-85) | P7 |
-| Unit (pure algorithms) | 7 tests (86-92) | P8 |
-| Transcript paging & virtualization | 4 tests (93-96) | P3 |
-| Item rendering & workspace UX | 4 tests (97-100) | P3 |
-| Mobile keyboard & touch | 3 tests (101-103) | P3 |
-| Session identity & settings | 9 tests (104-112) | P3 |
-| Reconnect & error handling | 5 tests (113-117) | P3 |
+| Area | Test count | Priority | Harness |
+|------|-----------|----------|---------|
+| **E2E Browser: Picker & lifecycle** | 13 tests (E2E-1) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Shell states** | 9 tests (E2E-2) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Composer I/O** | 9 tests (E2E-3) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Transcript items** | 19 tests (E2E-4) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Workspace panel** | 11 tests (E2E-5) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Approval banners** | 6 tests (E2E-6) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Question banners** | 5 tests (E2E-7) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Fork/review flow** | 6 tests (E2E-8) | **P0** | Playwright E2E + orchestration |
+| **E2E Browser: Mobile viewport** | 5 tests (E2E-9) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Multi-client/reconnect** | 4 tests (E2E-10) | **P0** | Playwright E2E |
+| **E2E Browser: Settings** | 6 tests (E2E-11) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Persistence** | 4 tests (E2E-12) | **P0** | Playwright E2E + screenshots |
+| **E2E Browser: Real Codex runtime** | 10 tests (E2E-13) | **P0** | Playwright E2E + real Codex |
+| Existing regression (merge gate) | 3 tests (1-3) | P1 | Vitest unit |
+| Existing integration/scenario | 4 tests (4-7) | P2 | Vitest unit + Playwright |
+| Shared contract schemas | 8 tests (8-15) | P3 | Vitest unit |
+| Provider registry & routing | 8 tests (16-23) | P3 | Vitest unit |
+| Codex app-server protocol | 13 tests (24-36) | P3 | Vitest unit |
+| Codex normalization & adapter | 22 tests (37-58) | P3 | Vitest unit |
+| Controller, shell, composer | 8 tests (59-66) | P3 | Vitest unit |
+| Differential/reference | 2 tests (67-68) | P4 | Vitest unit |
+| Invariants | 3 tests (69-71) | P5 | Vitest unit |
+| Boundary & edge cases | 9 tests (72-80) | P6 | Vitest unit |
+| Regression | 5 tests (81-85) | P7 | Vitest unit |
+| Unit (pure algorithms) | 7 tests (86-92) | P8 | Vitest unit |
+| Transcript paging & virtualization | 4 tests (93-96) | P3 | Vitest unit |
+| Item rendering & workspace UX | 4 tests (97-100) | P3 | Vitest unit |
+| Mobile keyboard & touch | 3 tests (101-103) | P3 | Vitest unit |
+| Session identity & settings | 9 tests (104-112) | P3 | Vitest unit |
+| Reconnect & error handling | 5 tests (113-117) | P3 | Vitest unit |
 
-All user-visible surfaces covered: pane picker creation, compose/send, interrupt, fork, approve, answer, review, diff inspection, worktree/child-thread workspace, transcript paging, mobile touch, browser persistence, reconnect, error recovery.
+**Total: 107 new E2E browser tests (P0) + 117 unit/integration tests (P1-P8) = 224 tests**
+
+Every visual state is driven through a real browser: picker entry, all 6 shell lifecycle states, compose/send with text + images + settings, all 17 transcript item kinds, workspace panel with worktrees/child threads/diffs/review/fork/tokens, all approval and question banner types, fork→sibling pane lifecycle, review start→results flow, mobile viewport with keyboard/sheet/touch, multi-client and reconnect resilience, settings dialog with real model lists, persistence and restore including legacy migration, and real Codex runtime end-to-end with a cheap model.
 
 ### Explicitly excluded per agreed strategy
 
-1. **Visual diff/pixel perfection** — The plan defers to semantic DOM assertions (text content, accessibility labels, expand/collapse state) rather than screenshot comparison for diff rendering. Screenshot comparison is used only in Playwright E2E specs where visual layout matters.
-2. **Performance benchmarking** — Not in scope; the plan calls for `react-window` virtualization with a simple "does not render every row" assertion. No throughput/latency benchmarks.
-3. **Codex app-server real instance integration tests** — The plan explicitly avoids external `codex` CLI dependency in normal test runs by checking in generated schema snapshots.
-4. **Freshopencode** — Remains disabled and unimplemented. No tests written for it.
-5. **Claude raw terminal scrape path** — The existing raw terminal paths are not affected; only the Freshclaude adapter normalization path is tested.
-6. **Differential testing against a live Codex app-server** — The checked-in schema snapshot serves as the reference; no live differential tests against a running Codex app-server process.
-7. **Electron-specific behavior** — Out of scope for this plan; electron tests are separate.
+1. **Performance benchmarking** — Not in scope beyond the virtualization "does not render every row" assertion.
+2. **Freshopencode** — Remains disabled and unimplemented. No tests written for it.
+3. **Claude raw terminal scrape path** — The existing raw terminal paths are separate.
+4. **Electron-specific behavior** — Separate test suite.
 
 ### Risks carried by exclusions
 
 - **Schema snapshot staleness**: If Codex releases a breaking CLI update (0.129.0+), the checked-in snapshot must be regenerated via `scripts/audit-codex-app-server-schema.ts`. The audit script fails when local schema diverges, so this is a controlled (not silent) risk.
-- **No live Codex app-server integration**: The rich stdio runtime is tested against fake child-process transports. Real stdin/stdout edge cases (partial line reads, process crash timings) may surface in manual use before automated coverage catches them.
-- **No performance benchmarks**: The virtualized list test only verifies DOM node count, not scroll performance under load or memory profile over long sessions.
+- **Real Codex runtime E2E tests depend on Codex CLI availability**: E2E-13 tests require a working `codex` CLI on the test machine. CI environments without `codex` installed skip these tests gracefully using `test.skip(!codexAvailable)`. This is controlled: the gate runs these locally and in CI with Codex available.
+- **Real E2E test cost**: E2E-13 tests make real Codex API calls. With `gpt-4o-mini` and `effort: minimal`, each turn costs approximately $0.01-$0.05. The full E2E-13 suite of ~10 tests costs approximately $0.50-$2.00 per full run.
