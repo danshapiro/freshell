@@ -66,7 +66,9 @@ Schema-grounded protocol facts to preserve:
 - Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. Do not send the thread-level `sandbox` string to `turn/start`.
 - `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
 - `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
-- `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, `startedAt`, `completedAt`, and `durationMs`.
+- `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
+- `thread/loaded/list` returns `{ data: string[], nextCursor }`, not thread summaries. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
+- `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
@@ -89,7 +91,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Freshcodex honors Codex runtime settings at create and turn time, including model, sandbox, permission/approval policy, and effort where supported by the generated local app-server schema.
 - Freshcodex model and provider capability choices come from Codex app-server `model/list` and `modelProvider/capabilities/read` when the app-server is available. The UI may cache the result, but it must not hard-code model or capability assumptions into the shared shell.
 - Freshcodex can send text and image inputs, interrupt an active turn, fork a thread into a new freshcodex pane, answer Codex command/file/permission approval requests, answer request-user-input prompts, answer MCP elicitations, and reject unsupported dynamic tool calls with a clear response that unblocks the turn.
-- Freshcodex can start a Codex review through `review/start` and then render review status/output through the shared workspace panel.
+- Freshcodex can start a Codex review through `review/start` for uncommitted changes by default, preserve the schema `target`, `delivery`, and returned `reviewThreadId`, and then render review status/output through the shared workspace panel.
 - Freshcodex receives Codex app-server notifications live. Turn started/completed, item started/completed, token usage, status, diff, review, compaction, child-agent/collaboration, and thread metadata notifications invalidate or patch the normalized read model and reach subscribed browsers as `freshAgent.event` without requiring a manual refresh.
 - Unsupported Codex capabilities are disabled with clear labels. Do not silently fall back to raw terminal mode.
 - The Freshcodex transcript renders normalized item cards for user messages, hook prompts, agent messages, plans, reasoning, command executions, file changes/diffs, MCP tool calls, collaboration calls, web searches, image views, image generations, review mode, context compaction, dynamic tool calls, errors, and tool/request prompts. Codex user-message content is preserved as multi-part message content, including mixed text and images; do not collapse a multi-part Codex `userMessage.content` array into a single text-only item.
@@ -624,6 +626,14 @@ export const FreshAgentTurnPageSchema = z.object({
   backwardsCursor: z.string().nullable().optional(),
 })
 
+export const FreshAgentTurnPageQuerySchema = z.object({
+  cursor: z.string().min(1).optional(),
+  priority: z.enum(['visible', 'background']).optional(),
+  revision: z.coerce.number().int().nonnegative(),
+  limit: z.number().int().positive().max(200).optional(),
+  sortDirection: z.enum(['asc', 'desc']).optional(),
+})
+
 export const FreshAgentCapabilitiesSchema = z.object({
   send: z.boolean(),
   interrupt: z.boolean(),
@@ -637,6 +647,13 @@ export const FreshAgentCapabilitiesSchema = z.object({
   turnPaging: z.boolean(),
   turnBodies: z.boolean(),
 })
+
+export const FreshAgentReviewTargetSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('uncommittedChanges') }),
+  z.object({ type: z.literal('baseBranch'), branch: NonEmptyString }),
+  z.object({ type: z.literal('commit'), sha: NonEmptyString, title: z.string().nullable().optional() }),
+  z.object({ type: z.literal('custom'), instructions: NonEmptyString }),
+])
 
 export const FreshAgentInputImageSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('url'), url: z.string().url(), mediaType: z.string().optional() }),
@@ -949,6 +966,7 @@ getFreshAgentTurnBody(sessionType, provider, threadId, turnId, revision): Promis
 ```
 
 The router should accept `sessionType` in the request path or query, validate it with `FreshAgentSessionTypeSchema`, and pass it to the runtime manager. Do not reconstruct `sessionType` from `provider`.
+The fresh-agent turn-page REST query should use `FreshAgentTurnPageQuerySchema` from `shared/fresh-agent-contract.ts`, not the legacy `AgentTimelinePageQuerySchema`, because Freshcodex needs `sortDirection` for newest-first pages and must not expose `includeBodies` as a Codex app-server parameter. The router may keep an `includeBodies` compatibility branch only for non-Codex providers that still need it, but Freshcodex requests should use `sortDirection` plus bounded `limit`, and the Codex adapter must not forward Freshell-only `revision`, `priority`, or `includeBodies` fields to `thread/turns/list`.
 
 Replace `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` with independent fresh-agent reducer, contract-shaped types, and thunk type prefixes. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
 
@@ -1122,10 +1140,10 @@ await expect(client.listThreads({ limit: 25 }))
   .resolves.toMatchObject({ data: expect.any(Array) })
 
 await expect(client.listLoadedThreads({}))
-  .resolves.toMatchObject({ data: expect.any(Array) })
+  .resolves.toMatchObject({ data: ['thread-1'], nextCursor: null })
 
 await expect(client.startReview({ threadId: 'thread-1', target: { type: 'uncommittedChanges' }, delivery: 'inline' }))
-  .resolves.toMatchObject({ turn: expect.any(Object) })
+  .resolves.toMatchObject({ turn: expect.any(Object), reviewThreadId: 'thread-1' })
 
 await expect(client.listModels({}))
   .resolves.toMatchObject({ data: expect.any(Array) })
@@ -1232,6 +1250,11 @@ export const CodexThreadTurnsListResultSchema = z.object({
   backwardsCursor: z.string().nullable().optional(),
 })
 
+export const CodexThreadLoadedListResultSchema = z.object({
+  data: z.array(z.string().min(1)),
+  nextCursor: z.string().nullable(),
+})
+
 export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string(), text_elements: z.array(z.unknown()).default([]) }),
   z.object({ type: z.literal('image'), url: z.string().url() }),
@@ -1305,8 +1328,8 @@ export const CodexTurnSchema = z.object({
   items: z.array(CodexThreadItemSchema),
   status: CodexTurnStatusSchema,
   error: z.unknown().nullable().optional(),
-  startedAt: z.string().nullable().optional(),
-  completedAt: z.string().nullable().optional(),
+  startedAt: z.number().nullable().optional(),
+  completedAt: z.number().nullable().optional(),
   durationMs: z.number().nullable().optional(),
 })
 export const CodexThreadSchema = z.object({
@@ -1668,6 +1691,9 @@ await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
 
 await expect(adapter.startReview?.('thread-1')).resolves.toMatchObject({
   turnId: expect.any(String),
+  reviewThreadId: 'thread-1',
+  target: { type: 'uncommittedChanges' },
+  delivery: 'inline',
 })
 expect(runtime.startReview).toHaveBeenCalledWith({
   threadId: 'thread-1',
@@ -1804,6 +1830,9 @@ Do not require or synthesize a turn-level role for Codex. `normalizeCodexTurnBod
 
 ```ts
 const items = rawTurn.items.flatMap((item) => normalizeCodexItem(item))
+const codexUnixSecondsToIso = (value: number | null | undefined) => (
+  typeof value === 'number' ? new Date(value * 1000).toISOString() : undefined
+)
 return FreshAgentTurnBodySchema.parse({
   sessionType: 'freshcodex',
   provider: 'codex',
@@ -1811,9 +1840,13 @@ return FreshAgentTurnBodySchema.parse({
   turnId: rawTurn.id,
   revision,
   source: 'durable',
+  startedAt: codexUnixSecondsToIso(rawTurn.startedAt),
+  completedAt: codexUnixSecondsToIso(rawTurn.completedAt),
   items,
 })
 ```
+
+The `startedAt` and `completedAt` conversion is required because the local Codex app-server schema emits Unix seconds, while the fresh-agent UI contract uses ISO strings. Tests should include non-null numeric timestamps and assert the ISO conversion so the raw Codex schema is not accidentally modeled as strings.
 
 In `adapter.ts`, track per-thread ephemeral live state:
 
@@ -1956,26 +1989,29 @@ Extend WS protocol with `freshAgent.forked`:
 
 Send it from `server/ws-handler.ts` after `freshAgent.fork`.
 
-Extend client-to-server WS protocol with `freshAgent.review.start` and route it through `FreshAgentRuntimeManager.startReview(sessionId)`:
+Extend client-to-server WS protocol with `freshAgent.review.start` and route it through `FreshAgentRuntimeManager.startReview(sessionId, { target, delivery })`:
 
 ```ts
 export const FreshAgentReviewStartSchema = z.object({
   type: z.literal('freshAgent.review.start'),
   sessionId: z.string().min(1),
+  target: FreshAgentReviewTargetSchema.default({ type: 'uncommittedChanges' }),
+  delivery: z.enum(['inline', 'detached']).default('inline'),
 })
 
 export type FreshAgentServerMessage =
+  | { type: 'freshAgent.review.started'; sessionId: string; turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }
   | { type: 'freshAgent.error'; sessionId?: string; requestId?: string; code: string; message: string; retryable?: boolean }
 ```
 
-On success, emit a `freshAgent.event` invalidation for the same session so the workspace panel refreshes review output; on failure, emit `freshAgent.error` with a typed code.
+On success, emit `freshAgent.review.started` with the returned `reviewThreadId`, then emit a `freshAgent.event` invalidation for the same session so the workspace panel refreshes review output. On failure, emit `freshAgent.error` with a typed code. Preserve `reviewThreadId` in the Codex extension or review metadata when the snapshot refresh observes review items; do not collapse detached and inline reviews into only the source thread id.
 
 Extend the fresh-agent adapter/runtime contract with implemented Codex methods that Task 4 classified as supported:
 
 ```ts
-startReview?(sessionId: string): Promise<{ turnId: string }>
+startReview?(sessionId: string, input?: { target?: FreshAgentReviewTarget; delivery?: 'inline' | 'detached' }): Promise<{ turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }>
 listThreads?(query: { limit?: number; cursor?: string }): Promise<FreshAgentSessionSummary[]>
-listLoadedThreads?(): Promise<FreshAgentSessionSummary[]>
+listLoadedThreadIds?(query?: { limit?: number; cursor?: string }): Promise<{ ids: string[]; nextCursor: string | null }>
 listModels?(): Promise<FreshAgentModelSummary[]>
 readModelProviderCapabilities?(): Promise<FreshAgentModelProviderCapabilities>
 ```
@@ -2174,7 +2210,7 @@ type FreshAgentShellProps = {
     send(text: string, images?: FreshAgentInputImage[], runtimeSettings?: FreshAgentRuntimeSettings): void
     interrupt(): void
     fork(): void
-    startReview(): void
+    startReview(target?: FreshAgentReviewTarget, delivery?: 'inline' | 'detached'): void
     retryCreate(): void
     answerQuestion(requestId: string, answers: Record<string, string>): void
     resolveApproval(requestId: string, decision: FreshAgentApprovalDecision): void
@@ -2890,7 +2926,7 @@ Rules:
 - Update `src/lib/session-type-utils.ts`, `src/store/tabsSlice.ts`, and `src/components/panes/PaneContainer.tsx` so Freshcodex creation and resume use Freshcodex settings from `freshAgent.providers.freshcodex` plus Codex CLI defaults from `codingCli.providers.codex`. Do not route Freshcodex through `getAgentChatProviderConfig()` or an `agentChatProviderSettings` parameter; those are Claude/Kilroy compatibility paths only.
 - Update `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, `src/store/paneTreeValidation.ts`, and pane persistence schemas/tests so Freshcodex `sandbox`, generated Codex effort values, and structured/generated approval policies are preserved in local and remote tab snapshots. Remote snapshots must not cast Freshcodex effort back to `'low' | 'medium' | 'high' | 'max'`, must not cast structured approval policy objects to strings, and must not omit `sandbox`.
 - Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
-- Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex threads, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented.
+- Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone.
 - Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
@@ -3191,7 +3227,7 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - Freshcodex renders without `agentChat` session state.
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
-- Freshcodex starts Codex review through `review/start`, lists/resumes rich Codex threads through `thread/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
+- Freshcodex starts Codex review through `review/start`, preserves `reviewThreadId`/target/delivery metadata, lists/resumes rich Codex threads through `thread/list`, exposes loaded thread ids according to `thread/loaded/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
 - Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
 - Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
