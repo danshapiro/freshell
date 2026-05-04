@@ -7,6 +7,7 @@ import path from 'path'
 import fs from 'fs'
 import { EventEmitter } from 'events'
 import { logger } from './logger.js'
+import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { ServerSettings } from '../shared/settings.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
@@ -1303,6 +1304,7 @@ export class TerminalRegistry extends EventEmitter {
           this.finalizeTerminalExit(record, e.exitCode, 'user_final_close')
           return
         }
+        this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
         void this.handleCodexWorkerFailure(
           record,
           generation,
@@ -1547,6 +1549,18 @@ export class TerminalRegistry extends EventEmitter {
         generation,
       }, 'Ignoring conflicting Codex durable session promotion')
       return
+    }
+
+    const alreadyObservedDurableSession = codex.durableSessionId === sessionId
+    if (!alreadyObservedDurableSession) {
+      recordSessionLifecycleEvent({
+        kind: 'codex_durable_session_observed',
+        provider: 'codex',
+        terminalId: record.terminalId,
+        sessionId,
+        generation,
+        source: 'sidecar',
+      })
     }
 
     codex.durableSessionId = sessionId
@@ -2125,9 +2139,34 @@ export class TerminalRegistry extends EventEmitter {
     record.clients.clear()
     record.suppressedOutputClients.clear()
     record.pendingSnapshotClients.clear()
+    this.recordTerminalExitWithoutDurableSession(record, finalExitCode, _reason)
     this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: finalExitCode })
     this.reapExitedTerminals()
+  }
+
+  private recordTerminalExitWithoutDurableSession(
+    record: TerminalRecord,
+    exitCode: number | undefined,
+    reason: 'pty_exit' | 'user_final_close',
+  ): void {
+    const hadDurableSession = Boolean(record.resumeSessionId || record.codex?.durableSessionId)
+    if (record.mode === 'shell' || hadDurableSession) {
+      return
+    }
+
+    const now = Date.now()
+    const ptyPid = record.pty.pid
+    recordSessionLifecycleEvent({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: record.terminalId,
+      mode: record.mode,
+      exitCode: exitCode ?? 0,
+      ageMs: Math.max(0, now - record.createdAt),
+      reason,
+      ...(ptyPid ? { ptyPid } : {}),
+      ...(record.codex?.recoveryState ? { codexRecoveryState: record.codex.recoveryState } : {}),
+    })
   }
 
   create(opts: {
@@ -3039,6 +3078,13 @@ export class TerminalRegistry extends EventEmitter {
       sessionId: normalized,
       reason,
     } satisfies TerminalSessionBoundEvent)
+    recordSessionLifecycleEvent({
+      kind: 'terminal_session_bound',
+      terminalId,
+      provider,
+      sessionId: normalized,
+      reason,
+    })
     return { ok: true, terminalId, sessionId: normalized }
   }
 
