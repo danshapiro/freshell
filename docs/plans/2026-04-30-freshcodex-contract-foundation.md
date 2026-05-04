@@ -79,6 +79,11 @@ Schema-grounded protocol facts to preserve:
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`; `activeFlags` is required on the active variant. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`. Generated TypeScript exposes `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, and `Turn.durationMs` as nullable properties, but generated JSON Schema does not require them; raw protocol schemas must accept omitted values and normalize them to `null`.
 - `Thread.source` uses generated `SessionSource`, not `ThreadSourceKind`. `ThreadSourceKind` is only the filter type for `thread/list`. `SessionSource` values include flat sources such as `"cli"`, `"vscode"`, `"exec"`, and `"appServer"`, but subagent source metadata is represented as `{ subAgent: ... }` with generated `SubAgentSource` variants such as `"review"`, `"compact"`, `{ thread_spawn: ... }`, `"memory_consolidation"`, and `{ other: string }`. Freshcodex protocol schemas, fixtures, history projection, and child-thread metadata must parse and preserve the generated `SessionSource` shape instead of flattening thread metadata to `subAgentReview`/`subAgentCompact` strings.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
+- `reasoning` items contain both `summary: string[]` and `content: string[]`. Fresh-agent reasoning items must preserve both arrays; a derived joined `text` may be added for convenience, but it must not replace the generated content list.
+- Generated item status leaf types use `"inProgress"` for active work, not `"running"`: `CommandExecutionStatus` and `PatchApplyStatus` are `"inProgress" | "completed" | "failed" | "declined"`, while `McpToolCallStatus`, `DynamicToolCallStatus`, and `CollabAgentToolCallStatus` are `"inProgress" | "completed" | "failed"`. Fresh-agent transcript contracts may keep the UI-facing `"running"` value, but Codex normalization must explicitly map every generated item-level `"inProgress"` to `"running"` and must test that mapping for command, file-change, MCP tool, dynamic tool, and collaboration items.
+- Generated file-change kinds are `{ type: "add" }`, `{ type: "delete" }`, and `{ type: "update", move_path: string | null }`. Fresh-agent file-change items must map `update` with `move_path: null` to `modify`, map `update` with a non-null `move_path` to `rename`, and preserve the generated `move_path` as `movePath` so diff/review UI can show moved or renamed files accurately.
+- `collabAgentToolCall` carries `senderThreadId`, `receiverThreadIds: string[]`, optional `model`, optional `reasoningEffort`, and `agentsStates` keyed by child thread id. Fresh-agent collaboration items must preserve the receiver id array and agent-state metadata under typed fields; do not collapse this to a singular `receiverThreadId` / `newThreadId`, because spawned or resumed child-agent calls can involve multiple receiver threads and the shared shell needs that metadata for child-thread UX.
+- `imageGeneration.status` is generated as an unconstrained string, not a fixed enum. Fresh-agent image-generation items must preserve the raw generated status string and may derive a separate UI bucket if useful; do not narrow the contract to only `pending` / `running` / `completed` / `failed`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`. The v2 request variants use `params.threadId` for routing, while the legacy root `applyPatchApproval` and `execCommandApproval` variants use `params.conversationId`; both fields identify the Codex thread and must route to the matching Freshcodex locator.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`. Legacy `applyPatchApproval` and `execCommandApproval` responses use root `ReviewDecision` values through `{ decision }`, including `"approved"`, `"approved_for_session"`, `"denied"`, `"timed_out"`, `"abort"`, and the generated amendment-object variants; do not answer those legacy requests with v2 `"accept"` / `"decline"` decisions.
 - Generated JSON Schema, not generated TypeScript formatting, is the wire-requiredness source for those legacy root requests. `ApplyPatchApprovalParams` requires `conversationId`, `callId`, and `fileChanges`; optional `reason` and `grantRoot` must normalize to `null` when omitted. `ExecCommandApprovalParams` requires `conversationId`, `callId`, `command`, `cwd`, and `parsedCmd`; optional `approvalId` and `reason` must normalize to `null` when omitted.
@@ -135,6 +140,11 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
 - A normalized turn is a lifecycle/container boundary, not a single message role. Codex `Turn` objects contain mixed user, assistant, tool, and system items, so role belongs on message transcript items and turn-level `role` must be optional/legacy-only. Do not invent a turn role to satisfy the contract.
 - A Codex app-server item may normalize to zero, one, or many fresh-agent transcript items. In particular, `userMessage.content` can contain multiple text/image/localImage parts. Codex item normalization must return an array and turn normalization must `flatMap` item output while preserving stable derived ids for split content parts.
+- Codex item-status normalization is a separate leaf mapping from thread/turn status normalization. Do not pass raw item status strings through to fresh-agent transcript item contracts: map generated `"inProgress"` to the shared UI `"running"` status and preserve generated terminal states (`"completed"`, `"failed"`, `"declined"`) where the shared item kind supports them.
+- Codex reasoning normalization must preserve both generated `summary` and `content` arrays. Do not collapse `content` into a lossy preview-only field.
+- Codex file-change normalization must preserve generated rename/move metadata. Do not flatten all `{ type: "update" }` changes to `modify`; a non-null `move_path` is a first-class diff/review detail that belongs in the shared contract.
+- Codex collaboration items must preserve all generated receiver thread ids and agent states. The normalized item can add convenience display labels, but the durable contract must keep `receiverThreadIds` as an array and must not replace it with a single `receiverThreadId`.
+- Codex image-generation normalization must preserve the generated raw `status: string`. If the UI wants a small visual state enum, derive it into a separate optional display field instead of rejecting unknown raw statuses at the contract boundary.
 - Codex `UserInput` content parts include text, image, localImage, skill, and mention. Freshcodex message content and renderers must preserve every generated part type; do not silently drop skill or mention references from existing threads.
 - Freshcodex runtime settings use Codex-shaped values at the app-server boundary. Shared UI/state may keep the historical field name `permissionMode`, but the value sent to Codex must parse as generated `AskForApproval`; `effort` must parse as generated `ReasoningEffort`; and turn-time sandbox overrides must be converted to generated `SandboxPolicy` with a clear error if the selected mode cannot be represented.
 - `FreshAgentRuntimeSettingsSchema` may remain a broad persisted/UI shape only because Freshclaude and Freshcodex share historical field names. Any executable action parser (`freshAgent.create`, `freshAgent.send`, `freshAgent.attach`, review/fork settings, and REST action bodies) must resolve the provider first, then validate settings with a provider-specific schema before the runtime manager or adapter receives the action. A Freshcodex action carrying Claude-only values such as `permissionMode: "bypassPermissions"` or `effort: "max"` must fail in WebSocket/controller parsing with `FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING`, not merely inside the Codex adapter after generic parsing has already accepted it.
@@ -481,6 +491,35 @@ expect(FreshAgentTranscriptItemSchema.parse({
   reason: 'Dynamic tool calls are not supported by Freshell yet.',
 })).toMatchObject({ kind: 'dynamic_tool', status: 'declined' })
 
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'reasoning-1',
+  kind: 'reasoning',
+  summary: ['Checked repository state'],
+  content: ['First reasoning paragraph', 'Second reasoning paragraph'],
+})).toMatchObject({
+  kind: 'reasoning',
+  summary: ['Checked repository state'],
+  content: ['First reasoning paragraph', 'Second reasoning paragraph'],
+})
+
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'collab-1',
+  kind: 'collaboration',
+  tool: 'spawnAgent',
+  status: 'running',
+  senderThreadId: 'thread-parent-1',
+  receiverThreadIds: ['thread-child-1', 'thread-child-2'],
+  model: 'configured-model',
+  reasoningEffort: 'high',
+  agentsStates: {
+    'thread-child-1': { status: 'running', message: 'Working' },
+    'thread-child-2': { status: 'completed', message: null },
+  },
+})).toMatchObject({
+  kind: 'collaboration',
+  receiverThreadIds: ['thread-child-1', 'thread-child-2'],
+})
+
 expect(FreshAgentQuestionRequestSchema.parse({
   requestId: 'server-request-1',
   kind: 'mcp_elicitation',
@@ -647,6 +686,7 @@ export const FreshAgentReasoningItemSchema = z.object({
   id: NonEmptyString,
   kind: z.literal('reasoning'),
   summary: z.array(z.string()).default([]),
+  content: z.array(z.string()).default([]),
   text: z.string().optional(),
 })
 
@@ -668,6 +708,7 @@ export const FreshAgentFileChangeItemSchema = z.object({
   changes: z.array(z.object({
     path: NonEmptyString,
     changeKind: z.enum(['add', 'modify', 'delete', 'rename', 'unknown']),
+    movePath: z.string().nullable().optional(),
     diff: z.string().optional(),
   })),
 })
@@ -694,8 +735,27 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({ id: NonEmptyString, kind: z.literal('web_search'), query: z.string(), status: z.enum(['pending', 'running', 'completed', 'failed']).optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('hook_prompt'), fragments: z.array(z.string()).default([]), text: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('image'), path: z.string().optional(), url: z.string().optional(), alt: z.string().optional() }),
-  z.object({ id: NonEmptyString, kind: z.literal('image_generation'), prompt: z.string().optional(), status: z.enum(['pending', 'running', 'completed', 'failed']).optional(), imageUrl: z.string().optional(), path: z.string().optional() }),
-  z.object({ id: NonEmptyString, kind: z.literal('collaboration'), tool: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed']), senderThreadId: z.string().optional(), receiverThreadId: z.string().optional(), newThreadId: z.string().optional(), prompt: z.string().optional() }),
+  z.object({
+    id: NonEmptyString,
+    kind: z.literal('image_generation'),
+    prompt: z.string().optional(),
+    status: z.string().optional(),
+    displayStatus: z.enum(['pending', 'running', 'completed', 'failed']).optional(),
+    imageUrl: z.string().optional(),
+    path: z.string().optional(),
+  }),
+  z.object({
+    id: NonEmptyString,
+    kind: z.literal('collaboration'),
+    tool: NonEmptyString,
+    status: z.enum(['pending', 'running', 'completed', 'failed']),
+    senderThreadId: z.string().optional(),
+    receiverThreadIds: z.array(z.string()).default([]),
+    prompt: z.string().nullable().optional(),
+    model: z.string().nullable().optional(),
+    reasoningEffort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).nullable().optional(),
+    agentsStates: z.record(z.string(), JsonValue).default({}),
+  }),
   z.object({ id: NonEmptyString, kind: z.literal('context_compaction'), status: z.enum(['pending', 'running', 'completed', 'failed', 'deprecated']), summary: z.string().optional(), beforeTokens: z.number().int().nonnegative().optional(), afterTokens: z.number().int().nonnegative().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('dynamic_tool'), name: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed', 'declined']), input: z.record(z.string(), JsonValue).optional(), result: JsonValue.optional(), reason: z.string().optional(), error: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('request_prompt'), requestId: FreshAgentServerRequestIdSchema, requestKind: z.enum(['approval', 'question', 'mcp_elicitation', 'dynamic_tool', 'auth_refresh']), title: z.string().optional(), prompt: z.string().optional(), status: z.enum(['pending', 'resolved', 'declined']) }),
@@ -1466,6 +1526,12 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadActiveFlag.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PatchApplyStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PatchChangeKind.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpToolCallStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CollabAgentToolCallStatus.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SessionSource.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartSource.ts`
@@ -1746,6 +1812,14 @@ expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localI
 expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
 expect(() => CodexThreadStatusSchema.parse({ type: 'active' })).toThrow(/activeFlags/i)
 expect(turnStatusValuesFromGeneratedSchema()).toEqual(['completed', 'interrupted', 'failed', 'inProgress'])
+expect(commandExecutionStatusValuesFromGeneratedSchema()).toEqual(['inProgress', 'completed', 'failed', 'declined'])
+expect(patchApplyStatusValuesFromGeneratedSchema()).toEqual(['inProgress', 'completed', 'failed', 'declined'])
+expect(patchChangeKindVariantsFromGeneratedSchema()).toEqual(['add', 'delete', 'update'])
+expect(patchChangeKindFieldsFromGeneratedSchema('update')).toEqual(expect.arrayContaining(['move_path']))
+expect(mcpToolCallStatusValuesFromGeneratedSchema()).toEqual(['inProgress', 'completed', 'failed'])
+expect(dynamicToolCallStatusValuesFromGeneratedSchema()).toEqual(['inProgress', 'completed', 'failed'])
+expect(collabAgentToolCallStatusValuesFromGeneratedSchema()).toEqual(['inProgress', 'completed', 'failed'])
+expect(imageGenerationStatusTypeFromGeneratedSchema()).toEqual('string')
 expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadReadResponse.json', 'Turn')).toEqual(expect.arrayContaining([
   'id',
   'items',
@@ -2501,6 +2575,12 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadActiveFlag.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PatchApplyStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PatchChangeKind.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpToolCallStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CollabAgentToolCallStatus.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SessionSource.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartSource.ts \
@@ -2612,6 +2692,19 @@ expect(normalizeCodexItem(parseCodexItemFixture({ type: 'agentMessage', id: 'a1'
   .toEqual([{ id: 'a1', kind: 'message', role: 'assistant', content: [{ kind: 'text', text: 'Done' }] }])
 
 expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'reasoning',
+  id: 'r1',
+  summary: ['Checked repository state'],
+  content: ['First reasoning paragraph', 'Second reasoning paragraph'],
+})))
+  .toEqual([expect.objectContaining({
+    id: 'r1',
+    kind: 'reasoning',
+    summary: ['Checked repository state'],
+    content: ['First reasoning paragraph', 'Second reasoning paragraph'],
+  })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({
   type: 'commandExecution',
   id: 'c1',
   command: 'npm test',
@@ -2626,8 +2719,43 @@ expect(normalizeCodexItem(parseCodexItemFixture({
 })))
   .toEqual([expect.objectContaining({ id: 'c1', kind: 'command', command: 'npm test', status: 'completed', output: 'ok' })])
 
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'commandExecution',
+  id: 'c-running',
+  command: 'npm test',
+  cwd: '/repo',
+  processId: null,
+  source: 'agent',
+  status: 'inProgress',
+  commandActions: [],
+  aggregatedOutput: null,
+  exitCode: null,
+  durationMs: null,
+})))
+  .toEqual([expect.objectContaining({ id: 'c-running', kind: 'command', status: 'running' })])
+
 expect(normalizeCodexItem(parseCodexItemFixture({ type: 'fileChange', id: 'f1', status: 'completed', changes: [{ path: 'src/a.ts', kind: { type: 'update', move_path: null }, diff: '@@' }] })))
-  .toEqual([expect.objectContaining({ id: 'f1', kind: 'file_change', changes: [{ path: 'src/a.ts', diff: '@@' }] })])
+  .toEqual([expect.objectContaining({ id: 'f1', kind: 'file_change', changes: [{ path: 'src/a.ts', changeKind: 'modify', diff: '@@' }] })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'fileChange',
+  id: 'f-rename',
+  status: 'completed',
+  changes: [{ path: 'src/new-name.ts', kind: { type: 'update', move_path: 'src/old-name.ts' }, diff: '@@' }],
+})))
+  .toEqual([expect.objectContaining({
+    id: 'f-rename',
+    kind: 'file_change',
+    changes: [{ path: 'src/new-name.ts', changeKind: 'rename', movePath: 'src/old-name.ts', diff: '@@' }],
+  })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'fileChange',
+  id: 'f-running',
+  status: 'inProgress',
+  changes: [{ path: 'src/a.ts', kind: { type: 'update', move_path: null }, diff: '' }],
+})))
+  .toEqual([expect.objectContaining({ id: 'f-running', kind: 'file_change', status: 'running' })])
 
 expect(() => normalizeCodexItem({ type: 'newUnknownItem', id: 'u1' }))
   .toThrow(/unsupported Codex item/i)
@@ -2648,8 +2776,60 @@ expect(normalizeCodexItem(parseCodexItemFixture({
 })))
   .toEqual([expect.objectContaining({ id: 'dyn-1', kind: 'dynamic_tool', status: 'failed' })])
 
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'mcpToolCall',
+  id: 'mcp-running',
+  server: 'fixture-server',
+  tool: 'fixture-tool',
+  status: 'inProgress',
+  arguments: {},
+  result: null,
+  error: null,
+  durationMs: null,
+})))
+  .toEqual([expect.objectContaining({ id: 'mcp-running', kind: 'tool', status: 'running' })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'dynamicToolCall',
+  id: 'dyn-running',
+  namespace: null,
+  tool: 'tool-x',
+  arguments: {},
+  status: 'inProgress',
+  contentItems: null,
+  success: null,
+  durationMs: null,
+})))
+  .toEqual([expect.objectContaining({ id: 'dyn-running', kind: 'dynamic_tool', status: 'running' })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({
+  type: 'collabAgentToolCall',
+  id: 'collab-running',
+  tool: 'spawnAgent',
+  status: 'inProgress',
+  senderThreadId: 'thread-1',
+  receiverThreadIds: ['thread-child-1', 'thread-child-2'],
+  prompt: 'Review this',
+  model: 'configured-model',
+  reasoningEffort: 'high',
+  agentsStates: {
+    'thread-child-1': { status: 'running', message: 'Working' },
+    'thread-child-2': { status: 'completed', message: null },
+  },
+})))
+  .toEqual([expect.objectContaining({
+    id: 'collab-running',
+    kind: 'collaboration',
+    status: 'running',
+    receiverThreadIds: ['thread-child-1', 'thread-child-2'],
+    agentsStates: expect.objectContaining({ 'thread-child-1': expect.any(Object) }),
+  })])
+
 expect(normalizeCodexItem(parseCodexItemFixture({ type: 'imageGeneration', id: 'img-gen-1', status: 'completed', revisedPrompt: 'diagram', result: 'https://example.test/generated.png' })))
   .toEqual([expect.objectContaining({ id: 'img-gen-1', kind: 'image_generation' })])
+
+expect(normalizeCodexItem(parseCodexItemFixture({ type: 'imageGeneration', id: 'img-gen-custom', status: 'provider_specific_status', revisedPrompt: null, result: 'https://example.test/generated.png' })))
+  .toEqual([expect.objectContaining({ id: 'img-gen-custom', kind: 'image_generation', status: 'provider_specific_status' })])
 ```
 
 Add table-driven coverage for every local generated `ThreadItem` type: `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`. The table must derive the expected type names from `schema-inventory.ts` and fail if the checked-in generated `ThreadItem.ts` contains a variant with no schema-valid fixture.
@@ -3017,6 +3197,35 @@ export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus
 ```
 
 Throw a clear `UnsupportedCodexItemError` for item types not intentionally modeled. Normalize actual app-server shapes from the generated `Thread` / `Turn` / `ThreadItem` schemas:
+
+Map generated item statuses through one small helper and use it for every transcript item kind that carries a status:
+
+```ts
+function normalizeCodexItemStatus(status: 'inProgress' | 'completed' | 'failed' | 'declined'): 'running' | 'completed' | 'failed' | 'declined' {
+  return status === 'inProgress' ? 'running' : status
+}
+```
+
+Do not reuse `normalizeCodexThreadStatus` or `TurnStatus` handling for item statuses; those are different generated leaf types. Tests must cover the active `"inProgress"` case for command executions, file changes, MCP tool calls, dynamic tool calls, and collab-agent tool calls because active live updates are the path most likely to hit the mismatch.
+
+Map generated patch-change kinds through another focused helper:
+
+```ts
+function normalizeCodexPatchChangeKind(kind: CodexPatchChangeKind): { changeKind: 'add' | 'modify' | 'delete' | 'rename'; movePath?: string } {
+  switch (kind.type) {
+    case 'add':
+      return { changeKind: 'add' }
+    case 'delete':
+      return { changeKind: 'delete' }
+    case 'update':
+      return kind.move_path
+        ? { changeKind: 'rename', movePath: kind.move_path }
+        : { changeKind: 'modify' }
+  }
+}
+```
+
+Use this helper for every `fileChange.changes[]` entry before parsing the normalized item through `FreshAgentFileChangeItemSchema`; do not drop `move_path`.
 
 ```ts
 export function normalizeCodexThreadSnapshot(input: {
@@ -3884,6 +4093,7 @@ Use typed fixtures to assert every important Codex surface:
 ```ts
 expect(screen.getByRole('article', { name: /command npm test/i })).toHaveTextContent('completed')
 expect(screen.getByRole('button', { name: /view diff src\/app.ts/i })).toBeInTheDocument()
+expect(screen.getByRole('article', { name: /renamed file src\/new-name.ts/i })).toHaveTextContent('src/old-name.ts')
 expect(screen.getByRole('region', { name: /review current changes/i })).toHaveTextContent('No blocking findings')
 await user.click(screen.getByRole('button', { name: /start codex review/i }))
 expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
@@ -3893,6 +4103,8 @@ expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
 expect(screen.getByRole('region', { name: /worktree/i })).toHaveTextContent('feature/freshcodex')
 expect(screen.getByRole('region', { name: /fork lineage/i })).toHaveTextContent('thread-parent-1')
 expect(screen.getByRole('region', { name: /child threads/i })).toHaveTextContent('Review shell')
+expect(screen.getByRole('article', { name: /child-agent action spawnAgent/i })).toHaveTextContent('thread-child-1')
+expect(screen.getByRole('article', { name: /child-agent action spawnAgent/i })).toHaveTextContent('thread-child-2')
 expect(screen.getByRole('button', { name: /mentioned file README.md/i })).toHaveTextContent('/repo/README.md')
 expect(screen.getByRole('button', { name: /skill reviewer/i })).toHaveTextContent('reviewer')
 ```
@@ -3921,17 +4133,17 @@ Expected: FAIL because normalized Codex item rendering and workspace panel are i
 - `message` mention/skill parts: render preserved Codex `mention` and `skill` content parts as accessible inline chips with their names and paths.
 - `text`: markdown/plain text with wrapping.
 - `hook_prompt`: hook/context prompt fragments without exposing raw JSON.
-- `reasoning`: collapsed by default, with summary visible and accessible toggle.
+- `reasoning`: collapsed by default, with generated summary visible, full generated content available behind an accessible toggle, and no loss of either array.
 - `plan`: plan card.
 - `command`: command, cwd, status, output, exit code.
-- `file_change`: list changed files and expandable diff using shared `DiffView`.
+- `file_change`: list changed files, distinguish add/modify/delete/rename, show `movePath` for renamed/moved files, and provide expandable diffs using shared `DiffView`.
 - `tool`: MCP/tool card with input/result/error.
 - `dynamic_tool`: unsupported or completed dynamic tool call state with the user-visible response.
-- `collaboration`: child-agent action card with thread ids.
+- `collaboration`: child-agent action card with all `receiverThreadIds`, sender id, prompt, model/effort metadata, and generated agent-state summaries when available.
 - `review`: entered/exited review cards.
 - `web_search`: query and status.
 - `image`: path/url card.
-- `image_generation`: prompt/status and generated image metadata when available.
+- `image_generation`: prompt, raw generated status string, optional derived display status, and generated image metadata when available.
 - `context_compaction`: compaction status and token before/after summary when available.
 - `request_prompt`: pending/resolved approval/question/tool prompt state.
 - `error`: alert card.
@@ -4659,6 +4871,11 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Codex model pages and provider capability reads cross REST, adapter, and settings UI through typed fresh-agent schemas; provider-level `namespaceTools`, `imageGeneration`, and `webSearch` booleans are not lost as unknown model-item fields.
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
+- Codex reasoning items preserve both generated `summary` and generated `content` arrays.
+- Codex item-level `"inProgress"` statuses for command executions, file changes, MCP tool calls, dynamic tool calls, and collab-agent calls normalize to fresh-agent `"running"` statuses and are covered by schema-valid fixtures.
+- Codex file-change items preserve generated `update.move_path` as normalized `movePath` and render rename/move details in diff UI.
+- Codex collaboration transcript items preserve all generated `receiverThreadIds` and child-agent state metadata, and the shared UI renders every receiver id instead of collapsing child-agent calls to one thread.
+- Codex image-generation items preserve raw generated status strings, including statuses outside Freshell's small display-state buckets.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
 - Codex runtime-global server requests without a generated thread locator, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread. Legacy `applyPatchApproval` and `execCommandApproval` use generated `conversationId` as their Freshcodex thread locator and answer with root `ReviewDecision` response shapes.
 - Freshcodex renders without `agentChat` session state.
