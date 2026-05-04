@@ -744,6 +744,7 @@ git commit -m "Add strict fresh-agent read-model contracts"
 ### Task 3: Enforce Contracts At Server And Client Boundaries
 
 **Files:**
+- Modify: `server/index.ts`
 - Modify: `server/fresh-agent/runtime-adapter.ts`
 - Modify: `server/fresh-agent/provider-registry.ts`
 - Modify: `server/fresh-agent/runtime-manager.ts`
@@ -760,6 +761,7 @@ git commit -m "Add strict fresh-agent read-model contracts"
 - Test: `test/unit/server/fresh-agent/contract-boundary.test.ts`
 - Test: `test/unit/server/fresh-agent/provider-registry.test.ts`
 - Test: `test/unit/server/fresh-agent/router.test.ts`
+- Test: `test/unit/server/fresh-agent/runtime-manager.test.ts`
 - Test: `test/unit/client/lib/api.fresh-agent-contract.test.ts`
 - Test: `test/unit/client/store/freshAgentSlice.test.ts`
 - Test: `test/unit/client/lib/pane-activity.test.ts`
@@ -841,6 +843,7 @@ Run:
 npm run test:vitest -- \
   test/unit/server/fresh-agent/contract-boundary.test.ts \
   test/unit/server/fresh-agent/provider-registry.test.ts \
+  test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
   test/unit/client/store/freshAgentSlice.test.ts \
@@ -887,6 +890,26 @@ type FreshAgentRuntimeAdapterRegistration = {
 ```
 
 `resolveBySessionType(sessionType)` should return the matching session descriptor plus the adapter registered for that descriptor's runtime provider. `resolveByRuntimeProvider(provider)` should return the adapter registered for that provider without depending on whichever session type was registered last. Add an invariant test that `freshclaude` and `kilroy` both resolve to the Claude adapter and cannot overwrite each other.
+
+Update every registry construction site in the same task. In `server/index.ts`, replace the current array of combined registrations with separate session descriptors and runtime adapters:
+
+```ts
+const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
+  registry: createFreshAgentProviderRegistry({
+    sessionTypes: [
+      { sessionType: 'freshclaude', runtimeProvider: 'claude', label: 'Freshclaude' },
+      { sessionType: 'kilroy', runtimeProvider: 'claude', label: 'Kilroy', hidden: true },
+      { sessionType: 'freshcodex', runtimeProvider: 'codex', label: 'Freshcodex' },
+    ],
+    runtimeAdapters: [
+      { runtimeProvider: 'claude', adapter: claudeFreshAgentAdapter },
+      { runtimeProvider: 'codex', adapter: codexFreshAgentAdapter },
+    ],
+  }),
+})
+```
+
+Update existing runtime-manager tests that construct the registry so Task 3 remains typecheckable on its own. Do not add a legacy overload that accepts the old combined array; that would keep the ambiguous many-session-to-one-provider model alive.
 
 In `runtime-manager.ts`, add:
 
@@ -939,6 +962,7 @@ Run:
 npm run test:vitest -- \
   test/unit/server/fresh-agent/contract-boundary.test.ts \
   test/unit/server/fresh-agent/provider-registry.test.ts \
+  test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
   test/unit/client/store/freshAgentSlice.test.ts \
@@ -965,6 +989,7 @@ Run:
 npm run test:vitest -- \
   test/unit/server/fresh-agent/contract-boundary.test.ts \
   test/unit/server/fresh-agent/provider-registry.test.ts \
+  test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
   test/unit/client/store/freshAgentSlice.test.ts \
@@ -981,6 +1006,7 @@ Expected: PASS.
 
 ```bash
 git add \
+  server/index.ts \
   server/fresh-agent/runtime-adapter.ts server/fresh-agent/provider-registry.ts \
   server/fresh-agent/runtime-manager.ts \
   server/fresh-agent/router.ts server/fresh-agent/adapters/claude/normalize.ts \
@@ -990,6 +1016,7 @@ git add \
   src/lib/fresh-agent-api-error.ts \
   test/unit/server/fresh-agent/contract-boundary.test.ts \
   test/unit/server/fresh-agent/provider-registry.test.ts \
+  test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
   test/unit/client/store/freshAgentSlice.test.ts \
@@ -1002,12 +1029,14 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 ### Task 4: Bring Codex App-Server Protocol Support Up To Freshcodex Needs
 
 **Files:**
+- Modify: `server/index.ts`
 - Modify: `server/coding-cli/codex-app-server/protocol.ts`
 - Modify: `server/coding-cli/codex-app-server/client.ts`
 - Modify: `server/coding-cli/codex-app-server/runtime.ts`
 - Modify: `server/coding-cli/codex-app-server/launch-planner.ts`
 - Create: `server/coding-cli/codex-app-server/transport.ts`
 - Create: `server/coding-cli/codex-app-server/rich-runtime.ts`
+- Modify: `server/fresh-agent/adapters/codex/adapter.ts`
 - Create: `scripts/audit-codex-app-server-schema.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ClientRequest.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts`
@@ -1022,6 +1051,7 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Test: `test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/runtime.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts`
+- Test: `test/unit/server/fresh-agent/codex-adapter.test.ts`
 
 - [ ] **Step 1: Generate local app-server schema and write failing protocol tests**
 
@@ -1107,6 +1137,7 @@ await expect(runtime.startTurn({ threadId: 'thread-1', input: [{ type: 'text', t
   .resolves.toMatchObject({ turn: { id: expect.any(String) } })
 
 expect('readThreadTurn' in client).toBe(false) // no public method; direct turn read is not in the generated schema
+expect('readThreadTurn' in runtime).toBe(false) // the raw websocket runtime must not keep a fake turn-read API either
 
 await expect(websocketRuntime.startThread({ cwd: '/repo' }))
   .resolves.toMatchObject({ threadId: expect.any(String), wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/) })
@@ -1145,6 +1176,13 @@ it('lets the rich stdio runtime subscribe to notifications and server requests f
   expect(seen).toContainEqual(expect.objectContaining({ method: 'item/completed' }))
   unsubscribe()
 })
+
+it('shuts down the rich stdio app-server child without touching the raw websocket runtime', async () => {
+  await richRuntime.ensureReady()
+  await richRuntime.shutdown()
+  expect(fakeStdioChild.killed).toBe(true)
+  expect(websocketRuntime.status()).toBe('running')
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1156,7 +1194,8 @@ npm run test:vitest -- \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
-  test/unit/server/coding-cli/codex-app-server/runtime.test.ts
+  test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
+  test/unit/server/fresh-agent/codex-adapter.test.ts
 ```
 
 Expected: FAIL because the client still owns WebSocket directly, emits `"jsonrpc": "2.0"`, does not send `initialized`, parses the old initialize result, exposes stale turn-read behavior, lacks turn, fork, interrupt, and server-request response methods, and has no Freshcodex-only stdio rich runtime.
@@ -1357,6 +1396,33 @@ onServerRequest(listener: (request: CodexServerRequest) => void): () => void
 
 The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by `threadId` only when the generated params contain a thread id; notifications without a thread id but with visible global impact, such as app-server errors, should still reach subscribers as typed runtime events.
 
+Keep the branch typecheckable at the end of Task 4. Because this task removes the nonexistent `thread/turn/read` client/runtime API, also update `server/fresh-agent/adapters/codex/adapter.ts` enough to stop depending on `readThreadTurn` or a websocket-only `{ wsUrl }` result. This is a narrow compile-preserving bridge before Task 5's full normalization:
+
+```ts
+type CodexFreshAgentRichRuntimePort = {
+  startThread(params: CodexThreadStartParams): Promise<{ threadId: string }>
+  resumeThread(params: CodexThreadResumeParams): Promise<{ threadId: string }>
+  readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult>
+  listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult>
+  subscribe?(threadId: string, listener: (event: unknown) => void): Promise<() => void> | (() => void)
+}
+```
+
+For this bridge only, `getTurnBody` should return a typed `FreshAgentUnsupportedCapabilityError` or cache-miss style error rather than calling a fake Codex RPC. Task 5 replaces that bridge with the bounded page/body cache and full event/request handling. Do not keep any `readThreadTurn` method on the client, raw websocket runtime, rich stdio runtime, or adapter port.
+
+Wire both Codex runtimes in `server/index.ts` in the same task:
+
+```ts
+const codexAppServerRuntime = new CodexAppServerRuntime()
+const codexRichAppServerRuntime = new CodexRichAppServerRuntime()
+const codexLaunchPlanner = new CodexLaunchPlanner(codexAppServerRuntime)
+const codexFreshAgentAdapter = createCodexFreshAgentAdapter({
+  runtime: codexRichAppServerRuntime,
+})
+```
+
+The raw websocket runtime remains exclusively for `CodexLaunchPlanner` and raw Codex terminal `--remote` attach. The rich stdio runtime is passed to the Freshcodex adapter. On server shutdown, call `await codexRichAppServerRuntime.shutdown()` next to the existing raw runtime shutdown so the stdio app-server process cannot be orphaned.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run:
@@ -1366,7 +1432,8 @@ npm run test:vitest -- \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
-  test/unit/server/coding-cli/codex-app-server/runtime.test.ts
+  test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
+  test/unit/server/fresh-agent/codex-adapter.test.ts
 ```
 
 Expected: PASS.
@@ -1384,6 +1451,7 @@ npm run test:vitest -- \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
   test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts \
+  test/unit/server/fresh-agent/codex-adapter.test.ts \
   test/integration/server/codex-session-flow.test.ts
 npm run typecheck:server
 ```
@@ -1394,12 +1462,14 @@ Expected: PASS.
 
 ```bash
 git add \
+  server/index.ts \
   server/coding-cli/codex-app-server/protocol.ts \
   server/coding-cli/codex-app-server/transport.ts \
   server/coding-cli/codex-app-server/client.ts \
   server/coding-cli/codex-app-server/rich-runtime.ts \
   server/coding-cli/codex-app-server/runtime.ts \
   server/coding-cli/codex-app-server/launch-planner.ts \
+  server/fresh-agent/adapters/codex/adapter.ts \
   test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ClientRequest.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts \
@@ -1414,6 +1484,7 @@ git add \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
   test/unit/server/coding-cli/codex-app-server/launch-planner.test.ts \
+  test/unit/server/fresh-agent/codex-adapter.test.ts \
   test/integration/server/codex-session-flow.test.ts
 git commit -m "Extend Codex app-server client for rich turns"
 ```
@@ -3052,10 +3123,10 @@ Update `docs/index.html` to show Freshcodex as a rich fresh-agent pane with tran
 Run:
 
 ```bash
-rg -n "freshcodex.*agent-chat|Freshcodex.*agent-chat|sdk\\.send.*freshcodex|kind: 'agent-chat'.*freshcodex|provider: 'freshcodex'" src server shared test docs
+rg -n "freshcodex.*agent-chat|Freshcodex.*agent-chat|sdk\\.send.*freshcodex|kind: 'agent-chat'.*freshcodex|provider: 'freshcodex'" src server shared test docs/index.html
 ```
 
-Expected: no stale Freshcodex-on-agent-chat references. Legacy Freshclaude/agent-chat references may remain where they are still intentional.
+Expected: no stale Freshcodex-on-agent-chat references in product code, tests, shared contracts, or the public docs mock. Do not include `docs/plans/**` in this grep; the historical implementation plan itself intentionally describes stale references that the implementation is removing. Legacy Freshclaude/agent-chat references may remain where they are still intentional.
 
 - [ ] **Step 4: Run full verification**
 
