@@ -47,7 +47,8 @@ The generated sources that matter most are:
 - `/tmp/freshell-codex-schema-0.128.0/json/JSONRPCRequest.json`, `JSONRPCResponse.json`, `JSONRPCError.json`, `JSONRPCNotification.json`, and `JSONRPCMessage.json`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/RequestId.ts`, `ClientRequest.ts`, `ClientNotification.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `InitializeParams.ts`, `InitializeResponse.ts`, and `InitializeCapabilities.ts`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/v2/ThreadStartParams.ts`, `ThreadStartResponse.ts`, `ThreadResumeParams.ts`, `ThreadReadParams.ts`, `ThreadReadResponse.ts`, `ThreadTurnsListParams.ts`, `ThreadTurnsListResponse.ts`, `ThreadForkParams.ts`, `ThreadForkResponse.ts`, `TurnStartParams.ts`, `TurnStartResponse.ts`, `TurnInterruptParams.ts`, and `TurnInterruptResponse.ts`.
-- `/tmp/freshell-codex-schema-0.128.0/ts/v2/Thread.ts`, `Turn.ts`, `ThreadItem.ts`, `UserInput.ts`, `ThreadStatus.ts`, `TurnStatus.ts`, the approval/request param and response files, and `DynamicToolCallResponse.ts`.
+- `/tmp/freshell-codex-schema-0.128.0/ts/v2/Thread.ts`, `Turn.ts`, `ThreadItem.ts`, `UserInput.ts`, `ThreadStatus.ts`, `TurnStatus.ts`, the v2 approval/request param and response files, and `DynamicToolCallResponse.ts`.
+- Legacy root server-request files are still generated in this local schema and remain part of the Freshcodex unblock contract: `/tmp/freshell-codex-schema-0.128.0/ts/ApplyPatchApprovalParams.ts`, `ExecCommandApprovalParams.ts`, `ApplyPatchApprovalResponse.ts`, `ExecCommandApprovalResponse.ts`, and `ReviewDecision.ts`.
 - Runtime-setting and identity leaf types are part of the contract, not incidental dependencies. The plan must also preserve and audit `ReasoningEffort.ts`, `v2/AskForApproval.ts`, `v2/SandboxMode.ts`, `v2/SandboxPolicy.ts`, `v2/NetworkAccess.ts`, `v2/UserInput.ts`, `v2/ThreadStatus.ts`, `v2/TurnStatus.ts`, `v2/ThreadActiveFlag.ts`, `v2/SessionSource.ts`, and `SubAgentSource.ts` because those files define the values Freshcodex sends to Codex and the source/subagent shapes Freshcodex projects into history and child-thread UI.
 
 Schema-grounded protocol facts to preserve:
@@ -78,9 +79,9 @@ Schema-grounded protocol facts to preserve:
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`; `activeFlags` is required on the active variant. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`. Generated TypeScript exposes `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, and `Turn.durationMs` as nullable properties, but generated JSON Schema does not require them; raw protocol schemas must accept omitted values and normalize them to `null`.
 - `Thread.source` uses generated `SessionSource`, not `ThreadSourceKind`. `ThreadSourceKind` is only the filter type for `thread/list`. `SessionSource` values include flat sources such as `"cli"`, `"vscode"`, `"exec"`, and `"appServer"`, but subagent source metadata is represented as `{ subAgent: ... }` with generated `SubAgentSource` variants such as `"review"`, `"compact"`, `{ thread_spawn: ... }`, `"memory_consolidation"`, and `{ other: string }`. Freshcodex protocol schemas, fixtures, history projection, and child-thread metadata must parse and preserve the generated `SessionSource` shape instead of flattening thread metadata to `subAgentReview`/`subAgentCompact` strings.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
-- Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
-- Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`.
-- `account/chatgptAuthTokens/refresh` expects real token fields in a successful result and its generated params do not include `threadId`. Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh runtime error to every subscribed Freshcodex pane for that rich runtime instance, since the request is not thread-addressable.
+- Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`. The v2 request variants use `params.threadId` for routing, while the legacy root `applyPatchApproval` and `execCommandApproval` variants use `params.conversationId`; both fields identify the Codex thread and must route to the matching Freshcodex locator.
+- Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`. Legacy `applyPatchApproval` and `execCommandApproval` responses use root `ReviewDecision` values through `{ decision }`, including `"approved"`, `"approved_for_session"`, `"denied"`, `"timed_out"`, `"abort"`, and the generated amendment-object variants; do not answer those legacy requests with v2 `"accept"` / `"decline"` decisions.
+- `account/chatgptAuthTokens/refresh` expects real token fields in a successful result and its generated params do not include a thread locator (`threadId` or `conversationId`). Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh runtime error to every subscribed Freshcodex pane for that rich runtime instance, since the request is not thread-addressable.
 - Generated `ServerNotification` method names are slash-delimited and must be copied exactly from `ServerNotification.ts`; examples include `thread/status/changed`, `thread/tokenUsage/updated`, `turn/diff/updated`, `turn/plan/updated`, `thread/compacted`, `item/agentMessage/delta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `thread/realtime/error`, and `thread/realtime/closed`.
 - Any per-turn body API in Freshell must be an internal facade over `thread/turns/list` results or a server-side page/body cache until Codex exposes a direct turn-read request. Do not implement normal Freshcodex body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
 - Freshcodex must not opt out of generated notification methods that affect visible state. In particular, do not include `thread/started`, turn lifecycle, item lifecycle, token usage, diff/review, status, compaction, or error notifications in `InitializeCapabilities.optOutNotificationMethods`; suppressing those events would make the live read model stale by construction.
@@ -139,7 +140,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Every Codex normalization fixture that claims to model an app-server `Thread`, `Turn`, `ThreadItem`, `ServerRequest`, or `ServerNotification` must first parse through the local generated Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts`. Do not write tests against impossible mock shapes. If an example in this plan differs from the generated schema, the generated schema wins and the fixture must be corrected.
 - Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated JSON-Schema-required fields, while accepting generated-optional wire fields and normalizing them at the protocol boundary. Do not use permissive partial schemas for app-server entities that generated JSON Schema makes required. Known important required examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, and `Turn.status`. Known important optional/default examples that must parse and normalize are `Thread.forkedFromId`, `Thread.path`, `Thread.agentNickname`, `Thread.agentRole`, `Thread.gitInfo`, `Thread.name`, `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, `Turn.durationMs`, `ThreadListResponse.nextCursor`, `ThreadListResponse.backwardsCursor`, `ThreadTurnsListResponse.nextCursor`, `ThreadTurnsListResponse.backwardsCursor`, `ThreadLoadedListResponse.nextCursor`, and `ModelListResponse.nextCursor`.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
-- Server-initiated Codex requests that include `threadId` are routed to that Freshcodex thread. Server-initiated Codex requests without `threadId`, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
+- Server-initiated Codex requests that include a generated thread locator are routed to that Freshcodex thread. For v2 request params the locator is `threadId`; for legacy root `applyPatchApproval` and `execCommandApproval` params the locator is `conversationId`. Server-initiated Codex requests without either locator, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
 - Codex server-request response shapes must stay discriminated by generated request method all the way through the shared contract, WebSocket protocol, controller, and adapter. Do not collapse all prompts to Claude-style `answers: Record<string, string>` or `decision: string`: `item/tool/requestUserInput` responds with `{ answers: Record<string, { answers: string[] }> }`, `mcpServer/elicitation/request` responds with `{ action, content, _meta }`, `item/permissions/requestApproval` responds with `{ permissions, scope, strictAutoReview? }`, and command/file approval responses keep their generated decision payloads.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
 - Freshcodex tests must be able to render without `state.agentChat.sessions` or Claude restore helpers.
@@ -520,6 +521,18 @@ expect(FreshAgentServerRequestResponseSchema.parse({
 })).toMatchObject({ kind: 'dynamic_tool', success: false })
 
 expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'legacy-exec-1',
+  kind: 'legacy_exec_approval',
+  decision: 'approved',
+})).toMatchObject({ kind: 'legacy_exec_approval', decision: 'approved' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'legacy-patch-1',
+  kind: 'legacy_patch_approval',
+  decision: 'denied',
+})).toMatchObject({ kind: 'legacy_patch_approval', decision: 'denied' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
   requestId: 42,
   kind: 'tool_user_input',
   answers: {
@@ -884,6 +897,20 @@ export const FreshAgentDynamicToolOutputContentItemSchema = z.discriminatedUnion
   z.object({ type: z.literal('inputImage'), imageUrl: z.string() }),
 ])
 
+export const FreshAgentLegacyCodexReviewDecisionSchema = z.union([
+  z.enum(['approved', 'approved_for_session', 'denied', 'timed_out', 'abort']),
+  z.object({
+    approved_execpolicy_amendment: z.object({
+      proposed_execpolicy_amendment: z.record(z.string(), JsonValue),
+    }),
+  }),
+  z.object({
+    network_policy_amendment: z.object({
+      network_policy_amendment: z.record(z.string(), JsonValue),
+    }),
+  }),
+])
+
 export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind', [
   z.object({
     requestId: FreshAgentServerRequestIdSchema,
@@ -923,10 +950,20 @@ export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind'
     contentItems: z.array(FreshAgentDynamicToolOutputContentItemSchema),
     success: z.boolean(),
   }),
+  z.object({
+    requestId: FreshAgentServerRequestIdSchema,
+    kind: z.literal('legacy_exec_approval'),
+    decision: FreshAgentLegacyCodexReviewDecisionSchema,
+  }),
+  z.object({
+    requestId: FreshAgentServerRequestIdSchema,
+    kind: z.literal('legacy_patch_approval'),
+    decision: FreshAgentLegacyCodexReviewDecisionSchema,
+  }),
 ])
 ```
 
-The implementation may narrow `permissions`, `scope`, MCP `content`, and dynamic-tool output content further when the Codex generated response schemas are modeled in `server/coding-cli/codex-app-server/protocol.ts`, but the shared action contract must not reduce them to strings or Claude-style answers. Even when Freshcodex auto-declines unsupported dynamic tool calls without user input, the response shape must stay contract-modeled so tests can prove the app-server turn is unblocked with the generated `DynamicToolCallResponse` envelope.
+The implementation may narrow `permissions`, `scope`, MCP `content`, dynamic-tool output content, and legacy review-decision amendment payloads further when the Codex generated response schemas are modeled in `server/coding-cli/codex-app-server/protocol.ts`, but the shared action contract must not reduce them to strings or Claude-style answers. Even when Freshcodex auto-declines unsupported dynamic tool calls without user input, the response shape must stay contract-modeled so tests can prove the app-server turn is unblocked with the generated `DynamicToolCallResponse` envelope. Legacy root `applyPatchApproval` and `execCommandApproval` must likewise stay distinguishable from v2 command/file approvals because their generated decision enum uses root `ReviewDecision`, not v2 `accept` / `decline` values.
 
 Define referenced schemas before any schema that uses them, or wrap recursive references in `z.lazy`, so module evaluation cannot hit a temporal-dead-zone `ReferenceError`.
 
@@ -1361,6 +1398,11 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ApplyPatchApprovalParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ApplyPatchApprovalResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ExecCommandApprovalParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ExecCommandApprovalResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReviewDecision.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionRequestApprovalResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/FileChangeRequestApprovalResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PermissionsRequestApprovalResponse.ts`
@@ -1552,6 +1594,33 @@ expect(CodexModelProviderCapabilitiesReadResultSchema.parse({
   imageGeneration: false,
   webSearch: true,
 })).toEqual({ namespaceTools: true, imageGeneration: false, webSearch: true })
+expect(requiredFieldsForGeneratedType('ApplyPatchApprovalParams.ts', 'ApplyPatchApprovalParams')).toEqual(expect.arrayContaining([
+  'conversationId',
+  'callId',
+  'fileChanges',
+  'reason',
+  'grantRoot',
+]))
+expect(requiredFieldsForGeneratedType('ExecCommandApprovalParams.ts', 'ExecCommandApprovalParams')).toEqual(expect.arrayContaining([
+  'conversationId',
+  'callId',
+  'approvalId',
+  'command',
+  'cwd',
+  'reason',
+  'parsedCmd',
+]))
+expect(reviewDecisionValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'approved',
+  'approved_for_session',
+  'denied',
+  'timed_out',
+  'abort',
+  'approved_execpolicy_amendment',
+  'network_policy_amendment',
+]))
+expect(CodexLegacyApplyPatchApprovalResponseSchema.parse({ decision: 'approved' })).toEqual({ decision: 'approved' })
+expect(CodexLegacyExecCommandApprovalResponseSchema.parse({ decision: 'denied' })).toEqual({ decision: 'denied' })
 expect(reasoningEffortValuesFromGeneratedSchema()).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
 expect(inputModalityValuesFromGeneratedSchema()).toEqual(['text', 'image'])
 expect(askForApprovalValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
@@ -1804,7 +1873,7 @@ Expected: FAIL because the client still owns WebSocket directly, emits `"jsonrpc
 
 - [ ] **Step 3: Implement app-server protocol methods**
 
-Update `protocol.ts` with schema names matching the generated app-server schema. The implementation must include generated response schemas for every server request that Freshell answers, not only request-param schemas. The checked-in schema snapshot and `schema-inventory.ts` should cover `CommandExecutionRequestApprovalResponse`, `FileChangeRequestApprovalResponse`, `PermissionsRequestApprovalResponse`, `ToolRequestUserInputResponse`, `McpServerElicitationRequestResponse`, `DynamicToolCallResponse`, and `ChatgptAuthTokensRefreshResponse` so tests fail when Codex changes the payload shape Freshell sends back to unblock a turn.
+Update `protocol.ts` with schema names matching the generated app-server schema. The implementation must include generated response schemas for every server request that Freshell answers, not only request-param schemas. The checked-in schema snapshot and `schema-inventory.ts` should cover `CommandExecutionRequestApprovalResponse`, `FileChangeRequestApprovalResponse`, `PermissionsRequestApprovalResponse`, `ToolRequestUserInputResponse`, `McpServerElicitationRequestResponse`, `DynamicToolCallResponse`, `ChatgptAuthTokensRefreshResponse`, root `ApplyPatchApprovalResponse`, root `ExecCommandApprovalResponse`, and root `ReviewDecision` so tests fail when Codex changes the payload shape Freshell sends back to unblock a turn.
 
 The implementation must include, at minimum:
 
@@ -2073,6 +2142,49 @@ export const CodexServerNotificationSchema = z.discriminatedUnion('method', [...
 
 The object schemas and discriminated unions must be generated-schema faithful enough that Task 5 fixtures cannot use impossible app-server thread, turn, item, request, response, or notification shapes. It is acceptable to use `.passthrough()` for extra future fields on known variants, but do not make generated-required fields optional and do not use a catch-all unknown item variant.
 
+Model the legacy root approval request/response schemas explicitly alongside the v2 request schemas because the current generated `ServerRequest` union still includes them:
+
+```ts
+export const CodexLegacyReviewDecisionSchema = z.union([
+  z.enum(['approved', 'approved_for_session', 'denied', 'timed_out', 'abort']),
+  z.object({
+    approved_execpolicy_amendment: z.object({
+      proposed_execpolicy_amendment: z.record(z.string(), JsonValue),
+    }),
+  }),
+  z.object({
+    network_policy_amendment: z.object({
+      network_policy_amendment: z.record(z.string(), JsonValue),
+    }),
+  }),
+])
+
+export const CodexLegacyApplyPatchApprovalParamsSchema = z.object({
+  conversationId: z.string().min(1),
+  callId: z.string().min(1),
+  fileChanges: z.record(z.string(), JsonValue),
+  reason: z.string().nullable(),
+  grantRoot: z.string().nullable(),
+})
+export const CodexLegacyExecCommandApprovalParamsSchema = z.object({
+  conversationId: z.string().min(1),
+  callId: z.string().min(1),
+  approvalId: z.string().nullable(),
+  command: z.array(z.string()),
+  cwd: z.string(),
+  reason: z.string().nullable(),
+  parsedCmd: z.array(JsonValue),
+})
+export const CodexLegacyApplyPatchApprovalResponseSchema = z.object({
+  decision: CodexLegacyReviewDecisionSchema,
+})
+export const CodexLegacyExecCommandApprovalResponseSchema = z.object({
+  decision: CodexLegacyReviewDecisionSchema,
+})
+```
+
+Do not route these legacy requests through the runtime-global/auth-refresh path just because their params do not have `threadId`; their generated `conversationId` is the Codex thread id.
+
 Create `transport.ts` as the only app-server framing owner:
 
 ```ts
@@ -2148,7 +2260,7 @@ onServerRequest(listener: (request: CodexServerRequest) => void): () => void
 onRuntimeError(listener: (error: CodexRuntimeError) => void): () => void
 ```
 
-The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by `threadId` only when the generated params contain a thread id; notifications or server requests without a thread id but with visible global impact, such as app-server errors and `account/chatgptAuthTokens/refresh`, should still reach subscribers as typed runtime events or runtime errors.
+The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by generated thread locator only when the generated params contain `threadId` or legacy `conversationId`; notifications or server requests without a thread locator but with visible global impact, such as app-server errors and `account/chatgptAuthTokens/refresh`, should still reach subscribers as typed runtime events or runtime errors.
 
 Keep the branch typecheckable at the end of Task 4. Because this task removes the nonexistent `thread/turn/read` client/runtime API, also update `server/fresh-agent/adapters/codex/adapter.ts` enough to stop depending on `readThreadTurn` or a websocket-only `{ wsUrl }` result. This is a narrow compile-preserving bridge before Task 5's full normalization:
 
@@ -2242,6 +2354,11 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ApplyPatchApprovalParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ApplyPatchApprovalResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ExecCommandApprovalParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ExecCommandApprovalResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReviewDecision.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionRequestApprovalResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/FileChangeRequestApprovalResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PermissionsRequestApprovalResponse.ts \
@@ -2568,7 +2685,7 @@ expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex
   .toMatchObject({ pendingApprovals: [{ requestId: expect.stringContaining('cmd-1') }] })
 ```
 
-Add table-driven server-request coverage for every local generated `ServerRequest` method. Build each request with a helper that parses `{ id, method, params }` through `CodexServerRequestSchema` before the adapter sees it, because several request variants have required structured params beyond `threadId`. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no `threadId`, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
+Add table-driven server-request coverage for every local generated `ServerRequest` method. Build each request with a helper that parses `{ id, method, params }` through `CodexServerRequestSchema` before the adapter sees it, because several request variants have required structured params beyond `threadId`. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no thread locator, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Legacy root `applyPatchApproval` and `execCommandApproval` are mapped to pending approval prompts when generated schema still includes them, but their thread locator is `params.conversationId`, not `params.threadId`, and their response decision schema is root `ReviewDecision`, not v2 command/file approval decisions. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
 
 The same table must verify response serialization for each interactive request method through the fresh-agent action contract, not only through low-level client tests:
 
@@ -2624,6 +2741,51 @@ await adapter.respondToServerRequest?.('thread-1', {
 expect(runtime.respondToServerRequest).toHaveBeenCalledWith('dynamic-tool-1', {
   contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
   success: false,
+})
+
+emitSchemaValidServerRequest({
+  id: 'legacy-patch-request-1',
+  method: 'applyPatchApproval',
+  params: {
+    conversationId: 'thread-1',
+    callId: 'patch-1',
+    fileChanges: {},
+    reason: null,
+    grantRoot: null,
+  },
+})
+expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' }))
+  .toMatchObject({ pendingApprovals: [expect.objectContaining({ requestId: expect.anything() })] })
+
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'legacy-patch-request-1',
+  kind: 'legacy_patch_approval',
+  decision: 'approved',
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('legacy-patch-request-1', {
+  decision: 'approved',
+})
+
+emitSchemaValidServerRequest({
+  id: 'legacy-exec-request-1',
+  method: 'execCommandApproval',
+  params: {
+    conversationId: 'thread-1',
+    callId: 'exec-1',
+    approvalId: null,
+    command: ['npm', 'test'],
+    cwd: '/repo',
+    reason: null,
+    parsedCmd: [],
+  },
+})
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'legacy-exec-request-1',
+  kind: 'legacy_exec_approval',
+  decision: 'denied',
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('legacy-exec-request-1', {
+  decision: 'denied',
 })
 ```
 
@@ -2770,13 +2932,14 @@ Implement `adapter.subscribe(sessionId, listener)` for Codex by subscribing to t
 ```ts
 return await runtime.subscribe(sessionId, (event) => {
   if (isCodexServerRequest(event)) {
-    if (!hasThreadId(event)) {
+    const routedThreadId = getServerRequestThreadId(event) // params.threadId for v2, params.conversationId for legacy root approvals
+    if (!routedThreadId) {
       respondToUnsupportedRuntimeGlobalRequest(event)
       listener({ type: 'freshAgent.error', sessionId, sessionType: 'freshcodex', provider: 'codex', code: 'FRESH_AGENT_UNSUPPORTED_AUTH_REFRESH', message: 'Freshell cannot refresh Codex ChatGPT auth tokens from this runtime.', retryable: false })
       return
     }
-    updatePendingRequestState(sessionId, event)
-    listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: sessionId, reason: event.method })
+    updatePendingRequestState(routedThreadId, event)
+    listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: routedThreadId, reason: event.method })
     return
   }
   if (isVisibleCodexNotification(event)) {
@@ -2790,6 +2953,18 @@ return await runtime.subscribe(sessionId, (event) => {
 `getSnapshot` and `resume` must also recover `activeTurnId` without loading the full transcript. First read metadata with `thread/read { includeTurns: false }`, then fetch a bounded newest-first page with `thread/turns/list { limit: 10, sortDirection: 'desc' }` and select the newest `status: 'inProgress'` turn if present. This is required for interrupt to work after a browser reconnect, server restart, or adapter resubscription that missed the original `turn/started` notification while preserving long-transcript scalability.
 
 Implement `send`, `interrupt`, `fork`, and `respondToServerRequest` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(locator)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `respondToServerRequest` must look up the pending request by generated request id, validate that the response `kind` matches the original generated server request method, serialize the generated response shape, and respond on the original JSON-RPC server request id. Do not keep separate `resolveApproval` / `answerQuestion` action paths for Codex; those names encourage collapsing permissions approvals, request-user-input prompts, and MCP elicitations into the wrong Claude-shaped payload.
+
+Add a single routing helper for generated server requests:
+
+```ts
+function getServerRequestThreadId(request: CodexServerRequest): string | null {
+  if ('threadId' in request.params && typeof request.params.threadId === 'string') return request.params.threadId
+  if ('conversationId' in request.params && typeof request.params.conversationId === 'string') return request.params.conversationId
+  return null
+}
+```
+
+Only `account/chatgptAuthTokens/refresh` should currently return `null`. Legacy `applyPatchApproval` and `execCommandApproval` must use `conversationId` to update the correct thread's pending approval state and must respond with `CodexLegacyApplyPatchApprovalResponseSchema` / `CodexLegacyExecCommandApprovalResponseSchema` payloads.
 
 Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Replace the old create-message effort enum with the shared runtime-settings schema so Freshcodex create can carry generated Codex effort values such as `xhigh` and granular approval policy objects:
 
@@ -4308,7 +4483,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
-- Codex runtime-global server requests without `threadId`, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread.
+- Codex runtime-global server requests without a generated thread locator, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread. Legacy `applyPatchApproval` and `execCommandApproval` use generated `conversationId` as their Freshcodex thread locator and answer with root `ReviewDecision` response shapes.
 - Freshcodex renders without `agentChat` session state.
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
