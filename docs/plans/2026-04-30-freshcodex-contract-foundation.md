@@ -66,16 +66,16 @@ Schema-grounded protocol facts to preserve:
 - Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`.
 - Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. `SandboxPolicy.externalSandbox.networkAccess` uses generated `NetworkAccess` values `"restricted" | "enabled"`, not a free-form payload. Do not send the thread-level `sandbox` string to `turn/start`.
 - `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
-- `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
+- `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; generated TypeScript returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`, while generated JSON Schema requires only `thread`, `model`, `modelProvider`, `cwd`, `approvalPolicy`, `approvalsReviewer`, and `sandbox`. Raw protocol schemas must accept omitted `serviceTier`, `instructionSources`, and `reasoningEffort` and normalize them to `null`, `[]`, and `null`.
 - `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
-- `thread/loaded/list` returns `{ data: string[], nextCursor }`, not thread summaries. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
-- `thread/list` is paginated. Params include `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `cwd`, `useStateDbOnly`, and `searchTerm`; the response is `{ data: Thread[], nextCursor, backwardsCursor }`. Freshcodex history/session APIs must preserve both cursors instead of collapsing the response to an array.
-- `model/list` is paginated. Params are `{ cursor?, limit?, includeHidden? }`; the response is `{ data: Model[], nextCursor }`. Fresh-agent model APIs must preserve `nextCursor` rather than returning a bare first-page array. A convenience settings helper may accumulate pages for a dropdown, but the adapter/runtime/router/API contract must remain page-shaped so hidden or future large model lists are not silently truncated.
+- `thread/loaded/list` returns `{ data: string[], nextCursor? }`, not thread summaries. Raw protocol schemas must normalize omitted `nextCursor` to `null`. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
+- `thread/list` is paginated. Params include `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `cwd`, `useStateDbOnly`, and `searchTerm`; the TypeScript response is `{ data: Thread[], nextCursor, backwardsCursor }`, while generated JSON Schema requires only `data` and marks cursor fields optional/null. Raw protocol schemas must accept missing cursors and normalize them to `null` before producing fresh-agent page contracts. Freshcodex history/session APIs must preserve both normalized cursors instead of collapsing the response to an array.
+- `model/list` is paginated. Params are `{ cursor?, limit?, includeHidden? }`; the TypeScript response is `{ data: Model[], nextCursor }`, while generated JSON Schema requires only `data` and marks `nextCursor` optional/null. Raw protocol schemas must accept missing `nextCursor` and normalize it to `null` before producing fresh-agent page contracts. A convenience settings helper may accumulate pages for a dropdown, but the adapter/runtime/router/API contract must remain page-shaped so hidden or future large model lists are not silently truncated.
 - Generated `ThreadSourceKind` values are `cli`, `vscode`, `exec`, `appServer`, `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, `subAgentOther`, and `unknown`. Freshcodex rich history must explicitly request `appServer`, `vscode`, and every generated `subAgent*` kind, including `subAgentCompact`, so Codex app-server rich sessions and child-agent sessions are not hidden by default source filters. The `vscode` source is required because local runtime probes against `codex app-server --listen stdio://` on `codex-cli 0.128.0` returned newly created app-server threads with `source: "vscode"` even when the client was Freshell and `serviceName: "freshell"` was supplied.
 - Generated `ThreadStartSource` values are only `"startup"` and `"clear"`. Do not use `sessionStartSource` as a Freshell/app-server source marker or send `"appServer"` there.
-- `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
-- Generated `Thread` objects require the full thread metadata envelope even when turn bodies are omitted. At minimum, schema-valid fixtures must include `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `path`, `cwd`, `cliVersion`, `source`, `agentNickname`, `agentRole`, `gitInfo`, `name`, and `turns`. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
-- `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`; `activeFlags` is required on the active variant. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`. `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, and `Turn.durationMs` are generated-required nullable fields, not optional fields.
+- `Thread` has `id`, optional/null `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, optional/null `path`, `cwd`, `cliVersion`, `source`, optional/null subagent metadata, optional/null `gitInfo`, optional/null `name`, and `turns`. `Turn` has `id`, `items`, `status`, optional/null `error`, optional/null Unix-second `startedAt`/`completedAt` values, and optional/null `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize omitted nullable fields explicitly.
+- Generated JSON Schema requires the core `Thread` metadata envelope even when turn bodies are omitted. At minimum, schema-valid wire fixtures must include `id`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `cwd`, `cliVersion`, `source`, and `turns`. Optional/null fields such as `forkedFromId`, `path`, `agentNickname`, `agentRole`, `gitInfo`, and `name` may be omitted on the JSON wire and must normalize to `null` before provider extensions or fresh-agent contracts depend on them. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
+- `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`; `activeFlags` is required on the active variant. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`. Generated TypeScript exposes `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, and `Turn.durationMs` as nullable properties, but generated JSON Schema does not require them; raw protocol schemas must accept omitted values and normalize them to `null`.
 - `Thread.source` uses generated `SessionSource`, not `ThreadSourceKind`. `ThreadSourceKind` is only the filter type for `thread/list`. `SessionSource` values include flat sources such as `"cli"`, `"vscode"`, `"exec"`, and `"appServer"`, but subagent source metadata is represented as `{ subAgent: ... }` with generated `SubAgentSource` variants such as `"review"`, `"compact"`, `{ thread_spawn: ... }`, `"memory_consolidation"`, and `{ other: string }`. Freshcodex protocol schemas, fixtures, history projection, and child-thread metadata must parse and preserve the generated `SessionSource` shape instead of flattening thread metadata to `subAgentReview`/`subAgentCompact` strings.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
@@ -137,7 +137,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Codex turn bodies are page-first. `thread/turns/list` returns `Turn` objects with items, so Freshcodex should normalize those page results directly into turn bodies. A server-side LRU turn-body cache may serve `/turns/:turnId` for bodies already loaded from pages; the adapter must not implement body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every Codex normalization fixture that claims to model an app-server `Thread`, `Turn`, `ThreadItem`, `ServerRequest`, or `ServerNotification` must first parse through the local generated Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts`. Do not write tests against impossible mock shapes. If an example in this plan differs from the generated schema, the generated schema wins and the fixture must be corrected.
-- Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated-required fields. Do not use permissive partial schemas for app-server entities that the generated schema makes required. Known important examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, `Turn.status`, `ThreadTurnsListResponse.nextCursor`, and `ThreadTurnsListResponse.backwardsCursor`.
+- Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated JSON-Schema-required fields, while accepting generated-optional wire fields and normalizing them at the protocol boundary. Do not use permissive partial schemas for app-server entities that generated JSON Schema makes required. Known important required examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, and `Turn.status`. Known important optional/default examples that must parse and normalize are `Thread.forkedFromId`, `Thread.path`, `Thread.agentNickname`, `Thread.agentRole`, `Thread.gitInfo`, `Thread.name`, `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, `Turn.durationMs`, `ThreadListResponse.nextCursor`, `ThreadListResponse.backwardsCursor`, `ThreadTurnsListResponse.nextCursor`, `ThreadTurnsListResponse.backwardsCursor`, `ThreadLoadedListResponse.nextCursor`, and `ModelListResponse.nextCursor`.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
 - Server-initiated Codex requests that include `threadId` are routed to that Freshcodex thread. Server-initiated Codex requests without `threadId`, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
 - Codex server-request response shapes must stay discriminated by generated request method all the way through the shared contract, WebSocket protocol, controller, and adapter. Do not collapse all prompts to Claude-style `answers: Record<string, string>` or `decision: string`: `item/tool/requestUserInput` responds with `{ answers: Record<string, { answers: string[] }> }`, `mcpServer/elicitation/request` responds with `{ action, content, _meta }`, `item/permissions/requestApproval` responds with `{ permissions, scope, strictAutoReview? }`, and command/file approval responses keep their generated decision payloads.
@@ -1429,38 +1429,52 @@ codex app-server generate-ts --out /tmp/freshell-codex-app-server-schema-ts
 find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSONRPC|Initialize|Thread|Turn|Approval|Request|Item|Fork|Interrupt|ServerRequest|Model|Capabilities'
 ```
 
-Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, `model/list`, `modelProvider/capabilities/read`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `model/list { cursor?, limit?, includeHidden? }`, `model/list -> { data, nextCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
+Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, `model/list`, `modelProvider/capabilities/read`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor?, backwardsCursor? }`, `model/list { cursor?, limit?, includeHidden? }`, `model/list -> { data, nextCursor? }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
 Add generated inventory assertions for both methods and field-level requiredness. Tests must parse method names and important required fields from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings and required object fields. For wire-only constraints that TypeScript cannot express, such as `RequestId`'s integer numeric branch, `schema-inventory.ts` must also read the checked-in generated JSON Schema files. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
 
 Field inventory tests must fail if `protocol.ts` accepts a generated-required entity with missing required fields. At minimum, assert these local schema facts:
 
 ```ts
-expect(requiredFieldsForGeneratedType('v2/Thread.ts', 'Thread')).toEqual(expect.arrayContaining([
+expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadReadResponse.json', 'Thread')).toEqual(expect.arrayContaining([
   'id',
-  'forkedFromId',
   'preview',
   'ephemeral',
   'modelProvider',
   'createdAt',
   'updatedAt',
   'status',
-  'path',
   'cwd',
   'cliVersion',
   'source',
-  'agentNickname',
-  'agentRole',
-  'gitInfo',
-  'name',
   'turns',
 ]))
 expect(() => CodexThreadSchema.parse({ id: 'thread-missing-required-fields' })).toThrow(/turns|cwd|createdAt/i)
+expect(CodexThreadSchema.parse({
+  id: 'thread-optional-null-fields',
+  preview: '',
+  ephemeral: false,
+  modelProvider: 'openai',
+  createdAt: 1,
+  updatedAt: 1,
+  status: { type: 'idle' },
+  cwd: '/repo',
+  cliVersion: '0.128.0',
+  source: 'vscode',
+  turns: [],
+})).toMatchObject({
+  forkedFromId: null,
+  path: null,
+  agentNickname: null,
+  agentRole: null,
+  gitInfo: null,
+  name: null,
+})
 expect(requestIdTypeFromGeneratedTs()).toEqual('string | number')
 expect(requestIdNumericTypeFromGeneratedJsonSchema()).toEqual('integer')
 expect(CodexRequestIdSchema.parse(42)).toBe(42)
 expect(() => CodexRequestIdSchema.parse(42.5)).toThrow(/integer/i)
-expect(() => CodexThreadTurnsListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
+expect(CodexThreadTurnsListResultSchema.parse({ data: [] })).toMatchObject({ data: [], nextCursor: null, backwardsCursor: null })
 expect(CodexThreadReadResultSchema.parse({ thread: schemaValidThread({ turns: [] }) }).thread.turns).toEqual([])
 expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'vscode',
@@ -1472,12 +1486,34 @@ expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'subAgentOther',
 ]))
 expect(threadStartSourceValuesFromGeneratedSchema()).toEqual(['startup', 'clear'])
-expect(() => CodexThreadListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
-expect(() => CodexModelListResultSchema.parse({ data: [] })).toThrow(/nextCursor/i)
-expect(() => CodexThreadStartResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|instructionSources|approvalPolicy|sandbox/i)
-expect(() => CodexThreadResumeResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|instructionSources|approvalPolicy|sandbox/i)
-expect(() => CodexThreadForkResultSchema.parse({ thread: schemaValidThread({ turns: [] }), model: 'fixture', modelProvider: 'fixture', cwd: '/repo' })).toThrow(/instructionSources|approvalPolicy|sandbox|reasoningEffort/i)
-expect(requiredFieldsForGeneratedType('v2/Model.ts', 'Model')).toEqual(expect.arrayContaining([
+expect(CodexThreadListResultSchema.parse({ data: [] })).toMatchObject({ data: [], nextCursor: null, backwardsCursor: null })
+expect(CodexModelListResultSchema.parse({ data: [] })).toMatchObject({ data: [], nextCursor: null })
+expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadStartResponse.json', 'ThreadStartResponse')).toEqual(expect.arrayContaining([
+  'thread',
+  'model',
+  'modelProvider',
+  'cwd',
+  'approvalPolicy',
+  'approvalsReviewer',
+  'sandbox',
+]))
+expect(() => CodexThreadStartResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|approvalPolicy|sandbox/i)
+expect(() => CodexThreadResumeResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|approvalPolicy|sandbox/i)
+expect(() => CodexThreadForkResultSchema.parse({ thread: schemaValidThread({ turns: [] }), model: 'fixture', modelProvider: 'fixture', cwd: '/repo' })).toThrow(/approvalPolicy|sandbox/i)
+expect(CodexThreadForkResultSchema.parse({
+  thread: schemaValidThread({ turns: [] }),
+  model: 'fixture',
+  modelProvider: 'fixture-provider',
+  cwd: '/repo',
+  approvalPolicy: 'on-request',
+  approvalsReviewer: 'user',
+  sandbox: { type: 'dangerFullAccess' },
+})).toMatchObject({
+  serviceTier: null,
+  instructionSources: [],
+  reasoningEffort: null,
+})
+expect(requiredFieldsForGeneratedJsonSchema('v2/ModelListResponse.json', 'Model')).toEqual(expect.arrayContaining([
   'id',
   'model',
   'displayName',
@@ -1485,13 +1521,27 @@ expect(requiredFieldsForGeneratedType('v2/Model.ts', 'Model')).toEqual(expect.ar
   'hidden',
   'supportedReasoningEfforts',
   'defaultReasoningEffort',
-  'inputModalities',
-  'supportsPersonality',
-  'additionalSpeedTiers',
   'isDefault',
 ]))
 expect(requiredFieldsForGeneratedType('v2/ReasoningEffortOption.ts', 'ReasoningEffortOption')).toEqual(['reasoningEffort', 'description'])
-expect(() => CodexModelSchema.parse({ id: 'model-missing-required-fields' })).toThrow(/displayName|defaultReasoningEffort|inputModalities/i)
+expect(() => CodexModelSchema.parse({ id: 'model-missing-required-fields' })).toThrow(/displayName|defaultReasoningEffort/i)
+expect(CodexModelSchema.parse({
+  id: 'model-defaulted-fields',
+  model: 'model-defaulted-fields',
+  displayName: 'Defaulted Fields',
+  description: '',
+  hidden: false,
+  supportedReasoningEfforts: [],
+  defaultReasoningEffort: 'medium',
+  isDefault: false,
+})).toMatchObject({
+  inputModalities: ['text', 'image'],
+  supportsPersonality: false,
+  additionalSpeedTiers: [],
+  upgrade: null,
+  upgradeInfo: null,
+  availabilityNux: null,
+})
 expect(requiredFieldsForGeneratedType('v2/ModelProviderCapabilitiesReadResponse.ts', 'ModelProviderCapabilitiesReadResponse')).toEqual([
   'namespaceTools',
   'imageGeneration',
@@ -1523,16 +1573,17 @@ expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localI
 expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
 expect(() => CodexThreadStatusSchema.parse({ type: 'active' })).toThrow(/activeFlags/i)
 expect(turnStatusValuesFromGeneratedSchema()).toEqual(['completed', 'interrupted', 'failed', 'inProgress'])
-expect(requiredFieldsForGeneratedType('v2/Turn.ts', 'Turn')).toEqual(expect.arrayContaining([
+expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadReadResponse.json', 'Turn')).toEqual(expect.arrayContaining([
   'id',
   'items',
   'status',
-  'error',
-  'startedAt',
-  'completedAt',
-  'durationMs',
 ]))
-expect(() => CodexTurnSchema.parse({ id: 'turn-missing-required-nullables', items: [], status: 'completed' })).toThrow(/error|startedAt|completedAt|durationMs/i)
+expect(CodexTurnSchema.parse({ id: 'turn-missing-optional-nullables', items: [], status: 'completed' })).toMatchObject({
+  error: null,
+  startedAt: null,
+  completedAt: null,
+  durationMs: null,
+})
 expect(sessionSourceVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'cli',
   'vscode',
@@ -1780,9 +1831,13 @@ export const CodexThreadTurnsListParamsSchema = z.object({
 })
 
 export const CodexThreadTurnsListResultSchema = z.object({
-  data: z.array(CodexTurnSchema),
-  nextCursor: z.string().nullable(),
-  backwardsCursor: z.string().nullable(),
+  data: z.array(z.lazy(() => CodexTurnSchema)),
+  nextCursor: z.string().nullable().optional().default(null),
+  backwardsCursor: z.string().nullable().optional().default(null),
+})
+
+export const CodexThreadReadResultSchema = z.object({
+  thread: z.lazy(() => CodexThreadSchema),
 })
 
 export const CodexThreadSourceKindSchema = z.enum([
@@ -1844,20 +1899,47 @@ export const CodexThreadListParamsSchema = z.object({
 })
 
 export const CodexThreadListResultSchema = z.object({
-  data: z.array(CodexThreadSchema),
-  nextCursor: z.string().nullable(),
-  backwardsCursor: z.string().nullable(),
+  data: z.array(z.lazy(() => CodexThreadSchema)),
+  nextCursor: z.string().nullable().optional().default(null),
+  backwardsCursor: z.string().nullable().optional().default(null),
 })
 
 export const CodexThreadLoadedListResultSchema = z.object({
   data: z.array(z.string().min(1)),
-  nextCursor: z.string().nullable(),
+  nextCursor: z.string().nullable().optional().default(null),
 })
 
 export const CodexModelProviderCapabilitiesReadResultSchema = z.object({
   namespaceTools: z.boolean(),
   imageGeneration: z.boolean(),
   webSearch: z.boolean(),
+})
+
+export const CodexReasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+export const CodexModelSchema = z.object({
+  id: z.string().min(1),
+  model: z.string().min(1),
+  upgrade: z.string().nullable().optional().default(null),
+  upgradeInfo: z.unknown().nullable().optional().default(null),
+  availabilityNux: z.unknown().nullable().optional().default(null),
+  displayName: z.string(),
+  description: z.string(),
+  hidden: z.boolean(),
+  supportedReasoningEfforts: z.array(z.object({
+    reasoningEffort: CodexReasoningEffortSchema,
+    description: z.string(),
+  })),
+  defaultReasoningEffort: CodexReasoningEffortSchema,
+  inputModalities: z.array(z.enum(['text', 'image'])).optional().default(['text', 'image']),
+  supportsPersonality: z.boolean().optional().default(false),
+  additionalSpeedTiers: z.array(z.string()).optional().default([]),
+  isDefault: z.boolean(),
+})
+
+export const CodexModelListResultSchema = z.object({
+  data: z.array(CodexModelSchema),
+  nextCursor: z.string().nullable().optional().default(null),
 })
 
 export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
@@ -1868,7 +1950,6 @@ export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('mention'), name: z.string().min(1), path: z.string().min(1) }),
 ])
 
-export const CodexReasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
 export const CodexApprovalPolicySchema = z.union([
   z.enum(['untrusted', 'on-failure', 'on-request', 'never']),
   z.object({
@@ -1920,16 +2001,16 @@ export const CodexServiceTierSchema = z.enum(['fast', 'flex'])
 export const CodexApprovalsReviewerSchema = z.enum(['user', 'auto_review', 'guardian_subagent'])
 
 const CodexThreadLifecycleResultSchema = z.object({
-  thread: CodexThreadSchema,
+  thread: z.lazy(() => CodexThreadSchema),
   model: z.string().min(1),
   modelProvider: z.string().min(1),
-  serviceTier: CodexServiceTierSchema.nullable(),
+  serviceTier: CodexServiceTierSchema.nullable().optional().default(null),
   cwd: z.string().min(1),
-  instructionSources: z.array(z.string()),
+  instructionSources: z.array(z.string()).optional().default([]),
   approvalPolicy: CodexApprovalPolicySchema,
   approvalsReviewer: CodexApprovalsReviewerSchema,
   sandbox: CodexSandboxPolicySchema,
-  reasoningEffort: CodexReasoningEffortSchema.nullable(),
+  reasoningEffort: CodexReasoningEffortSchema.nullable().optional().default(null),
 })
 
 export const CodexThreadStartResultSchema = CodexThreadLifecycleResultSchema
@@ -1937,7 +2018,7 @@ export const CodexThreadResumeResultSchema = CodexThreadLifecycleResultSchema
 export const CodexThreadForkResultSchema = CodexThreadLifecycleResultSchema
 
 export const CodexTurnStartResultSchema = z.object({
-  turn: CodexTurnSchema,
+  turn: z.lazy(() => CodexTurnSchema),
 })
 
 export const CodexTurnInterruptParamsSchema = z.object({
@@ -1962,28 +2043,28 @@ export const CodexTurnSchema = z.object({
     message: z.string(),
     codexErrorInfo: z.unknown().nullable(),
     additionalDetails: z.string().nullable(),
-  }).nullable(),
-  startedAt: z.number().nullable(),
-  completedAt: z.number().nullable(),
-  durationMs: z.number().nullable(),
+  }).nullable().optional().default(null),
+  startedAt: z.number().nullable().optional().default(null),
+  completedAt: z.number().nullable().optional().default(null),
+  durationMs: z.number().nullable().optional().default(null),
 })
 export const CodexThreadSchema = z.object({
   id: z.string().min(1),
-  forkedFromId: z.string().nullable(),
+  forkedFromId: z.string().nullable().optional().default(null),
   preview: z.string(),
   ephemeral: z.boolean(),
   modelProvider: z.string(),
   createdAt: z.number(),
   updatedAt: z.number(),
   status: CodexThreadStatusSchema,
-  path: z.string().nullable(),
+  path: z.string().nullable().optional().default(null),
   cwd: z.string().min(1),
   cliVersion: z.string(),
   source: CodexSessionSourceSchema,
-  agentNickname: z.string().nullable(),
-  agentRole: z.string().nullable(),
-  gitInfo: CodexGitInfoSchema.nullable(),
-  name: z.string().nullable(),
+  agentNickname: z.string().nullable().optional().default(null),
+  agentRole: z.string().nullable().optional().default(null),
+  gitInfo: CodexGitInfoSchema.nullable().optional().default(null),
+  name: z.string().nullable().optional().default(null),
   turns: z.array(CodexTurnSchema),
 }).passthrough()
 export const CodexServerRequestSchema = z.discriminatedUnion('method', [...])
@@ -4222,7 +4303,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware, key Freshcodex state by full `{ sessionType, provider, sessionId }` locators, and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
 - Codex server-initiated request ids round-trip unchanged through pending approval/question state, WebSocket response actions, adapter response serialization, and error events whether the generated JSON-RPC id is a string or an integer number.
-- Codex protocol schemas and fixtures reject impossible partial app-server entities; generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing.
+- Codex protocol schemas and fixtures reject impossible partial app-server entities, while accepting and normalizing generated-optional JSON wire fields. Generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing; generated-optional fields such as response cursors, optional thread metadata, turn timing/error fields, and lifecycle response defaults normalize to explicit `null`/default values before fresh-agent contracts depend on them.
 - Codex model pages and provider capability reads cross REST, adapter, and settings UI through typed fresh-agent schemas; provider-level `namespaceTools`, `imageGeneration`, and `webSearch` booleans are not lost as unknown model-item fields.
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
