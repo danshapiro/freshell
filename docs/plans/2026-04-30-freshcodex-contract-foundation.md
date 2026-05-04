@@ -103,6 +103,27 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Runtime-global or connection-scoped notification methods must be surfaced as runtime/capability warnings or explicitly ignored by classification, not used to invalidate an arbitrary Freshcodex thread: `command/exec/outputDelta` is scoped to a `processId` from unsupported standalone `command/exec`; `fs/changed` is scoped to a `watchId` from unsupported `fs/watch`; `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `configWarning`, `warning` with `threadId: null`, `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted` have no Freshcodex thread locator. If a future task implements the corresponding app-server feature, it must add an ownership map from that feature's request id/watch id/process id to a Freshcodex locator before treating these as thread-visible.
 - Generated notifications that may be ignored only by an explicit non-visible allowlist: `skills/changed`, `account/updated`, `account/rateLimits/updated`, `app/list/updated`, `remoteControl/status/changed`, `externalAgentConfig/import/completed`, `deprecationNotice`, `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`, and `account/login/completed`.
 
+## Executable Schema Traceability Foundation
+
+The repeated planning-review nonconvergence was not a disagreement about product direction; it was evidence that the plan was relying on manual rediscovery of generated Codex protocol details. This plan therefore treats the generated schema snapshot and an executable traceability matrix as the foundation. The examples in this document are regression seeds, not the source of truth. If an example and the checked-in generated schema disagree, the generated schema and traceability tests win.
+
+Task 4 must create `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts` next to the generated schema inventory. That artifact is the required ownership map for every generated Codex surface Freshcodex can encounter:
+
+- Client requests and responses: generated method, generated params schema, generated result schema, strict outbound parser, app-server client method, rich-runtime method, adapter/runtime-manager method, REST or WebSocket exposure, UI capability owner, fixture tests, and explicit supported or unsupported classification.
+- Server notifications: generated method, generated params schema, route classification (`thread`, `runtimeGlobal`, `connectionScoped`, or `nonVisible`), exact locator extraction rule, invalidation or patch behavior, user-visible warning behavior when applicable, and tests proving no notification falls through to subscriber state as a fake thread locator.
+- Server requests: generated method, generated params schema, generated response schema, request id type preservation, route classification, pending request contract, UI response owner, JSON-RPC result or error serializer, and tests proving legacy root approvals route by `conversationId` while auth refresh remains runtime-global.
+- Thread, turn, item, runtime-setting, model, source, status, and leaf types: generated file, wire-required fields, generated-optional/defaulted fields, protocol parser behavior, normalized fresh-agent schema, lossless extension fields, UI renderer or supported-negative behavior, fixtures, and intentional omissions.
+- Shared fresh-agent contracts: shared schema name, producer boundary, server parser, client parser, Redux owner, persistence or pane-lifecycle owner if applicable, UI consumer, fixture, and regression test.
+
+The traceability test is a gate, not documentation. It must fail if any generated method, notification, server request, item variant, runtime leaf enum, or shared fresh-agent schema lacks a classification. It must also fail if a classification says `implemented` but has no parser, normalizer, user-visible behavior or explicit API owner, and at least one test path. Intentional omissions are allowed only when they carry a stable reason, a typed unsupported/error behavior, and a test proving the unsupported path is clear to users or harmlessly non-visible.
+
+This changes how implementation tasks should be executed:
+
+- Do not add one-off Codex protocol facts directly to component or adapter tests first. Add or update the generated snapshot and traceability entry, then write the failing parser/normalizer/UI test derived from that entry.
+- Do not classify a method as implemented merely because `CodexAppServerClient` can send it. A generated method is implemented only when it is represented through the fresh-agent adapter/runtime/API boundary and has a user-visible consumer or an intentionally documented internal owner.
+- Do not add permissive catch-all transcript items, server-request responses, or notification routing fallbacks. Unknown future generated variants should fail the traceability/schema audit until intentionally modeled.
+- Do not repair schema drift by weakening tests. Regenerate the reduced schema snapshot, update traceability, update parsers/normalizers/UI/tests, and then re-run `npm run audit:codex-app-server-schema`.
+
 ## User-Visible End State
 
 - The Freshcodex pane picker entry creates a `fresh-agent` pane with `sessionType: 'freshcodex'` and `provider: 'codex'`.
@@ -137,6 +158,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Freshcodex restored-session loading is also page-first. When a browser-restored or server-restarted Freshcodex pane needs to load a thread into the stdio app-server process, the Codex adapter must call `thread/resume` with `excludeTurns: true` and then fetch the visible page through `thread/turns/list`; it must not rely on a default `thread/resume` response that may include all turns.
 - Fresh-agent `revision` is a Freshell normalized read-model revision, not a Codex app-server revision. For Codex, derive it from runtime-manager event ordering and stable thread metadata such as `thread.updatedAt`; preserve the app-server source version separately in `extensions.codex.sourceVersion`. Turn page and turn body requests compare against the Freshell normalized revision. Do not send nonexistent Codex `revision` fields to app-server requests.
 - Codex app-server protocol schemas are owned by `server/coding-cli/codex-app-server/protocol.ts`, and must be cross-checked with `codex app-server generate-json-schema` during implementation.
+- Codex generated-schema traceability is owned by `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts`, and shared fresh-agent contract traceability is owned by `test/fixtures/fresh-agent/contract-traceability.ts`. These are executable completeness gates, not optional docs. Any generated surface or shared contract added without a parser, normalizer, API/action owner, UI behavior or supported-negative owner, and test path must fail the relevant traceability test before implementation can proceed.
 - Codex app-server transports are separated by runtime purpose. `server/coding-cli/codex-app-server/client.ts` owns JSON-RPC request/response semantics over an injected transport; `transport.ts` owns concrete stdio JSONL and websocket framing. `runtime.ts` remains the loopback websocket runtime used by `CodexLaunchPlanner` and raw Codex terminal `--remote` attach. New `rich-runtime.ts` is the Freshcodex-only stdio runtime and must not return or require a `wsUrl`.
 - Codex JSON-RPC messages omit the `jsonrpc` property on the wire and emit `initialized` exactly once after successful `initialize`.
 - Codex request ids must round-trip as generated `string | number`; never coerce server-initiated request ids to numbers before responding. Runtime Zod schemas should use `z.number().int()` for the numeric branch because the generated JSON wire schema constrains numeric `RequestId` values to integers even though TypeScript can only represent that branch as `number`.
@@ -181,7 +203,9 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `src/components/fresh-agent/fresh-agent-policy.ts` - small runtime/session policy helpers for labels, action availability, and restore behavior.
 - `test/fixtures/fresh-agent/codex/contract-fixtures.ts` - schema-validated Codex snapshot, turn page, turn body, event, approval, review, and fork fixtures.
 - `test/fixtures/fresh-agent/claude/contract-fixtures.ts` - schema-validated Claude snapshot/page/body fixtures that preserve existing behavior.
+- `test/fixtures/fresh-agent/contract-traceability.ts` - executable owner map from shared fresh-agent schemas to producer boundaries, parser boundaries, state owners, UI consumers, fixtures, and tests.
 - `test/unit/shared/fresh-agent-contract.test.ts`
+- `test/unit/shared/fresh-agent-contract-traceability.test.ts`
 - `test/unit/client/lib/api.fresh-agent-contract.test.ts`
 - `test/unit/client/components/fresh-agent/FreshAgentShell.test.tsx`
 - `test/unit/client/components/fresh-agent/FreshAgentTranscriptVirtualList.test.tsx`
@@ -192,6 +216,8 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts` - Freshcodex stdio runtime lifecycle and rich API proxy coverage.
 - `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/` - checked-in schema audit snapshot generated from local `codex app-server generate-ts` / `generate-json-schema`, reduced to the files needed by tests.
 - `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts` - helper that extracts method/type inventories from the checked-in generated schema snapshot so protocol tests do not depend on `/tmp` state.
+- `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts` - executable traceability matrix classifying every generated client request, server request, server notification, item variant, runtime leaf type, response shape, and intentional omission.
+- `test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts`
 - `scripts/audit-codex-app-server-schema.ts` - developer audit script that regenerates the local Codex schema, compares it with the checked-in fixture inventory, and prints the exact methods/types requiring reclassification.
 
 ### Modify
@@ -278,6 +304,7 @@ The correct route is:
 - Merge current main first because main contains fixes in exactly the cutover surfaces.
 - Split session-type identity from runtime-provider adapter lookup before depending on either in contract tests. `freshclaude` and `kilroy` sharing the Claude adapter must be an intentional many-to-one mapping, not a Map overwrite side effect.
 - Lock shared Zod contracts for all read-model payloads and action responses.
+- Lock executable traceability for shared fresh-agent schemas and generated Codex schemas before relying on individual examples. The matrix must prove every generated method/request/notification/item/leaf and every shared schema has an owner across parser, normalizer, API/action, UI or supported-negative behavior, fixture, and test.
 - Enforce those contracts on both server and client boundaries.
 - Replace the temporary `freshAgentSlice` re-export of `agentChatSlice` with a real contract-shaped fresh-agent slice. Freshclaude compatibility can be implemented through the Claude adapter and explicit migration/projection code, not by keeping Fresh-agent state as a renamed agent-chat state tree.
 - Replace only Freshcodex's app-server dependency on the experimental websocket transport with a dedicated stdio JSONL rich runtime, while preserving the existing websocket runtime for raw Codex terminal remote attach. Then normalize Codex app-server data fully using app-server generated schemas to avoid guessing method shapes.
@@ -425,8 +452,10 @@ git commit -m "Sync main into freshcodex contract foundation"
 - Modify: `shared/fresh-agent.ts`
 - Modify: `shared/read-models.ts`
 - Test: `test/unit/shared/fresh-agent-contract.test.ts`
+- Test: `test/unit/shared/fresh-agent-contract-traceability.test.ts`
 - Test: `test/fixtures/fresh-agent/codex/contract-fixtures.ts`
 - Test: `test/fixtures/fresh-agent/claude/contract-fixtures.ts`
+- Test: `test/fixtures/fresh-agent/contract-traceability.ts`
 
 - [ ] **Step 1: Write failing contract tests**
 
@@ -494,6 +523,7 @@ expect(FreshAgentTranscriptItemSchema.parse({
 
 Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentThreadListPageSchema`, `FreshAgentModelListPageSchema`, `FreshAgentModelProviderCapabilitiesSchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures. The thread-list fixture must preserve `items`, `nextCursor`, and `backwardsCursor` because Codex `thread/list` is paginated and Freshcodex history must not collapse the app-server page to an array. The model-list fixture must preserve `items`, `nextCursor`, and provider-level capabilities when available because Codex `model/list` is paginated and Freshcodex settings must not treat the first page as a complete model catalog or drop `modelProvider/capabilities/read` data at the shared contract boundary.
 Also assert that `FreshAgentInputImageSchema`, `FreshAgentRuntimeSettingsSchema`, `FreshAgentCodexRuntimeSettingsSchema`, and `FreshAgentClaudeRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, provider-specific permission/approval policy, and provider-specific effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code. The broad `FreshAgentRuntimeSettingsSchema` may accept historical Claude and Codex values for persisted data, but the provider-specific schemas are the executable action gate. The test must prove Freshcodex accepts generated Codex effort values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and rejects legacy Claude-only effort values such as `max` through `FreshAgentCodexRuntimeSettingsSchema` before an adapter call. It must also prove Freshcodex accepts generated Codex approval policies (`untrusted`, `on-failure`, `on-request`, `never`, and granular policy objects) and rejects Claude permission modes such as `bypassPermissions` through the same provider-specific parser. Add the mirror assertion that Freshclaude still accepts its existing Claude permission/effort values through `FreshAgentClaudeRuntimeSettingsSchema`.
+Add `test/fixtures/fresh-agent/contract-traceability.ts` and `test/unit/shared/fresh-agent-contract-traceability.test.ts` before implementing the schemas. The traceability test must enumerate every exported durable schema from `shared/fresh-agent-contract.ts` and require an owner for producer boundary, server parse boundary, client parse boundary, state/persistence boundary when applicable, UI consumer, fixture, and test. It should fail for any exported contract schema that is not listed, and it should fail for any listed schema whose owner/test path is empty. This prevents future shared contract expansion from becoming another implicit, unreviewed surface.
 
 Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
 
@@ -676,7 +706,9 @@ expect(FreshAgentModelListPageSchema.parse({
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/shared/fresh-agent-contract.test.ts
+npm run test:vitest -- \
+  test/unit/shared/fresh-agent-contract.test.ts \
+  test/unit/shared/fresh-agent-contract-traceability.test.ts
 ```
 
 Expected: FAIL because `shared/fresh-agent-contract.ts` does not exist.
@@ -1334,12 +1366,48 @@ export type FreshAgentServerRequestId = z.infer<typeof FreshAgentServerRequestId
 export type FreshAgentServerRequestResponse = z.infer<typeof FreshAgentServerRequestResponseSchema>
 ```
 
+Create `test/fixtures/fresh-agent/contract-traceability.ts` with a small, explicit data shape so completeness is testable:
+
+```ts
+export type FreshAgentContractTraceabilityEntry = {
+  schemaName: string
+  producerBoundary: string
+  serverParser: string
+  clientParser: string
+  stateOwner: string
+  persistenceOwner: string | null
+  uiConsumer: string
+  fixtureOwner: string
+  testOwner: string
+  notes?: string
+}
+
+export const freshAgentContractTraceability: FreshAgentContractTraceabilityEntry[] = [
+  {
+    schemaName: 'FreshAgentThreadSnapshotSchema',
+    producerBoundary: 'server/fresh-agent/runtime-manager.ts',
+    serverParser: 'FreshAgentThreadSnapshotSchema.parse',
+    clientParser: 'src/lib/api.ts parseFreshAgentThreadSnapshot',
+    stateOwner: 'src/store/freshAgentSlice.ts',
+    persistenceOwner: null,
+    uiConsumer: 'src/components/fresh-agent/useFreshAgentThreadController.ts',
+    fixtureOwner: 'test/fixtures/fresh-agent/codex/contract-fixtures.ts',
+    testOwner: 'test/unit/shared/fresh-agent-contract.test.ts',
+  },
+  // Replace this comment with one entry for every exported durable FreshAgent*Schema before committing.
+]
+```
+
+The test should compute exported durable schema names from `shared/fresh-agent-contract.ts` text and compare them to `freshAgentContractTraceability.map((entry) => entry.schemaName)`. Exclude private helper schemas that are not exported, but do not exclude exported schemas merely because only one provider currently uses them. The placeholder comment above must not survive the task; the traceability test must fail if any entry field is blank or if any exported durable schema lacks an entry.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/shared/fresh-agent-contract.test.ts
+npm run test:vitest -- \
+  test/unit/shared/fresh-agent-contract.test.ts \
+  test/unit/shared/fresh-agent-contract-traceability.test.ts
 ```
 
 Expected: PASS.
@@ -1351,7 +1419,10 @@ Move any duplicate provider/session enum literals from `shared/fresh-agent.ts` i
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/shared/fresh-agent-contract.test.ts test/unit/shared/fresh-agent-registry.test.ts
+npm run test:vitest -- \
+  test/unit/shared/fresh-agent-contract.test.ts \
+  test/unit/shared/fresh-agent-contract-traceability.test.ts \
+  test/unit/shared/fresh-agent-registry.test.ts
 npm run typecheck
 ```
 
@@ -1363,8 +1434,10 @@ Expected: PASS.
 git add \
   shared/fresh-agent-contract.ts shared/fresh-agent.ts shared/read-models.ts \
   test/unit/shared/fresh-agent-contract.test.ts \
+  test/unit/shared/fresh-agent-contract-traceability.test.ts \
   test/fixtures/fresh-agent/codex/contract-fixtures.ts \
-  test/fixtures/fresh-agent/claude/contract-fixtures.ts
+  test/fixtures/fresh-agent/claude/contract-fixtures.ts \
+  test/fixtures/fresh-agent/contract-traceability.ts
 git commit -m "Add strict fresh-agent read-model contracts"
 ```
 
@@ -1831,7 +1904,9 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts`
 - Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`
+- Test: `test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/transport.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/client.test.ts`
 - Test: `test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts`
@@ -1853,6 +1928,49 @@ find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSON
 Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, `model/list`, `modelProvider/capabilities/read`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor?, backwardsCursor? }`, `model/list { cursor?, limit?, includeHidden? }`, `model/list -> { data, nextCursor? }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
 Add generated inventory assertions for both methods and field-level requiredness. Tests must parse method names and important required fields from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings and required object fields. For wire-only constraints that TypeScript cannot express, such as `RequestId`'s integer numeric branch, `schema-inventory.ts` must also read the checked-in generated JSON Schema files. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
+
+Create `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts` and `test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts` in the same red step. This test must use `schema-inventory.ts` as its input and fail until every generated Codex surface is classified. The matrix entries should be data, not prose comments, so tests can assert completeness and cross-field consistency:
+
+```ts
+type GeneratedCodexTraceabilityEntry = {
+  generatedKind: 'clientRequest' | 'serverRequest' | 'serverNotification' | 'threadItem' | 'runtimeLeaf' | 'entity' | 'response'
+  generatedName: string
+  generatedSource: string
+  support: 'implemented' | 'unsupported' | 'nonVisible' | 'runtimeGlobal' | 'connectionScoped'
+  protocolParser: string
+  outboundStrict?: boolean
+  normalizer?: string
+  freshAgentSchema?: string
+  runtimeOwner?: string
+  apiOrActionOwner?: string
+  uiOwner?: string
+  route?: { kind: 'thread' | 'runtimeGlobal' | 'connectionScoped' | 'nonVisible'; locator: string | null }
+  requiredFieldsCoveredBy?: string[]
+  optionalDefaultsCoveredBy?: string[]
+  fixtureOwners: string[]
+  testOwners: string[]
+  intentionalOmission?: { reason: string; behavior: string; test: string }
+}
+```
+
+The failing tests must check:
+
+```ts
+expect(unclassifiedGeneratedClientRequests()).toEqual([])
+expect(unclassifiedGeneratedServerRequests()).toEqual([])
+expect(unclassifiedGeneratedServerNotifications()).toEqual([])
+expect(unclassifiedGeneratedThreadItemVariants()).toEqual([])
+expect(unclassifiedGeneratedRuntimeLeaves()).toEqual([])
+expect(implementedEntriesMissingOwners()).toEqual([])
+expect(strictOutboundEntriesWithPassthrough()).toEqual([])
+expect(unsupportedEntriesMissingUserVisibleBehavior()).toEqual([])
+expect(notificationEntriesWithImplicitSubscriberRouting()).toEqual([])
+expect(serverRequestEntriesMissingGeneratedResponseSchema()).toEqual([])
+expect(itemEntriesMissingFreshAgentSchemaOrLosslessExtension()).toEqual([])
+expect(codexEntriesReferencingUnknownFreshAgentSchemas()).toEqual([])
+```
+
+This is the durable replacement for manual issue-by-issue discovery. Each later test in Task 4 and Task 5 can still assert concrete fixtures, but those fixtures must be derived from traceability entries. A new Codex schema release that adds one generated method, request, notification, item variant, enum value, response shape, or required/defaulted field must make the traceability gate red before it can silently reach the adapter or UI.
 
 Field inventory tests must fail if `protocol.ts` accepts a generated-required entity with missing required fields or rejects generated-defaulted fields that may be omitted on the JSON wire. Add `schema-inventory.ts` helpers for both required fields and defaulted JSON-schema properties, for example `requiredFieldsForGeneratedJsonSchema(...)` and `defaultedFieldsForGeneratedJsonSchema(...)`. At minimum, assert these local schema facts:
 
@@ -2162,7 +2280,7 @@ Compare generated method names to two explicit sets:
 - implemented in Freshcodex rich runtime: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, `modelProvider/capabilities/read`
 - explicitly unsupported in Freshcodex rich runtime: every other generated method
 
-The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. It must also fail if an implemented client request parser accepts a field that is not in the generated parameter type. Add negative assertions that `CodexThreadStartParamsSchema`, `CodexThreadResumeParamsSchema`, `CodexThreadForkParamsSchema`, and `CodexTurnStartParamsSchema` reject stale fields such as `persistExtendedHistory`, `richClient`, `experimentalRawEvents`, `revision`, `includeBodies`, and thread-level `sandbox` on `turn/start`. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
+The traceability matrix must own these sets. The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. It must also fail if an implemented client request parser accepts a field that is not in the generated parameter type. Add negative assertions that `CodexThreadStartParamsSchema`, `CodexThreadResumeParamsSchema`, `CodexThreadForkParamsSchema`, and `CodexTurnStartParamsSchema` reject stale fields such as `persistExtendedHistory`, `richClient`, `experimentalRawEvents`, `revision`, `includeBodies`, and thread-level `sandbox` on `turn/start`. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
 
 Add the same generated-inventory coverage for `ServerNotification` routing. Every method in the checked-in `ServerNotification.ts` snapshot must be classified as exactly one of `thread`, `runtimeGlobal`, `connectionScoped`, or `nonVisible`. The classification test must prove `thread/started` extracts `params.thread.id`, ordinary thread events extract `params.threadId`, `warning` branches on nullable `params.threadId`, and no-locator `command/exec/outputDelta` / `fs/changed` do not produce a Freshcodex thread invalidation until a future feature records a process/watch owner.
 
@@ -2363,6 +2481,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
@@ -2373,6 +2492,8 @@ npm run test:vitest -- \
 Expected: FAIL because the client still owns WebSocket directly, emits `"jsonrpc": "2.0"`, does not send `initialized`, parses the old initialize result, exposes stale turn-read behavior, lacks turn, fork, interrupt, and server-request response methods, and has no Freshcodex-only stdio rich runtime.
 
 - [ ] **Step 3: Implement app-server protocol methods**
+
+Implement `schema-traceability.ts` before filling in broad protocol/client behavior. Keep it data-only and importable by tests without starting Codex. The entries should reference the exact parser/export names that this step adds to `protocol.ts`, the rich-runtime/client method names that own supported requests, and the UI/API owners that later tasks must satisfy. During this step it is acceptable for Task 5 UI owners to point at planned owners such as `FreshAgentItemCard` or `FreshAgentWorkspacePanel`, but they must be concrete file/component names and later tasks must update or satisfy them. Do not leave placeholder owners such as `TODO`, `unknown`, or `adapter`.
 
 Update `protocol.ts` with schema names matching the generated app-server schema. The implementation must include generated response schemas for every server request that Freshell answers, not only request-param schemas. The checked-in schema snapshot and `schema-inventory.ts` should cover `CommandExecutionRequestApprovalResponse`, `FileChangeRequestApprovalResponse`, `PermissionsRequestApprovalResponse`, `ToolRequestUserInputResponse`, `McpServerElicitationRequestResponse`, `DynamicToolCallResponse`, `ChatgptAuthTokensRefreshResponse`, root `ApplyPatchApprovalResponse`, root `ExecCommandApprovalResponse`, and root `ReviewDecision` so tests fail when Codex changes the payload shape Freshell sends back to unblock a turn.
 
@@ -2858,6 +2979,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
@@ -2875,6 +2997,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
@@ -2886,7 +3009,7 @@ npm run audit:codex-app-server-schema
 npm run typecheck:server
 ```
 
-Expected: PASS. If `npm run audit:codex-app-server-schema` fails because the installed `codex` schema differs from the checked-in snapshot, do not proceed by weakening tests; regenerate the snapshot, update protocol schemas and classifications, and rerun this task.
+Expected: PASS. If `npm run audit:codex-app-server-schema` fails because the installed `codex` schema differs from the checked-in snapshot or because the traceability matrix has unclassified generated surfaces, do not proceed by weakening tests; regenerate the snapshot, update protocol schemas, update traceability classifications, and rerun this task.
 
 - [ ] **Step 6: Commit**
 
@@ -2997,7 +3120,9 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadResponse.ts \
   test/fixtures/coding-cli/codex-app-server/schema-inventory.ts \
+  test/fixtures/coding-cli/codex-app-server/schema-traceability.ts \
   scripts/audit-codex-app-server-schema.ts \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
   test/unit/server/coding-cli/codex-app-server/client.test.ts \
   test/unit/server/coding-cli/codex-app-server/rich-runtime.test.ts \
@@ -3022,6 +3147,7 @@ git commit -m "Extend Codex app-server client for rich turns"
 - Modify: `src/store/paneTypes.ts`
 - Modify: `test/fixtures/fresh-agent/codex/contract-fixtures.ts`
 - Modify: `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`
+- Modify: `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts`
 - Test: `test/unit/server/fresh-agent/codex-normalize.test.ts`
 - Test: `test/unit/server/fresh-agent/codex-adapter.test.ts`
 - Test: `test/unit/server/fresh-agent/runtime-manager.test.ts`
@@ -3031,6 +3157,8 @@ git commit -m "Extend Codex app-server client for rich turns"
 - [ ] **Step 1: Write failing normalization and event tests**
 
 Require all documented Codex item variants to normalize into `FreshAgentTranscriptItemSchema` variants. Build every raw fixture with a helper that first parses the fixture through `CodexThreadItemSchema` or `CodexTurnSchema`:
+
+Drive this fixture list from `schema-traceability.ts`, not from hand-maintained test arrays. The normalization test should iterate every traceability entry with `generatedKind: 'threadItem'` and require either a `normalizer` plus `freshAgentSchema` fixture that parses, or an `intentionalOmission` with a typed supported-negative behavior. The concrete examples below are minimum regression fixtures for the historical nonconvergence findings; the traceability matrix is what proves the list is exhaustive.
 
 ```ts
 function parseCodexItemFixture(value: unknown): CodexThreadItem {
@@ -3641,6 +3769,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/fresh-agent/codex-normalize.test.ts \
   test/unit/server/fresh-agent/codex-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
@@ -4090,6 +4219,7 @@ Run:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/server/coding-cli/codex-app-server/schema-traceability.test.ts \
   test/unit/server/fresh-agent/codex-normalize.test.ts \
   test/unit/server/fresh-agent/codex-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
@@ -4127,6 +4257,7 @@ git add \
   shared/ws-protocol.ts server/ws-handler.ts src/lib/fresh-agent-ws.ts \
   src/store/paneTypes.ts \
   test/fixtures/fresh-agent/codex/contract-fixtures.ts \
+  test/fixtures/coding-cli/codex-app-server/schema-traceability.ts \
   test/unit/server/fresh-agent/codex-normalize.test.ts \
   test/unit/server/fresh-agent/codex-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
@@ -5393,6 +5524,8 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 ## Final Acceptance Checklist
 
 - `shared/fresh-agent-contract.ts` owns typed schemas for snapshots, turn pages, turn bodies, items, provider extensions, and action results.
+- `test/fixtures/fresh-agent/contract-traceability.ts` covers every shared fresh-agent durable schema with producer, parser, state, UI, fixture, and test owners.
+- `test/fixtures/coding-cli/codex-app-server/schema-traceability.ts` covers every generated Codex client request, response, server request, server notification, item variant, runtime leaf type, and explicit omission; the traceability tests pass without unclassified generated surfaces.
 - Server adapters and runtime manager parse every fresh-agent payload before returning it.
 - Client API parses fresh-agent payloads and surfaces controlled errors.
 - Session-type registry and runtime-provider adapter registry are separate; `freshclaude` and `kilroy` can share the Claude adapter without overwriting provider lookup.
