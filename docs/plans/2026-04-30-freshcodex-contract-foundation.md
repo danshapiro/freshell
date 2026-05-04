@@ -59,7 +59,7 @@ Schema-grounded protocol facts to preserve:
 - Initialization is `initialize` with `{ clientInfo, capabilities }`, followed by exactly one client notification `{ method: 'initialized' }` after a valid response. `InitializeCapabilities` has `experimentalApi` and optional `optOutNotificationMethods`. `InitializeResponse` has `userAgent`, `codexHome`, `platformFamily`, and `platformOs`; there is no `protocolVersion` field in this local schema. Because this plan checks in and classifies the normal generated schema, Freshcodex must initialize with `experimentalApi: false`. If a future plan opts into experimental APIs, it must regenerate the checked-in snapshot with `--experimental`, classify every added method/field/notification, and update fixtures before sending `experimentalApi: true`.
 - Generated client methods relevant enough to classify include `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `thread/compact/start`, `thread/rollback`, `turn/start`, `turn/steer`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`; Task 4 defines which of these Freshcodex implements now versus disables with a clear unsupported path. There is no `thread/turn/read` method.
 - `thread/start` accepts runtime settings such as `model`, `modelProvider`, `serviceTier`, `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`, `config`, instructions/personality, `ephemeral`, and `sessionStartSource`; it does not accept `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
-- `thread/resume` accepts `threadId`, the same major runtime overrides, and `excludeTurns?: boolean`; it does not accept `persistExtendedHistory`.
+- `thread/resume` accepts `threadId`, the same major runtime overrides, and `excludeTurns?: boolean`; it does not accept `persistExtendedHistory`. Freshcodex restored-pane attach and any adapter path that resumes a thread before calling `thread/turns/list` must send `excludeTurns: true` so app-server does not populate the resumed `thread.turns` with a full transcript as part of normal snapshot/attach work.
 - `thread/read` params are exactly `{ threadId: string, includeTurns: boolean }`. `includeTurns` is required in the generated TypeScript. The response is `{ thread }`.
 - `thread/turns/list` params are `{ threadId, cursor?, limit?, sortDirection? }`. It does not accept `revision` or `includeBodies`. The response is `{ data, nextCursor, backwardsCursor }`.
 - `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, local images are `{ type: 'localImage', path }`, skills are `{ type: 'skill', name, path }`, and mentions are `{ type: 'mention', name, path }`.
@@ -125,6 +125,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - All fresh-agent REST payloads parse again in `src/lib/api.ts` before UI state sees them.
 - A snapshot, turn page, or turn body with an invalid contract is a controlled error, not partially rendered data.
 - Freshcodex snapshots are lightweight. They may include thread metadata, pending request state, extensions, and at most a bounded initial turn page. They must not call `thread/read { includeTurns: true }` merely to render the normal snapshot.
+- Freshcodex restored-session loading is also page-first. When a browser-restored or server-restarted Freshcodex pane needs to load a thread into the stdio app-server process, the Codex adapter must call `thread/resume` with `excludeTurns: true` and then fetch the visible page through `thread/turns/list`; it must not rely on a default `thread/resume` response that may include all turns.
 - Fresh-agent `revision` is a Freshell normalized read-model revision, not a Codex app-server revision. For Codex, derive it from runtime-manager event ordering and stable thread metadata such as `thread.updatedAt`; preserve the app-server source version separately in `extensions.codex.sourceVersion`. Turn page and turn body requests compare against the Freshell normalized revision. Do not send nonexistent Codex `revision` fields to app-server requests.
 - Codex app-server protocol schemas are owned by `server/coding-cli/codex-app-server/protocol.ts`, and must be cross-checked with `codex app-server generate-json-schema` during implementation.
 - Codex app-server transports are separated by runtime purpose. `server/coding-cli/codex-app-server/client.ts` owns JSON-RPC request/response semantics over an injected transport; `transport.ts` owns concrete stdio JSONL and websocket framing. `runtime.ts` remains the loopback websocket runtime used by `CodexLaunchPlanner` and raw Codex terminal `--remote` attach. New `rich-runtime.ts` is the Freshcodex-only stdio runtime and must not return or require a `wsUrl`.
@@ -1780,6 +1781,18 @@ expect(fakeTransport.sent).toContainEqual({ method: 'initialized' })
 await expect(client.readThread({ threadId: 'thread-1', includeTurns: true }))
   .resolves.toMatchObject({ thread: { id: 'thread-1' } })
 
+await expect(client.resumeThread({ threadId: 'thread-1', excludeTurns: true }))
+  .resolves.toMatchObject({ thread: { id: 'thread-1', turns: [] } })
+expect(fakeTransport.sent).toContainEqual(expect.objectContaining({
+  method: 'thread/resume',
+  params: expect.objectContaining({
+    threadId: 'thread-1',
+    excludeTurns: true,
+  }),
+}))
+expect(fakeTransport.sent.find((message) => message.method === 'thread/resume')?.params)
+  .not.toHaveProperty('persistExtendedHistory')
+
 await expect(client.listThreadTurns({ threadId: 'thread-1', limit: 25, sortDirection: 'desc' }))
   .resolves.toMatchObject({ data: expect.any(Array), nextCursor: null })
 
@@ -2642,6 +2655,30 @@ runtime.forkThread.mockResolvedValue(schemaValidThreadLifecycleResult({ thread: 
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
   .resolves.toMatchObject({ sessionId: 'thread-fork-1', parentThreadId: 'thread-1' })
 
+runtime.readThread
+  .mockRejectedValueOnce({ code: 'FRESH_AGENT_LOST_SESSION' })
+  .mockResolvedValueOnce({ thread: schemaValidThread({ id: 'thread-restored-1', turns: [] }) })
+runtime.resumeThread.mockResolvedValue(schemaValidThreadLifecycleResult({
+  thread: schemaValidThread({ id: 'thread-restored-1', turns: [] }),
+}))
+await adapter.getSnapshot?.({
+  sessionType: 'freshcodex',
+  provider: 'codex',
+  threadId: 'thread-restored-1',
+}, {
+  cwd: '/repo',
+  runtimeSettings: { model: 'configured-model', sandbox: 'workspace-write', permissionMode: 'on-request', effort: 'xhigh' },
+})
+expect(runtime.resumeThread).toHaveBeenCalledWith(expect.objectContaining({
+  threadId: 'thread-restored-1',
+  excludeTurns: true,
+  cwd: '/repo',
+}))
+expect(runtime.listThreadTurns).toHaveBeenCalledWith(expect.objectContaining({
+  threadId: 'thread-restored-1',
+  limit: expect.any(Number),
+}))
+
 await expect(adapter.startReview?.('thread-1')).resolves.toMatchObject({
   turnId: expect.any(String),
   reviewThreadId: 'thread-1',
@@ -3103,7 +3140,7 @@ export const FreshAgentAttachSchema = z.object({
 })
 ```
 
-The Codex adapter must implement `ensureThreadLoaded(sessionId, context)` and call it before snapshot, subscribe, send, interrupt, fork, and start-review work. It should first try `thread/read { includeTurns: false }`; if the returned status is `{ type: 'notLoaded' }` or the app-server reports a lost/unloaded thread, call `thread/resume` with the attach/create context and then re-read metadata. If the thread still cannot be loaded, surface `FRESH_AGENT_LOST_SESSION` or `FRESH_AGENT_RUNTIME_UNAVAILABLE` with a clear pane error. This is required because a fresh stdio app-server process does not necessarily have browser-restored thread ids loaded in memory.
+The Codex adapter must implement `ensureThreadLoaded(sessionId, context)` and call it before snapshot, subscribe, send, interrupt, fork, and start-review work. It should first try `thread/read { includeTurns: false }`; if the returned status is `{ type: 'notLoaded' }` or the app-server reports a lost/unloaded thread, call `thread/resume` with the attach/create context and `excludeTurns: true`, then re-read metadata. If the thread still cannot be loaded, surface `FRESH_AGENT_LOST_SESSION` or `FRESH_AGENT_RUNTIME_UNAVAILABLE` with a clear pane error. This is required because a fresh stdio app-server process does not necessarily have browser-restored thread ids loaded in memory, and omitting `excludeTurns: true` would let normal restore paths load an entire long transcript before the page-first `thread/turns/list` request.
 
 Convert `thread/fork -> { thread, ...metadata }` to the fresh-agent fork result at the adapter boundary:
 
@@ -4519,7 +4556,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Freshcodex history APIs preserve `thread/list` `nextCursor` and `backwardsCursor`, and history queries explicitly include Codex rich app-server, local app-server-created `vscode` source, and all generated child-agent source kinds rather than relying on app-server defaults.
 - Freshcodex settings/model APIs preserve `model/list` `nextCursor`; any dropdown convenience helper that returns a full option array explicitly drains pages and guards against cursor loops instead of truncating at the first page.
 - Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
-- Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart.
+- Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart. Every restore/resume path uses `thread/resume { excludeTurns: true }` and then `thread/turns/list` for the visible page so restore cannot accidentally load a full transcript.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
 - Long Freshcodex transcripts use paging and virtualization.
 - Mobile Freshcodex composer, banners, and transcript remain usable with keyboard inset changes.
