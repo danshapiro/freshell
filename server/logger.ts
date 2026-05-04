@@ -13,6 +13,10 @@ const DEFAULT_DEBUG_LOG_FILE = 'server-debug'
 const DEFAULT_DEBUG_LOG_SUFFIX = '.jsonl'
 const DEFAULT_DEBUG_LOG_SIZE: SizeString = '10M'
 const DEFAULT_DEBUG_LOG_MAX_FILES = 5
+const DEFAULT_SESSION_LIFECYCLE_LOG_FILE = 'session-lifecycle'
+const DEFAULT_SESSION_LIFECYCLE_LOG_SUFFIX = '.jsonl'
+const DEFAULT_SESSION_LIFECYCLE_LOG_SIZE: SizeString = '10M'
+const DEFAULT_SESSION_LIFECYCLE_LOG_MAX_FILES = 10
 export const DEFAULT_NON_DEBUG_LOG_LEVEL: LevelWithSilent = 'warn'
 const SOURCE_ENTRY_MATCHERS = [/(^|\/)server\/index\.ts$/i, /(^|\/)server\/index\.js$/i]
 const DIST_ENTRY_MATCHERS = [/(^|\/)dist\/server\/index\.js$/i]
@@ -96,6 +100,25 @@ export function resolveDebugLogPath(
   const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
   const filename = resolveDebugLogFilename(envVars, argv)
   return path.join(logDir, filename)
+}
+
+export function resolveSessionLifecycleLogPath(
+  envVars: NodeJS.ProcessEnv = process.env,
+  homeDir: string = getFreshellHomeDir(envVars),
+  argv: string[] = process.argv,
+): string | null {
+  const explicitPath = envVars.LOG_SESSION_LIFECYCLE_PATH?.trim()
+  if (explicitPath) return path.resolve(explicitPath)
+  if (isTestRuntime(envVars)) return null
+
+  const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
+  const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
+  const mode = resolveDebugLogMode(envVars, argv)
+  const instance = resolveDebugInstanceTag(envVars)
+  return path.join(
+    logDir,
+    `${DEFAULT_SESSION_LIFECYCLE_LOG_FILE}.${mode}.${instance}${DEFAULT_SESSION_LIFECYCLE_LOG_SUFFIX}`,
+  )
 }
 
 function normalizeLogMode(value: string | undefined): LogMode | undefined {
@@ -183,13 +206,21 @@ export function createDebugFileStream(filePath: string, options: DebugFileStream
   return createStream(path.basename(filePath), { path: dir, size, maxFiles })
 }
 
+export function createSessionLifecycleLogger(filePath: string) {
+  const stream = createDebugFileStream(filePath, {
+    size: DEFAULT_SESSION_LIFECYCLE_LOG_SIZE,
+    maxFiles: DEFAULT_SESSION_LIFECYCLE_LOG_MAX_FILES,
+  })
+  return pino(createPinoOptions({ level: 'info' }), stream)
+}
+
 export function resolveRuntimeLogLevel(debugLoggingEnabled: boolean): LevelWithSilent {
   return debugLoggingEnabled ? 'debug' : DEFAULT_NON_DEBUG_LOG_LEVEL
 }
 
-function createPinoOptions() {
+function createPinoOptions(options: { level?: LevelWithSilent } = {}) {
   return {
-    level,
+    level: options.level ?? level,
     base: {
       app: 'freshell',
       env,
@@ -269,6 +300,11 @@ export function createLogger(destination?: DestinationStream) {
 }
 
 export const logger = createLogger()
+
+const sessionLifecycleLogPath = resolveSessionLifecycleLogPath()
+export const sessionLifecycleLogger = sessionLifecycleLogPath
+  ? createSessionLifecycleLogger(sessionLifecycleLogPath)
+  : logger.child({ component: 'session-lifecycle-disabled' })
 
 export function setLogLevel(nextLevel: LevelWithSilent): void {
   logger.level = nextLevel

@@ -207,6 +207,69 @@ describe("logger", () => {
     )
 
     it(
+      "resolves a session lifecycle log path under FRESHELL_LOG_DIR",
+      async () => {
+        const logDir = path.join(os.tmpdir(), "freshell-lifecycle-logs")
+        const { resolveSessionLifecycleLogPath } = await import("../../../server/logger")
+
+        const resolved = resolveSessionLifecycleLogPath(
+          { FRESHELL_LOG_DIR: logDir, NODE_ENV: "production", PORT: "3333" } as NodeJS.ProcessEnv,
+          "/home/test",
+          ["node", "dist/server/index.js"],
+        )
+
+        expect(resolved).toBe(
+          path.join(
+            path.resolve(logDir),
+            "session-lifecycle.production.3333.jsonl",
+          ),
+        )
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "resolves a default session lifecycle log path under FRESHELL_HOME",
+      async () => {
+        const { resolveSessionLifecycleLogPath } = await import("../../../server/logger")
+
+        const resolved = resolveSessionLifecycleLogPath(
+          {
+            FRESHELL_HOME: "/tmp/freshell-home",
+            NODE_ENV: "production",
+            FRESHELL_LOG_INSTANCE_ID: "prod-main",
+          } as NodeJS.ProcessEnv,
+          undefined,
+          ["node", "dist/server/index.js"],
+        )
+
+        expect(resolved).toBe(
+          path.join(
+            "/tmp/freshell-home",
+            ".freshell",
+            "logs",
+            "session-lifecycle.production.prod-main.jsonl",
+          ),
+        )
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "skips session lifecycle log path under vitest unless explicitly requested",
+      async () => {
+        const { resolveSessionLifecycleLogPath } = await import("../../../server/logger")
+
+        expect(resolveSessionLifecycleLogPath({ VITEST: "true" } as NodeJS.ProcessEnv, "/home/test")).toBeNull()
+        expect(resolveSessionLifecycleLogPath({
+          VITEST: "true",
+          LOG_SESSION_LIFECYCLE_PATH: "/tmp/session-lifecycle.jsonl",
+        } as NodeJS.ProcessEnv, "/home/test")).toBe("/tmp/session-lifecycle.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
       "uses FRESHELL_HOME when deriving the default log directory",
       async () => {
         const { resolveDebugLogPath } = await import("../../../server/logger")
@@ -457,6 +520,29 @@ describe("logger", () => {
 
         const content = await fsp.readFile(filePath, "utf-8")
         expect(content).toContain("\"event\":\"test\"")
+
+        await fsp.rm(tempDir, { recursive: true, force: true })
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "creates the session lifecycle logger at info level independent of runtime debug level",
+      async () => {
+        const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "freshell-lifecycle-"))
+        const filePath = path.join(tempDir, "session-lifecycle.jsonl")
+        const { createSessionLifecycleLogger, setLogLevel, logger } = await import("../../../server/logger")
+
+        setLogLevel("warn")
+        const lifecycleLogger = createSessionLifecycleLogger(filePath)
+
+        lifecycleLogger.info({ event: "session_lifecycle_test" }, "session_lifecycle_test")
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        const content = await fsp.readFile(filePath, "utf8")
+        expect(logger.level).toBe("warn")
+        expect(lifecycleLogger.level).toBe("info")
+        expect(content).toContain("session_lifecycle_test")
 
         await fsp.rm(tempDir, { recursive: true, force: true })
       },
