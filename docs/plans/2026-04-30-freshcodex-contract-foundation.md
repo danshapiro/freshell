@@ -75,7 +75,7 @@ Schema-grounded protocol facts to preserve:
 - Generated `ThreadStartSource` values are only `"startup"` and `"clear"`. Do not use `sessionStartSource` as a Freshell/app-server source marker or send `"appServer"` there.
 - `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
 - Generated `Thread` objects require the full thread metadata envelope even when turn bodies are omitted. At minimum, schema-valid fixtures must include `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `path`, `cwd`, `cliVersion`, `source`, `agentNickname`, `agentRole`, `gitInfo`, `name`, and `turns`. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
-- `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
+- `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`; `activeFlags` is required on the active variant. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`. `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, and `Turn.durationMs` are generated-required nullable fields, not optional fields.
 - `Thread.source` uses generated `SessionSource`, not `ThreadSourceKind`. `ThreadSourceKind` is only the filter type for `thread/list`. `SessionSource` values include flat sources such as `"cli"`, `"vscode"`, `"exec"`, and `"appServer"`, but subagent source metadata is represented as `{ subAgent: ... }` with generated `SubAgentSource` variants such as `"review"`, `"compact"`, `{ thread_spawn: ... }`, `"memory_consolidation"`, and `{ other: string }`. Freshcodex protocol schemas, fixtures, history projection, and child-thread metadata must parse and preserve the generated `SessionSource` shape instead of flattening thread metadata to `subAgentReview`/`subAgentCompact` strings.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
@@ -127,7 +127,8 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Codex app-server protocol schemas are owned by `server/coding-cli/codex-app-server/protocol.ts`, and must be cross-checked with `codex app-server generate-json-schema` during implementation.
 - Codex app-server transports are separated by runtime purpose. `server/coding-cli/codex-app-server/client.ts` owns JSON-RPC request/response semantics over an injected transport; `transport.ts` owns concrete stdio JSONL and websocket framing. `runtime.ts` remains the loopback websocket runtime used by `CodexLaunchPlanner` and raw Codex terminal `--remote` attach. New `rich-runtime.ts` is the Freshcodex-only stdio runtime and must not return or require a `wsUrl`.
 - Codex JSON-RPC messages omit the `jsonrpc` property on the wire and emit `initialized` exactly once after successful `initialize`.
-- Codex request ids must round-trip as `string | number`; never coerce server-initiated request ids to numbers before responding.
+- Codex request ids must round-trip as generated `string | number`; never coerce server-initiated request ids to numbers before responding, and never narrow numeric ids to integers because the generated `RequestId` type is `number`, not `integer`.
+- Fresh-agent pending approval/question/request contracts that represent Codex server-initiated JSON-RPC requests must also carry generated `string | number` request ids. Browser-created request ids, such as `freshAgent.create.requestId`, may remain strings, but Codex server request ids must not be narrowed to `NonEmptyString` or integer-only numbers in shared response schemas, Redux pending state, or WebSocket response actions.
 - Provider-specific detail is preserved under typed extension schemas, not ad-hoc `Record<string, unknown>` blobs in transcript items.
 - A normalized turn is a lifecycle/container boundary, not a single message role. Codex `Turn` objects contain mixed user, assistant, tool, and system items, so role belongs on message transcript items and turn-level `role` must be optional/legacy-only. Do not invent a turn role to satisfy the contract.
 - A Codex app-server item may normalize to zero, one, or many fresh-agent transcript items. In particular, `userMessage.content` can contain multiple text/image/localImage parts. Codex item normalization must return an array and turn normalization must `flatMap` item output while preserving stable derived ids for split content parts.
@@ -517,6 +518,22 @@ expect(FreshAgentServerRequestResponseSchema.parse({
   contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
   success: false,
 })).toMatchObject({ kind: 'dynamic_tool', success: false })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 42,
+  kind: 'tool_user_input',
+  answers: {
+    choice: { answers: ['a'] },
+  },
+})).toMatchObject({ requestId: 42, kind: 'tool_user_input' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 42.5,
+  kind: 'tool_user_input',
+  answers: {
+    choice: { answers: ['a'] },
+  },
+})).toMatchObject({ requestId: 42.5, kind: 'tool_user_input' })
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -546,6 +563,7 @@ export type FreshAgentSessionType = z.infer<typeof FreshAgentSessionTypeSchema>
 export type FreshAgentRuntimeProvider = z.infer<typeof FreshAgentRuntimeProviderSchema>
 
 const NonEmptyString = z.string().min(1)
+const FreshAgentServerRequestIdSchema = z.union([NonEmptyString, z.number()])
 const JsonValue: z.ZodType<unknown> = z.lazy(() => z.union([
   z.string(),
   z.number(),
@@ -651,7 +669,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
   z.object({ id: NonEmptyString, kind: z.literal('collaboration'), tool: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed']), senderThreadId: z.string().optional(), receiverThreadId: z.string().optional(), newThreadId: z.string().optional(), prompt: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('context_compaction'), status: z.enum(['pending', 'running', 'completed', 'failed', 'deprecated']), summary: z.string().optional(), beforeTokens: z.number().int().nonnegative().optional(), afterTokens: z.number().int().nonnegative().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('dynamic_tool'), name: NonEmptyString, status: z.enum(['pending', 'running', 'completed', 'failed', 'declined']), input: z.record(z.string(), JsonValue).optional(), result: JsonValue.optional(), reason: z.string().optional(), error: z.string().optional() }),
-  z.object({ id: NonEmptyString, kind: z.literal('request_prompt'), requestId: NonEmptyString, requestKind: z.enum(['approval', 'question', 'mcp_elicitation', 'dynamic_tool', 'auth_refresh']), title: z.string().optional(), prompt: z.string().optional(), status: z.enum(['pending', 'resolved', 'declined']) }),
+  z.object({ id: NonEmptyString, kind: z.literal('request_prompt'), requestId: FreshAgentServerRequestIdSchema, requestKind: z.enum(['approval', 'question', 'mcp_elicitation', 'dynamic_tool', 'auth_refresh']), title: z.string().optional(), prompt: z.string().optional(), status: z.enum(['pending', 'resolved', 'declined']) }),
   z.object({ id: NonEmptyString, kind: z.literal('error'), message: z.string(), code: z.string().optional() }),
 ])
 
@@ -848,7 +866,7 @@ export const FreshAgentDynamicToolOutputContentItemSchema = z.discriminatedUnion
 
 export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind', [
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('command_approval'),
     decision: z.union([
       z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
@@ -856,31 +874,31 @@ export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind'
     ]),
   }),
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('file_change_approval'),
     decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
   }),
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('permissions_approval'),
     permissions: z.record(z.string(), JsonValue),
     scope: z.enum(['turn', 'session']),
     strictAutoReview: z.boolean().optional(),
   }),
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('tool_user_input'),
     answers: z.record(z.string(), FreshAgentToolUserInputAnswerSchema),
   }),
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('mcp_elicitation'),
     action: FreshAgentMcpElicitationActionSchema,
     content: JsonValue.nullable(),
     _meta: JsonValue.nullable(),
   }),
   z.object({
-    requestId: NonEmptyString,
+    requestId: FreshAgentServerRequestIdSchema,
     kind: z.literal('dynamic_tool'),
     contentItems: z.array(FreshAgentDynamicToolOutputContentItemSchema),
     success: z.boolean(),
@@ -901,6 +919,7 @@ export type FreshAgentThreadListPage = z.infer<typeof FreshAgentThreadListPageSc
 export type FreshAgentModelSummary = z.infer<typeof FreshAgentModelSummarySchema>
 export type FreshAgentModelListPage = z.infer<typeof FreshAgentModelListPageSchema>
 export type FreshAgentModelListQuery = z.infer<typeof FreshAgentModelListQuerySchema>
+export type FreshAgentServerRequestId = z.infer<typeof FreshAgentServerRequestIdSchema>
 export type FreshAgentServerRequestResponse = z.infer<typeof FreshAgentServerRequestResponseSchema>
 ```
 
@@ -1328,6 +1347,7 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/NetworkAccess.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnError.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/UserInput.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts`
@@ -1409,6 +1429,8 @@ expect(requiredFieldsForGeneratedType('v2/Thread.ts', 'Thread')).toEqual(expect.
   'turns',
 ]))
 expect(() => CodexThreadSchema.parse({ id: 'thread-missing-required-fields' })).toThrow(/turns|cwd|createdAt/i)
+expect(requestIdTypeFromGeneratedSchema()).toEqual('string | number')
+expect(CodexRequestIdSchema.parse(42.5)).toBe(42.5)
 expect(() => CodexThreadTurnsListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
 expect(CodexThreadReadResultSchema.parse({ thread: schemaValidThread({ turns: [] }) }).thread.turns).toEqual([])
 expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
@@ -1460,7 +1482,18 @@ expect(sandboxPolicyVariantsFromGeneratedSchema()).toEqual(expect.arrayContainin
 expect(networkAccessValuesFromGeneratedSchema()).toEqual(['restricted', 'enabled'])
 expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localImage', 'skill', 'mention'])
 expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
+expect(() => CodexThreadStatusSchema.parse({ type: 'active' })).toThrow(/activeFlags/i)
 expect(turnStatusValuesFromGeneratedSchema()).toEqual(['completed', 'interrupted', 'failed', 'inProgress'])
+expect(requiredFieldsForGeneratedType('v2/Turn.ts', 'Turn')).toEqual(expect.arrayContaining([
+  'id',
+  'items',
+  'status',
+  'error',
+  'startedAt',
+  'completedAt',
+  'durationMs',
+]))
+expect(() => CodexTurnSchema.parse({ id: 'turn-missing-required-nullables', items: [], status: 'completed' })).toThrow(/error|startedAt|completedAt|durationMs/i)
 expect(sessionSourceVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'cli',
   'vscode',
@@ -1682,7 +1715,7 @@ Update `protocol.ts` with schema names matching the generated app-server schema.
 The implementation must include, at minimum:
 
 ```ts
-export const CodexRequestIdSchema = z.union([z.string().min(1), z.number().int()])
+export const CodexRequestIdSchema = z.union([z.string().min(1), z.number()])
 
 export const CodexInitializeResultSchema = z.object({
   userAgent: z.string().min(1),
@@ -1744,6 +1777,13 @@ export const CodexSessionSourceSchema = z.union([
   z.object({ custom: z.string() }),
   z.object({ subAgent: CodexSubAgentSourceSchema }),
   z.literal('unknown'),
+])
+export const CodexThreadActiveFlagSchema = z.enum(['waitingOnApproval', 'waitingOnUserInput'])
+export const CodexThreadStatusSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('notLoaded') }),
+  z.object({ type: z.literal('idle') }),
+  z.object({ type: z.literal('systemError') }),
+  z.object({ type: z.literal('active'), activeFlags: z.array(CodexThreadActiveFlagSchema) }),
 ])
 export const CodexThreadSortKeySchema = z.enum(['created_at', 'updated_at'])
 
@@ -1869,10 +1909,14 @@ export const CodexTurnSchema = z.object({
   id: z.string().min(1),
   items: z.array(CodexThreadItemSchema),
   status: CodexTurnStatusSchema,
-  error: z.unknown().nullable().optional(),
-  startedAt: z.number().nullable().optional(),
-  completedAt: z.number().nullable().optional(),
-  durationMs: z.number().nullable().optional(),
+  error: z.object({
+    message: z.string(),
+    codexErrorInfo: z.unknown().nullable(),
+    additionalDetails: z.string().nullable(),
+  }).nullable(),
+  startedAt: z.number().nullable(),
+  completedAt: z.number().nullable(),
+  durationMs: z.number().nullable(),
 })
 export const CodexThreadSchema = z.object({
   id: z.string().min(1),
@@ -2075,6 +2119,7 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/NetworkAccess.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnError.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/UserInput.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts \
@@ -2393,6 +2438,15 @@ The same table must verify response serialization for each interactive request m
 
 ```ts
 await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 42,
+  kind: 'tool_user_input',
+  answers: { choice: { answers: ['a'] } },
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith(42, {
+  answers: { choice: { answers: ['a'] } },
+})
+
+await adapter.respondToServerRequest?.('thread-1', {
   requestId: 'user-input-1',
   kind: 'tool_user_input',
   answers: { choice: { answers: ['a'] } },
@@ -2503,7 +2557,7 @@ export function normalizeCodexTurnPage(input: { threadId: string; revision: numb
 export function normalizeCodexThreadSnapshot(input: ...): FreshAgentThreadSnapshot
 ```
 
-Map generated Codex status objects explicitly. The current app-server schema represents thread status as `{ type: 'notLoaded' | 'idle' | 'systemError' | 'active', activeFlags?: [...] }`, not as a bare string. Preserve active flags such as `waitingOnApproval` and `waitingOnUserInput` under the Codex extension while mapping them to a shared running status:
+Map generated Codex status objects explicitly. The current app-server schema represents thread status as `{ type: 'notLoaded' | 'idle' | 'systemError' | 'active', activeFlags: [...] }`, not as a bare string. Preserve active flags such as `waitingOnApproval` and `waitingOnUserInput` under the Codex extension while mapping them to a shared running status:
 
 ```ts
 export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus {
@@ -2782,7 +2836,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.review.started'; sessionId: string; sessionType: string; provider: string; turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
-  | { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string | number; code: string; message: string; retryable?: boolean }
 ```
 
 On success, emit `freshAgent.review.started` with the returned `reviewThreadId` and full `{ sessionType, provider, sessionId }` locator, then emit a `freshAgent.event` invalidation for the same session so the workspace panel refreshes review output. On failure, emit `freshAgent.error` with a typed code and locator fields whenever the failure is session-specific. Preserve `reviewThreadId` in the Codex extension or review metadata when the snapshot refresh observes review items; do not collapse detached and inline reviews into only the source thread id.
@@ -3939,7 +3993,7 @@ Expected: FAIL for missing typed fresh-agent action errors and duplicate/reconne
 Use the fresh-agent specific error message added in Task 5 consistently in `shared/ws-protocol.ts` and handlers:
 
 ```ts
-| { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string; code: string; message: string; retryable?: boolean }
+| { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string | number; code: string; message: string; retryable?: boolean }
 ```
 
 Use this message for fresh-agent action errors instead of generic `sendError`. Include `sessionType` and `provider` whenever `sessionId` is present so client-side reconnect/error handling never has to guess which runtime owns an opaque id.
@@ -4106,6 +4160,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` are real fresh-agent state modules, not aliases/re-exports of agent-chat modules.
 - `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware, key Freshcodex state by full `{ sessionType, provider, sessionId }` locators, and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
+- Codex server-initiated request ids round-trip unchanged through pending approval/question state, WebSocket response actions, adapter response serialization, and error events whether the generated JSON-RPC id is a string or any generated number value.
 - Codex protocol schemas and fixtures reject impossible partial app-server entities; generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing.
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
