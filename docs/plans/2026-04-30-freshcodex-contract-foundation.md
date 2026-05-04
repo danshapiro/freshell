@@ -98,7 +98,8 @@ Generated method inventory the executor must keep aligned with the local schema:
 
 - Freshcodex client-request methods to implement or intentionally leave unsupported must be generated from `ClientRequest.ts` during Task 4, not copied by hand. The implementation-required Freshcodex subset is `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, and `modelProvider/capabilities/read`. The explicit unsupported/disabled subset for this plan is every other generated client method, including `thread/archive`, `thread/unsubscribe`, `thread/name/set`, `thread/metadata/update`, `thread/unarchive`, `thread/compact/start`, `thread/shellCommand`, `thread/approveGuardianDeniedAction`, `thread/rollback`, `thread/inject_items`, skills/plugin/marketplace/app/fs/config/account/device/feedback/fuzzy-file-search methods, standalone `command/exec*`, `turn/steer`, MCP direct-call methods, and Windows sandbox setup. Unsupported methods must have clear server/client capability labels if exposed by UI; do not silently proxy arbitrary generated methods through Freshcodex.
 - Server-request methods requiring pending UI state or explicit unblock responses: `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
-- Visible-state notification methods that must invalidate or patch Freshcodex read models: `error`, `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/closed`, `thread/name/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/tokenUsage/updated`, `turn/started`, `hook/started`, `turn/completed`, `hook/completed`, `turn/diff/updated`, `turn/plan/updated`, `item/started`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `item/completed`, `rawResponseItem/completed`, `item/agentMessage/delta`, `item/plan/delta`, `command/exec/outputDelta`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `item/mcpToolCall/progress`, `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `fs/changed`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta`, `thread/compacted`, `model/rerouted`, `model/verification`, `warning`, `guardianWarning`, `configWarning`, `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, `thread/realtime/closed`, `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted`.
+- Visible thread-located notification methods that must invalidate or patch the matching Freshcodex read model: `error`, `thread/started`, `thread/status/changed`, `thread/archived`, `thread/unarchived`, `thread/closed`, `thread/name/updated`, `thread/goal/updated`, `thread/goal/cleared`, `thread/tokenUsage/updated`, `turn/started`, `hook/started`, `turn/completed`, `hook/completed`, `turn/diff/updated`, `turn/plan/updated`, `item/started`, `item/autoApprovalReview/started`, `item/autoApprovalReview/completed`, `item/completed`, `rawResponseItem/completed`, `item/agentMessage/delta`, `item/plan/delta`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `item/mcpToolCall/progress`, `item/reasoning/summaryTextDelta`, `item/reasoning/summaryPartAdded`, `item/reasoning/textDelta`, `thread/compacted`, `model/rerouted`, `model/verification`, `guardianWarning`, `thread/realtime/started`, `thread/realtime/itemAdded`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/sdp`, `thread/realtime/error`, and `thread/realtime/closed`. Most of these use `params.threadId`, but `thread/started` uses `params.thread.id`, and `warning` is thread-located only when `params.threadId` is non-null. Notification routing must be generated-method-specific; never fall back to the subscribed session id when a notification has no thread locator.
+- Runtime-global or connection-scoped notification methods must be surfaced as runtime/capability warnings or explicitly ignored by classification, not used to invalidate an arbitrary Freshcodex thread: `command/exec/outputDelta` is scoped to a `processId` from unsupported standalone `command/exec`; `fs/changed` is scoped to a `watchId` from unsupported `fs/watch`; `mcpServer/oauthLogin/completed`, `mcpServer/startupStatus/updated`, `configWarning`, `warning` with `threadId: null`, `windows/worldWritableWarning`, and `windowsSandbox/setupCompleted` have no Freshcodex thread locator. If a future task implements the corresponding app-server feature, it must add an ownership map from that feature's request id/watch id/process id to a Freshcodex locator before treating these as thread-visible.
 - Generated notifications that may be ignored only by an explicit non-visible allowlist: `skills/changed`, `account/updated`, `account/rateLimits/updated`, `app/list/updated`, `remoteControl/status/changed`, `externalAgentConfig/import/completed`, `deprecationNotice`, `fuzzyFileSearch/sessionUpdated`, `fuzzyFileSearch/sessionCompleted`, and `account/login/completed`.
 
 ## User-Visible End State
@@ -156,7 +157,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every Codex normalization fixture that claims to model an app-server `Thread`, `Turn`, `ThreadItem`, `ServerRequest`, or `ServerNotification` must first parse through the local generated Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts`. Do not write tests against impossible mock shapes. If an example in this plan differs from the generated schema, the generated schema wins and the fixture must be corrected.
 - Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated JSON-Schema-required fields, while accepting generated-optional wire fields and normalizing them at the protocol boundary. Do not use permissive partial schemas for app-server entities that generated JSON Schema makes required. Known important required examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, and `Turn.status`. Known important optional/default examples that must parse and normalize are `Thread.forkedFromId`, `Thread.path`, `Thread.agentNickname`, `Thread.agentRole`, `Thread.gitInfo`, `Thread.name`, `Turn.error`, `Turn.startedAt`, `Turn.completedAt`, `Turn.durationMs`, `ThreadListResponse.nextCursor`, `ThreadListResponse.backwardsCursor`, `ThreadTurnsListResponse.nextCursor`, `ThreadTurnsListResponse.backwardsCursor`, `ThreadLoadedListResponse.nextCursor`, and `ModelListResponse.nextCursor`.
-- Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
+- Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled and routed by its generated locator shape. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event for the generated target thread or a typed runtime/global warning when no thread locator exists. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped. Do not route no-locator notifications to the current subscriber's `sessionId`; that makes global app-server events corrupt unrelated thread state.
 - Server-initiated Codex requests that include a generated thread locator are routed to that Freshcodex thread. For v2 request params the locator is `threadId`; for legacy root `applyPatchApproval` and `execCommandApproval` params the locator is `conversationId`. Server-initiated Codex requests without either locator, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
 - Codex server-request response shapes must stay discriminated by generated request method all the way through the shared contract, WebSocket protocol, controller, and adapter. Do not collapse all prompts to Claude-style `answers: Record<string, string>` or `decision: string`: `item/tool/requestUserInput` responds with `{ answers: Record<string, { answers: string[] }> }`, `mcpServer/elicitation/request` responds with `{ action, content, _meta }`, `item/permissions/requestApproval` responds with `{ permissions, scope, strictAutoReview? }`, and command/file approval responses keep their generated decision payloads.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
@@ -2022,6 +2023,8 @@ Compare generated method names to two explicit sets:
 
 The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
 
+Add the same generated-inventory coverage for `ServerNotification` routing. Every method in the checked-in `ServerNotification.ts` snapshot must be classified as exactly one of `thread`, `runtimeGlobal`, `connectionScoped`, or `nonVisible`. The classification test must prove `thread/started` extracts `params.thread.id`, ordinary thread events extract `params.threadId`, `warning` branches on nullable `params.threadId`, and no-locator `command/exec/outputDelta` / `fs/changed` do not produce a Freshcodex thread invalidation until a future feature records a process/watch owner.
+
 Add transport tests requiring stdio JSONL framing and websocket preservation:
 
 ```ts
@@ -2170,11 +2173,38 @@ it('forwards app-server notifications without treating them as request responses
   expect(client.pendingRequestCountForTest()).toBe(0)
 })
 
+it('classifies notification thread locators from generated params instead of subscriber state', async () => {
+  await expect(notificationRouteFor(CodexServerNotificationSchema.parse({
+    method: 'thread/started',
+    params: { thread: schemaValidThread({ id: 'thread-from-nested-thread' }) },
+  }))).toEqual({ kind: 'thread', threadId: 'thread-from-nested-thread' })
+  await expect(notificationRouteFor(CodexServerNotificationSchema.parse({
+    method: 'warning',
+    params: { threadId: null, message: 'Global warning' },
+  }))).toEqual({ kind: 'runtimeGlobal' })
+  await expect(notificationRouteFor(CodexServerNotificationSchema.parse({
+    method: 'command/exec/outputDelta',
+    params: { processId: 'process-1', stream: 'stdout', deltaBase64: '', capReached: false },
+  }))).toEqual({ kind: 'connectionScoped', owner: 'unsupported-command-exec' })
+})
+
 it('lets the rich stdio runtime subscribe to notifications and server requests for a specific Freshcodex session', async () => {
   const seen: unknown[] = []
   const unsubscribe = await richRuntime.subscribe('thread-1', (event) => seen.push(event))
   await fakeServer.sendNotification({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: schemaValidCodexItem({ type: 'plan', id: 'item-1', text: 'Plan' }) } })
   expect(seen).toContainEqual(expect.objectContaining({ method: 'item/completed' }))
+  unsubscribe()
+})
+
+it('does not deliver no-locator global or connection-scoped notifications as thread invalidations', async () => {
+  const seen: unknown[] = []
+  const unsubscribe = await richRuntime.subscribe('thread-1', (event) => seen.push(event))
+  await fakeServer.sendNotification({ method: 'thread/started', params: { thread: schemaValidThread({ id: 'thread-2' }) } })
+  await fakeServer.sendNotification({ method: 'fs/changed', params: { watchId: 'watch-1', changedPaths: ['/repo/file.ts'] } })
+  await fakeServer.sendNotification({ method: 'warning', params: { threadId: null, message: 'Global warning' } })
+  expect(seen).not.toContainEqual(expect.objectContaining({ threadId: 'thread-1', reason: 'thread/started' }))
+  expect(seen).not.toContainEqual(expect.objectContaining({ threadId: 'thread-1', reason: 'fs/changed' }))
+  expect(seen).toContainEqual(expect.objectContaining({ method: 'warning', route: { kind: 'runtimeGlobal' } }))
   unsubscribe()
 })
 
@@ -2590,7 +2620,7 @@ onServerRequest(listener: (request: CodexServerRequest) => void): () => void
 onRuntimeError(listener: (error: CodexRuntimeError) => void): () => void
 ```
 
-The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by generated thread locator only when the generated params contain `threadId` or legacy `conversationId`; notifications or server requests without a thread locator but with visible global impact, such as app-server errors and `account/chatgptAuthTokens/refresh`, should still reach subscribers as typed runtime events or runtime errors.
+The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. Server requests use `params.threadId` for v2 requests and `params.conversationId` for legacy root approvals. Notifications need their own generated-method-specific router: common thread-visible notifications use `params.threadId`, `thread/started` uses `params.thread.id`, `warning` is thread-visible only when `params.threadId` is non-null, and connection-scoped/global notifications such as `command/exec/outputDelta`, `fs/changed`, `configWarning`, MCP startup/OAuth status, and Windows sandbox warnings have no Freshcodex thread locator. Notifications or server requests without a thread locator but with visible global impact, such as app-server errors, null-thread warnings, and `account/chatgptAuthTokens/refresh`, should still reach subscribers as typed runtime events or runtime errors. They must not be attached to whichever thread happened to subscribe.
 
 Keep the branch typecheckable at the end of Task 4. Because this task removes the nonexistent `thread/turn/read` client/runtime API, also update `server/fresh-agent/adapters/codex/adapter.ts` enough to stop depending on `readThreadTurn` or a websocket-only `{ wsUrl }` result. This is a narrow compile-preserving bridge before Task 5's full normalization:
 
@@ -3353,6 +3383,7 @@ function emitSchemaValidNotification(method: string, overrides: Record<string, u
 }
 
 it.each([
+  ['thread/started'],
   ['turn/started'],
   ['turn/completed'],
   ['item/started'],
@@ -3381,6 +3412,25 @@ it.each([
 ```
 
 If the generated schema uses different method names or params, use the generated names and generated params in the test table. The executor must add every visible-state notification method present in `ServerNotification.json`; do not shrink the table to the example above. Do not emit `{ threadId }`-only fake notifications for methods whose generated params require a `Turn`, `ThreadItem`, token-usage object, realtime payload, or another structured body; every notification fixture must parse through `CodexServerNotificationSchema` before it reaches the adapter.
+
+Also add negative routing tests for generated notifications with no Freshcodex thread locator:
+
+```ts
+it.each([
+  ['command/exec/outputDelta', { processId: 'process-1', stream: 'stdout', deltaBase64: '', capReached: false }],
+  ['fs/changed', { watchId: 'watch-1', changedPaths: ['/repo/file.ts'] }],
+  ['warning', { threadId: null, message: 'Runtime warning' }],
+])('does not invalidate the subscribed thread for %s without a thread locator', async (method, params) => {
+  const listener = vi.fn()
+  await adapter.subscribe?.('thread-1', listener)
+  emitNotification(method, CodexServerNotificationSchema.parse({ method, params }).params)
+  expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({
+    type: 'freshAgent.snapshot.invalidate',
+    threadId: 'thread-1',
+    reason: method,
+  }))
+})
+```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -3525,14 +3575,27 @@ return await runtime.subscribe(sessionId, (event) => {
     listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: routedThreadId, reason: event.method })
     return
   }
-  if (isVisibleCodexNotification(event)) {
-    updateLiveThreadStateFromNotification(sessionId, event)
-    listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: sessionId, reason: event.method })
+  if (isCodexServerNotification(event)) {
+    const route = getCodexNotificationRoute(event)
+    if (route.kind === 'thread') {
+      if (route.threadId !== sessionId) return
+      updateLiveThreadStateFromNotification(route.threadId, event)
+      listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: route.threadId, reason: event.method })
+      return
+    }
+    if (route.kind === 'runtimeGlobal') {
+      listener({ type: 'freshAgent.runtimeEvent', sessionType: 'freshcodex', provider: 'codex', event })
+      return
+    }
+    if (route.kind === 'connectionScoped') {
+      logIgnoredConnectionScopedNotification(event.method, route.owner)
+      return
+    }
   }
 })
 ```
 
-`turn/started` and `turn/completed` must update `activeTurnId`; `thread/tokenUsage/updated` must update `tokenUsage` in live state so the next snapshot rebuild includes current token counts; status, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
+`getCodexNotificationRoute` must be a generated-method-specific table, not a generic `params.threadId ?? sessionId` fallback. It must cover `thread/started` via `params.thread.id`, nullable-thread `warning`, and no-locator runtime/global or connection-scoped notifications. `turn/started` and `turn/completed` must update `activeTurnId`; `thread/tokenUsage/updated` must update `tokenUsage` in live state so the next snapshot rebuild includes current token counts; status, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
 `getSnapshot` and `resume` must also recover `activeTurnId` without loading the full transcript. First read metadata with `thread/read { includeTurns: false }`, then fetch a bounded newest-first page with `thread/turns/list { limit: 10, sortDirection: 'desc' }` and select the newest `status: 'inProgress'` turn if present. This is required for interrupt to work after a browser reconnect, server restart, or adapter resubscription that missed the original `turn/started` notification while preserving long-transcript scalability.
 
 Implement `send`, `interrupt`, `fork`, and `respondToServerRequest` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(locator)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `respondToServerRequest` must look up the pending request by generated request id, validate that the response `kind` matches the original generated server request method, serialize the generated response shape, and respond on the original JSON-RPC server request id. Do not keep separate `resolveApproval` / `answerQuestion` action paths for Codex; those names encourage collapsing permissions approvals, request-user-input prompts, and MCP elicitations into the wrong Claude-shaped payload.
@@ -3548,6 +3611,43 @@ function getServerRequestThreadId(request: CodexServerRequest): string | null {
 ```
 
 Only `account/chatgptAuthTokens/refresh` should currently return `null`. Legacy `applyPatchApproval` and `execCommandApproval` must use `conversationId` to update the correct thread's pending approval state and must respond with `CodexLegacyApplyPatchApprovalResponseSchema` / `CodexLegacyExecCommandApprovalResponseSchema` payloads.
+
+Add a separate routing helper for generated server notifications:
+
+```ts
+type CodexNotificationRoute =
+  | { kind: 'thread'; threadId: string }
+  | { kind: 'runtimeGlobal' }
+  | { kind: 'connectionScoped'; owner: 'unsupported-command-exec' | 'unsupported-fs-watch' | 'runtime-capability' }
+  | { kind: 'nonVisible' }
+
+function getCodexNotificationRoute(notification: CodexServerNotification): CodexNotificationRoute {
+  switch (notification.method) {
+    case 'thread/started':
+      return { kind: 'thread', threadId: notification.params.thread.id }
+    case 'warning':
+      return notification.params.threadId
+        ? { kind: 'thread', threadId: notification.params.threadId }
+        : { kind: 'runtimeGlobal' }
+    case 'command/exec/outputDelta':
+      return { kind: 'connectionScoped', owner: 'unsupported-command-exec' }
+    case 'fs/changed':
+      return { kind: 'connectionScoped', owner: 'unsupported-fs-watch' }
+    case 'configWarning':
+    case 'mcpServer/oauthLogin/completed':
+    case 'mcpServer/startupStatus/updated':
+    case 'windows/worldWritableWarning':
+    case 'windowsSandbox/setupCompleted':
+      return { kind: 'runtimeGlobal' }
+    default:
+      return hasGeneratedThreadId(notification.params)
+        ? { kind: 'thread', threadId: notification.params.threadId }
+        : { kind: 'nonVisible' }
+  }
+}
+```
+
+The actual implementation should use an exhaustive table keyed by generated method name rather than the loose `default` above if that is clearer for TypeScript exhaustiveness. The important invariant is that no-locator notifications never use the subscriber's session id as a fake target thread.
 
 Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Replace the old create-message effort enum with the shared runtime-settings field schemas so Freshcodex create can carry generated Codex effort values such as `xhigh` and granular approval policy objects. The create parser must also resolve the effective provider from the session-type registry before accepting runtime settings; otherwise the broad persisted/UI settings schema would accept `bypassPermissions` and `max` for Freshcodex:
 
@@ -5096,6 +5196,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` are real fresh-agent state modules, not aliases/re-exports of agent-chat modules.
 - `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware, key Freshcodex state by full `{ sessionType, provider, sessionId }` locators, and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
+- Codex notification routing is generated-method-specific: `thread/started` routes by `params.thread.id`, ordinary thread events route by `params.threadId`, nullable/global warnings do not fake a thread target, and connection-scoped unsupported notifications such as `command/exec/outputDelta` and `fs/changed` never invalidate an arbitrary subscribed Freshcodex thread.
 - Codex server-initiated request ids round-trip unchanged through pending approval/question state, WebSocket response actions, adapter response serialization, and error events whether the generated JSON-RPC id is a string or an integer number.
 - Codex protocol schemas and fixtures reject impossible partial app-server entities, while accepting and normalizing generated-optional JSON wire fields. Generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing; generated-optional fields such as response cursors, optional thread metadata, turn timing/error fields, and lifecycle response defaults normalize to explicit `null`/default values before fresh-agent contracts depend on them.
 - Codex model pages and provider capability reads cross REST, adapter, and settings UI through typed fresh-agent schemas; provider-level `namespaceTools`, `imageGeneration`, and `webSearch` booleans are not lost as unknown model-item fields.
