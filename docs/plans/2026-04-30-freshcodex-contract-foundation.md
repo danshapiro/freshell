@@ -113,6 +113,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `provider` means runtime family: `claude`, `codex`, or later `opencode`.
 - `sessionType` means user-facing identity: `freshclaude`, `freshcodex`, `kilroy`, or disabled `freshopencode`.
 - Every fresh-agent read-model contract and browser/server API that identifies a session must include `sessionType` as well as `provider` and `threadId`. Do not infer user-facing identity from `provider`; multiple session types can share one runtime provider.
+- Fresh-agent live session tracking and action routing must key sessions by the full locator `{ sessionType, provider, threadId }`, not by `sessionId` alone. Claude, Codex, and later OpenCode can all expose opaque ids, and a durable foundation must not depend on cross-provider id uniqueness. WebSocket action messages may keep `sessionId` as the user-facing field name for compatibility, but they must also carry `sessionType` and `provider`, and the runtime manager must validate the full locator before dispatching an action.
 - `server/fresh-agent/provider-registry.ts` must model two separate concepts: a session-type descriptor registry and a runtime-provider adapter registry. Runtime adapter lookup by provider must not be overwritten by another session type using the same provider.
 - `src/store/freshAgentSlice.ts` must become an actual fresh-agent slice with fresh-agent action names and contract-shaped state. It must not re-export `agentChatSlice`; `src/store/freshAgentTypes.ts` must not alias `agentChatTypes`; and `src/store/freshAgentThunks.ts` must not alias `agentChatThunks`.
 - All fresh-agent server adapter outputs parse before leaving `server/fresh-agent/runtime-manager.ts`.
@@ -135,6 +136,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated-required fields. Do not use permissive partial schemas for app-server entities that the generated schema makes required. Known important examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, `Turn.status`, `ThreadTurnsListResponse.nextCursor`, and `ThreadTurnsListResponse.backwardsCursor`.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
 - Server-initiated Codex requests that include `threadId` are routed to that Freshcodex thread. Server-initiated Codex requests without `threadId`, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
+- Codex server-request response shapes must stay discriminated by generated request method all the way through the shared contract, WebSocket protocol, controller, and adapter. Do not collapse all prompts to Claude-style `answers: Record<string, string>` or `decision: string`: `item/tool/requestUserInput` responds with `{ answers: Record<string, { answers: string[] }> }`, `mcpServer/elicitation/request` responds with `{ action, content, _meta }`, `item/permissions/requestApproval` responds with `{ permissions, scope, strictAutoReview? }`, and command/file approval responses keep their generated decision payloads.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
 - Freshcodex tests must be able to render without `state.agentChat.sessions` or Claude restore helpers.
 - Main-branch fixes for auto-title, mobile keyboard/touch target behavior, stale pane hydration, reconnect recovery, and app-server stdio/init hardening must survive the cutover.
@@ -468,6 +470,33 @@ expect(FreshAgentQuestionRequestSchema.parse({
   prompt: 'Choose a value',
   fields: [],
 })).toMatchObject({ kind: 'mcp_elicitation' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'user-input-1',
+  kind: 'tool_user_input',
+  answers: {
+    choice: { answers: ['a'] },
+  },
+})).toMatchObject({
+  kind: 'tool_user_input',
+  answers: { choice: { answers: ['a'] } },
+})
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'mcp-elicit-1',
+  kind: 'mcp_elicitation',
+  action: 'accept',
+  content: { value: 'approved' },
+  _meta: null,
+})).toMatchObject({ kind: 'mcp_elicitation', action: 'accept' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'permissions-1',
+  kind: 'permissions_approval',
+  permissions: { filesystem: { read: true } },
+  scope: 'turn',
+  strictAutoReview: true,
+})).toMatchObject({ kind: 'permissions_approval' })
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -661,7 +690,7 @@ export const FreshAgentTurnPageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: z.enum(['visible', 'background']).optional(),
   revision: z.coerce.number().int().nonnegative(),
-  limit: z.number().int().positive().max(200).optional(),
+  limit: z.coerce.number().int().positive().max(200).optional(),
   sortDirection: z.enum(['asc', 'desc']).optional(),
 })
 
@@ -746,6 +775,53 @@ export const FreshAgentThreadSnapshotSchema = z.object({
 
 Define the referenced approval, question, worktree, diff, child-thread, Claude extension, Codex extension, and action-result schemas in the same file. Export inferred types for every schema. Keep provider extension schemas typed and narrow:
 
+Also define a generated-shape-preserving response schema for pending server requests. This schema is the shared surface used by WebSocket actions, controller props, and the Codex adapter when it responds on the original JSON-RPC server request id:
+
+```ts
+export const FreshAgentToolUserInputAnswerSchema = z.object({
+  answers: z.array(z.string()),
+})
+
+export const FreshAgentMcpElicitationActionSchema = z.enum(['accept', 'decline', 'cancel'])
+
+export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind', [
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('command_approval'),
+    decision: z.union([
+      z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
+      z.record(z.string(), JsonValue),
+    ]),
+  }),
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('file_change_approval'),
+    decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
+  }),
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('permissions_approval'),
+    permissions: z.record(z.string(), JsonValue),
+    scope: z.enum(['turn', 'session']),
+    strictAutoReview: z.boolean().optional(),
+  }),
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('tool_user_input'),
+    answers: z.record(z.string(), FreshAgentToolUserInputAnswerSchema),
+  }),
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('mcp_elicitation'),
+    action: FreshAgentMcpElicitationActionSchema,
+    content: JsonValue.nullable(),
+    _meta: JsonValue.nullable(),
+  }),
+])
+```
+
+The implementation may narrow `permissions`, `scope`, and MCP `content` further when the Codex generated response schemas are modeled in `server/coding-cli/codex-app-server/protocol.ts`, but the shared action contract must not reduce them to strings or Claude-style answers.
+
 Define referenced schemas before any schema that uses them, or wrap recursive references in `z.lazy`, so module evaluation cannot hit a temporal-dead-zone `ReferenceError`.
 
 ```ts
@@ -754,6 +830,7 @@ export type FreshAgentTurnPage = z.infer<typeof FreshAgentTurnPageSchema>
 export type FreshAgentTurnBody = z.infer<typeof FreshAgentTurnBodySchema>
 export type FreshAgentTranscriptItem = z.infer<typeof FreshAgentTranscriptItemSchema>
 export type FreshAgentThreadListPage = z.infer<typeof FreshAgentThreadListPageSchema>
+export type FreshAgentServerRequestResponse = z.infer<typeof FreshAgentServerRequestResponseSchema>
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -882,6 +959,29 @@ it('freshAgentThunks and activity projection do not read fresh-agent state throu
   })
   expect(activity).toEqual({ isBusy: true, source: 'fresh-agent' })
 })
+
+it('routes fresh-agent actions by the full session locator instead of bare session id', async () => {
+  const manager = new FreshAgentRuntimeManager({ registry })
+  manager.attach({ sessionType: 'freshclaude', provider: 'claude', sessionId: 'shared-thread-id' })
+  manager.attach({ sessionType: 'freshcodex', provider: 'codex', sessionId: 'shared-thread-id' })
+  await manager.send({
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    sessionId: 'shared-thread-id',
+  }, { text: 'Route to Codex' })
+  expect(codexAdapter.send).toHaveBeenCalledWith('shared-thread-id', expect.objectContaining({ text: 'Route to Codex' }))
+  expect(claudeAdapter.send).not.toHaveBeenCalled()
+})
+
+it('rejects action messages whose locator does not match the attached session record', async () => {
+  const manager = new FreshAgentRuntimeManager({ registry })
+  manager.attach({ sessionType: 'freshcodex', provider: 'codex', sessionId: 'thread-1' })
+  await expect(manager.send({
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    sessionId: 'thread-1',
+  }, { text: 'Wrong runtime' })).rejects.toMatchObject({ code: 'FRESH_AGENT_SESSION_LOCATOR_MISMATCH' })
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -963,6 +1063,20 @@ Update existing runtime-manager tests that construct the registry so Task 3 rema
 In `runtime-manager.ts`, add:
 
 ```ts
+type FreshAgentSessionLocator = {
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  sessionId: string
+}
+
+function makeFreshAgentSessionKey(locator: FreshAgentSessionLocator): string {
+  return `${locator.sessionType}:${locator.provider}:${locator.sessionId}`
+}
+
+export class FreshAgentSessionLocatorMismatchError extends Error {
+  readonly code = 'FRESH_AGENT_SESSION_LOCATOR_MISMATCH' as const
+}
+
 export class FreshAgentContractValidationError extends Error {
   readonly code = 'FRESH_AGENT_CONTRACT_INVALID' as const
   constructor(readonly surface: string, readonly issues: unknown) {
@@ -977,7 +1091,7 @@ function parseSnapshot(value: unknown): FreshAgentThreadSnapshot {
 }
 ```
 
-Parse snapshot, page, body, fork/action responses before returning them.
+Use `FreshAgentSessionLocator` for `attach`, `subscribe`, `send`, `interrupt`, `kill`, `fork`, `respondToServerRequest`, and `startReview` routing. Internally store sessions by `makeFreshAgentSessionKey(locator)`, and when an action arrives for a bare `sessionId` from older compatibility paths, resolve it only if exactly one tracked session has that id; otherwise throw `FreshAgentSessionLocatorMismatchError` with a clear error requiring `sessionType` and `provider`. Parse snapshot, page, body, fork/action responses before returning them.
 
 In `router.ts`, map `FreshAgentContractValidationError` to HTTP 502:
 
@@ -2079,6 +2193,43 @@ expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex
 
 Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no `threadId`, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
 
+The same table must verify response serialization for each interactive request method through the fresh-agent action contract, not only through low-level client tests:
+
+```ts
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'user-input-1',
+  kind: 'tool_user_input',
+  answers: { choice: { answers: ['a'] } },
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('user-input-1', {
+  answers: { choice: { answers: ['a'] } },
+})
+
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'mcp-elicit-1',
+  kind: 'mcp_elicitation',
+  action: 'accept',
+  content: { selected: true },
+  _meta: null,
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('mcp-elicit-1', {
+  action: 'accept',
+  content: { selected: true },
+  _meta: null,
+})
+
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'permissions-1',
+  kind: 'permissions_approval',
+  permissions: grantedPermissionFixture,
+  scope: 'session',
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('permissions-1', {
+  permissions: grantedPermissionFixture,
+  scope: 'session',
+})
+```
+
 Add table-driven notification coverage for every local generated `ServerNotification` method that can change visible Freshcodex state:
 
 ```ts
@@ -2233,7 +2384,7 @@ return await runtime.subscribe(sessionId, (event) => {
 `turn/started` and `turn/completed` must update `activeTurnId`; status, token, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
 `getSnapshot` and `resume` must also recover `activeTurnId` without loading the full transcript. First read metadata with `thread/read { includeTurns: false }`, then fetch a bounded newest-first page with `thread/turns/list { limit: 10, sortDirection: 'desc' }` and select the newest `status: 'inProgress'` turn if present. This is required for interrupt to work after a browser reconnect, server restart, or adapter resubscription that missed the original `turn/started` notification while preserving long-transcript scalability.
 
-Implement `send`, `interrupt`, `fork`, `resolveApproval`, and `answerQuestion` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(sessionId)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `resolveApproval` and `answerQuestion` must respond to the stored JSON-RPC server request id, not invent a new RPC.
+Implement `send`, `interrupt`, `fork`, and `respondToServerRequest` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(locator)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `respondToServerRequest` must look up the pending request by generated request id, validate that the response `kind` matches the original generated server request method, serialize the generated response shape, and respond on the original JSON-RPC server request id. Do not keep separate `resolveApproval` / `answerQuestion` action paths for Codex; those names encourage collapsing permissions approvals, request-user-input prompts, and MCP elicitations into the wrong Claude-shaped payload.
 
 Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, Codex-shaped `permissionMode` as generated `approvalPolicy`, and Codex-shaped `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them. Tests must also prove Freshcodex rejects legacy Claude-only values (`permissionMode: 'bypassPermissions'`, `effort: 'max'`) before calling Codex app-server.
 
@@ -2284,6 +2435,8 @@ Extend `FreshAgentSendSchema`, `FreshAgentRuntimeAdapter.send`, `FreshAgentRunti
 export const FreshAgentSendSchema = z.object({
   type: z.literal('freshAgent.send'),
   sessionId: z.string().min(1),
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
   text: z.string().optional(),
   images: z.array(FreshAgentInputImageSchema).optional(),
   runtimeSettings: FreshAgentRuntimeSettingsSchema.optional(),
@@ -2291,6 +2444,8 @@ export const FreshAgentSendSchema = z.object({
   message: 'Fresh-agent send requires text or an image',
 })
 ```
+
+Apply the same locator rule to `freshAgent.interrupt`, `freshAgent.fork`, approval/request response, review start, and any future fresh-agent action message: each action schema must include `sessionType` and `provider` alongside `sessionId`, and `server/ws-handler.ts` must pass the full locator to the runtime manager. Tests should send two attached records with the same `sessionId` and different providers, then prove each action reaches only the intended adapter.
 
 Map input content explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert remote URLs to Codex `{ type: 'image', url }`, convert `{ kind: 'data', mediaType, data }` into a valid `data:${mediaType};base64,${data}` URL before sending `{ type: 'image', url }`, and convert local file paths to `{ type: 'localImage', path }`. Existing Codex transcripts may contain `{ type: 'skill' }` and `{ type: 'mention' }` content parts; preserve them in normalized message content. If a new outbound input part cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
 
@@ -2301,6 +2456,7 @@ export const FreshAgentAttachSchema = z.object({
   type: z.literal('freshAgent.attach'),
   sessionId: z.string().min(1),
   sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   runtimeSettings: FreshAgentRuntimeSettingsSchema.optional(),
@@ -2344,14 +2500,24 @@ Extend WS protocol with `freshAgent.forked`:
 
 Send it from `server/ws-handler.ts` after `freshAgent.fork`.
 
-Extend client-to-server WS protocol with `freshAgent.review.start` and route it through `FreshAgentRuntimeManager.startReview(sessionId, { target, delivery })`:
+Extend client-to-server WS protocol with `freshAgent.review.start` and route it through `FreshAgentRuntimeManager.startReview(locator, { target, delivery })`:
 
 ```ts
 export const FreshAgentReviewStartSchema = z.object({
   type: z.literal('freshAgent.review.start'),
   sessionId: z.string().min(1),
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
   target: FreshAgentReviewTargetSchema.default({ type: 'uncommittedChanges' }),
   delivery: z.enum(['inline', 'detached']).default('inline'),
+})
+
+export const FreshAgentServerRequestRespondSchema = z.object({
+  type: z.literal('freshAgent.serverRequest.respond'),
+  sessionId: z.string().min(1),
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
+  response: FreshAgentServerRequestResponseSchema,
 })
 
 export type FreshAgentServerMessage =
@@ -2365,6 +2531,7 @@ Extend the fresh-agent adapter/runtime contract with implemented Codex methods t
 
 ```ts
 startReview?(sessionId: string, input?: { target?: FreshAgentReviewTarget; delivery?: 'inline' | 'detached' }): Promise<{ turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }>
+respondToServerRequest?(sessionId: string, response: FreshAgentServerRequestResponse): Promise<void>
 listThreads?(query: { limit?: number; cursor?: string; sortDirection?: 'asc' | 'desc'; sourceKinds?: string[] }): Promise<FreshAgentThreadListPage>
 listLoadedThreadIds?(query?: { limit?: number; cursor?: string }): Promise<{ ids: string[]; nextCursor: string | null }>
 listModels?(): Promise<FreshAgentModelSummary[]>
@@ -2479,6 +2646,8 @@ it('sends Freshcodex text, images, and runtime settings without reading Claude s
   await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
     type: 'freshAgent.send',
+    sessionType: 'freshcodex',
+    provider: 'codex',
     text: 'Use this mockup',
     images: [{ kind: 'url', url: 'https://example.test/mockup.png', mediaType: 'image/png' }],
     runtimeSettings: {
@@ -2505,6 +2674,8 @@ it('attaches a restored Freshcodex pane with runtime context so the server can l
   expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
     type: 'freshAgent.attach',
     sessionId: 'thread-restored-1',
+    sessionType: 'freshcodex',
+    provider: 'codex',
     cwd: '/repo',
     runtimeSettings: {
       model: 'configured-model',
@@ -2522,8 +2693,42 @@ it('accepts pasted or uploaded browser images as data image inputs', async () =>
   await user.click(screen.getByRole('button', { name: 'Send' }))
   expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
     type: 'freshAgent.send',
+    sessionType: 'freshcodex',
+    provider: 'codex',
     text: 'Use this uploaded image',
     images: [expect.objectContaining({ kind: 'data', mediaType: 'image/png', data: expect.any(String) })],
+  }))
+})
+
+it('responds to Codex request-user-input prompts with generated answer arrays', async () => {
+  renderFreshcodexPane({ snapshot: snapshotWithToolUserInputRequest })
+  await user.click(screen.getByRole('button', { name: /answer a/i }))
+  expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'freshAgent.serverRequest.respond',
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    response: {
+      requestId: 'user-input-1',
+      kind: 'tool_user_input',
+      answers: { choice: { answers: ['a'] } },
+    },
+  }))
+})
+
+it('responds to MCP elicitations with generated action/content metadata', async () => {
+  renderFreshcodexPane({ snapshot: snapshotWithMcpElicitationRequest })
+  await user.click(screen.getByRole('button', { name: /accept mcp input/i }))
+  expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'freshAgent.serverRequest.respond',
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    response: {
+      requestId: 'mcp-elicit-1',
+      kind: 'mcp_elicitation',
+      action: 'accept',
+      content: expect.any(Object),
+      _meta: null,
+    },
   }))
 })
 ```
@@ -2580,8 +2785,7 @@ type FreshAgentShellProps = {
     fork(): void
     startReview(target?: FreshAgentReviewTarget, delivery?: 'inline' | 'detached'): void
     retryCreate(): void
-    answerQuestion(requestId: string, answers: Record<string, string>): void
-    resolveApproval(requestId: string, decision: FreshAgentApprovalDecision): void
+    respondToServerRequest(response: FreshAgentServerRequestResponse): void
   }
 }
 ```
@@ -2632,6 +2836,7 @@ ws.send({
   type: 'freshAgent.attach',
   sessionId,
   sessionType,
+  provider,
   resumeSessionId: paneContent.resumeSessionId,
   cwd: paneContent.initialCwd,
   runtimeSettings: {
