@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { buildFreshellTerminalEnv, modeSupportsResume } from './terminal-registry.js'
@@ -1284,6 +1285,21 @@ export class WsHandler {
     })
   }
 
+  private recordInvalidTerminalId(
+    ws: LiveWebSocket,
+    terminalId: string,
+    operation: 'terminal.attach' | 'terminal.input' | 'terminal.resize',
+    attemptedInputBytes?: number,
+  ): void {
+    recordSessionLifecycleEvent({
+      kind: 'invalid_terminal_id_without_session_ref',
+      terminalId,
+      connectionId: ws.connectionId || 'unknown',
+      operation,
+      ...(attemptedInputBytes !== undefined ? { attemptedInputBytes } : {}),
+    })
+  }
+
   private async sendSdkSessionSnapshot(
     ws: LiveWebSocket,
     opts: {
@@ -1853,6 +1869,18 @@ export class WsHandler {
         )
         const canonicalSessionId = requestedSessionRef?.sessionId
         const restoreRequested = m.restore === true || rawRestoreRequested
+        recordSessionLifecycleEvent({
+          kind: 'terminal_create_requested',
+          requestId: m.requestId,
+          connectionId: ws.connectionId || 'unknown',
+          tabId: m.tabId,
+          paneId: m.paneId,
+          cwd: m.cwd,
+          mode: m.mode as TerminalMode,
+          restoreRequested,
+          hasRequestedSessionRef: Boolean(requestedSessionRef),
+          ...(canonicalSessionId ? { requestedSessionId: canonicalSessionId } : {}),
+        })
         const localLiveTerminalId = (
           m.liveTerminal?.serverInstanceId === this.serverInstanceId
           && typeof m.liveTerminal?.terminalId === 'string'
@@ -1926,6 +1954,18 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
                 terminalId = reusedTerminalId
                 reused = true
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: reusedTerminalId,
+                  tabId: m.tabId,
+                  paneId: m.paneId,
+                  cwd: m.cwd,
+                  mode: m.mode as TerminalMode,
+                  reused: true,
+                  hasSessionRef: Boolean(requestedSessionRef),
+                })
                 this.broadcastTerminalsChanged()
                 return true
               }
@@ -2193,6 +2233,19 @@ export class WsHandler {
                   return
                 }
 
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: record.terminalId,
+                  tabId: m.tabId,
+                  paneId: m.paneId,
+                  cwd: m.cwd,
+                  mode: m.mode as TerminalMode,
+                  reused: false,
+                  hasSessionRef: Boolean(requestedSessionRef),
+                })
+
                 // Notify all clients that list changed
                 this.broadcastTerminalsChanged()
               } catch (error) {
@@ -2222,10 +2275,12 @@ export class WsHandler {
       case 'terminal.attach': {
         const record = this.registry.get(m.terminalId)
         if (!record) {
+          this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.attach')
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
           return
         }
         if (record.status !== 'running') {
+          this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.attach')
           this.sendError(ws, {
             code: 'INVALID_TERMINAL_ID',
             message: formatExitedTerminalAttachMessage(record),
@@ -2247,6 +2302,7 @@ export class WsHandler {
         if (attachResult === 'missing') {
           const latestRecord = this.registry.get(m.terminalId)
           if (latestRecord && latestRecord.status !== 'running') {
+            this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.attach')
             this.sendError(ws, {
               code: 'INVALID_TERMINAL_ID',
               message: formatExitedTerminalAttachMessage(latestRecord),
@@ -2254,6 +2310,7 @@ export class WsHandler {
             })
             return
           }
+          this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.attach')
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -2276,6 +2333,7 @@ export class WsHandler {
       case 'terminal.input': {
         const ok = this.registry.input(m.terminalId, m.data)
         if (!ok) {
+          this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.input', Buffer.byteLength(m.data, 'utf8'))
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
         }
         return
@@ -2284,6 +2342,7 @@ export class WsHandler {
       case 'terminal.resize': {
         const ok = this.registry.resize(m.terminalId, m.cols, m.rows)
         if (!ok) {
+          this.recordInvalidTerminalId(ws, m.terminalId, 'terminal.resize')
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
         }
         return
