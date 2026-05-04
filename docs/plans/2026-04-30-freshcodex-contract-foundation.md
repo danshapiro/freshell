@@ -69,11 +69,12 @@ Schema-grounded protocol facts to preserve:
 - `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
 - `thread/loaded/list` returns `{ data: string[], nextCursor }`, not thread summaries. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
 - `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
+- Generated `Thread` objects require the full thread metadata envelope even when turn bodies are omitted. At minimum, schema-valid fixtures must include `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `path`, `cwd`, `cliVersion`, `source`, `agentNickname`, `agentRole`, `gitInfo`, `name`, and `turns`. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`.
-- `account/chatgptAuthTokens/refresh` expects real token fields in a successful result. Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh error in the pane.
+- `account/chatgptAuthTokens/refresh` expects real token fields in a successful result and its generated params do not include `threadId`. Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh runtime error to every subscribed Freshcodex pane for that rich runtime instance, since the request is not thread-addressable.
 - Generated `ServerNotification` method names are slash-delimited and must be copied exactly from `ServerNotification.ts`; examples include `thread/status/changed`, `thread/tokenUsage/updated`, `turn/diff/updated`, `turn/plan/updated`, `thread/compacted`, `item/agentMessage/delta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `thread/realtime/error`, and `thread/realtime/closed`.
 - Any per-turn body API in Freshell must be an internal facade over `thread/turns/list` results or a server-side page/body cache until Codex exposes a direct turn-read request. Do not implement normal Freshcodex body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
 
@@ -126,7 +127,9 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Codex turn bodies are page-first. `thread/turns/list` returns `Turn` objects with items, so Freshcodex should normalize those page results directly into turn bodies. A server-side LRU turn-body cache may serve `/turns/:turnId` for bodies already loaded from pages; the adapter must not implement body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every Codex normalization fixture that claims to model an app-server `Thread`, `Turn`, `ThreadItem`, `ServerRequest`, or `ServerNotification` must first parse through the local generated Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts`. Do not write tests against impossible mock shapes. If an example in this plan differs from the generated schema, the generated schema wins and the fixture must be corrected.
+- Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts` must reject missing generated-required fields. Do not use permissive partial schemas for app-server entities that the generated schema makes required. Known important examples are `Thread.turns`, `Thread.cwd`, `Thread.source`, `Thread.createdAt`, `Thread.updatedAt`, `Turn.items`, `Turn.status`, `ThreadTurnsListResponse.nextCursor`, and `ThreadTurnsListResponse.backwardsCursor`.
 - Every app-server notification method documented by the current local generated schema that can affect visible Freshcodex state must be intentionally handled. At minimum, turn lifecycle, item lifecycle, token usage, status, diff/review, thread metadata/name/archive/close, context compaction, collaboration/child-agent, realtime error/close, and app-server error notifications must trigger a fresh-agent invalidation event or a typed terminal error. Unknown future notification methods should be logged at debug level and ignored only if they are explicitly classified as non-visible; visible-state notifications must not be silently dropped.
+- Server-initiated Codex requests that include `threadId` are routed to that Freshcodex thread. Server-initiated Codex requests without `threadId`, currently `account/chatgptAuthTokens/refresh`, are runtime-global; they must be answered on the original JSON-RPC id and broadcast as a typed runtime error to subscribed Freshcodex panes instead of being dropped or attached to an arbitrary thread.
 - Async pane updates in `FreshAgentView` must use targeted `mergePaneContent` updates unless replacing an entire pane is intentional.
 - Freshcodex tests must be able to render without `state.agentChat.sessions` or Claude restore helpers.
 - Main-branch fixes for auto-title, mobile keyboard/touch target behavior, stale pane hydration, reconnect recovery, and app-server stdio/init hardening must survive the cutover.
@@ -1059,9 +1062,34 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ClientRequest.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerNotification.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/RequestId.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadTurnsListParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadTurnsListResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStartParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStartResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnInterruptParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnInterruptResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ReviewStartParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ReviewStartResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelListParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelListResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadParams.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`
 - Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`
 - Test: `test/unit/server/coding-cli/codex-app-server/transport.test.ts`
@@ -1084,14 +1112,43 @@ find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSON
 
 Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
-Add a generated client-method inventory assertion. Tests must parse method names from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
+Add generated inventory assertions for both methods and field-level requiredness. Tests must parse method names and important required fields from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings and required object fields. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
+
+Field inventory tests must fail if `protocol.ts` accepts a generated-required entity with missing required fields. At minimum, assert these local schema facts:
+
+```ts
+expect(requiredFieldsForGeneratedType('v2/Thread.ts', 'Thread')).toEqual(expect.arrayContaining([
+  'id',
+  'forkedFromId',
+  'preview',
+  'ephemeral',
+  'modelProvider',
+  'createdAt',
+  'updatedAt',
+  'status',
+  'path',
+  'cwd',
+  'cliVersion',
+  'source',
+  'agentNickname',
+  'agentRole',
+  'gitInfo',
+  'name',
+  'turns',
+]))
+expect(() => CodexThreadSchema.parse({ id: 'thread-missing-required-fields' })).toThrow(/turns|cwd|createdAt/i)
+expect(() => CodexThreadTurnsListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
+expect(CodexThreadReadResultSchema.parse({ thread: schemaValidThread({ turns: [] }) }).thread.turns).toEqual([])
+```
+
+This is required because `thread/read { includeTurns: false }` returns a schema-valid `Thread` with `turns: []`, not a partial object with `turns` omitted. Do not loosen `protocol.ts` to make impossible mocks easier to write.
 
 Compare generated method names to two explicit sets:
 
 - implemented in Freshcodex rich runtime: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, `modelProvider/capabilities/read`
 - explicitly unsupported in Freshcodex rich runtime: every other generated method
 
-The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names that require updating fixtures and classification.
+The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
 
 Add transport tests requiring stdio JSONL framing and websocket preservation:
 
@@ -1174,6 +1231,25 @@ it('surfaces server-initiated approval requests and responds on the same JSON-RP
   await client.respondToServerRequest('approval-99', { decision: 'accept' })
   expect(fakeServer.responses).toContainEqual({ id: 'approval-99', result: { decision: 'accept' } })
 })
+
+it('surfaces runtime-global server requests without inventing a thread id', async () => {
+  const seen: unknown[] = []
+  client.onServerRequest((request) => seen.push(request))
+  await fakeServer.sendRequest({
+    id: 'auth-refresh-1',
+    method: 'account/chatgptAuthTokens/refresh',
+    params: { reason: 'unauthorized', previousAccountId: null },
+  })
+  await client.respondToServerRequestError('auth-refresh-1', {
+    code: -32050,
+    message: 'Freshell cannot refresh Codex ChatGPT auth tokens from this runtime.',
+  })
+  expect(seen).toContainEqual(expect.objectContaining({ id: 'auth-refresh-1', method: 'account/chatgptAuthTokens/refresh' }))
+  expect(fakeServer.responses).toContainEqual({
+    id: 'auth-refresh-1',
+    error: expect.objectContaining({ code: -32050 }),
+  })
+})
 ```
 
 Add notification forwarding tests in `client.test.ts` and `rich-runtime.test.ts`:
@@ -1246,8 +1322,8 @@ export const CodexThreadTurnsListParamsSchema = z.object({
 
 export const CodexThreadTurnsListResultSchema = z.object({
   data: z.array(CodexTurnSchema),
-  nextCursor: z.string().nullable().optional(),
-  backwardsCursor: z.string().nullable().optional(),
+  nextCursor: z.string().nullable(),
+  backwardsCursor: z.string().nullable(),
 })
 
 export const CodexThreadLoadedListResultSchema = z.object({
@@ -1334,14 +1410,28 @@ export const CodexTurnSchema = z.object({
 })
 export const CodexThreadSchema = z.object({
   id: z.string().min(1),
+  forkedFromId: z.string().nullable(),
+  preview: z.string(),
+  ephemeral: z.boolean(),
+  modelProvider: z.string(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
   status: CodexThreadStatusSchema,
-  turns: z.array(CodexTurnSchema).optional(),
+  path: z.string().nullable(),
+  cwd: z.string().min(1),
+  cliVersion: z.string(),
+  source: CodexSessionSourceSchema,
+  agentNickname: z.string().nullable(),
+  agentRole: z.string().nullable(),
+  gitInfo: CodexGitInfoSchema.nullable(),
+  name: z.string().nullable(),
+  turns: z.array(CodexTurnSchema),
 }).passthrough()
 export const CodexServerRequestSchema = z.discriminatedUnion('method', [...])
 export const CodexServerNotificationSchema = z.discriminatedUnion('method', [...])
 ```
 
-The discriminated unions must be generated-schema faithful enough that Task 5 fixtures cannot use impossible app-server item/request/notification shapes. Use `.passthrough()` only for extra fields on known variants; do not use a catch-all unknown item variant.
+The object schemas and discriminated unions must be generated-schema faithful enough that Task 5 fixtures cannot use impossible app-server thread, turn, item, request, response, or notification shapes. It is acceptable to use `.passthrough()` for extra future fields on known variants, but do not make generated-required fields optional and do not use a catch-all unknown item variant.
 
 Create `transport.ts` as the only app-server framing owner:
 
@@ -1415,9 +1505,10 @@ and use `CodexStdioJsonlTransport` internally. Proxy the new rich methods after 
 ```ts
 subscribe(threadId: string, listener: (event: CodexRuntimeEvent) => void): Promise<() => void>
 onServerRequest(listener: (request: CodexServerRequest) => void): () => void
+onRuntimeError(listener: (error: CodexRuntimeError) => void): () => void
 ```
 
-The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by `threadId` only when the generated params contain a thread id; notifications without a thread id but with visible global impact, such as app-server errors, should still reach subscribers as typed runtime events.
+The runtime should forward notifications and server requests from `client.ts` without buffering them behind a snapshot call. It may filter by `threadId` only when the generated params contain a thread id; notifications or server requests without a thread id but with visible global impact, such as app-server errors and `account/chatgptAuthTokens/refresh`, should still reach subscribers as typed runtime events or runtime errors.
 
 Keep the branch typecheckable at the end of Task 4. Because this task removes the nonexistent `thread/turn/read` client/runtime API, also update `server/fresh-agent/adapters/codex/adapter.ts` enough to stop depending on `readThreadTurn` or a websocket-only `{ wsUrl }` result. This is a narrow compile-preserving bridge before Task 5's full normalization:
 
@@ -1497,9 +1588,34 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ClientRequest.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerNotification.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/RequestId.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadTurnsListParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadTurnsListResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStartParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStartResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnInterruptParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnInterruptResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ReviewStartParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ReviewStartResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelListParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelListResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadParams.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ModelProviderCapabilitiesReadResponse.ts \
   test/fixtures/coding-cli/codex-app-server/schema-inventory.ts \
   scripts/audit-codex-app-server-schema.ts \
   test/unit/server/coding-cli/codex-app-server/transport.test.ts \
@@ -1668,10 +1784,11 @@ await expect(adapter.interrupt?.('thread-without-active-turn'))
   .rejects.toMatchObject({ code: 'FRESH_AGENT_NO_ACTIVE_TURN' })
 
 runtime.readThread.mockResolvedValue({
-  thread: {
+  thread: schemaValidThread({
     id: 'thread-resumed-running',
     status: { type: 'active', activeFlags: [] },
-  },
+    turns: [],
+  }),
 })
 runtime.listThreadTurns.mockResolvedValue({
   data: [{ id: 'turn-running-1', status: 'inProgress', items: [] }],
@@ -1685,7 +1802,7 @@ expect(runtime.interruptTurn).toHaveBeenCalledWith({
   turnId: 'turn-running-1',
 })
 
-runtime.forkThread.mockResolvedValue({ thread: { id: 'thread-fork-1' }, cwd: '/repo', model: 'fixture', modelProvider: 'fixture' })
+runtime.forkThread.mockResolvedValue({ thread: schemaValidThread({ id: 'thread-fork-1', turns: [] }), cwd: '/repo', model: 'fixture', modelProvider: 'fixture' })
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
   .resolves.toMatchObject({ sessionId: 'thread-fork-1', parentThreadId: 'thread-1' })
 
@@ -1727,7 +1844,7 @@ expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex
   .toMatchObject({ pendingApprovals: [{ requestId: expect.stringContaining('cmd-1') }] })
 ```
 
-Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields; deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state.
+Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no `threadId`, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
 
 Add table-driven notification coverage for every local generated `ServerNotification` method that can change visible Freshcodex state:
 
@@ -1864,6 +1981,11 @@ Implement `adapter.subscribe(sessionId, listener)` for Codex by subscribing to t
 ```ts
 return await runtime.subscribe(sessionId, (event) => {
   if (isCodexServerRequest(event)) {
+    if (!hasThreadId(event)) {
+      respondToUnsupportedRuntimeGlobalRequest(event)
+      listener({ type: 'freshAgent.error', sessionId, code: 'FRESH_AGENT_UNSUPPORTED_AUTH_REFRESH', message: 'Freshell cannot refresh Codex ChatGPT auth tokens from this runtime.', retryable: false })
+      return
+    }
     updatePendingRequestState(sessionId, event)
     listener({ type: 'freshAgent.snapshot.invalidate', sessionType: 'freshcodex', provider: 'codex', threadId: sessionId, reason: event.method })
     return
@@ -2766,6 +2888,10 @@ runtime.listThreads.mockResolvedValue({ data: [codexThread], nextCursor: null })
 await expect(loadFreshcodexHistoryPage({ limit: 25 })).resolves.toEqual(expect.arrayContaining([
   expect.objectContaining({ provider: 'codex', sessionType: 'freshcodex', sessionId: codexThread.id }),
 ]))
+expect(runtime.listThreads).toHaveBeenCalledWith(expect.objectContaining({
+  limit: 25,
+  sourceKinds: ['appServer', 'subAgent', 'subAgentReview', 'subAgentThreadSpawn', 'subAgentOther'],
+}))
 
 runtime.listModels.mockResolvedValue({
   data: [{
@@ -2927,7 +3053,7 @@ Rules:
 - Update `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, `src/store/paneTreeValidation.ts`, and pane persistence schemas/tests so Freshcodex `sandbox`, generated Codex effort values, and structured/generated approval policies are preserved in local and remote tab snapshots. Remote snapshots must not cast Freshcodex effort back to `'low' | 'medium' | 'high' | 'max'`, must not cast structured approval policy objects to strings, and must not omit `sandbox`.
 - Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
 - Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone.
-- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads.
+- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for rich app-server and child-agent sessions, at least `['appServer', 'subAgent', 'subAgentReview', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps app-server-created Freshcodex threads, review threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
 - `freshopencode` remains disabled and cannot be created.
@@ -3222,12 +3348,15 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` are real fresh-agent state modules, not aliases/re-exports of agent-chat modules.
 - `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
+- Codex protocol schemas and fixtures reject impossible partial app-server entities; generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
+- Codex runtime-global server requests without `threadId`, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread.
 - Freshcodex renders without `agentChat` session state.
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
 - Freshcodex starts Codex review through `review/start`, preserves `reviewThreadId`/target/delivery metadata, lists/resumes rich Codex threads through `thread/list`, exposes loaded thread ids according to `thread/loaded/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
+- Freshcodex history queries explicitly include Codex rich app-server and child-agent source kinds rather than relying on app-server defaults.
 - Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
 - Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
