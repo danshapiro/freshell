@@ -64,15 +64,15 @@ Schema-grounded protocol facts to preserve:
 - `thread/turns/list` params are `{ threadId, cursor?, limit?, sortDirection? }`. It does not accept `revision` or `includeBodies`. The response is `{ data, nextCursor, backwardsCursor }`.
 - `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, local images are `{ type: 'localImage', path }`, skills are `{ type: 'skill', name, path }`, and mentions are `{ type: 'mention', name, path }`.
 - Codex reasoning effort values are generated as `"none" | "minimal" | "low" | "medium" | "high" | "xhigh"`. Freshcodex must not reuse Claude's legacy `"max"` effort value; if `"max"` is present in migrated settings, show a controlled unsupported Freshcodex settings error or map only through an explicit user-visible migration rule added in this plan.
-- Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`.
-- Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. `SandboxPolicy.externalSandbox.networkAccess` uses generated `NetworkAccess` values `"restricted" | "enabled"`, not a free-form payload. Do not send the thread-level `sandbox` string to `turn/start`.
+- Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`. The generated JSON Schema defaults `AskForApproval.granular.skill_approval` and `AskForApproval.granular.request_permissions` to `false` even though the generated TypeScript type prints them as required; raw Codex protocol schemas must accept those omitted fields and normalize them to `false`.
+- Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. `SandboxPolicy.externalSandbox.networkAccess` uses generated `NetworkAccess` values `"restricted" | "enabled"`, not a free-form payload. Generated JSON Schema defaults omitted sandbox-policy fields (`readOnly.networkAccess`, `externalSandbox.networkAccess`, and `workspaceWrite`'s `writableRoots`, `networkAccess`, `excludeTmpdirEnvVar`, and `excludeSlashTmp`); raw protocol schemas must accept those omitted fields and normalize them before lifecycle responses cross into fresh-agent contracts. Do not send the thread-level `sandbox` string to `turn/start`.
 - `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
 - `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; generated TypeScript returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`, while generated JSON Schema requires only `thread`, `model`, `modelProvider`, `cwd`, `approvalPolicy`, `approvalsReviewer`, and `sandbox`. Raw protocol schemas must accept omitted `serviceTier`, `instructionSources`, and `reasoningEffort` and normalize them to `null`, `[]`, and `null`.
 - `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
 - `thread/loaded/list` returns `{ data: string[], nextCursor? }`, not thread summaries. Raw protocol schemas must normalize omitted `nextCursor` to `null`. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
 - `thread/list` is paginated. Params include `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `cwd`, `useStateDbOnly`, and `searchTerm`; the TypeScript response is `{ data: Thread[], nextCursor, backwardsCursor }`, while generated JSON Schema requires only `data` and marks cursor fields optional/null. Raw protocol schemas must accept missing cursors and normalize them to `null` before producing fresh-agent page contracts. Freshcodex history/session APIs must preserve both normalized cursors instead of collapsing the response to an array.
 - `model/list` is paginated. Params are `{ cursor?, limit?, includeHidden? }`; the TypeScript response is `{ data: Model[], nextCursor }`, while generated JSON Schema requires only `data` and marks `nextCursor` optional/null. Raw protocol schemas must accept missing `nextCursor` and normalize it to `null` before producing fresh-agent page contracts. A convenience settings helper may accumulate pages for a dropdown, but the adapter/runtime/router/API contract must remain page-shaped so hidden or future large model lists are not silently truncated.
-- Generated `ThreadSourceKind` values are `cli`, `vscode`, `exec`, `appServer`, `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, `subAgentOther`, and `unknown`. Freshcodex rich history must explicitly request `appServer`, `vscode`, and every generated `subAgent*` kind, including `subAgentCompact`, so Codex app-server rich sessions and child-agent sessions are not hidden by default source filters. The `vscode` source is required because local runtime probes against `codex app-server --listen stdio://` on `codex-cli 0.128.0` returned newly created app-server threads with `source: "vscode"` even when the client was Freshell and `serviceName: "freshell"` was supplied.
+- Generated `ThreadSourceKind` values are `cli`, `vscode`, `exec`, `appServer`, `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, `subAgentOther`, and `unknown`. Freshcodex rich history must explicitly request generated user-visible/resumable Codex sources (`cli`, `vscode`, `exec`, and `appServer`) plus every generated `subAgent*` kind, including `subAgentCompact`, so CLI-created threads, app-server-created threads, command/exec sessions, and child-agent sessions are not hidden by the explicit source filter. The `vscode` source is required because local runtime probes against `codex app-server --listen stdio://` on `codex-cli 0.128.0` returned newly created app-server threads with `source: "vscode"` even when the client was Freshell and `serviceName: "freshell"` was supplied. `unknown` must parse and preserve when returned, but it should not be in the default history filter unless the UI exposes an explicit "unknown source" option.
 - Generated `ThreadStartSource` values are only `"startup"` and `"clear"`. Do not use `sessionStartSource` as a Freshell/app-server source marker or send `"appServer"` there.
 - `Thread` has `id`, optional/null `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, optional/null `path`, `cwd`, `cliVersion`, `source`, optional/null subagent metadata, optional/null `gitInfo`, optional/null `name`, and `turns`. `Turn` has `id`, `items`, `status`, optional/null `error`, optional/null Unix-second `startedAt`/`completedAt` values, and optional/null `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize omitted nullable fields explicitly.
 - Generated JSON Schema requires the core `Thread` metadata envelope even when turn bodies are omitted. At minimum, schema-valid wire fixtures must include `id`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `cwd`, `cliVersion`, `source`, and `turns`. Optional/null fields such as `forkedFromId`, `path`, `agentNickname`, `agentRole`, `gitInfo`, and `name` may be omitted on the JSON wire and must normalize to `null` before provider extensions or fresh-agent contracts depend on them. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
@@ -137,6 +137,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - A Codex app-server item may normalize to zero, one, or many fresh-agent transcript items. In particular, `userMessage.content` can contain multiple text/image/localImage parts. Codex item normalization must return an array and turn normalization must `flatMap` item output while preserving stable derived ids for split content parts.
 - Codex `UserInput` content parts include text, image, localImage, skill, and mention. Freshcodex message content and renderers must preserve every generated part type; do not silently drop skill or mention references from existing threads.
 - Freshcodex runtime settings use Codex-shaped values at the app-server boundary. Shared UI/state may keep the historical field name `permissionMode`, but the value sent to Codex must parse as generated `AskForApproval`; `effort` must parse as generated `ReasoningEffort`; and turn-time sandbox overrides must be converted to generated `SandboxPolicy` with a clear error if the selected mode cannot be represented.
+- `FreshAgentRuntimeSettingsSchema` may remain a broad persisted/UI shape only because Freshclaude and Freshcodex share historical field names. Any executable action parser (`freshAgent.create`, `freshAgent.send`, `freshAgent.attach`, review/fork settings, and REST action bodies) must resolve the provider first, then validate settings with a provider-specific schema before the runtime manager or adapter receives the action. A Freshcodex action carrying Claude-only values such as `permissionMode: "bypassPermissions"` or `effort: "max"` must fail in WebSocket/controller parsing with `FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING`, not merely inside the Codex adapter after generic parsing has already accepted it.
 - Codex turn bodies are page-first. `thread/turns/list` returns `Turn` objects with items, so Freshcodex should normalize those page results directly into turn bodies. A server-side LRU turn-body cache may serve `/turns/:turnId` for bodies already loaded from pages; the adapter must not implement body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
 - Every app-server item/request type documented by the current local generated schema must either have a normalized UI representation or a clear supported-negative response path. Unknown future item types should fail contract validation until intentionally modeled. Do not add a catch-all transcript fallback without explicit approval.
 - Every Codex normalization fixture that claims to model an app-server `Thread`, `Turn`, `ThreadItem`, `ServerRequest`, or `ServerNotification` must first parse through the local generated Codex protocol schemas in `server/coding-cli/codex-app-server/protocol.ts`. Do not write tests against impossible mock shapes. If an example in this plan differs from the generated schema, the generated schema wins and the fixture must be corrected.
@@ -460,7 +461,7 @@ expect(FreshAgentTranscriptItemSchema.parse({
 ```
 
 Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentThreadListPageSchema`, `FreshAgentModelListPageSchema`, `FreshAgentModelProviderCapabilitiesSchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures. The thread-list fixture must preserve `items`, `nextCursor`, and `backwardsCursor` because Codex `thread/list` is paginated and Freshcodex history must not collapse the app-server page to an array. The model-list fixture must preserve `items`, `nextCursor`, and provider-level capabilities when available because Codex `model/list` is paginated and Freshcodex settings must not treat the first page as a complete model catalog or drop `modelProvider/capabilities/read` data at the shared contract boundary.
-Also assert that `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, Codex approval policy, and Codex effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code. The test must prove Freshcodex accepts generated Codex effort values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and rejects sending legacy Claude-only effort values such as `max` through the Codex adapter. It must also prove Freshcodex accepts generated Codex approval policies (`untrusted`, `on-failure`, `on-request`, `never`, and granular policy objects) and rejects Claude permission modes such as `bypassPermissions` at the Codex boundary.
+Also assert that `FreshAgentInputImageSchema`, `FreshAgentRuntimeSettingsSchema`, `FreshAgentCodexRuntimeSettingsSchema`, and `FreshAgentClaudeRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, provider-specific permission/approval policy, and provider-specific effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code. The broad `FreshAgentRuntimeSettingsSchema` may accept historical Claude and Codex values for persisted data, but the provider-specific schemas are the executable action gate. The test must prove Freshcodex accepts generated Codex effort values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and rejects legacy Claude-only effort values such as `max` through `FreshAgentCodexRuntimeSettingsSchema` before an adapter call. It must also prove Freshcodex accepts generated Codex approval policies (`untrusted`, `on-failure`, `on-request`, `never`, and granular policy objects) and rejects Claude permission modes such as `bypassPermissions` through the same provider-specific parser. Add the mirror assertion that Freshclaude still accepts its existing Claude permission/effort values through `FreshAgentClaudeRuntimeSettingsSchema`.
 
 Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
 
@@ -840,22 +841,53 @@ export const FreshAgentCodexApprovalPolicySchema = z.union([
     granular: z.object({
       sandbox_approval: z.boolean(),
       rules: z.boolean(),
-      skill_approval: z.boolean(),
-      request_permissions: z.boolean(),
+      skill_approval: z.boolean().optional().default(false),
+      request_permissions: z.boolean().optional().default(false),
       mcp_elicitations: z.boolean(),
     }),
   }),
 ])
 export const FreshAgentLegacyClaudePermissionModeSchema = z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions'])
 
+const FreshAgentRuntimeSettingsBaseSchema = z.object({
+  model: z.string().min(1).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+})
+
+export const FreshAgentCodexRuntimeSettingsSchema = FreshAgentRuntimeSettingsBaseSchema.extend({
+  permissionMode: FreshAgentCodexApprovalPolicySchema.optional(),
+  effort: FreshAgentCodexReasoningEffortSchema.optional(),
+})
+
+export const FreshAgentClaudeRuntimeSettingsSchema = FreshAgentRuntimeSettingsBaseSchema.extend({
+  permissionMode: FreshAgentLegacyClaudePermissionModeSchema.optional(),
+  effort: FreshAgentLegacyClaudeEffortSchema.optional(),
+})
+
 export const FreshAgentRuntimeSettingsSchema = z.object({
   model: z.string().min(1).optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-  // Historical field name retained for pane/settings compatibility. Provider
-  // adapters must validate against their own generated runtime schema before sending.
+  // Historical field name retained for persisted pane/settings compatibility only.
+  // Executable actions must call parseFreshAgentRuntimeSettingsForProvider after
+  // resolving the provider so Freshcodex cannot accept Claude-only values.
   permissionMode: z.union([FreshAgentCodexApprovalPolicySchema, FreshAgentLegacyClaudePermissionModeSchema]).optional(),
   effort: z.union([FreshAgentCodexReasoningEffortSchema, FreshAgentLegacyClaudeEffortSchema]).optional(),
 })
+
+export function parseFreshAgentRuntimeSettingsForProvider(
+  provider: FreshAgentRuntimeProvider,
+  value: unknown | undefined,
+): FreshAgentRuntimeSettings | undefined {
+  if (value === undefined) return undefined
+  switch (provider) {
+    case 'codex':
+      return FreshAgentCodexRuntimeSettingsSchema.parse(value)
+    case 'claude':
+      return FreshAgentClaudeRuntimeSettingsSchema.parse(value)
+    case 'opencode':
+      throw new Error('Freshopencode runtime settings are not implemented')
+  }
+}
 
 export const FreshAgentThreadSnapshotSchema = z.object({
   sessionType: FreshAgentSessionTypeSchema,
@@ -979,6 +1011,9 @@ export type FreshAgentModelSummary = z.infer<typeof FreshAgentModelSummarySchema
 export type FreshAgentModelProviderCapabilities = z.infer<typeof FreshAgentModelProviderCapabilitiesSchema>
 export type FreshAgentModelListPage = z.infer<typeof FreshAgentModelListPageSchema>
 export type FreshAgentModelListQuery = z.infer<typeof FreshAgentModelListQuerySchema>
+export type FreshAgentCodexRuntimeSettings = z.infer<typeof FreshAgentCodexRuntimeSettingsSchema>
+export type FreshAgentClaudeRuntimeSettings = z.infer<typeof FreshAgentClaudeRuntimeSettingsSchema>
+export type FreshAgentRuntimeSettings = z.infer<typeof FreshAgentRuntimeSettingsSchema>
 export type FreshAgentServerRequestId = z.infer<typeof FreshAgentServerRequestIdSchema>
 export type FreshAgentServerRequestResponse = z.infer<typeof FreshAgentServerRequestResponseSchema>
 ```
@@ -1399,6 +1434,9 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalResponse.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalParams.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalResponse.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ThreadReadResponse.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ThreadStartResponse.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ModelListResponse.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InputModality.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts`
@@ -1481,7 +1519,7 @@ Use the generated schema to verify exact parameter and response names for `initi
 
 Add generated inventory assertions for both methods and field-level requiredness. Tests must parse method names and important required fields from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings and required object fields. For wire-only constraints that TypeScript cannot express, such as `RequestId`'s integer numeric branch, `schema-inventory.ts` must also read the checked-in generated JSON Schema files. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
 
-Field inventory tests must fail if `protocol.ts` accepts a generated-required entity with missing required fields. At minimum, assert these local schema facts:
+Field inventory tests must fail if `protocol.ts` accepts a generated-required entity with missing required fields or rejects generated-defaulted fields that may be omitted on the JSON wire. Add `schema-inventory.ts` helpers for both required fields and defaulted JSON-schema properties, for example `requiredFieldsForGeneratedJsonSchema(...)` and `defaultedFieldsForGeneratedJsonSchema(...)`. At minimum, assert these local schema facts:
 
 ```ts
 expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadReadResponse.json', 'Thread')).toEqual(expect.arrayContaining([
@@ -1525,7 +1563,9 @@ expect(() => CodexRequestIdSchema.parse(42.5)).toThrow(/integer/i)
 expect(CodexThreadTurnsListResultSchema.parse({ data: [] })).toMatchObject({ data: [], nextCursor: null, backwardsCursor: null })
 expect(CodexThreadReadResultSchema.parse({ thread: schemaValidThread({ turns: [] }) }).thread.turns).toEqual([])
 expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'cli',
   'vscode',
+  'exec',
   'appServer',
   'subAgent',
   'subAgentReview',
@@ -1658,6 +1698,25 @@ expect(askForApprovalValuesFromGeneratedSchema()).toEqual(expect.arrayContaining
   'never',
   'granular',
 ]))
+expect(defaultedFieldsForGeneratedJsonSchema('v2/ThreadStartResponse.json', 'AskForApproval.granular')).toEqual(expect.objectContaining({
+  skill_approval: false,
+  request_permissions: false,
+}))
+expect(CodexApprovalPolicySchema.parse({
+  granular: {
+    sandbox_approval: true,
+    rules: true,
+    mcp_elicitations: false,
+  },
+})).toEqual({
+  granular: {
+    sandbox_approval: true,
+    rules: true,
+    skill_approval: false,
+    request_permissions: false,
+    mcp_elicitations: false,
+  },
+})
 expect(sandboxModeValuesFromGeneratedSchema()).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
 expect(sandboxPolicyVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'dangerFullAccess',
@@ -1666,6 +1725,23 @@ expect(sandboxPolicyVariantsFromGeneratedSchema()).toEqual(expect.arrayContainin
   'workspaceWrite',
 ]))
 expect(networkAccessValuesFromGeneratedSchema()).toEqual(['restricted', 'enabled'])
+expect(defaultedFieldsForGeneratedJsonSchema('v2/ThreadStartResponse.json', 'SandboxPolicy.readOnly')).toEqual({ networkAccess: false })
+expect(defaultedFieldsForGeneratedJsonSchema('v2/ThreadStartResponse.json', 'SandboxPolicy.externalSandbox')).toEqual({ networkAccess: 'restricted' })
+expect(defaultedFieldsForGeneratedJsonSchema('v2/ThreadStartResponse.json', 'SandboxPolicy.workspaceWrite')).toEqual({
+  writableRoots: [],
+  networkAccess: false,
+  excludeTmpdirEnvVar: false,
+  excludeSlashTmp: false,
+})
+expect(CodexSandboxPolicySchema.parse({ type: 'readOnly' })).toEqual({ type: 'readOnly', networkAccess: false })
+expect(CodexSandboxPolicySchema.parse({ type: 'externalSandbox' })).toEqual({ type: 'externalSandbox', networkAccess: 'restricted' })
+expect(CodexSandboxPolicySchema.parse({ type: 'workspaceWrite' })).toEqual({
+  type: 'workspaceWrite',
+  writableRoots: [],
+  networkAccess: false,
+  excludeTmpdirEnvVar: false,
+  excludeSlashTmp: false,
+})
 expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localImage', 'skill', 'mention'])
 expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
 expect(() => CodexThreadStatusSchema.parse({ type: 'active' })).toThrow(/activeFlags/i)
@@ -2065,22 +2141,22 @@ export const CodexApprovalPolicySchema = z.union([
     granular: z.object({
       sandbox_approval: z.boolean(),
       rules: z.boolean(),
-      skill_approval: z.boolean(),
-      request_permissions: z.boolean(),
+      skill_approval: z.boolean().optional().default(false),
+      request_permissions: z.boolean().optional().default(false),
       mcp_elicitations: z.boolean(),
     }),
   }),
 ])
 export const CodexSandboxPolicySchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('dangerFullAccess') }),
-  z.object({ type: z.literal('readOnly'), networkAccess: z.boolean() }),
-  z.object({ type: z.literal('externalSandbox'), networkAccess: z.enum(['restricted', 'enabled']) }),
+  z.object({ type: z.literal('readOnly'), networkAccess: z.boolean().optional().default(false) }),
+  z.object({ type: z.literal('externalSandbox'), networkAccess: z.enum(['restricted', 'enabled']).optional().default('restricted') }),
   z.object({
     type: z.literal('workspaceWrite'),
-    writableRoots: z.array(z.string()),
-    networkAccess: z.boolean(),
-    excludeTmpdirEnvVar: z.boolean(),
-    excludeSlashTmp: z.boolean(),
+    writableRoots: z.array(z.string()).optional().default([]),
+    networkAccess: z.boolean().optional().default(false),
+    excludeTmpdirEnvVar: z.boolean().optional().default(false),
+    excludeSlashTmp: z.boolean().optional().default(false),
   }),
 ])
 
@@ -2393,6 +2469,9 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalResponse.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalParams.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalResponse.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ThreadReadResponse.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ThreadStartResponse.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/v2/ModelListResponse.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InputModality.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts \
@@ -3031,10 +3110,10 @@ function getServerRequestThreadId(request: CodexServerRequest): string | null {
 
 Only `account/chatgptAuthTokens/refresh` should currently return `null`. Legacy `applyPatchApproval` and `execCommandApproval` must use `conversationId` to update the correct thread's pending approval state and must respond with `CodexLegacyApplyPatchApprovalResponseSchema` / `CodexLegacyExecCommandApprovalResponseSchema` payloads.
 
-Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Replace the old create-message effort enum with the shared runtime-settings schema so Freshcodex create can carry generated Codex effort values such as `xhigh` and granular approval policy objects:
+Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Replace the old create-message effort enum with the shared runtime-settings field schemas so Freshcodex create can carry generated Codex effort values such as `xhigh` and granular approval policy objects. The create parser must also resolve the effective provider from the session-type registry before accepting runtime settings; otherwise the broad persisted/UI settings schema would accept `bypassPermissions` and `max` for Freshcodex:
 
 ```ts
-export const FreshAgentCreateSchema = z.object({
+const FreshAgentCreateBaseSchema = z.object({
   type: z.literal('freshAgent.create'),
   requestId: z.string().min(1),
   sessionType: FreshAgentSessionTypeSchema,
@@ -3047,7 +3126,36 @@ export const FreshAgentCreateSchema = z.object({
   effort: FreshAgentRuntimeSettingsSchema.shape.effort,
   plugins: z.array(z.string()).optional(),
 })
+
+export const FreshAgentCreateSchema = FreshAgentCreateBaseSchema.superRefine((value, ctx) => {
+  const provider = resolveRuntimeProviderForCreate(value.sessionType, value.provider)
+  validateFreshAgentRuntimeSettingFieldsForProvider(provider, value, ctx)
+})
 ```
+
+Add explicit create-parser tests for both branches:
+
+```ts
+expect(() => FreshAgentCreateSchema.parse({
+  type: 'freshAgent.create',
+  requestId: 'create-codex-invalid',
+  sessionType: 'freshcodex',
+  provider: 'codex',
+  permissionMode: 'bypassPermissions',
+  effort: 'max',
+})).toThrow(/FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING|permissionMode|effort/i)
+
+expect(FreshAgentCreateSchema.parse({
+  type: 'freshAgent.create',
+  requestId: 'create-claude-valid',
+  sessionType: 'freshclaude',
+  provider: 'claude',
+  permissionMode: 'bypassPermissions',
+  effort: 'max',
+})).toMatchObject({ provider: 'claude' })
+```
+
+Implement `resolveRuntimeProviderForCreate` from the shared session descriptor source (`shared/fresh-agent.ts` or the split shared descriptor registry from Task 3), not from the client-only `src/lib/fresh-agent-registry.ts`. Implement `validateFreshAgentRuntimeSettingFieldsForProvider` by extracting `{ model, sandbox, permissionMode, effort }` from the parsed action and calling `FreshAgentCodexRuntimeSettingsSchema` or `FreshAgentClaudeRuntimeSettingsSchema` from `shared/fresh-agent-contract.ts`. Convert Zod failures into `FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING` action errors so the UI reports invalid migrated Freshcodex settings before a Codex app-server request is sent.
 
 Also update the server-to-client create response so the newly created session immediately carries the same locator shape:
 
@@ -3119,6 +3227,8 @@ export const FreshAgentSendSchema = z.object({
   runtimeSettings: FreshAgentRuntimeSettingsSchema.optional(),
 }).refine((value) => Boolean(value.text?.trim() || value.images?.length), {
   message: 'Fresh-agent send requires text or an image',
+}).superRefine((value, ctx) => {
+  validateFreshAgentRuntimeSettingsForProvider(value.provider, value.runtimeSettings, ctx)
 })
 ```
 
@@ -3137,6 +3247,8 @@ export const FreshAgentAttachSchema = z.object({
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   runtimeSettings: FreshAgentRuntimeSettingsSchema.optional(),
+}).superRefine((value, ctx) => {
+  validateFreshAgentRuntimeSettingsForProvider(value.provider, value.runtimeSettings, ctx)
 })
 ```
 
@@ -3501,7 +3613,7 @@ type FreshAgentRuntimeSettings = {
 }
 ```
 
-Provider policy helpers must validate these union fields before action dispatch. Freshcodex may dispatch only generated Codex `approvalPolicy` and `effort` values; Freshclaude may keep its existing Claude-specific permission/effort values. The shell should show a controlled settings error if a migrated Freshcodex pane still contains Claude-only values.
+Provider policy helpers must validate these union fields with the provider-specific schemas before action dispatch. Freshcodex may dispatch only generated Codex `approvalPolicy` and `effort` values; Freshclaude may keep its existing Claude-specific permission/effort values. The shell should show a controlled settings error if a migrated Freshcodex pane still contains Claude-only values, and the WebSocket/client action parser must reject those values before the runtime manager calls the Codex adapter.
 
 `FreshAgentComposer.tsx` must support browser-representable image input directly, not only a test helper. Add an accessible image URL attachment control and file/paste handling that converts selected browser files to `{ kind: 'data', mediaType, data }` before dispatch. Keep `{ kind: 'local', path }` in the shared contract for server-side or restored Codex content, but do not pretend the browser can produce arbitrary local filesystem paths without an explicit server-side file picker.
 
@@ -4067,7 +4179,7 @@ await expect(loadFreshcodexHistoryPage({ limit: 25 })).resolves.toMatchObject({
 })
 expect(runtime.listThreads).toHaveBeenCalledWith(expect.objectContaining({
   limit: 25,
-  sourceKinds: ['appServer', 'vscode', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther'],
+  sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther'],
 }))
 
 runtime.listModels.mockResolvedValue({
@@ -4240,7 +4352,7 @@ Rules:
 - Update `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, `src/store/paneTreeValidation.ts`, and pane persistence schemas/tests so Freshcodex `sandbox`, generated Codex effort values, and structured/generated approval policies are preserved in local and remote tab snapshots. Remote snapshots must not cast Freshcodex effort back to `'low' | 'medium' | 'high' | 'max'`, must not cast structured approval policy objects to strings, and must not omit `sandbox`.
 - Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
 - Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The thread-list surface must reflect the generated app-server shape after fresh-agent normalization (`{ items, nextCursor, backwardsCursor }`) rather than returning a bare array; the loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone. The model-list surface must likewise reflect the generated paginated shape after fresh-agent normalization (`{ items, nextCursor }`) rather than returning a bare first-page array.
-- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for rich app-server sessions, locally created app-server threads reported as `vscode`, and child-agent sessions, at least `['appServer', 'vscode', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps locally created Freshcodex threads, app-server-created threads, review threads, compaction subagent threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
+- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for CLI-created sessions, rich app-server sessions, command/exec sessions, locally created app-server threads reported as `vscode`, and child-agent sessions, at least `['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps CLI-created Codex threads, locally created Freshcodex threads, app-server-created threads, exec sessions, review threads, compaction subagent threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
 - Preserve generated `Thread.source` separately from the `thread/list` `sourceKinds` filter. For subagent threads, parse and store nested `SessionSource` metadata such as `{ subAgent: { thread_spawn: ... } }`; derive `parentThreadId`, child-thread labels, and fork/child UX from that nested metadata where available. Do not flatten returned `Thread.source` into the source-kind filter enum because that loses spawned-agent parent ids, depth, nickname, and role.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. `loadFreshcodexModelPage` should preserve the page cursor for settings UIs that can page model options; any `loadFreshcodexModelOptions` convenience helper that returns an array must explicitly iterate pages until `nextCursor` is null and fail on cursor cycles or an excessive page count instead of silently truncating. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
@@ -4553,7 +4665,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
 - Freshcodex starts Codex review through `review/start`, preserves `reviewThreadId`/target/delivery metadata, lists/resumes rich Codex threads through paginated `thread/list`, exposes loaded thread ids according to `thread/loaded/list`, and populates model/capability UI from paginated `model/list` plus `modelProvider/capabilities/read`.
-- Freshcodex history APIs preserve `thread/list` `nextCursor` and `backwardsCursor`, and history queries explicitly include Codex rich app-server, local app-server-created `vscode` source, and all generated child-agent source kinds rather than relying on app-server defaults.
+- Freshcodex history APIs preserve `thread/list` `nextCursor` and `backwardsCursor`, and history queries explicitly include Codex `cli`, `vscode`, `exec`, rich `appServer`, and all generated child-agent source kinds rather than relying on app-server defaults.
 - Freshcodex settings/model APIs preserve `model/list` `nextCursor`; any dropdown convenience helper that returns a full option array explicitly drains pages and guards against cursor loops instead of truncating at the first page.
 - Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
 - Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart. Every restore/resume path uses `thread/resume { excludeTurns: true }` and then `thread/turns/list` for the visible page so restore cannot accidentally load a full transcript.
