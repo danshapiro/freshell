@@ -24,7 +24,8 @@ The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-
 Two existing implementation seams must be corrected before the new feature work can be considered a durable shared foundation:
 
 - `server/fresh-agent/provider-registry.ts` currently stores one registration per runtime provider. Because both `freshclaude` and hidden `kilroy` use `provider: 'claude'`, the last registration can overwrite the runtime-provider lookup. Split session identity registration from runtime adapter registration so many `sessionType` values can intentionally share one provider adapter without changing lookup semantics.
-- `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` currently re-export the legacy agent-chat reducer and types. That was acceptable as a temporary bridge, but it is not a shared fresh-agent foundation. Fresh-agent state must have its own typed slice/actions based on the shared fresh-agent contract; legacy agent-chat may keep its own slice until Freshclaude is fully ported.
+- `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` currently re-export or alias legacy agent-chat state/thunks. `src/lib/pane-activity.ts` also reads fresh-agent pane activity from `agentChatSessions`. That was acceptable as a temporary bridge, but it is not a shared fresh-agent foundation. Fresh-agent state, thunks, activity projection, and action names must be based on the shared fresh-agent contract; legacy agent-chat may keep its own slice until Freshclaude is fully ported.
+- Freshcodex defaults and restored-pane runtime settings currently flow through helper files that still assume Claude-shaped agent-chat values. `src/lib/session-type-utils.ts`, `src/store/tabsSlice.ts`, `src/lib/tab-registry-snapshot.ts`, `src/store/paneTreeValidation.ts`, `src/components/TabsView.tsx`, and pane persistence tests must be updated so Codex-shaped approval policy, sandbox, and effort values survive picker creation, session resume, browser persistence, remote tab snapshots, and hydration.
 
 The branch is behind `origin/main` by commits that touch exactly the areas this project depends on: agent-chat auto-title, mobile keyboard/touch behavior, stale pane hydration, two-browser reconnect recovery, and Codex app-server startup/init hardening. Those changes must be merged into this worktree before contract work so the implementation does not reintroduce known fixed bugs.
 
@@ -105,7 +106,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `sessionType` means user-facing identity: `freshclaude`, `freshcodex`, `kilroy`, or disabled `freshopencode`.
 - Every fresh-agent read-model contract and browser/server API that identifies a session must include `sessionType` as well as `provider` and `threadId`. Do not infer user-facing identity from `provider`; multiple session types can share one runtime provider.
 - `server/fresh-agent/provider-registry.ts` must model two separate concepts: a session-type descriptor registry and a runtime-provider adapter registry. Runtime adapter lookup by provider must not be overwritten by another session type using the same provider.
-- `src/store/freshAgentSlice.ts` must become an actual fresh-agent slice with fresh-agent action names and contract-shaped state. It must not re-export `agentChatSlice`, and `src/store/freshAgentTypes.ts` must not alias `agentChatTypes`.
+- `src/store/freshAgentSlice.ts` must become an actual fresh-agent slice with fresh-agent action names and contract-shaped state. It must not re-export `agentChatSlice`; `src/store/freshAgentTypes.ts` must not alias `agentChatTypes`; and `src/store/freshAgentThunks.ts` must not alias `agentChatThunks`.
 - All fresh-agent server adapter outputs parse before leaving `server/fresh-agent/runtime-manager.ts`.
 - All fresh-agent REST payloads parse again in `src/lib/api.ts` before UI state sees them.
 - A snapshot, turn page, or turn body with an invalid contract is a controlled error, not partially rendered data.
@@ -179,13 +180,23 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `src/lib/api.ts`
 - `src/lib/fresh-agent-ws.ts`
 - `src/lib/fresh-agent-registry.ts`
+- `src/lib/pane-activity.ts`
+- `src/lib/session-type-utils.ts`
+- `src/lib/tab-registry-snapshot.ts`
 - `src/store/freshAgentSlice.ts`
+- `src/store/freshAgentThunks.ts`
 - `src/store/freshAgentTypes.ts`
 - `src/store/paneTypes.ts`
 - `src/store/panesSlice.ts`
+- `src/store/paneTreeValidation.ts`
 - `src/store/selectors/sidebarSelectors.ts`
+- `src/store/tabsSlice.ts`
+- `src/store/managed-items.ts`
+- `src/store/settingsThunks.ts`
 - `src/lib/derivePaneTitle.ts`
 - `src/lib/session-utils.ts`
+- `src/components/ExtensionsView.tsx`
+- `src/components/TabsView.tsx`
 - `src/components/fresh-agent/FreshAgentView.tsx`
 - `src/components/fresh-agent/FreshAgentTranscript.tsx`
 - `src/components/fresh-agent/FreshAgentComposer.tsx`
@@ -742,13 +753,18 @@ git commit -m "Add strict fresh-agent read-model contracts"
 - Modify: `src/lib/api.ts`
 - Modify: `src/lib/fresh-agent-ws.ts`
 - Modify: `src/store/freshAgentSlice.ts`
+- Modify: `src/store/freshAgentThunks.ts`
 - Modify: `src/store/freshAgentTypes.ts`
+- Modify: `src/lib/pane-activity.ts`
 - Create: `src/lib/fresh-agent-api-error.ts`
 - Test: `test/unit/server/fresh-agent/contract-boundary.test.ts`
 - Test: `test/unit/server/fresh-agent/provider-registry.test.ts`
 - Test: `test/unit/server/fresh-agent/router.test.ts`
 - Test: `test/unit/client/lib/api.fresh-agent-contract.test.ts`
 - Test: `test/unit/client/store/freshAgentSlice.test.ts`
+- Test: `test/unit/client/lib/pane-activity.test.ts`
+- Test: `test/unit/server/fresh-agent/claude-normalize.test.ts`
+- Test: `test/unit/server/fresh-agent/claude-adapter.test.ts`
 
 - [ ] **Step 1: Write failing boundary tests**
 
@@ -798,6 +814,23 @@ it('freshAgentSlice is independent from legacy agentChatSlice', () => {
     provider: 'codex',
   })
 })
+
+it('freshAgentThunks and activity projection do not read fresh-agent state through agent-chat bridges', () => {
+  expect(String(loadFreshAgentTurnBody.typePrefix)).toMatch(/^freshAgent\//)
+  const activity = resolvePaneActivity({
+    paneId: 'pane-1',
+    content: { kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', sessionId: 'thread-1', createRequestId: 'req-1', status: 'running' },
+    isOnlyPane: true,
+    codexActivityByTerminalId: {},
+    opencodeActivityByTerminalId: {},
+    paneRuntimeActivityByPaneId: {},
+    agentChatSessions: {},
+    freshAgentSessions: {
+      'thread-1': { sessionType: 'freshcodex', provider: 'codex', status: 'running' },
+    },
+  })
+  expect(activity).toEqual({ isBusy: true, source: 'fresh-agent' })
+})
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -810,10 +843,13 @@ npm run test:vitest -- \
   test/unit/server/fresh-agent/provider-registry.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
-  test/unit/client/store/freshAgentSlice.test.ts
+  test/unit/client/store/freshAgentSlice.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
+  test/unit/server/fresh-agent/claude-normalize.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts
 ```
 
-Expected: FAIL because boundary parsing is not implemented, client helpers return `any`, provider lookup still conflates session type with runtime provider, and `freshAgentSlice` is still a legacy agent-chat alias.
+Expected: FAIL because boundary parsing is not implemented, client helpers return `any`, provider lookup still conflates session type with runtime provider, fresh-agent state/thunks are still legacy agent-chat aliases, and fresh-agent pane activity still reads through `agentChatSessions`.
 
 - [ ] **Step 3: Implement boundary parsing**
 
@@ -891,7 +927,9 @@ getFreshAgentTurnBody(sessionType, provider, threadId, turnId, revision): Promis
 
 The router should accept `sessionType` in the request path or query, validate it with `FreshAgentSessionTypeSchema`, and pass it to the runtime manager. Do not reconstruct `sessionType` from `provider`.
 
-Replace `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` with an independent fresh-agent reducer and contract-shaped types. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
+Replace `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` with independent fresh-agent reducer, contract-shaped types, and thunk type prefixes. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
+
+Update `src/lib/pane-activity.ts` so `agent-chat` panes continue to use `agentChatSessions`, while `fresh-agent` panes use the new fresh-agent session state. `resolvePaneActivity`, `getBusyPaneIdsForTab`, and `collectBusySessionKeys` should accept `freshAgentSessions` separately from `agentChatSessions`; do not keep the current behavior where a Freshcodex pane has to appear in `agentChat.sessions` before activity, busy badges, or session keys work.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -903,7 +941,10 @@ npm run test:vitest -- \
   test/unit/server/fresh-agent/provider-registry.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
-  test/unit/client/store/freshAgentSlice.test.ts
+  test/unit/client/store/freshAgentSlice.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
+  test/unit/server/fresh-agent/claude-normalize.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts
 ```
 
 Expected: PASS.
@@ -927,6 +968,9 @@ npm run test:vitest -- \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
   test/unit/client/store/freshAgentSlice.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
+  test/unit/server/fresh-agent/claude-normalize.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
 npm run typecheck
 ```
@@ -941,13 +985,17 @@ git add \
   server/fresh-agent/runtime-manager.ts \
   server/fresh-agent/router.ts server/fresh-agent/adapters/claude/normalize.ts \
   server/fresh-agent/adapters/codex/normalize.ts src/lib/api.ts \
-  src/lib/fresh-agent-ws.ts src/store/freshAgentSlice.ts src/store/freshAgentTypes.ts \
+  src/lib/fresh-agent-ws.ts src/store/freshAgentSlice.ts src/store/freshAgentThunks.ts \
+  src/store/freshAgentTypes.ts src/lib/pane-activity.ts \
   src/lib/fresh-agent-api-error.ts \
   test/unit/server/fresh-agent/contract-boundary.test.ts \
   test/unit/server/fresh-agent/provider-registry.test.ts \
   test/unit/server/fresh-agent/router.test.ts \
   test/unit/client/lib/api.fresh-agent-contract.test.ts \
-  test/unit/client/store/freshAgentSlice.test.ts
+  test/unit/client/store/freshAgentSlice.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
+  test/unit/server/fresh-agent/claude-normalize.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts
 git commit -m "Validate fresh-agent payloads at runtime boundaries"
 ```
 
@@ -988,7 +1036,7 @@ find /tmp/freshell-codex-app-server-schema -maxdepth 3 -type f | sort | rg 'JSON
 
 Use the generated schema to verify exact parameter and response names for `initialize`, `initialized`, `thread/start`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `thread/fork`, server notifications, approval server requests, and user-input server requests. The current local schema uses `thread/read { includeTurns: boolean }`, `thread/turns/list { cursor?, limit?, sortDirection? }`, `thread/turns/list -> { data, nextCursor, backwardsCursor }`, `turn/start -> { turn }`, `turn/interrupt { threadId, turnId }`, `thread/fork -> { thread, ...metadata }`, and has no `thread/turn/read`; tests must encode those facts so a future implementation does not accidentally keep the stale API. Tests must also prove `thread/start` and `thread/resume` do not send stale fields such as `richClient`, `experimentalRawEvents`, or `persistExtendedHistory`.
 
-Add a generated client-method inventory assertion. Tests must parse method names from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
+Add a generated client-method inventory assertion. Tests must parse method names from the checked-in generated schema snapshot through `test/fixtures/coding-cli/codex-app-server/schema-inventory.ts`, not from `/tmp`, so normal test runs and CI do not depend on an external `codex` executable. The generated `*.ts` snapshot files intentionally import many sibling type files that this reduced fixture does not check in, so `schema-inventory.ts` must read them as raw UTF-8 text with `fs`/`import.meta.url` path resolution and extract discriminant strings. Do not import generated snapshot modules into the test module graph unless the entire generated dependency tree is checked in. The developer audit script may call the local `codex` executable and compare against the checked-in snapshot, but unit tests must be deterministic.
 
 Compare generated method names to two explicit sets:
 
@@ -1785,7 +1833,7 @@ export const FreshAgentSendSchema = z.object({
 })
 ```
 
-Map input content explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert data URLs or remote URLs to Codex `{ type: 'image', url }` input and local file paths to `{ type: 'localImage', path }`. Existing Codex transcripts may contain `{ type: 'skill' }` and `{ type: 'mention' }` content parts; preserve them in normalized message content. If a new outbound input part cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
+Map input content explicitly. The Freshcodex composer/controller should pass image attachments as typed `FreshAgentInputImage` values; the adapter should convert remote URLs to Codex `{ type: 'image', url }`, convert `{ kind: 'data', mediaType, data }` into a valid `data:${mediaType};base64,${data}` URL before sending `{ type: 'image', url }`, and convert local file paths to `{ type: 'localImage', path }`. Existing Codex transcripts may contain `{ type: 'skill' }` and `{ type: 'mention' }` content parts; preserve them in normalized message content. If a new outbound input part cannot be represented by the generated schema, return a typed unsupported-capability error before starting the turn.
 
 Extend `FreshAgentAttachSchema`, `FreshAgentRuntimeManager.attach`, and `FreshAgentRuntimeAdapter.attach?` so a saved Freshcodex pane can provide `cwd`, `model`, `sandbox`, `permissionMode`, and `effort` when it reattaches:
 
@@ -2546,22 +2594,45 @@ git commit -m "Port mobile ergonomics to fresh-agent shell"
 - Modify: `src/lib/fresh-agent-registry.ts`
 - Modify: `src/lib/derivePaneTitle.ts`
 - Modify: `src/lib/session-utils.ts`
+- Modify: `src/lib/session-type-utils.ts`
+- Modify: `src/lib/tab-registry-snapshot.ts`
+- Modify: `src/lib/api.ts`
+- Modify: `src/lib/pane-activity.ts`
+- Modify: `src/store/tabsSlice.ts`
+- Modify: `src/store/paneTreeValidation.ts`
+- Modify: `src/store/panesSlice.ts`
+- Modify: `src/store/persistedState.ts` if runtime-setting persistence schemas need versioned validation changes
+- Modify: `src/store/managed-items.ts`
+- Modify: `src/store/settingsThunks.ts`
 - Modify: `src/store/selectors/sidebarSelectors.ts`
+- Modify: `src/components/ExtensionsView.tsx`
 - Modify: `src/components/HistoryView.tsx`
+- Modify: `src/components/TabsView.tsx`
 - Modify: `src/components/panes/PaneContainer.tsx`
 - Modify: `src/components/panes/PanePicker.tsx`
 - Modify: `src/components/SettingsView.tsx`
 - Modify: `src/store/paneTypes.ts`
+- Modify: `server/fresh-agent/runtime-manager.ts`
+- Modify: `server/fresh-agent/router.ts`
 - Modify: `server/session-directory/projection.ts`
 - Modify: `server/coding-cli/session-indexer.ts`
 - Modify: `shared/settings.ts`
 - Test: `test/unit/shared/fresh-agent-registry.test.ts`
 - Test: `test/unit/client/lib/derivePaneTitle.test.ts`
 - Test: `test/unit/client/lib/session-utils.test.ts`
+- Test: `test/unit/client/lib/session-type-utils.test.ts`
+- Test: `test/unit/client/lib/tab-registry-snapshot.test.ts`
+- Test: `test/unit/client/lib/pane-activity.test.ts`
 - Test: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
+- Test: `test/unit/client/store/panesPersistence.test.ts`
+- Test: `test/unit/client/store/storage-migration.fresh-agent.test.ts`
+- Test: `test/unit/client/store/persisted-state.fresh-agent.test.ts`
+- Test: `test/unit/client/components/TabsView.fresh-agent.test.tsx`
+- Test: `test/unit/client/components/ExtensionsView.test.tsx`
 - Test: `test/unit/client/components/HistoryView.mobile.test.tsx`
 - Test: `test/unit/client/components/panes/PaneContainer.test.tsx`
 - Test: `test/unit/client/components/panes/PanePicker.test.tsx`
+- Test: `test/unit/server/fresh-agent/router.test.ts`
 - Test: `test/unit/server/session-directory/fresh-agent-projection.test.ts`
 - Test: `test/unit/server/coding-cli/session-indexer.test.ts`
 
@@ -2614,14 +2685,20 @@ await expect(loadFreshcodexModelOptions()).resolves.toEqual(expect.arrayContaini
 ]))
 
 expect(createFreshcodexPaneFromSettings({
-  codex: {
-    model: 'configured-model',
-    sandbox: 'workspace-write',
-    permissionMode: 'on-request',
+  codingCli: {
+    providers: {
+      codex: {
+        model: 'configured-model',
+        sandbox: 'workspace-write',
+        permissionMode: 'on-request',
+      },
+    },
   },
-  agentChat: {
-    freshcodex: {
-      defaultEffort: 'xhigh',
+  freshAgent: {
+    providers: {
+      freshcodex: {
+        defaultEffort: 'xhigh',
+      },
     },
   },
 })).toMatchObject({
@@ -2635,14 +2712,20 @@ expect(createFreshcodexPaneFromSettings({
 })
 
 expect(createFreshcodexPaneFromSettings({
-  codex: {
-    model: 'configured-model',
-    sandbox: 'workspace-write',
-    permissionMode: 'bypassPermissions',
+  codingCli: {
+    providers: {
+      codex: {
+        model: 'configured-model',
+        sandbox: 'workspace-write',
+        permissionMode: 'bypassPermissions',
+      },
+    },
   },
-  agentChat: {
-    freshcodex: {
-      defaultEffort: 'max',
+  freshAgent: {
+    providers: {
+      freshcodex: {
+        defaultEffort: 'max',
+      },
     },
   },
 })).toMatchObject({
@@ -2653,7 +2736,52 @@ expect(createFreshcodexPaneFromSettings({
 })
 ```
 
-Also test that `freshcodex` settings appear independently from Freshclaude where the UI exposes runtime settings, and `freshopencode` remains disabled/hidden.
+Also test that `buildResumeContent`, `TabsView` remote snapshot hydration, `collectPaneSnapshots`, `paneTreeValidation`, and pane persistence preserve Freshcodex `sandbox`, generated Codex effort values, and generated Codex approval policies without narrowing them to Claude strings:
+
+```ts
+expect(buildResumeContent({
+  sessionType: 'freshcodex',
+  sessionId: 'thread-1',
+  cwd: '/repo',
+  freshAgentProviderSettings: {
+    defaultModel: 'configured-model',
+    defaultSandbox: 'workspace-write',
+    defaultPermissionMode: 'on-request',
+    defaultEffort: 'xhigh',
+  },
+})).toMatchObject({
+  kind: 'fresh-agent',
+  provider: 'codex',
+  sessionType: 'freshcodex',
+  sandbox: 'workspace-write',
+  permissionMode: 'on-request',
+  effort: 'xhigh',
+})
+
+expect(collectPaneSnapshots({
+  type: 'leaf',
+  id: 'pane-1',
+  content: {
+    kind: 'fresh-agent',
+    provider: 'codex',
+    sessionType: 'freshcodex',
+    resumeSessionId: 'thread-1',
+    createRequestId: 'req-1',
+    status: 'idle',
+    sandbox: 'workspace-write',
+    permissionMode: { granular: { sandbox_approval: true, rules: true, skill_approval: true, request_permissions: true, mcp_elicitations: true } },
+    effort: 'xhigh',
+  },
+}, 'server-1')).toContainEqual(expect.objectContaining({
+  payload: expect.objectContaining({
+    sandbox: 'workspace-write',
+    permissionMode: expect.objectContaining({ granular: expect.any(Object) }),
+    effort: 'xhigh',
+  }),
+}))
+```
+
+Add persistence tests for browser-reloaded Freshcodex panes with valid Codex runtime settings and for legacy Freshcodex panes with Claude-only values. Valid panes must rehydrate unchanged and attach; legacy invalid panes must remain visible with a controlled `createError`, not be dropped, silently coerced, or replaced with a picker pane. Also test that `freshcodex` settings appear independently from Freshclaude where the UI exposes runtime settings, and `freshopencode` remains disabled/hidden.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -2664,11 +2792,20 @@ npm run test:vitest -- \
   test/unit/shared/fresh-agent-registry.test.ts \
   test/unit/client/lib/derivePaneTitle.test.ts \
   test/unit/client/lib/session-utils.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
   test/unit/client/store/selectors/sidebarSelectors.test.ts \
+  test/unit/client/store/panesPersistence.test.ts \
+  test/unit/client/store/storage-migration.fresh-agent.test.ts \
+  test/unit/client/store/persisted-state.fresh-agent.test.ts \
+  test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/components/ExtensionsView.test.tsx \
+  test/unit/server/fresh-agent/router.test.ts \
   test/unit/server/session-directory/fresh-agent-projection.test.ts
 ```
 
-Expected: FAIL for any identity/title/sidebar gaps still coupled to `agent-chat` or Claude assumptions.
+Expected: FAIL for any identity/title/sidebar/settings/history/snapshot gaps still coupled to `agent-chat` or Claude-shaped runtime assumptions.
 
 - [ ] **Step 3: Implement identity fixes**
 
@@ -2678,7 +2815,11 @@ Rules:
 - `provider: 'codex'` plus `sessionType: 'freshcodex'` is the session ref identity.
 - `sandbox` is stored on fresh-agent pane content and comes from Codex provider settings, not from Claude/Freshclaude settings.
 - `freshcodex` default permission/effort settings must be Codex-shaped. Replace any Freshcodex registry/default value that still uses Claude-specific permission modes such as `bypassPermissions` with a generated Codex approval policy such as `on-request`; replace any Freshcodex default effort that still uses Claude-only `max` with a generated Codex effort value. Do not mutate Freshclaude or Kilroy defaults.
-- Split settings types so Codex and Claude defaults cannot be accidentally interchanged. In `shared/settings.ts`, stop typing `codingCli.providers.codex.permissionMode` and `freshAgent.providers.freshcodex.defaultEffort` with Claude-only aliases. Introduce Codex-specific approval/effort schemas based on the generated app-server values, keep Claude-specific settings for Freshclaude/Kilroy, and migrate invalid legacy Freshcodex values into a visible `createError` rather than silently coercing them.
+- Split settings types so Codex and Claude defaults cannot be accidentally interchanged. In `shared/settings.ts`, stop typing `codingCli.providers.codex.permissionMode` and `freshAgent.providers.freshcodex.defaultEffort` with Claude-only aliases. Introduce Codex-specific approval/effort/sandbox schemas based on the generated app-server values, keep Claude-specific settings for Freshclaude/Kilroy, and migrate invalid legacy Freshcodex values into a visible `createError` rather than silently coercing them.
+- Update `src/lib/session-type-utils.ts`, `src/store/tabsSlice.ts`, and `src/components/panes/PaneContainer.tsx` so Freshcodex creation and resume use Freshcodex settings from `freshAgent.providers.freshcodex` plus Codex CLI defaults from `codingCli.providers.codex`. Do not route Freshcodex through `getAgentChatProviderConfig()` or an `agentChatProviderSettings` parameter; those are Claude/Kilroy compatibility paths only.
+- Update `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, `src/store/paneTreeValidation.ts`, and pane persistence schemas/tests so Freshcodex `sandbox`, generated Codex effort values, and structured/generated approval policies are preserved in local and remote tab snapshots. Remote snapshots must not cast Freshcodex effort back to `'low' | 'medium' | 'high' | 'max'`, must not cast structured approval policy objects to strings, and must not omit `sandbox`.
+- Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
+- Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex threads, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented.
 - Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
@@ -2696,10 +2837,19 @@ npm run test:vitest -- \
   test/unit/shared/fresh-agent-registry.test.ts \
   test/unit/client/lib/derivePaneTitle.test.ts \
   test/unit/client/lib/session-utils.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
   test/unit/client/store/selectors/sidebarSelectors.test.ts \
+  test/unit/client/store/panesPersistence.test.ts \
+  test/unit/client/store/storage-migration.fresh-agent.test.ts \
+  test/unit/client/store/persisted-state.fresh-agent.test.ts \
+  test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/components/ExtensionsView.test.tsx \
   test/unit/client/components/HistoryView.mobile.test.tsx \
   test/unit/client/components/panes/PaneContainer.test.tsx \
   test/unit/client/components/panes/PanePicker.test.tsx \
+  test/unit/server/fresh-agent/router.test.ts \
   test/unit/server/session-directory/fresh-agent-projection.test.ts \
   test/unit/server/coding-cli/session-indexer.test.ts
 ```
@@ -2712,29 +2862,45 @@ Run:
 
 ```bash
 rg -n "freshcodex.*agentChat|agentChat.*freshcodex|state\\.agentChat.*freshcodex|kind: 'agent-chat'.*freshcodex" src server test
-rg -n "agentChatSlice|agentChatTypes" src/store/freshAgentSlice.ts src/store/freshAgentTypes.ts
+rg -n "agentChatSlice|agentChatTypes|agentChatThunks" src/store/freshAgentSlice.ts src/store/freshAgentTypes.ts src/store/freshAgentThunks.ts src/lib/pane-activity.ts
+rg -n "effort.*'max'|as 'low' \\| 'medium' \\| 'high' \\| 'max'|permissionMode as string" src/lib/fresh-agent-registry.ts src/lib/session-type-utils.ts src/lib/tab-registry-snapshot.ts src/components/TabsView.tsx src/store/paneTreeValidation.ts
 npm run typecheck
 ```
 
-Expected: both `rg` commands find no Freshcodex dependence on agent-chat state and no fresh-agent slice/type alias back to agent-chat modules; typecheck passes.
+Expected: `rg` commands find no Freshcodex dependence on agent-chat state, no fresh-agent slice/type/thunk alias back to agent-chat modules, and no Freshcodex runtime-setting narrowing to Claude-only effort or string-only permission values; typecheck passes.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add \
   src/lib/fresh-agent-registry.ts src/lib/derivePaneTitle.ts src/lib/session-utils.ts \
+  src/lib/session-type-utils.ts src/lib/tab-registry-snapshot.ts src/lib/api.ts \
+  src/lib/pane-activity.ts \
   src/store/selectors/sidebarSelectors.ts src/components/HistoryView.tsx \
+  src/components/ExtensionsView.tsx src/components/TabsView.tsx \
   src/components/panes/PaneContainer.tsx src/components/panes/PanePicker.tsx \
-  src/components/SettingsView.tsx src/store/paneTypes.ts \
+  src/components/SettingsView.tsx src/store/paneTypes.ts src/store/panesSlice.ts \
+  src/store/paneTreeValidation.ts src/store/persistedState.ts src/store/tabsSlice.ts \
+  src/store/managed-items.ts src/store/settingsThunks.ts \
+  server/fresh-agent/runtime-manager.ts server/fresh-agent/router.ts \
   server/session-directory/projection.ts \
   server/coding-cli/session-indexer.ts shared/settings.ts \
   test/unit/shared/fresh-agent-registry.test.ts \
   test/unit/client/lib/derivePaneTitle.test.ts \
   test/unit/client/lib/session-utils.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/pane-activity.test.ts \
   test/unit/client/store/selectors/sidebarSelectors.test.ts \
+  test/unit/client/store/panesPersistence.test.ts \
+  test/unit/client/store/storage-migration.fresh-agent.test.ts \
+  test/unit/client/store/persisted-state.fresh-agent.test.ts \
+  test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/components/ExtensionsView.test.tsx \
   test/unit/client/components/HistoryView.mobile.test.tsx \
   test/unit/client/components/panes/PaneContainer.test.tsx \
   test/unit/client/components/panes/PanePicker.test.tsx \
+  test/unit/server/fresh-agent/router.test.ts \
   test/unit/server/session-directory/fresh-agent-projection.test.ts \
   test/unit/server/coding-cli/session-indexer.test.ts
 git commit -m "Finalize Freshcodex identity and session projections"
@@ -2947,6 +3113,7 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - Client API parses fresh-agent payloads and surfaces controlled errors.
 - Session-type registry and runtime-provider adapter registry are separate; `freshclaude` and `kilroy` can share the Claude adapter without overwriting provider lookup.
 - `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` are real fresh-agent state modules, not aliases/re-exports of agent-chat modules.
+- `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
@@ -2954,6 +3121,7 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
 - Freshcodex starts Codex review through `review/start`, lists/resumes rich Codex threads through `thread/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
+- Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
 - Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
 - Long Freshcodex transcripts use paging and virtualization.
