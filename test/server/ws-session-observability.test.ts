@@ -131,6 +131,21 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 500): Promise<void> {
   })
 }
 
+async function waitForLifecycleEvent(expected: Record<string, unknown>, timeoutMs = 1000): Promise<void> {
+  const start = Date.now()
+  let lastError: unknown
+  while (Date.now() - start < timeoutMs) {
+    try {
+      expect(recordSessionLifecycleEvent).toHaveBeenCalledWith(expected)
+      return
+    } catch (err) {
+      lastError = err
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+  }
+  throw lastError
+}
+
 class FakeBuffer {
   snapshot() {
     return ''
@@ -314,6 +329,36 @@ describe('websocket session observability', () => {
         attemptedInputBytes: 5,
       })
       expect(JSON.stringify(vi.mocked(recordSessionLifecycleEvent).mock.calls)).not.toContain('hello')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('records restore-unavailable client diagnostics', async () => {
+    const ws = await connectReady(port)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'client.diagnostic',
+        event: 'restore_unavailable',
+        reason: 'dead_live_handle',
+        terminalId: 'term-stale',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        mode: 'codex',
+        hasSessionRef: false,
+      }))
+
+      await waitForLifecycleEvent({
+        kind: 'client_restore_unavailable',
+        terminalId: 'term-stale',
+        connectionId: 'conn-1',
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        mode: 'codex',
+        reason: 'dead_live_handle',
+        hasSessionRef: false,
+      })
     } finally {
       await closeWebSocket(ws)
     }

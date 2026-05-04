@@ -55,6 +55,7 @@ import {
   OpencodeActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
+  ClientDiagnosticSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -510,6 +511,7 @@ export class WsHandler {
     this.clientMessageSchema = z.discriminatedUnion('type', [
       HelloSchema,
       PingSchema,
+      ClientDiagnosticSchema,
       dynamicTerminalCreateSchema,
       TerminalAttachSchema,
       TerminalDetachSchema,
@@ -1858,6 +1860,21 @@ export class WsHandler {
         )
         if (!sameStringSet(state.sidebarOpenSessionKeys, nextSidebarOpenSessionKeys)) {
           state.sidebarOpenSessionKeys = nextSidebarOpenSessionKeys
+        }
+        return
+      }
+      case 'client.diagnostic': {
+        if (m.event === 'restore_unavailable') {
+          recordSessionLifecycleEvent({
+            kind: 'client_restore_unavailable',
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId || 'unknown',
+            tabId: m.tabId,
+            paneId: m.paneId,
+            mode: m.mode,
+            reason: m.reason,
+            hasSessionRef: m.hasSessionRef,
+          })
         }
         return
       }

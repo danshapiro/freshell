@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vites
 import http from 'http'
 import WebSocket from 'ws'
 import {
+  ClientMessageSchema,
   HelloSchema,
   TerminalCreateSchema,
   WS_PROTOCOL_VERSION,
@@ -370,6 +371,21 @@ describe('ws protocol', () => {
     })
 
     expect(legacy.success).toBe(false)
+  })
+
+  it('accepts restore-unavailable client diagnostics', () => {
+    const result = ClientMessageSchema.safeParse({
+      type: 'client.diagnostic',
+      event: 'restore_unavailable',
+      reason: 'dead_live_handle',
+      terminalId: 'term-stale',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      mode: 'codex',
+      hasSessionRef: false,
+    })
+
+    expect(result.success).toBe(true)
   })
 
   it('accepts hello with capabilities', async () => {

@@ -2212,6 +2212,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
             if (!current?.sessionRef) {
+              const restoreDiagnostic = {
+                event: 'restore_unavailable' as const,
+                reason: 'dead_live_handle' as const,
+                terminalId: currentTerminalId,
+                tabId,
+                paneId: paneIdRef.current,
+                mode: current?.mode || paneContent.mode || 'shell',
+                hasSessionRef: false as const,
+              }
+              log.warn('restore_unavailable', {
+                ...restoreDiagnostic,
+              })
+              ws.send({
+                type: 'client.diagnostic',
+                ...restoreDiagnostic,
+              })
               term.writeln('\r\n[Restore unavailable - the live terminal is gone and no durable session identity was saved]\r\n')
               launchAttemptRef.current = null
               clearRateLimitRetry()

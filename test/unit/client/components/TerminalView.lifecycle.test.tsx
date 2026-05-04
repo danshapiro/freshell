@@ -2843,42 +2843,70 @@ describe('TerminalView lifecycle updates', () => {
       },
     })
 
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>
-    )
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
 
-    await waitFor(() => {
-      expect(messageHandler).not.toBeNull()
-    })
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
 
-    // Trigger INVALID_TERMINAL_ID for the current terminal
-    messageHandler!({
-      type: 'error',
-      code: 'INVALID_TERMINAL_ID',
-      message: 'Unknown terminalId',
-      terminalId: 'term-clear',
-    })
+      // Trigger INVALID_TERMINAL_ID for the current terminal
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId: 'term-clear',
+      })
 
-    // Wait for state update - pane content terminalId should be cleared
-    await waitFor(() => {
+      // Wait for state update - pane content terminalId should be cleared
+      await waitFor(() => {
+        const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+        expect(layout.content.terminalId).toBeUndefined()
+      })
+
+      // Verify tab status was set to an explicit restore failure
+      const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
+      expect(tab?.status).toBe('error')
+
+      // Verify pane content was also updated
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
       expect(layout.content.terminalId).toBeUndefined()
-    })
-
-    // Verify tab status was set to an explicit restore failure
-    const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-    expect(tab?.status).toBe('error')
-
-    // Verify pane content was also updated
-    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-    expect(layout.content.terminalId).toBeUndefined()
-    expect(layout.content.status).toBe('error')
-    expect(layout.content.restoreError).toEqual({
-      code: 'RESTORE_UNAVAILABLE',
-      reason: 'dead_live_handle',
-    })
+      expect(layout.content.status).toBe('error')
+      expect(layout.content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'dead_live_handle',
+      })
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[TerminalView]'),
+        'restore_unavailable',
+        expect.objectContaining({
+          event: 'restore_unavailable',
+          reason: 'dead_live_handle',
+          terminalId: 'term-clear',
+          tabId,
+          paneId,
+          mode: 'claude',
+          hasSessionRef: false,
+        }),
+      )
+      expect(wsMocks.send.mock.calls.map(([msg]) => msg)).toContainEqual({
+        type: 'client.diagnostic',
+        event: 'restore_unavailable',
+        reason: 'dead_live_handle',
+        terminalId: 'term-clear',
+        tabId,
+        paneId,
+        mode: 'claude',
+        hasSessionRef: false,
+      })
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 
   describe('non-blocking reconnect', () => {

@@ -201,6 +201,17 @@ export const PingSchema = z.object({
   type: z.literal('ping'),
 })
 
+export const ClientDiagnosticSchema = z.object({
+  type: z.literal('client.diagnostic'),
+  event: z.literal('restore_unavailable'),
+  reason: z.literal('dead_live_handle'),
+  terminalId: z.string().min(1),
+  tabId: z.string().min(1),
+  paneId: z.string().min(1),
+  mode: z.string().min(1),
+  hasSessionRef: z.literal(false),
+})
+
 export const TerminalCreateSchema = z.object({
   type: z.literal('terminal.create'),
   requestId: z.string().min(1),
@@ -403,6 +414,7 @@ export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
 export const ClientMessageSchema = z.discriminatedUnion('type', [
   HelloSchema,
   PingSchema,
+  ClientDiagnosticSchema,
   TerminalCreateSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
