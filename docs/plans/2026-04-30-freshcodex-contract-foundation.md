@@ -48,6 +48,7 @@ The generated sources that matter most are:
 - `/tmp/freshell-codex-schema-0.128.0/ts/RequestId.ts`, `ClientRequest.ts`, `ClientNotification.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `InitializeParams.ts`, `InitializeResponse.ts`, and `InitializeCapabilities.ts`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/v2/ThreadStartParams.ts`, `ThreadStartResponse.ts`, `ThreadResumeParams.ts`, `ThreadReadParams.ts`, `ThreadReadResponse.ts`, `ThreadTurnsListParams.ts`, `ThreadTurnsListResponse.ts`, `ThreadForkParams.ts`, `ThreadForkResponse.ts`, `TurnStartParams.ts`, `TurnStartResponse.ts`, `TurnInterruptParams.ts`, and `TurnInterruptResponse.ts`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/v2/Thread.ts`, `Turn.ts`, `ThreadItem.ts`, `UserInput.ts`, `ThreadStatus.ts`, `TurnStatus.ts`, the approval/request param and response files, and `DynamicToolCallResponse.ts`.
+- Runtime-setting and identity leaf types are part of the contract, not incidental dependencies. The plan must also preserve and audit `ReasoningEffort.ts`, `v2/AskForApproval.ts`, `v2/SandboxMode.ts`, `v2/SandboxPolicy.ts`, `v2/UserInput.ts`, `v2/ThreadStatus.ts`, `v2/TurnStatus.ts`, `v2/ThreadActiveFlag.ts`, `v2/SessionSource.ts`, and `SubAgentSource.ts` because those files define the values Freshcodex sends to Codex and the source/subagent shapes Freshcodex projects into history and child-thread UI.
 
 Schema-grounded protocol facts to preserve:
 
@@ -74,6 +75,7 @@ Schema-grounded protocol facts to preserve:
 - `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
 - Generated `Thread` objects require the full thread metadata envelope even when turn bodies are omitted. At minimum, schema-valid fixtures must include `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `path`, `cwd`, `cliVersion`, `source`, `agentNickname`, `agentRole`, `gitInfo`, `name`, and `turns`. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
+- `Thread.source` uses generated `SessionSource`, not `ThreadSourceKind`. `ThreadSourceKind` is only the filter type for `thread/list`. `SessionSource` values include flat sources such as `"cli"`, `"vscode"`, `"exec"`, and `"appServer"`, but subagent source metadata is represented as `{ subAgent: ... }` with generated `SubAgentSource` variants such as `"review"`, `"compact"`, `{ thread_spawn: ... }`, `"memory_consolidation"`, and `{ other: string }`. Freshcodex protocol schemas, fixtures, history projection, and child-thread metadata must parse and preserve the generated `SessionSource` shape instead of flattening thread metadata to `subAgentReview`/`subAgentCompact` strings.
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`.
@@ -1090,6 +1092,8 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerNotification.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/RequestId.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionRequestApprovalResponse.ts`
@@ -1099,9 +1103,17 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpServerElicitationRequestResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ChatgptAuthTokensRefreshResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxMode.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxPolicy.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/UserInput.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadActiveFlag.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStatus.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SessionSource.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartSource.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartResponse.ts`
@@ -1188,9 +1200,56 @@ expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
 ]))
 expect(threadStartSourceValuesFromGeneratedSchema()).toEqual(['startup', 'clear'])
 expect(() => CodexThreadListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
+expect(reasoningEffortValuesFromGeneratedSchema()).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+expect(askForApprovalValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'untrusted',
+  'on-failure',
+  'on-request',
+  'never',
+  'granular',
+]))
+expect(sandboxModeValuesFromGeneratedSchema()).toEqual(['read-only', 'workspace-write', 'danger-full-access'])
+expect(sandboxPolicyVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'dangerFullAccess',
+  'readOnly',
+  'externalSandbox',
+  'workspaceWrite',
+]))
+expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localImage', 'skill', 'mention'])
+expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
+expect(turnStatusValuesFromGeneratedSchema()).toEqual(['completed', 'interrupted', 'failed', 'inProgress'])
+expect(sessionSourceVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'cli',
+  'vscode',
+  'exec',
+  'appServer',
+  'custom',
+  'subAgent',
+  'unknown',
+]))
+expect(subAgentSourceVariantsFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'review',
+  'compact',
+  'thread_spawn',
+  'memory_consolidation',
+  'other',
+]))
+expect(CodexThreadSchema.parse(schemaValidThread({
+  source: { subAgent: { thread_spawn: {
+    parent_thread_id: 'thread-parent-1',
+    depth: 1,
+    agent_path: null,
+    agent_nickname: 'reviewer',
+    agent_role: 'review',
+  } } },
+  turns: [],
+}))).toMatchObject({
+  source: { subAgent: { thread_spawn: expect.objectContaining({ parent_thread_id: 'thread-parent-1' }) } },
+})
 ```
 
 This is required because `thread/read { includeTurns: false }` returns a schema-valid `Thread` with `turns: []`, not a partial object with `turns` omitted. Do not loosen `protocol.ts` to make impossible mocks easier to write.
+It is also required because `ThreadSourceKind` and `SessionSource` are different generated types: `sourceKinds` filters use flattened subagent source-kind strings, while the `Thread.source` metadata returned in `Thread` objects preserves nested subagent details. The checked-in schema snapshot and inventory tests must cover both so Freshcodex history filters and child-thread metadata do not accidentally share one lossy source enum.
 
 Compare generated method names to two explicit sets:
 
@@ -1388,6 +1447,30 @@ export const CodexThreadSourceKindSchema = z.enum([
   'subAgentThreadSpawn',
   'subAgentOther',
   'unknown',
+])
+export const CodexSubAgentSourceSchema = z.union([
+  z.literal('review'),
+  z.literal('compact'),
+  z.object({
+    thread_spawn: z.object({
+      parent_thread_id: z.string().min(1),
+      depth: z.number().int().nonnegative(),
+      agent_path: z.unknown().nullable(),
+      agent_nickname: z.string().nullable(),
+      agent_role: z.string().nullable(),
+    }),
+  }),
+  z.literal('memory_consolidation'),
+  z.object({ other: z.string() }),
+])
+export const CodexSessionSourceSchema = z.union([
+  z.literal('cli'),
+  z.literal('vscode'),
+  z.literal('exec'),
+  z.literal('appServer'),
+  z.object({ custom: z.string() }),
+  z.object({ subAgent: CodexSubAgentSourceSchema }),
+  z.literal('unknown'),
 ])
 export const CodexThreadSortKeySchema = z.enum(['created_at', 'updated_at'])
 
@@ -1673,6 +1756,8 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerRequest.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ServerNotification.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/RequestId.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InitializeResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/CommandExecutionRequestApprovalResponse.ts \
@@ -1682,9 +1767,17 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpServerElicitationRequestResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ChatgptAuthTokensRefreshResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxMode.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxPolicy.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/UserInput.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadActiveFlag.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/TurnStatus.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SessionSource.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartSource.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadStartResponse.ts \
@@ -1867,6 +1960,20 @@ expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   ],
 }))
 
+await adapter.send?.('thread-1', {
+  images: [
+    { kind: 'data', mediaType: 'image/png', data: 'AQID' },
+    { kind: 'local', path: '/repo/mockup.png', mediaType: 'image/png' },
+  ],
+})
+expect(runtime.startTurn).toHaveBeenLastCalledWith(expect.objectContaining({
+  threadId: 'thread-1',
+  input: [
+    { type: 'image', url: 'data:image/png;base64,AQID' },
+    { type: 'localImage', path: '/repo/mockup.png' },
+  ],
+}))
+
 await expect(adapter.send?.('thread-1', {
   text: 'Invalid codex settings',
   runtimeSettings: { permissionMode: 'bypassPermissions', effort: 'max' },
@@ -1919,6 +2026,33 @@ await expect(adapter.listThreads?.({ limit: 25 })).resolves.toMatchObject({
   items: [expect.objectContaining({ sessionType: 'freshcodex', runtimeProvider: 'codex' })],
   nextCursor: null,
   backwardsCursor: null,
+})
+
+runtime.listThreads.mockResolvedValue({
+  data: [schemaValidThread({
+    id: 'thread-child-1',
+    source: { subAgent: { thread_spawn: {
+      parent_thread_id: 'thread-parent-1',
+      depth: 1,
+      agent_path: null,
+      agent_nickname: 'reviewer',
+      agent_role: 'review',
+    } } },
+    turns: [],
+  })],
+  nextCursor: null,
+  backwardsCursor: null,
+})
+await expect(adapter.listThreads?.({ limit: 25 })).resolves.toMatchObject({
+  items: [expect.objectContaining({
+    sessionId: 'thread-child-1',
+    source: expect.objectContaining({
+      subAgent: expect.objectContaining({
+        thread_spawn: expect.objectContaining({ parent_thread_id: 'thread-parent-1' }),
+      }),
+    }),
+    parentThreadId: 'thread-parent-1',
+  })],
 })
 
 await expect(adapter.listModels?.()).resolves.toEqual(expect.arrayContaining([
@@ -2347,13 +2481,13 @@ it('sends Freshcodex text, images, and runtime settings without reading Claude s
     type: 'freshAgent.send',
     text: 'Use this mockup',
     images: [{ kind: 'url', url: 'https://example.test/mockup.png', mediaType: 'image/png' }],
-  runtimeSettings: {
-    model: 'configured-model',
-    sandbox: 'workspace-write',
-    permissionMode: 'on-request',
-    effort: 'xhigh',
-  },
-}))
+    runtimeSettings: {
+      model: 'configured-model',
+      sandbox: 'workspace-write',
+      permissionMode: 'on-request',
+      effort: 'xhigh',
+    },
+  }))
 })
 
 it('attaches a restored Freshcodex pane with runtime context so the server can load the thread', async () => {
@@ -2378,6 +2512,18 @@ it('attaches a restored Freshcodex pane with runtime context so the server can l
       permissionMode: 'on-request',
       effort: 'xhigh',
     },
+  }))
+})
+
+it('accepts pasted or uploaded browser images as data image inputs', async () => {
+  renderFreshcodexPane()
+  await uploadImageFile(new File([new Uint8Array([1, 2, 3])], 'mockup.png', { type: 'image/png' }))
+  await user.type(screen.getByRole('textbox', { name: /chat message input/i }), 'Use this uploaded image')
+  await user.click(screen.getByRole('button', { name: 'Send' }))
+  expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+    type: 'freshAgent.send',
+    text: 'Use this uploaded image',
+    images: [expect.objectContaining({ kind: 'data', mediaType: 'image/png', data: expect.any(String) })],
   }))
 })
 ```
@@ -2411,6 +2557,7 @@ export function FreshAgentView(props: FreshAgentViewProps) {
 - create/attach WS sends
 - snapshot loading
 - turn page/body loading hooks needed by Task 7
+- image attachment state passed from the composer to `freshAgent.send`
 - retry/recovery state
 - action dispatchers
 - forked-pane creation through `splitPane`
@@ -2451,6 +2598,8 @@ type FreshAgentRuntimeSettings = {
 ```
 
 Provider policy helpers must validate these union fields before action dispatch. Freshcodex may dispatch only generated Codex `approvalPolicy` and `effort` values; Freshclaude may keep its existing Claude-specific permission/effort values. The shell should show a controlled settings error if a migrated Freshcodex pane still contains Claude-only values.
+
+`FreshAgentComposer.tsx` must support browser-representable image input directly, not only a test helper. Add an accessible image URL attachment control and file/paste handling that converts selected browser files to `{ kind: 'data', mediaType, data }` before dispatch. Keep `{ kind: 'local', path }` in the shared contract for server-side or restored Codex content, but do not pretend the browser can produce arbitrary local filesystem paths without an explicit server-side file picker.
 
 `fresh-agent-policy.ts` owns small pure helpers:
 
@@ -2983,6 +3132,28 @@ expect(projectFreshAgentSession(codexThread)).toMatchObject({
   title: expect.any(String),
 })
 
+expect(projectFreshAgentSession(schemaValidThread({
+  id: 'thread-child-1',
+  source: { subAgent: { thread_spawn: {
+    parent_thread_id: 'thread-parent-1',
+    depth: 1,
+    agent_path: null,
+    agent_nickname: 'reviewer',
+    agent_role: 'review',
+  } } },
+  turns: [],
+}))).toMatchObject({
+  provider: 'codex',
+  sessionType: 'freshcodex',
+  sessionId: 'thread-child-1',
+  parentThreadId: 'thread-parent-1',
+  source: expect.objectContaining({
+    subAgent: expect.objectContaining({
+      thread_spawn: expect.objectContaining({ parent_thread_id: 'thread-parent-1' }),
+    }),
+  }),
+})
+
 runtime.listThreads.mockResolvedValue({ data: [codexThread], nextCursor: null, backwardsCursor: null })
 await expect(loadFreshcodexHistoryPage({ limit: 25 })).resolves.toMatchObject({
   items: [expect.objectContaining({ provider: 'codex', sessionType: 'freshcodex', sessionId: codexThread.id })],
@@ -3155,6 +3326,7 @@ Rules:
 - Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
 - Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The thread-list surface must reflect the generated app-server shape after fresh-agent normalization (`{ items, nextCursor, backwardsCursor }`) rather than returning a bare array; the loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone.
 - Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for rich app-server sessions, locally created app-server threads reported as `vscode`, and child-agent sessions, at least `['appServer', 'vscode', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps locally created Freshcodex threads, app-server-created threads, review threads, compaction subagent threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
+- Preserve generated `Thread.source` separately from the `thread/list` `sourceKinds` filter. For subagent threads, parse and store nested `SessionSource` metadata such as `{ subAgent: { thread_spawn: ... } }`; derive `parentThreadId`, child-thread labels, and fork/child UX from that nested metadata where available. Do not flatten returned `Thread.source` into the source-kind filter enum because that loses spawned-agent parent ids, depth, nickname, and role.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
 - `freshopencode` remains disabled and cannot be created.
@@ -3450,6 +3622,7 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
 - Codex protocol schemas and fixtures reject impossible partial app-server entities; generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing.
+- Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
 - Codex runtime-global server requests without `threadId`, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread.
