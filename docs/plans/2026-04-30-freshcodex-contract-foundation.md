@@ -63,6 +63,7 @@ Schema-grounded protocol facts to preserve:
 - `thread/read` params are exactly `{ threadId: string, includeTurns: boolean }`. `includeTurns` is required in the generated TypeScript. The response is `{ thread }`.
 - `thread/turns/list` params are `{ threadId, cursor?, limit?, sortDirection? }`. It does not accept `revision` or `includeBodies`. The response is `{ data, nextCursor, backwardsCursor }`.
 - `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, local images are `{ type: 'localImage', path }`, skills are `{ type: 'skill', name, path }`, and mentions are `{ type: 'mention', name, path }`.
+- Implemented client-request parameter schemas are outbound safety gates and must be strict generated-shape schemas, not permissive `.passthrough()` bags. They should reject stale Freshell-only fields such as `persistExtendedHistory`, `richClient`, `experimentalRawEvents`, `revision`, `includeBodies`, provider-only runtime values, or misspelled generated fields before a request reaches Codex app-server. `.passthrough()` is acceptable for known result/entity schemas only where forward-compatible extra app-server fields are intentionally preserved or ignored after generated-required fields are enforced.
 - Codex reasoning effort values are generated as `"none" | "minimal" | "low" | "medium" | "high" | "xhigh"`. Freshcodex must not reuse Claude's legacy `"max"` effort value; if `"max"` is present in migrated settings, show a controlled unsupported Freshcodex settings error or map only through an explicit user-visible migration rule added in this plan.
 - Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`. The generated JSON Schema defaults `AskForApproval.granular.skill_approval` and `AskForApproval.granular.request_permissions` to `false` even though the generated TypeScript type prints them as required; raw Codex protocol schemas must accept those omitted fields and normalize them to `false`.
 - Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. `SandboxPolicy.externalSandbox.networkAccess` uses generated `NetworkAccess` values `"restricted" | "enabled"`, not a free-form payload. Generated JSON Schema defaults omitted sandbox-policy fields (`readOnly.networkAccess`, `externalSandbox.networkAccess`, and `workspaceWrite`'s `writableRoots`, `networkAccess`, `excludeTmpdirEnvVar`, and `excludeSlashTmp`); raw protocol schemas must accept those omitted fields and normalize them before lifecycle responses cross into fresh-agent contracts. Do not send the thread-level `sandbox` string to `turn/start`.
@@ -2021,7 +2022,7 @@ Compare generated method names to two explicit sets:
 - implemented in Freshcodex rich runtime: `initialize`, `thread/start`, `thread/resume`, `thread/fork`, `thread/list`, `thread/loaded/list`, `thread/read`, `thread/turns/list`, `turn/start`, `turn/interrupt`, `review/start`, `model/list`, `modelProvider/capabilities/read`
 - explicitly unsupported in Freshcodex rich runtime: every other generated method
 
-The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
+The test must fail if a new generated client method appears in the checked-in schema snapshot without being classified, and must fail if a method outside the implemented set is accidentally proxied through as a generic request. It must also fail if an implemented client request parser accepts a field that is not in the generated parameter type. Add negative assertions that `CodexThreadStartParamsSchema`, `CodexThreadResumeParamsSchema`, `CodexThreadForkParamsSchema`, and `CodexTurnStartParamsSchema` reject stale fields such as `persistExtendedHistory`, `richClient`, `experimentalRawEvents`, `revision`, `includeBodies`, and thread-level `sandbox` on `turn/start`. `scripts/audit-codex-app-server-schema.ts` must fail when the local generated schema differs from the checked-in snapshot and print the new method/type names or required-field changes that require updating fixtures and classification.
 
 Add the same generated-inventory coverage for `ServerNotification` routing. Every method in the checked-in `ServerNotification.ts` snapshot must be classified as exactly one of `thread`, `runtimeGlobal`, `connectionScoped`, or `nonVisible`. The classification test must prove `thread/started` extracts `params.thread.id`, ordinary thread events extract `params.threadId`, `warning` branches on nullable `params.threadId`, and no-locator `command/exec/outputDelta` / `fs/changed` do not produce a Freshcodex thread invalidation until a future feature records a process/watch owner.
 
@@ -2250,14 +2251,14 @@ export const CodexInitializeResultSchema = z.object({
 export const CodexThreadReadParamsSchema = z.object({
   threadId: z.string().min(1),
   includeTurns: z.boolean(),
-})
+}).strict()
 
 export const CodexThreadTurnsListParamsSchema = z.object({
   threadId: z.string().min(1),
   cursor: z.string().nullable().optional(),
   limit: z.number().int().nonnegative().optional(),
   sortDirection: z.enum(['asc', 'desc']).nullable().optional(),
-})
+}).strict()
 
 export const CodexThreadTurnsListResultSchema = z.object({
   data: z.array(z.lazy(() => CodexTurnSchema)),
@@ -2325,7 +2326,12 @@ export const CodexThreadListParamsSchema = z.object({
   cwd: z.union([z.string(), z.array(z.string())]).nullable().optional(),
   useStateDbOnly: z.boolean().optional(),
   searchTerm: z.string().nullable().optional(),
-})
+}).strict()
+
+export const CodexThreadLoadedListParamsSchema = z.object({
+  cursor: z.string().nullable().optional(),
+  limit: z.number().int().nonnegative().optional(),
+}).strict()
 
 export const CodexThreadListResultSchema = z.object({
   data: z.array(z.lazy(() => CodexThreadSchema)),
@@ -2371,6 +2377,14 @@ export const CodexModelListResultSchema = z.object({
   nextCursor: z.string().nullable().optional().default(null),
 })
 
+export const CodexModelListParamsSchema = z.object({
+  cursor: z.string().nullable().optional(),
+  limit: z.number().int().nonnegative().optional(),
+  includeHidden: z.boolean().nullable().optional(),
+}).strict()
+
+export const CodexModelProviderCapabilitiesReadParamsSchema = z.object({}).strict()
+
 export const CodexTurnInputItemSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('text'), text: z.string(), text_elements: z.array(z.unknown()).default([]) }),
   z.object({ type: z.literal('image'), url: z.string().url() }),
@@ -2404,21 +2418,73 @@ export const CodexSandboxPolicySchema = z.discriminatedUnion('type', [
   }),
 ])
 
+export const CodexServiceTierSchema = z.enum(['fast', 'flex'])
+export const CodexApprovalsReviewerSchema = z.enum(['user', 'auto_review', 'guardian_subagent'])
+export const CodexThreadSandboxModeSchema = z.enum(['read-only', 'workspace-write', 'danger-full-access'])
+export const CodexReasoningSummarySchema = z.enum(['auto', 'concise', 'detailed', 'none'])
+export const CodexPersonalitySchema = z.enum(['none', 'friendly', 'pragmatic'])
+export const CodexThreadStartSourceSchema = z.enum(['startup', 'clear'])
+export const CodexRuntimeConfigSchema = z.record(z.string(), JsonValue)
+
+const CodexThreadRuntimeOverridesSchema = z.object({
+  model: z.string().nullable().optional(),
+  modelProvider: z.string().nullable().optional(),
+  serviceTier: CodexServiceTierSchema.nullable().optional(),
+  cwd: z.string().nullable().optional(),
+  approvalPolicy: CodexApprovalPolicySchema.nullable().optional(),
+  approvalsReviewer: CodexApprovalsReviewerSchema.nullable().optional(),
+  sandbox: CodexThreadSandboxModeSchema.nullable().optional(),
+  config: CodexRuntimeConfigSchema.nullable().optional(),
+  baseInstructions: z.string().nullable().optional(),
+  developerInstructions: z.string().nullable().optional(),
+})
+
+export const CodexThreadStartParamsSchema = CodexThreadRuntimeOverridesSchema.extend({
+  serviceName: z.string().nullable().optional(),
+  personality: CodexPersonalitySchema.nullable().optional(),
+  ephemeral: z.boolean().nullable().optional(),
+  sessionStartSource: CodexThreadStartSourceSchema.nullable().optional(),
+}).strict()
+
+export const CodexThreadResumeParamsSchema = CodexThreadRuntimeOverridesSchema.extend({
+  threadId: z.string().min(1),
+  personality: CodexPersonalitySchema.nullable().optional(),
+  excludeTurns: z.boolean().optional(),
+}).strict()
+
 export const CodexTurnStartParamsSchema = z.object({
   threadId: z.string().min(1),
   input: z.array(CodexTurnInputItemSchema).min(1),
-  cwd: z.string().optional(),
-  model: z.string().optional(),
-  sandboxPolicy: CodexSandboxPolicySchema.nullable().optional(),
+  cwd: z.string().nullable().optional(),
   approvalPolicy: CodexApprovalPolicySchema.nullable().optional(),
+  approvalsReviewer: CodexApprovalsReviewerSchema.nullable().optional(),
+  sandboxPolicy: CodexSandboxPolicySchema.nullable().optional(),
+  model: z.string().nullable().optional(),
+  serviceTier: CodexServiceTierSchema.nullable().optional(),
   effort: CodexReasoningEffortSchema.nullable().optional(),
-}).passthrough()
+  summary: CodexReasoningSummarySchema.nullable().optional(),
+  personality: CodexPersonalitySchema.nullable().optional(),
+  outputSchema: JsonValue.nullable().optional(),
+}).strict()
 
-export const CodexThreadForkParamsSchema = z.object({
+export const CodexThreadForkParamsSchema = CodexThreadRuntimeOverridesSchema.extend({
   threadId: z.string().min(1),
   ephemeral: z.boolean().optional(),
   excludeTurns: z.boolean().optional(),
-}).passthrough()
+}).strict()
+
+export const CodexReviewTargetSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('uncommittedChanges') }),
+  z.object({ type: z.literal('baseBranch'), branch: z.string().min(1) }),
+  z.object({ type: z.literal('commit'), sha: z.string().min(1), title: z.string().nullable() }),
+  z.object({ type: z.literal('custom'), instructions: z.string().min(1) }),
+])
+
+export const CodexReviewStartParamsSchema = z.object({
+  threadId: z.string().min(1),
+  target: CodexReviewTargetSchema,
+  delivery: z.enum(['inline', 'detached']).nullable().optional(),
+}).strict()
 ```
 
 Use generated schema field names. Do not guess against tests. Delete the stale `CodexThreadTurnRead*` schemas unless a future generated schema actually contains a direct turn-read client request.
@@ -2426,9 +2492,6 @@ Use generated schema field names. Do not guess against tests. Delete the stale `
 Model the response schemas with the generated shapes, not Freshell convenience shapes:
 
 ```ts
-export const CodexServiceTierSchema = z.enum(['fast', 'flex'])
-export const CodexApprovalsReviewerSchema = z.enum(['user', 'auto_review', 'guardian_subagent'])
-
 const CodexThreadLifecycleResultSchema = z.object({
   thread: z.lazy(() => CodexThreadSchema),
   model: z.string().min(1),
@@ -2500,7 +2563,7 @@ export const CodexServerRequestSchema = z.discriminatedUnion('method', [...])
 export const CodexServerNotificationSchema = z.discriminatedUnion('method', [...])
 ```
 
-The object schemas and discriminated unions must be generated-schema faithful enough that Task 5 fixtures cannot use impossible app-server thread, turn, item, request, response, or notification shapes. It is acceptable to use `.passthrough()` for extra future fields on known variants, but do not make generated-required fields optional and do not use a catch-all unknown item variant.
+The object schemas and discriminated unions must be generated-schema faithful enough that Task 5 fixtures cannot use impossible app-server thread, turn, item, request, response, or notification shapes. It is acceptable to use `.passthrough()` for extra future fields on known result/entity variants, but implemented client-request parameter schemas must be `.strict()` so stale outbound fields fail before reaching Codex. Do not make generated-required fields optional and do not use a catch-all unknown item variant.
 
 Model the legacy root approval request/response schemas explicitly alongside the v2 request schemas because the current generated `ServerRequest` union still includes them:
 
@@ -5199,6 +5262,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Codex notification routing is generated-method-specific: `thread/started` routes by `params.thread.id`, ordinary thread events route by `params.threadId`, nullable/global warnings do not fake a thread target, and connection-scoped unsupported notifications such as `command/exec/outputDelta` and `fs/changed` never invalidate an arbitrary subscribed Freshcodex thread.
 - Codex server-initiated request ids round-trip unchanged through pending approval/question state, WebSocket response actions, adapter response serialization, and error events whether the generated JSON-RPC id is a string or an integer number.
 - Codex protocol schemas and fixtures reject impossible partial app-server entities, while accepting and normalizing generated-optional JSON wire fields. Generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing; generated-optional fields such as response cursors, optional thread metadata, turn timing/error fields, and lifecycle response defaults normalize to explicit `null`/default values before fresh-agent contracts depend on them.
+- Codex implemented client-request parameter schemas are strict generated-shape schemas. They preserve all supported generated runtime override fields and reject stale Freshell-only or misspelled outbound fields before a request reaches app-server.
 - Codex model pages and provider capability reads cross REST, adapter, and settings UI through typed fresh-agent schemas; provider-level `namespaceTools`, `imageGeneration`, and `webSearch` booleans are not lost as unknown model-item fields.
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
 - Codex transcript items are fully normalized; no raw transcript item arrays cross the fresh-agent boundary.
