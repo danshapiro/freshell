@@ -85,6 +85,7 @@ Schema-grounded protocol facts to preserve:
 - `collabAgentToolCall` carries `senderThreadId`, `receiverThreadIds: string[]`, optional `model`, optional `reasoningEffort`, and `agentsStates` keyed by child thread id. Fresh-agent collaboration items must preserve the receiver id array and agent-state metadata under typed fields; do not collapse this to a singular `receiverThreadId` / `newThreadId`, because spawned or resumed child-agent calls can involve multiple receiver threads and the shared shell needs that metadata for child-thread UX.
 - `imageGeneration.status` is generated as an unconstrained string, not a fixed enum. Fresh-agent image-generation items must preserve the raw generated status string and may derive a separate UI bucket if useful; do not narrow the contract to only `pending` / `running` / `completed` / `failed`.
 - Several generated `ThreadItem` variants carry structured details beyond their display label: text `UserInput` parts include `text_elements`, `hookPrompt.fragments[]` include `hookRunId`, `agentMessage` includes `phase` and `memoryCitation`, `commandExecution` includes `source`, `processId`, and `commandActions`, MCP tool calls include `server`, `mcpAppResourceUri`, structured result metadata, and duration, `dynamicToolCall` includes `namespace`, `contentItems`, `success`, and duration, `webSearch` includes structured `action`, and `imageGeneration` includes raw `result` plus optional `savedPath`. Fresh-agent contracts and fixtures must preserve these generated fields under typed item fields rather than flattening them to display-only strings.
+- Generated MCP and dynamic tool-call `arguments` fields are `JsonValue`, not `Record<string, JsonValue>`. Fresh-agent `tool.input` and `dynamic_tool.input` must preserve arbitrary JSON values, including arrays, strings, numbers, booleans, and null; object-shaped tool calls are common but not a wire-contract guarantee.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`. The v2 request variants use `params.threadId` for routing, while the legacy root `applyPatchApproval` and `execCommandApproval` variants use `params.conversationId`; both fields identify the Codex thread and must route to the matching Freshcodex locator.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`. Legacy `applyPatchApproval` and `execCommandApproval` responses use root `ReviewDecision` values through `{ decision }`, including `"approved"`, `"approved_for_session"`, `"denied"`, `"timed_out"`, `"abort"`, and the generated amendment-object variants; do not answer those legacy requests with v2 `"accept"` / `"decline"` decisions.
 - Generated JSON Schema, not generated TypeScript formatting, is the wire-requiredness source for those legacy root requests. `ApplyPatchApprovalParams` requires `conversationId`, `callId`, and `fileChanges`; optional `reason` and `grantRoot` must normalize to `null` when omitted. `ExecCommandApprovalParams` requires `conversationId`, `callId`, `command`, `cwd`, and `parsedCmd`; optional `approvalId` and `reason` must normalize to `null` when omitted.
@@ -147,6 +148,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Codex collaboration items must preserve all generated receiver thread ids and agent states. The normalized item can add convenience display labels, but the durable contract must keep `receiverThreadIds` as an array and must not replace it with a single `receiverThreadId`.
 - Codex image-generation normalization must preserve the generated raw `status: string`. If the UI wants a small visual state enum, derive it into a separate optional display field instead of rejecting unknown raw statuses at the contract boundary.
 - Codex generated item-detail normalization must be lossless for the fields the local schema exposes today. Display-oriented convenience fields are fine, but the shared contract must keep structured text elements, hook run ids, agent-message phase/memory citations, command source/action metadata, MCP resource/result metadata, dynamic-tool output content, web-search actions, and image-generation `result`/`savedPath` so later UX work does not need another contract migration.
+- Codex tool-call argument normalization must preserve generated `JsonValue` exactly. Do not type fresh-agent tool inputs as object records or coerce non-object arguments into strings for display.
 - Codex `UserInput` content parts include text, image, localImage, skill, and mention. Freshcodex message content and renderers must preserve every generated part type; do not silently drop skill or mention references from existing threads.
 - Freshcodex runtime settings use Codex-shaped values at the app-server boundary. Shared UI/state may keep the historical field name `permissionMode`, but the value sent to Codex must parse as generated `AskForApproval`; `effort` must parse as generated `ReasoningEffort`; and turn-time sandbox overrides must be converted to generated `SandboxPolicy` with a clear error if the selected mode cannot be represented.
 - `FreshAgentRuntimeSettingsSchema` may remain a broad persisted/UI shape only because Freshclaude and Freshcodex share historical field names. Any executable action parser (`freshAgent.create`, `freshAgent.send`, `freshAgent.attach`, review/fork settings, and REST action bodies) must resolve the provider first, then validate settings with a provider-specific schema before the runtime manager or adapter receives the action. A Freshcodex action carrying Claude-only values such as `permissionMode: "bypassPermissions"` or `effort: "max"` must fail in WebSocket/controller parsing with `FRESH_AGENT_UNSUPPORTED_RUNTIME_SETTING`, not merely inside the Codex adapter after generic parsing has already accepted it.
@@ -507,10 +509,21 @@ expect(FreshAgentTranscriptItemSchema.parse({
   name: 'unsupported-local-tool',
   namespace: 'fixture-namespace',
   status: 'declined',
+  input: ['non-object', { ok: true }],
   contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
   success: false,
   reason: 'Dynamic tool calls are not supported by Freshell yet.',
-})).toMatchObject({ kind: 'dynamic_tool', status: 'declined', success: false })
+})).toMatchObject({ kind: 'dynamic_tool', status: 'declined', input: ['non-object', { ok: true }], success: false })
+
+expect(FreshAgentTranscriptItemSchema.parse({
+  id: 'tool-1',
+  kind: 'tool',
+  server: 'fixture-server',
+  name: 'fixture-tool',
+  status: 'completed',
+  input: 'raw-string-argument',
+  result: { content: [], structuredContent: null, _meta: null },
+})).toMatchObject({ kind: 'tool', input: 'raw-string-argument' })
 
 expect(FreshAgentTranscriptItemSchema.parse({
   id: 'hook-1',
@@ -819,7 +832,7 @@ export const FreshAgentToolItemSchema = z.object({
   server: z.string().optional(),
   name: NonEmptyString,
   status: z.enum(['pending', 'running', 'completed', 'failed']),
-  input: z.record(z.string(), JsonValue).optional(),
+  input: JsonValue.optional(),
   mcpAppResourceUri: z.string().optional(),
   result: JsonValue.optional(),
   error: z.string().optional(),
@@ -862,7 +875,7 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     agentsStates: z.record(z.string(), JsonValue).default({}),
   }),
   z.object({ id: NonEmptyString, kind: z.literal('context_compaction'), status: z.enum(['pending', 'running', 'completed', 'failed', 'deprecated']), summary: z.string().optional(), beforeTokens: z.number().int().nonnegative().optional(), afterTokens: z.number().int().nonnegative().optional() }),
-  z.object({ id: NonEmptyString, kind: z.literal('dynamic_tool'), name: NonEmptyString, namespace: z.string().nullable().optional(), status: z.enum(['pending', 'running', 'completed', 'failed', 'declined']), input: z.record(z.string(), JsonValue).optional(), contentItems: z.array(FreshAgentDynamicToolOutputContentItemSchema).nullable().optional(), success: z.boolean().nullable().optional(), durationMs: z.number().nonnegative().nullable().optional(), result: JsonValue.optional(), reason: z.string().optional(), error: z.string().optional() }),
+  z.object({ id: NonEmptyString, kind: z.literal('dynamic_tool'), name: NonEmptyString, namespace: z.string().nullable().optional(), status: z.enum(['pending', 'running', 'completed', 'failed', 'declined']), input: JsonValue.optional(), contentItems: z.array(FreshAgentDynamicToolOutputContentItemSchema).nullable().optional(), success: z.boolean().nullable().optional(), durationMs: z.number().nonnegative().nullable().optional(), result: JsonValue.optional(), reason: z.string().optional(), error: z.string().optional() }),
   z.object({ id: NonEmptyString, kind: z.literal('request_prompt'), requestId: FreshAgentServerRequestIdSchema, requestKind: z.enum(['approval', 'question', 'mcp_elicitation', 'dynamic_tool', 'auth_refresh']), title: z.string().optional(), prompt: z.string().optional(), status: z.enum(['pending', 'resolved', 'declined']) }),
   z.object({ id: NonEmptyString, kind: z.literal('error'), message: z.string(), code: z.string().optional() }),
 ])
@@ -1613,6 +1626,7 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PermissionsRequestApprovalResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ToolRequestUserInputResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpServerElicitationRequestResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ChatgptAuthTokensRefreshResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts`
@@ -1943,6 +1957,9 @@ expect(requiredFieldsForGeneratedType('v2/McpToolCallResult.ts', 'McpToolCallRes
 expect(dynamicToolCallOutputContentItemVariantsFromGeneratedSchema()).toEqual(['inputText', 'inputImage'])
 expect(webSearchActionVariantsFromGeneratedSchema()).toEqual(['search', 'openPage', 'findInPage', 'other'])
 expect(threadItemVariantFieldsFromGeneratedSchema('imageGeneration')).toEqual(expect.arrayContaining(['status', 'revisedPrompt', 'result', 'savedPath']))
+expect(threadItemFieldTypeFromGeneratedSchema('mcpToolCall', 'arguments')).toEqual('JsonValue')
+expect(threadItemFieldTypeFromGeneratedSchema('dynamicToolCall', 'arguments')).toEqual('JsonValue')
+expect(serverRequestFieldTypeFromGeneratedSchema('item/tool/call', 'arguments')).toEqual('JsonValue')
 expect(requiredFieldsForGeneratedJsonSchema('v2/ThreadReadResponse.json', 'Turn')).toEqual(expect.arrayContaining([
   'id',
   'items',
@@ -2684,6 +2701,7 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/PermissionsRequestApprovalResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ToolRequestUserInputResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/McpServerElicitationRequestResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/DynamicToolCallResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ChatgptAuthTokensRefreshResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts \
@@ -2935,7 +2953,7 @@ expect(normalizeCodexItem(parseCodexItemFixture({
   id: 'dyn-1',
   namespace: null,
   tool: 'tool-x',
-  arguments: {},
+  arguments: ['non-object', { ok: true }],
   status: 'failed',
   contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
   success: false,
@@ -2945,6 +2963,7 @@ expect(normalizeCodexItem(parseCodexItemFixture({
     id: 'dyn-1',
     kind: 'dynamic_tool',
     namespace: null,
+    input: ['non-object', { ok: true }],
     status: 'failed',
     contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
     success: false,
@@ -2956,7 +2975,7 @@ expect(normalizeCodexItem(parseCodexItemFixture({
   server: 'fixture-server',
   tool: 'fixture-tool',
   status: 'completed',
-  arguments: {},
+  arguments: 'raw-string-argument',
   mcpAppResourceUri: 'mcp://fixture/resource',
   result: { content: [{ type: 'text', text: 'ok' }], structuredContent: { ok: true }, _meta: null },
   error: null,
@@ -2968,6 +2987,7 @@ expect(normalizeCodexItem(parseCodexItemFixture({
     server: 'fixture-server',
     name: 'fixture-tool',
     status: 'completed',
+    input: 'raw-string-argument',
     mcpAppResourceUri: 'mcp://fixture/resource',
     result: { content: [{ type: 'text', text: 'ok' }], structuredContent: { ok: true }, _meta: null },
     durationMs: 12,
@@ -4347,8 +4367,8 @@ Expected: FAIL because normalized Codex item rendering and workspace panel are i
 - `plan`: plan card.
 - `command`: command, cwd, source, status, command-action metadata, output, exit code, process id, and duration.
 - `file_change`: list changed files, distinguish add/modify/delete/rename, show `movePath` for renamed/moved files, and provide expandable diffs using shared `DiffView`.
-- `tool`: MCP/tool card with server, input, MCP app resource URI, structured result metadata, error, and duration.
-- `dynamic_tool`: unsupported or completed dynamic tool call state with namespace, generated output content items, success state, duration, and the user-visible response.
+- `tool`: MCP/tool card with server, arbitrary JSON input, MCP app resource URI, structured result metadata, error, and duration.
+- `dynamic_tool`: unsupported or completed dynamic tool call state with namespace, arbitrary JSON input, generated output content items, success state, duration, and the user-visible response.
 - `collaboration`: child-agent action card with all `receiverThreadIds`, sender id, prompt, model/effort metadata, and generated agent-state summaries when available.
 - `review`: entered/exited review cards.
 - `web_search`: query, structured generated action (`search`, `openPage`, `findInPage`, or `other`), and status.
@@ -5087,6 +5107,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Codex collaboration transcript items preserve all generated `receiverThreadIds` and child-agent state metadata, and the shared UI renders every receiver id instead of collapsing child-agent calls to one thread.
 - Codex image-generation items preserve raw generated status strings, including statuses outside Freshell's small display-state buckets.
 - Codex generated item detail fields remain contract-visible: text elements, hook run ids, agent-message phase/memory citations, command source/action metadata, MCP resource/result metadata, dynamic-tool output content, web-search actions, and image-generation `result`/`savedPath` are not flattened away.
+- Codex MCP and dynamic tool-call `arguments` preserve arbitrary generated `JsonValue` and are not narrowed to object records in shared contracts, normalization, Redux state, or renderers.
 - Codex app-server notifications and server requests flow through the rich stdio runtime into fresh-agent subscriptions; live turns, items, token usage, status, diffs, review, compaction, child-thread/collaboration, and thread metadata updates refresh subscribed browsers.
 - Codex runtime-global server requests without a generated thread locator, currently auth-token refresh, are answered with valid JSON-RPC error envelopes and surfaced as typed Freshcodex runtime errors instead of hanging or attaching to an arbitrary thread. Legacy `applyPatchApproval` and `execCommandApproval` use generated `conversationId` as their Freshcodex thread locator and answer with root `ReviewDecision` response shapes.
 - Freshcodex renders without `agentChat` session state.
