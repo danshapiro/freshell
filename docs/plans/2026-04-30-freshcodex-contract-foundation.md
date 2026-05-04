@@ -1096,7 +1096,147 @@ export const FreshAgentThreadSnapshotSchema = z.object({
 })
 ```
 
-Define the referenced approval, question, worktree, diff, child-thread, Claude extension, Codex extension, and action-result schemas in the same file. Export inferred types for every schema. Keep provider extension schemas typed and narrow:
+Define the referenced approval, question, worktree, diff, child-thread, Claude extension, Codex extension, and action-result schemas in the same file. In the actual implementation file, place these definitions before `FreshAgentThreadSnapshotSchema` or use `z.lazy` for any recursive reference. Do not leave these as implicit shapes for the executor to invent; they are part of the shared contract boundary and must be parsed by server, client API, Redux, and UI tests.
+
+```ts
+export const FreshAgentApprovalRequestSchema = z.object({
+  requestId: FreshAgentServerRequestIdSchema,
+  kind: z.enum(['command', 'file_change', 'permissions', 'legacy_exec', 'legacy_patch']),
+  title: z.string(),
+  prompt: z.string().optional(),
+  threadId: z.string().optional(),
+  turnId: z.string().nullable().optional(),
+  itemId: z.string().nullable().optional(),
+  command: z.string().optional(),
+  cwd: z.string().optional(),
+  fileChanges: z.array(z.object({
+    path: NonEmptyString,
+    changeKind: z.enum(['add', 'modify', 'delete', 'rename', 'unknown']),
+    movePath: z.string().nullable().optional(),
+    diff: z.string().optional(),
+  })).default([]),
+  permissions: z.object({
+    network: JsonValue.optional(),
+    fileSystem: JsonValue.optional(),
+  }).optional(),
+  reason: z.string().nullable().optional(),
+  status: z.enum(['pending', 'resolved', 'declined']).default('pending'),
+})
+
+export const FreshAgentQuestionFieldSchema = z.object({
+  id: NonEmptyString,
+  label: z.string(),
+  prompt: z.string().optional(),
+  type: z.enum(['text', 'single_select', 'multi_select', 'boolean', 'number', 'json']).default('text'),
+  options: z.array(z.object({
+    value: z.string(),
+    label: z.string(),
+    description: z.string().optional(),
+  })).default([]),
+  required: z.boolean().default(false),
+  schema: JsonValue.optional(),
+})
+
+export const FreshAgentQuestionRequestSchema = z.object({
+  requestId: FreshAgentServerRequestIdSchema,
+  kind: z.enum(['tool_user_input', 'mcp_elicitation', 'auth_refresh']),
+  title: z.string(),
+  prompt: z.string().optional(),
+  threadId: z.string().optional(),
+  turnId: z.string().nullable().optional(),
+  itemId: z.string().nullable().optional(),
+  fields: z.array(FreshAgentQuestionFieldSchema).default([]),
+  status: z.enum(['pending', 'resolved', 'declined']).default('pending'),
+})
+
+export const FreshAgentWorktreeRefSchema = z.object({
+  id: NonEmptyString,
+  path: NonEmptyString,
+  cwd: z.string().optional(),
+  branch: z.string().nullable().optional(),
+  baseBranch: z.string().nullable().optional(),
+  headSha: z.string().nullable().optional(),
+  dirty: z.boolean().optional(),
+  active: z.boolean().default(false),
+})
+
+export const FreshAgentDiffFileSchema = z.object({
+  path: NonEmptyString,
+  changeKind: z.enum(['add', 'modify', 'delete', 'rename', 'unknown']),
+  movePath: z.string().nullable().optional(),
+  additions: z.number().int().nonnegative().optional(),
+  deletions: z.number().int().nonnegative().optional(),
+  diff: z.string().optional(),
+})
+
+export const FreshAgentDiffRefSchema = z.object({
+  id: NonEmptyString,
+  title: z.string(),
+  status: z.enum(['pending', 'running', 'completed', 'failed']).optional(),
+  files: z.array(FreshAgentDiffFileSchema).default([]),
+  reviewThreadId: z.string().nullable().optional(),
+  summary: z.string().optional(),
+})
+
+export const FreshAgentChildThreadRefSchema = z.object({
+  threadId: NonEmptyString,
+  parentThreadId: z.string().nullable().optional(),
+  title: z.string().optional(),
+  status: FreshAgentThreadStatusSchema.optional(),
+  source: JsonValue.optional(),
+  depth: z.number().int().nonnegative().optional(),
+  agentNickname: z.string().nullable().optional(),
+  agentRole: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  reasoningEffort: FreshAgentCodexReasoningEffortSchema.nullable().optional(),
+})
+
+export const FreshAgentCodexExtensionSchema = z.object({
+  model: z.string().nullable().optional(),
+  modelProvider: z.string().nullable().optional(),
+  serviceTier: z.enum(['fast', 'flex']).nullable().optional(),
+  cwd: z.string().nullable().optional(),
+  cliVersion: z.string().nullable().optional(),
+  source: JsonValue.optional(),
+  gitInfo: JsonValue.nullable().optional(),
+  forkedFromId: z.string().nullable().optional(),
+  activeFlags: z.array(z.enum(['waitingOnApproval', 'waitingOnUserInput'])).default([]),
+  approvalsReviewer: z.enum(['user', 'auto_review', 'guardian_subagent']).nullable().optional(),
+  sandbox: JsonValue.optional(),
+  approvalPolicy: JsonValue.optional(),
+  review: z.object({
+    reviewThreadId: z.string().nullable().optional(),
+    target: FreshAgentReviewTargetSchema.optional(),
+    delivery: z.enum(['inline', 'detached']).optional(),
+    status: z.enum(['pending', 'running', 'completed', 'failed']).optional(),
+    summary: z.string().optional(),
+  }).optional(),
+})
+
+export const FreshAgentClaudeExtensionSchema = z.object({
+  sessionFile: z.string().nullable().optional(),
+  projectPath: z.string().nullable().optional(),
+  permissionMode: FreshAgentLegacyClaudePermissionModeSchema.optional(),
+  effort: FreshAgentLegacyClaudeEffortSchema.optional(),
+})
+
+export const FreshAgentExtensionsSchema = z.object({
+  codex: FreshAgentCodexExtensionSchema.optional(),
+  claude: FreshAgentClaudeExtensionSchema.optional(),
+})
+
+export const FreshAgentActionResultSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('send'), sessionId: NonEmptyString, turnId: z.string().optional() }),
+  z.object({ type: z.literal('interrupt'), sessionId: NonEmptyString, interrupted: z.boolean() }),
+  z.object({ type: z.literal('fork'), sourceSessionId: NonEmptyString, session: FreshAgentSessionSummarySchema, parentThreadId: z.string().nullable().optional() }),
+  z.object({ type: z.literal('review_start'), sessionId: NonEmptyString, turnId: NonEmptyString, reviewThreadId: NonEmptyString, target: FreshAgentReviewTargetSchema, delivery: z.enum(['inline', 'detached']) }),
+  z.object({ type: z.literal('server_request_response'), sessionId: NonEmptyString, requestId: FreshAgentServerRequestIdSchema, responseKind: z.string() }),
+  z.object({ type: z.literal('kill'), sessionId: NonEmptyString, success: z.boolean() }),
+  z.object({ type: z.literal('error'), code: NonEmptyString, message: z.string(), retryable: z.boolean().optional() }),
+])
+```
+
+Export inferred types for every schema. Keep provider extension schemas typed and narrow.
 
 Also define a generated-shape-preserving response schema for pending server requests. This schema is the shared surface used by WebSocket actions, controller props, and the Codex adapter when it responds on the original JSON-RPC server request id:
 
