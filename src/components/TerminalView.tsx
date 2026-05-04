@@ -2218,7 +2218,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 terminalId: currentTerminalId,
                 tabId,
                 paneId: paneIdRef.current,
-                mode: current?.mode || paneContent.mode || 'shell',
+                mode: current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell'),
                 hasSessionRef: false as const,
               }
               log.warn('restore_unavailable', {
