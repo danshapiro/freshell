@@ -68,6 +68,8 @@ Schema-grounded protocol facts to preserve:
 - `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
 - `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
 - `thread/loaded/list` returns `{ data: string[], nextCursor }`, not thread summaries. Any fresh-agent loaded-thread UI or API must expose loaded ids directly or hydrate them through `thread/read`/`thread/list`; it must not pretend this app-server method returns rich session rows.
+- `thread/list` is paginated. Params include `cursor`, `limit`, `sortKey`, `sortDirection`, `modelProviders`, `sourceKinds`, `archived`, `cwd`, `useStateDbOnly`, and `searchTerm`; the response is `{ data: Thread[], nextCursor, backwardsCursor }`. Freshcodex history/session APIs must preserve both cursors instead of collapsing the response to an array.
+- Generated `ThreadSourceKind` values are `cli`, `vscode`, `exec`, `appServer`, `subAgent`, `subAgentReview`, `subAgentCompact`, `subAgentThreadSpawn`, `subAgentOther`, and `unknown`. Freshcodex rich history must explicitly request `appServer` plus every generated `subAgent*` kind, including `subAgentCompact`, so Codex app-server rich sessions and child-agent sessions are not hidden by default source filters.
 - `Thread` has `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, Unix-second timestamps, structured `status`, `path`, `cwd`, `cliVersion`, `source`, optional subagent metadata, `gitInfo`, `name`, and `turns`. `Turn` has `id`, `items`, `status`, `error`, Unix-second `startedAt`/`completedAt` values, and `durationMs`. Fresh-agent contract timestamps may stay ISO strings for UI consistency, but Codex raw protocol schemas and fixtures must parse numeric app-server timestamps and normalize them explicitly.
 - Generated `Thread` objects require the full thread metadata envelope even when turn bodies are omitted. At minimum, schema-valid fixtures must include `id`, `forkedFromId`, `preview`, `ephemeral`, `modelProvider`, `createdAt`, `updatedAt`, structured `status`, `path`, `cwd`, `cliVersion`, `source`, `agentNickname`, `agentRole`, `gitInfo`, `name`, and `turns`. `turns` is a required array that may be empty; do not mark it optional in `CodexThreadSchema` just because `thread/read { includeTurns: false }` returns an empty list.
 - `ThreadStatus` is structured: `{ type: 'notLoaded' } | { type: 'idle' } | { type: 'systemError' } | { type: 'active', activeFlags: [...] }`. `TurnStatus` is `"completed" | "interrupted" | "failed" | "inProgress"`.
@@ -435,7 +437,7 @@ expect(FreshAgentTranscriptItemSchema.parse({
 })
 ```
 
-Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures.
+Also assert that `FreshAgentTurnPageSchema`, `FreshAgentTurnBodySchema`, `FreshAgentThreadListPageSchema`, `FreshAgentActionResultSchema`, `FreshAgentCodexExtensionSchema`, and `FreshAgentClaudeExtensionSchema` parse the new fixtures. The thread-list fixture must preserve `items`, `nextCursor`, and `backwardsCursor` because Codex `thread/list` is paginated and Freshcodex history must not collapse the app-server page to an array.
 Also assert that `FreshAgentInputImageSchema` and `FreshAgentRuntimeSettingsSchema` parse URL, local-path, data-URL/image-data, model, sandbox, Codex approval policy, and Codex effort fixtures because those shapes are shared by REST, WebSocket, controller, and adapter code. The test must prove Freshcodex accepts generated Codex effort values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`) and rejects sending legacy Claude-only effort values such as `max` through the Codex adapter. It must also prove Freshcodex accepts generated Codex approval policies (`untrusted`, `on-failure`, `on-request`, `never`, and granular policy objects) and rejects Claude permission modes such as `bypassPermissions` at the Codex boundary.
 
 Include explicit fixtures for every Codex transcript/request surface the user-visible end state names:
@@ -629,6 +631,29 @@ export const FreshAgentTurnPageSchema = z.object({
   backwardsCursor: z.string().nullable().optional(),
 })
 
+export const FreshAgentSessionSummarySchema = z.object({
+  sessionId: NonEmptyString,
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
+  runtimeProvider: FreshAgentRuntimeProviderSchema.optional(),
+  title: z.string().optional(),
+  summary: z.string().optional(),
+  cwd: z.string().optional(),
+  createdAt: z.string().optional(),
+  updatedAt: z.string().optional(),
+  source: JsonValue.optional(),
+  archived: z.boolean().optional(),
+  parentThreadId: z.string().nullable().optional(),
+})
+
+export const FreshAgentThreadListPageSchema = z.object({
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema,
+  items: z.array(FreshAgentSessionSummarySchema),
+  nextCursor: z.string().nullable(),
+  backwardsCursor: z.string().nullable(),
+})
+
 export const FreshAgentTurnPageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: z.enum(['visible', 'background']).optional(),
@@ -725,6 +750,7 @@ export type FreshAgentThreadSnapshot = z.infer<typeof FreshAgentThreadSnapshotSc
 export type FreshAgentTurnPage = z.infer<typeof FreshAgentTurnPageSchema>
 export type FreshAgentTurnBody = z.infer<typeof FreshAgentTurnBodySchema>
 export type FreshAgentTranscriptItem = z.infer<typeof FreshAgentTranscriptItemSchema>
+export type FreshAgentThreadListPage = z.infer<typeof FreshAgentThreadListPageSchema>
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1074,6 +1100,9 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListResponse.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadSourceKind.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadSortKey.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SortDirection.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListParams.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListResponse.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadParams.ts`
@@ -1139,6 +1168,15 @@ expect(requiredFieldsForGeneratedType('v2/Thread.ts', 'Thread')).toEqual(expect.
 expect(() => CodexThreadSchema.parse({ id: 'thread-missing-required-fields' })).toThrow(/turns|cwd|createdAt/i)
 expect(() => CodexThreadTurnsListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
 expect(CodexThreadReadResultSchema.parse({ thread: schemaValidThread({ turns: [] }) }).thread.turns).toEqual([])
+expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
+  'appServer',
+  'subAgent',
+  'subAgentReview',
+  'subAgentCompact',
+  'subAgentThreadSpawn',
+  'subAgentOther',
+]))
+expect(() => CodexThreadListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
 ```
 
 This is required because `thread/read { includeTurns: false }` returns a schema-valid `Thread` with `turns: []`, not a partial object with `turns` omitted. Do not loosen `protocol.ts` to make impossible mocks easier to write.
@@ -1322,6 +1360,39 @@ export const CodexThreadTurnsListParamsSchema = z.object({
 
 export const CodexThreadTurnsListResultSchema = z.object({
   data: z.array(CodexTurnSchema),
+  nextCursor: z.string().nullable(),
+  backwardsCursor: z.string().nullable(),
+})
+
+export const CodexThreadSourceKindSchema = z.enum([
+  'cli',
+  'vscode',
+  'exec',
+  'appServer',
+  'subAgent',
+  'subAgentReview',
+  'subAgentCompact',
+  'subAgentThreadSpawn',
+  'subAgentOther',
+  'unknown',
+])
+export const CodexThreadSortKeySchema = z.enum(['created_at', 'updated_at'])
+
+export const CodexThreadListParamsSchema = z.object({
+  cursor: z.string().nullable().optional(),
+  limit: z.number().int().nonnegative().optional(),
+  sortKey: CodexThreadSortKeySchema.nullable().optional(),
+  sortDirection: z.enum(['asc', 'desc']).nullable().optional(),
+  modelProviders: z.array(z.string()).nullable().optional(),
+  sourceKinds: z.array(CodexThreadSourceKindSchema).nullable().optional(),
+  archived: z.boolean().nullable().optional(),
+  cwd: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+  useStateDbOnly: z.boolean().optional(),
+  searchTerm: z.string().nullable().optional(),
+})
+
+export const CodexThreadListResultSchema = z.object({
+  data: z.array(CodexThreadSchema),
   nextCursor: z.string().nullable(),
   backwardsCursor: z.string().nullable(),
 })
@@ -1600,6 +1671,9 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadResumeResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadListResponse.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadSourceKind.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadSortKey.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SortDirection.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListParams.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadLoadedListResponse.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadReadParams.ts \
@@ -1818,9 +1892,13 @@ expect(runtime.startReview).toHaveBeenCalledWith({
   delivery: 'inline',
 })
 
-await expect(adapter.listThreads?.({ limit: 25 })).resolves.toEqual(expect.arrayContaining([
-  expect.objectContaining({ sessionType: 'freshcodex', runtimeProvider: 'codex' }),
-]))
+await expect(adapter.listThreads?.({ limit: 25 })).resolves.toMatchObject({
+  sessionType: 'freshcodex',
+  provider: 'codex',
+  items: [expect.objectContaining({ sessionType: 'freshcodex', runtimeProvider: 'codex' })],
+  nextCursor: null,
+  backwardsCursor: null,
+})
 
 await expect(adapter.listModels?.()).resolves.toEqual(expect.arrayContaining([
   expect.objectContaining({ id: expect.any(String) }),
@@ -2132,7 +2210,7 @@ Extend the fresh-agent adapter/runtime contract with implemented Codex methods t
 
 ```ts
 startReview?(sessionId: string, input?: { target?: FreshAgentReviewTarget; delivery?: 'inline' | 'detached' }): Promise<{ turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }>
-listThreads?(query: { limit?: number; cursor?: string }): Promise<FreshAgentSessionSummary[]>
+listThreads?(query: { limit?: number; cursor?: string; sortDirection?: 'asc' | 'desc'; sourceKinds?: string[] }): Promise<FreshAgentThreadListPage>
 listLoadedThreadIds?(query?: { limit?: number; cursor?: string }): Promise<{ ids: string[]; nextCursor: string | null }>
 listModels?(): Promise<FreshAgentModelSummary[]>
 readModelProviderCapabilities?(): Promise<FreshAgentModelProviderCapabilities>
@@ -2884,13 +2962,15 @@ expect(projectFreshAgentSession(codexThread)).toMatchObject({
   title: expect.any(String),
 })
 
-runtime.listThreads.mockResolvedValue({ data: [codexThread], nextCursor: null })
-await expect(loadFreshcodexHistoryPage({ limit: 25 })).resolves.toEqual(expect.arrayContaining([
-  expect.objectContaining({ provider: 'codex', sessionType: 'freshcodex', sessionId: codexThread.id }),
-]))
+runtime.listThreads.mockResolvedValue({ data: [codexThread], nextCursor: null, backwardsCursor: null })
+await expect(loadFreshcodexHistoryPage({ limit: 25 })).resolves.toMatchObject({
+  items: [expect.objectContaining({ provider: 'codex', sessionType: 'freshcodex', sessionId: codexThread.id })],
+  nextCursor: null,
+  backwardsCursor: null,
+})
 expect(runtime.listThreads).toHaveBeenCalledWith(expect.objectContaining({
   limit: 25,
-  sourceKinds: ['appServer', 'subAgent', 'subAgentReview', 'subAgentThreadSpawn', 'subAgentOther'],
+  sourceKinds: ['appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther'],
 }))
 
 runtime.listModels.mockResolvedValue({
@@ -3052,8 +3132,8 @@ Rules:
 - Update `src/lib/session-type-utils.ts`, `src/store/tabsSlice.ts`, and `src/components/panes/PaneContainer.tsx` so Freshcodex creation and resume use Freshcodex settings from `freshAgent.providers.freshcodex` plus Codex CLI defaults from `codingCli.providers.codex`. Do not route Freshcodex through `getAgentChatProviderConfig()` or an `agentChatProviderSettings` parameter; those are Claude/Kilroy compatibility paths only.
 - Update `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, `src/store/paneTreeValidation.ts`, and pane persistence schemas/tests so Freshcodex `sandbox`, generated Codex effort values, and structured/generated approval policies are preserved in local and remote tab snapshots. Remote snapshots must not cast Freshcodex effort back to `'low' | 'medium' | 'high' | 'max'`, must not cast structured approval policy objects to strings, and must not omit `sandbox`.
 - Update `src/store/managed-items.ts`, `src/components/ExtensionsView.tsx`, and `src/store/settingsThunks.ts` where provider settings are exposed or sanitized so Codex provider settings do not offer or accept Claude permission modes for Freshcodex defaults. If raw Codex terminal settings still need a narrower CLI-specific representation, model that separately from Freshcodex rich runtime settings.
-- Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone.
-- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for rich app-server and child-agent sessions, at least `['appServer', 'subAgent', 'subAgentReview', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps app-server-created Freshcodex threads, review threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
+- Add fresh-agent REST/API surfaces for the adapter methods classified as implemented in Task 5: list Freshcodex threads, list loaded Freshcodex thread ids, list models, and read model-provider capabilities. These should be typed in `server/fresh-agent/runtime-manager.ts`, exposed by `server/fresh-agent/router.ts`, parsed in `src/lib/api.ts`, and consumed by history/settings UI. Do not leave `thread/list`, `thread/loaded/list`, `model/list`, or `modelProvider/capabilities/read` as uncalled low-level app-server helpers after classifying them as implemented. The thread-list surface must reflect the generated app-server shape after fresh-agent normalization (`{ items, nextCursor, backwardsCursor }`) rather than returning a bare array; the loaded-list surface must reflect the generated app-server shape (`{ ids, nextCursor }` after fresh-agent normalization), or explicitly hydrate those ids with `thread/read`; it must not return fake `FreshAgentSessionSummary` rows from `thread/loaded/list` alone.
+- Feed Freshcodex history/session rows from the Codex rich adapter's `thread/list` results where available, projected through `session-directory` with `sessionType: 'freshcodex'` and `provider: 'codex'`. Existing file/indexer-derived Codex terminal history may remain for raw Codex terminal panes, but it must not be the only source for Freshcodex rich threads. The Freshcodex history query must pass explicit generated `sourceKinds` for rich app-server and child-agent sessions, at least `['appServer', 'subAgent', 'subAgentReview', 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther']`, rather than relying on the app-server default source filter. This keeps app-server-created Freshcodex threads, review threads, compaction subagent threads, and spawned child-agent threads visible even if Codex changes the default "interactive" source set.
 - Feed Freshcodex model/settings options from `model/list` plus `modelProvider/capabilities/read` and cache them behind the fresh-agent adapter boundary. If the runtime is unavailable, show a typed runtime-unavailable settings error rather than falling back to stale Claude model defaults.
 - Hidden `kilroy` resolves to Claude runtime metadata but does not appear as a public picker entry.
 - `freshopencode` remains disabled and cannot be created.
@@ -3355,8 +3435,8 @@ If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, o
 - Freshcodex renders without `agentChat` session state.
 - Freshcodex normal snapshot and transcript paths are page-first; they do not load the full Codex thread body list for every snapshot or visible-row hydration.
 - Freshcodex supports create, resume, send text/images with runtime settings, interrupt, fork, approvals, questions, diff/review/worktree/child-thread display, reconnect, retry, and stale revision recovery.
-- Freshcodex starts Codex review through `review/start`, preserves `reviewThreadId`/target/delivery metadata, lists/resumes rich Codex threads through `thread/list`, exposes loaded thread ids according to `thread/loaded/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
-- Freshcodex history queries explicitly include Codex rich app-server and child-agent source kinds rather than relying on app-server defaults.
+- Freshcodex starts Codex review through `review/start`, preserves `reviewThreadId`/target/delivery metadata, lists/resumes rich Codex threads through paginated `thread/list`, exposes loaded thread ids according to `thread/loaded/list`, and populates model/capability UI from `model/list` and `modelProvider/capabilities/read`.
+- Freshcodex history APIs preserve `thread/list` `nextCursor` and `backwardsCursor`, and history queries explicitly include Codex rich app-server and all generated child-agent source kinds rather than relying on app-server defaults.
 - Freshcodex create/resume settings are Codex-shaped across picker creation, history open, pane persistence, remote tab snapshots, and attach; `sandbox`, generated Codex approval policies, and generated Codex effort values are not dropped or narrowed to Claude-only types.
 - Restored Freshcodex panes send attach context and load/resume the Codex app-server thread before snapshot or action work after a browser reload, server restart, or app-server process restart.
 - Existing raw Codex terminal panes still launch through the websocket app-server planner and receive a valid loopback `wsUrl`.
