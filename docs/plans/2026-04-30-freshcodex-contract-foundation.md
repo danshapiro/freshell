@@ -12,7 +12,7 @@
 
 ## Current State
 
-The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation`. At this planning checkpoint it is ahead of `origin/main` with the first fresh-agent platform cutover and behind `origin/main` by additional mainline fixes; Task 1 must re-check the exact counts before merging main into the worktree branch. The branch already contains:
+The implementation workspace is `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation`. At this planning checkpoint the branch already contains `origin/main`, but Task 1 must re-check the exact ahead/behind counts before implementation because main can move between planning and execution. If `origin/main` has moved, merge it into this worktree branch before contract work. If `origin/main` is already contained, run the merge-sensitive verification and skip the no-op merge commit. The branch already contains:
 
 - `kind: 'fresh-agent'` pane content with `sessionType` separate from runtime `provider`.
 - Claude and Codex runtime adapters under `server/fresh-agent/adapters/*`.
@@ -27,7 +27,7 @@ Two existing implementation seams must be corrected before the new feature work 
 - `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` currently re-export or alias legacy agent-chat state/thunks. `src/lib/pane-activity.ts` also reads fresh-agent pane activity from `agentChatSessions`. That was acceptable as a temporary bridge, but it is not a shared fresh-agent foundation. Fresh-agent state, thunks, activity projection, and action names must be based on the shared fresh-agent contract; legacy agent-chat may keep its own slice until Freshclaude is fully ported.
 - Freshcodex defaults and restored-pane runtime settings currently flow through helper files that still assume Claude-shaped agent-chat values. `src/lib/session-type-utils.ts`, `src/store/tabsSlice.ts`, `src/lib/tab-registry-snapshot.ts`, `src/store/paneTreeValidation.ts`, `src/components/TabsView.tsx`, and pane persistence tests must be updated so Codex-shaped approval policy, sandbox, and effort values survive picker creation, session resume, browser persistence, remote tab snapshots, and hydration.
 
-The branch is behind `origin/main` by commits that touch exactly the areas this project depends on: agent-chat auto-title, mobile keyboard/touch behavior, stale pane hydration, two-browser reconnect recovery, and Codex app-server startup/init hardening. Those changes must be merged into this worktree before contract work so the implementation does not reintroduce known fixed bugs.
+Recent mainline fixes touched exactly the areas this project depends on: agent-chat auto-title, mobile keyboard/touch behavior, stale pane hydration, two-browser reconnect recovery, and Codex app-server startup/init hardening. Those changes are present at this planning checkpoint, but Task 1 must preserve them and repeat the main-sync gate if `origin/main` moves again before implementation so the implementation does not reintroduce known fixed bugs.
 
 ## Local Codex Schema Audit
 
@@ -265,7 +265,7 @@ The correct route is:
 
 No user decision is required. The plan makes one deliberate scope choice: `freshopencode` stays disabled and unimplemented, while the shared contract remains provider-extensible.
 
-### Task 1: Merge Current Main Without Regressing Fresh-Agent Work
+### Task 1: Sync Current Main Without Regressing Fresh-Agent Work
 
 **Files:**
 - Modify as needed by merge: `server/ws-handler.ts`
@@ -306,20 +306,28 @@ npm run test:vitest -- \
   test/unit/server/ws-handler-sdk.test.ts
 ```
 
-Expected: branch is clean; logs show main commits that must be merged; some tests may not exist or may fail before the merge because they live only on `origin/main`.
+Expected: record the exact ahead/behind state. If `git status` shows pre-existing unrelated changes, record those paths and do not stage or overwrite them; stop only if they conflict with this task. If the right-side count is nonzero, logs show main commits that must be merged. If the right-side count is zero, `origin/main` is already contained and this task becomes a verification-only sync gate with no merge commit.
 
-- [ ] **Step 2: Merge `origin/main` into the worktree branch**
+- [ ] **Step 2: Merge `origin/main` into the worktree branch only when needed**
 
 Run:
 
 ```bash
 git fetch origin
+git rev-list --left-right --count HEAD...origin/main
+```
+
+If the right-side count is nonzero, run:
+
+```bash
 git merge origin/main
 ```
 
-Expected: conflicts are possible in `server/ws-handler.ts`, `shared/ws-protocol.ts`, `src/store/panesSlice.ts`, `src/components/agent-chat/AgentChatView.tsx`, and Codex app-server files.
+Expected: conflicts are possible in `server/ws-handler.ts`, `shared/ws-protocol.ts`, `src/store/panesSlice.ts`, `src/components/agent-chat/AgentChatView.tsx`, and Codex app-server files. If the right-side count is zero, do not run a no-op merge and do not create an empty commit; proceed to Step 4.
 
 - [ ] **Step 3: Resolve conflicts by preserving both main fixes and fresh-agent behavior**
+
+Skip this step if Step 2 found no right-side `origin/main` commits.
 
 Conflict resolution rules:
 
@@ -362,7 +370,9 @@ npm run typecheck
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Commit only if the main sync changed tracked files**
+
+If Step 2 found no right-side `origin/main` commits and Step 5 made no tracked changes, do not create an empty commit. Otherwise commit only the files changed by the sync/conflict resolution; do not stage unrelated pre-existing dirty paths.
 
 ```bash
 git add \
@@ -381,7 +391,7 @@ git add \
   test/unit/server/coding-cli/codex-app-server/runtime.test.ts \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/server/ws-handler-sdk.test.ts
-git commit -m "Merge main into freshcodex contract foundation"
+git commit -m "Sync main into freshcodex contract foundation"
 ```
 
 ### Task 2: Define The Shared Fresh-Agent Contract
@@ -497,6 +507,13 @@ expect(FreshAgentServerRequestResponseSchema.parse({
   scope: 'turn',
   strictAutoReview: true,
 })).toMatchObject({ kind: 'permissions_approval' })
+
+expect(FreshAgentServerRequestResponseSchema.parse({
+  requestId: 'dynamic-tool-1',
+  kind: 'dynamic_tool',
+  contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
+  success: false,
+})).toMatchObject({ kind: 'dynamic_tool', success: false })
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -783,6 +800,10 @@ export const FreshAgentToolUserInputAnswerSchema = z.object({
 })
 
 export const FreshAgentMcpElicitationActionSchema = z.enum(['accept', 'decline', 'cancel'])
+export const FreshAgentDynamicToolOutputContentItemSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('inputText'), text: z.string() }),
+  z.object({ type: z.literal('inputImage'), imageUrl: z.string() }),
+])
 
 export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind', [
   z.object({
@@ -817,10 +838,16 @@ export const FreshAgentServerRequestResponseSchema = z.discriminatedUnion('kind'
     content: JsonValue.nullable(),
     _meta: JsonValue.nullable(),
   }),
+  z.object({
+    requestId: NonEmptyString,
+    kind: z.literal('dynamic_tool'),
+    contentItems: z.array(FreshAgentDynamicToolOutputContentItemSchema),
+    success: z.boolean(),
+  }),
 ])
 ```
 
-The implementation may narrow `permissions`, `scope`, and MCP `content` further when the Codex generated response schemas are modeled in `server/coding-cli/codex-app-server/protocol.ts`, but the shared action contract must not reduce them to strings or Claude-style answers.
+The implementation may narrow `permissions`, `scope`, MCP `content`, and dynamic-tool output content further when the Codex generated response schemas are modeled in `server/coding-cli/codex-app-server/protocol.ts`, but the shared action contract must not reduce them to strings or Claude-style answers. Even when Freshcodex auto-declines unsupported dynamic tool calls without user input, the response shape must stay contract-modeled so tests can prove the app-server turn is unblocked with the generated `DynamicToolCallResponse` envelope.
 
 Define referenced schemas before any schema that uses them, or wrap recursive references in `z.lazy`, so module evaluation cannot hit a temporal-dead-zone `ReferenceError`.
 
@@ -2227,6 +2254,17 @@ await adapter.respondToServerRequest?.('thread-1', {
 expect(runtime.respondToServerRequest).toHaveBeenCalledWith('permissions-1', {
   permissions: grantedPermissionFixture,
   scope: 'session',
+})
+
+await adapter.respondToServerRequest?.('thread-1', {
+  requestId: 'dynamic-tool-1',
+  kind: 'dynamic_tool',
+  contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
+  success: false,
+})
+expect(runtime.respondToServerRequest).toHaveBeenCalledWith('dynamic-tool-1', {
+  contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }],
+  success: false,
 })
 ```
 
@@ -3730,7 +3768,7 @@ git commit -m "Harden Freshcodex reconnect and action errors"
 
 **Files:**
 - Modify: `docs/index.html`
-- Modify: `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` only if it is still used as living reference; otherwise leave old plan untouched
+- Modify: `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` only if implementation changes alter the living Freshcodex acceptance-test inventory; otherwise leave the test plan untouched
 - Modify: `test/e2e-browser/specs/fresh-agent.spec.ts`
 - Modify: `test/e2e-browser/specs/fresh-agent-mobile.spec.ts`
 - Modify: any tests renamed from legacy `agent-chat` specs only if they now cover fresh-agent behavior
@@ -3800,11 +3838,15 @@ If the right-side count is nonzero:
 
 ```bash
 git merge origin/main
+npm run lint
 npm run build
 FRESHELL_TEST_SUMMARY="freshcodex contract foundation post-main-merge" npm test
+npm run test:e2e:chromium -- \
+  test/e2e-browser/specs/fresh-agent.spec.ts \
+  test/e2e-browser/specs/fresh-agent-mobile.spec.ts
 ```
 
-Expected: clean merge or resolved conflicts in the worktree, all tests pass.
+Expected: clean merge or resolved conflicts in the worktree, all final gates pass after the merge. If the right-side count is zero, do not create a no-op merge commit.
 
 - [ ] **Step 6: Commit**
 
@@ -3813,11 +3855,11 @@ git add \
   docs/index.html \
   test/e2e-browser/specs/fresh-agent.spec.ts \
   test/e2e-browser/specs/fresh-agent-mobile.spec.ts \
-  docs/plans/2026-04-18-fresh-agent-platform-test-plan.md
+  docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md
 git commit -m "Document and verify Freshcodex contract foundation"
 ```
 
-If `docs/plans/2026-04-18-fresh-agent-platform-test-plan.md` was not modified, omit it from `git add`.
+If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not modified, omit it from `git add`.
 
 ## Final Acceptance Checklist
 
