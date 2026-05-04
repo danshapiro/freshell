@@ -112,7 +112,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - Durable read-model contracts live in `shared/fresh-agent-contract.ts`; pane lifecycle state stays in `src/store/paneTypes.ts` and must not leak into durable snapshot schemas.
 - `provider` means runtime family: `claude`, `codex`, or later `opencode`.
 - `sessionType` means user-facing identity: `freshclaude`, `freshcodex`, `kilroy`, or disabled `freshopencode`.
-- Every fresh-agent read-model contract and browser/server API that identifies a session must include `sessionType` as well as `provider` and `threadId`. Do not infer user-facing identity from `provider`; multiple session types can share one runtime provider.
+- Every fresh-agent read-model contract and browser/server API that identifies a session must include `sessionType` as well as `provider` and `threadId`. Do not infer user-facing identity from `provider`; multiple session types can share one runtime provider. Use one canonical REST locator shape for fresh-agent thread resources: `/api/fresh-agent/threads/:sessionType/:provider/:threadId` and `/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns...`. Do not keep the old provider-only route as the primary API because it makes `freshclaude`/`kilroy` and future shared-provider clients ambiguous.
 - Fresh-agent live session tracking and action routing must key sessions by the full locator `{ sessionType, provider, threadId }`, not by `sessionId` alone. Claude, Codex, and later OpenCode can all expose opaque ids, and a durable foundation must not depend on cross-provider id uniqueness. WebSocket action messages may keep `sessionId` as the user-facing field name for compatibility, but they must also carry `sessionType` and `provider`, and the runtime manager must validate the full locator before dispatching an action.
 - `server/fresh-agent/provider-registry.ts` must model two separate concepts: a session-type descriptor registry and a runtime-provider adapter registry. Runtime adapter lookup by provider must not be overwritten by another session type using the same provider.
 - `src/store/freshAgentSlice.ts` must become an actual fresh-agent slice with fresh-agent action names and contract-shaped state. It must not re-export `agentChatSlice`; `src/store/freshAgentTypes.ts` must not alias `agentChatTypes`; and `src/store/freshAgentThunks.ts` must not alias `agentChatThunks`.
@@ -933,9 +933,14 @@ it('rejects invalid adapter snapshots with a clear contract error', async () => 
 })
 
 it('returns 502 when adapter output violates the fresh-agent contract', async () => {
-  const response = await request(app).get('/api/fresh-agent/threads/codex/thread-1')
+  const response = await request(app).get('/api/fresh-agent/threads/freshcodex/codex/thread-1')
   expect(response.status).toBe(502)
   expect(response.body.code).toBe('FRESH_AGENT_CONTRACT_INVALID')
+})
+
+it('does not expose provider-only fresh-agent thread routes', async () => {
+  const response = await request(app).get('/api/fresh-agent/threads/codex/thread-1')
+  expect([400, 404]).toContain(response.status)
 })
 
 it('surfaces a controlled client load error for invalid snapshot payloads', async () => {
@@ -1130,7 +1135,7 @@ return res.status(502).json({
 })
 ```
 
-In `src/lib/api.ts`, parse fresh-agent helpers with the schemas and throw `FreshAgentApiPayloadError` from `src/lib/fresh-agent-api-error.ts` when parsing fails. Update helper signatures and REST paths to carry session identity explicitly:
+In `src/lib/api.ts`, parse fresh-agent helpers with the schemas and throw `FreshAgentApiPayloadError` from `src/lib/fresh-agent-api-error.ts` when parsing fails. Update helper signatures and REST paths to carry session identity explicitly and to use the canonical locator route `/api/fresh-agent/threads/:sessionType/:provider/:threadId`:
 
 ```ts
 getFreshAgentThreadSnapshot(sessionType, provider, threadId, options): Promise<FreshAgentThreadSnapshot>
@@ -1138,7 +1143,7 @@ getFreshAgentTurnPage(sessionType, provider, threadId, query): Promise<FreshAgen
 getFreshAgentTurnBody(sessionType, provider, threadId, turnId, revision): Promise<FreshAgentTurnBody>
 ```
 
-The router should accept `sessionType` in the request path or query, validate it with `FreshAgentSessionTypeSchema`, and pass it to the runtime manager. Do not reconstruct `sessionType` from `provider`.
+The router must accept `sessionType` in the request path, validate it with `FreshAgentSessionTypeSchema`, and pass it to the runtime manager. Do not reconstruct `sessionType` from `provider`, and do not leave a provider-only fresh-agent thread route active except as an explicit temporary backwards-compatibility redirect that rejects ambiguous shared-provider cases and is removed before final verification.
 The fresh-agent turn-page REST query should use `FreshAgentTurnPageQuerySchema` from `shared/fresh-agent-contract.ts`, not the legacy `AgentTimelinePageQuerySchema`, because Freshcodex needs `sortDirection` for newest-first pages and must not expose `includeBodies` as a Codex app-server parameter. The router may keep an `includeBodies` compatibility branch only for non-Codex providers that still need it, but Freshcodex requests should use `sortDirection` plus bounded `limit`, and the Codex adapter must not forward Freshell-only `revision`, `priority`, or `includeBodies` fields to `thread/turns/list`.
 
 Replace `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` with independent fresh-agent reducer, contract-shaped types, and thunk type prefixes. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
@@ -1341,6 +1346,9 @@ expect(sourceKindValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
 ]))
 expect(threadStartSourceValuesFromGeneratedSchema()).toEqual(['startup', 'clear'])
 expect(() => CodexThreadListResultSchema.parse({ data: [] })).toThrow(/nextCursor|backwardsCursor/i)
+expect(() => CodexThreadStartResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|instructionSources|approvalPolicy|sandbox/i)
+expect(() => CodexThreadResumeResultSchema.parse({ thread: schemaValidThread({ turns: [] }) })).toThrow(/model|cwd|instructionSources|approvalPolicy|sandbox/i)
+expect(() => CodexThreadForkResultSchema.parse({ thread: schemaValidThread({ turns: [] }), model: 'fixture', modelProvider: 'fixture', cwd: '/repo' })).toThrow(/instructionSources|approvalPolicy|sandbox|reasoningEffort/i)
 expect(reasoningEffortValuesFromGeneratedSchema()).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])
 expect(askForApprovalValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'untrusted',
@@ -1391,6 +1399,7 @@ expect(CodexThreadSchema.parse(schemaValidThread({
 
 This is required because `thread/read { includeTurns: false }` returns a schema-valid `Thread` with `turns: []`, not a partial object with `turns` omitted. Do not loosen `protocol.ts` to make impossible mocks easier to write.
 It is also required because `ThreadSourceKind` and `SessionSource` are different generated types: `sourceKinds` filters use flattened subagent source-kind strings, while the `Thread.source` metadata returned in `Thread` objects preserves nested subagent details. The checked-in schema snapshot and inventory tests must cover both so Freshcodex history filters and child-thread metadata do not accidentally share one lossy source enum.
+Add fixture helpers such as `schemaValidThread`, `schemaValidTurn`, `schemaValidCodexItem`, and `schemaValidThreadLifecycleResult`; adapter/runtime tests must use those helpers instead of `{ thread: { id } }`, `{ turn: { id } }`, `{ item: { id } }`, or partial lifecycle responses.
 
 Compare generated method names to two explicit sets:
 
@@ -1507,7 +1516,7 @@ Add notification forwarding tests in `client.test.ts` and `rich-runtime.test.ts`
 it('forwards app-server notifications without treating them as request responses', async () => {
   const notifications: unknown[] = []
   client.onNotification((notification) => notifications.push(notification))
-  await fakeServer.sendNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1' } } })
+  await fakeServer.sendNotification({ method: 'turn/started', params: { threadId: 'thread-1', turn: schemaValidTurn({ id: 'turn-1' }) } })
   expect(notifications).toContainEqual({ method: 'turn/started', params: expect.objectContaining({ threadId: 'thread-1' }) })
   expect(client.pendingRequestCountForTest()).toBe(0)
 })
@@ -1515,7 +1524,7 @@ it('forwards app-server notifications without treating them as request responses
 it('lets the rich stdio runtime subscribe to notifications and server requests for a specific Freshcodex session', async () => {
   const seen: unknown[] = []
   const unsubscribe = await richRuntime.subscribe('thread-1', (event) => seen.push(event))
-  await fakeServer.sendNotification({ method: 'item/completed', params: { threadId: 'thread-1', item: { id: 'item-1' } } })
+  await fakeServer.sendNotification({ method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: schemaValidCodexItem({ type: 'plan', id: 'item-1', text: 'Plan' }) } })
   expect(seen).toContainEqual(expect.objectContaining({ method: 'item/completed' }))
   unsubscribe()
 })
@@ -1660,6 +1669,18 @@ export const CodexApprovalPolicySchema = z.union([
     }),
   }),
 ])
+export const CodexSandboxPolicySchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('dangerFullAccess') }),
+  z.object({ type: z.literal('readOnly'), networkAccess: z.boolean() }),
+  z.object({ type: z.literal('externalSandbox'), networkAccess: z.unknown() }),
+  z.object({
+    type: z.literal('workspaceWrite'),
+    writableRoots: z.array(z.string()),
+    networkAccess: z.boolean(),
+    excludeTmpdirEnvVar: z.boolean(),
+    excludeSlashTmp: z.boolean(),
+  }),
+])
 
 export const CodexTurnStartParamsSchema = z.object({
   threadId: z.string().min(1),
@@ -1683,6 +1704,26 @@ Use generated schema field names. Do not guess against tests. Delete the stale `
 Model the response schemas with the generated shapes, not Freshell convenience shapes:
 
 ```ts
+export const CodexServiceTierSchema = z.enum(['fast', 'flex'])
+export const CodexApprovalsReviewerSchema = z.enum(['user', 'auto_review', 'guardian_subagent'])
+
+const CodexThreadLifecycleResultSchema = z.object({
+  thread: CodexThreadSchema,
+  model: z.string().min(1),
+  modelProvider: z.string().min(1),
+  serviceTier: CodexServiceTierSchema.nullable(),
+  cwd: z.string().min(1),
+  instructionSources: z.array(z.string()),
+  approvalPolicy: CodexApprovalPolicySchema,
+  approvalsReviewer: CodexApprovalsReviewerSchema,
+  sandbox: CodexSandboxPolicySchema,
+  reasoningEffort: CodexReasoningEffortSchema.nullable(),
+})
+
+export const CodexThreadStartResultSchema = CodexThreadLifecycleResultSchema
+export const CodexThreadResumeResultSchema = CodexThreadLifecycleResultSchema
+export const CodexThreadForkResultSchema = CodexThreadLifecycleResultSchema
+
 export const CodexTurnStartResultSchema = z.object({
   turn: CodexTurnSchema,
 })
@@ -1694,12 +1735,6 @@ export const CodexTurnInterruptParamsSchema = z.object({
 
 export const CodexTurnInterruptResultSchema = z.object({}).passthrough()
 
-export const CodexThreadForkResultSchema = z.object({
-  thread: CodexThreadSchema,
-  cwd: z.string().min(1),
-  model: z.string().min(1),
-  modelProvider: z.string().min(1),
-}).passthrough()
 ```
 
 Also model generated app-server read shapes used by later normalization and UI tasks:
@@ -2072,7 +2107,7 @@ Add table-driven coverage for every local generated `ThreadItem` type: `userMess
 Require adapter methods:
 
 ```ts
-runtime.startTurn.mockResolvedValue({ turn: { id: 'turn-1' } })
+runtime.startTurn.mockResolvedValue({ turn: schemaValidTurn({ id: 'turn-1' }) })
 await adapter.send?.('thread-1', { text: 'Ship it' })
 expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
   threadId: 'thread-1',
@@ -2134,7 +2169,7 @@ runtime.readThread.mockResolvedValue({
   }),
 })
 runtime.listThreadTurns.mockResolvedValue({
-  data: [{ id: 'turn-running-1', status: 'inProgress', items: [] }],
+  data: [schemaValidTurn({ id: 'turn-running-1', status: 'inProgress', items: [] })],
   nextCursor: null,
   backwardsCursor: null,
 })
@@ -2145,7 +2180,7 @@ expect(runtime.interruptTurn).toHaveBeenCalledWith({
   turnId: 'turn-running-1',
 })
 
-runtime.forkThread.mockResolvedValue({ thread: schemaValidThread({ id: 'thread-fork-1', turns: [] }), cwd: '/repo', model: 'fixture', modelProvider: 'fixture' })
+runtime.forkThread.mockResolvedValue(schemaValidThreadLifecycleResult({ thread: schemaValidThread({ id: 'thread-fork-1', turns: [] }) }))
 await expect(adapter.fork?.('thread-1', { excludeTurns: true }))
   .resolves.toMatchObject({ sessionId: 'thread-fork-1', parentThreadId: 'thread-1' })
 
@@ -2164,7 +2199,7 @@ expect(runtime.startReview).toHaveBeenCalledWith({
 await expect(adapter.listThreads?.({ limit: 25 })).resolves.toMatchObject({
   sessionType: 'freshcodex',
   provider: 'codex',
-  items: [expect.objectContaining({ sessionType: 'freshcodex', runtimeProvider: 'codex' })],
+  items: [expect.objectContaining({ sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })],
   nextCursor: null,
   backwardsCursor: null,
 })
@@ -2218,7 +2253,7 @@ expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex
   .toMatchObject({ pendingApprovals: [{ requestId: expect.stringContaining('cmd-1') }] })
 ```
 
-Add table-driven server-request coverage for every local generated `ServerRequest` method. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no `threadId`, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
+Add table-driven server-request coverage for every local generated `ServerRequest` method. Build each request with a helper that parses `{ id, method, params }` through `CodexServerRequestSchema` before the adapter sees it, because several request variants have required structured params beyond `threadId`. `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, and `item/permissions/requestApproval` become pending approvals; `item/tool/requestUserInput` and `mcpServer/elicitation/request` become pending questions; `item/tool/call` receives an explicit generated-shape dynamic-tool result such as `{ contentItems: [{ type: 'inputText', text: 'Dynamic tool calls are not supported by Freshell yet.' }], success: false }`; `account/chatgptAuthTokens/refresh` receives a JSON-RPC error response on the same request id because its success shape requires real token fields and, because it has no `threadId`, also emits a runtime-global `freshAgent.error` or equivalent runtime event to all subscribed Freshcodex panes for that rich runtime. Deprecated `applyPatchApproval` and `execCommandApproval` are mapped to legacy approval prompts only if generated schema still includes them. `serverRequest/resolved` must remove matching pending approval/question/request state by generated `requestId`.
 
 The same table must verify response serialization for each interactive request method through the fresh-agent action contract, not only through low-level client tests:
 
@@ -2271,6 +2306,12 @@ expect(runtime.respondToServerRequest).toHaveBeenCalledWith('dynamic-tool-1', {
 Add table-driven notification coverage for every local generated `ServerNotification` method that can change visible Freshcodex state:
 
 ```ts
+function emitSchemaValidNotification(method: string, overrides: Record<string, unknown> = {}) {
+  const params = schemaValidNotificationParams(method, overrides)
+  const notification = CodexServerNotificationSchema.parse({ method, params })
+  emitNotification(notification.method, notification.params)
+}
+
 it.each([
   ['turn/started'],
   ['turn/completed'],
@@ -2288,7 +2329,7 @@ it.each([
 ])('invalidates the Freshcodex snapshot for %s notifications', async (method) => {
   const listener = vi.fn()
   await adapter.subscribe?.('thread-1', listener)
-  emitNotification(method, { threadId: 'thread-1' })
+  emitSchemaValidNotification(method, { threadId: 'thread-1' })
   expect(listener).toHaveBeenCalledWith(expect.objectContaining({
     type: 'freshAgent.snapshot.invalidate',
     sessionType: 'freshcodex',
@@ -2299,7 +2340,7 @@ it.each([
 })
 ```
 
-If the generated schema uses different method names, use the generated names in the test table. The executor must add every visible-state notification method present in `ServerNotification.json`; do not shrink the table to the example above.
+If the generated schema uses different method names or params, use the generated names and generated params in the test table. The executor must add every visible-state notification method present in `ServerNotification.json`; do not shrink the table to the example above. Do not emit `{ threadId }`-only fake notifications for methods whose generated params require a `Turn`, `ThreadItem`, token-usage object, realtime payload, or another structured body; every notification fixture must parse through `CodexServerNotificationSchema` before it reaches the adapter.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -2407,7 +2448,7 @@ return await runtime.subscribe(sessionId, (event) => {
   if (isCodexServerRequest(event)) {
     if (!hasThreadId(event)) {
       respondToUnsupportedRuntimeGlobalRequest(event)
-      listener({ type: 'freshAgent.error', sessionId, code: 'FRESH_AGENT_UNSUPPORTED_AUTH_REFRESH', message: 'Freshell cannot refresh Codex ChatGPT auth tokens from this runtime.', retryable: false })
+      listener({ type: 'freshAgent.error', sessionId, sessionType: 'freshcodex', provider: 'codex', code: 'FRESH_AGENT_UNSUPPORTED_AUTH_REFRESH', message: 'Freshell cannot refresh Codex ChatGPT auth tokens from this runtime.', retryable: false })
       return
     }
     updatePendingRequestState(sessionId, event)
@@ -2426,7 +2467,39 @@ return await runtime.subscribe(sessionId, (event) => {
 
 Implement `send`, `interrupt`, `fork`, and `respondToServerRequest` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(locator)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `respondToServerRequest` must look up the pending request by generated request id, validate that the response `kind` matches the original generated server request method, serialize the generated response shape, and respond on the original JSON-RPC server request id. Do not keep separate `resolveApproval` / `answerQuestion` action paths for Codex; those names encourage collapsing permissions approvals, request-user-input prompts, and MCP elicitations into the wrong Claude-shaped payload.
 
-Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, Codex-shaped `permissionMode` as generated `approvalPolicy`, and Codex-shaped `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them. Tests must also prove Freshcodex rejects legacy Claude-only values (`permissionMode: 'bypassPermissions'`, `effort: 'max'`) before calling Codex app-server.
+Carry runtime settings into both create/resume and turn start. Add `sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'` to `FreshAgentCreateRequest`, `FreshAgentPaneContent`, and the fresh-agent create WS payload. Replace the old create-message effort enum with the shared runtime-settings schema so Freshcodex create can carry generated Codex effort values such as `xhigh` and granular approval policy objects:
+
+```ts
+export const FreshAgentCreateSchema = z.object({
+  type: z.literal('freshAgent.create'),
+  requestId: z.string().min(1),
+  sessionType: FreshAgentSessionTypeSchema,
+  provider: FreshAgentRuntimeProviderSchema.optional(), // omitted only when resolved from the session-type registry
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: FreshAgentRuntimeSettingsSchema.shape.model,
+  sandbox: FreshAgentRuntimeSettingsSchema.shape.sandbox,
+  permissionMode: FreshAgentRuntimeSettingsSchema.shape.permissionMode,
+  effort: FreshAgentRuntimeSettingsSchema.shape.effort,
+  plugins: z.array(z.string()).optional(),
+})
+```
+
+Also update the server-to-client create response so the newly created session immediately carries the same locator shape:
+
+```ts
+| {
+    type: 'freshAgent.created'
+    requestId: string
+    sessionId: string
+    sessionType: string
+    provider: string
+    runtimeProvider?: string
+  }
+| { type: 'freshAgent.create.failed'; requestId: string; sessionType?: string; provider?: string; code: string; message: string; retryable?: boolean }
+```
+
+Resolve Freshcodex defaults from provider settings when the pane is created, then include `model`, `sandbox`, Codex-shaped `permissionMode` as generated `approvalPolicy`, and Codex-shaped `effort` in `thread/start`, `thread/resume`, and `turn/start` where the generated schema supports them. Tests must prove a pane with model/sandbox/permission/effort settings creates the Codex thread with those values and sends a later turn with the same values unless the user changes them. Tests must also prove Freshcodex rejects legacy Claude-only values (`permissionMode: 'bypassPermissions'`, `effort: 'max'`) before calling Codex app-server, including through `freshAgent.create` parsing rather than only through later send actions.
 
 Implement explicit runtime-setting mappers:
 
@@ -2512,6 +2585,7 @@ const forked = await runtime.forkThread({ threadId: sessionId, excludeTurns: tru
 return {
   sessionId: forked.thread.id,
   sessionType: 'freshcodex',
+  provider: 'codex',
   runtimeProvider: 'codex',
   parentThreadId: sessionId,
   extensions: { codex: { fork: { parentThreadId: sessionId } } },
@@ -2535,7 +2609,17 @@ If a later generated schema adds a direct turn-read method, replace this cache f
 Extend WS protocol with `freshAgent.forked`:
 
 ```ts
-| { type: 'freshAgent.forked'; sourceSessionId: string; sessionId: string; sessionType: string; runtimeProvider: string; parentThreadId?: string }
+| {
+    type: 'freshAgent.forked'
+    sourceSessionId: string
+    sourceSessionType: string
+    sourceProvider: string
+    sessionId: string
+    sessionType: string
+    provider: string
+    runtimeProvider?: string
+    parentThreadId?: string
+  }
 ```
 
 Send it from `server/ws-handler.ts` after `freshAgent.fork`.
@@ -2561,11 +2645,13 @@ export const FreshAgentServerRequestRespondSchema = z.object({
 })
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.review.started'; sessionId: string; turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }
-  | { type: 'freshAgent.error'; sessionId?: string; requestId?: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.review.started'; sessionId: string; sessionType: string; provider: string; turnId: string; reviewThreadId: string; target: FreshAgentReviewTarget; delivery: 'inline' | 'detached' }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+  | { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string; code: string; message: string; retryable?: boolean }
 ```
 
-On success, emit `freshAgent.review.started` with the returned `reviewThreadId`, then emit a `freshAgent.event` invalidation for the same session so the workspace panel refreshes review output. On failure, emit `freshAgent.error` with a typed code. Preserve `reviewThreadId` in the Codex extension or review metadata when the snapshot refresh observes review items; do not collapse detached and inline reviews into only the source thread id.
+On success, emit `freshAgent.review.started` with the returned `reviewThreadId` and full `{ sessionType, provider, sessionId }` locator, then emit a `freshAgent.event` invalidation for the same session so the workspace panel refreshes review output. On failure, emit `freshAgent.error` with a typed code and locator fields whenever the failure is session-specific. Preserve `reviewThreadId` in the Codex extension or review metadata when the snapshot refresh observes review items; do not collapse detached and inline reviews into only the source thread id.
 
 Extend the fresh-agent adapter/runtime contract with implemented Codex methods that Task 4 classified as supported:
 
@@ -2666,7 +2752,17 @@ it('does not clobber newer pane fields when freshAgent.created arrives late', as
 })
 
 it('opens a forked freshcodex thread in a sibling pane', async () => {
-  emitWs({ type: 'freshAgent.forked', sourceSessionId: 'thread-1', sessionId: 'thread-fork-1', sessionType: 'freshcodex', runtimeProvider: 'codex', parentThreadId: 'thread-1' })
+  emitWs({
+    type: 'freshAgent.forked',
+    sourceSessionId: 'thread-1',
+    sourceSessionType: 'freshcodex',
+    sourceProvider: 'codex',
+    sessionId: 'thread-fork-1',
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    runtimeProvider: 'codex',
+    parentThreadId: 'thread-1',
+  })
   expect(selectLayoutLeaves(store.getState(), 'tab-1')).toContainEqual(expect.objectContaining({
     content: expect.objectContaining({ kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', sessionId: 'thread-fork-1' }),
   }))
@@ -3705,10 +3801,10 @@ Expected: FAIL for missing typed fresh-agent action errors and duplicate/reconne
 Use the fresh-agent specific error message added in Task 5 consistently in `shared/ws-protocol.ts` and handlers:
 
 ```ts
-| { type: 'freshAgent.error'; sessionId?: string; requestId?: string; code: string; message: string; retryable?: boolean }
+| { type: 'freshAgent.error'; sessionId?: string; sessionType?: string; provider?: string; requestId?: string; code: string; message: string; retryable?: boolean }
 ```
 
-Use this message for fresh-agent action errors instead of generic `sendError`.
+Use this message for fresh-agent action errors instead of generic `sendError`. Include `sessionType` and `provider` whenever `sessionId` is present so client-side reconnect/error handling never has to guess which runtime owns an opaque id.
 
 In the controller:
 
