@@ -48,7 +48,7 @@ The generated sources that matter most are:
 - `/tmp/freshell-codex-schema-0.128.0/ts/RequestId.ts`, `ClientRequest.ts`, `ClientNotification.ts`, `ServerRequest.ts`, `ServerNotification.ts`, `InitializeParams.ts`, `InitializeResponse.ts`, and `InitializeCapabilities.ts`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/v2/ThreadStartParams.ts`, `ThreadStartResponse.ts`, `ThreadResumeParams.ts`, `ThreadReadParams.ts`, `ThreadReadResponse.ts`, `ThreadTurnsListParams.ts`, `ThreadTurnsListResponse.ts`, `ThreadForkParams.ts`, `ThreadForkResponse.ts`, `TurnStartParams.ts`, `TurnStartResponse.ts`, `TurnInterruptParams.ts`, and `TurnInterruptResponse.ts`.
 - `/tmp/freshell-codex-schema-0.128.0/ts/v2/Thread.ts`, `Turn.ts`, `ThreadItem.ts`, `UserInput.ts`, `ThreadStatus.ts`, `TurnStatus.ts`, the approval/request param and response files, and `DynamicToolCallResponse.ts`.
-- Runtime-setting and identity leaf types are part of the contract, not incidental dependencies. The plan must also preserve and audit `ReasoningEffort.ts`, `v2/AskForApproval.ts`, `v2/SandboxMode.ts`, `v2/SandboxPolicy.ts`, `v2/UserInput.ts`, `v2/ThreadStatus.ts`, `v2/TurnStatus.ts`, `v2/ThreadActiveFlag.ts`, `v2/SessionSource.ts`, and `SubAgentSource.ts` because those files define the values Freshcodex sends to Codex and the source/subagent shapes Freshcodex projects into history and child-thread UI.
+- Runtime-setting and identity leaf types are part of the contract, not incidental dependencies. The plan must also preserve and audit `ReasoningEffort.ts`, `v2/AskForApproval.ts`, `v2/SandboxMode.ts`, `v2/SandboxPolicy.ts`, `v2/NetworkAccess.ts`, `v2/UserInput.ts`, `v2/ThreadStatus.ts`, `v2/TurnStatus.ts`, `v2/ThreadActiveFlag.ts`, `v2/SessionSource.ts`, and `SubAgentSource.ts` because those files define the values Freshcodex sends to Codex and the source/subagent shapes Freshcodex projects into history and child-thread UI.
 
 Schema-grounded protocol facts to preserve:
 
@@ -64,7 +64,7 @@ Schema-grounded protocol facts to preserve:
 - `turn/start` params are `{ threadId, input, cwd?, approvalPolicy?, approvalsReviewer?, sandboxPolicy?, model?, serviceTier?, effort?, summary?, personality?, outputSchema? }`. Input is an array of generated `UserInput`: text is `{ type: 'text', text, text_elements: [] }`, remote/data images are `{ type: 'image', url }`, local images are `{ type: 'localImage', path }`, skills are `{ type: 'skill', name, path }`, and mentions are `{ type: 'mention', name, path }`.
 - Codex reasoning effort values are generated as `"none" | "minimal" | "low" | "medium" | "high" | "xhigh"`. Freshcodex must not reuse Claude's legacy `"max"` effort value; if `"max"` is present in migrated settings, show a controlled unsupported Freshcodex settings error or map only through an explicit user-visible migration rule added in this plan.
 - Codex approval policy values are generated as `"untrusted" | "on-failure" | "on-request" | "never" | { granular: ... }`. Freshcodex must not send Claude permission modes such as `"bypassPermissions"` as Codex `approvalPolicy`.
-- Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. Do not send the thread-level `sandbox` string to `turn/start`.
+- Codex sandbox settings are split across APIs: `thread/start`, `thread/resume`, and `thread/fork` accept string `sandbox?: "read-only" | "workspace-write" | "danger-full-access"`, while `turn/start` accepts structured `sandboxPolicy`. `SandboxPolicy.externalSandbox.networkAccess` uses generated `NetworkAccess` values `"restricted" | "enabled"`, not a free-form payload. Do not send the thread-level `sandbox` string to `turn/start`.
 - `turn/start` returns `{ turn }`. `turn/interrupt` requires `{ threadId, turnId }` and returns `{}`.
 - `thread/fork` accepts `threadId`, runtime overrides, `ephemeral?`, and `excludeTurns?`; it returns `{ thread, model, modelProvider, serviceTier, cwd, instructionSources, approvalPolicy, approvalsReviewer, sandbox, reasoningEffort }`.
 - `review/start` accepts `{ threadId, target, delivery? }` where target is `uncommittedChanges`, `baseBranch`, `commit`, or `custom`, and delivery is `inline` or `detached`. It returns `{ turn, reviewThreadId }`; the review thread id must be preserved in fresh-agent action results and extensions so inline and future detached review flows can be tracked correctly.
@@ -116,6 +116,7 @@ Generated method inventory the executor must keep aligned with the local schema:
 - `sessionType` means user-facing identity: `freshclaude`, `freshcodex`, `kilroy`, or disabled `freshopencode`.
 - Every fresh-agent read-model contract and browser/server API that identifies a session must include `sessionType` as well as `provider` and `threadId`. Do not infer user-facing identity from `provider`; multiple session types can share one runtime provider. Use one canonical REST locator shape for fresh-agent thread resources: `/api/fresh-agent/threads/:sessionType/:provider/:threadId` and `/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns...`. Do not keep the old provider-only route as the primary API because it makes `freshclaude`/`kilroy` and future shared-provider clients ambiguous.
 - Fresh-agent live session tracking and action routing must key sessions by the full locator `{ sessionType, provider, threadId }`, not by `sessionId` alone. Claude, Codex, and later OpenCode can all expose opaque ids, and a durable foundation must not depend on cross-provider id uniqueness. WebSocket action messages may keep `sessionId` as the user-facing field name for compatibility, but they must also carry `sessionType` and `provider`, and the runtime manager must validate the full locator before dispatching an action.
+- Fresh-agent client state, thunk caches, pane activity projection, and subscription bookkeeping must use the same canonical full-locator key as the server runtime manager. Do not index `freshAgent.sessions` by bare `sessionId`; a server-side routing fix is incomplete if Redux or pane activity can still collapse two providers that reuse an opaque id.
 - `server/fresh-agent/provider-registry.ts` must model two separate concepts: a session-type descriptor registry and a runtime-provider adapter registry. Runtime adapter lookup by provider must not be overwritten by another session type using the same provider.
 - `src/store/freshAgentSlice.ts` must become an actual fresh-agent slice with fresh-agent action names and contract-shaped state. It must not re-export `agentChatSlice`; `src/store/freshAgentTypes.ts` must not alias `agentChatTypes`; and `src/store/freshAgentThunks.ts` must not alias `agentChatThunks`.
 - All fresh-agent server adapter outputs parse before leaving `server/fresh-agent/runtime-manager.ts`.
@@ -540,6 +541,9 @@ export const FreshAgentRuntimeProviderSchema = z.enum(['claude', 'codex', 'openc
 export const FreshAgentThreadStatusSchema = z.enum(['idle', 'running', 'compacting', 'exited', 'lost', 'error'])
 export const FreshAgentRoleSchema = z.enum(['user', 'assistant', 'system'])
 export const FreshAgentTurnSourceSchema = z.enum(['durable', 'live'])
+
+export type FreshAgentSessionType = z.infer<typeof FreshAgentSessionTypeSchema>
+export type FreshAgentRuntimeProvider = z.infer<typeof FreshAgentRuntimeProviderSchema>
 
 const NonEmptyString = z.string().min(1)
 const JsonValue: z.ZodType<unknown> = z.lazy(() => z.union([
@@ -1009,10 +1013,26 @@ it('keeps session-type identity separate from runtime adapter lookup', () => {
 it('freshAgentSlice is independent from legacy agentChatSlice', () => {
   expect(freshAgentReducer).not.toBe(agentChatReducer)
   const state = freshAgentReducer(undefined, freshAgentSnapshotReceived(validCodexSnapshot))
-  expect(state.sessions['thread-codex-1']).toMatchObject({
+  const key = makeFreshAgentSessionKey({
+    sessionType: 'freshcodex',
+    provider: 'codex',
+    sessionId: 'thread-codex-1',
+  })
+  expect(state.sessions[key]).toMatchObject({
     sessionType: 'freshcodex',
     provider: 'codex',
   })
+})
+
+it('freshAgentSlice keeps colliding opaque ids separate by full locator', () => {
+  const codexSnapshot = { ...validCodexSnapshot, sessionType: 'freshcodex', provider: 'codex', threadId: 'shared-thread-id' }
+  const claudeSnapshot = { ...validClaudeSnapshot, sessionType: 'freshclaude', provider: 'claude', threadId: 'shared-thread-id' }
+  let state = freshAgentReducer(undefined, freshAgentSnapshotReceived(codexSnapshot))
+  state = freshAgentReducer(state, freshAgentSnapshotReceived(claudeSnapshot))
+  expect(Object.keys(state.sessions)).toEqual(expect.arrayContaining([
+    'freshcodex:codex:shared-thread-id',
+    'freshclaude:claude:shared-thread-id',
+  ]))
 })
 
 it('freshAgentThunks and activity projection do not read fresh-agent state through agent-chat bridges', () => {
@@ -1026,7 +1046,11 @@ it('freshAgentThunks and activity projection do not read fresh-agent state throu
     paneRuntimeActivityByPaneId: {},
     agentChatSessions: {},
     freshAgentSessions: {
-      'thread-1': { sessionType: 'freshcodex', provider: 'codex', status: 'running' },
+      [makeFreshAgentSessionKey({ sessionType: 'freshcodex', provider: 'codex', sessionId: 'thread-1' })]: {
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        status: 'running',
+      },
     },
   })
   expect(activity).toEqual({ isBusy: true, source: 'fresh-agent' })
@@ -1132,18 +1156,25 @@ const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
 
 Update existing runtime-manager tests that construct the registry so Task 3 remains typecheckable on its own. Do not add a legacy overload that accepts the old combined array; that would keep the ambiguous many-session-to-one-provider model alive.
 
-In `runtime-manager.ts`, add:
+In a shared fresh-agent locator module or in `shared/fresh-agent-contract.ts`, export the canonical locator key helper so server runtime state, Redux state, pane activity, and tests cannot drift:
 
 ```ts
-type FreshAgentSessionLocator = {
+export type FreshAgentSessionLocator = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   sessionId: string
 }
 
-function makeFreshAgentSessionKey(locator: FreshAgentSessionLocator): string {
+export type FreshAgentSessionKey = `${FreshAgentSessionType}:${FreshAgentRuntimeProvider}:${string}`
+
+export function makeFreshAgentSessionKey(locator: FreshAgentSessionLocator): FreshAgentSessionKey {
   return `${locator.sessionType}:${locator.provider}:${locator.sessionId}`
 }
+```
+
+In `runtime-manager.ts`, import that helper and add:
+
+```ts
 
 export class FreshAgentSessionLocatorMismatchError extends Error {
   readonly code = 'FRESH_AGENT_SESSION_LOCATOR_MISMATCH' as const
@@ -1186,9 +1217,9 @@ getFreshAgentTurnBody(sessionType, provider, threadId, turnId, revision): Promis
 The router must accept `sessionType` in the request path, validate it with `FreshAgentSessionTypeSchema`, and pass it to the runtime manager. Do not reconstruct `sessionType` from `provider`, and do not leave a provider-only fresh-agent thread route active except as an explicit temporary backwards-compatibility redirect that rejects ambiguous shared-provider cases and is removed before final verification.
 The fresh-agent turn-page REST query should use `FreshAgentTurnPageQuerySchema` from `shared/fresh-agent-contract.ts`, not the legacy `AgentTimelinePageQuerySchema`, because Freshcodex needs `sortDirection` for newest-first pages and must not expose `includeBodies` as a Codex app-server parameter. The router may keep an `includeBodies` compatibility branch only for non-Codex providers that still need it, but Freshcodex requests should use `sortDirection` plus bounded `limit`, and the Codex adapter must not forward Freshell-only `revision`, `priority`, or `includeBodies` fields to `thread/turns/list`.
 
-Replace `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` with independent fresh-agent reducer, contract-shaped types, and thunk type prefixes. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
+Replace `src/store/freshAgentSlice.ts`, `src/store/freshAgentTypes.ts`, and `src/store/freshAgentThunks.ts` with independent fresh-agent reducer, contract-shaped types, and thunk type prefixes. Store sessions by `FreshAgentSessionKey`, not by bare `sessionId`; each session value should still retain `sessionId`, `sessionType`, and `provider` for rendering and debugging. Keep action names fresh-agent-specific, for example `freshAgentCreateRegistered`, `freshAgentCreateFailed`, `freshAgentSnapshotReceived`, `freshAgentEventReceived`, and `freshAgentSessionLost`. `src/lib/fresh-agent-ws.ts` should dispatch these actions directly and should not import `agentChatSlice` actions.
 
-Update `src/lib/pane-activity.ts` so `agent-chat` panes continue to use `agentChatSessions`, while `fresh-agent` panes use the new fresh-agent session state. `resolvePaneActivity`, `getBusyPaneIdsForTab`, and `collectBusySessionKeys` should accept `freshAgentSessions` separately from `agentChatSessions`; do not keep the current behavior where a Freshcodex pane has to appear in `agentChat.sessions` before activity, busy badges, or session keys work.
+Update `src/lib/pane-activity.ts` so `agent-chat` panes continue to use `agentChatSessions`, while `fresh-agent` panes use the new fresh-agent session state by computing `makeFreshAgentSessionKey({ sessionType, provider, sessionId })` from pane content. `resolvePaneActivity`, `getBusyPaneIdsForTab`, and `collectBusySessionKeys` should accept `freshAgentSessions` separately from `agentChatSessions`; do not keep the current behavior where a Freshcodex pane has to appear in `agentChat.sessions` before activity, busy badges, or session keys work, and do not look up Freshcodex activity by bare `sessionId`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1294,6 +1325,7 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxMode.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxPolicy.ts`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/NetworkAccess.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts`
@@ -1425,6 +1457,7 @@ expect(sandboxPolicyVariantsFromGeneratedSchema()).toEqual(expect.arrayContainin
   'externalSandbox',
   'workspaceWrite',
 ]))
+expect(networkAccessValuesFromGeneratedSchema()).toEqual(['restricted', 'enabled'])
 expect(userInputVariantsFromGeneratedSchema()).toEqual(['text', 'image', 'localImage', 'skill', 'mention'])
 expect(threadStatusVariantsFromGeneratedSchema()).toEqual(['notLoaded', 'idle', 'systemError', 'active'])
 expect(turnStatusValuesFromGeneratedSchema()).toEqual(['completed', 'interrupted', 'failed', 'inProgress'])
@@ -1762,7 +1795,7 @@ export const CodexApprovalPolicySchema = z.union([
 export const CodexSandboxPolicySchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('dangerFullAccess') }),
   z.object({ type: z.literal('readOnly'), networkAccess: z.boolean() }),
-  z.object({ type: z.literal('externalSandbox'), networkAccess: z.unknown() }),
+  z.object({ type: z.literal('externalSandbox'), networkAccess: z.enum(['restricted', 'enabled']) }),
   z.object({
     type: z.literal('workspaceWrite'),
     writableRoots: z.array(z.string()),
@@ -2039,6 +2072,7 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/AskForApproval.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxMode.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/SandboxPolicy.ts \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/NetworkAccess.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Thread.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/Turn.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/v2/ThreadItem.ts \
@@ -4070,7 +4104,7 @@ If `docs/plans/2026-05-03-freshcodex-contract-foundation-test-plan.md` was not m
 - Client API parses fresh-agent payloads and surfaces controlled errors.
 - Session-type registry and runtime-provider adapter registry are separate; `freshclaude` and `kilroy` can share the Claude adapter without overwriting provider lookup.
 - `src/store/freshAgentSlice.ts` and `src/store/freshAgentTypes.ts` are real fresh-agent state modules, not aliases/re-exports of agent-chat modules.
-- `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware and do not require Freshcodex sessions to exist in legacy agent-chat state.
+- `src/store/freshAgentThunks.ts` and `src/lib/pane-activity.ts` are fresh-agent-aware, key Freshcodex state by full `{ sessionType, provider, sessionId }` locators, and do not require Freshcodex sessions to exist in legacy agent-chat state.
 - Codex app-server client supports thread fork, turn start, turn interrupt, notifications, and server-request responses according to generated local app-server schemas.
 - Codex protocol schemas and fixtures reject impossible partial app-server entities; generated-required fields such as `Thread.turns`, `Thread.cwd`, and `Thread.updatedAt` are required in tests and runtime parsing.
 - Codex generated leaf types for runtime settings, user input, statuses, and session/subagent source metadata are checked into the reduced schema fixture snapshot and covered by inventory tests; `Thread.source` preserves generated nested `SessionSource` / `SubAgentSource` metadata while `thread/list` filters use generated `ThreadSourceKind` values.
