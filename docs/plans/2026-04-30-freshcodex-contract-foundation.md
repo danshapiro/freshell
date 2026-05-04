@@ -81,6 +81,7 @@ Schema-grounded protocol facts to preserve:
 - Generated `ThreadItem` variants are exactly `userMessage`, `hookPrompt`, `agentMessage`, `plan`, `reasoning`, `commandExecution`, `fileChange`, `mcpToolCall`, `dynamicToolCall`, `collabAgentToolCall`, `webSearch`, `imageView`, `imageGeneration`, `enteredReviewMode`, `exitedReviewMode`, and `contextCompaction`.
 - Generated `ServerRequest` variants are exactly `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/tool/requestUserInput`, `mcpServer/elicitation/request`, `item/permissions/requestApproval`, `item/tool/call`, `account/chatgptAuthTokens/refresh`, `applyPatchApproval`, and `execCommandApproval`. The v2 request variants use `params.threadId` for routing, while the legacy root `applyPatchApproval` and `execCommandApproval` variants use `params.conversationId`; both fields identify the Codex thread and must route to the matching Freshcodex locator.
 - Command approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" | amendment-object }`; file-change approval responses use `{ decision: "accept" | "acceptForSession" | "decline" | "cancel" }`; permission responses use `{ permissions, scope, strictAutoReview? }`; user-input responses use `{ answers }`; MCP elicitation responses use `{ action, content, _meta }`; dynamic-tool responses use `{ contentItems, success }`. Legacy `applyPatchApproval` and `execCommandApproval` responses use root `ReviewDecision` values through `{ decision }`, including `"approved"`, `"approved_for_session"`, `"denied"`, `"timed_out"`, `"abort"`, and the generated amendment-object variants; do not answer those legacy requests with v2 `"accept"` / `"decline"` decisions.
+- Generated JSON Schema, not generated TypeScript formatting, is the wire-requiredness source for those legacy root requests. `ApplyPatchApprovalParams` requires `conversationId`, `callId`, and `fileChanges`; optional `reason` and `grantRoot` must normalize to `null` when omitted. `ExecCommandApprovalParams` requires `conversationId`, `callId`, `command`, `cwd`, and `parsedCmd`; optional `approvalId` and `reason` must normalize to `null` when omitted.
 - `account/chatgptAuthTokens/refresh` expects real token fields in a successful result and its generated params do not include a thread locator (`threadId` or `conversationId`). Freshcodex must not fabricate an unsupported success payload for it. If Freshell cannot satisfy this request, respond with a JSON-RPC error envelope on the original server request id and surface a clear unsupported-auth-refresh runtime error to every subscribed Freshcodex pane for that rich runtime instance, since the request is not thread-addressable.
 - Generated `ServerNotification` method names are slash-delimited and must be copied exactly from `ServerNotification.ts`; examples include `thread/status/changed`, `thread/tokenUsage/updated`, `turn/diff/updated`, `turn/plan/updated`, `thread/compacted`, `item/agentMessage/delta`, `item/fileChange/patchUpdated`, `serverRequest/resolved`, `thread/realtime/error`, and `thread/realtime/closed`.
 - Any per-turn body API in Freshell must be an internal facade over `thread/turns/list` results or a server-side page/body cache until Codex exposes a direct turn-read request. Do not implement normal Freshcodex body hydration by repeatedly calling `thread/read { includeTurns: true }` over the full thread.
@@ -1393,6 +1394,10 @@ git commit -m "Validate fresh-agent payloads at runtime boundaries"
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCError.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCNotification.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCMessage.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalParams.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalResponse.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalParams.json`
+- Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalResponse.json`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InputModality.ts`
 - Create: `test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts`
@@ -1594,22 +1599,44 @@ expect(CodexModelProviderCapabilitiesReadResultSchema.parse({
   imageGeneration: false,
   webSearch: true,
 })).toEqual({ namespaceTools: true, imageGeneration: false, webSearch: true })
-expect(requiredFieldsForGeneratedType('ApplyPatchApprovalParams.ts', 'ApplyPatchApprovalParams')).toEqual(expect.arrayContaining([
+expect(requiredFieldsForGeneratedJsonSchema('ApplyPatchApprovalParams.json', 'ApplyPatchApprovalParams')).toEqual(expect.arrayContaining([
   'conversationId',
   'callId',
   'fileChanges',
+]))
+expect(requiredFieldsForGeneratedJsonSchema('ApplyPatchApprovalParams.json', 'ApplyPatchApprovalParams')).not.toEqual(expect.arrayContaining([
   'reason',
   'grantRoot',
 ]))
-expect(requiredFieldsForGeneratedType('ExecCommandApprovalParams.ts', 'ExecCommandApprovalParams')).toEqual(expect.arrayContaining([
+expect(CodexLegacyApplyPatchApprovalParamsSchema.parse({
+  conversationId: 'thread-1',
+  callId: 'patch-1',
+  fileChanges: {},
+})).toMatchObject({
+  reason: null,
+  grantRoot: null,
+})
+expect(requiredFieldsForGeneratedJsonSchema('ExecCommandApprovalParams.json', 'ExecCommandApprovalParams')).toEqual(expect.arrayContaining([
   'conversationId',
   'callId',
-  'approvalId',
   'command',
   'cwd',
-  'reason',
   'parsedCmd',
 ]))
+expect(requiredFieldsForGeneratedJsonSchema('ExecCommandApprovalParams.json', 'ExecCommandApprovalParams')).not.toEqual(expect.arrayContaining([
+  'approvalId',
+  'reason',
+]))
+expect(CodexLegacyExecCommandApprovalParamsSchema.parse({
+  conversationId: 'thread-1',
+  callId: 'exec-1',
+  command: ['npm', 'test'],
+  cwd: '/repo',
+  parsedCmd: [],
+})).toMatchObject({
+  approvalId: null,
+  reason: null,
+})
 expect(reviewDecisionValuesFromGeneratedSchema()).toEqual(expect.arrayContaining([
   'approved',
   'approved_for_session',
@@ -2163,17 +2190,17 @@ export const CodexLegacyApplyPatchApprovalParamsSchema = z.object({
   conversationId: z.string().min(1),
   callId: z.string().min(1),
   fileChanges: z.record(z.string(), JsonValue),
-  reason: z.string().nullable(),
-  grantRoot: z.string().nullable(),
+  reason: z.string().nullable().optional().default(null),
+  grantRoot: z.string().nullable().optional().default(null),
 })
 export const CodexLegacyExecCommandApprovalParamsSchema = z.object({
   conversationId: z.string().min(1),
   callId: z.string().min(1),
-  approvalId: z.string().nullable(),
   command: z.array(z.string()),
   cwd: z.string(),
-  reason: z.string().nullable(),
   parsedCmd: z.array(JsonValue),
+  approvalId: z.string().nullable().optional().default(null),
+  reason: z.string().nullable().optional().default(null),
 })
 export const CodexLegacyApplyPatchApprovalResponseSchema = z.object({
   decision: CodexLegacyReviewDecisionSchema,
@@ -2349,6 +2376,10 @@ git add \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCError.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCNotification.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/JSONRPCMessage.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalParams.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ApplyPatchApprovalResponse.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalParams.json \
+  test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/json/ExecCommandApprovalResponse.json \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/ReasoningEffort.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/InputModality.ts \
   test/fixtures/coding-cli/codex-app-server/generated-schema-0.128.0/SubAgentSource.ts \
@@ -2750,8 +2781,6 @@ emitSchemaValidServerRequest({
     conversationId: 'thread-1',
     callId: 'patch-1',
     fileChanges: {},
-    reason: null,
-    grantRoot: null,
   },
 })
 expect(await adapter.getSnapshot?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-1' }))
@@ -2775,7 +2804,6 @@ emitSchemaValidServerRequest({
     approvalId: null,
     command: ['npm', 'test'],
     cwd: '/repo',
-    reason: null,
     parsedCmd: [],
   },
 })
