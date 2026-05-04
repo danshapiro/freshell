@@ -660,7 +660,7 @@ export const FreshAgentTurnPageSchema = z.object({
   revision: z.number().int().nonnegative(),
   turns: z.array(FreshAgentTurnSummarySchema),
   nextCursor: z.string().nullable(),
-  backwardsCursor: z.string().nullable().optional(),
+  backwardsCursor: z.string().nullable(),
 })
 
 export const FreshAgentSessionSummarySchema = z.object({
@@ -2285,7 +2285,7 @@ In `normalize.ts`, expose focused pure helpers:
 ```ts
 export function normalizeCodexThreadStatus(raw: unknown): FreshAgentThreadStatus
 export function normalizeCodexItem(raw: unknown): FreshAgentTranscriptItem[]
-export function normalizeCodexTurnBody(input: { sessionType: 'freshcodex'; provider: 'codex'; threadId: string; revision: number; rawTurn: CodexThreadTurn }): FreshAgentTurnBody
+export function normalizeCodexTurnBody(input: { sessionType: 'freshcodex'; provider: 'codex'; threadId: string; revision: number; rawTurn: CodexTurn }): FreshAgentTurnBody
 export function normalizeCodexTurnPage(input: { threadId: string; revision: number; page: CodexThreadTurnsListResult }): FreshAgentTurnPage
 export function normalizeCodexThreadSnapshot(input: ...): FreshAgentThreadSnapshot
 ```
@@ -2315,6 +2315,7 @@ export function normalizeCodexThreadSnapshot(input: {
   normalizedRevision: number
   pendingApprovals: PendingCodexApproval[]
   pendingQuestions: PendingCodexQuestion[]
+  tokenUsage?: FreshAgentThreadSnapshot['tokenUsage']
 }): FreshAgentThreadSnapshot
 
 export function normalizeCodexTurnPage(input: {
@@ -2357,6 +2358,7 @@ type CodexLiveThreadState = {
   pendingQuestions: Map<string, PendingCodexQuestion>
   activeTurnId?: string
   latestRevision?: number
+  tokenUsage?: FreshAgentThreadSnapshot['tokenUsage']
 }
 ```
 
@@ -2381,7 +2383,7 @@ return await runtime.subscribe(sessionId, (event) => {
 })
 ```
 
-`turn/started` and `turn/completed` must update `activeTurnId`; status, token, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
+`turn/started` and `turn/completed` must update `activeTurnId`; `thread/tokenUsage/updated` must update `tokenUsage` in live state so the next snapshot rebuild includes current token counts; status, diff, review, compaction, item, metadata/name, close/archive, realtime error/close, and child-agent/collaboration notifications must invalidate the snapshot so every subscribed browser refreshes from the normalized app-server source. Non-visible notifications may be ignored only through an explicit allowlist with a comment naming why they do not affect the Freshcodex UI.
 `getSnapshot` and `resume` must also recover `activeTurnId` without loading the full transcript. First read metadata with `thread/read { includeTurns: false }`, then fetch a bounded newest-first page with `thread/turns/list { limit: 10, sortDirection: 'desc' }` and select the newest `status: 'inProgress'` turn if present. This is required for interrupt to work after a browser reconnect, server restart, or adapter resubscription that missed the original `turn/started` notification while preserving long-transcript scalability.
 
 Implement `send`, `interrupt`, `fork`, and `respondToServerRequest` using the Freshcodex stdio rich runtime from Task 4, not the websocket launch planner runtime. `send` must store the active turn id from `turn/start -> { turn }`; `turn/started`, `turn/completed`, and runtime close/error notifications must keep `activeTurnId` current. `interrupt(locator)` remains the Fresh-agent API because the UI interrupts the active turn, but the Codex adapter must translate that to `turn/interrupt { threadId, turnId: activeTurnId }` and return a clear `FRESH_AGENT_NO_ACTIVE_TURN` action error if there is no active turn. `respondToServerRequest` must look up the pending request by generated request id, validate that the response `kind` matches the original generated server request method, serialize the generated response shape, and respond on the original JSON-RPC server request id. Do not keep separate `resolveApproval` / `answerQuestion` action paths for Codex; those names encourage collapsing permissions approvals, request-user-input prompts, and MCP elicitations into the wrong Claude-shaped payload.
