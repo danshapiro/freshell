@@ -34,7 +34,7 @@ vi.mock('../../../server/logger', () => {
     error: vi.fn(),
     child: vi.fn(() => logger),
   }
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 vi.mock('../../../server/perf-logger', () => ({

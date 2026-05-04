@@ -18,7 +18,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'

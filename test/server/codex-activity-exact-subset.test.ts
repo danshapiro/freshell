@@ -25,7 +25,7 @@ vi.mock('../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 function createSession(overrides: Partial<CodingCliSession> = {}): CodingCliSession {
