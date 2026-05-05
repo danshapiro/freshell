@@ -10,13 +10,6 @@ test.describe('Settings', () => {
     await expect(page.getByRole('tab', { name: /^Appearance$/i })).toBeVisible({ timeout: 5_000 })
   }
 
-  async function openSettingsSection(page: any, name: string) {
-    await page.getByRole('tab', { name: new RegExp(`^${name}$`, 'i') }).click()
-    await expect(page.getByRole('tabpanel', { name: new RegExp(`${name} settings`, 'i') })).toBeVisible({
-      timeout: 5_000,
-    })
-  }
-
   async function enableFreshclaude(page: any) {
     await page.evaluate(() => {
       const harness = window.__FRESHELL_TEST_HARNESS__
@@ -116,6 +109,14 @@ test.describe('Settings', () => {
     })
 
     expect(response.ok).toBe(true)
+  }
+
+  async function openSettingsSection(page: any, section: string) {
+    await openSettings(page)
+    await page.getByRole('tab', { name: new RegExp(`^${section}$`, 'i') }).click()
+    await expect(page.getByRole('tabpanel', { name: new RegExp(`${section} settings`, 'i') })).toBeVisible({
+      timeout: 5_000,
+    })
   }
 
   test('settings view is accessible from sidebar', async ({ freshellPage, page }) => {
@@ -227,7 +228,6 @@ test.describe('Settings', () => {
   })
 
   test('scrollback lines slider changes setting', async ({ freshellPage, page, harness }) => {
-    await openSettings(page)
     await openSettingsSection(page, 'Advanced')
 
     // "Scrollback lines" row with RangeSlider
@@ -246,10 +246,9 @@ test.describe('Settings', () => {
   })
 
   test('debug logging toggle', async ({ freshellPage, page, harness }) => {
-    await openSettings(page)
     await openSettingsSection(page, 'Advanced')
 
-    // Scroll down to "Debugging" section, find "Debug logging" row
+    // Advanced section contains the debug logging row.
     const debugLoggingRow = page.getByText('Debug logging')
     await expect(debugLoggingRow).toBeVisible()
 

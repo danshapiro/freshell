@@ -571,7 +571,7 @@ test.describe('Settings Persistence Split', () => {
     await context.close()
   })
 
-  test('freshclaude legacy exact provider-default selections recover on create after reload', async ({ browser, serverInfo }) => {
+  test('freshclaude legacy exact selections stay visible after reload instead of silently migrating', async ({ browser, serverInfo }) => {
     const context = await browser.newContext()
     const page = await context.newPage()
 
@@ -621,39 +621,18 @@ test.describe('Settings Persistence Split', () => {
     await clearSentWsMessages(page)
     await createFreshclaudePane(page, serverInfo.homeDir)
 
+    await expect(page.getByText('Session start failed')).toBeVisible()
+    await expect(page.getByText('Selected model claude-opus-4-6 is no longer available.')).toBeVisible()
     await expect.poll(async () => {
       const sent = await getSentWsMessages(page)
-      const create = sent.find((message) => message?.type === 'sdk.create')
-      return create
-        ? {
-            model: create.model ?? null,
-            effort: Object.prototype.hasOwnProperty.call(create, 'effort') ? create.effort : null,
-          }
-        : null
-    }).toEqual({
-      model: 'opus',
-      effort: null,
-    })
-
-    await expect(page.getByText('Session start failed')).toBeHidden()
-    await expect(page.getByText('Selected model claude-opus-4-6 is no longer available.')).toBeHidden()
-
-    await expect.poll(async () => {
-      const settings = await getResolvedSettings(page)
-      return settings?.agentChat?.providers?.freshclaude?.modelSelection
-    }).toBeUndefined()
-
-    const configPath = path.join(serverInfo.homeDir, '.freshell', 'config.json')
-    await expect.poll(async () => {
-      const config = JSON.parse(await fs.readFile(configPath, 'utf8'))
-      return config.settings.agentChat?.providers?.freshclaude?.modelSelection
-    }).toBeUndefined()
+      return sent.filter((message) => message?.type === 'sdk.create').length
+    }).toBe(0)
 
     const dialog = await openFreshclaudeSettings(page)
     await expect(
       dialog.getByRole('combobox', { name: /^Model$/i }).locator('option:checked'),
-    ).toHaveText('Provider default (track latest Opus)')
-    await expect(dialog.getByText('Saved legacy model is no longer available.')).toBeHidden()
+    ).toHaveText('claude-opus-4-6 (Unavailable)')
+    await expect(dialog.getByText('Saved legacy model is no longer available.')).toBeVisible()
 
     await context.close()
   })

@@ -19,3 +19,32 @@ export async function waitForAllSettledOrThrow(
 ): Promise<void> {
   throwShutdownFailures(await collectShutdownFailures(tasks), message)
 }
+
+function invokeShutdownTask(task: () => PromiseLike<unknown>): Promise<unknown> {
+  try {
+    return Promise.resolve(task())
+  } catch (error) {
+    return Promise.reject(error)
+  }
+}
+
+type CodexShutdownOwners = {
+  registry: {
+    shutdownGracefully(timeoutMs?: number): Promise<void>
+  }
+  codexLaunchPlanner: {
+    shutdown(): Promise<void>
+  }
+  terminalShutdownTimeoutMs: number
+}
+
+export async function joinCodexShutdownOwners({
+  registry,
+  codexLaunchPlanner,
+  terminalShutdownTimeoutMs,
+}: CodexShutdownOwners): Promise<void> {
+  await waitForAllSettledOrThrow([
+    invokeShutdownTask(() => registry.shutdownGracefully(terminalShutdownTimeoutMs)),
+    invokeShutdownTask(() => codexLaunchPlanner.shutdown()),
+  ], 'Codex shutdown owners failed.')
+}

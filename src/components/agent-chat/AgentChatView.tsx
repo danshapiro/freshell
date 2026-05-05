@@ -11,7 +11,6 @@ import {
   registerPendingCreate,
   removePermission,
   removeQuestion,
-  sessionError,
 } from '@/store/agentChatSlice'
 import {
   fetchAgentChatCapabilities,
@@ -53,10 +52,10 @@ import {
   buildAgentChatPersistedIdentityUpdate,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
+  getPreferredResumeSessionId,
 } from '@/store/persistControl'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
-import { buildRestoreError, type RestoreError } from '@shared/session-contract'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -68,23 +67,6 @@ const EARLY_STATES = new Set(['creating', 'starting'])
  */
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
-}
-
-function getRestoreFailureMessage(restoreError: RestoreError): string {
-  switch (restoreError.reason) {
-    case 'dead_live_handle':
-      return 'The live session is gone and no canonical Claude restore identity was saved.'
-    case 'invalid_legacy_restore_target':
-      return 'This saved session used a legacy restore token that cannot be replayed safely.'
-    case 'missing_canonical_identity':
-      return 'No canonical Claude restore identity is available for this session.'
-    case 'provider_runtime_failed':
-      return 'The provider runtime failed before restore could complete.'
-    case 'durable_artifact_missing':
-      return 'The provider did not produce a durable restore artifact for this session.'
-    default:
-      return 'This session can no longer be restored.'
-  }
 }
 
 function modelSelectionsMatch(
@@ -102,13 +84,6 @@ function paneMatchesCurrentProviderDefaults(
 ): boolean {
   return modelSelectionsMatch(pane.modelSelection, providerDefaults?.modelSelection)
     && pane.effort === providerDefaults?.effort
-}
-
-function paneModelSelectionMatchesCurrentProviderDefault(
-  pane: Pick<AgentChatPaneContent, 'modelSelection'>,
-  providerDefaults?: Pick<AgentChatPaneContent, 'modelSelection'>,
-): boolean {
-  return modelSelectionsMatch(pane.modelSelection, providerDefaults?.modelSelection)
 }
 
 interface AgentChatViewProps {
@@ -161,7 +136,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const currentTab = useAppSelector((s) => (
     (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
   ))
-  const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
   const providerCapabilitiesState = useAppSelector(
     (s) => s.agentChat.capabilitiesByProvider?.[paneContent.provider],
@@ -203,15 +177,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = (
-    paneContent.sessionRef?.provider === 'claude'
-    && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
-  )
-    ? paneContent.sessionRef.sessionId
-    : (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
+  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
+    ? paneContent.resumeSessionId
+    : undefined
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
-  const restoreHistoryQueryId = canonicalDurableSessionId ?? paneContent.sessionId
-  const attachResumeSessionId = canonicalDurableSessionId
+  const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
+  const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = getPreferredResumeSessionId(session)
+    ?? (
+      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
+        ? paneContent.resumeSessionId
+        : undefined
+    )
   const attachPayload = useMemo(() => {
     if (!paneContent.sessionId) return null
     return {
@@ -248,24 +225,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }))
   }, [dispatch, paneContent.provider, providerSettings])
 
-  const clearPersistedProviderModelSelectionIfPaneMatchesDefault = useCallback((
-    pane: Pick<AgentChatPaneContent, 'modelSelection'>,
-  ) => {
-    if (!paneModelSelectionMatchesCurrentProviderDefault(pane, providerSettings)) {
-      return
-    }
-
-    void dispatch(saveServerSettingsPatch({
-      agentChat: {
-        providers: {
-          [paneContent.provider]: {
-            modelSelection: undefined,
-          },
-        },
-      },
-    }))
-  }, [dispatch, paneContent.provider, providerSettings])
-
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
   // HTTP timeline window (even if it is empty).
@@ -280,53 +239,18 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
   // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
   const triggerRecovery = useCallback(() => {
-    const deadSessionId = paneContentRef.current.sessionId
-    const durableResumeSessionId = getCanonicalDurableSessionId(sessionRef.current)
-      ?? (
-        paneContentRef.current.sessionRef?.provider === 'claude'
-        && isValidClaudeSessionId(paneContentRef.current.sessionRef.sessionId)
-          ? paneContentRef.current.sessionRef.sessionId
-          : (isValidClaudeSessionId(paneContentRef.current.resumeSessionId) ? paneContentRef.current.resumeSessionId : undefined)
-      )
-    if (!durableResumeSessionId) {
-      const restoreError = buildRestoreError('dead_live_handle')
-      if (deadSessionId) {
-        dispatch(sessionError({
-          sessionId: deadSessionId,
-          code: 'RESTORE_UNAVAILABLE',
-          message: getRestoreFailureMessage(restoreError),
-        }))
-      }
-      dispatch(updatePaneContent({
-        tabId,
-        paneId,
-        content: {
-          ...paneContentRef.current,
-          sessionId: undefined,
-          status: 'idle' as const,
-          restoreError,
-        },
-      }))
-      createSentRef.current = false
-      attachSentRef.current = false
-      return
-    }
-
     const newRequestId = nanoid()
+    const resumeSessionId = getPreferredResumeSessionId(sessionRef.current)
+      ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        sessionRef: {
-          provider: 'claude',
-          sessionId: durableResumeSessionId,
-        },
-        resumeSessionId: undefined,
+        resumeSessionId,
         createRequestId: newRequestId,
         status: 'creating' as const,
-        restoreError: undefined,
       },
     }))
     createSentRef.current = false
@@ -432,7 +356,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     dispatch(updatePaneContent({
       tabId,
       paneId,
-      content: { ...paneContentRef.current, sessionId: pendingSessionId, status: 'starting', restoreError: undefined },
+      content: { ...paneContentRef.current, sessionId: pendingSessionId, status: 'starting' },
     }))
     dispatch(clearPendingCreate({ requestId: paneContent.createRequestId }))
   }, [pendingSessionId, paneContent.sessionId, paneContent.createRequestId, tabId, paneId, dispatch])
@@ -486,7 +410,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     const identityUpdate = buildAgentChatPersistedIdentityUpdate({
       session,
       paneContent: paneContentRef.current,
-      currentTab: tabHasSinglePane ? currentTab : undefined,
+      currentTab,
       metadataProvider,
     })
     if (!identityUpdate) return
@@ -509,7 +433,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (identityUpdate.shouldFlush) {
       dispatch(flushPersistedLayoutNow())
     }
-  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabHasSinglePane, tabId])
+  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabId])
 
   // Tag this Claude Code session as belonging to this agent-chat provider.
   // Fires once when cliSessionId first becomes available (including resumes).
@@ -517,20 +441,21 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    if (!canonicalDurableSessionId) return
-    if (taggedSessionRef.current === canonicalDurableSessionId) return
-    taggedSessionRef.current = canonicalDurableSessionId
+    const preferredResumeSessionId = getPreferredResumeSessionId(session)
+    if (!preferredResumeSessionId) return
+    if (taggedSessionRef.current === preferredResumeSessionId) return
+    taggedSessionRef.current = preferredResumeSessionId
 
     if (providerConfig?.codingCliProvider) {
       setSessionMetadata(
         providerConfig.codingCliProvider,
-        canonicalDurableSessionId,
+        preferredResumeSessionId,
         paneContent.provider,
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [canonicalDurableSessionId, paneContent.provider, providerConfig?.codingCliProvider, suppressNetworkEffects])
+  }, [paneContent.provider, providerConfig?.codingCliProvider, session?.cliSessionId, session?.timelineSessionId, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -544,7 +469,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (suppressNetworkEffects) return
     if (paneContent.sessionId || createSentRef.current) return
     if (paneContent.status !== 'creating') return
-    if (paneContent.restoreError) return
 
     const requestId = paneContent.createRequestId
     createSentRef.current = true
@@ -604,27 +528,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         : (typeof currentPane.resumeSessionId === 'string' && currentPane.resumeSessionId.trim().length > 0
           ? currentPane.resumeSessionId
           : undefined)
-
-      let resolvedSelection = resolveAgentChatModelSelection({
+      const resolvedSelection = resolveAgentChatModelSelection({
         providerDefaultModelId,
         capabilities,
         modelSelection: currentPane.modelSelection,
       })
-      let shouldClearPaneModelSelection = false
-      let shouldClearPersistedProviderModelSelection = false
-
-      if (!resolvedSelection.resolvedModelId && resolvedSelection.unavailableExactSelection) {
-        shouldClearPaneModelSelection = true
-        shouldClearPersistedProviderModelSelection = paneModelSelectionMatchesCurrentProviderDefault(
-          currentPane,
-          providerSettings,
-        )
-        resolvedSelection = resolveAgentChatModelSelection({
-          providerDefaultModelId,
-          capabilities,
-          modelSelection: undefined,
-        })
-      }
 
       if (!resolvedSelection.resolvedModelId) {
         const unavailableModelId =
@@ -681,7 +589,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         content: {
           ...currentPane,
           status: 'starting',
-          ...(shouldClearPaneModelSelection ? { modelSelection: undefined } : {}),
           ...(resolvedEffort ? {} : { effort: undefined }),
           createError: undefined,
         },
@@ -689,9 +596,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       if (shouldClearPersistedProviderEffort) {
         clearPersistedProviderEffortIfPaneMatchesDefaults(currentPane)
-      }
-      if (shouldClearPersistedProviderModelSelection) {
-        clearPersistedProviderModelSelectionIfPaneMatchesDefault(currentPane)
       }
 
     })()
@@ -701,14 +605,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }
   }, [
     defaultPermissionMode,
-    clearPersistedProviderEffortIfPaneMatchesDefaults,
-    clearPersistedProviderModelSelectionIfPaneMatchesDefault,
     dispatch,
     paneContent.createRequestId,
     paneContent.effort,
     paneContent.modelSelection,
     paneContent.provider,
-    paneContent.restoreError,
     paneContent.sessionId,
     paneContent.status,
     paneId,
@@ -1207,13 +1108,6 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         {isRestoring && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p>Restoring session...</p>
-          </div>
-        )}
-
-        {!paneContent.sessionId && paneContent.restoreError && (
-          <div className="rounded-lg border border-red-300/60 bg-red-500/10 px-4 py-4 text-sm" role="alert">
-            <p className="font-medium text-red-700 dark:text-red-300">Session restore failed</p>
-            <p className="mt-1 text-red-700/90 dark:text-red-200">{getRestoreFailureMessage(paneContent.restoreError)}</p>
           </div>
         )}
 

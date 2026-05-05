@@ -47,20 +47,7 @@ vi.mock('@/store/settingsThunks', () => ({
   }),
 }))
 
-function makeStore(
-  preloadedAgentChat: Record<string, unknown> = {},
-  agentChatSettings: Partial<typeof defaultSettings.agentChat> = {},
-) {
-  const mergedAgentChatSettings = {
-    ...defaultSettings.agentChat,
-    initialSetupDone: true,
-    ...agentChatSettings,
-    providers: {
-      ...defaultSettings.agentChat.providers,
-      ...(agentChatSettings.providers ?? {}),
-    },
-  }
-
+function makeStore(preloadedAgentChat: Record<string, unknown> = {}) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
@@ -71,7 +58,10 @@ function makeStore(
       settings: {
         settings: {
           ...defaultSettings,
-          agentChat: mergedAgentChatSettings,
+          agentChat: {
+            ...defaultSettings.agentChat,
+            initialSetupDone: true,
+          },
         },
         loaded: true,
         lastSavedAt: 0,
@@ -98,9 +88,8 @@ const BASE_PANE: AgentChatPaneContent = {
 function renderStoreBackedPane(
   paneContent: AgentChatPaneContent,
   preloadedAgentChat: Record<string, unknown> = {},
-  agentChatSettings: Partial<typeof defaultSettings.agentChat> = {},
 ) {
-  const store = makeStore(preloadedAgentChat, agentChatSettings)
+  const store = makeStore(preloadedAgentChat)
   store.dispatch(initLayout({ tabId: 't1', paneId: 'p1', content: paneContent }))
 
   function Wrapper() {
@@ -268,7 +257,7 @@ describe('agent chat capability settings flow', () => {
     expect(screen.getByText('Saved legacy model is no longer available.')).toBeInTheDocument()
   })
 
-  it('clears an unavailable exact pane selection and starts on the provider-default track', async () => {
+  it('blocks unavailable exact create until the user switches to provider-default and retries', async () => {
     const store = renderStoreBackedPane({
       ...BASE_PANE,
       sessionId: undefined,
@@ -297,72 +286,37 @@ describe('agent chat capability settings flow', () => {
       },
     })
 
-    await waitFor(() => {
-      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'sdk.create',
-        requestId: 'req-unavailable-exact',
-        model: 'opus',
-      }))
+    expect(await screen.findByText('Session start failed')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+    const modelSelect = screen.getByLabelText('Model') as HTMLSelectElement
+    expect(parseAgentChatSettingsModelValue(modelSelect.value)).toEqual({
+      kind: 'exact',
+      modelId: 'claude-opus-4-6',
     })
-
-    expect(screen.queryByText('Session start failed')).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'claude-opus-4-6 (Unavailable)' })).toBeInTheDocument()
+    expect(screen.getByText('Saved legacy model is no longer available.')).toBeInTheDocument()
+    expect(screen.getByText('Selected model claude-opus-4-6 is no longer available.')).toBeInTheDocument()
+    expect(wsSend.mock.calls.filter((call) => call[0]?.type === 'sdk.create')).toHaveLength(0)
     expect(getRenderedPaneContent(store)).toEqual(expect.objectContaining({
-      status: 'starting',
-      modelSelection: undefined,
-      createError: undefined,
+      status: 'create-failed',
+      createError: expect.objectContaining({
+        code: 'MODEL_UNAVAILABLE',
+      }),
     }))
-  })
 
-  it('clears an inherited unavailable exact default and starts on the provider-default track', async () => {
-    const staleSelection = { kind: 'exact' as const, modelId: 'claude-opus-4-6' }
-    const store = renderStoreBackedPane({
-      ...BASE_PANE,
-      sessionId: undefined,
-      createRequestId: 'req-inherited-unavailable-default',
-      status: 'creating',
-      modelSelection: staleSelection,
-    }, {
-      capabilitiesByProvider: {
-        freshclaude: {
-          status: 'succeeded',
-          capabilities: {
-            provider: 'freshclaude',
-            fetchedAt: freshFetchedAt(),
-            models: [
-              {
-                id: 'opus',
-                displayName: 'Opus',
-                description: 'Latest Opus track',
-                supportsEffort: true,
-                supportedEffortLevels: ['turbo'],
-                supportsAdaptiveThinking: true,
-              },
-            ],
-          },
-        },
-      },
-    }, {
-      providers: {
-        freshclaude: {
-          modelSelection: staleSelection,
-        },
-      },
+    fireEvent.change(modelSelect, {
+      target: { value: AGENT_CHAT_PROVIDER_DEFAULT_OPTION_VALUE },
     })
+    expect(getRenderedPaneContent(store).modelSelection).toBeUndefined()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
 
     await waitFor(() => {
       expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
         type: 'sdk.create',
-        requestId: 'req-inherited-unavailable-default',
         model: 'opus',
       }))
     })
-
-    expect(screen.queryByText('Session start failed')).not.toBeInTheDocument()
-    expect(getRenderedPaneContent(store)).toEqual(expect.objectContaining({
-      status: 'starting',
-      modelSelection: undefined,
-      createError: undefined,
-    }))
   })
 
   it('shows a retryable capability error and keeps a persisted tracked selection visible after retry', async () => {

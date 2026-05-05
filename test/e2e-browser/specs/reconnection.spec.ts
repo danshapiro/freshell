@@ -14,9 +14,7 @@ test.describe('WebSocket Reconnection', () => {
     // Force-close the underlying WebSocket via the test harness.
     // This calls ws.close() on the raw WebSocket without setting intentionalClose,
     // so the WsClient will auto-reconnect.
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
-    })
+    await harness.forceDisconnect()
 
     // The WS state should briefly leave 'ready'
     // Wait for it to reconnect
@@ -27,7 +25,7 @@ test.describe('WebSocket Reconnection', () => {
     expect(status).toBe('ready')
   })
 
-  test('terminal output resumes after reconnect', async ({ freshellPage, page, harness, terminal }) => {
+  test('terminal output resumes after reconnect', async ({ freshellPage, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
 
@@ -36,9 +34,7 @@ test.describe('WebSocket Reconnection', () => {
     await terminal.waitForOutput('before-reconnect')
 
     // Force disconnect the WebSocket (triggers auto-reconnect)
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
-    })
+    await harness.forceDisconnect()
 
     // Wait for reconnection
     await harness.waitForConnection()
@@ -67,9 +63,7 @@ test.describe('WebSocket Reconnection', () => {
 
     // Simulate flaky network with multiple rapid disconnects
     for (let i = 0; i < 3; i++) {
-      await page.evaluate(() => {
-        window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
-      })
+      await harness.forceDisconnect()
       // Brief pause between disconnects to let reconnect attempt start
       await page.waitForTimeout(500)
     }
@@ -93,9 +87,7 @@ test.describe('WebSocket Reconnection', () => {
     await harness.waitForTabCount(2)
 
     // Force disconnect
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
-    })
+    await harness.forceDisconnect()
 
     // Wait for reconnection
     await harness.waitForConnection()
@@ -112,15 +104,13 @@ test.describe('WebSocket Reconnection', () => {
     }
   })
 
-  test('pending terminal creates retry after reconnect', async ({ freshellPage, page, harness, terminal }) => {
+  test('pending terminal creates retry after reconnect', async ({ freshellPage, harness, terminal }) => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
     await harness.waitForConnection()
 
     // Force disconnect
-    await page.evaluate(() => {
-      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
-    })
+    await harness.forceDisconnect()
 
     // Wait for reconnection
     await harness.waitForConnection()

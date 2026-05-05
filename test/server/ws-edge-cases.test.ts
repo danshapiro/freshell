@@ -167,6 +167,10 @@ class FakeRegistry extends EventEmitter {
     return true
   }
 
+  async killAndWait(terminalId: string) {
+    return this.kill(terminalId)
+  }
+
   list() {
     return Array.from(this.records.values()).map((r) => ({
       terminalId: r.terminalId,

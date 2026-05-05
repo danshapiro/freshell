@@ -38,15 +38,26 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         viewMode: content.viewMode,
       }
     case 'agent-chat':
-      return {
-        provider: content.provider,
-        sessionId: content.sessionId,
-        sessionRef: content.sessionRef,
-        initialCwd: content.initialCwd,
-        modelSelection: content.modelSelection,
-        permissionMode: content.permissionMode,
-        effort: content.effort,
-        plugins: content.plugins,
+      {
+        const sessionRef = content.sessionRef
+          || (content.resumeSessionId
+            ? {
+                provider: 'claude',
+                sessionId: content.resumeSessionId,
+                serverInstanceId,
+              }
+            : undefined)
+        return {
+          provider: content.provider,
+          sessionId: content.sessionId,
+          resumeSessionId: content.resumeSessionId,
+          sessionRef,
+          initialCwd: content.initialCwd,
+          modelSelection: content.modelSelection,
+          permissionMode: content.permissionMode,
+          effort: content.effort,
+          plugins: content.plugins,
+        }
       }
     case 'extension':
       return {
