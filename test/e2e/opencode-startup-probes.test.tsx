@@ -871,7 +871,7 @@ describe('opencode startup probes (e2e)', () => {
     await waitFor(() => {
       expect(writeEvents()).toEqual([
         { kind: 'write', data: 'prefix' },
-        { kind: 'write', data: '\u0007after' },
+        { kind: 'write', data: 'after' },
       ])
     })
 

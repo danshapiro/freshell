@@ -14,6 +14,14 @@ describe('shared turn-complete signal parser', () => {
     expect(out.cleaned).toBe('helloworld')
   })
 
+  it('counts BEL in OpenCode output and strips it from cleaned output', () => {
+    const input = `result${TURN_COMPLETE_SIGNAL}done`
+    const out = extractTurnCompleteSignals(input, 'opencode')
+
+    expect(out.count).toBe(1)
+    expect(out.cleaned).toBe('resultdone')
+  })
+
   it('preserves BEL when it terminates an OSC sequence', () => {
     const input = '\x1b]0;tab-title\x07'
     const out = extractTurnCompleteSignals(input, 'codex')

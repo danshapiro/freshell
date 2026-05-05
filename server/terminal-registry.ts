@@ -167,6 +167,17 @@ function providerNotificationArgs(
     }
   }
 
+  if (mode === 'opencode') {
+    return {
+      args: [
+        '-c', 'tui.notification_method=bel',
+        '-c', "tui.notifications=['agent-turn-complete']",
+        ...mcpInjection.args,
+      ],
+      env: mcpInjection.env,
+    }
+  }
+
   if (mode === 'claude') {
     const bellCommand = target === 'windows'
       ? `powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }"`
