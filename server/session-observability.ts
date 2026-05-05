@@ -67,16 +67,26 @@ export type SessionLifecycleEvent =
     provider?: CodingCliProviderName
     terminalId: string
     connectionId: string
-    operation: 'terminal.attach' | 'terminal.input' | 'terminal.resize'
+    operation:
+      | 'terminal.attach'
+      | 'terminal.input'
+      | 'terminal.resize'
+      | 'terminal.detach'
+      | 'terminal.kill'
     attemptedInputBytes?: number
   })
   | (OptionalUiContext & {
     kind: 'client_restore_unavailable'
-    terminalId: string
+    terminalId?: string
+    sessionId?: string
     connectionId: string
-    mode: string
-    reason: 'dead_live_handle'
-    hasSessionRef: false
+    mode?: string
+    reason:
+      | 'dead_live_handle'
+      | 'restore_internal'
+      | 'restore_not_found'
+      | 'restore_unavailable'
+    hasSessionRef: boolean
   })
 
 let sink: SessionLifecycleSink = sessionLifecycleLogger
@@ -178,6 +188,7 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
       return {
         ...base,
         terminalId: event.terminalId,
+        sessionId: event.sessionId,
         connectionId: event.connectionId,
         tabId: event.tabId,
         paneId: event.paneId,

@@ -7,11 +7,39 @@ import {
 import { RestoreResolutionError, RestoreStaleRevisionError, type AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
+import { recordSessionLifecycleEvent } from '../session-observability.js'
 import {
   defaultReadModelScheduler,
   isReadModelAbortError,
   type ReadModelWorkScheduler,
 } from '../read-models/work-scheduler.js'
+
+function restoreResolutionReason(
+  code: RestoreResolutionError['code'],
+): 'restore_not_found' | 'restore_unavailable' | 'restore_internal' | undefined {
+  switch (code) {
+    case 'RESTORE_NOT_FOUND':
+      return 'restore_not_found'
+    case 'RESTORE_UNAVAILABLE':
+      return 'restore_unavailable'
+    case 'RESTORE_INTERNAL':
+      return 'restore_internal'
+    default:
+      return undefined
+  }
+}
+
+function recordRestoreResolutionLifecycle(sessionId: string, code: RestoreResolutionError['code']): void {
+  const reason = restoreResolutionReason(code)
+  if (!reason) return
+  recordSessionLifecycleEvent({
+    kind: 'client_restore_unavailable',
+    sessionId,
+    connectionId: 'http',
+    reason,
+    hasSessionRef: true,
+  })
+}
 
 export type AgentTimelineRouterDeps = {
   service: AgentTimelineService
@@ -90,6 +118,9 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
         : error instanceof RestoreResolutionError
           ? { error: message, code: error.code }
           : { error: message }
+      if (error instanceof RestoreResolutionError) {
+        recordRestoreResolutionLifecycle(params.data.sessionId, error.code)
+      }
       res.status(status).json(body)
     }
   })
@@ -125,6 +156,9 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
         : error instanceof RestoreResolutionError
           ? { error: message, code: error.code }
           : { error: message }
+      if (error instanceof RestoreResolutionError) {
+        recordRestoreResolutionLifecycle(params.data.sessionId, error.code)
+      }
       res.status(status).json(body)
     }
   })
