@@ -20,6 +20,13 @@ describe('extractTurnCompleteSignals', () => {
     expect(out.cleaned).toBe('ab')
   })
 
+  it('extracts BEL for opencode and strips it from output', () => {
+    const input = `done${TURN_COMPLETE_SIGNAL}next`
+    const out = extractTurnCompleteSignals(input, 'opencode')
+    expect(out.count).toBe(1)
+    expect(out.cleaned).toBe('donenext')
+  })
+
   it('ignores BEL in shell mode', () => {
     const input = `x${TURN_COMPLETE_SIGNAL}y`
     const out = extractTurnCompleteSignals(input, 'shell')
