@@ -1028,6 +1028,18 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
     })
+
+    it('includes bell notification args for opencode on Unix', () => {
+      delete process.env.OPENCODE_CMD
+
+      const spec = buildSpawnSpec('opencode', '/home/user/project', 'system', undefined, {
+        opencodeServer: TEST_OPENCODE_SERVER,
+      })
+
+      expect(spec.args).toContain('-c')
+      expect(spec.args).toContain('tui.notification_method=bel')
+      expect(spec.args).toContain("tui.notifications=['agent-turn-complete']")
+    })
   })
 
   describe('environment variables in spawn spec', () => {
