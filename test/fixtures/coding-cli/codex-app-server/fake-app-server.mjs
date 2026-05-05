@@ -1,6 +1,21 @@
 #!/usr/bin/env node
 
 import { WebSocketServer } from 'ws'
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+
+if (process.argv[2] === 'fake-native-child') {
+  process.on('SIGTERM', () => {
+    if (process.env.FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM === '1') {
+      return
+    }
+    process.exit(0)
+  })
+
+  setInterval(() => undefined, 1_000)
+  process.stdin.resume()
+  await new Promise(() => undefined)
+}
 
 function parseListenUrl(argv) {
   const listenIndex = argv.indexOf('--listen')
@@ -85,6 +100,11 @@ function successResult(method, params) {
       },
     }
   }
+  if (method === 'thread/loaded/list') {
+    return {
+      data: behavior.loadedThreadIds || [],
+    }
+  }
   return {}
 }
 
@@ -95,12 +115,35 @@ const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
 
+let nativeChild
+if (behavior.spawnNativeChild) {
+  nativeChild = spawn(process.execPath, [new URL(import.meta.url).pathname, 'fake-native-child'], {
+    env: {
+      ...process.env,
+      FAKE_CODEX_NATIVE_CHILD_IGNORE_SIGTERM: behavior.nativeChildIgnoresSigterm ? '1' : '',
+    },
+    stdio: 'ignore',
+  })
+  nativeChild.unref()
+  if (behavior.nativePidFile) {
+    fs.writeFileSync(behavior.nativePidFile, `${nativeChild.pid}\n`, 'utf8')
+  }
+  if (behavior.exitAfterSpawningNative) {
+    process.exit(Number(behavior.exitAfterSpawningNativeCode ?? 42))
+  }
+}
+
 const wss = new WebSocketServer({ host, port })
 
 wss.on('connection', (socket) => {
   let initialized = false
+  let initializedNotification = false
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (message.method === 'initialized') {
+      initializedNotification = true
+      return
+    }
     if (behavior.requireJsonRpc && message.jsonrpc !== '2.0') {
       socket.send(JSON.stringify({
         id: message.id,
@@ -113,7 +156,11 @@ wss.on('connection', (socket) => {
     }
     const method = message.method
 
-    if (behavior.requireInitializeBeforeOtherMethods && method !== 'initialize' && !initialized) {
+    if (
+      behavior.requireInitializeBeforeOtherMethods
+      && method !== 'initialize'
+      && (!initialized || (behavior.requireInitializedNotification && !initializedNotification))
+    ) {
       socket.send(JSON.stringify({
         id: message.id,
         error: {
@@ -149,6 +196,9 @@ wss.on('connection', (socket) => {
         id: message.id,
         result: override?.result ?? successResult(method, message.params),
       }))
+      for (const notification of behavior.notificationsAfterMethods?.[method] || []) {
+        socket.send(JSON.stringify(notification))
+      }
       if (method === 'initialize') {
         initialized = true
       }
@@ -163,5 +213,17 @@ process.on('SIGTERM', () => {
   if (process.env.FAKE_CODEX_APP_SERVER_IGNORE_SIGTERM === '1') {
     return
   }
-  wss.close(() => process.exit(0))
+  if (behavior.signalFileOnSigterm) {
+    fs.writeFileSync(behavior.signalFileOnSigterm, `${process.pid}\n`, 'utf8')
+  }
+  if (!behavior.wrapperLeavesNativeOnSigterm) {
+    nativeChild?.kill('SIGTERM')
+  }
+  const exit = () => wss.close(() => process.exit(0))
+  const delayExitMs = Number(behavior.delayExitOnSigtermMs || 0)
+  if (delayExitMs > 0) {
+    setTimeout(exit, delayExitMs)
+    return
+  }
+  exit()
 })

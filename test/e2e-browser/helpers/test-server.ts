@@ -47,6 +47,10 @@ function isWindowsStylePath(filePath: string): boolean {
   return /^[A-Za-z]:\\/.test(filePath.replace(/\//g, '\\'))
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
 function applyAppDataIsolation(
   env: Record<string, string>,
   homeDir: string,
@@ -179,6 +183,35 @@ async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
   }
 }
 
+async function readJsonFileIfPresent(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = JSON.parse(await fsp.readFile(filePath, 'utf8'))
+    return isRecord(parsed) ? parsed : null
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+}
+
+async function ensureSetupWizardBypassConfig(configPath: string): Promise<void> {
+  const existing = await readJsonFileIfPresent(configPath)
+  const existingSettings = isRecord(existing?.settings) ? existing.settings : {}
+  const existingNetwork = isRecord(existingSettings.network) ? existingSettings.network : {}
+
+  await fsp.writeFile(configPath, JSON.stringify({
+    ...(existing ?? {}),
+    version: 1,
+    settings: {
+      ...existingSettings,
+      network: {
+        configured: true,
+        host: '127.0.0.1',
+        ...existingNetwork,
+      },
+    },
+  }, null, 2))
+}
+
 function readAuthTokenFromEnvFile(envText: string): string {
   const match = envText.match(/^AUTH_TOKEN=(.+)$/m)
   if (!match) {
@@ -276,40 +309,7 @@ export class TestServer {
       // Preserve any setupHome-provided config and only ensure the network
       // bootstrap fields needed for the browser harness are present.
       const configPath = path.join(freshellDir, 'config.json')
-      let existingConfig: Record<string, unknown> | null = null
-      try {
-        existingConfig = JSON.parse(await fsp.readFile(configPath, 'utf8')) as Record<string, unknown>
-      } catch {
-        existingConfig = null
-      }
-
-      const existingSettings =
-        existingConfig && typeof existingConfig.settings === 'object' && !Array.isArray(existingConfig.settings)
-          ? existingConfig.settings as Record<string, unknown>
-          : {}
-      const existingNetwork =
-        typeof existingSettings.network === 'object' && !Array.isArray(existingSettings.network)
-          ? existingSettings.network as Record<string, unknown>
-          : {}
-
-      await fsp.writeFile(configPath, JSON.stringify({
-        ...(existingConfig ?? {}),
-        version:
-          existingConfig && typeof existingConfig.version === 'number'
-            ? existingConfig.version
-            : 1,
-        settings: {
-          ...existingSettings,
-          network: {
-            ...existingNetwork,
-            configured: true,
-            host:
-              typeof existingNetwork.host === 'string' && existingNetwork.host.length > 0
-                ? existingNetwork.host
-                : '127.0.0.1',
-          },
-        },
-      }, null, 2))
+      await ensureSetupWizardBypassConfig(configPath)
 
       // Create a logs dir
       const logsDir = path.join(homeDir, '.freshell', 'logs')
