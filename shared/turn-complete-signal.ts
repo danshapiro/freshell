@@ -19,7 +19,7 @@ export function createTurnCompleteSignalParserState(): TurnCompleteSignalParserS
 }
 
 function supportsTurnSignal(mode: TurnCompleteSignalMode): boolean {
-  return mode === 'claude' || mode === 'codex'
+  return mode === 'claude' || mode === 'codex' || mode === 'opencode'
 }
 
 export function extractTurnCompleteSignals(
