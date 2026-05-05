@@ -139,22 +139,6 @@ Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` 
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## Trycycle
-
-Freshell is built with [trycycle](https://github.com/danshapiro/trycycle), a philosophy for coding agents:
-
-- **Take any request, of any size or complexity** — from "Make the button blue" to "Implement this 20-page specification." Trycycle handles it all through a structured pipeline: planning, test-planning, execution, and multi-round review.
-- **Avoid asking the user questions** — The agent assumes the starting request is everything the user cares about and uses its best judgment for the rest. You can always interrupt or redirect.
-- **Prioritize zero bugs** — Trycycle runs planning issue-review loops (up to 5 rounds), builds a test plan from your testing strategy, then cycles through execution and post-implementation review (up to 8 rounds) with deepening passes and plan-reconsideration checkpoints. No shortcuts.
-
-### Tips & Tricks
-
-**Write a spec first.** Use your favorite chatbot, or a skill like Jesse Vincent's "brainstorm" superpowers, to produce a spec before handing it to trycycle. A good spec dramatically improves results.
-
-This works in Claude Code, Codex CLI, and OpenCode. It's very inexpensive on OpenCode with the OpenCode Go subscription and Deepseek v4 (substitute your favorite inexpensive model if this recommendation goes stale).
-
-It's just a skill. If you're not sure what it did, or if you don't like what it's doing, just stop it and tell it. Once it finishes 5–8 passes, it will stop to complain. That's fine — ask any questions, then tell it to wrap up, change course, or do up to 5 more passes (usually the last one is best).
-
 ## Community Projects
 
 Projects built by the community around freshell.
