@@ -311,6 +311,17 @@ export class LayoutStore {
     return undefined
   }
 
+  findPaneByTerminalId(terminalId: string): { tabId: string; paneId: string } | undefined {
+    if (!this.snapshot) return undefined
+    for (const tab of this.snapshot.tabs) {
+      const root = this.snapshot.layouts?.[tab.id]
+      const leaves = this.collectLeaves(root, [])
+      const match = leaves.find((leaf) => leaf.content?.terminalId === terminalId)
+      if (match) return { tabId: tab.id, paneId: match.id }
+    }
+    return undefined
+  }
+
   getPaneSnapshot(paneId: string): PaneSnapshot | undefined {
     if (!this.snapshot) return undefined
     for (const tab of this.snapshot.tabs) {
