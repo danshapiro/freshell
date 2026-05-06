@@ -419,8 +419,16 @@ describe('CodexAppServerRuntime', () => {
     await expect(runtime.unwatchPath('watch-rollout')).resolves.toBeUndefined()
   })
 
-  it('notifies runtime exit handlers when the app-server client socket disconnects while the child is alive', async () => {
+  it('does not publish ready when the app-server client socket disconnects before startup completes', async () => {
     const runtime = createRuntime({
+      startupAttemptLimit: 1,
+      metadataWriter: async (filePath, metadata) => {
+        if (metadata.codexHome) {
+          await new Promise((resolve) => setTimeout(resolve, 25))
+        }
+        await fsp.mkdir(path.dirname(filePath), { recursive: true })
+        await fsp.writeFile(filePath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 })
+      },
       env: {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           closeSocketAfterMethodsOnce: ['initialize'],
@@ -430,7 +438,26 @@ describe('CodexAppServerRuntime', () => {
     const onExit = vi.fn()
     runtime.onExit(onExit)
 
+    await expect(runtime.ensureReady()).rejects.toThrow(
+      /Codex app-server client disconnected before startup completed/,
+    )
+    expect(runtime.status()).toBe('stopped')
+    expect(onExit).not.toHaveBeenCalled()
+  })
+
+  it('notifies runtime exit handlers when the app-server client socket disconnects while the child is alive', async () => {
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          closeSocketAfterMethodsOnce: ['thread/start'],
+        }),
+      },
+    })
+    const onExit = vi.fn()
+    runtime.onExit(onExit)
+
     await runtime.ensureReady()
+    await runtime.startThread({ cwd: '/repo/worktree' })
 
     await waitFor(() => expect(onExit).toHaveBeenCalledWith(
       expect.any(Error),

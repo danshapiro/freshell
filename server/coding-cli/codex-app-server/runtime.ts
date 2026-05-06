@@ -527,6 +527,7 @@ export class CodexAppServerRuntime {
   private ownership: ActiveOwnership | null = null
   private ownershipTeardownPromise: Promise<void> | null = null
   private ownershipTeardownFailure: Error | null = null
+  private startupAbortError: Error | null = null
   private shutdownRequested = false
   private readonly exitHandlers = new Set<(error?: Error, source?: CodexAppServerRuntimeFailureSource) => void>()
   private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
@@ -613,6 +614,7 @@ export class CodexAppServerRuntime {
   }
 
   private publishReady(ready: ReadyState): ReadyState {
+    this.startupAbortError = null
     this.ready = ready
     this.statusValue = 'running'
     return ready
@@ -704,6 +706,7 @@ export class CodexAppServerRuntime {
       if (this.shutdownRequested) {
         throw new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
       }
+      this.startupAbortError = null
 
       const endpoint = await this.portAllocator()
       const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
@@ -791,7 +794,9 @@ export class CodexAppServerRuntime {
         this.client = client
 
         const initialized = await this.waitForInitialize(client, child, childDiagnostics)
+        this.assertStartupRuntimeStillActive(client, child)
         await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
+        this.assertStartupRuntimeStillActive(client, child)
         return {
           wsUrl,
           processPid: child.pid,
@@ -907,6 +912,18 @@ export class CodexAppServerRuntime {
     throw lastError ?? new Error('Codex app-server exited before it finished initializing.')
   }
 
+  private assertStartupRuntimeStillActive(client: CodexAppServerClient, child: ChildProcess): void {
+    if (this.startupAbortError) {
+      throw this.startupAbortError
+    }
+    if (this.child !== child) {
+      throw new Error('Codex app-server child exited before startup completed.')
+    }
+    if (this.client !== client) {
+      throw new Error('Codex app-server client disconnected before startup completed.')
+    }
+  }
+
   private attachChildErrorHandler(child: ChildProcess, diagnostics: RuntimeChildDiagnostics): void {
     child.once('error', (error) => {
       diagnostics.processError = error instanceof Error ? error : new Error(String(error))
@@ -997,6 +1014,11 @@ export class CodexAppServerRuntime {
     this.statusValue = 'stopped'
 
     if (!wasReady || this.shutdownRequested) {
+      if (!this.shutdownRequested) {
+        this.startupAbortError = new Error(event.reason === 'error'
+          ? `Codex app-server client socket errored before startup completed: ${event.error?.message ?? 'unknown error'}`
+          : 'Codex app-server client disconnected before startup completed.')
+      }
       void this.stopActiveChild().catch(() => undefined)
       return
     }
