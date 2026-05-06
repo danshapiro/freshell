@@ -46,6 +46,18 @@ Do not resolve semantic conflicts only on `dev`. `dev` must remain reproducible 
 
 Draft PRs, do-not-merge PRs, closed PRs, superseded PRs, and approval artifacts are excluded from `dev` unless the user explicitly says otherwise.
 
+## Building `dev`
+
+Use an explicit queue. Do not blindly apply every open PR.
+
+Example:
+
+```bash
+npm run dev:queue -- plan --prs 321,309,319
+```
+
+The queue script must fail if a PR is draft, closed, not targeting `main`, or cannot be applied cleanly. Fix PR branches before rebuilding `dev`.
+
 ## Local Main Realignment
 
 Only realign local `main` after Freshell is self-hosting from `dev`, the user has explicitly approved the reset, and the intentional OpenCode notification-argument removal has been preserved in an open PR that is included in `dev` or confirmed already present in a selected pending PR.
