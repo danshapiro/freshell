@@ -1,6 +1,6 @@
 # Coding CLI Session Contract Lab Note
 
-This note records the real-binary provider probes rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-03` inside `/home/user/code/freshell/.worktrees/land-local-main-codex-sidecar-lifecycle`.
+This note records the real-binary provider probes rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-03` inside `/home/user/code/freshell/.worktrees/land-local-main-codex-sidecar-lifecycle`; the Claude Code binary version fact was refreshed again on `2026-05-05` inside `/home/user/code/freshell/.worktrees/codex-sidebar-reopen-corner-20260505` after the installed binary changed. The later version-only refreshes did not re-prove the behavior contract, so `capturedOn` remains `2026-04-26`.
 
 The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-26` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
 
@@ -9,7 +9,8 @@ The implementation plan file is dated `2026-04-19` because the design work was w
 {
   "capturedOn": "2026-04-26",
   "planCreatedOn": "2026-04-19",
-  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-03 after the installed provider versions changed.",
+  "binaryVersionFactsRefreshedOn": "2026-05-05",
+  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-03 after installed provider versions changed, and the Claude Code binary version fact was refreshed on 2026-05-05 after the local installed binary changed to 2.1.129. These later version-only refreshes did not re-prove the behavior contract.",
   "cleanup": {
     "liveProcessAuditCommand": "ps -eo pid,ppid,stat,cmd --sort=pid | rg \"codex|claude|opencode\"",
     "ownershipReportFields": [
@@ -240,6 +241,8 @@ command -v claude
 claude --version
 # 2.1.129 (Claude Code)
 ```
+
+This Claude Code version line was refreshed on `2026-05-05`; the behavior observations below remain from the `2026-04-26` real-provider proof.
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.
 
