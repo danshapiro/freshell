@@ -145,6 +145,28 @@ describe('CodexAppServerRuntime', () => {
     }
   })
 
+  it('waits for a complete wrapper identity proof during startup', async () => {
+    let identityReads = 0
+    const runtime = createRuntime({
+      startupAttemptLimit: 1,
+      startupAttemptTimeoutMs: 1_000,
+      processIdentityReader: async () => {
+        identityReads += 1
+        if (identityReads === 1) return null
+        return {
+          commandLine: ['node', FAKE_SERVER_PATH, 'app-server'],
+          cwd: process.cwd(),
+          startTimeTicks: 12345,
+        }
+      },
+    })
+
+    await expect(runtime.ensureReady()).resolves.toEqual(expect.objectContaining({
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    }))
+    expect(identityReads).toBeGreaterThan(1)
+  })
+
   it('keeps separate runtime instances isolated for concurrent codex terminals', async () => {
     const firstRuntime = createRuntime()
     const secondRuntime = createRuntime()
