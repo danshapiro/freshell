@@ -1,20 +1,29 @@
 #!/usr/bin/env bash
-# Launch Freshell: pull upstream, build, start server in background.
+# Launch Freshell: build, start server in background.
 
 set -euo pipefail
 
 FRESHELL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-FRESHELL_HOME="$HOME/.freshell"
+FRESHELL_HOME="${FRESHELL_HOME:-$HOME/.freshell}"
 LOG_FILE="$FRESHELL_HOME/logs/server.log"
 URL_FILE="$FRESHELL_HOME/url"
 PID_FILE="$FRESHELL_HOME/server.pid"
 
 cd "$FRESHELL_DIR"
 
-# Check for already-running server (verify PID is actually a node process from this project)
+is_freshell_pid() {
+  local pid="$1"
+  local cwd=""
+  local args=""
+  cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ "$cwd" == "$FRESHELL_DIR" && ( "$args" == *"dist/server/index.js"* || "$args" == *"npm start"* ) ]]
+}
+
+# Check for already-running server (verify PID belongs to this project)
 if [[ -f "$PID_FILE" ]]; then
   saved_pid="$(cat "$PID_FILE")"
-  if kill -0 "$saved_pid" 2>/dev/null && ps -p "$saved_pid" -o args= 2>/dev/null | grep -q "dist/server/index.js"; then
+  if kill -0 "$saved_pid" 2>/dev/null && is_freshell_pid "$saved_pid"; then
     echo "freshell is already running (pid $saved_pid)"
     if [[ -f "$URL_FILE" ]]; then
       echo "  $(cat "$URL_FILE")"
@@ -25,30 +34,8 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-# Pull latest from upstream (only on main)
-current_branch="$(git branch --show-current)"
-if [[ "$current_branch" == "main" ]]; then
-  echo "Pulling latest from upstream..."
-  if git remote get-url upstream >/dev/null 2>&1; then
-    git fetch upstream
-    if git merge-base --is-ancestor upstream/main HEAD 2>/dev/null; then
-      echo "  Already up to date."
-    elif git merge --ff-only upstream/main 2>/dev/null; then
-      echo "  Merged upstream changes."
-    else
-      echo "  Local main has diverged from upstream. Resetting to upstream/main..."
-      git reset --hard upstream/main
-      echo "  Done."
-    fi
-  else
-    echo "  No upstream remote, skipping pull."
-  fi
-
-  echo "Pushing to origin..."
-  git push origin main 2>/dev/null && echo "  Done." || echo "  Push failed (non-fatal)."
-else
-  echo "Warning: on branch '$current_branch', skipping upstream pull. Switch to main for auto-update."
-fi
+echo "Checking self-host branch..."
+npx tsx scripts/selfhost-branch.ts validate-launch
 
 # Build
 echo "Building..."
@@ -59,7 +46,7 @@ echo "Starting server..."
 mkdir -p "$(dirname "$LOG_FILE")"
 rm -f "$URL_FILE"
 
-NODE_ENV=production node dist/server/index.js > "$LOG_FILE" 2>&1 &
+npm start > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 

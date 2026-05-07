@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,11 +14,9 @@ type FakeServerBehavior = {
   closeSocketAfterMethodsOnce?: string[]
   delayMethodsMs?: Record<string, number>
   ignoreMethods?: string[]
-  loadedThreadIds?: string[]
-  notificationsAfterMethods?: Record<string, unknown[]>
+  notifyAfterMethodsOnce?: Record<string, Array<{ method: string; params?: unknown }>>
   requireJsonRpc?: boolean
   requireInitializeBeforeOtherMethods?: boolean
-  requireInitializedNotification?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
 }
 
@@ -98,6 +96,24 @@ async function stopFakeCodexAppServer(handle: FakeServerHandle): Promise<void> {
   })
 }
 
+async function waitFor(assertion: () => void | Promise<void>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+
+  while (Date.now() < deadline) {
+    try {
+      await assertion()
+      return
+    } catch (error) {
+      lastError = error
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
+  if (lastError instanceof Error) throw lastError
+  throw new Error('Timed out waiting for assertion')
+}
+
 afterEach(async () => {
   await Promise.all([...fakeServers].map((server) => stopFakeCodexAppServer(server)))
 })
@@ -121,8 +137,128 @@ describe('CodexAppServerClient', () => {
 
     await client.initialize()
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
+  })
+
+  it('surfaces thread/started notifications to sidecar consumers', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    const startedThread = new Promise<{ id: string; path: string | null; ephemeral: boolean }>((resolve) => {
+      client.onThreadStarted((thread) => resolve(thread))
+    })
+
+    await client.initialize()
+    await client.startThread({ cwd: '/repo/worktree' })
+
+    await expect(startedThread).resolves.toEqual({
+      id: 'thread-new-1',
+      path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+      ephemeral: false,
+    })
+  })
+
+  it('emits thread lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/started',
+            params: {
+              thread: {
+                id: 'thread-resume-1',
+                path: '/tmp/codex/rollout-thread-resume-1.jsonl',
+                ephemeral: false,
+              },
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_started',
+      thread: {
+        id: 'thread-resume-1',
+        path: '/tmp/codex/rollout-thread-resume-1.jsonl',
+        ephemeral: false,
+      },
+    }))
+  })
+
+  it('emits thread closed lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/closed',
+            params: {
+              threadId: 'thread-resume-1',
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_closed',
+      threadId: 'thread-resume-1',
+    }))
+  })
+
+  it('emits thread status lifecycle notifications from app-server notifications', async () => {
+    const server = await startFakeCodexAppServer({
+      notifyAfterMethodsOnce: {
+        initialize: [
+          {
+            method: 'thread/status/changed',
+            params: {
+              threadId: 'thread-resume-1',
+              status: { type: 'notLoaded' },
+            },
+          },
+        ],
+      },
+    })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const lifecycle = vi.fn()
+    client.onThreadLifecycle(lifecycle)
+
+    await client.initialize()
+
+    await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
+      kind: 'thread_status_changed',
+      threadId: 'thread-resume-1',
+      status: { type: 'notLoaded' },
+    }))
+  })
+
+  it('emits a disconnect callback when the app-server client socket closes unexpectedly', async () => {
+    const server = await startFakeCodexAppServer({ closeSocketAfterMethodsOnce: ['initialize'] })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+    const onDisconnect = vi.fn()
+    client.onDisconnect(onDisconnect)
+
+    await client.initialize()
+
+    await waitFor(() => expect(onDisconnect).toHaveBeenCalledWith(expect.objectContaining({
+      reason: 'close',
+    })))
   })
 
   it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {
@@ -131,7 +267,11 @@ describe('CodexAppServerClient', () => {
 
     await client.initialize()
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -144,7 +284,11 @@ describe('CodexAppServerClient', () => {
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
     })).resolves.toEqual({
-      threadId: '019d9859-5670-72b1-851f-794ad7fef112',
+      thread: {
+        id: '019d9859-5670-72b1-851f-794ad7fef112',
+        path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -156,7 +300,11 @@ describe('CodexAppServerClient', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
@@ -177,75 +325,44 @@ describe('CodexAppServerClient', () => {
       platformOs: expect.any(String),
     })
     await expect(startThreadPromise).resolves.toEqual({
-      threadId: 'thread-new-1',
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
     })
   })
 
-  it('sends initialized after initialize before later requests', async () => {
+  it('sends fs/watch and fs/unwatch envelopes and surfaces fs/changed notifications with the original watchId', async () => {
+    const rolloutPath = '/repo/worktree/.codex/sessions/2026/04/23/rollout-thread-new-1.jsonl'
     const server = await startFakeCodexAppServer({
-      requireInitializeBeforeOtherMethods: true,
-      requireInitializedNotification: true,
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-
-    await client.initialize()
-
-    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
-      threadId: 'thread-new-1',
-    })
-  })
-
-  it('lists loaded in-memory thread ids', async () => {
-    const server = await startFakeCodexAppServer({
-      loadedThreadIds: ['019d9859-5670-72b1-851f-794ad7fef112', 'thread-new-1'],
-    })
-    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-
-    await client.initialize()
-
-    await expect(client.listLoadedThreads()).resolves.toEqual([
-      '019d9859-5670-72b1-851f-794ad7fef112',
-      'thread-new-1',
-    ])
-  })
-
-  it('emits lifecycle-loss events for closed, notLoaded, and systemError notifications', async () => {
-    const server = await startFakeCodexAppServer({
-      notificationsAfterMethods: {
-        'thread/loaded/list': [
+      notifyAfterMethodsOnce: {
+        'fs/watch': [
           {
-            method: 'thread/closed',
-            params: { threadId: 'thread-closed' },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { threadId: 'thread-not-loaded', status: { type: 'notLoaded' } },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { thread: { id: 'thread-system-error', status: { type: 'systemError' } } },
-          },
-          {
-            method: 'thread/status/changed',
-            params: { threadId: 'thread-running', status: { type: 'running' } },
+            method: 'fs/changed',
+            params: {
+              watchId: 'watch-rollout',
+              changedPaths: [rolloutPath],
+            },
           },
         ],
       },
     })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
-    const events: unknown[] = []
-    const unsubscribe = client.onThreadLifecycleLoss((event) => events.push(event))
+
+    const changedEvent = new Promise<{ watchId: string; changedPaths: string[] }>((resolve) => {
+      client.onFsChanged((event) => resolve(event))
+    })
 
     await client.initialize()
-    await client.listLoadedThreads()
-    await new Promise((resolve) => setTimeout(resolve, 25))
-    unsubscribe()
-
-    expect(events).toEqual([
-      { method: 'thread/closed', threadId: 'thread-closed' },
-      { method: 'thread/status/changed', threadId: 'thread-not-loaded', status: 'notLoaded' },
-      { method: 'thread/status/changed', threadId: 'thread-system-error', status: 'systemError' },
-    ])
+    await expect(client.watchPath(rolloutPath, 'watch-rollout')).resolves.toEqual({
+      path: rolloutPath,
+    })
+    await expect(changedEvent).resolves.toEqual({
+      watchId: 'watch-rollout',
+      changedPaths: [rolloutPath],
+    })
+    await expect(client.unwatchPath('watch-rollout')).resolves.toBeUndefined()
   })
 
   it('fails clearly when the app-server never answers a request', async () => {

@@ -54,7 +54,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger, sessionLifecycleLogger: logger }
+  return { logger }
 })
 
 // Mock MCP config writer
