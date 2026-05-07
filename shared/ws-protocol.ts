@@ -32,7 +32,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 4 as const
+export const WS_PROTOCOL_VERSION = 5 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -599,7 +599,9 @@ export type ConfigFallbackMessage = {
 
 export type TabsSyncAckMessage = {
   type: 'tabs.sync.ack'
-  updated: number
+  accepted: boolean
+  openRecords: number
+  closedRecords: number
 }
 
 export type TabsSyncSnapshotMessage = {
@@ -607,8 +609,10 @@ export type TabsSyncSnapshotMessage = {
   requestId: string
   data: {
     localOpen: unknown[]
+    sameDeviceOpen: unknown[]
     remoteOpen: unknown[]
     closed: unknown[]
+    devices: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
   }
 }
 

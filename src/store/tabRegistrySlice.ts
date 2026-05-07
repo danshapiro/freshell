@@ -2,7 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
 import type { Tab } from './types'
 import type { PaneNode } from './paneTypes'
-import { getSearchRangeDaysPreference } from '@/lib/browser-preferences'
+import { getClosedTabRetentionDaysPreference } from '@/lib/browser-preferences'
 import {
   DEVICE_ALIASES_STORAGE_KEY,
   DEVICE_DISMISSED_STORAGE_KEY,
@@ -228,10 +228,13 @@ export interface TabRegistryState {
   deviceAliases: Record<string, string>
   dismissedDeviceIds: string[]
   localOpen: RegistryTabRecord[]
+  sameDeviceOpen: RegistryTabRecord[]
   remoteOpen: RegistryTabRecord[]
   closed: RegistryTabRecord[]
+  devices: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
   localClosed: Record<string, RegistryTabRecord>
   reopenStack: ClosedTabEntry[]
+  closedTabRetentionDays: number
   searchRangeDays: number
   loading: boolean
   syncError?: string
@@ -241,7 +244,7 @@ export interface TabRegistryState {
 const device = loadDeviceMeta()
 const aliases = loadDeviceAliases(safeStorage())
 const dismissedDeviceIds = loadDismissedDeviceIds(safeStorage())
-const initialSearchRangeDays = getSearchRangeDaysPreference()
+const initialClosedTabRetentionDays = getClosedTabRetentionDaysPreference()
 
 const initialState: TabRegistryState = {
   deviceId: device.deviceId,
@@ -249,11 +252,14 @@ const initialState: TabRegistryState = {
   deviceAliases: aliases,
   dismissedDeviceIds,
   localOpen: [],
+  sameDeviceOpen: [],
   remoteOpen: [],
+  devices: [],
   closed: [],
   localClosed: {},
   reopenStack: [],
-  searchRangeDays: initialSearchRangeDays,
+  closedTabRetentionDays: initialClosedTabRetentionDays,
+  searchRangeDays: initialClosedTabRetentionDays,
   loading: false,
 }
 
@@ -278,7 +284,14 @@ export const tabRegistrySlice = createSlice({
       state.dismissedDeviceIds = action.payload
     },
     setTabRegistrySearchRangeDays: (state, action: PayloadAction<number>) => {
-      state.searchRangeDays = Math.max(1, action.payload)
+      const closedTabRetentionDays = Math.min(30, Math.max(1, Math.floor(action.payload)))
+      state.closedTabRetentionDays = closedTabRetentionDays
+      state.searchRangeDays = closedTabRetentionDays
+    },
+    setTabRegistryClosedTabRetentionDays: (state, action: PayloadAction<number>) => {
+      const closedTabRetentionDays = Math.min(30, Math.max(1, Math.floor(action.payload)))
+      state.closedTabRetentionDays = closedTabRetentionDays
+      state.searchRangeDays = closedTabRetentionDays
     },
     setTabRegistryLoading: (state, action: PayloadAction<boolean>) => {
       state.loading = action.payload
@@ -287,13 +300,17 @@ export const tabRegistrySlice = createSlice({
       state,
       action: PayloadAction<{
         localOpen: RegistryTabRecord[]
+        sameDeviceOpen?: RegistryTabRecord[]
         remoteOpen: RegistryTabRecord[]
         closed: RegistryTabRecord[]
+        devices?: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
       }>,
     ) => {
       state.localOpen = action.payload.localOpen || []
+      state.sameDeviceOpen = action.payload.sameDeviceOpen || []
       state.remoteOpen = action.payload.remoteOpen || []
       state.closed = action.payload.closed || []
+      state.devices = action.payload.devices || []
       state.lastSnapshotAt = Date.now()
       state.syncError = undefined
       state.loading = false
@@ -303,6 +320,9 @@ export const tabRegistrySlice = createSlice({
     },
     recordClosedTabSnapshot: (state, action: PayloadAction<RegistryTabRecord>) => {
       state.localClosed[action.payload.tabKey] = action.payload
+    },
+    clearTabRegistryLocalClosed: (state) => {
+      state.localClosed = {}
     },
     pushReopenEntry: (state, action: PayloadAction<ClosedTabEntry>) => {
       state.reopenStack.push(action.payload)
@@ -322,10 +342,12 @@ export const {
   setTabRegistryDeviceAliases,
   setTabRegistryDismissedDeviceIds,
   setTabRegistrySearchRangeDays,
+  setTabRegistryClosedTabRetentionDays,
   setTabRegistryLoading,
   setTabRegistrySnapshot,
   setTabRegistrySyncError,
   recordClosedTabSnapshot,
+  clearTabRegistryLocalClosed,
   pushReopenEntry,
   popReopenEntry,
 } = tabRegistrySlice.actions

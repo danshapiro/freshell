@@ -455,6 +455,10 @@ describe('SettingsView behavior sections', () => {
             remoteOpen: [
               makeRegistryRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
             ],
+            devices: [
+              { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
+              { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
+            ],
             closed: [
               makeRegistryRecord({
                 deviceId: 'remote-b',

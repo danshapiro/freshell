@@ -2,7 +2,7 @@ import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { hydratePanes } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
-import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
+import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
 import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
@@ -16,7 +16,7 @@ type StoreLike = {
   getState: () => any
 }
 
-const DEFAULT_SEARCH_RANGE_DAYS = 30
+const DEFAULT_CLOSED_TAB_RETENTION_DAYS = 30
 
 const zPersistBroadcastMsg = z.object({
   type: z.literal('persist'),
@@ -212,8 +212,10 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
 
   const previousParsed = previousRaw ? parseBrowserPreferencesRaw(previousRaw) : null
   const remoteResetSettingsToDefaults = previousParsed?.settings !== undefined && parsed.settings === undefined
-  const remoteResetSearchRangeToDefault =
-    previousParsed?.tabs?.searchRangeDays !== undefined && parsed.tabs?.searchRangeDays === undefined
+  const previousRetention = previousParsed?.tabs?.closedTabRetentionDays ?? previousParsed?.tabs?.searchRangeDays
+  const parsedRetention = parsed.tabs?.closedTabRetentionDays ?? parsed.tabs?.searchRangeDays
+  const remoteResetRetentionToDefault =
+    previousRetention !== undefined && parsedRetention === undefined
   const pendingWriteState = getPendingBrowserPreferencesWriteState(store)
   const remoteSettingsPatch = parsed.settings ?? {}
   let mergedSettingsPatch = remoteSettingsPatch
@@ -223,9 +225,11 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
   const nextSettings = pendingWriteState.settingsPatch
     ? resolveLocalSettings(mergedSettingsPatch)
     : resolveBrowserPreferenceSettings(parsed)
-  const nextSearchRangeDays = pendingWriteState.hasPendingSearchRangeDays
-    ? pendingWriteState.searchRangeDays
-    : (parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS)
+  const hasPendingRetention = pendingWriteState.hasPendingClosedTabRetentionDays ?? pendingWriteState.hasPendingSearchRangeDays
+  const pendingRetention = pendingWriteState.closedTabRetentionDays ?? pendingWriteState.searchRangeDays
+  const nextClosedTabRetentionDays = hasPendingRetention
+    ? pendingRetention
+    : (parsedRetention ?? DEFAULT_CLOSED_TAB_RETENTION_DAYS)
 
   if (
     parsed.settings
@@ -238,12 +242,12 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
     })
   }
   if (
-    parsed.tabs?.searchRangeDays !== undefined
-    || remoteResetSearchRangeToDefault
-    || pendingWriteState.hasPendingSearchRangeDays
+    parsedRetention !== undefined
+    || remoteResetRetentionToDefault
+    || hasPendingRetention
   ) {
     store.dispatch({
-      ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
+      ...setTabRegistryClosedTabRetentionDays(nextClosedTabRetentionDays),
       meta: { skipPersist: true, source: 'cross-tab' },
     })
   }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import os from 'os'
@@ -58,8 +58,6 @@ function makeRecord(overrides: Record<string, unknown>) {
   return {
     tabKey: 'device-1:tab-1',
     tabId: 'tab-1',
-    deviceId: 'device-1',
-    deviceLabel: 'danlaptop',
     tabName: 'freshell',
     status: 'open',
     revision: 1,
@@ -91,13 +89,7 @@ describe('ws tabs registry protocol', () => {
   let wsHandler: any
   let tempDir: string
 
-  beforeAll(async () => {
-    process.env.NODE_ENV = 'test'
-    process.env.AUTH_TOKEN = 'tabs-sync-token'
-
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-tabs-registry-'))
-    const tabsStore = createTabsRegistryStore(tempDir, { now: () => NOW })
-
+  async function startServer(options: { tabsRegistryStore?: any } = {}) {
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -106,33 +98,75 @@ describe('ws tabs registry protocol', () => {
     wsHandler = new WsHandler(
       server,
       new FakeRegistry() as any,
-      { tabsRegistryStore: tabsStore },
+      options,
     )
     port = await listen(server)
-  })
+  }
 
-  afterAll(async () => {
-    wsHandler?.close?.()
-    await new Promise<void>((resolve) => server.close(() => resolve()))
-    await fs.rm(tempDir, { recursive: true, force: true })
-  })
-
-  it('accepts tabs.sync.push and returns tabs.sync.snapshot (default 24h)', async () => {
+  async function connect(): Promise<WebSocket> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
     ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: WS_PROTOCOL_VERSION }))
-    const ready = await waitForMessage(ws, (msg) => msg.type === 'ready')
-    expect(typeof ready.serverInstanceId).toBe('string')
-    expect(ready.serverInstanceId.length).toBeGreaterThan(0)
+    await waitForMessage(ws, (msg) => msg.type === 'ready')
+    return ws
+  }
+
+  beforeEach(async () => {
+    process.env.NODE_ENV = 'test'
+    process.env.AUTH_TOKEN = 'tabs-sync-token'
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-tabs-registry-'))
+  })
+
+  afterEach(async () => {
+    wsHandler?.close?.()
+    if (server?.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+    await fs.rm(tempDir, { recursive: true, force: true })
+  })
+
+  it('uses protocol version 5 and rejects version 4 clients with reload-required mismatch', async () => {
+    expect(WS_PROTOCOL_VERSION).toBe(5)
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: 4 }))
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH')
+    expect(error.message).toMatch(/expected protocol version 5/i)
+    ws.close()
+  })
+
+  it('accepts v5 push/query, returns same-device/devices, and rejects invalid retention', async () => {
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
 
     ws.send(JSON.stringify({
       type: 'tabs.sync.push',
       deviceId: 'local-device',
-      deviceLabel: 'danlaptop',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
       records: [
         makeRecord({
           tabKey: 'local:open-1',
           tabId: 'open-1',
+          status: 'open',
+        }),
+      ],
+    }))
+    const localAck = await waitForMessage(ws, (msg) => msg.type === 'tabs.sync.ack')
+    expect(localAck).toMatchObject({ accepted: true, openRecords: 1, closedRecords: 0 })
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'local:open-2',
+          tabId: 'open-2',
           status: 'open',
         }),
       ],
@@ -142,11 +176,13 @@ describe('ws tabs registry protocol', () => {
     ws.send(JSON.stringify({
       type: 'tabs.sync.push',
       deviceId: 'remote-device',
-      deviceLabel: 'danshapiromain',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
       records: [
         makeRecord({
           tabKey: 'remote:open-1',
-          tabId: 'open-2',
+          tabId: 'open-3',
           status: 'open',
         }),
         makeRecord({
@@ -156,43 +192,109 @@ describe('ws tabs registry protocol', () => {
           updatedAt: NOW - 2 * 60 * 60 * 1000,
           closedAt: NOW - 2 * 60 * 60 * 1000,
         }),
-        makeRecord({
-          tabKey: 'remote:closed-old',
-          tabId: 'closed-old',
-          status: 'closed',
-          updatedAt: NOW - 5 * 24 * 60 * 60 * 1000,
-          closedAt: NOW - 5 * 24 * 60 * 60 * 1000,
-        }),
       ],
     }))
-    await waitForMessage(ws, (msg) => msg.type === 'tabs.sync.ack')
+    const remoteAck = await waitForMessage(ws, (msg) => msg.type === 'tabs.sync.ack')
+    expect(remoteAck).toMatchObject({ accepted: true, openRecords: 1, closedRecords: 1 })
 
     ws.send(JSON.stringify({
       type: 'tabs.sync.query',
       requestId: 'snapshot-1',
       deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
     }))
     const snapshot = await waitForMessage(
       ws,
       (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'snapshot-1',
     )
 
-    expect(snapshot.data.localOpen.some((record: any) => record.tabKey === 'local:open-1')).toBe(true)
-    expect(snapshot.data.remoteOpen.some((record: any) => record.tabKey === 'remote:open-1')).toBe(true)
-    expect(snapshot.data.closed.some((record: any) => record.tabKey === 'remote:closed-recent')).toBe(true)
-    expect(snapshot.data.closed.some((record: any) => record.tabKey === 'remote:closed-old')).toBe(false)
+    expect(snapshot.data.localOpen.map((record: any) => record.tabKey)).toEqual(['local:open-1'])
+    expect(snapshot.data.sameDeviceOpen.map((record: any) => record.tabKey)).toEqual(['local:open-2'])
+    expect(snapshot.data.remoteOpen.map((record: any) => record.tabKey)).toEqual(['remote:open-1'])
+    expect(snapshot.data.closed.map((record: any) => record.tabKey)).toEqual(['remote:closed-recent'])
+    expect(snapshot.data.devices.map((device: any) => device.deviceId).sort()).toEqual(['local-device', 'remote-device'])
 
     ws.send(JSON.stringify({
       type: 'tabs.sync.query',
-      requestId: 'snapshot-2',
+      requestId: 'bad-retention',
       deviceId: 'local-device',
-      rangeDays: 30,
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 31,
     }))
-    const longRange = await waitForMessage(
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.requestId === 'bad-retention')
+    expect(error.message).toMatch(/closedTabRetentionDays/i)
+    ws.close()
+  })
+
+  it('requires clientInstanceId/snapshotRevision and retires only that client snapshot', async () => {
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      records: [],
+    }))
+    const invalid = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'INVALID_MESSAGE')
+    expect(invalid.message).toMatch(/clientInstanceId|snapshotRevision/)
+
+    for (const clientInstanceId of ['window-a', 'window-b']) {
+      ws.send(JSON.stringify({
+        type: 'tabs.sync.push',
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId,
+        snapshotRevision: 1,
+        records: [
+          makeRecord({
+            tabKey: `local:${clientInstanceId}`,
+            tabId: clientInstanceId,
+            status: 'open',
+          }),
+        ],
+      }))
+      await waitForMessage(ws, (msg) => msg.type === 'tabs.sync.ack')
+    }
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.client.retire',
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+    }))
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.query',
+      requestId: 'snapshot-after-retire',
+      deviceId: 'local-device',
+      clientInstanceId: 'window-b',
+      closedTabRetentionDays: 30,
+    }))
+    const snapshot = await waitForMessage(
       ws,
-      (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'snapshot-2',
+      (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'snapshot-after-retire',
     )
-    expect(longRange.data.closed.some((record: any) => record.tabKey === 'remote:closed-old')).toBe(true)
+    expect(snapshot.data.localOpen.map((record: any) => record.tabKey)).toEqual(['local:window-b'])
+    expect(snapshot.data.sameDeviceOpen).toHaveLength(0)
+    ws.close()
+  })
+
+  it('returns a clear query error when the registry is unavailable', async () => {
+    await startServer()
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.query',
+      requestId: 'missing-store',
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    }))
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.requestId === 'missing-store')
+    expect(error.message).toMatch(/tabs registry unavailable/i)
     ws.close()
   })
 })

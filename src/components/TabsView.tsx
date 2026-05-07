@@ -1,4 +1,4 @@
-import { createElement, memo, useEffect, useMemo, useState } from 'react'
+import { createElement, memo, useEffect, useMemo, useRef, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -19,7 +19,8 @@ import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
-import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
+import { setTabRegistryClosedTabRetentionDays, setTabRegistryLoading } from '@/store/tabRegistrySlice'
+import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { copyText } from '@/lib/clipboard'
@@ -487,9 +488,10 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const store = useAppStore()
   const ws = useMemo(() => getWsClient(), [])
   const groups = useAppSelector(selectTabsRegistryGroups)
-  const { deviceId, deviceLabel, deviceAliases, searchRangeDays, syncError } = useAppSelector(
+  const { deviceId, deviceLabel, deviceAliases, closedTabRetentionDays, searchRangeDays, syncError } = useAppSelector(
     (state) => state.tabRegistry,
   )
+  const effectiveClosedRetentionDays = closedTabRetentionDays ?? searchRangeDays
   const localServerInstanceId = useAppSelector((state) => state.connection.serverInstanceId)
   const connectionStatus = useAppSelector((state) => state.connection.status)
   const connectionError = useAppSelector((state) => state.connection.lastError)
@@ -497,6 +499,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const [query, setQuery] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('all')
   const [scopeMode, setScopeMode] = useState<ScopeMode>('all')
+  const didMountRetentionQuery = useRef(false)
   const [contextMenuState, setContextMenuState] = useState<{
     position: { x: number; y: number }
     items: MenuItem[]
@@ -519,21 +522,25 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   /* -- search range sync -------------------------------------------- */
 
   useEffect(() => {
+    if (!didMountRetentionQuery.current) {
+      didMountRetentionQuery.current = true
+      return
+    }
     if (ws.state !== 'ready') return
-    if (searchRangeDays <= 30) return
     dispatch(setTabRegistryLoading(true))
     ws.sendTabsSyncQuery({
       requestId: `tabs-range-${Date.now()}`,
       deviceId,
-      rangeDays: searchRangeDays,
+      clientInstanceId: getCurrentTabRegistryClientInstanceId(),
+      closedTabRetentionDays: effectiveClosedRetentionDays,
     })
-  }, [dispatch, ws, deviceId, searchRangeDays])
+  }, [dispatch, ws, deviceId, effectiveClosedRetentionDays])
 
   /* -- filtering ---------------------------------------------------- */
 
   const filtered = useMemo(() => {
     const localOpen = groups.localOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
-    const remoteOpen = groups.remoteOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
+    const remoteOpen = [...groups.sameDeviceOpen, ...groups.remoteOpen].map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
     const closed = groups.closed.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
 
     const byScope = (records: DisplayRecord[], scope: 'local' | 'remote') => {
@@ -731,14 +738,15 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
             ariaLabel="Device scope filter"
           />
           <select
-            value={String(searchRangeDays)}
-            onChange={(e) => dispatch(setTabRegistrySearchRangeDays(Number(e.target.value)))}
+            value={String(effectiveClosedRetentionDays)}
+            onChange={(e) => dispatch(setTabRegistryClosedTabRetentionDays(Number(e.target.value)))}
             className="h-7 px-2 text-xs rounded-md border border-border bg-background text-muted-foreground"
             aria-label="Closed range filter"
           >
+            <option value="1">Last 1 day</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
             <option value="30">Last 30 days</option>
-            <option value="90">Last 90 days</option>
-            <option value="365">Last year</option>
           </select>
         </div>
       </div>

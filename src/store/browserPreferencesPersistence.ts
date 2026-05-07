@@ -1,7 +1,7 @@
 import type { Middleware } from '@reduxjs/toolkit'
 
 import { mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
-import { loadBrowserPreferencesRecord, type BrowserPreferencesRecord } from '@/lib/browser-preferences'
+import { DEFAULT_CLOSED_TAB_RETENTION_DAYS, loadBrowserPreferencesRecord, type BrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import type { SettingsState } from './settingsSlice'
@@ -11,16 +11,16 @@ export const BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS = 500
 
 type BrowserPreferencesState = {
   settings: SettingsState
-  tabRegistry: Pick<TabRegistryState, 'searchRangeDays'>
+  tabRegistry: Pick<TabRegistryState, 'closedTabRetentionDays' | 'searchRangeDays'>
 }
 
 type BrowserPreferencesWriteState = {
   settingsPatch?: LocalSettingsPatch
-  hasPendingSearchRangeDays: boolean
-  searchRangeDays: number
+  hasPendingClosedTabRetentionDays: boolean
+  closedTabRetentionDays: number
 }
 
-const DEFAULT_SEARCH_RANGE_DAYS = 30
+const DEFAULT_SEARCH_RANGE_DAYS = DEFAULT_CLOSED_TAB_RETENTION_DAYS
 
 const flushCallbacks = new Set<() => void>()
 let flushListenersAttached = false
@@ -156,9 +156,10 @@ function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserP
     next.settings = settingsPatch
   }
 
-  if (state.tabRegistry.searchRangeDays !== DEFAULT_SEARCH_RANGE_DAYS) {
+  const closedTabRetentionDays = Math.min(30, Math.max(1, state.tabRegistry.closedTabRetentionDays ?? state.tabRegistry.searchRangeDays))
+  if (closedTabRetentionDays !== DEFAULT_SEARCH_RANGE_DAYS) {
     next.tabs = {
-      searchRangeDays: state.tabRegistry.searchRangeDays,
+      closedTabRetentionDays,
     }
   }
 
@@ -172,8 +173,8 @@ function getOrCreatePendingWriteState(getState: BrowserPreferencesMiddlewareGetS
   }
 
   const created: BrowserPreferencesWriteState = {
-    hasPendingSearchRangeDays: false,
-    searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+    hasPendingClosedTabRetentionDays: false,
+    closedTabRetentionDays: DEFAULT_SEARCH_RANGE_DAYS,
   }
   pendingWritesByGetState.set(getState, created)
   return created
@@ -181,8 +182,8 @@ function getOrCreatePendingWriteState(getState: BrowserPreferencesMiddlewareGetS
 
 function resetPendingWriteState(getState: BrowserPreferencesMiddlewareGetState) {
   pendingWritesByGetState.set(getState, {
-    hasPendingSearchRangeDays: false,
-    searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+    hasPendingClosedTabRetentionDays: false,
+    closedTabRetentionDays: DEFAULT_SEARCH_RANGE_DAYS,
   })
 }
 
@@ -192,12 +193,16 @@ export function getPendingBrowserPreferencesWriteState(store: { getState: Browse
     return {
       hasPendingSearchRangeDays: false,
       searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+      hasPendingClosedTabRetentionDays: false,
+      closedTabRetentionDays: DEFAULT_SEARCH_RANGE_DAYS,
     }
   }
   return {
     settingsPatch: pending.settingsPatch,
-    hasPendingSearchRangeDays: pending.hasPendingSearchRangeDays,
-    searchRangeDays: pending.searchRangeDays,
+    hasPendingSearchRangeDays: pending.hasPendingClosedTabRetentionDays,
+    searchRangeDays: pending.closedTabRetentionDays,
+    hasPendingClosedTabRetentionDays: pending.hasPendingClosedTabRetentionDays,
+    closedTabRetentionDays: pending.closedTabRetentionDays,
   }
 }
 
@@ -254,6 +259,7 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       action?.type === 'settings/updateSettingsLocal'
       || action?.type === 'settings/setLocalSettings'
       || action?.type === 'tabRegistry/setTabRegistrySearchRangeDays'
+      || action?.type === 'tabRegistry/setTabRegistryClosedTabRetentionDays'
     ) {
       const pending = getOrCreatePendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
       if (action?.type === 'settings/updateSettingsLocal') {
@@ -261,9 +267,12 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       } else if (action?.type === 'settings/setLocalSettings') {
         const nextPatch = buildLocalSettingsPatch(action.payload as LocalSettings)
         pending.settingsPatch = Object.keys(nextPatch).length > 0 ? nextPatch : undefined
-      } else if (action?.type === 'tabRegistry/setTabRegistrySearchRangeDays') {
-        pending.hasPendingSearchRangeDays = true
-        pending.searchRangeDays = action.payload
+      } else if (
+        action?.type === 'tabRegistry/setTabRegistrySearchRangeDays'
+        || action?.type === 'tabRegistry/setTabRegistryClosedTabRetentionDays'
+      ) {
+        pending.hasPendingClosedTabRetentionDays = true
+        pending.closedTabRetentionDays = Math.min(30, Math.max(1, Math.floor(action.payload)))
       }
       retrySuppressed = false
       dirty = true
