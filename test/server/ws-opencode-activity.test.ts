@@ -207,4 +207,38 @@ describe('ws opencode activity protocol', () => {
     authenticated.close()
     unauthenticated.close()
   })
+
+  it('broadcasts terminal.turn.complete only to authenticated sockets', async () => {
+    const authenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const unauthenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    await Promise.all([
+      new Promise<void>((resolve) => authenticated.on('open', () => resolve())),
+      new Promise<void>((resolve) => unauthenticated.on('open', () => resolve())),
+    ])
+
+    authenticated.send(JSON.stringify({ type: 'hello', token: 'opencode-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(authenticated, (msg) => msg.type === 'ready')
+
+    wsHandler.broadcastTerminalTurnComplete({
+      terminalId: 'term-opencode-1',
+      provider: 'opencode',
+      sessionId: 'session-opencode-1',
+      at: 1234,
+    })
+
+    const completed = await waitForMessage(authenticated, (msg) => msg.type === 'terminal.turn.complete')
+    expect(completed).toEqual({
+      type: 'terminal.turn.complete',
+      terminalId: 'term-opencode-1',
+      provider: 'opencode',
+      sessionId: 'session-opencode-1',
+      at: 1234,
+    })
+
+    await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'terminal.turn.complete')).resolves.toBeUndefined()
+
+    authenticated.close()
+    unauthenticated.close()
+  })
 })

@@ -11,6 +11,7 @@ import panesReducer from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
@@ -52,6 +53,17 @@ vi.mock('@/components/SetupWizard', () => ({
 const defaultServerSettings = createDefaultServerSettings({
   loggingDebug: defaultSettings.logging.debug,
 })
+
+function stubAudio(): void {
+  vi.stubGlobal('Audio', vi.fn(() => ({
+    preload: '',
+    volume: 1,
+    pause: vi.fn(),
+    play: vi.fn().mockResolvedValue(undefined),
+    currentTime: 0,
+    src: '',
+  }) as unknown as HTMLAudioElement))
+}
 
 function createSettingsState(options: {
   server?: ServerSettingsPatch
@@ -168,6 +180,7 @@ function createStore(options?: {
       tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       extensions: extensionsReducer,
+      turnCompletion: turnCompletionReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -214,6 +227,13 @@ function createStore(options?: {
       },
       terminalMeta: { byTerminalId: {} },
       extensions: { entries: [] },
+      turnCompletion: {
+        seq: 0,
+        lastEvent: null,
+        pendingEvents: [],
+        attentionByTab: {},
+        attentionByPane: {},
+      },
     },
   })
 }
@@ -222,6 +242,7 @@ describe('App WS bootstrap recovery', () => {
   beforeEach(() => {
     cleanup()
     vi.resetAllMocks()
+    stubAudio()
     wsMocks.onReconnect.mockReturnValue(() => {})
     wsMocks.onDisconnect.mockImplementation((cb: () => void) => {
       disconnectHandler = cb
@@ -257,6 +278,7 @@ describe('App WS bootstrap recovery', () => {
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
   })
 
   it('marks connection as auth-required and skips websocket connect when the bootstrap request returns 401', async () => {
@@ -906,6 +928,73 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.status).toBe('disconnected')
       expect(store.getState().opencodeActivity.byTerminalId).toEqual({})
     })
+  })
+
+  it('records OpenCode turn completion from the production WebSocket message path', async () => {
+    const store = createStore({
+      tabs: [{
+        id: 'tab-opencode',
+        createRequestId: 'req-opencode',
+        title: 'OpenCode',
+        status: 'running',
+        mode: 'opencode',
+        shell: 'system',
+        terminalId: 'term-opencode',
+        createdAt: 1,
+      }],
+      panes: {
+        layouts: {
+          'tab-opencode': {
+            type: 'leaf',
+            id: 'pane-opencode',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-opencode',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-opencode',
+              initialCwd: '/workspace',
+            },
+          },
+        },
+        activePane: {
+          'tab-opencode': 'pane-opencode',
+        },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-turn-complete'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.turn.complete',
+        terminalId: 'term-opencode',
+        provider: 'opencode',
+        sessionId: 'session-opencode',
+        at: 1234,
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.lastEvent).toMatchObject({
+        tabId: 'tab-opencode',
+        paneId: 'pane-opencode',
+        terminalId: 'term-opencode',
+        at: 1234,
+      })
+    })
+    expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
   it('keeps the WS message handler registered after an initial connect failure, so a later ready can recover state', async () => {

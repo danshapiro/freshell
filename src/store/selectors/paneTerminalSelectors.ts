@@ -49,6 +49,19 @@ export function selectTabIdByTerminalId(state: RootState, terminalId: string): s
   return undefined
 }
 
+export function selectTabPaneByTerminalId(
+  state: RootState,
+  terminalId: string,
+): { tabId: string; paneId: string } | undefined {
+  for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+    const paneId = findPaneIdByTerminalId(layout, terminalId)
+    if (paneId) {
+      return { tabId, paneId }
+    }
+  }
+  return undefined
+}
+
 function findFirstTerminalId(node: PaneNode): string | undefined {
   if (node.type === 'leaf') {
     return node.content.kind === 'terminal' ? node.content.terminalId : undefined
@@ -62,4 +75,14 @@ function nodeContainsTerminalId(node: PaneNode, terminalId: string): boolean {
   }
   return nodeContainsTerminalId(node.children[0], terminalId)
     || nodeContainsTerminalId(node.children[1], terminalId)
+}
+
+function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
+  if (node.type === 'leaf') {
+    return node.content.kind === 'terminal' && node.content.terminalId === terminalId
+      ? node.id
+      : undefined
+  }
+  return findPaneIdByTerminalId(node.children[0], terminalId)
+    ?? findPaneIdByTerminalId(node.children[1], terminalId)
 }

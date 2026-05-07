@@ -93,6 +93,62 @@ describe('OpencodeActivityTracker', () => {
     tracker.dispose()
   })
 
+  it('opens SSE before snapshot and emits completion only after association is confirmed', async () => {
+    vi.useFakeTimers()
+    const requestOrder: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        requestOrder.push('/global/health')
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/event')) {
+        requestOrder.push('/event')
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-oc',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.idle',
+            properties: {
+              sessionID: 'session-oc',
+            },
+          },
+        ])
+      }
+      if (url.endsWith('/session/status')) {
+        requestOrder.push('/session/status')
+        return createJsonResponse({})
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+    const completions: unknown[] = []
+    tracker.on('association.requested', (payload) => {
+      expect(completions).toEqual([])
+      tracker.confirmSessionAssociation(payload)
+    })
+    tracker.on('turn.complete', (payload) => completions.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(requestOrder.slice(0, 3)).toEqual(['/global/health', '/event', '/session/status'])
+    expect(completions).toEqual([{
+      terminalId: 'term-oc',
+      sessionId: 'session-oc',
+      at: expect.any(Number),
+    }])
+
+    tracker.dispose()
+  })
+
   it('keeps health polling on connection errors until the endpoint comes up', async () => {
     vi.useFakeTimers()
     let healthCalls = 0
@@ -148,6 +204,13 @@ describe('OpencodeActivityTracker', () => {
       if (url.endsWith('/event')) {
         return createSseResponse([
           { type: 'server.connected', properties: {} },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-oc',
+              status: { type: 'busy' },
+            },
+          },
           {
             type: 'session.status',
             properties: {
@@ -284,7 +347,15 @@ describe('OpencodeActivityTracker', () => {
       }
       if (url.endsWith('/event')) {
         return createRawSseResponse([
+          `data: ${JSON.stringify({ type: 'server.connected', properties: {} })}\n\n`,
           'data: {not valid json}\n\n',
+          `data: ${JSON.stringify({
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-oc',
+              status: { type: 'busy' },
+            },
+          })}\n\n`,
           `data: ${JSON.stringify({ type: 'session.idle', properties: { sessionID: 'session-oc' } })}\n\n`,
         ])
       }
@@ -340,6 +411,13 @@ describe('OpencodeActivityTracker', () => {
         return createRawSseResponse([
           `data: ${JSON.stringify({ type: 'server.connected', properties: {} })}\n\n`,
           `data: ${JSON.stringify({ type: 'session.progress', properties: { percent: 50 } })}\n\n`,
+          `data: ${JSON.stringify({
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-oc',
+              status: { type: 'busy' },
+            },
+          })}\n\n`,
           `data: ${JSON.stringify({ type: 'session.idle', properties: { sessionID: 'session-oc' } })}\n\n`,
         ])
       }
