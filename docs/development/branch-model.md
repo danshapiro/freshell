@@ -78,7 +78,7 @@ Initial migration queue:
 | #324 | `fc8a953565c8c4e416fc7bc0e951b0888c8ed421` | Durable session restore identity parity |
 | #326 | Current PR head | Codex sidecar resilience parity |
 | #325 | Current PR head | Intentional removal of broken Codex notification launch args |
-| #322 | `26601cec20434790936af3a3f9cc823c8c19f984` | Replacement for externally-owned factory terminal orchestration PR |
+| #322 | Current PR head | Replacement for externally-owned factory terminal orchestration PR |
 
 Initial migration exclusions:
 
