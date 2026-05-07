@@ -53,7 +53,7 @@ Use an explicit queue. Do not blindly apply every open PR.
 Example:
 
 ```bash
-npm run dev:queue -- plan --prs 323,321,309,319,322
+npm run dev:queue -- plan --prs 323,321,309,319,324,326,325,322
 ```
 
 The queue script must fail if a PR is draft, closed, not targeting `main`, or cannot be applied cleanly. Fix PR branches before rebuilding `dev`.
@@ -62,7 +62,7 @@ To rebuild local `dev`:
 
 ```bash
 git switch dev
-npm run dev:queue -- assemble --prs 323,321,309,319,322
+npm run dev:queue -- assemble --prs 323,321,309,319,324,326,325,322
 ```
 
 Use replacement PR numbers instead of external or superseded PRs. If the script stops on a conflict, do not resolve the conflict on `dev`. Abort the merge, fix the PR branch, and rerun the queue.
@@ -75,7 +75,10 @@ Initial migration queue:
 | #321 | `7eae9acf13d2ecf36de6ecade8354cb22b944f7b` | Sidebar reopen corner behavior |
 | #309 | `93c0e15f8b3e04d7e1bbd8ab312619ae28cfefa2` | Codex startup cwd fix |
 | #319 | `48927eef6b46a2232ebe31d1e1dea38d2203eb72` | OpenCode native scroll behavior |
-| #322 | `0a334be42553929aed033c3aa3920d0bf58a2a65` | Replacement for externally-owned factory terminal orchestration PR |
+| #324 | `fc8a953565c8c4e416fc7bc0e951b0888c8ed421` | Durable session restore identity parity |
+| #326 | Current PR head | Codex sidecar resilience parity |
+| #325 | Current PR head | Intentional removal of broken Codex notification launch args |
+| #322 | `26601cec20434790936af3a3f9cc823c8c19f984` | Replacement for externally-owned factory terminal orchestration PR |
 
 Initial migration exclusions:
 
