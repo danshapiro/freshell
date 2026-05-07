@@ -210,7 +210,7 @@ function reduceIdle(
   observation: Extract<OpencodeObservation, { kind: 'sse' }>,
 ): OpencodeOwnershipResult {
   if (state.kind === 'candidate') {
-    if (state.startedBy !== 'sse' || !sameSessionStream(state, observation)) return { state, actions: [] }
+    if (!sameSessionStream(state, observation)) return { state, actions: [] }
     return {
       state: {
         kind: 'awaitingAssociation',
@@ -228,7 +228,7 @@ function reduceIdle(
   }
 
   if (state.kind === 'knownBusy') {
-    if (state.startedBy !== 'sse' || !sameSessionStream(state, observation)) return { state, actions: [] }
+    if (!sameSessionStream(state, observation)) return { state, actions: [] }
     return {
       state: {
         kind: 'quiet',
@@ -238,6 +238,27 @@ function reduceIdle(
         { kind: 'activityRemove', at: observation.at },
         { kind: 'turnComplete', sessionId: state.sessionId, at: observation.at },
       ],
+    }
+  }
+
+  if (state.kind === 'ambiguous') {
+    if (!state.blockedSessionIds.includes(observation.sessionId)) {
+      return { state, actions: [] }
+    }
+
+    const blockedSessionIds = state.blockedSessionIds.filter(
+      (sessionId) => sessionId !== observation.sessionId,
+    )
+    if (blockedSessionIds.length === 0) {
+      return {
+        state: { kind: 'quiet', knownSessionId: state.knownSessionId },
+        actions: [{ kind: 'activityRemove', at: observation.at }],
+      }
+    }
+
+    return {
+      state: { ...state, blockedSessionIds },
+      actions: [{ kind: 'activityUpsert', at: observation.at }],
     }
   }
 

@@ -167,6 +167,70 @@ describe('opencode ownership reducer', () => {
     expect(result.actions).toEqual([{ kind: 'activityRemove', at: 30 }])
   })
 
+  it('clears ambiguous ownership after every blocked session idles on the live stream', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    })
+    state = result.state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 20,
+    })
+    state = result.state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-b'],
+      since: 11,
+    })
+    expect(result.actions).toEqual([{ kind: 'activityUpsert', at: 20 }])
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'idle',
+      at: 21,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: undefined,
+    })
+    expect(result.actions).toEqual([{ kind: 'activityRemove', at: 21 }])
+  })
+
   it('never emits turn completion from snapshots', () => {
     let state = createOpencodeOwnershipState('session-a')
 
@@ -199,7 +263,7 @@ describe('opencode ownership reducer', () => {
     }))
   })
 
-  it('does not associate or complete a snapshot-only busy interval from live idle', () => {
+  it('requests association for a snapshot-seeded candidate that idles on the same live stream', () => {
     let state = createOpencodeOwnershipState()
 
     let result = reduceOpencodeOwnership(state, {
@@ -217,6 +281,46 @@ describe('opencode ownership reducer', () => {
       kind: 'sse',
       cycleId: 1,
       streamId: 1,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 20,
+    })
+    state = result.state
+
+    expect(result.actions).toEqual([
+      { kind: 'activityRemove', at: 20 },
+      { kind: 'requestAssociation', sessionId: 'session-a' },
+    ])
+
+    result = confirmOpencodeAssociation(state, { sessionId: 'session-a' })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: 'session-a',
+    })
+    expect(result.actions).toEqual([
+      { kind: 'turnComplete', sessionId: 'session-a', at: 20 },
+    ])
+  })
+
+  it('ignores a stale-stream idle for a snapshot-seeded busy interval', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 2,
       sessionId: 'session-a',
       status: 'idle',
       at: 20,
