@@ -304,14 +304,25 @@ const TabsSyncPushSchema = z.object({
   type: z.literal('tabs.sync.push'),
   deviceId: z.string().min(1),
   deviceLabel: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
   records: z.array(TabsSyncPushRecordSchema),
 })
+type TabsSyncPushRecord = z.infer<typeof TabsSyncPushRecordSchema>
 
 const TabsSyncQuerySchema = z.object({
   type: z.literal('tabs.sync.query'),
   requestId: z.string().min(1),
   deviceId: z.string().min(1),
-  rangeDays: z.number().int().positive().optional(),
+  clientInstanceId: z.string().min(1),
+  closedTabRetentionDays: z.number().int().min(1).max(30),
+})
+
+const TabsSyncClientRetireSchema = z.object({
+  type: z.literal('tabs.sync.client.retire'),
+  deviceId: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
 })
 
 type ClientState = {
@@ -507,6 +518,7 @@ export class WsHandler {
       OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
+      TabsSyncClientRetireSchema,
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
@@ -2422,30 +2434,56 @@ export class WsHandler {
           })
           return
         }
-        for (const record of m.records) {
-          await this.tabsRegistryStore.upsert({
+        const result = await this.tabsRegistryStore.replaceClientSnapshot({
+          deviceId: m.deviceId,
+          deviceLabel: m.deviceLabel,
+          clientInstanceId: m.clientInstanceId,
+          snapshotRevision: m.snapshotRevision,
+          records: m.records.map((record: TabsSyncPushRecord) => ({
             ...record,
             serverInstanceId: this.serverInstanceId,
             deviceId: m.deviceId,
             deviceLabel: m.deviceLabel,
+          })),
+        })
+        this.send(ws, {
+          type: 'tabs.sync.ack',
+          accepted: result.accepted,
+          openRecords: result.openRecords,
+          closedRecords: result.closedRecords,
+        })
+        return
+      }
+
+      case 'tabs.sync.client.retire': {
+        if (!this.tabsRegistryStore) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
           })
+          return
         }
-        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
+        await this.tabsRegistryStore.retireClientSnapshot({
+          deviceId: m.deviceId,
+          clientInstanceId: m.clientInstanceId,
+          snapshotRevision: m.snapshotRevision,
+        })
         return
       }
 
       case 'tabs.sync.query': {
         if (!this.tabsRegistryStore) {
-          this.send(ws, {
-            type: 'tabs.sync.snapshot',
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
             requestId: m.requestId,
-            data: { localOpen: [], remoteOpen: [], closed: [] },
           })
           return
         }
         const data = await this.tabsRegistryStore.query({
           deviceId: m.deviceId,
-          rangeDays: m.rangeDays,
+          clientInstanceId: m.clientInstanceId,
+          closedTabRetentionDays: m.closedTabRetentionDays,
         })
         this.send(ws, {
           type: 'tabs.sync.snapshot',
