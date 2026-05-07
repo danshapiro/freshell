@@ -355,6 +355,7 @@ Revised snapshot data:
   sameDeviceOpen: RegistryTabRecord[]
   remoteOpen: RegistryTabRecord[]
   closed: RegistryTabRecord[]
+  devices: RegistryDeviceEntry[]
 }
 ```
 
@@ -363,8 +364,10 @@ Rules:
 - `localOpen` contains only records owned by the querying `(deviceId, clientInstanceId)`.
 - `sameDeviceOpen` contains records from other browser windows with the same `deviceId`.
 - `remoteOpen` contains records from other devices.
+- `devices` contains recent device metadata from `listDevices()`, filtered by the 7-day device display TTL and sorted by `lastSeenAt` descending.
 - Open records should include source metadata (`deviceId`, `deviceLabel`, `clientInstanceId`) so the UI cannot accidentally treat same-device-other-window records as jumpable local tabs.
 - The Tabs view may continue deriving currently open local tabs from Redux for jump actions, but server-returned same-device records must be treated like copy/pullable records, not like current-window jump targets.
+- The Settings Devices view reads device rows from `tabs.sync.snapshot.data.devices` and combines that with the current local device identity if the current device has not yet received a server ack.
 
 ## Store API
 
@@ -624,6 +627,7 @@ Revised behavior:
 - Send closed records from local memory while they exist and are within retention.
 - Do not rely on omission to delete server-side closed records.
 - Add a forced heartbeat/snapshot interval so idle active browsers refresh `snapshotReceivedAt`.
+- Real tab lifecycle changes still update the affected record's `updatedAt` before the next push.
 - Do not update per-record `updatedAt` for unchanged open tabs during heartbeat.
 - Send a best-effort `tabs.sync.client.retire` when the app/window is closing, while keeping TTL as the correctness backstop.
 
@@ -673,8 +677,9 @@ Settings:
 
 Device management:
 
-- Settings "Devices" should represent own device plus recent remote devices from `devicesById`.
+- Settings "Devices" should represent own device plus recent remote devices from `tabs.sync.snapshot.data.devices`.
 - `devicesById` is updated only from server receipt of accepted client messages, not from historical closed-record timestamps.
+- The server sends `devices` in every `tabs.sync.snapshot` response; no separate device endpoint is needed for this change.
 - Do not keep a remote device row alive solely because it has a closed tombstone retained for 30 days.
 - Keep a remote device row for up to 7 days after `lastSeenAt`, even after its open snapshots expire at 30 minutes.
 - Closed tab cards can still show the record's device label.
@@ -743,6 +748,7 @@ Integration/persistence tests:
 
 - Manifest-referenced per-client snapshot objects, closed tombstones, and devices rehydrate without JSONL.
 - Orphaned objects/temp files from interrupted writes are ignored on startup.
+- Maintenance garbage-collects unreferenced objects after successful commits and preserves every object referenced by the current manifest.
 - Crash/restart before manifest publish loads the previous committed state.
 - Crash/restart after manifest publish loads the new committed state.
 - Legacy JSONL migration computes latest per tab before pruning.
@@ -765,6 +771,7 @@ WebSocket tests:
 - `tabs.sync.client.retire` removes only that client snapshot and rejects/ignores stale revisions.
 - Query requires/uses `clientInstanceId` and `closedTabRetentionDays`.
 - Snapshot data includes `sameDeviceOpen`.
+- Snapshot data includes `devices` from `listDevices()`.
 - `closedTabRetentionDays > 30` is rejected.
 - Missing registry returns clear error for query, not empty snapshot.
 
@@ -775,6 +782,7 @@ Client tests:
 - Reload preserves client id/revision; new window gets a distinct id.
 - Duplicated-tab `sessionStorage` collision is detected and rotated.
 - Forced heartbeat sends even when record fingerprint is unchanged.
+- Real tab lifecycle changes update the changed open record's `updatedAt`.
 - Heartbeat does not mutate tab record `updatedAt`.
 - Best-effort retire is sent on close/pagehide where the environment supports it.
 - Closed records older than retention are not sent.
@@ -785,7 +793,7 @@ Client tests:
 - Tabs view no longer offers 90/365.
 - Tabs view does not offer jump actions for `sameDeviceOpen` records from other browser windows.
 - Settings devices are not kept alive solely by closed tombstones.
-- Settings devices are kept by `devicesById` until the 7-day display TTL.
+- Settings devices read `tabs.sync.snapshot.data.devices` and are kept by `devicesById` until the 7-day display TTL.
 - `docs/index.html` mock is updated if it shows the old 90/365 retention options.
 
 ### Phase 2: Compact Store Types And Helpers
@@ -860,7 +868,7 @@ Add protocol handling for:
 await tabsRegistryStore.retireClientSnapshot(...)
 ```
 
-Include `clientInstanceId` in query messages and return `sameDeviceOpen` in snapshots.
+Include `clientInstanceId` in query messages and return `sameDeviceOpen` plus `devices` in snapshots.
 Increment `WS_PROTOCOL_VERSION` to 5 and rely on the existing protocol mismatch path for old loaded clients, with clearer reload-required copy if needed.
 Do not send empty snapshots when the registry is unavailable. Send a clear error.
 
@@ -912,6 +920,7 @@ Tabs View:
 Devices:
 
 - base device rows on `devicesById`/server device metadata
+- hydrate device rows from `tabs.sync.snapshot.data.devices`
 - keep aliases/dismissal behavior
 - do not use closed-only records to keep stale devices alive
 
@@ -944,6 +953,7 @@ Manual perf verification:
 6. Confirm legacy JSONL is archived.
 7. Confirm remote tabs and recently closed tabs still appear correctly.
 8. Benchmark heartbeat write latency near the configured caps and confirm it writes only the relevant client snapshot object, small device metadata object if needed, and manifest.
+9. Confirm unreferenced-object garbage collection bounds disk usage after repeated heartbeat commits and never removes manifest-referenced objects.
 
 Expected result:
 
@@ -962,6 +972,7 @@ Expected result:
 - Same-device multiple browser windows cannot erase each other's open tabs.
 - Same-device other-window tabs are distinguishable from current-window local tabs.
 - Same-window reloads reuse the same `sessionStorage` client id and replace the prior snapshot.
+- `tabs.sync.snapshot.data.devices` is the client transport for recent device metadata.
 - Closed history survives browser reload and server restart for up to 30 days.
 - Retained closed tombstones participate in conflict resolution before requested-range filtering.
 - Newer reopened open records delete older closed tombstones so stale closed cards do not return after open TTL expiry.
@@ -970,6 +981,7 @@ Expected result:
 - Remote open snapshots fall away after 30 minutes without server receipt.
 - Remote device rows are backed by `devicesById` and fall away after 7 days without server receipt.
 - Idle active browser instances remain fresh through heartbeat.
+- Real tab lifecycle changes advance the affected record's `updatedAt`.
 - Heartbeat updates snapshot liveness without changing per-record `updatedAt`.
 - Best-effort retire removes only the calling client snapshot and stale retires cannot delete newer snapshots.
 - Retention default is 30 days.
@@ -978,6 +990,7 @@ Expected result:
 - Query is pure; pruning happens through queued maintenance writes.
 - Failed atomic writes do not change live query results.
 - Crash/restart before manifest publish loads previous state; crash/restart after manifest publish loads new state.
+- Unreferenced-object garbage collection keeps disk bounded without deleting manifest-referenced objects.
 - Legacy migration has explicit memory/size caps and uses migration-time liveness for synthetic open snapshots.
 - Query failures are explicit; no empty-snapshot fallback.
 - Oversized/malformed pushes are rejected clearly.
