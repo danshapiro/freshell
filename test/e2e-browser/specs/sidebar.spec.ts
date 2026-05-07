@@ -26,6 +26,61 @@ test.describe('Sidebar', () => {
     await expect(page.getByRole('button', { name: /hide sidebar/i })).toBeVisible()
   })
 
+  test('sidebar reopen button stays fixed when overflowing tabs are scrolled', async ({ freshellPage, page }) => {
+    await page.setViewportSize({ width: 900, height: 700 })
+    await page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Freshell test harness is not installed')
+      for (let i = 0; i < 18; i += 1) {
+        harness.dispatch({
+          type: 'tabs/addTab',
+          payload: {
+            id: `overflow-tab-${i}`,
+            createRequestId: `overflow-tab-${i}`,
+            title: `Overflow tab ${i}`,
+            mode: 'shell',
+            shell: 'system',
+            status: 'running',
+          },
+        })
+      }
+    })
+    await page.waitForFunction(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.tabs?.tabs?.length ?? 0
+    ) >= 18)
+
+    const collapseButton = page.getByRole('button', { name: /hide sidebar/i })
+    await collapseButton.click()
+
+    const showButton = page.getByRole('button', { name: /show sidebar/i })
+    await expect(showButton).toBeVisible({ timeout: 3_000 })
+
+    const tabBar = page.locator('[data-context="global"]').filter({
+      has: page.getByRole('button', { name: /new shell tab/i }),
+    }).first()
+    const tabScroller = tabBar.locator('.overflow-x-auto').first()
+    await expect(tabScroller).toBeVisible()
+    await expect.poll(async () => tabScroller.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true)
+
+    const before = await showButton.boundingBox()
+    expect(before).not.toBeNull()
+
+    const scrollLeft = await tabScroller.evaluate((element) => {
+      element.scrollLeft = element.scrollWidth
+      element.dispatchEvent(new Event('scroll', { bubbles: true }))
+      return element.scrollLeft
+    })
+    expect(scrollLeft).toBeGreaterThan(0)
+
+    const after = await showButton.boundingBox()
+    const scrollerBox = await tabScroller.boundingBox()
+    expect(after).not.toBeNull()
+    expect(scrollerBox).not.toBeNull()
+    expect(after!.x).toBeCloseTo(before!.x, 0)
+    expect(after!.x).toBeGreaterThanOrEqual(0)
+    expect(after!.x + after!.width).toBeLessThanOrEqual(scrollerBox!.x)
+  })
+
   test('sidebar shows navigation buttons', async ({ freshellPage, page }) => {
     // Nav buttons have title attributes like "Settings (Ctrl+B ,)", "Tabs (Ctrl+B A)", etc.
     // Playwright matches title as accessible name for buttons with no text/aria-label.
