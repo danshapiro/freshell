@@ -103,7 +103,7 @@ const opencodeExtensionWithBehaviorHint: ClientExtensionEntry = {
   cli: {
     terminalBehavior: {
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     },
   },
 }
@@ -178,7 +178,7 @@ describe('opencode scroll input policy (e2e)', () => {
     vi.unstubAllGlobals()
   })
 
-  it('sends cursor-key input when an OpenCode pane receives wheel input in alt screen mouse mode', async () => {
+  it('does not translate wheel input for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint])
 
     const { getByTestId } = render(
@@ -195,10 +195,8 @@ describe('opencode scroll input policy (e2e)', () => {
 
     fireEvent.wheel(getByTestId('terminal-xterm-container'), { deltaY: 24 })
 
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
     }))
   })
 

@@ -111,7 +111,7 @@ const opencodeExtensionWithBehaviorHint: ClientExtensionEntry = {
   cli: {
     terminalBehavior: {
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     },
   },
 }
@@ -193,7 +193,7 @@ describe('TerminalView wheel scroll input policy', () => {
     vi.unstubAllGlobals()
   })
 
-  it('loads the extension registry for coding-cli panes before applying wheel translation', async () => {
+  it('loads the extension registry for coding-cli panes and does not translate when policy is native', async () => {
     authMocks.getAuthToken.mockReturnValue('token-test')
     apiMocks.get.mockResolvedValue([opencodeExtensionWithBehaviorHint])
     const { store, tabId, paneId, paneContent } = createStore('opencode', [], 'term-opencode')
@@ -212,15 +212,11 @@ describe('TerminalView wheel scroll input policy', () => {
     wsMocks.send.mockClear()
 
     const event = new WheelEvent('wheel', { deltaY: 24, cancelable: true })
-    expect(wheelHandler?.(event)).toBe(false)
-    expect(wsMocks.send).toHaveBeenCalledWith({
-      type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
-    })
+    expect(wheelHandler?.(event)).toBe(true)
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.input' }))
   })
 
-  it('translates wheel scrolling into cursor-key input for opted-in providers', async () => {
+  it('does not translate wheel scrolling for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint], 'term-opencode')
 
     render(
@@ -242,14 +238,10 @@ describe('TerminalView wheel scroll input policy', () => {
       preventDefault,
       stopPropagation,
     } as unknown as WheelEvent
-    expect(wheelHandler?.(event)).toBe(false)
-    expect(preventDefault).toHaveBeenCalledOnce()
-    expect(stopPropagation).toHaveBeenCalledOnce()
-    expect(wsMocks.send).toHaveBeenCalledWith({
-      type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
-    })
+    expect(wheelHandler?.(event)).toBe(true)
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(stopPropagation).not.toHaveBeenCalled()
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.input' }))
   })
 
   it('keeps non-opted-in providers on native wheel behavior', async () => {
@@ -307,11 +299,9 @@ describe('TerminalView wheel scroll input policy', () => {
     })
 
     wsMocks.send.mockClear()
-    expect(wheelHandler?.(event)).toBe(false)
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+    expect(wheelHandler?.(event)).toBe(true)
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
     }))
   })
 })

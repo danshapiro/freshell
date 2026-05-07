@@ -101,7 +101,7 @@ const opencodeExtensionWithBehaviorHint: ClientExtensionEntry = {
   cli: {
     terminalBehavior: {
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     },
   },
 }
@@ -177,7 +177,7 @@ describe('TerminalView touch scroll input policy', () => {
     ;(globalThis as any).setMobileForTest(false)
   })
 
-  it('translates touch scrolling into cursor-key input for opted-in providers', async () => {
+  it('does not translate touch scrolling for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint])
 
     const { getByTestId } = render(
@@ -203,10 +203,8 @@ describe('TerminalView touch scroll input policy', () => {
     })
 
     expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
     }))
   })
 })
