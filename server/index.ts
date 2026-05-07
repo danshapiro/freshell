@@ -189,7 +189,7 @@ async function main() {
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
-  const tabsRegistryStore = createTabsRegistryStore()
+  const tabsRegistryStore = await createTabsRegistryStore()
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   AI_CONFIG.applySettingsKey(settings.ai?.geminiApiKey)

@@ -9,6 +9,8 @@ import {
 import type { RegistryTabRecord } from '../../../../server/tabs-registry/types.js'
 
 const NOW = 1_740_000_000_000
+const MINUTE_MS = 60 * 1000
+const DAY_MS = 24 * 60 * 60 * 1000
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -29,99 +31,404 @@ function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   }
 }
 
-describe('TabsRegistryStore', () => {
+async function replace(
+  store: TabsRegistryStore,
+  input: {
+    deviceId: string
+    deviceLabel?: string
+    clientInstanceId: string
+    snapshotRevision: number
+    records: RegistryTabRecord[]
+  },
+) {
+  return store.replaceClientSnapshot({
+    deviceId: input.deviceId,
+    deviceLabel: input.deviceLabel ?? input.deviceId,
+    clientInstanceId: input.clientInstanceId,
+    snapshotRevision: input.snapshotRevision,
+    records: input.records,
+  })
+}
+
+describe('TabsRegistryStore compact state', () => {
   let tempDir: string
+  let now = NOW
   let store: TabsRegistryStore
 
   beforeEach(async () => {
+    now = NOW
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'tabs-registry-store-'))
-    store = createTabsRegistryStore(tempDir, { now: () => NOW })
+    store = await createTabsRegistryStore(tempDir, { now: () => now })
   })
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('returns only live + closed within 24h for default snapshot', async () => {
-    const recordOpen = makeRecord({
-      tabKey: 'local:open-1',
-      tabId: 'open-1',
+  it('scopes open replacement to one client instance and splits same-device open tabs', async () => {
+    await replace(store, {
       deviceId: 'local-device',
-      status: 'open',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local', tabName: 'A' }),
+      ],
     })
-    const recordClosedRecent = makeRecord({
-      tabKey: 'remote:closed-recent',
-      tabId: 'closed-recent',
-      deviceId: 'remote-device',
-      status: 'closed',
-      closedAt: NOW - 2 * 60 * 60 * 1000,
-      updatedAt: NOW - 2 * 60 * 60 * 1000,
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:b', tabId: 'b', deviceId: 'local-device', deviceLabel: 'local', tabName: 'B' }),
+      ],
     })
-    const recordClosedOld = makeRecord({
-      tabKey: 'remote:closed-old',
-      tabId: 'closed-old',
+    await replace(store, {
       deviceId: 'remote-device',
-      status: 'closed',
-      closedAt: NOW - 3 * 24 * 60 * 60 * 1000,
-      updatedAt: NOW - 3 * 24 * 60 * 60 * 1000,
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'remote:r', tabId: 'r', deviceId: 'remote-device', deviceLabel: 'remote', tabName: 'R' }),
+      ],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [
+        makeRecord({ tabKey: 'local:a2', tabId: 'a2', deviceId: 'local-device', deviceLabel: 'local', tabName: 'A2' }),
+      ],
     })
 
-    await store.upsert(recordOpen)
-    await store.upsert(recordClosedRecent)
-    await store.upsert(recordClosedOld)
-
-    const result = await store.query({ deviceId: 'local-device' })
-    expect(result.localOpen.some((record) => record.tabKey === recordOpen.tabKey)).toBe(true)
-    expect(result.closed.some((record) => record.tabKey === recordClosedRecent.tabKey)).toBe(true)
-    expect(result.closed.some((record) => record.tabKey === recordClosedOld.tabKey)).toBe(false)
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen.map((record) => record.tabKey)).toEqual(['local:a2'])
+    expect(result.sameDeviceOpen.map((record) => record.tabKey)).toEqual(['local:b'])
+    expect(result.remoteOpen.map((record) => record.tabKey)).toEqual(['remote:r'])
   })
 
-  it('groups remote open tabs separately', async () => {
-    await store.upsert(makeRecord({
-      tabKey: 'local:open-1',
-      tabId: 'open-1',
+  it('rejects stale revisions but accepts same-revision idempotent retries only with matching content', async () => {
+    const record = makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local' })
+    await expect(replace(store, {
       deviceId: 'local-device',
-      status: 'open',
-    }))
-    await store.upsert(makeRecord({
-      tabKey: 'remote:open-1',
-      tabId: 'open-2',
-      deviceId: 'remote-device',
-      status: 'open',
-    }))
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [record],
+    })).resolves.toMatchObject({ accepted: true, openRecords: 1, closedRecords: 0 })
 
-    const result = await store.query({ deviceId: 'local-device' })
-    expect(result.localOpen).toHaveLength(1)
-    expect(result.remoteOpen).toHaveLength(1)
-    expect(result.remoteOpen[0]?.deviceId).toBe('remote-device')
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [record],
+    })).rejects.toThrow(/stale snapshot revision/i)
+
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [record],
+    })).resolves.toMatchObject({ accepted: true, openRecords: 1, closedRecords: 0 })
+
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [{ ...record, tabName: 'different' }],
+    })).rejects.toThrow(/duplicate snapshot revision/i)
   })
 
-  it('uses last-write-wins by revision and updatedAt', async () => {
-    const base = makeRecord({
-      tabKey: 'local:open-1',
+  it('retire removes only the matching client snapshot and ignores stale retires', async () => {
+    await replace(store, {
       deviceId: 'local-device',
-      tabName: 'older',
-      revision: 2,
-      updatedAt: NOW - 4_000,
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 3,
+      records: [
+        makeRecord({ tabKey: 'local:a', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
     })
-    const stale = makeRecord({
-      ...base,
-      tabName: 'stale',
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:b', tabId: 'b', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
+    })
+
+    await expect(store.retireClientSnapshot({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+    })).resolves.toEqual({ accepted: false })
+    await expect(store.retireClientSnapshot({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 4,
+    })).resolves.toEqual({ accepted: true })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-b',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen.map((record) => record.tabKey)).toEqual(['local:b'])
+    expect(result.sameDeviceOpen).toHaveLength(0)
+  })
+
+  it('keeps closed tombstones across later omissions and uses updatedAt before revision for LWW', async () => {
+    const staleOpen = makeRecord({
+      tabKey: 'local:a',
+      tabId: 'a',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'open',
+      revision: 50,
+      updatedAt: NOW - 10_000,
+    })
+    const newerClosedLowerRevision = makeRecord({
+      ...staleOpen,
+      status: 'closed',
       revision: 1,
       updatedAt: NOW - 1_000,
+      closedAt: NOW - 1_000,
     })
-    const newer = makeRecord({
-      ...base,
-      tabName: 'newer',
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [staleOpen],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [newerClosedLowerRevision],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [],
+    })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen).toHaveLength(0)
+    expect(result.closed.map((record) => record.tabKey)).toEqual(['local:a'])
+  })
+
+  it('lets a newer open delete an older closed tombstone so it cannot return after TTL or restart', async () => {
+    const closed = makeRecord({
+      tabKey: 'local:a',
+      tabId: 'a',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'closed',
+      revision: 1,
+      updatedAt: NOW - 10_000,
+      closedAt: NOW - 10_000,
+    })
+    const reopened = makeRecord({
+      ...closed,
+      status: 'open',
       revision: 2,
-      updatedAt: NOW,
+      updatedAt: NOW - 1_000,
+      closedAt: undefined,
     })
 
-    await store.upsert(base)
-    await store.upsert(stale)
-    await store.upsert(newer)
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [closed],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [reopened],
+    })
 
-    const result = await store.query({ deviceId: 'local-device' })
-    expect(result.localOpen[0]?.tabName).toBe('newer')
+    now = NOW + 31 * MINUTE_MS
+    const restarted = await createTabsRegistryStore(tempDir, { now: () => now })
+    const result = await restarted.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen).toHaveLength(0)
+    expect(result.closed).toHaveLength(0)
+  })
+
+  it('uses retained closed winners for conflict resolution before requested retention filtering', async () => {
+    const oldOpen = makeRecord({
+      tabKey: 'remote:a',
+      tabId: 'a',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      status: 'open',
+      revision: 3,
+      updatedAt: NOW - 12 * DAY_MS,
+    })
+    const closedTenDaysAgo = makeRecord({
+      ...oldOpen,
+      status: 'closed',
+      revision: 1,
+      updatedAt: NOW - 10 * DAY_MS,
+      closedAt: NOW - 10 * DAY_MS,
+    })
+    await replace(store, {
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
+      records: [oldOpen],
+    })
+    await replace(store, {
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-closer',
+      snapshotRevision: 1,
+      records: [closedTenDaysAgo],
+    })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 7,
+    })
+    expect(result.remoteOpen).toHaveLength(0)
+    expect(result.closed).toHaveLength(0)
+  })
+
+  it('uses server receipt time for open snapshot freshness and keeps devices for seven days', async () => {
+    await replace(store, {
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'remote:a',
+          tabId: 'a',
+          deviceId: 'remote-device',
+          deviceLabel: 'remote',
+          updatedAt: NOW - 30 * DAY_MS,
+        }),
+      ],
+    })
+
+    now = NOW + 31 * MINUTE_MS
+    const afterOpenTtl = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(afterOpenTtl.remoteOpen).toHaveLength(0)
+    expect(store.listDevices().map((device) => device.deviceId)).toContain('remote-device')
+
+    now = NOW + 8 * DAY_MS
+    expect(store.listDevices().map((device) => device.deviceId)).not.toContain('remote-device')
+  })
+
+  it('does not create device rows from closed tombstones alone', async () => {
+    await replace(store, {
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'remote:closed',
+          tabId: 'closed',
+          deviceId: 'remote-device',
+          deviceLabel: 'remote',
+          status: 'closed',
+          updatedAt: NOW - 1_000,
+          closedAt: NOW - 1_000,
+        }),
+      ],
+    })
+    await store.retireClientSnapshot({
+      deviceId: 'remote-device',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 2,
+    })
+
+    expect(store.listDevices().map((device) => device.deviceId)).toContain('remote-device')
+    now = NOW + 8 * DAY_MS
+    expect(store.listDevices().map((device) => device.deviceId)).not.toContain('remote-device')
+  })
+
+  it('rejects invalid retention, oversized pushes, oversized panes, and duplicate tab keys clearly', async () => {
+    await expect(store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 31,
+    })).rejects.toThrow(/closed tab retention.*1.*30/i)
+
+    const tooManyRecords = Array.from({ length: 501 }, (_, index) => makeRecord({
+      tabKey: `local:${index}`,
+      tabId: `tab-${index}`,
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    }))
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: tooManyRecords,
+    })).rejects.toThrow(/at most 500 records/i)
+
+    const largePayload = 'x'.repeat(1024 * 1024)
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'local:huge',
+          tabId: 'huge',
+          deviceId: 'local-device',
+          deviceLabel: 'local',
+          paneCount: 1,
+          panes: [{ paneId: 'pane-1', kind: 'terminal', payload: { largePayload } }],
+        }),
+      ],
+    })).rejects.toThrow(/push payload.*1 mib|client snapshot.*512 kib/i)
+
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'local:dup', tabId: 'a', deviceId: 'local-device', deviceLabel: 'local' }),
+        makeRecord({ tabKey: 'local:dup', tabId: 'b', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
+    })).rejects.toThrow(/duplicate tab key/i)
   })
 })
