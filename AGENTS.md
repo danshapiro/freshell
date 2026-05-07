@@ -33,6 +33,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 - Local `main` is a mirror of `origin/main`; do not commit to it, merge into it, or self-host from it.
 - Local `dev` is the self-hosted integration branch. It is rebuilt from `origin/main` plus pending PR heads.
+- The repo root normally remains on local `main`; use `.worktrees/dev` as the self-hosted integration checkout and create separate worktrees for authored changes.
 - Do not edit production behavior directly on `dev`.
 - If a change is needed on `dev`, create or update a PR against `origin/main`, then apply that PR head to `dev`.
 - If applying a PR to `dev` needs semantic conflict resolution, stop and fix the PR branch or create a replacement PR. Do not hide behavior changes in a local-only `dev` merge commit.
