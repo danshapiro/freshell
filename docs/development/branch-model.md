@@ -76,7 +76,7 @@ Initial migration queue:
 | #309 | `93c0e15f8b3e04d7e1bbd8ab312619ae28cfefa2` | Codex startup cwd fix |
 | #319 | `48927eef6b46a2232ebe31d1e1dea38d2203eb72` | OpenCode native scroll behavior |
 | #324 | `fc8a953565c8c4e416fc7bc0e951b0888c8ed421` | Durable session restore identity parity |
-| #326 | `4f37b649d5f1aad162847935cb46ad10774a4722` | Codex sidecar resilience parity |
+| #326 | Current PR head | Codex sidecar resilience parity |
 | #325 | `e15a86db992ab5d70048dec9c45da8e8ff0b7652` | Intentional removal of broken Codex notification launch args |
 | #322 | `26601cec20434790936af3a3f9cc823c8c19f984` | Replacement for externally-owned factory terminal orchestration PR |
 
