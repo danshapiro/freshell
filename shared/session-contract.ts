@@ -143,7 +143,9 @@ export function migrateLegacyAgentChatDurableState({
 
   const canonicalClaudeSessionId = isCanonicalClaudeSessionId(cliSessionId)
     ? cliSessionId
-    : (isCanonicalClaudeSessionId(timelineSessionId) ? timelineSessionId : undefined)
+    : (isCanonicalClaudeSessionId(timelineSessionId)
+        ? timelineSessionId
+        : (isCanonicalClaudeSessionId(resumeSessionId) ? resumeSessionId : undefined))
 
   if (canonicalClaudeSessionId) {
     return {
