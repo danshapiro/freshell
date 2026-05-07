@@ -94,13 +94,14 @@ Present the proposed README changes to the user for approval before proceeding t
 
 ## Release Steps
 
-All work happens on a release branch in a worktree — main is untouched until the final atomic fast-forward. This protects the running Freshell instance.
+All release preparation happens on a release branch in a worktree from `origin/main`. Local `main` is a mirror of `origin/main`; do not commit to it, fast-forward it, or push it directly.
 
 ### 1. Create the release branch
 
 ```bash
-# From the main repo
-git worktree add .worktrees/release-vX.Y.Z -b release/vX.Y.Z main
+# From the repo root
+git fetch origin
+git worktree add .worktrees/release-vX.Y.Z -b release/vX.Y.Z origin/main
 cd .worktrees/release-vX.Y.Z
 npm install
 ```
@@ -129,19 +130,14 @@ All of these are committed to the release branch:
 2. **Update README:** Change `--branch vOLD` to `--branch vNEW` in the clone command, and apply the approved Features changes
 3. **Commit** with message like `release: vX.Y.Z`
 
-### 4. Fast-forward main
+### 4. Open and merge a release PR
 
-```bash
-# Back in the main repo working directory
-git merge --ff-only release/vX.Y.Z
-```
-
-If `--ff-only` fails, go back to the worktree and rebase onto main until it can fast-forward.
+Push the release branch and open a PR against `main`. After user approval and required checks, merge it through GitHub. If conflicts appear, rebase the release branch onto `origin/main`, resolve in the worktree, retest, and force-push with `--force-with-lease`.
 
 ### 5. Tag and publish
 
 ```bash
-git push origin main
+git fetch origin
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push --tags
 gh release create vX.Y.Z --title "vX.Y.Z" --notes "..."  # with the release notes
@@ -156,8 +152,8 @@ git branch -d release/vX.Y.Z
 
 ## Safety
 
-- Main can contain work-in-progress; users clone a specific release tag
-- You are running inside Freshell — if you break main mid-release, you kill yourself
-- All release prep happens on a branch in a worktree, so main is never modified until the atomic fast-forward
+- Local `main` mirrors `origin/main`; release work happens on a PR branch.
+- Users clone a specific release tag.
+- The self-hosted integration branch is `dev`, not local `main`.
 - Commit the version bump before tagging so the tag points to the right commit
 - If any step fails, stop and assess, then make recommendations to the user, rather than pushing forward
