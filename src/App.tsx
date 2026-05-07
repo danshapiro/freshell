@@ -59,6 +59,8 @@ import { clearDeadTerminals } from '@/store/panesSlice'
 import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
+import { recordTurnComplete } from '@/store/turnCompletionSlice'
+import { selectTabPaneByTerminalId } from '@/store/selectors/paneTerminalSelectors'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
@@ -876,6 +878,21 @@ export default function App() {
               terminalIds: remove,
               mutationSeq,
             }))
+          }
+        }
+        if (msg.type === 'terminal.turn.complete') {
+          const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
+          const at = typeof msg.at === 'number' ? msg.at : Date.now()
+          if (terminalId) {
+            const location = selectTabPaneByTerminalId(appStore.getState(), terminalId)
+            if (location) {
+              dispatch(recordTurnComplete({
+                tabId: location.tabId,
+                paneId: location.paneId,
+                terminalId,
+                at,
+              }))
+            }
           }
         }
         if (msg.type === 'terminal.exit') {

@@ -196,7 +196,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
-  const opencodeActivity = wireOpencodeActivityTracker({ registry })
+  let opencodeActivity: ReturnType<typeof wireOpencodeActivityTracker> | undefined
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -327,7 +327,7 @@ async function main() {
       extensionManager,
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
-      opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
+      opencodeActivityListProvider: () => opencodeActivity?.tracker.list() ?? [],
     },
   )
   attachProxyUpgradeHandler(server)
@@ -375,24 +375,6 @@ async function main() {
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
-  opencodeActivity.tracker.on('changed', (payload) => {
-    wsHandler.broadcastOpencodeActivityUpdated(payload)
-  })
-  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
-    try {
-      broadcastTerminalSessionAssociation({
-        wsHandler,
-        terminalMetadata,
-        broadcastTerminalMetaUpserts,
-        provider: 'opencode',
-        terminalId,
-        sessionId,
-        source: 'opencode_controller',
-      })
-    } catch (err) {
-      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
-    }
-  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -437,6 +419,46 @@ async function main() {
     if (terminalMetadata.retire(terminalId)) {
       broadcastTerminalMetaRemoval(terminalId)
     }
+  })
+
+  opencodeActivity = wireOpencodeActivityTracker({
+    registry,
+    onActivityChanged: (payload) => {
+      wsHandler.broadcastOpencodeActivityUpdated(payload)
+    },
+    onAssociated: ({ terminalId, sessionId }) => {
+      try {
+        broadcastTerminalSessionAssociation({
+          wsHandler,
+          terminalMetadata,
+          broadcastTerminalMetaUpserts,
+          provider: 'opencode',
+          terminalId,
+          sessionId,
+          source: 'opencode_controller',
+        })
+      } catch (err) {
+        log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+      }
+    },
+    onTurnComplete: ({ terminalId, sessionId, at }) => {
+      const terminal = registry.get(terminalId)
+      if (
+        !terminal
+        || terminal.mode !== 'opencode'
+        || terminal.status !== 'running'
+        || terminal.resumeSessionId !== sessionId
+      ) {
+        log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
+        return
+      }
+      wsHandler.broadcastTerminalTurnComplete({
+        terminalId,
+        provider: 'opencode',
+        sessionId,
+        at,
+      })
+    },
   })
 
   const applyDebugLogging = (enabled: boolean, source: string) => {
@@ -838,7 +860,7 @@ async function main() {
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
-    opencodeActivity.dispose()
+    opencodeActivity?.dispose()
 
     // 10. Stop session repair service
     await sessionRepairService.stop()

@@ -3,25 +3,19 @@ import type { SessionBindingReason } from '../terminal-stream/registry-events.js
 import type { BindSessionResult, TerminalRecord } from '../terminal-registry.js'
 import { logger } from '../logger.js'
 import type {
-  OpencodeActivityChange,
-  OpencodeActivityRecord,
+  OpencodeAssociationRequestedEvent,
 } from './opencode-activity-tracker.js'
 
 type OpencodeActivityTrackerLike = {
-  list: () => OpencodeActivityRecord[]
-  on: (event: 'changed', handler: (payload: OpencodeActivityChange) => void) => void
-  off: (event: 'changed', handler: (payload: OpencodeActivityChange) => void) => void
+  confirmSessionAssociation: (input: { terminalId: string; sessionId: string }) => void
+  rejectSessionAssociation: (input: { terminalId: string; sessionId: string }) => void
+  on: (event: 'association.requested', handler: (payload: OpencodeAssociationRequestedEvent) => void) => void
+  off: (event: 'association.requested', handler: (payload: OpencodeAssociationRequestedEvent) => void) => void
 }
 
 type OpencodeSessionRegistry = {
   get: (terminalId: string) => TerminalRecord | undefined | null
   bindSession: (
-    terminalId: string,
-    provider: 'opencode',
-    sessionId: string,
-    reason?: SessionBindingReason,
-  ) => BindSessionResult
-  rebindSession?: (
     terminalId: string,
     provider: 'opencode',
     sessionId: string,
@@ -46,10 +40,8 @@ export class OpencodeSessionController extends EventEmitter {
   private readonly log: ControllerLogger
   private readonly associatedSessionIds = new Map<string, string>()
 
-  private readonly handleTrackerChanged = (payload: OpencodeActivityChange) => {
-    for (const record of payload.upsert) {
-      this.promoteRecord(record)
-    }
+  private readonly handleAssociationRequested = (payload: OpencodeAssociationRequestedEvent) => {
+    this.promoteAssociation(payload)
   }
 
   private readonly handleTerminalExit = (payload: { terminalId?: string }) => {
@@ -67,56 +59,47 @@ export class OpencodeSessionController extends EventEmitter {
     this.registry = input.registry
     this.log = input.log ?? logger.child({ component: 'opencode-session-controller' })
 
-    this.tracker.on('changed', this.handleTrackerChanged)
+    this.tracker.on('association.requested', this.handleAssociationRequested)
     this.registry.on('terminal.exit', this.handleTerminalExit)
-
-    const existing = this.tracker.list()
-    if (existing.length > 0) {
-      this.handleTrackerChanged({
-        upsert: existing,
-        remove: [],
-      })
-    }
   }
 
   dispose(): void {
-    this.tracker.off('changed', this.handleTrackerChanged)
+    this.tracker.off('association.requested', this.handleAssociationRequested)
     this.registry.off('terminal.exit', this.handleTerminalExit)
     this.associatedSessionIds.clear()
   }
 
-  private promoteRecord(record: OpencodeActivityRecord): void {
-    if (!record.sessionId) return
-
-    const terminal = this.registry.get(record.terminalId)
+  private promoteAssociation(request: OpencodeAssociationRequestedEvent): void {
+    const terminal = this.registry.get(request.terminalId)
     if (!terminal || terminal.mode !== 'opencode' || terminal.status !== 'running') {
+      this.tracker.rejectSessionAssociation(request)
       return
     }
 
-    const previousSessionId = this.associatedSessionIds.get(record.terminalId) ?? terminal.resumeSessionId
-    if (previousSessionId === record.sessionId) {
-      this.associatedSessionIds.set(record.terminalId, record.sessionId)
+    const previousSessionId = this.associatedSessionIds.get(request.terminalId) ?? terminal.resumeSessionId
+    if (previousSessionId === request.sessionId) {
+      this.associatedSessionIds.set(request.terminalId, request.sessionId)
+      this.tracker.confirmSessionAssociation(request)
       return
     }
 
-    const bind = previousSessionId && this.registry.rebindSession
-      ? this.registry.rebindSession.bind(this.registry)
-      : this.registry.bindSession.bind(this.registry)
-    const result = bind(record.terminalId, 'opencode', record.sessionId, 'association')
+    const result = this.registry.bindSession(request.terminalId, 'opencode', request.sessionId, 'association')
 
     if (!result.ok) {
       this.log.warn({
-        terminalId: record.terminalId,
-        sessionId: record.sessionId,
+        terminalId: request.terminalId,
+        sessionId: request.sessionId,
         reason: result.reason,
       }, 'Failed to promote OpenCode durable session from authoritative control data')
+      this.tracker.rejectSessionAssociation(request)
       return
     }
 
-    this.associatedSessionIds.set(record.terminalId, record.sessionId)
+    this.associatedSessionIds.set(request.terminalId, request.sessionId)
     this.emit('associated', {
-      terminalId: record.terminalId,
-      sessionId: record.sessionId,
+      terminalId: request.terminalId,
+      sessionId: request.sessionId,
     } satisfies OpencodeSessionAssociatedEvent)
+    this.tracker.confirmSessionAssociation(request)
   }
 }
