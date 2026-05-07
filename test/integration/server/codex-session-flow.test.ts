@@ -30,7 +30,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 process.env.AUTH_TOKEN = 'test-token'
@@ -386,7 +386,8 @@ describe('Codex Session Flow Integration', () => {
       ])
       expect(recordedArgs).toContain('resume')
       expect(recordedArgs).toContain('thread-new-1')
-      expect(recordedArgs).toContain('tui.notification_method=bel')
+      expect(recordedArgs).not.toContain('tui.notification_method=bel')
+      expect(recordedArgs).not.toContain("tui.notifications=['agent-turn-complete']")
       expect(recordedArgs).not.toContain('--model')
       expect(recordedArgs).not.toContain('--sandbox')
     } finally {
