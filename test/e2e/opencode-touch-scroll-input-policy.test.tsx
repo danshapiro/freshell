@@ -101,7 +101,7 @@ const opencodeExtensionWithBehaviorHint: ClientExtensionEntry = {
   cli: {
     terminalBehavior: {
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     },
   },
 }
@@ -177,7 +177,7 @@ describe('opencode touch scroll input policy (e2e)', () => {
     ;(globalThis as any).setMobileForTest(false)
   })
 
-  it('sends translated cursor-key input instead of local scrollback for OpenCode touch scrolling', async () => {
+  it('does not translate touch scroll for opencode providers when policy is native', async () => {
     const { store, tabId, paneId, paneContent } = createStore('opencode', [opencodeExtensionWithBehaviorHint])
 
     const { getByTestId } = render(
@@ -202,14 +202,12 @@ describe('opencode touch scroll input policy (e2e)', () => {
     })
 
     expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
-      terminalId: 'term-opencode',
-      data: '\u001b[B',
     }))
   })
 
-  it('keeps native touch scrolling for non-opted-in providers', async () => {
+  it('skips scrollLines in alt screen for non-opted-in providers', async () => {
     const { store, tabId, paneId, paneContent } = createStore('shell')
 
     const { getByTestId } = render(
@@ -233,7 +231,7 @@ describe('opencode touch scroll input policy (e2e)', () => {
       touches: [{ clientX: 20, clientY: 100 }],
     })
 
-    expect(latestTerminal?.scrollLines).toHaveBeenCalledWith(1)
+    expect(latestTerminal?.scrollLines).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'terminal.input',
     }))

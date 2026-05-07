@@ -706,7 +706,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
       if (!translateScrollLinesToInput(term, lines)) {
-        term.scrollLines(lines)
+        if (term.buffer.active.type !== 'alternate') {
+          term.scrollLines(lines)
+        }
       }
 
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE

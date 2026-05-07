@@ -17,7 +17,7 @@ const extensions: ClientExtensionEntry[] = [{
   cli: {
     terminalBehavior: {
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     },
   },
 }]
@@ -26,7 +26,7 @@ describe('terminal behavior', () => {
   it('returns provider terminal behavior from the extension registry', () => {
     expect(getProviderTerminalBehavior('opencode', extensions)).toEqual({
       preferredRenderer: 'canvas',
-      scrollInputPolicy: 'fallbackToCursorKeysWhenAltScreenMouseCapture',
+      scrollInputPolicy: 'native',
     })
   })
 
