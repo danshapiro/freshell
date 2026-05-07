@@ -873,6 +873,8 @@ export function buildSpawnSpec(
     ALLOWED_ORIGINS: _allowedOrigins,
     NODE_ENV: _nodeEnv,
     npm_lifecycle_script: _npmLifecycleScript,
+    OPENCODE_SERVER_USERNAME: _opencodeServerUsername,
+    OPENCODE_SERVER_PASSWORD: _opencodeServerPassword,
     ...parentEnv
   } = process.env
   const env = {

@@ -453,8 +453,9 @@ describe('opencode session flow (integration)', () => {
     }
   })
 
-  it('promotes an OpenCode terminal only after authoritative control data exposes a canonical session id', async () => {
+  it('promotes and completes an OpenCode terminal only after live same-stream idle', async () => {
     vi.useFakeTimers()
+    const turnCompletions: Array<{ terminalId: string; sessionId: string; at: number }> = []
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.endsWith('/global/health')) {
@@ -466,7 +467,17 @@ describe('opencode session flow (integration)', () => {
         })
       }
       if (url.endsWith('/event')) {
-        return createSseResponse([{ type: 'server.connected', properties: {} }])
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: OPENCODE_SESSION_ID,
+              status: { type: 'busy' },
+            },
+          },
+          { type: 'session.idle', properties: { sessionID: OPENCODE_SESSION_ID } },
+        ])
       }
       throw new Error(`Unexpected URL: ${url}`)
     })
@@ -475,6 +486,9 @@ describe('opencode session flow (integration)', () => {
       registry: registry as any,
       fetchImpl: fetchImpl as typeof fetch,
       random: () => 0,
+      onTurnComplete: (payload) => {
+        turnCompletions.push(payload)
+      },
     })
 
     try {
@@ -495,6 +509,13 @@ describe('opencode session flow (integration)', () => {
           provider: 'opencode',
           sessionId: OPENCODE_SESSION_ID,
           reason: 'association',
+        }),
+      ])
+      expect(turnCompletions).toEqual([
+        expect.objectContaining({
+          terminalId: record.terminalId,
+          sessionId: OPENCODE_SESSION_ID,
+          at: expect.any(Number),
         }),
       ])
     } finally {

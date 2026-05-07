@@ -1027,6 +1027,19 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
     })
+
+    it('scrubs inherited OpenCode server auth env for managed TUI endpoints', () => {
+      delete process.env.OPENCODE_CMD
+      process.env.OPENCODE_SERVER_USERNAME = 'user'
+      process.env.OPENCODE_SERVER_PASSWORD = 'secret'
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        opencodeServer: TEST_OPENCODE_SERVER,
+      })
+
+      expect(spec.env).not.toHaveProperty('OPENCODE_SERVER_USERNAME')
+      expect(spec.env).not.toHaveProperty('OPENCODE_SERVER_PASSWORD')
+    })
   })
 
   describe('environment variables in spawn spec', () => {

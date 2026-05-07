@@ -1,0 +1,228 @@
+import { describe, expect, it } from 'vitest'
+import {
+  confirmOpencodeAssociation,
+  createOpencodeOwnershipState,
+  reduceOpencodeOwnership,
+} from '../../../../server/coding-cli/opencode-ownership-reducer'
+
+describe('opencode ownership reducer', () => {
+  it('requests association before completing a fresh live candidate', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    })
+    state = result.state
+    expect(result.actions).toContainEqual({
+      kind: 'activityUpsert',
+      sessionId: 'session-a',
+      at: 10,
+    })
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 20,
+    })
+    state = result.state
+
+    expect(result.actions).toEqual([
+      { kind: 'activityRemove', at: 20 },
+      { kind: 'requestAssociation', sessionId: 'session-a' },
+    ])
+
+    result = confirmOpencodeAssociation(state, { sessionId: 'session-a' })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: 'session-a',
+    })
+    expect(result.actions).toEqual([
+      {
+        kind: 'turnComplete',
+        sessionId: 'session-a',
+        at: 20,
+      },
+    ])
+  })
+
+  it('completes a known busy interval only from the same live stream', () => {
+    let state = createOpencodeOwnershipState('session-a')
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 2,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 20,
+    })
+
+    expect(result.state).toEqual(state)
+    expect(result.actions).toEqual([])
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 30,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: 'session-a',
+    })
+    expect(result.actions).toEqual([
+      { kind: 'activityRemove', at: 30 },
+      { kind: 'turnComplete', sessionId: 'session-a', at: 30 },
+    ])
+  })
+
+  it('treats competing candidate sessions as durable ambiguity and blocks third-session adoption until quiet', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    })
+    state = result.state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+    expect(result.actions).toContainEqual({
+      kind: 'activityUpsert',
+      at: 11,
+    })
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-c',
+      status: 'busy',
+      at: 12,
+    })
+    state = result.state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b', 'session-c'],
+      since: 11,
+    })
+    expect(result.actions).not.toContainEqual(expect.objectContaining({
+      kind: 'requestAssociation',
+    }))
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {},
+      at: 30,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: undefined,
+    })
+    expect(result.actions).toEqual([{ kind: 'activityRemove', at: 30 }])
+  })
+
+  it('never emits turn completion from snapshots', () => {
+    let state = createOpencodeOwnershipState('session-a')
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 2,
+      streamId: 2,
+      statuses: {},
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'quiet',
+      knownSessionId: 'session-a',
+    })
+    expect(result.actions).toEqual([{ kind: 'activityRemove', at: 20 }])
+    expect(result.actions).not.toContainEqual(expect.objectContaining({
+      kind: 'turnComplete',
+    }))
+  })
+
+  it('does not associate or complete a snapshot-only busy interval from live idle', () => {
+    let state = createOpencodeOwnershipState()
+
+    let result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 10,
+    })
+    state = result.state
+
+    result = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'idle',
+      at: 20,
+    })
+
+    expect(result.state).toEqual(state)
+    expect(result.actions).toEqual([])
+  })
+})

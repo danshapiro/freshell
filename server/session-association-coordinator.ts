@@ -78,7 +78,7 @@ export class SessionAssociationCoordinator {
   private associationCandidateReason(
     session: CodingCliSession,
   ): 'ok' | NonNullable<SessionAssociationResult['reason']> {
-    if (session.provider === 'codex') return 'provider_managed'
+    if (session.provider === 'codex' || session.provider === 'opencode') return 'provider_managed'
     if (!modeSupportsResume(session.provider)) return 'provider_not_supported'
     if (!session.cwd) return 'missing_cwd'
     if (session.isSubagent) return 'subagent'
