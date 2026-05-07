@@ -10,6 +10,7 @@
  */
 
 import { readFileSync } from 'fs'
+import { execFileSync } from 'child_process'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
@@ -27,6 +28,18 @@ function getPackageVersion(): string {
     return pkg.version || '0.0.0'
   } catch {
     return '0.0.0'
+  }
+}
+
+function getCurrentBranch(): string | undefined {
+  try {
+    return execFileSync('git', ['branch', '--show-current'], {
+      cwd: rootDir,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -182,7 +195,7 @@ async function checkVitePort(): Promise<PortCheckResult> {
 
 async function main(): Promise<void> {
   // 1. Check for updates first (before anything else can fail)
-  if (!shouldSkipUpdateCheck()) {
+  if (!shouldSkipUpdateCheck({ branch: getCurrentBranch() })) {
     const currentVersion = getPackageVersion()
     const updateResult = await runUpdateCheck(currentVersion)
 
