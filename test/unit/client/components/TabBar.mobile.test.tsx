@@ -137,7 +137,7 @@ describe('TabBar sidebar toggle integration', () => {
     ;(globalThis as any).setMobileForTest?.(false)
   })
 
-  it('renders show-sidebar button before tabs on desktop when sidebar is collapsed', () => {
+  it('renders show-sidebar button in a fixed desktop slot when sidebar is collapsed', () => {
     const onToggleSidebar = vi.fn()
     const store = createStore(defaultTabsState, defaultPanesState)
     render(
@@ -147,7 +147,10 @@ describe('TabBar sidebar toggle integration', () => {
     )
 
     const showButton = screen.getByTitle('Show sidebar')
+    const fixedSlot = screen.getByTestId('desktop-sidebar-reopen-slot')
     expect(showButton).toBeInTheDocument()
+    expect(fixedSlot).toContainElement(showButton)
+    expect(showButton.closest('.overflow-x-auto')).toBeNull()
     fireEvent.click(showButton)
     expect(onToggleSidebar).toHaveBeenCalled()
   })

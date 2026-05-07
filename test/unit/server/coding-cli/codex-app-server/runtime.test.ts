@@ -204,6 +204,24 @@ describe('CodexAppServerRuntime', () => {
     expect(runtime.status()).toBe('running')
   })
 
+  it('waits for a complete wrapper identity proof during startup', async () => {
+    let identityReads = 0
+    const runtime = createRuntime({
+      startupAttemptLimit: 1,
+      startupAttemptTimeoutMs: 1_000,
+      processIdentityReader: async (pid) => {
+        identityReads += 1
+        if (identityReads === 1) return null
+        return readWrapperIdentityForTest(pid)
+      },
+    })
+
+    await expect(runtime.ensureReady()).resolves.toEqual(expect.objectContaining({
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    }))
+    expect(identityReads).toBeGreaterThan(1)
+  })
+
   it('rejects before spawning on platforms without Linux /proc ownership support', async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
     if (!originalPlatform?.configurable) {
@@ -479,12 +497,11 @@ describe('CodexAppServerRuntime', () => {
     expect(Date.now() - start).toBeLessThan(1_500)
   }, 3_000)
 
-  it('tears down the owned process group before retry when wrapper identity cannot be read', async () => {
+  it('waits for a transiently unreadable wrapper identity without retrying startup', async () => {
     const tempDir = await makeTempDir()
     const metadataDir = path.join(tempDir, 'metadata')
     const processGroups: number[] = []
     const seenProcessGroups = new Set<number>()
-    let previousAttemptGoneBeforeRetry = false
     let identityReadAttempts = 0
     const runtime = createRuntime({
       metadataDir,
@@ -499,9 +516,6 @@ describe('CodexAppServerRuntime', () => {
       },
       metadataWriter: async (filePath, metadata) => {
         if (!seenProcessGroups.has(metadata.processGroupId)) {
-          if (processGroups.length > 0) {
-            previousAttemptGoneBeforeRetry = !(await isProcessGroupAlive(processGroups[0]))
-          }
           seenProcessGroups.add(metadata.processGroupId)
           processGroups.push(metadata.processGroupId)
         }
@@ -513,19 +527,17 @@ describe('CodexAppServerRuntime', () => {
     const ready = await runtime.ensureReady()
     const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
 
-    expect(processGroups).toHaveLength(2)
+    expect(processGroups).toHaveLength(1)
     expect(identityReadAttempts).toBe(2)
-    expect(previousAttemptGoneBeforeRetry).toBe(true)
-    expect(record.processGroupId).toBe(processGroups[1])
+    expect(record.processGroupId).toBe(processGroups[0])
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
   }, 3_000)
 
-  it('tears down the owned process group before retry when wrapper identity is incomplete', async () => {
+  it('waits for a transiently incomplete wrapper identity without retrying startup', async () => {
     const tempDir = await makeTempDir()
     const metadataDir = path.join(tempDir, 'metadata')
     const processGroups: number[] = []
     const seenProcessGroups = new Set<number>()
-    let previousAttemptGoneBeforeRetry = false
     let identityReadAttempts = 0
     const runtime = createRuntime({
       metadataDir,
@@ -542,9 +554,6 @@ describe('CodexAppServerRuntime', () => {
       },
       metadataWriter: async (filePath, metadata) => {
         if (!seenProcessGroups.has(metadata.processGroupId)) {
-          if (processGroups.length > 0) {
-            previousAttemptGoneBeforeRetry = !(await isProcessGroupAlive(processGroups[0]))
-          }
           seenProcessGroups.add(metadata.processGroupId)
           processGroups.push(metadata.processGroupId)
         }
@@ -556,10 +565,9 @@ describe('CodexAppServerRuntime', () => {
     const ready = await runtime.ensureReady()
     const record = JSON.parse(await fsp.readFile(ready.metadataPath, 'utf8'))
 
-    expect(processGroups).toHaveLength(2)
+    expect(processGroups).toHaveLength(1)
     expect(identityReadAttempts).toBe(2)
-    expect(previousAttemptGoneBeforeRetry).toBe(true)
-    expect(record.processGroupId).toBe(processGroups[1])
+    expect(record.processGroupId).toBe(processGroups[0])
     expect(record.wrapperIdentity.commandLine.length).toBeGreaterThan(0)
     expect(record.wrapperIdentity.cwd).toEqual(expect.any(String))
     expect(record.wrapperIdentity.startTimeTicks).toEqual(expect.any(Number))
@@ -909,6 +917,7 @@ describe('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-current',
     })
+    runtimes.delete(runtime)
 
     expect(result.reapedOwnershipIds).toContain(ready.ownershipId)
     await waitForProcessExit(ready.processPid)
@@ -1246,6 +1255,32 @@ describe('CodexAppServerRuntime', () => {
     expect(ready.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
     expect(ready.wsUrl).not.toBe(`ws://${endpoint.hostname}:${endpoint.port}`)
     await closeBlocker(blocker)
+  })
+
+  it('does not publish ready when the app-server client socket disconnects before startup completes', async () => {
+    const runtime = createRuntime({
+      startupAttemptLimit: 1,
+      metadataWriter: async (filePath, metadata) => {
+        if (metadata.codexHome) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+        await fsp.mkdir(path.dirname(filePath), { recursive: true })
+        await fsp.writeFile(filePath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 })
+      },
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          closeSocketAfterMethodsOnce: ['initialize'],
+        }),
+      },
+    })
+    const onExit = vi.fn()
+    runtime.onExit(onExit)
+
+    await expect(runtime.ensureReady()).rejects.toThrow(
+      /Codex app-server client disconnected before startup completed/,
+    )
+    expect(runtime.status()).toBe('stopped')
+    expect(onExit).not.toHaveBeenCalled()
   })
 
   it('keeps child stdio drained so large app-server logs do not stall thread/start replies', async () => {

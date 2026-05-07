@@ -7,6 +7,7 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-
 import { logger } from '../../logger.js'
 import {
   CodexAppServerClient,
+  type CodexAppServerDisconnectEvent,
   type CodexThreadLifecycleEvent,
   type CodexThreadLifecycleLossEvent,
 } from './client.js'
@@ -500,6 +501,7 @@ export class CodexAppServerRuntime {
   private ownership: ActiveOwnership | null = null
   private ownershipTeardownPromise: Promise<void> | null = null
   private ownershipTeardownFailure: Error | null = null
+  private startupAbortError: Error | null = null
   private shutdownRequested = false
   private lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
   private readonly exitHandlers = new Set<(error?: Error, source?: CodexAppServerRuntimeFailureSource) => void>()
@@ -551,9 +553,17 @@ export class CodexAppServerRuntime {
       this.ensureReadyPromise = null
     })
 
-    this.ready = await this.ensureReadyPromise
+    return this.publishReady(await this.ensureReadyPromise)
+  }
+
+  private publishReady(ready: ReadyState): ReadyState {
+    if (this.startupAbortError) {
+      throw this.startupAbortError
+    }
+    this.startupAbortError = null
+    this.ready = ready
     this.statusValue = 'running'
-    return this.ready
+    return ready
   }
 
   async startThread(
@@ -597,7 +607,7 @@ export class CodexAppServerRuntime {
       ...(input.codexHome !== undefined ? { codexHome: input.codexHome } : {}),
       updatedAt: new Date().toISOString(),
     }
-    await atomicWriteJson(this.ownership.metadataPath, this.ownership.metadata)
+    await this.writeOwnershipRecord(this.ownership)
   }
 
   onThreadLifecycleLoss(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void {
@@ -682,6 +692,7 @@ export class CodexAppServerRuntime {
       if (this.shutdownRequested) {
         throw new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
       }
+      this.startupAbortError = null
       const endpoint = await this.portAllocator()
       if (this.shutdownRequested) {
         throw new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
@@ -732,7 +743,7 @@ export class CodexAppServerRuntime {
         this.ownership = ownership
         attemptOwnership = ownership
         await this.writeOwnershipRecord(ownership)
-        await this.readWrapperIdentityInto(ownership)
+        await this.readWrapperIdentityInto(ownership, child, childErrorPromise)
         this.ownership = ownership
         await this.writeOwnershipRecord(ownership)
 
@@ -761,16 +772,14 @@ export class CodexAppServerRuntime {
           }
         })
         client.onDisconnect((event) => {
-          if (this.shutdownRequested) return
-          for (const handler of this.exitHandlers) {
-            handler(event.error, 'app_server_client_disconnect')
-          }
+          this.handleClientDisconnect(client, event)
         })
         this.client = client
 
         const initialized = await this.waitForInitialize(client, child, childErrorPromise)
+        this.assertStartupRuntimeStillActive(client, child)
         await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
-        this.statusValue = 'running'
+        this.assertStartupRuntimeStillActive(client, child)
         return {
           wsUrl,
           processPid: child.pid,
@@ -841,18 +850,41 @@ export class CodexAppServerRuntime {
     }
   }
 
-  private async readWrapperIdentityInto(ownership: ActiveOwnership): Promise<void> {
-    const wrapperIdentity = await this.processIdentityReader(ownership.metadata.wrapperPid)
-    if (!isCompleteWrapperIdentity(wrapperIdentity)) {
-      throw new Error(
-        `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
-      )
+  private async readWrapperIdentityInto(
+    ownership: ActiveOwnership,
+    child: ChildProcessHandle,
+    childErrorPromise: Promise<Error>,
+  ): Promise<void> {
+    const deadline = Date.now() + this.startupAttemptTimeoutMs
+
+    while (true) {
+      const [wrapperIdentity, hasOwnershipEnv] = await Promise.race([
+        Promise.all([
+          this.processIdentityReader(ownership.metadata.wrapperPid),
+          processHasOwnershipEnv(ownership.metadata.wrapperPid, ownership.metadata.ownershipId),
+        ]),
+        childErrorPromise.then((error) => {
+          throw error
+        }),
+      ])
+      if (hasOwnershipEnv && isCompleteWrapperIdentity(wrapperIdentity)) {
+        ownership.metadata = {
+          ...ownership.metadata,
+          wrapperIdentity,
+          updatedAt: new Date().toISOString(),
+        }
+        return
+      }
+
+      if (child.exitCode !== null || child.signalCode !== null || Date.now() >= deadline) {
+        break
+      }
+      await sleep(STARTUP_POLL_MS)
     }
-    ownership.metadata = {
-      ...ownership.metadata,
-      wrapperIdentity,
-      updatedAt: new Date().toISOString(),
-    }
+
+    throw new Error(
+      `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
+    )
   }
 
   private async writeOwnershipRecord(ownership: ActiveOwnership): Promise<void> {
@@ -894,6 +926,18 @@ export class CodexAppServerRuntime {
     throw lastError ?? new Error('Codex app-server exited before it finished initializing.')
   }
 
+  private assertStartupRuntimeStillActive(client: CodexAppServerClient, child: ChildProcessHandle): void {
+    if (this.startupAbortError) {
+      throw this.startupAbortError
+    }
+    if (this.child !== child) {
+      throw new Error('Codex app-server child exited before startup completed.')
+    }
+    if (this.client !== client) {
+      throw new Error('Codex app-server client disconnected before startup completed.')
+    }
+  }
+
   private watchChildError(child: ChildProcessHandle): Promise<Error> {
     return new Promise((resolve) => {
       child.once('error', (error) => {
@@ -919,6 +963,7 @@ export class CodexAppServerRuntime {
         return
       }
 
+      const wasReady = this.ready !== null
       const ownership = this.ownership
       this.child = null
       this.ready = null
@@ -948,12 +993,41 @@ export class CodexAppServerRuntime {
         void closeClient
       }
 
-      if (!this.shutdownRequested) {
+      if (wasReady && !this.shutdownRequested) {
         for (const handler of this.exitHandlers) {
           handler(undefined, 'app_server_exit')
         }
       }
     })
+  }
+
+  private handleClientDisconnect(client: CodexAppServerClient, event: CodexAppServerDisconnectEvent): void {
+    if (this.client !== client) {
+      return
+    }
+
+    const wasReady = this.ready !== null
+    this.client = null
+    this.ready = null
+    this.statusValue = 'stopped'
+
+    if (!wasReady || this.shutdownRequested) {
+      if (!this.shutdownRequested) {
+        this.startupAbortError = new Error(event.reason === 'error'
+          ? `Codex app-server client socket errored before startup completed: ${event.error?.message ?? 'unknown error'}`
+          : 'Codex app-server client disconnected before startup completed.')
+      }
+      void this.stopActiveChild().catch(() => undefined)
+      return
+    }
+
+    const error = event.reason === 'error'
+      ? new Error(`Codex app-server client socket errored: ${event.error?.message ?? 'unknown error'}`)
+      : new Error('Codex app-server client socket closed unexpectedly.')
+    for (const handler of this.exitHandlers) {
+      handler(error, 'app_server_client_disconnect')
+    }
+    void this.stopActiveChild().catch(() => undefined)
   }
 
   private async stopActiveChild(): Promise<void> {
