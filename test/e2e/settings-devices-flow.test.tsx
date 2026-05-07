@@ -52,9 +52,12 @@ function createTabRegistryState(overrides: Partial<TabRegistryState> = {}): TabR
     deviceId: 'local-device',
     deviceLabel: 'local-device',
     localOpen: [],
+    sameDeviceOpen: [],
     remoteOpen: [],
+    devices: [],
     closed: [],
     localClosed: {},
+    closedTabRetentionDays: 30,
     loading: false,
     searchRangeDays: 30,
     ...overrides,
@@ -110,6 +113,10 @@ describe('settings devices management flow (e2e)', () => {
     const store = createStore({
       remoteOpen: [
         makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
+      ],
+      devices: [
+        { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
+        { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
       ],
       closed: [
         makeRecord({
