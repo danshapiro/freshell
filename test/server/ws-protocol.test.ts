@@ -819,7 +819,10 @@ describe('ws protocol', () => {
         type: 'terminal.create',
         requestId: 'shutdown-during-readiness',
         mode: 'codex',
-        resumeSessionId: 'thread-during-readiness',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-during-readiness',
+        },
       })),
     )
     await vi.waitFor(() => expect(sidecar.waitForLoadedThreadCalls).toHaveLength(1))
@@ -848,7 +851,10 @@ describe('ws protocol', () => {
       type: 'terminal.create',
       requestId,
       mode: 'codex',
-      resumeSessionId: 'thread-resume-1',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'thread-resume-1',
+      },
     }))
     const created = await waitForMessage(
       ws,
@@ -880,7 +886,10 @@ describe('ws protocol', () => {
       type: 'terminal.create',
       requestId,
       mode: 'codex',
-      resumeSessionId: 'thread-missing',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'thread-missing',
+      },
     }))
     const error = await waitForMessage(
       ws,
@@ -916,7 +925,10 @@ describe('ws protocol', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
-        resumeSessionId: 'thread-resume-exits',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-resume-exits',
+        },
       }))
       const error = await waitForMessage(
         ws,

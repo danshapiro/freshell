@@ -136,6 +136,7 @@ describe('agent chat restore flow', () => {
   })
 
   it('restores a reloaded pane from sdk.session.snapshot, persists the durable id into pane and tab state, and shows partial output without a blank running gap', async () => {
+    const canonicalSessionId = '00000000-0000-4000-8000-000000000211'
     const store = makeStore({
       resumeSessionId: 'named-resume',
       sessionMetadataByKey: {
@@ -160,11 +161,11 @@ describe('agent chat restore flow', () => {
     }))
 
     getAgentTimelinePage.mockResolvedValue({
-      sessionId: 'cli-session-1',
+      sessionId: canonicalSessionId,
       items: [
         {
           turnId: 'turn-2',
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           role: 'assistant',
           summary: 'Recent summary',
           timestamp: '2026-03-10T10:01:00.000Z',
@@ -174,7 +175,7 @@ describe('agent chat restore flow', () => {
       revision: 2,
       bodies: {
         'turn-2': {
-          sessionId: 'cli-session-1',
+          sessionId: canonicalSessionId,
           turnId: 'turn-2',
           message: {
             role: 'assistant',
@@ -197,7 +198,7 @@ describe('agent chat restore flow', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'running',
-        timelineSessionId: 'cli-session-1',
+        timelineSessionId: canonicalSessionId,
         revision: 2,
         streamingActive: true,
         streamingText: 'partial reply',
@@ -209,7 +210,7 @@ describe('agent chat restore flow', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-session-1',
+        canonicalSessionId,
         expect.objectContaining({ priority: 'visible', includeBodies: true }),
         expect.anything(),
       )
@@ -222,11 +223,18 @@ describe('agent chat restore flow', () => {
     await waitFor(() => {
       const root = store.getState().panes.layouts.t1
       const leaf = root && findLeaf(root, 'p1')
-      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.resumeSessionId : undefined).toBe('cli-session-1')
+      expect(leaf?.content.kind === 'agent-chat' ? leaf.content.sessionRef : undefined).toEqual({
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      })
 
       const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-      expect(tab?.resumeSessionId).toBe('cli-session-1')
-      expect(tab?.sessionMetadataByKey?.['claude:cli-session-1']).toEqual(expect.objectContaining({
+      expect(tab?.resumeSessionId).toBeUndefined()
+      expect(tab?.sessionRef).toEqual({
+        provider: 'claude',
+        sessionId: canonicalSessionId,
+      })
+      expect(tab?.sessionMetadataByKey?.[`claude:${canonicalSessionId}`]).toEqual(expect.objectContaining({
         sessionType: 'freshclaude',
         firstUserMessage: 'Continue from the old tab',
       }))
