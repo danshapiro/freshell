@@ -30,7 +30,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 process.env.AUTH_TOKEN = 'test-token'
@@ -373,7 +373,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBe('thread-new-1')
@@ -415,7 +415,10 @@ describe('Codex Session Flow Integration', () => {
         requestId: 'test-req-codex-restore',
         mode: 'codex',
         cwd: tempDir,
-        resumeSessionId: 'thread-existing-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
       }))
 
       const created = await waitForMessage(
@@ -429,7 +432,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-existing-1')
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBe('thread-existing-1')

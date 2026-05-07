@@ -30,6 +30,10 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
+const DURABLE_SESSION_ID = '00000000-0000-4000-8000-000000000201'
+const DURABLE_SESSION_ID_ALT = '00000000-0000-4000-8000-000000000202'
+const DURABLE_SHELL_SESSION_ID = '00000000-0000-4000-8000-000000000203'
+
 const wsSend = vi.fn()
 const getAgentTimelinePage = vi.fn()
 const getAgentTurnBody = vi.fn()
@@ -142,7 +146,10 @@ const RELOAD_PANE: AgentChatPaneContent = {
 
 const RELOAD_PANE_WITH_CANONICAL_RESUME: AgentChatPaneContent = {
   ...RELOAD_PANE,
-  resumeSessionId: '00000000-0000-4000-8000-000000000321',
+  sessionRef: {
+    provider: 'claude',
+    sessionId: '00000000-0000-4000-8000-000000000321',
+  },
 }
 
 const RELOAD_PANE_WITH_NAMED_RESUME: AgentChatPaneContent = {
@@ -201,7 +208,7 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('includes the named resumeSessionId when attaching a persisted pane before the canonical durable id exists', () => {
+  it('does not attach through a named legacy resumeSessionId before the canonical durable id exists', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -216,7 +223,6 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(wsSend).toHaveBeenCalledWith({
       type: 'sdk.attach',
       sessionId: 'sess-reload-1',
-      resumeSessionId: 'named-resume-token',
     })
   })
 
@@ -840,7 +846,7 @@ describe('AgentChatView reload/restore behavior', () => {
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 12,
     }))
 
@@ -856,7 +862,7 @@ describe('AgentChatView reload/restore behavior', () => {
       expect(attachCalls[1]?.[0]).toEqual({
         type: 'sdk.attach',
         sessionId: 'sess-reload-1',
-        resumeSessionId: 'cli-sess-1',
+        resumeSessionId: DURABLE_SESSION_ID,
       })
     })
   })
@@ -1076,15 +1082,15 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('uses timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
-    getAgentTimelinePage.mockResolvedValue({ sessionId: 'cli-sess-1', items: [], nextCursor: null, revision: 1 })
+  it('uses canonical timelineSessionId from sdk.session.snapshot for visible restore hydration', async () => {
+    getAgentTimelinePage.mockResolvedValue({ sessionId: DURABLE_SESSION_ID, items: [], nextCursor: null, revision: 1 })
 
     const store = makeStore()
     store.dispatch(sessionSnapshotReceived({
       sessionId: 'sess-reload-1',
       latestTurnId: 'turn-2',
       status: 'idle',
-      timelineSessionId: 'cli-sess-1',
+      timelineSessionId: DURABLE_SESSION_ID,
       revision: 2,
     }))
 
@@ -1096,7 +1102,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'cli-sess-1',
+        DURABLE_SESSION_ID,
         expect.objectContaining({ includeBodies: true, revision: 2 }),
         expect.anything(),
       )
@@ -1164,15 +1170,22 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-sess-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-session-abc-123',
+        timelineSessionId: DURABLE_SESSION_ID_ALT,
         revision: 2,
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.resumeSessionId).toBe('cli-session-abc-123')
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't1', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't1')
-    expect(tab?.resumeSessionId).toBe('cli-session-abc-123')
-    expect(tab?.sessionMetadataByKey?.['claude:cli-session-abc-123']).toEqual(expect.objectContaining({
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
+    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SESSION_ID_ALT}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from the old tab',
     }))
@@ -1212,16 +1225,23 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-shell-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'cli-shell-abc-123',
+        timelineSessionId: DURABLE_SHELL_SESSION_ID,
         revision: 2,
       }))
     })
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.resumeSessionId).toBe('cli-shell-abc-123')
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-shell', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-shell')
-    expect(tab?.resumeSessionId).toBe('cli-shell-abc-123')
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SHELL_SESSION_ID,
+    })
     expect(tab?.codingCliProvider).toBe('claude')
-    expect(tab?.sessionMetadataByKey?.['claude:cli-shell-abc-123']).toEqual(expect.objectContaining({
+    expect(tab?.sessionMetadataByKey?.[`claude:${DURABLE_SHELL_SESSION_ID}`]).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from shell fallback',
     }))
@@ -1362,14 +1382,13 @@ describe('AgentChatView reload/restore behavior', () => {
         sessionId: 'sdk-meta-upgrade-1',
         latestTurnId: 'turn-2',
         status: 'idle',
-        timelineSessionId: 'named-resume',
         revision: 1,
       }))
     })
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'named-resume',
+        'sdk-meta-upgrade-1',
         expect.objectContaining({ includeBodies: true, revision: 1 }),
         expect.anything(),
       )
@@ -1440,9 +1459,16 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText('Live-only full body')).not.toBeInTheDocument()
     expect(screen.getAllByText('Post-watermark live delta')).toHaveLength(1)
 
-    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.resumeSessionId).toBe(canonicalSessionId)
+    expect(getPaneContent(store as unknown as ReturnType<typeof makeStore>, 't-meta', 'p1')?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     const tab = store.getState().tabs.tabs.find((entry) => entry.id === 't-meta')
-    expect(tab?.resumeSessionId).toBe(canonicalSessionId)
+    expect(tab?.resumeSessionId).toBeUndefined()
+    expect(tab?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: canonicalSessionId,
+    })
     expect(tab?.sessionMetadataByKey?.['claude:00000000-0000-4000-8000-000000000321']).toEqual(expect.objectContaining({
       sessionType: 'freshclaude',
       firstUserMessage: 'Continue from metadata upgrade',
@@ -1893,14 +1919,17 @@ describe('AgentChatView server-restart recovery', () => {
       store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sdk-sess-1' }))
       store.dispatch(sessionInit({
         sessionId: 'sdk-sess-1',
-        cliSessionId: 'cli-session-abc-123',
+        cliSessionId: DURABLE_SESSION_ID_ALT,
         model: 'claude-opus-4-6',
       }))
     })
 
-    // Pane content should now have resumeSessionId persisted
+    // Pane content should now have canonical sessionRef persisted
     const content = getPaneContent(store, 't1', 'p1')
-    expect(content?.resumeSessionId).toBe('cli-session-abc-123')
+    expect(content?.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: DURABLE_SESSION_ID_ALT,
+    })
   })
 
   it('does not reset the pane or send sdk.create when restore remains pending past the legacy timeout window', () => {
