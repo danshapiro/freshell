@@ -436,6 +436,7 @@ describe('CodexAppServerRuntime', () => {
       expect.any(Error),
       'app_server_client_disconnect',
     ))
+    expect(runtime.status()).toBe('stopped')
   })
 
   it('includes pid, websocket port, exit code, signal, and stderr tail when a child exits unexpectedly', async () => {

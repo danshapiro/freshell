@@ -612,7 +612,7 @@ export class CodexAppServerRuntime {
       this.ensureReadyPromise = null
     })
 
-    return this.publishReady(await this.ensureReadyPromise)
+    return this.ensureReadyPromise
   }
 
   private publishReady(ready: ReadyState): ReadyState {
@@ -794,17 +794,22 @@ export class CodexAppServerRuntime {
         this.client = client
 
         const initialized = await this.waitForInitialize(client, child, childDiagnostics)
-        await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
-        return {
+        const ready = this.publishReady({
           wsUrl,
           processPid: child.pid,
           codexHome: initialized.codexHome,
           ownershipId,
           processGroupId: child.pid,
           metadataPath: ownership.metadataPath,
-        }
+        })
+        await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
+        return ready
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
+        if (this.ready?.ownershipId === ownershipId) {
+          this.ready = null
+          this.statusValue = 'stopped'
+        }
         const client = this.client
         if (client) {
           await client.close().catch(() => undefined)
