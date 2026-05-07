@@ -26,6 +26,24 @@ import { resolveScreenshotOutputPath } from './screenshot-path.js'
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 
+function buildSessionRef(provider: unknown, sessionId: unknown): SessionRef | undefined {
+  if (typeof provider !== 'string' || provider === 'shell') return undefined
+  if (typeof sessionId !== 'string' || !sessionId) return undefined
+  return sanitizeSessionRef({ provider, sessionId })
+}
+
+function resolveTerminalSessionRef({
+  sessionRef,
+  mode,
+  resumeSessionId,
+}: {
+  sessionRef?: unknown
+  mode?: unknown
+  resumeSessionId?: unknown
+}): SessionRef | undefined {
+  return sanitizeSessionRef(sessionRef) ?? buildSessionRef(mode, resumeSessionId)
+}
+
 function agentRouteErrorStatus(error: unknown): number {
   return error instanceof CodexLaunchConfigError ? 400 : 500
 }
@@ -214,6 +232,14 @@ export function createAgentApiRouter({
   const router = Router()
   const assertTerminalAdmission = assertTerminalCreateAccepted ?? (() => undefined)
 
+  const broadcastReplayableUiCommand = (command: { command: string; payload?: any }) => {
+    if (typeof wsHandler?.broadcastUiCommandWithReplay === 'function') {
+      wsHandler.broadcastUiCommandWithReplay(command)
+      return
+    }
+    wsHandler?.broadcastUiCommand?.(command)
+  }
+
   const resolvePaneTarget = (raw: string) => {
     if (layoutStore.resolveTarget) {
       const resolved = layoutStore.resolveTarget(raw)
@@ -289,8 +315,9 @@ export function createAgentApiRouter({
       ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
       : undefined
     const paneSessionRef = sanitizeSessionRef(paneContent?.sessionRef)
-    const resumeSessionId = paneSessionRef?.sessionId
-      ?? (typeof paneContent?.resumeSessionId === 'string' ? paneContent.resumeSessionId : undefined)
+    const resumeSessionId = paneSessionRef?.sessionId ?? (typeof paneContent?.resumeSessionId === 'string'
+      ? paneContent.resumeSessionId
+      : undefined)
     const modeCandidates = [
       typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
       terminalId ? registry.get?.(terminalId)?.mode : undefined,
@@ -308,7 +335,7 @@ export function createAgentApiRouter({
       await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
       registry.updateTitle?.(terminalId, title)
 
-      const sessionProvider = typeof meta?.provider === 'string' ? meta.provider : mode
+      const sessionProvider = paneSessionRef?.provider ?? (typeof meta?.provider === 'string' ? meta.provider : mode)
       const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
       if (sessionProvider && sessionId) {
         try {
@@ -329,7 +356,7 @@ export function createAgentApiRouter({
   }
 
   router.post('/tabs', async (req, res) => {
-    const { name, mode, shell, cwd, browser, editor, sessionRef, permissionMode, model, sandbox } = req.body || {}
+    const { name, mode, shell, cwd, browser, editor, resumeSessionId, sessionRef, permissionMode, model, sandbox } = req.body || {}
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let rollbackTabId: string | undefined
@@ -345,8 +372,8 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
+        const requestedSessionRef = resolveTerminalSessionRef({ sessionRef, mode: effectiveMode, resumeSessionId })
         assertTerminalAdmission()
-        const requestedSessionRef = resolveRequestedSessionRef(effectiveMode, sessionRef)
         const isCodexMode = effectiveMode === 'codex'
         const preallocatedTerminalId = isCodexMode ? nanoid() : undefined
         let tabId: string
@@ -395,14 +422,15 @@ export function createAgentApiRouter({
           )
         }
         unownedCodexSidecar = launch.codexSidecar
-        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedSessionRef?.sessionId)
+        const launchSessionRef = launch.sessionRef ?? requestedSessionRef
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, launchSessionRef?.sessionId)
         assertTerminalAdmission()
         const terminal = registry.create({
           ...(preallocatedTerminalId ? { terminalId: preallocatedTerminalId } : {}),
           mode: effectiveMode,
           shell,
           cwd,
-          resumeSessionId: launch.sessionRef?.sessionId,
+          resumeSessionId: launchSessionRef?.sessionId,
           ...(sessionBindingReason ? { sessionBindingReason } : {}),
           ...(launch.codexSidecar ? { codexSidecar: launch.codexSidecar } : {}),
           ...(launch.codexLaunchFactory ? { codexLaunchFactory: launch.codexLaunchFactory } : {}),
@@ -418,9 +446,9 @@ export function createAgentApiRouter({
           kind: 'terminal',
           terminalId,
           status: 'running',
-          mode: mode || 'shell',
+          mode: effectiveMode,
           shell: shell || 'system',
-          ...(launch.sessionRef ? { sessionRef: launch.sessionRef } : {}),
+          ...(launchSessionRef ? { sessionRef: launchSessionRef } : {}),
           initialCwd: cwd,
         }
 
@@ -436,7 +464,7 @@ export function createAgentApiRouter({
             shell,
             terminalId,
             initialCwd: cwd,
-            sessionRef: paneContent?.sessionRef,
+            ...(paneContent?.sessionRef ? { sessionRef: paneContent.sessionRef } : {}),
             paneId,
             paneContent,
           },
@@ -524,6 +552,67 @@ export function createAgentApiRouter({
     const tabs = layoutStore.listTabs?.() || []
     const activeTabId = layoutStore.getActiveTabId?.() || null
     res.json(ok({ tabs, activeTabId }))
+  })
+
+  router.post('/terminals/:id/open', (req, res) => {
+    const terminalId = typeof req.params.id === 'string' ? req.params.id.trim() : ''
+    if (!terminalId) return res.status(400).json(fail('terminal id required'))
+    const term = registry.get?.(terminalId)
+    if (!term) return res.status(404).json(fail('terminal not found'))
+
+    const existing = layoutStore.findPaneByTerminalId?.(terminalId)
+    if (existing?.tabId && existing?.paneId) {
+      const result = layoutStore.selectPane?.(existing.tabId, existing.paneId) || existing
+      const tabId = result?.tabId || existing.tabId
+      const paneId = result?.paneId || existing.paneId
+      if (tabId && paneId) {
+        broadcastReplayableUiCommand({
+          command: 'tab.select',
+          payload: { id: tabId },
+        })
+        broadcastReplayableUiCommand({
+          command: 'pane.select',
+          payload: { tabId, paneId },
+        })
+      }
+      return res.json(ok({ tabId, paneId, terminalId, reused: true }, result?.message || 'terminal selected'))
+    }
+
+    if (!layoutStore.createTab || !layoutStore.attachPaneContent) {
+      return res.status(503).json(fail('layout store does not support terminal attach'))
+    }
+
+    const title = parseRequiredName(req.body?.name) || term.title || terminalId
+    const { tabId, paneId } = layoutStore.createTab({ title })
+    const sessionRef = resolveTerminalSessionRef({
+      sessionRef: term.sessionRef,
+      mode: term.mode,
+      resumeSessionId: term.resumeSessionId,
+    })
+    const paneContent = {
+      kind: 'terminal',
+      terminalId,
+      status: term.status || 'running',
+      mode: term.mode || 'shell',
+      initialCwd: term.cwd,
+      ...(sessionRef ? { sessionRef } : {}),
+    }
+    layoutStore.attachPaneContent(tabId, paneId, paneContent)
+    broadcastReplayableUiCommand({
+      command: 'tab.create',
+      payload: {
+        id: tabId,
+        title,
+        mode: term.mode || 'shell',
+        terminalId,
+        initialCwd: term.cwd,
+        ...(sessionRef ? { sessionRef } : {}),
+        paneId,
+        paneContent,
+        status: term.status || 'running',
+      },
+    })
+    res.json(ok({ tabId, paneId, terminalId, reused: false }, 'terminal opened'))
   })
 
   router.get('/panes', (req, res) => {

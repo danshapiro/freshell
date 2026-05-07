@@ -77,6 +77,28 @@ function buildRuntime(record: TerminalRecord): TerminalViewportRuntime {
   }
 }
 
+const ANSI_ESCAPE_RE = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g
+const MAX_LAST_LINE_CHARS = 500
+
+function isShellPromptLine(line: string): boolean {
+  return /^[^\s@:]+@[^\s:]+:.+[#$%]\s*$/.test(line)
+}
+
+function lastEmittedLine(snapshot: string): string | undefined {
+  const lastLine = snapshot
+    .replace(ANSI_ESCAPE_RE, '')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => !isShellPromptLine(line))
+    .filter(Boolean)
+    .at(-1)
+
+  if (!lastLine) return undefined
+  if (lastLine.length <= MAX_LAST_LINE_CHARS) return lastLine
+  return `${lastLine.slice(0, MAX_LAST_LINE_CHARS - 3)}...`
+}
+
 function encodeCursor(payload: CursorPayload): string {
   return Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
@@ -179,10 +201,13 @@ export function createTerminalViewService(deps: TerminalViewServiceDeps): Termin
       .filter((terminal) => !config.terminalOverrides?.[terminal.terminalId]?.deleted)
       .map((terminal) => {
         const override = config.terminalOverrides?.[terminal.terminalId]
+        const lastLine = lastEmittedLine(deps.registry.get(terminal.terminalId)?.buffer.snapshot() || '')
         return {
           ...buildDirectoryItem(terminal),
           title: override?.titleOverride || terminal.title,
           description: override?.descriptionOverride || terminal.description,
+          lastLine,
+          last_line: lastLine,
         }
       })
       .sort(compareTerminals)

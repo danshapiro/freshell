@@ -9,6 +9,7 @@ const expectedFreshellUrl = process.env.FRESHELL_URL || 'http://localhost:3001'
 
 class FakeRegistry {
   create = vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term_1' }))
+  get = vi.fn()
 }
 
 describe('tab endpoints', () => {
@@ -83,6 +84,148 @@ describe('tab endpoints', () => {
         },
       }),
     }))
+  })
+
+  it('opens an existing terminal in a new tab when it is detached', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    registry.get.mockReturnValue({
+      terminalId: 'term_1',
+      title: 'Detached shell',
+      mode: 'shell',
+      status: 'running',
+      cwd: '/workspace',
+    })
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const attachPaneContent = vi.fn()
+    const broadcastUiCommandWithReplay = vi.fn()
+    const layoutStore = {
+      createTab,
+      attachPaneContent,
+      findPaneByTerminalId: vi.fn(() => undefined),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      wsHandler: { broadcastUiCommandWithReplay },
+    }))
+
+    const res = await request(app)
+      .post('/api/terminals/term_1/open')
+      .send({ name: 'Work shell' })
+
+    expect(res.status).toBe(200)
+    expect(createTab).toHaveBeenCalledWith({ title: 'Work shell' })
+    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', {
+      kind: 'terminal',
+      terminalId: 'term_1',
+      status: 'running',
+      mode: 'shell',
+      initialCwd: '/workspace',
+    })
+    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
+    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
+      command: 'tab.create',
+      payload: expect.objectContaining({
+        id: 'tab_1',
+        paneId: 'pane_1',
+        terminalId: 'term_1',
+        title: 'Work shell',
+      }),
+    })
+    expect(res.body.data).toMatchObject({
+      tabId: 'tab_1',
+      paneId: 'pane_1',
+      terminalId: 'term_1',
+      reused: false,
+    })
+  })
+
+  it('opens detached coding terminals with canonical sessionRef payloads', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    registry.get.mockReturnValue({
+      terminalId: 'term_1',
+      title: 'Detached Claude',
+      mode: 'claude',
+      status: 'running',
+      cwd: '/workspace',
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+    })
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const attachPaneContent = vi.fn()
+    const broadcastUiCommandWithReplay = vi.fn()
+    const layoutStore = {
+      createTab,
+      attachPaneContent,
+      findPaneByTerminalId: vi.fn(() => undefined),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      wsHandler: { broadcastUiCommandWithReplay },
+    }))
+
+    const res = await request(app)
+      .post('/api/terminals/term_1/open')
+      .send({})
+
+    const sessionRef = { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' }
+    expect(res.status).toBe(200)
+    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+      kind: 'terminal',
+      terminalId: 'term_1',
+      sessionRef,
+    }))
+    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
+    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
+      command: 'tab.create',
+      payload: expect.objectContaining({
+        sessionRef,
+      }),
+    })
+    expect(broadcastUiCommandWithReplay.mock.calls[0]?.[0]?.payload).not.toHaveProperty('resumeSessionId')
+  })
+
+  it('selects the existing pane when opening an already-attached terminal', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    registry.get.mockReturnValue({ terminalId: 'term_1', title: 'Shell', mode: 'shell', status: 'running' })
+    const selectPane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const broadcastUiCommand = vi.fn()
+    const broadcastUiCommandWithReplay = vi.fn()
+    const layoutStore = {
+      findPaneByTerminalId: vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' })),
+      selectPane,
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      wsHandler: { broadcastUiCommand, broadcastUiCommandWithReplay },
+    }))
+
+    const res = await request(app).post('/api/terminals/term_1/open').send({})
+
+    expect(res.status).toBe(200)
+    expect(selectPane).toHaveBeenCalledWith('tab_1', 'pane_1')
+    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
+      command: 'tab.select',
+      payload: { id: 'tab_1' },
+    })
+    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
+      command: 'pane.select',
+      payload: { tabId: 'tab_1', paneId: 'pane_1' },
+    })
+    expect(broadcastUiCommand).not.toHaveBeenCalled()
+    expect(res.body.data).toMatchObject({
+      tabId: 'tab_1',
+      paneId: 'pane_1',
+      terminalId: 'term_1',
+      reused: true,
+    })
   })
 
   it('creates terminal tabs from canonical sessionRef without mirroring legacy resumeSessionId payloads', async () => {
