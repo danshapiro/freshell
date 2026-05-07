@@ -3,6 +3,7 @@
 import { describe, it, expect } from 'vitest'
 import type { PaneNode } from '@/store/paneTypes'
 import {
+  selectTabPaneByTerminalId,
   selectTerminalIdsForTab,
   selectPrimaryTerminalIdForTab,
   selectTabIdByTerminalId,
@@ -48,8 +49,12 @@ function makeSplit(left: PaneNode, right: PaneNode): PaneNode {
 function makeState(overrides: {
   layouts?: Record<string, PaneNode>
   activePane?: Record<string, string>
+  activeTabId?: string | null
 }) {
   return {
+    tabs: {
+      activeTabId: overrides.activeTabId ?? null,
+    },
     panes: {
       layouts: overrides.layouts ?? {},
       activePane: overrides.activePane ?? {},
@@ -105,6 +110,41 @@ describe('selectTerminalIdsForTab', () => {
       },
     })
     expect(selectTerminalIdsForTab(state, 'tab-1')).toEqual(['term-a'])
+  })
+})
+
+describe('selectTabPaneByTerminalId', () => {
+  it('prefers the active tab when the same running terminal is present in multiple tabs', () => {
+    const state = makeState({
+      activeTabId: 'tab-active',
+      layouts: {
+        'tab-background': makeLeaf('pane-background', 'term-shared'),
+        'tab-active': makeLeaf('pane-active', 'term-shared'),
+      },
+      activePane: {
+        'tab-active': 'pane-active',
+      },
+    })
+
+    expect(selectTabPaneByTerminalId(state, 'term-shared')).toEqual({
+      tabId: 'tab-active',
+      paneId: 'pane-active',
+    })
+  })
+
+  it('falls back to the first matching pane when the active tab does not contain the terminal', () => {
+    const state = makeState({
+      activeTabId: 'tab-other',
+      layouts: {
+        'tab-background': makeLeaf('pane-background', 'term-shared'),
+        'tab-other': makeLeaf('pane-other', 'term-other'),
+      },
+    })
+
+    expect(selectTabPaneByTerminalId(state, 'term-shared')).toEqual({
+      tabId: 'tab-background',
+      paneId: 'pane-background',
+    })
   })
 })
 

@@ -132,6 +132,7 @@ function createStore(options?: {
     loaded?: boolean
   }
   tabs?: Array<Record<string, unknown>>
+  activeTabId?: string | null
   panes?: {
     layouts: Record<string, unknown>
     activePane: Record<string, string>
@@ -188,7 +189,7 @@ function createStore(options?: {
       }),
     preloadedState: {
       settings: createSettingsState(options?.settings),
-      tabs: { tabs, activeTabId: (tabs[0]?.id as string | undefined) ?? null },
+      tabs: { tabs, activeTabId: options?.activeTabId ?? ((tabs[0]?.id as string | undefined) ?? null) },
       connection: {
         status: 'disconnected' as const,
         lastError: undefined,
@@ -992,6 +993,100 @@ describe('App WS bootstrap recovery', () => {
         paneId: 'pane-opencode',
         terminalId: 'term-opencode',
         at: 1234,
+      })
+    })
+    expect(store.getState().turnCompletion.seq).toBe(1)
+  })
+
+  it('records OpenCode turn completion against the active tab when a terminal is duplicated', async () => {
+    const store = createStore({
+      activeTabId: 'tab-active',
+      tabs: [
+        {
+          id: 'tab-background',
+          createRequestId: 'req-background',
+          title: 'OpenCode background',
+          status: 'running',
+          mode: 'opencode',
+          shell: 'system',
+          terminalId: 'term-opencode',
+          createdAt: 1,
+        },
+        {
+          id: 'tab-active',
+          createRequestId: 'req-active',
+          title: 'OpenCode active',
+          status: 'running',
+          mode: 'opencode',
+          shell: 'system',
+          terminalId: 'term-opencode',
+          createdAt: 2,
+        },
+      ],
+      panes: {
+        layouts: {
+          'tab-background': {
+            type: 'leaf',
+            id: 'pane-background',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-background',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-opencode',
+              initialCwd: '/workspace',
+            },
+          },
+          'tab-active': {
+            type: 'leaf',
+            id: 'pane-active',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-active',
+              status: 'running',
+              mode: 'opencode',
+              shell: 'system',
+              terminalId: 'term-opencode',
+              initialCwd: '/workspace',
+            },
+          },
+        },
+        activePane: {
+          'tab-background': 'pane-background',
+          'tab-active': 'pane-active',
+        },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-opencode-turn-complete-duplicate'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.turn.complete',
+        terminalId: 'term-opencode',
+        provider: 'opencode',
+        sessionId: 'session-opencode',
+        at: 5678,
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.lastEvent).toMatchObject({
+        tabId: 'tab-active',
+        paneId: 'pane-active',
+        terminalId: 'term-opencode',
+        at: 5678,
       })
     })
     expect(store.getState().turnCompletion.seq).toBe(1)

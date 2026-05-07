@@ -149,6 +149,129 @@ describe('OpencodeActivityTracker', () => {
     tracker.dispose()
   })
 
+  it('emits completion when the initial snapshot observes busy before a same-stream idle event', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.idle',
+            properties: {
+              sessionID: 'session-oc',
+            },
+          },
+        ])
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          'session-oc': { type: 'busy' },
+        })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+    const completions: unknown[] = []
+    tracker.on('association.requested', (payload) => {
+      expect(completions).toEqual([])
+      tracker.confirmSessionAssociation(payload)
+    })
+    tracker.on('turn.complete', (payload) => completions.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(completions).toEqual([{
+      terminalId: 'term-oc',
+      sessionId: 'session-oc',
+      at: expect.any(Number),
+    }])
+    expect(tracker.list()).toEqual([])
+
+    tracker.dispose()
+  })
+
+  it('clears ambiguous busy state when every ambiguous session idles on the same SSE stream', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-a',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'session-b',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.idle',
+            properties: {
+              sessionID: 'session-a',
+            },
+          },
+          {
+            type: 'session.idle',
+            properties: {
+              sessionID: 'session-b',
+            },
+          },
+        ])
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const log = { warn: vi.fn() }
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      log,
+      random: () => 0,
+    })
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    const completions: unknown[] = []
+    tracker.on('changed', (payload) => changes.push(payload))
+    tracker.on('association.requested', (payload) => tracker.confirmSessionAssociation(payload))
+    tracker.on('turn.complete', (payload) => completions.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(log.warn).toHaveBeenCalledWith(
+      {
+        terminalId: 'term-oc',
+        sessionIds: ['session-a', 'session-b'],
+      },
+      'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.',
+    )
+    expect(changes).toContainEqual({
+      upsert: [],
+      remove: ['term-oc'],
+    })
+    expect(completions).toEqual([])
+    expect(tracker.list()).toEqual([])
+
+    tracker.dispose()
+  })
+
   it('keeps health polling on connection errors until the endpoint comes up', async () => {
     vi.useFakeTimers()
     let healthCalls = 0

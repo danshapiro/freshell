@@ -53,7 +53,19 @@ export function selectTabPaneByTerminalId(
   state: RootState,
   terminalId: string,
 ): { tabId: string; paneId: string } | undefined {
+  const activeTabId = state.tabs.activeTabId
+  if (activeTabId) {
+    const activeLayout = state.panes.layouts[activeTabId]
+    if (activeLayout) {
+      const activePaneId = findPaneIdByTerminalId(activeLayout, terminalId)
+      if (activePaneId) {
+        return { tabId: activeTabId, paneId: activePaneId }
+      }
+    }
+  }
+
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+    if (tabId === activeTabId) continue
     const paneId = findPaneIdByTerminalId(layout, terminalId)
     if (paneId) {
       return { tabId, paneId }
