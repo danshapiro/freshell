@@ -281,6 +281,16 @@ describe('CodexAppServerRuntime', () => {
     }
   })
 
+  it('starts the app-server process in the requested cwd', async () => {
+    if (process.platform !== 'linux') return
+    const runtimeCwd = await makeTempDir()
+    const runtime = createRuntime({ cwd: runtimeCwd })
+
+    const ready = await runtime.ensureReady()
+
+    await expect(fsp.readlink(`/proc/${ready.processPid}/cwd`)).resolves.toBe(runtimeCwd)
+  })
+
   it('reuses the same process for repeated ensureReady calls on one runtime', async () => {
     const runtime = createRuntime()
 

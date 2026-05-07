@@ -71,7 +71,9 @@ class FakeRuntime {
 describe('CodexLaunchPlanner', () => {
   it('creates a distinct owned sidecar for each launch plan', async () => {
     const runtimes: FakeRuntime[] = []
-    const planner = new CodexLaunchPlanner(() => {
+    const runtimeInputs: Array<{ cwd?: string }> = []
+    const planner = new CodexLaunchPlanner((input) => {
+      runtimeInputs.push(input)
       const index = runtimes.length + 1
       const runtime = new FakeRuntime(`ws://127.0.0.1:${43000 + index}`, `thread-${index}`)
       runtimes.push(runtime)
@@ -82,6 +84,7 @@ describe('CodexLaunchPlanner', () => {
     const second = await planner.planCreate({ cwd: '/repo/two' })
 
     expect(runtimes).toHaveLength(2)
+    expect(runtimeInputs).toEqual([{ cwd: '/repo/one' }, { cwd: '/repo/two' }])
     expect(first.remote.wsUrl).toBe('ws://127.0.0.1:43001')
     expect(second.remote.wsUrl).toBe('ws://127.0.0.1:43002')
 
