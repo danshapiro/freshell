@@ -31,6 +31,7 @@ const selectPaneTitles = (state: RootState) => state.panes.paneTitles
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceOpen
 const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
 const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
@@ -70,9 +71,10 @@ export const selectMergedClosedRecords = createSelector(
 )
 
 export const selectTabsRegistryGroups = createSelector(
-  [selectLiveLocalTabRecords, selectRemoteOpen, selectMergedClosedRecords],
-  (localOpen, remoteOpen, closed) => ({
+  [selectLiveLocalTabRecords, selectSameDeviceOpen, selectRemoteOpen, selectMergedClosedRecords],
+  (localOpen, sameDeviceOpen, remoteOpen, closed) => ({
     localOpen,
+    sameDeviceOpen: [...(sameDeviceOpen || [])].sort(sortUpdatedDesc),
     remoteOpen: [...(remoteOpen || [])].sort(sortUpdatedDesc),
     closed,
   }),

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '@/store/settingsSlice'
-import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
+import tabRegistryReducer, { setTabRegistryClosedTabRetentionDays } from '@/store/tabRegistrySlice'
 import {
   BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS,
   browserPreferencesPersistenceMiddleware,
@@ -36,7 +36,7 @@ describe('browserPreferencesPersistence', () => {
     localStorage.clear()
   })
 
-  it('persists setLocalSettings and tab search range changes into the browser-preferences blob', () => {
+  it('persists setLocalSettings and closed tab retention changes into the browser-preferences blob', () => {
     const store = createStore()
 
     store.dispatch(setLocalSettings(resolveLocalSettings({
@@ -45,7 +45,7 @@ describe('browserPreferencesPersistence', () => {
         fontSize: 18,
       },
     })))
-    store.dispatch(setTabRegistrySearchRangeDays(90))
+    store.dispatch(setTabRegistryClosedTabRetentionDays(14))
 
     expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
 
@@ -59,7 +59,7 @@ describe('browserPreferencesPersistence', () => {
         },
       },
       tabs: {
-        searchRangeDays: 90,
+        closedTabRetentionDays: 14,
       },
     })
   })

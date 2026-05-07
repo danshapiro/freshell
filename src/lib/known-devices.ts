@@ -15,8 +15,10 @@ type BuildKnownDevicesInput = {
   deviceAliases?: Record<string, string>
   dismissedDeviceIds?: string[]
   localOpen?: RegistryTabRecord[]
+  sameDeviceOpen?: RegistryTabRecord[]
   remoteOpen?: RegistryTabRecord[]
   closed?: RegistryTabRecord[]
+  devices?: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
 }
 
 type DeviceGroup = {
@@ -76,8 +78,8 @@ export function buildKnownDevices(input: BuildKnownDevicesInput): KnownDevice[] 
 
   for (const record of [
     ...(input.localOpen ?? []),
+    ...(input.sameDeviceOpen ?? []),
     ...(input.remoteOpen ?? []),
-    ...(input.closed ?? []),
   ]) {
     if (record.deviceId === input.ownDeviceId) {
       continue
@@ -86,6 +88,16 @@ export function buildKnownDevices(input: BuildKnownDevicesInput): KnownDevice[] 
       continue
     }
     upsertRemoteGroup(groups, record)
+  }
+
+  for (const device of input.devices ?? []) {
+    if (device.deviceId === input.ownDeviceId || dismissedDeviceIds.has(device.deviceId)) continue
+    const recordLike = {
+      deviceId: device.deviceId,
+      deviceLabel: device.deviceLabel,
+      updatedAt: device.lastSeenAt,
+    } as RegistryTabRecord
+    upsertRemoteGroup(groups, recordLike)
   }
 
   return [...groups.values()]

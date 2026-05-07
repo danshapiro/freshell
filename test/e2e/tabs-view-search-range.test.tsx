@@ -53,10 +53,11 @@ describe('tabs view search range loading', () => {
     expect(wsMock.sendTabsSyncQuery).not.toHaveBeenCalled()
 
     fireEvent.change(screen.getByLabelText('Closed range filter'), {
-      target: { value: '90' },
+      target: { value: '14' },
     })
     expect(wsMock.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
-    expect(wsMock.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBe(90)
+    expect(wsMock.sendTabsSyncQuery.mock.calls[0][0].closedTabRetentionDays).toBe(14)
+    expect(wsMock.sendTabsSyncQuery.mock.calls[0][0].clientInstanceId).toEqual(expect.any(String))
   })
 
   it('hydrates the closed range filter from browser preferences on reload', async () => {
@@ -83,6 +84,6 @@ describe('tabs view search range loading', () => {
       </Provider>,
     )
 
-    expect(screen.getByLabelText('Closed range filter')).toHaveValue('90')
+    expect(screen.getByLabelText('Closed range filter')).toHaveValue('30')
   })
 })

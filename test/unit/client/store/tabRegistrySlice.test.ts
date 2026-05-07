@@ -148,7 +148,7 @@ describe('tabRegistrySlice', () => {
     })
   })
 
-  it('initializes searchRangeDays from browser preferences instead of always resetting to 30', async () => {
+  it('clamps legacy searchRangeDays from browser preferences to the closed retention limit', async () => {
     localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
       tabs: {
         searchRangeDays: 365,
@@ -159,6 +159,7 @@ describe('tabRegistrySlice', () => {
     const freshModule = await import('../../../../src/store/tabRegistrySlice')
     const freshReducer = freshModule.default
 
-    expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(365)
+    expect(freshReducer(undefined, { type: 'unknown' }).closedTabRetentionDays).toBe(30)
+    expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(30)
   })
 })

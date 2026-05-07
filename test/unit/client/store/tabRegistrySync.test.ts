@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { RootState } from '../../../../src/store/store'
-import { startTabRegistrySync, SYNC_INTERVAL_MS } from '../../../../src/store/tabRegistrySync'
+import { HEARTBEAT_INTERVAL_MS, startTabRegistrySync, SYNC_INTERVAL_MS } from '../../../../src/store/tabRegistrySync'
 
 type Listener = () => void
 
@@ -44,9 +44,12 @@ function createState(): RootState {
       deviceId: 'local-device',
       deviceLabel: 'local-label',
       localOpen: [],
+      sameDeviceOpen: [],
       remoteOpen: [],
       closed: [],
+      devices: [],
       localClosed: {},
+      closedTabRetentionDays: 30,
       searchRangeDays: 30,
       loading: false,
     },
@@ -111,8 +114,15 @@ describe('tabRegistrySync', () => {
 
     const stop = startTabRegistrySync(store as any, ws)
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
-    expect(ws.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBeUndefined()
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0]).toMatchObject({
+      clientInstanceId: expect.any(String),
+      closedTabRetentionDays: 30,
+    })
     expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncPush.mock.calls[0][0]).toMatchObject({
+      clientInstanceId: expect.any(String),
+      snapshotRevision: expect.any(Number),
+    })
 
     ws.sendTabsSyncPush.mockClear()
     vi.advanceTimersByTime(SYNC_INTERVAL_MS)
@@ -131,12 +141,13 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
-  it('includes expanded search range when querying snapshots', () => {
+  it('includes selected closed retention when querying snapshots', () => {
     state = {
       ...state,
       tabRegistry: {
         ...state.tabRegistry,
-        searchRangeDays: 90,
+        closedTabRetentionDays: 14,
+        searchRangeDays: 14,
       },
     }
 
@@ -153,16 +164,17 @@ describe('tabRegistrySync', () => {
 
     const stop = startTabRegistrySync(store as any, ws)
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
-    expect(ws.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBe(90)
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0].closedTabRetentionDays).toBe(14)
     stop()
   })
 
-  it('re-queries with the current search range after reconnect', () => {
+  it('re-queries with the current closed retention after reconnect', () => {
     state = {
       ...state,
       tabRegistry: {
         ...state.tabRegistry,
-        searchRangeDays: 365,
+        closedTabRetentionDays: 7,
+        searchRangeDays: 7,
       },
     }
 
@@ -183,7 +195,7 @@ describe('tabRegistrySync', () => {
     wsReconnectHandlers.forEach((handler) => handler())
 
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
-    expect(ws.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBe(365)
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0].closedTabRetentionDays).toBe(7)
     stop()
   })
 

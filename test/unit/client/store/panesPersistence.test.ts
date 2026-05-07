@@ -954,7 +954,7 @@ describe('legacy agent-chat display settings migration', () => {
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings.theme).toBe('dark')
-    expect(bp.tabs.searchRangeDays).toBe(60)
+    expect(bp.tabs.closedTabRetentionDays).toBe(30)
     expect(bp.settings.agentChat.showThinking).toBe(true)
   })
 })

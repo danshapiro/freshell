@@ -29,6 +29,10 @@ describe('buildKnownDevices', () => {
       remoteOpen: [
         makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
       ],
+      devices: [
+        { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
+        { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
+      ],
       closed: [
         makeRecord({
           deviceId: 'remote-b',
@@ -55,6 +59,10 @@ describe('buildKnownDevices', () => {
       dismissedDeviceIds: ['remote-a', 'remote-b'],
       remoteOpen: [
         makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
+      ],
+      devices: [
+        { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
+        { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
       ],
       closed: [
         makeRecord({
