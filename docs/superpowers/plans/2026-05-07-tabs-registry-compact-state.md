@@ -36,8 +36,9 @@ There are three identities:
    - Multiple browser windows can share it.
 
 2. Client instance
-   - A short-lived identity for one running Freshell browser app instance.
-   - Created at app startup and not persisted across reloads.
+   - A short-lived identity for one Freshell browser window.
+   - Stored in `sessionStorage`, so a reload keeps replacing the same window-owned snapshot.
+   - A separate browser window gets a separate client instance.
    - This is the ownership boundary for open-tab snapshots.
 
 3. Tab key
@@ -49,7 +50,7 @@ The server stores compact state:
 - `openSnapshotsByClient`: latest open snapshot from each active browser instance.
 - `closedByTabKey`: latest closed tombstone for each recently closed tab.
 
-On query, the server combines fresh open snapshots with recent closed tombstones, resolves conflicts by tab key, and returns:
+On query, the server combines fresh open snapshots with retained closed tombstones for conflict resolution, filters closed winners to the requested retention window, and returns:
 
 - `localOpen`
 - `remoteOpen`
@@ -104,38 +105,46 @@ Rules:
   - missing -> 30
   - 1..30 -> preserve
   - greater than 30 -> clamp to 30
-- Server stores closed tombstones up to the max retention window, then query filters to the requested local setting.
+- Server stores closed tombstones up to the max retention window. Query uses all retained tombstones for conflict resolution, then filters closed winners to the requested local setting.
 
 The old 90-day and 365-day UI options go away.
 
-### 4. Device Freshness Is Separate From Closed Retention
+### 4. Open Liveness, Device Freshness, And Closed Retention Are Separate
 
 Remote open tabs should fall away when a device has not been seen recently.
 
 Rules:
 
 - Open snapshot freshness uses server receipt time, not record `updatedAt`.
-- Default stale-client/device TTL: 7 days.
+- Default open snapshot TTL: 30 minutes.
+- Default device display TTL: 7 days.
 - A running idle browser should stay fresh via a low-frequency forced heartbeat/snapshot.
 - `updatedAt` remains the conflict-resolution timestamp for a tab record.
 
 This distinction matters:
 
 - `snapshotReceivedAt` answers "is this browser instance still around?"
+- `deviceLastSeenAt` answers "should this remote device still appear in device management?"
 - `record.updatedAt` answers "which version of this tab record wins?"
+
+Open snapshots are meant to represent currently open tabs. If a browser window closes or crashes and cannot send a final retire message, its open snapshot should expire quickly. Device rows can remain visible longer for management and naming, but stale device metadata must not keep open tabs alive.
 
 ### 5. Last-Write-Wins Must Still Resolve Open vs Closed
 
 Query must not simply append all fresh open records and all recent closed records.
 
-It must first combine candidate records by `tabKey` and select the newest record using the existing revision/updatedAt semantics:
+It must first combine candidate records by `tabKey` and select the newest record using event freshness, not heartbeat freshness:
 
-- higher `revision` wins
-- if revision ties, newer `updatedAt` wins
+- higher `updatedAt` wins
+- if `updatedAt` ties, higher `revision` wins
+- if both tie, closed wins over open
+- if still tied, use a deterministic source-key tie breaker
 
 Then it returns winners by status.
 
 This prevents a stale-but-fresh hidden window from resurrecting a tab that another window closed. The hidden window may keep sending its old open snapshot, but the newer closed tombstone wins for that `tabKey`.
+
+Important correction from the current code: client record `revision` is module-local and can reset after reload. It must not be the primary ordering signal. Heartbeats also must not rewrite `record.updatedAt` for unchanged open tabs; `snapshotReceivedAt` is the heartbeat/liveness time and must stay separate from the tab event time.
 
 ### 6. No Silent Fallbacks
 
@@ -147,19 +156,24 @@ Atomic writes may keep a manual recovery copy, but the server should not automat
 
 Add compact persistence under `~/.freshell/tabs-registry/`.
 
-Preferred active file:
+Preferred active layout:
 
 ```text
-device-snapshots.json
+v1/
+  manifest.json
+  open/
+    <safe-client-snapshot-key>.json
+  closed-tombstones.json
 ```
 
-Shape:
+In-memory shape:
 
 ```ts
 type CompactTabsRegistryStateV1 = {
   version: 1
   savedAt: number
-  deviceTtlDays: 7
+  openSnapshotTtlMinutes: 30
+  deviceDisplayTtlDays: 7
   maxClosedRetentionDays: 30
   openSnapshotsByClient: Record<string, ClientOpenSnapshot>
   closedByTabKey: Record<string, RegistryTabRecord>
@@ -181,6 +195,8 @@ Snapshot key:
 const clientSnapshotKey = `${deviceId}:${clientInstanceId}`
 ```
 
+The on-disk open snapshot filename must be derived from a safe encoding or hash of `clientSnapshotKey`, not raw user-controlled strings.
+
 Important constraints:
 
 - `records` in `ClientOpenSnapshot` must contain open records only.
@@ -188,6 +204,13 @@ Important constraints:
 - Server separates them:
   - open records replace that client's open snapshot
   - closed records merge into `closedByTabKey`
+- A heartbeat that does not change tab records updates only `snapshotReceivedAt` and the open snapshot file metadata/state, not the individual records' `updatedAt`.
+
+Reason for per-client open files:
+
+- Heartbeats should rewrite one small client snapshot, not a whole 5 MiB registry file.
+- Closed tombstones change much less often and can live in their own bounded file.
+- Startup still loads bounded compact state, but the active write path is no longer a whole-registry rewrite for every idle heartbeat.
 
 ## Protocol Changes
 
@@ -218,7 +241,7 @@ Revised push:
 Rules:
 
 - `clientInstanceId` is required.
-- `snapshotRevision` is monotonically increasing per client instance.
+- `snapshotRevision` is monotonically increasing per client instance, including across reloads that keep the same `sessionStorage` client id.
 - Server rejects same-key snapshots with `snapshotRevision <= current.snapshotRevision`.
 - Server acks only after validation and atomic persistence succeed.
 - Ack should describe replacement semantics, not claim `updated: records.length`.
@@ -233,6 +256,24 @@ Revised ack:
   closedRecords: number,
 }
 ```
+
+Best-effort client retire:
+
+```ts
+{
+  type: 'tabs.sync.client.retire',
+  deviceId,
+  clientInstanceId,
+  snapshotRevision,
+}
+```
+
+Rules:
+
+- Sent on explicit disconnect where possible and from `pagehide`/unload using a keepalive request or beacon if WebSocket delivery is not reliable.
+- Server deletes only that `(deviceId, clientInstanceId)` open snapshot.
+- Server ignores stale retire messages with `snapshotRevision < current.snapshotRevision`.
+- Retire is an optimization, not the correctness mechanism; the 30-minute open snapshot TTL remains required for crashes and missed unloads.
 
 Current query uses `rangeDays`. Revised query should use the semantic name:
 
@@ -273,6 +314,12 @@ class TabsRegistryStore {
     closedRecords: number
   }>
 
+  async retireClientSnapshot(input: {
+    deviceId: string
+    clientInstanceId: string
+    snapshotRevision: number
+  }): Promise<{ accepted: boolean }>
+
   async query(input: {
     deviceId: string
     closedTabRetentionDays: number
@@ -294,11 +341,19 @@ class TabsRegistryStore {
 
 Active persistence:
 
-- Write compact JSON only.
+- Write compact JSON files only.
 - No active append-only JSONL.
-- Write through a serialized write queue.
-- Atomic write with temp file + rename.
-- Validate compact state before accepting it into memory.
+- Persist open snapshots as per-client files under `v1/open/`.
+- Persist closed tombstones in `v1/closed-tombstones.json`.
+- Persist registry version/settings in `v1/manifest.json`.
+- Write all mutations through a serialized write queue.
+- Atomic write with temp file + rename for each changed file.
+- Use copy-on-write state mutation:
+  1. clone or derive the next bounded in-memory state
+  2. validate caps and schemas against the next state
+  3. write and rename changed files
+  4. swap the live in-memory state only after disk persistence succeeds
+- Validate compact state before accepting it into memory on startup.
 
 Caps:
 
@@ -307,7 +362,8 @@ Caps:
 - Max closed records accepted per push: 500.
 - Max panes per tab record: 20.
 - Max serialized push bytes: 1 MiB.
-- Max compact state bytes after pruning: 5 MiB.
+- Max compact state bytes after retention maintenance: 5 MiB.
+- Max client snapshot files: 200.
 - Max closed tombstones after retention pruning: 2,000 newest.
 
 If caps are exceeded:
@@ -317,6 +373,18 @@ If caps are exceeded:
 - Do not truncate open snapshots silently.
 
 Closed tombstones may be pruned by age and by the max-tombstone cap, keeping newest records first. That is not a fallback; it is an explicit retention policy.
+
+Read/query behavior:
+
+- `query()` must be pure. It can compute filtered results from the current in-memory state, but it must not mutate state or write files.
+- Retention cleanup runs as a queued maintenance write, either after successful pushes/retires or on a low-frequency timer.
+- If maintenance cleanup fails, queries should still use snapshot isolation over the last successfully persisted in-memory state and expose/log the maintenance error clearly.
+
+Failure behavior:
+
+- A failed write must not alter live query results.
+- A failed write must return a clear error to the WebSocket caller.
+- Tests must prove that injected write/rename failures leave memory and disk on the previous committed state.
 
 ## Query Algorithm
 
@@ -328,19 +396,34 @@ Inputs:
 
 Steps:
 
-1. Prune stale client snapshots where `snapshotReceivedAt < now - 7 days`.
-2. Prune closed tombstones older than max closed retention.
-3. Build candidate records:
+1. Compute fresh client snapshots where `snapshotReceivedAt >= now - 30 minutes`.
+   - Do not mutate or persist from `query()`.
+   - Expired snapshots are excluded from this response and removed later by queued maintenance.
+2. Build conflict-resolution candidates:
    - all open records from fresh client snapshots
-   - all closed tombstones with `closedAt >= now - closedTabRetentionDays`
-4. Resolve candidates by `tabKey` using existing LWW logic.
-5. Split winners:
+   - all closed tombstones retained by the server's max closed retention window, even if they are older than the caller's requested range
+3. Resolve candidates by `tabKey` using the event-time LWW helper:
+   - higher `updatedAt`
+   - then higher `revision`
+   - then closed over open
+   - then deterministic source-key tie breaker
+4. Apply the caller's requested `closedTabRetentionDays` only to closed winners.
+   - Example: if a tab was closed 10 days ago and the user selects 7 days, that closed winner is omitted from `closed`, but an older open snapshot for the same `tabKey` must still stay suppressed.
+   - This prevents shorter display retention from becoming a resurrection path.
+5. Split remaining winners:
    - open + same `deviceId` -> `localOpen`
    - open + different `deviceId` -> `remoteOpen`
-   - closed -> `closed`
+   - closed within requested retention -> `closed`
 6. Sort:
    - open by `updatedAt` descending
    - closed by `closedAt ?? updatedAt` descending
+
+Maintenance write, not query:
+
+1. Remove open snapshots older than the open snapshot TTL.
+2. Remove closed tombstones older than max closed retention.
+3. Enforce max snapshot-file and tombstone caps.
+4. Persist cleanup through the serialized copy-on-write queue.
 
 This preserves the current mental model while avoiding historical storage.
 
@@ -356,20 +439,27 @@ Migration must be one-time and streaming.
 
 Rules:
 
-1. If compact file exists, do not read legacy JSONL.
-2. If compact file does not exist and legacy JSONL exists, stream it line by line.
+1. If the compact `v1/manifest.json` exists, do not read legacy JSONL.
+2. If compact state does not exist and legacy JSONL exists, stream it line by line.
 3. Parse each valid record with the existing schema.
-4. Compute latest record per `tabKey` first.
-5. Only after latest-per-tab resolution:
+4. Enforce migration safety caps while streaming:
+   - Max legacy line bytes: 256 KiB.
+   - Max valid unique tab keys retained during migration: 10,000.
+   - Max migrated open snapshots/devices: 200.
+   - Max migrated compact state after retention maintenance: 5 MiB.
+   - If a cap is exceeded, fail startup with a clear recovery error rather than continuing toward memory pressure.
+5. Compute latest record per `tabKey` first using the same event-time LWW helper as query.
+6. Only after latest-per-tab resolution:
    - closed latest records within 30 days become `closedByTabKey`
    - open latest records are grouped into synthetic migrated snapshots by `deviceId`
-6. Synthetic migrated snapshots use:
+7. Synthetic migrated snapshots use:
    - `clientInstanceId: 'legacy-migration'`
    - `snapshotRevision: 1`
-   - `snapshotReceivedAt: max(updatedAt of grouped open records)`
-7. The 7-day freshness rule naturally drops stale migrated open snapshots.
-8. Write compact state atomically.
-9. Rename legacy JSONL to an archived name only after compact write succeeds.
+   - `snapshotReceivedAt: migrationStartedAt`
+   - normal open snapshot TTL expiration
+8. The migration-time receipt gives currently loaded clients a short grace period to reconnect and publish real per-window snapshots. It does not keep legacy opens alive for 7 days.
+9. Write compact files atomically.
+10. Rename legacy JSONL to an archived name only after compact write succeeds.
 
 Archive name example:
 
@@ -381,6 +471,7 @@ Critical ordering:
 
 - Do not prune closed records before latest-per-tab resolution.
 - Otherwise an old closed tombstone could be discarded and an older open record could be resurrected.
+- Do not use legacy record `updatedAt` as open snapshot liveness evidence. It is tab-event time, not proof that the browser is still around.
 
 Startup rule:
 
@@ -391,15 +482,17 @@ Startup rule:
 
 ### Client Instance Identity
 
-Add a per-running-app `clientInstanceId`.
+Add a per-window `clientInstanceId`.
 
 Rules:
 
-- Generated once per loaded app instance.
-- Not persisted in `localStorage`.
+- Generated once per browser window.
+- Stored in `sessionStorage`, not `localStorage`.
+- Reused across reloads of the same browser window.
 - Included in every `tabs.sync.push`.
 - New browser window gets a different `clientInstanceId`.
-- Browser reload gets a different `clientInstanceId`; the old snapshot falls away by TTL.
+- Browser reload keeps the same `clientInstanceId` and replaces the same server snapshot.
+- If a duplicated tab copies `sessionStorage`, use `BroadcastChannel` or an equivalent local lease to detect an already-active identical `clientInstanceId` and mint a fresh one for the duplicate window.
 
 Candidate location:
 
@@ -414,9 +507,12 @@ Keep a monotonic `snapshotRevision` per client instance.
 
 Rules:
 
+- Store the last sent revision beside `clientInstanceId` in `sessionStorage`.
 - Increment when sending a push.
+- Continue from the stored value after reload.
 - Do not use tab record revision for snapshot ordering.
 - Server rejects stale snapshot revisions for the same `(deviceId, clientInstanceId)`.
+- Retire messages also carry a revision so an old unload cannot delete a newer reloaded snapshot.
 
 ### Push Behavior
 
@@ -431,6 +527,8 @@ Revised behavior:
 - Send closed records from local memory while they exist and are within retention.
 - Do not rely on omission to delete server-side closed records.
 - Add a forced heartbeat/snapshot interval so idle active browsers refresh `snapshotReceivedAt`.
+- Do not update per-record `updatedAt` for unchanged open tabs during heartbeat.
+- Send a best-effort `tabs.sync.client.retire` when the app/window is closing, while keeping TTL as the correctness backstop.
 
 Suggested intervals:
 
@@ -484,7 +582,8 @@ Device management:
 
 This satisfies both:
 
-- remote open devices fall away after the freshness TTL
+- remote open snapshots fall away after the freshness TTL
+- remote device rows fall away after the device display TTL
 - closed tab history can remain visible for 30 days
 
 ## ServerInstanceId Rules
@@ -496,8 +595,10 @@ Keep that for live open snapshots from the current connection.
 Be careful with closed records:
 
 - If a closed record originated on the current server, preserving/overwriting to current server is fine.
-- If closed records ever become persisted client-side, namespace them by `serverInstanceId` or clear them when the ready server changes.
-- This plan avoids requiring client-side persisted closed history, so the immediate implementation can keep the current overwrite behavior.
+- `localClosed` must track the `ready.serverInstanceId` it belongs to.
+- If `ready.serverInstanceId` changes during the same app session, clear `localClosed` before the next push or namespace the in-memory closed map by `serverInstanceId` and send only the current namespace.
+- This prevents closed records from server A being re-authored as server B.
+- This plan avoids requiring client-side persisted closed history, so the immediate implementation can keep closed history memory-only and clear it on server switch.
 
 Legacy migration should preserve the `serverInstanceId` already stored in each legacy record.
 
@@ -516,42 +617,61 @@ Server store unit tests:
 
 - Open snapshot replacement is scoped to `(deviceId, clientInstanceId)`.
 - Two client instances on the same device do not erase each other.
+- Reloaded same-window client reuses `clientInstanceId` and replaces the prior snapshot.
 - Stale snapshot revision for the same client is rejected.
+- Stale retire does not delete a newer snapshot.
 - Closed tombstone survives later open snapshot omission.
 - Newer closed tombstone suppresses stale open record.
 - Newer open record suppresses older closed tombstone.
+- Closed tombstone older than requested retention still participates in LWW and can suppress an older open.
+- `updatedAt` beats reset-prone `revision`; a reload-then-close record with lower revision can beat an older open record.
+- Deterministic LWW ties choose closed over open and produce stable results.
 - Query uses server receipt time for snapshot freshness.
+- Query is pure and does not prune/write.
+- Open snapshot TTL is 30 minutes; device display TTL is 7 days.
 - Closed retention defaults to 30 and clamps/rejects outside 1..30.
-- Stale snapshots are pruned from query.
+- Stale snapshots are excluded from query and pruned by queued maintenance.
 - Oversized pushes are rejected.
 - Duplicate tab keys in one push are resolved or rejected explicitly.
 
 Integration/persistence tests:
 
-- Compact state rehydrates without JSONL.
+- Compact per-client snapshot files and closed tombstones rehydrate without JSONL.
 - Legacy JSONL migration computes latest per tab before pruning.
 - Old closed tombstone does not resurrect older open record.
+- Legacy migration uses migration-time liveness for open snapshots, not legacy `updatedAt`.
+- Migration caps fail with a clear recovery error before unbounded memory growth.
 - Legacy file is archived only after compact write succeeds.
 - Startup awaits migration before WS can query.
 - Corrupt compact file produces a clear error, not empty data.
+- Injected write/rename failure leaves memory and disk at the previous committed state.
+- Concurrent query during queued push sees either old or new committed state, never partial state.
 
 WebSocket tests:
 
 - `tabs.sync.push` requires `clientInstanceId` and `snapshotRevision`.
 - Ack reports accepted/open/closed counts.
+- `tabs.sync.client.retire` removes only that client snapshot and rejects/ignores stale revisions.
 - Query requires/uses `closedTabRetentionDays`.
 - `closedTabRetentionDays > 30` is rejected.
 - Missing registry returns clear error for query, not empty snapshot.
 
 Client tests:
 
-- Sync includes `clientInstanceId` and increasing `snapshotRevision`.
+- Sync includes `sessionStorage` `clientInstanceId` and increasing `snapshotRevision`.
+- Reload preserves client id/revision; new window gets a distinct id.
+- Duplicated-tab `sessionStorage` collision is detected and rotated.
 - Forced heartbeat sends even when record fingerprint is unchanged.
+- Heartbeat does not mutate tab record `updatedAt`.
+- Best-effort retire is sent on close/pagehide where the environment supports it.
 - Closed records older than retention are not sent.
+- `localClosed` clears or namespaces when `ready.serverInstanceId` changes.
 - Browser preference migration clamps old `searchRangeDays`.
+- Old/new preference mixed cross-tab sync converges on `closedTabRetentionDays`.
 - Cross-tab preference sync preserves pending local `closedTabRetentionDays`.
 - Tabs view no longer offers 90/365.
 - Settings devices are not kept alive solely by closed tombstones.
+- `docs/index.html` mock is updated if it shows the old 90/365 retention options.
 
 ### Phase 2: Compact Store Types And Helpers
 
@@ -565,10 +685,11 @@ Add:
 
 - compact state schema
 - push input schema
-- LWW helper shared by migration/query
-- prune helpers
+- event-time LWW helper shared by migration/query
+- pure filter helpers and queued maintenance prune helpers
 - size/cap validation
-- atomic write helper
+- copy-on-write atomic write helper
+- safe client snapshot filename helper
 
 Keep imports NodeNext-compatible with `.js` extensions.
 
@@ -594,7 +715,7 @@ const tabsRegistryStore = await TabsRegistryStore.open(...)
 The factory must:
 
 1. ensure directory exists
-2. load compact state if present
+2. load compact `v1/` state if present
 3. otherwise migrate legacy JSONL if present
 4. otherwise initialize empty compact state
 
@@ -615,6 +736,12 @@ Replace looped `upsert` calls with one store call:
 await tabsRegistryStore.replaceClientSnapshot(...)
 ```
 
+Add protocol handling for:
+
+```ts
+await tabsRegistryStore.retireClientSnapshot(...)
+```
+
 Do not send empty snapshots when the registry is unavailable. Send a clear error.
 
 ### Phase 5: Client Sync And Preferences
@@ -632,11 +759,14 @@ Modify:
 
 Add:
 
-- `clientInstanceId`
-- `snapshotRevision`
+- `sessionStorage` `clientInstanceId`
+- `sessionStorage` `snapshotRevision`
+- duplicated-tab client id collision handling
 - heartbeat push
+- best-effort retire
 - retention rename/migration
 - retention-aware closed pruning
+- `localClosed` server-instance guard
 
 Keep `localClosed` memory-only unless implementation proves a client-side persistence gap remains. Server tombstones should handle reload survival.
 
@@ -647,6 +777,7 @@ Modify:
 - `src/components/TabsView.tsx`
 - `src/components/settings/SafetySettings.tsx`
 - `src/lib/known-devices.ts`
+- `docs/index.html` if it contains stale Tabs mock retention options
 - relevant unit/e2e tests
 
 Tabs View:
@@ -686,9 +817,10 @@ Manual perf verification:
 2. Copy a large legacy `tabs-registry.jsonl` fixture into a temp Freshell home.
 3. Start production server on a unique port with that temp home.
 4. Confirm startup does not read/split the full file into heap.
-5. Confirm compact file is small.
+5. Confirm compact files are small.
 6. Confirm legacy JSONL is archived.
 7. Confirm remote tabs and recently closed tabs still appear correctly.
+8. Benchmark heartbeat write latency near the configured caps and confirm it rewrites only the relevant client snapshot file.
 
 Expected result:
 
@@ -701,16 +833,25 @@ Expected result:
 - Server no longer appends to active `tabs-registry.jsonl`.
 - Server startup does not `readFileSync` and `split` a large tabs-registry JSONL file.
 - Legacy migration streams line by line.
-- Compact file is versioned and schema-validated.
+- Compact files are versioned and schema-validated.
 - Open replacement is scoped to `(deviceId, clientInstanceId)`.
 - Same-device multiple browser windows cannot erase each other's open tabs.
+- Same-window reloads reuse the same `sessionStorage` client id and replace the prior snapshot.
 - Closed history survives browser reload and server restart for up to 30 days.
+- Retained closed tombstones participate in conflict resolution before requested-range filtering.
+- Tab conflict ordering lets newer `updatedAt` beat stale higher `revision`.
 - Stale hidden-window open records cannot resurrect newer closed tabs.
-- Remote open devices fall away after 7 days without server receipt.
+- Remote open snapshots fall away after 30 minutes without server receipt.
+- Remote device rows fall away after 7 days without server receipt.
 - Idle active browser instances remain fresh through heartbeat.
+- Heartbeat updates snapshot liveness without changing per-record `updatedAt`.
+- Best-effort retire removes only the calling client snapshot and stale retires cannot delete newer snapshots.
 - Retention default is 30 days.
 - Retention setting is clamped/rejected to 1..30.
 - 90-day and 365-day closed history options are gone.
+- Query is pure; pruning happens through queued maintenance writes.
+- Failed atomic writes do not change live query results.
+- Legacy migration has explicit memory/size caps and uses migration-time liveness for synthetic open snapshots.
 - Query failures are explicit; no empty-snapshot fallback.
 - Oversized/malformed pushes are rejected clearly.
 - Existing Tabs behavior still works:
@@ -729,16 +870,18 @@ Risk: client instance snapshots accumulate after browser crashes.
 
 Mitigation:
 
-- 7-day freshness TTL.
-- Prune on query and write.
+- 30-minute open snapshot TTL.
+- Query excludes stale snapshots without mutating state.
+- Queued maintenance prunes stale snapshot files.
 
 Risk: heartbeat creates needless writes.
 
 Mitigation:
 
 - Heartbeat interval is low frequency.
-- Compact writes are bounded and small.
-- Only refresh one client snapshot, not append history.
+- Heartbeat rewrites one small per-client open snapshot file.
+- Heartbeat does not rewrite the closed tombstone file unless closed records changed.
+- Writes remain bounded and do not append history.
 
 Risk: changing protocol breaks stale browser bundles.
 
@@ -747,20 +890,21 @@ Mitigation:
 - Reject invalid/missing `clientInstanceId` with a clear error.
 - Do not maintain a long-term compatibility fallback unless explicitly approved.
 
-Risk: compact JSON still grows from bad clients.
+Risk: compact state still grows from bad clients.
 
 Mitigation:
 
-- hard caps on push size, records, panes, tombstones, and compact file size
+- hard caps on push size, records, panes, snapshot files, tombstones, and compact state size
 - clear errors on rejection
 
-Risk: migration drops useful current open tabs from idle devices.
+Risk: migration shows stale historical open tabs or drops useful current open tabs.
 
 Mitigation:
 
-- migrated open snapshots use legacy `updatedAt` as freshness evidence
-- current active browsers push immediately after reconnect/startup
-- stale historical devices intentionally fall away
+- migrated open snapshots get a short migration-time grace period
+- current active browsers push immediately after reconnect/startup and replace synthetic snapshots
+- stale historical opens fall away after the open snapshot TTL
+- legacy `updatedAt` is never used as browser liveness evidence
 
 ## Implementation Handoff
 
