@@ -91,7 +91,7 @@ describe('SessionAssociationCoordinator', () => {
     expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'claude', 'session-main', 'association')
   })
 
-  it('associates opencode sessions with matching unassociated terminals', () => {
+  it('does not attempt heuristic association for opencode sessions', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-2', createdAt: 1_000 }]),
       bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-2', sessionId: 'session-main' })),
@@ -101,9 +101,9 @@ describe('SessionAssociationCoordinator', () => {
 
     const result = coordinator.associateSingleSession(createSession({ provider: 'opencode' }))
 
-    expect(result).toEqual({ associated: true, terminalId: 'term-2' })
-    expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('opencode', '/repo/project')
-    expect(registry.bindSession).toHaveBeenCalledWith('term-2', 'opencode', 'session-main', 'association')
+    expect(result).toEqual({ associated: false, reason: 'provider_managed' })
+    expect(registry.findUnassociatedTerminals).not.toHaveBeenCalled()
+    expect(registry.bindSession).not.toHaveBeenCalled()
   })
 
   it('skips association when session is already bound to another terminal', () => {
