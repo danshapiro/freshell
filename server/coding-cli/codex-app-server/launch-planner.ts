@@ -35,6 +35,10 @@ type PlanCreateInput = {
   approvalPolicy?: string
 }
 
+type RuntimeCreateInput = {
+  cwd?: string
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -53,11 +57,11 @@ export function isCodexSidecarTeardownError(error: unknown): error is CodexSidec
 export class CodexLaunchPlanner {
   private readonly activeSidecars = new Set<CodexLaunchSidecar>()
   private readonly failedSidecarShutdowns = new Set<CodexLaunchSidecar>()
-  private readonly runtimeFactory: () => CodexRuntimeLike
+  private readonly runtimeFactory: (input: RuntimeCreateInput) => CodexRuntimeLike
   private shutdownStarted = false
   private shutdownPromise: Promise<void> | null = null
 
-  constructor(runtimeOrFactory: CodexRuntimeLike | (() => CodexRuntimeLike)) {
+  constructor(runtimeOrFactory: CodexRuntimeLike | ((input: RuntimeCreateInput) => CodexRuntimeLike)) {
     this.runtimeFactory = typeof runtimeOrFactory === 'function'
       ? runtimeOrFactory
       : () => runtimeOrFactory
@@ -68,7 +72,7 @@ export class CodexLaunchPlanner {
     await this.retryFailedSidecarShutdownsBeforePlan()
     this.assertAcceptingPlans()
 
-    const runtime = this.runtimeFactory()
+    const runtime = this.runtimeFactory({ cwd: input.cwd })
     const sidecar = this.createSidecar(runtime)
     this.activeSidecars.add(sidecar)
 

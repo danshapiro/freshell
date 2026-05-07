@@ -298,7 +298,10 @@ async function main() {
   sdkBridge = new SdkBridge(agentHistorySource)
 
   const server = http.createServer(app)
-  const codexLaunchPlanner = new CodexLaunchPlanner(() => new CodexAppServerRuntime({ serverInstanceId }))
+  const codexLaunchPlanner = new CodexLaunchPlanner((input) => new CodexAppServerRuntime({
+    serverInstanceId,
+    cwd: input.cwd,
+  }))
   const wsHandler = new WsHandler(
     server,
     registry,
