@@ -1,11 +1,10 @@
-import { beforeEach, describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from '../../server/coding-cli/types'
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
-import { recordSessionLifecycleEvent } from '../../server/session-observability'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -20,10 +19,6 @@ vi.mock('node-pty', () => ({
 vi.mock('../../server/mcp/config-writer.js', () => ({
   generateMcpInjection: vi.fn(() => ({ args: [], env: {} })),
   cleanupMcpConfig: vi.fn(),
-}))
-
-vi.mock('../../server/session-observability.js', () => ({
-  recordSessionLifecycleEvent: vi.fn(),
 }))
 
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
@@ -53,10 +48,6 @@ function createMetadataService() {
 function createIndexer(): CodingCliSessionIndexer {
   return new CodingCliSessionIndexer([])
 }
-
-beforeEach(() => {
-  vi.mocked(recordSessionLifecycleEvent).mockClear()
-})
 
 describe('SessionAssociationCoordinator integration', () => {
   it('associates a Claude terminal created with a human-readable resume name after UUID discovery', () => {
@@ -148,77 +139,6 @@ describe('SessionAssociationCoordinator integration', () => {
     expect(result).toEqual({ associated: false, reason: 'provider_managed' })
     expect(registry.get(terminal.terminalId)?.resumeSessionId).toBeUndefined()
     expect(onBound).not.toHaveBeenCalled()
-
-    registry.shutdown()
-  })
-
-  it('records a lifecycle event when Codex durable identity is explicitly bound', () => {
-    const registry = new TerminalRegistry()
-    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    registry.rebindSession(terminal.terminalId, 'codex', 'codex-thread-1', 'association')
-
-    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith({
-      kind: 'terminal_session_bound',
-      provider: 'codex',
-      terminalId: terminal.terminalId,
-      sessionId: 'codex-thread-1',
-      reason: 'association',
-    })
-
-    registry.shutdown()
-  })
-
-  it('records a lifecycle warning when a Codex terminal exits before durable identity exists', () => {
-    const registry = new TerminalRegistry()
-    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    const pty = terminal.pty as unknown as { onExit: ReturnType<typeof vi.fn> }
-    const onExit = pty.onExit.mock.calls[0][0]
-
-    onExit({ exitCode: 0, signal: 0 })
-
-    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'terminal_exit_without_durable_session',
-      terminalId: terminal.terminalId,
-      mode: 'codex',
-      exitCode: 0,
-      reason: 'pty_exit',
-    }))
-
-    registry.shutdown()
-  })
-
-  it('records a lifecycle event when the Codex sidecar reports durable identity', () => {
-    let onDurableSession: ((sessionId: string) => void) | undefined
-    const sidecar = {
-      attachTerminal: vi.fn((callbacks: { onDurableSession: (sessionId: string) => void }) => {
-        onDurableSession = callbacks.onDurableSession
-      }),
-      shutdown: vi.fn(async () => undefined),
-    }
-    const registry = new TerminalRegistry()
-    const terminal = registry.create({
-      mode: 'codex',
-      cwd: '/home/user/project',
-      codexSidecar: sidecar,
-    })
-
-    onDurableSession?.('codex-thread-1')
-    onDurableSession?.('codex-thread-1')
-
-    const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
-      event.kind === 'codex_durable_session_observed'
-    )
-    expect(durableObservationCalls).toEqual([[
-      {
-        kind: 'codex_durable_session_observed',
-        provider: 'codex',
-        terminalId: terminal.terminalId,
-        sessionId: 'codex-thread-1',
-        generation: 1,
-        source: 'sidecar',
-      },
-    ]])
 
     registry.shutdown()
   })

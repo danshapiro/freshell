@@ -1,27 +1,22 @@
+import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { logger } from '../../logger.js'
 import { convertWindowsPathToWslPath, isWslEnvironment, sanitizeUserPathInput } from '../../path-utils.js'
-import {
-  CodexAppServerClient,
-  type CodexAppServerDisconnectEvent,
-  type CodexThreadLifecycleEvent,
-  type CodexThreadLifecycleLossEvent,
-} from './client.js'
+import { CodexAppServerClient, type CodexAppServerDisconnectEvent, type CodexThreadLifecycleEvent } from './client.js'
 import type {
   CodexFsWatchResult,
   CodexInitializeResult,
   CodexThreadHandle,
+  CodexThreadOperationResult,
   CodexThreadResumeParams,
   CodexThreadStartParams,
 } from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
-
 export type CodexAppServerRuntimeFailureSource =
   | 'app_server_exit'
   | 'app_server_client_disconnect'
@@ -48,9 +43,10 @@ export type CodexSidecarOwnershipMetadata = {
   codexHome?: string
 }
 
-export type ReadyState = {
+type ReadyState = {
   wsUrl: string
   processPid: number
+  codexHome: string
   ownershipId: string
   processGroupId: number
   metadataPath: string
@@ -62,8 +58,6 @@ type ActiveOwnership = {
   metadata: CodexSidecarOwnershipMetadata
 }
 
-type ChildProcessHandle = ReturnType<typeof spawn>
-
 type RuntimeOptions = {
   command?: string
   commandArgs?: string[]
@@ -72,6 +66,7 @@ type RuntimeOptions = {
   requestTimeoutMs?: number
   startupAttemptLimit?: number
   startupAttemptTimeoutMs?: number
+  terminateGraceMs?: number
   portAllocator?: () => Promise<LoopbackServerEndpoint>
   metadataDir?: string
   serverInstanceId?: string
@@ -80,27 +75,64 @@ type RuntimeOptions = {
   processIdentityReader?: (pid: number) => Promise<WrapperIdentity | null>
 }
 
-export type ReapOrphanedSidecarsOptions = {
-  metadataDir?: string
-  serverInstanceId: string
-  terminateGraceMs?: number
+export type ReapOrphanedSidecarsResult = {
+  scanned: number
+  reapedOwnershipIds: string[]
+  skippedActiveOwnershipIds: string[]
+  ignoredLegacyRecords: string[]
+  failedOwnershipIds: string[]
 }
 
-export type ReapOrphanedSidecarsResult = {
-  reapedOwnershipIds: string[]
-  ignoredLegacyRecords: string[]
-  skippedActiveOwnershipIds: string[]
-  failedOwnershipIds: string[]
+type ReapOrphanedSidecarsOptions = {
+  metadataDir?: string
+  serverInstanceId?: string
+  terminateGraceMs?: number
 }
 
 const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
 const DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS = 3_000
-const STARTUP_POLL_MS = 50
 const DEFAULT_TERMINATE_GRACE_MS = 1_000
+const STARTUP_POLL_MS = 50
+const OUTPUT_TAIL_MAX_CHARS = 4 * 1024
+const OUTPUT_TAIL_MAX_LINES = 40
 const OWNERSHIP_SCHEMA_VERSION = 1
+
+export const DEFAULT_CODEX_SIDECAR_METADATA_DIR = path.join(os.tmpdir(), 'freshell-codex-sidecars')
+
+class BoundedOutputTail {
+  private value = ''
+
+  push(chunk: Buffer | string): void {
+    this.value += chunk.toString()
+    const lines = this.value.split(/\r?\n/)
+    if (lines.length > OUTPUT_TAIL_MAX_LINES) {
+      this.value = lines.slice(-OUTPUT_TAIL_MAX_LINES).join('\n')
+    }
+    if (this.value.length > OUTPUT_TAIL_MAX_CHARS) {
+      this.value = this.value.slice(-OUTPUT_TAIL_MAX_CHARS)
+    }
+  }
+
+  snapshot(): string {
+    return this.value
+  }
+}
+
+type RuntimeChildDiagnostics = {
+  wsUrl: string
+  wsPort: number
+  startedAt: number
+  stdoutTail: BoundedOutputTail
+  stderrTail: BoundedOutputTail
+  processError?: Error
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function defaultMetadataDir(): string {
+  return process.env.FRESHELL_CODEX_SIDECAR_DIR || DEFAULT_CODEX_SIDECAR_METADATA_DIR
 }
 
 function resolveAppServerCwd(cwd: string | undefined): string | undefined {
@@ -111,11 +143,6 @@ function resolveAppServerCwd(cwd: string | undefined): string | undefined {
     return convertWindowsPathToWslPath(candidate) ?? candidate
   }
   return candidate
-}
-
-function defaultMetadataDir(): string {
-  return process.env.FRESHELL_CODEX_SIDECAR_DIR
-    || path.join(os.homedir(), '.freshell', 'codex-sidecars')
 }
 
 function assertUnixSidecarSupport(): void {
@@ -233,25 +260,23 @@ async function processHasOwnershipEnv(pid: number, ownershipId: string): Promise
 async function processGroupMembers(processGroupId: number): Promise<number[]> {
   const entries = await fsp.readdir('/proc')
   const members: number[] = []
-
-  await Promise.all(entries.map(async (entry) => {
-    if (!/^\d+$/.test(entry)) return
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue
     const pid = Number(entry)
     const pgrp = await getProcessGroupId(pid)
     if (pgrp === processGroupId) members.push(pid)
-  }))
-
-  return members.sort((a, b) => a - b)
+  }
+  return members
 }
 
 async function isProcessGroupGone(processGroupId: number): Promise<boolean> {
   if (!Number.isInteger(processGroupId) || processGroupId <= 0) return true
   try {
     process.kill(-processGroupId, 0)
+    return false
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true
+    return (error as NodeJS.ErrnoException).code === 'ESRCH'
   }
-  return false
 }
 
 async function verifyOwnedProcessGroup(metadata: CodexSidecarOwnershipMetadata): Promise<boolean> {
@@ -276,8 +301,15 @@ async function verifyOwnedProcessGroup(metadata: CodexSidecarOwnershipMetadata):
       return true
     }
   }
-
   return false
+}
+
+function hasRecordedWrapperProof(metadata: CodexSidecarOwnershipMetadata): boolean {
+  return metadata.wrapperIdentity.commandLine.length > 0
+    && typeof metadata.wrapperIdentity.cwd === 'string'
+    && metadata.wrapperIdentity.cwd.length > 0
+    && typeof metadata.wrapperIdentity.startTimeTicks === 'number'
+    && Number.isFinite(metadata.wrapperIdentity.startTimeTicks)
 }
 
 function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
@@ -302,10 +334,15 @@ async function waitForProcessGroupGone(processGroupId: number, timeoutMs: number
 async function teardownOwnedProcessGroup(
   ownership: ActiveOwnership,
   terminateGraceMs: number,
+  options: { activeOwner?: boolean } = {},
 ): Promise<boolean> {
   const { metadata } = ownership
-  if (!(await verifyOwnedProcessGroup(metadata))) {
-    logger.error(
+  const verified = await verifyOwnedProcessGroup(metadata)
+    || (options.activeOwner === true
+      && hasRecordedWrapperProof(metadata)
+      && (await getProcessGroupId('self')) !== metadata.processGroupId)
+  if (!verified) {
+    logger.warn(
       {
         ownershipId: metadata.ownershipId,
         terminalId: metadata.terminalId,
@@ -324,8 +361,12 @@ async function teardownOwnedProcessGroup(
     signalProcessGroup(metadata.processGroupId, 'SIGTERM')
   }
   if (!(await waitForProcessGroupGone(metadata.processGroupId, terminateGraceMs))) {
-    if (!(await verifyOwnedProcessGroup(metadata))) {
-      logger.error(
+    const stillVerified = await verifyOwnedProcessGroup(metadata)
+      || (options.activeOwner === true
+        && hasRecordedWrapperProof(metadata)
+        && (await getProcessGroupId('self')) !== metadata.processGroupId)
+    if (!stillVerified) {
+      logger.warn(
         {
           ownershipId: metadata.ownershipId,
           terminalId: metadata.terminalId,
@@ -344,7 +385,7 @@ async function teardownOwnedProcessGroup(
 
   const gone = await waitForProcessGroupGone(metadata.processGroupId, terminateGraceMs)
   if (!gone) {
-    logger.error(
+    logger.warn(
       {
         ownershipId: metadata.ownershipId,
         terminalId: metadata.terminalId,
@@ -355,7 +396,7 @@ async function teardownOwnedProcessGroup(
         serverInstanceId: metadata.serverInstanceId,
         remainingPids: await processGroupMembers(metadata.processGroupId),
       },
-      'Codex app-server sidecar process group remained alive after shutdown',
+      'Codex app-server sidecar process group did not exit after SIGKILL',
     )
     return false
   }
@@ -372,21 +413,8 @@ type ParsedMetadataRecord =
   | { kind: 'legacy' }
   | { kind: 'malformedNewSchema'; ownershipId: string }
 
-function isWrapperIdentity(value: unknown): value is WrapperIdentity {
-  if (!value || typeof value !== 'object') return false
-  const candidate = value as Partial<WrapperIdentity>
-  return Array.isArray(candidate.commandLine)
-    && candidate.commandLine.every((arg) => typeof arg === 'string')
-    && (candidate.cwd === null || typeof candidate.cwd === 'string')
-    && (candidate.startTimeTicks === null || typeof candidate.startTimeTicks === 'number')
-}
-
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isInteger(value) && value > 0
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0
 }
 
 function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataRecord {
@@ -396,20 +424,20 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
   } catch {
     return { kind: 'legacy' }
   }
+
   if (!parsed || typeof parsed !== 'object') return { kind: 'legacy' }
   const candidate = parsed as Partial<CodexSidecarOwnershipMetadata>
   if (candidate.schemaVersion !== OWNERSHIP_SCHEMA_VERSION) return { kind: 'legacy' }
+
   const ownershipId = typeof candidate.ownershipId === 'string' ? candidate.ownershipId : metadataPath
   if (
     typeof candidate.ownershipId !== 'string'
     || typeof candidate.serverInstanceId !== 'string'
     || !isPositiveInteger(candidate.ownerServerPid)
-    || (candidate.terminalId !== null && typeof candidate.terminalId !== 'string')
-    || (candidate.generation !== null && !isNonNegativeInteger(candidate.generation))
     || typeof candidate.wsUrl !== 'string'
     || !isPositiveInteger(candidate.wrapperPid)
     || !isPositiveInteger(candidate.processGroupId)
-    || !isWrapperIdentity(candidate.wrapperIdentity)
+    || !candidate.wrapperIdentity
     || typeof candidate.createdAt !== 'string'
     || typeof candidate.updatedAt !== 'string'
   ) {
@@ -419,28 +447,27 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
 }
 
 export async function reapOrphanedCodexAppServerSidecars(
-  options: ReapOrphanedSidecarsOptions,
+  options: ReapOrphanedSidecarsOptions = {},
 ): Promise<ReapOrphanedSidecarsResult> {
+  assertUnixSidecarSupport()
   const metadataDir = options.metadataDir ?? defaultMetadataDir()
   const result: ReapOrphanedSidecarsResult = {
+    scanned: 0,
     reapedOwnershipIds: [],
-    ignoredLegacyRecords: [],
     skippedActiveOwnershipIds: [],
+    ignoredLegacyRecords: [],
     failedOwnershipIds: [],
   }
-  let procOwnershipProofChecked = false
-  const ensureProcOwnershipProof = async () => {
-    if (procOwnershipProofChecked) return
-    await assertProcOwnershipProofAvailable()
-    procOwnershipProofChecked = true
-  }
+
   const entries = await fsp.readdir(metadataDir).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return []
     throw error
   })
 
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue
+    result.scanned += 1
     const metadataPath = path.join(metadataDir, entry)
     const raw = await fsp.readFile(metadataPath, 'utf8')
     const parsed = parseMetadataRecord(raw, metadataPath)
@@ -454,9 +481,7 @@ export async function reapOrphanedCodexAppServerSidecars(
       continue
     }
 
-    await ensureProcOwnershipProof()
     const metadata = parsed.metadata
-
     if (await isPidAlive(metadata.ownerServerPid)) {
       result.skippedActiveOwnershipIds.push(metadata.ownershipId)
       continue
@@ -480,32 +505,24 @@ export async function reapOrphanedCodexAppServerSidecars(
   return result
 }
 
-export async function runCodexStartupReaper(
-  options: ReapOrphanedSidecarsOptions,
+export async function reapOrphanedCodexAppServerSidecarsOnStartup(
+  options: ReapOrphanedSidecarsOptions = {},
 ): Promise<ReapOrphanedSidecarsResult> {
   const result = await reapOrphanedCodexAppServerSidecars(options)
-  assertCodexStartupReaperSucceeded(result)
-  return result
-}
+  const blockedOwnershipIds = result.failedOwnershipIds
+  if (blockedOwnershipIds.length === 0) return result
 
-export const reapOrphanedCodexAppServerSidecarsOnStartup = runCodexStartupReaper
-
-export function assertCodexStartupReaperSucceeded(result: ReapOrphanedSidecarsResult): void {
-  const unreapedOwnershipIds = [
-    ...result.failedOwnershipIds,
-    ...result.skippedActiveOwnershipIds,
-  ]
-  if (unreapedOwnershipIds.length === 0) return
-
-  const blockedOwnershipIds = [...new Set(unreapedOwnershipIds)]
   throw new Error(
     `Codex app-server startup reaper failed to reap ${blockedOwnershipIds.length} ownership record(s): ${blockedOwnershipIds.join(', ')}. `
     + 'Refusing to continue until the unreaped Codex sidecar ownership is verified gone or handled explicitly.',
   )
 }
 
+export const runCodexStartupReaper = reapOrphanedCodexAppServerSidecarsOnStartup
+
 export class CodexAppServerRuntime {
-  private child: ChildProcessHandle | null = null
+  private child: ChildProcess | null = null
+  private childDiagnostics: RuntimeChildDiagnostics | null = null
   private client: CodexAppServerClient | null = null
   private ready: ReadyState | null = null
   private ensureReadyPromise: Promise<ReadyState> | null = null
@@ -513,9 +530,7 @@ export class CodexAppServerRuntime {
   private ownership: ActiveOwnership | null = null
   private ownershipTeardownPromise: Promise<void> | null = null
   private ownershipTeardownFailure: Error | null = null
-  private startupAbortError: Error | null = null
   private shutdownRequested = false
-  private lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
   private readonly exitHandlers = new Set<(error?: Error, source?: CodexAppServerRuntimeFailureSource) => void>()
   private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
   private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
@@ -528,6 +543,7 @@ export class CodexAppServerRuntime {
   private readonly requestTimeoutMs?: number
   private readonly startupAttemptLimit: number
   private readonly startupAttemptTimeoutMs: number
+  private readonly terminateGraceMs: number
   private readonly portAllocator: () => Promise<LoopbackServerEndpoint>
   private readonly metadataDir: string
   private readonly serverInstanceId: string
@@ -543,6 +559,7 @@ export class CodexAppServerRuntime {
     this.requestTimeoutMs = options.requestTimeoutMs
     this.startupAttemptLimit = options.startupAttemptLimit ?? DEFAULT_STARTUP_ATTEMPT_LIMIT
     this.startupAttemptTimeoutMs = options.startupAttemptTimeoutMs ?? DEFAULT_STARTUP_ATTEMPT_TIMEOUT_MS
+    this.terminateGraceMs = options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS
     this.portAllocator = options.portAllocator ?? allocateLocalhostPort
     this.metadataDir = options.metadataDir ?? defaultMetadataDir()
     this.serverInstanceId = options.serverInstanceId ?? process.env.FRESHELL_SERVER_INSTANCE_ID ?? `srv-${process.pid}`
@@ -553,82 +570,6 @@ export class CodexAppServerRuntime {
 
   status(): RuntimeStatus {
     return this.statusValue
-  }
-
-  async ensureReady(): Promise<ReadyState> {
-    if (this.shutdownRequested) {
-      throw new Error('Codex app-server sidecar is shutting down.')
-    }
-    await this.assertNoBlockedOwnership('ensure Codex app-server sidecar readiness')
-    if (this.ready) return this.ready
-    if (this.ensureReadyPromise) return this.ensureReadyPromise
-
-    this.ensureReadyPromise = this.startRuntime().finally(() => {
-      this.ensureReadyPromise = null
-    })
-
-    return this.publishReady(await this.ensureReadyPromise)
-  }
-
-  private publishReady(ready: ReadyState): ReadyState {
-    if (this.startupAbortError) {
-      throw this.startupAbortError
-    }
-    this.startupAbortError = null
-    this.ready = ready
-    this.statusValue = 'running'
-    return ready
-  }
-
-  async startThread(
-    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
-    const ready = await this.ensureReady()
-    return {
-      ...(await this.client!.startThread(params)),
-      wsUrl: ready.wsUrl,
-    }
-  }
-
-  async resumeThread(
-    params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
-  ): Promise<{ threadId: string; wsUrl: string }> {
-    const ready = await this.ensureReady()
-    return {
-      ...(await this.client!.resumeThread(params)),
-      wsUrl: ready.wsUrl,
-    }
-  }
-
-  async listLoadedThreads(): Promise<string[]> {
-    await this.ensureReady()
-    return this.client!.listLoadedThreads()
-  }
-
-  async updateOwnershipMetadata(input: {
-    terminalId?: string | null
-    generation?: number | null
-    codexHome?: string
-  }): Promise<void> {
-    await this.assertNoBlockedOwnership('update Codex app-server ownership metadata')
-    if (!this.ownership) {
-      throw new Error('Cannot update Codex app-server ownership metadata because no active owned Codex app-server sidecar exists.')
-    }
-    this.ownership.metadata = {
-      ...this.ownership.metadata,
-      ...(input.terminalId !== undefined ? { terminalId: input.terminalId } : {}),
-      ...(input.generation !== undefined ? { generation: input.generation } : {}),
-      ...(input.codexHome !== undefined ? { codexHome: input.codexHome } : {}),
-      updatedAt: new Date().toISOString(),
-    }
-    await this.writeOwnershipRecord(this.ownership)
-  }
-
-  onThreadLifecycleLoss(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void {
-    this.lifecycleLossHandlers.add(handler)
-    return () => {
-      this.lifecycleLossHandlers.delete(handler)
-    }
   }
 
   onExit(handler: (error?: Error, source?: CodexAppServerRuntimeFailureSource) => void): () => void {
@@ -659,6 +600,47 @@ export class CodexAppServerRuntime {
     }
   }
 
+  async ensureReady(): Promise<ReadyState> {
+    if (this.shutdownRequested) {
+      throw new Error('Codex app-server sidecar is shutting down.')
+    }
+    await this.assertNoBlockedOwnership('ensure Codex app-server sidecar readiness')
+    if (this.ready) return this.ready
+    if (this.ensureReadyPromise) return this.ensureReadyPromise
+
+    this.ensureReadyPromise = this.startRuntime().finally(() => {
+      this.ensureReadyPromise = null
+    })
+
+    return this.ensureReadyPromise
+  }
+
+  private publishReady(ready: ReadyState): ReadyState {
+    this.ready = ready
+    this.statusValue = 'running'
+    return ready
+  }
+
+  async startThread(
+    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
+    const ready = await this.ensureReady()
+    return {
+      ...(await this.client!.startThread(params)),
+      wsUrl: ready.wsUrl,
+    }
+  }
+
+  async resumeThread(
+    params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
+  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
+    const ready = await this.ensureReady()
+    return {
+      ...(await this.client!.resumeThread(params)),
+      wsUrl: ready.wsUrl,
+    }
+  }
+
   async watchPath(targetPath: string, watchId: string): Promise<CodexFsWatchResult> {
     await this.ensureReady()
     return this.client!.watchPath(targetPath, watchId)
@@ -667,6 +649,25 @@ export class CodexAppServerRuntime {
   async unwatchPath(watchId: string): Promise<void> {
     await this.ensureReady()
     await this.client!.unwatchPath(watchId)
+  }
+
+  async updateOwnershipMetadata(input: {
+    terminalId?: string | null
+    generation?: number | null
+    codexHome?: string
+  }): Promise<void> {
+    await this.assertNoBlockedOwnership('update Codex app-server ownership metadata')
+    if (!this.ownership) {
+      return
+    }
+    this.ownership.metadata = {
+      ...this.ownership.metadata,
+      ...(input.terminalId !== undefined ? { terminalId: input.terminalId } : {}),
+      ...(input.generation !== undefined ? { generation: input.generation } : {}),
+      ...(input.codexHome !== undefined ? { codexHome: input.codexHome } : {}),
+      updatedAt: new Date().toISOString(),
+    }
+    await this.writeOwnershipRecord(this.ownership)
   }
 
   async shutdown(): Promise<void> {
@@ -706,11 +707,8 @@ export class CodexAppServerRuntime {
       if (this.shutdownRequested) {
         throw new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
       }
-      this.startupAbortError = null
+
       const endpoint = await this.portAllocator()
-      if (this.shutdownRequested) {
-        throw new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
-      }
       const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
       const ownershipId = this.ownershipIdFactory()
       const child = spawn(this.command, [
@@ -728,22 +726,31 @@ export class CodexAppServerRuntime {
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       })
-      const childErrorPromise = this.watchChildError(child)
 
-      // Drain child stdio continuously so verbose app-server or MCP startup logs
-      // cannot fill the pipe buffer and stall JSON-RPC request handling.
-      child.stdout?.resume()
-      child.stderr?.resume()
+      const childDiagnostics: RuntimeChildDiagnostics = {
+        wsUrl,
+        wsPort: endpoint.port,
+        startedAt: Date.now(),
+        stdoutTail: new BoundedOutputTail(),
+        stderrTail: new BoundedOutputTail(),
+      }
+
+      child.stdout?.on('data', (chunk) => childDiagnostics.stdoutTail.push(chunk))
+      child.stderr?.on('data', (chunk) => childDiagnostics.stderrTail.push(chunk))
 
       this.child = child
-      this.attachChildExitHandler(child)
+      this.childDiagnostics = childDiagnostics
+      this.attachChildErrorHandler(child, childDiagnostics)
+      this.attachChildExitHandler(child, childDiagnostics)
       let attemptOwnership: ActiveOwnership | null = null
 
       try {
         if (!child.pid) {
           const launchError = await Promise.race([
-            childErrorPromise,
-            sleep(25).then(() => null),
+            new Promise<Error | null>((resolve) => {
+              child.once('error', (error) => resolve(error instanceof Error ? error : new Error(String(error))))
+              setTimeout(() => resolve(null), 25)
+            }),
           ])
           if (launchError) throw launchError
           throw new Error('Codex app-server sidecar spawn did not expose a wrapper PID.')
@@ -758,7 +765,7 @@ export class CodexAppServerRuntime {
         this.ownership = ownership
         attemptOwnership = ownership
         await this.writeOwnershipRecord(ownership)
-        await this.readWrapperIdentityInto(ownership, child, childErrorPromise)
+        await this.readWrapperIdentityInto(ownership)
         this.ownership = ownership
         await this.writeOwnershipRecord(ownership)
 
@@ -766,8 +773,11 @@ export class CodexAppServerRuntime {
           { wsUrl },
           this.requestTimeoutMs ? { requestTimeoutMs: this.requestTimeoutMs } : {},
         )
-        client.onThreadLifecycleLoss((event) => {
-          for (const handler of this.lifecycleLossHandlers) {
+        client.onDisconnect((event) => {
+          this.handleClientDisconnect(client, event)
+        })
+        client.onThreadLifecycle((event) => {
+          for (const handler of this.threadLifecycleHandlers) {
             handler(event)
           }
         })
@@ -776,34 +786,30 @@ export class CodexAppServerRuntime {
             handler(thread)
           }
         })
-        client.onThreadLifecycle((event) => {
-          for (const handler of this.threadLifecycleHandlers) {
-            handler(event)
-          }
-        })
         client.onFsChanged((event) => {
           for (const handler of this.fsChangedHandlers) {
             handler(event)
           }
         })
-        client.onDisconnect((event) => {
-          this.handleClientDisconnect(client, event)
-        })
         this.client = client
 
-        const initialized = await this.waitForInitialize(client, child, childErrorPromise)
-        this.assertStartupRuntimeStillActive(client, child)
-        await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
-        this.assertStartupRuntimeStillActive(client, child)
-        return {
+        const initialized = await this.waitForInitialize(client, child, childDiagnostics)
+        const ready = this.publishReady({
           wsUrl,
           processPid: child.pid,
+          codexHome: initialized.codexHome,
           ownershipId,
           processGroupId: child.pid,
           metadataPath: ownership.metadataPath,
-        }
+        })
+        await this.updateOwnershipMetadata({ codexHome: initialized.codexHome })
+        return ready
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
+        if (this.ready?.ownershipId === ownershipId) {
+          this.ready = null
+          this.statusValue = 'stopped'
+        }
         const client = this.client
         if (client) {
           await client.close().catch(() => undefined)
@@ -813,22 +819,13 @@ export class CodexAppServerRuntime {
         }
         if (attemptOwnership) {
           await this.beginOwnershipTeardown(attemptOwnership).catch((teardownError) => {
-            if (lastError) {
-              lastError = new Error(`${lastError.message}; teardown failed: ${teardownError instanceof Error ? teardownError.message : String(teardownError)}`)
-            } else {
-              lastError = teardownError instanceof Error ? teardownError : new Error(String(teardownError))
-            }
+            lastError = new Error(`${lastError?.message ?? 'startup failed'}; teardown failed: ${teardownError instanceof Error ? teardownError.message : String(teardownError)}`)
             throw lastError
           })
         } else {
           await this.stopActiveChild()
         }
-        if (this.shutdownRequested) break
       }
-    }
-
-    if (this.shutdownRequested) {
-      throw lastError ?? new Error('Codex app-server startup was cancelled because the sidecar is shutting down.')
     }
 
     throw new Error(
@@ -865,41 +862,18 @@ export class CodexAppServerRuntime {
     }
   }
 
-  private async readWrapperIdentityInto(
-    ownership: ActiveOwnership,
-    child: ChildProcessHandle,
-    childErrorPromise: Promise<Error>,
-  ): Promise<void> {
-    const deadline = Date.now() + this.startupAttemptTimeoutMs
-
-    while (true) {
-      const [wrapperIdentity, hasOwnershipEnv] = await Promise.race([
-        Promise.all([
-          this.processIdentityReader(ownership.metadata.wrapperPid),
-          processHasOwnershipEnv(ownership.metadata.wrapperPid, ownership.metadata.ownershipId),
-        ]),
-        childErrorPromise.then((error) => {
-          throw error
-        }),
-      ])
-      if (hasOwnershipEnv && isCompleteWrapperIdentity(wrapperIdentity)) {
-        ownership.metadata = {
-          ...ownership.metadata,
-          wrapperIdentity,
-          updatedAt: new Date().toISOString(),
-        }
-        return
-      }
-
-      if (child.exitCode !== null || child.signalCode !== null || Date.now() >= deadline) {
-        break
-      }
-      await sleep(STARTUP_POLL_MS)
+  private async readWrapperIdentityInto(ownership: ActiveOwnership): Promise<void> {
+    const wrapperIdentity = await this.processIdentityReader(ownership.metadata.wrapperPid)
+    if (!isCompleteWrapperIdentity(wrapperIdentity)) {
+      throw new Error(
+        `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
+      )
     }
-
-    throw new Error(
-      `Codex app-server wrapper identity could not be completely read for PID ${ownership.metadata.wrapperPid}.`,
-    )
+    ownership.metadata = {
+      ...ownership.metadata,
+      wrapperIdentity,
+      updatedAt: new Date().toISOString(),
+    }
   }
 
   private async writeOwnershipRecord(ownership: ActiveOwnership): Promise<void> {
@@ -910,28 +884,28 @@ export class CodexAppServerRuntime {
 
   private async waitForInitialize(
     client: CodexAppServerClient,
-    child: ChildProcessHandle,
-    childErrorPromise: Promise<Error>,
+    child: ChildProcess,
+    diagnostics: RuntimeChildDiagnostics,
   ): Promise<CodexInitializeResult> {
     const deadline = Date.now() + this.startupAttemptTimeoutMs
     let lastError: Error | undefined
 
     while (Date.now() < deadline) {
+      if (diagnostics.processError) {
+        throw this.createUnexpectedExitError(
+          child,
+          diagnostics,
+          child.exitCode,
+          child.signalCode,
+          `Codex app-server runtime failed to start: ${diagnostics.processError.message}`,
+        )
+      }
       if (child.exitCode !== null || child.signalCode !== null) {
         break
       }
-      const remainingMs = Math.max(0, deadline - Date.now())
 
       try {
-        return await Promise.race([
-          client.initialize(),
-          childErrorPromise.then((error) => {
-            throw error
-          }),
-          sleep(remainingMs).then(() => {
-            throw new Error(`Codex app-server did not finish initialize within ${this.startupAttemptTimeoutMs}ms.`)
-          }),
-        ])
+        return await client.initialize()
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
         await sleep(STARTUP_POLL_MS)
@@ -941,39 +915,9 @@ export class CodexAppServerRuntime {
     throw lastError ?? new Error('Codex app-server exited before it finished initializing.')
   }
 
-  private assertStartupRuntimeStillActive(client: CodexAppServerClient, child: ChildProcessHandle): void {
-    if (this.startupAbortError) {
-      throw this.startupAbortError
-    }
-    if (this.child !== child) {
-      throw new Error('Codex app-server child exited before startup completed.')
-    }
-    if (this.client !== client) {
-      throw new Error('Codex app-server client disconnected before startup completed.')
-    }
-  }
-
-  private watchChildError(child: ChildProcessHandle): Promise<Error> {
-    return new Promise((resolve) => {
-      child.once('error', (error) => {
-        const base = error instanceof Error ? error : new Error(String(error))
-        const launchError = new Error(`Failed to launch Codex app-server sidecar: ${base.message}`)
-        ;(launchError as Error & { code?: string; cause?: unknown }).code =
-          (base as NodeJS.ErrnoException).code
-        ;(launchError as Error & { code?: string; cause?: unknown }).cause = base
-        if (this.child === child) {
-          this.child = null
-          this.ready = null
-          this.ensureReadyPromise = null
-          this.statusValue = 'stopped'
-        }
-        resolve(launchError)
-      })
-    })
-  }
-
-  private attachChildExitHandler(child: ChildProcessHandle): void {
-    child.once('exit', () => {
+  private attachChildErrorHandler(child: ChildProcess, diagnostics: RuntimeChildDiagnostics): void {
+    child.once('error', (error) => {
+      diagnostics.processError = error instanceof Error ? error : new Error(String(error))
       if (this.child !== child) {
         return
       }
@@ -981,37 +925,69 @@ export class CodexAppServerRuntime {
       const wasReady = this.ready !== null
       const ownership = this.ownership
       this.child = null
+      this.childDiagnostics = null
       this.ready = null
-      this.ensureReadyPromise = null
       this.statusValue = 'stopped'
 
       const client = this.client
       this.client = null
       const closeClient = client?.close().catch(() => undefined)
       if (ownership) {
-        void this.beginOwnershipTeardown(ownership, closeClient).catch((error) => {
-          logger.error(
-            {
-              err: error,
-              ownershipId: ownership.metadata.ownershipId,
-              terminalId: ownership.metadata.terminalId,
-              generation: ownership.metadata.generation,
-              wsUrl: ownership.metadata.wsUrl,
-              wrapperPid: ownership.metadata.wrapperPid,
-              processGroupId: ownership.metadata.processGroupId,
-              serverInstanceId: ownership.metadata.serverInstanceId,
-            },
-            'Codex app-server sidecar teardown after wrapper exit failed',
-          )
+        void this.beginOwnershipTeardown(ownership, closeClient).catch((teardownError) => {
+          logger.error({ err: teardownError, ownershipId: ownership.metadata.ownershipId }, 'Codex app-server sidecar teardown after wrapper error failed')
         })
       } else {
         void closeClient
       }
 
-      if (wasReady && !this.shutdownRequested) {
-        for (const handler of this.exitHandlers) {
-          handler(undefined, 'app_server_exit')
-        }
+      if (!wasReady || this.shutdownRequested) {
+        return
+      }
+
+      const runtimeError = this.createUnexpectedExitError(
+        child,
+        diagnostics,
+        child.exitCode,
+        child.signalCode,
+        `Codex app-server runtime errored unexpectedly: ${diagnostics.processError.message}`,
+      )
+      for (const handler of this.exitHandlers) {
+        handler(runtimeError, 'app_server_exit')
+      }
+    })
+  }
+
+  private attachChildExitHandler(child: ChildProcess, diagnostics: RuntimeChildDiagnostics): void {
+    child.once('exit', (code, signal) => {
+      if (this.child !== child) {
+        return
+      }
+
+      const wasReady = this.ready !== null
+      const ownership = this.ownership
+      this.child = null
+      this.childDiagnostics = null
+      this.ready = null
+      this.statusValue = 'stopped'
+
+      const client = this.client
+      this.client = null
+      const closeClient = client?.close().catch(() => undefined)
+      if (ownership) {
+        void this.beginOwnershipTeardown(ownership, closeClient).catch((teardownError) => {
+          logger.error({ err: teardownError, ownershipId: ownership.metadata.ownershipId }, 'Codex app-server sidecar teardown after wrapper exit failed')
+        })
+      } else {
+        void closeClient
+      }
+
+      if (!wasReady || this.shutdownRequested) {
+        return
+      }
+
+      const error = this.createUnexpectedExitError(child, diagnostics, code, signal)
+      for (const handler of this.exitHandlers) {
+        handler(error, 'app_server_exit')
       }
     })
   }
@@ -1021,41 +997,85 @@ export class CodexAppServerRuntime {
       return
     }
 
+    const child = this.child
+    const diagnostics = this.childDiagnostics
     const wasReady = this.ready !== null
     this.client = null
     this.ready = null
     this.statusValue = 'stopped'
 
     if (!wasReady || this.shutdownRequested) {
-      if (!this.shutdownRequested) {
-        this.startupAbortError = new Error(event.reason === 'error'
-          ? `Codex app-server client socket errored before startup completed: ${event.error?.message ?? 'unknown error'}`
-          : 'Codex app-server client disconnected before startup completed.')
-      }
       void this.stopActiveChild().catch(() => undefined)
       return
     }
 
-    const error = event.reason === 'error'
-      ? new Error(`Codex app-server client socket errored: ${event.error?.message ?? 'unknown error'}`)
-      : new Error('Codex app-server client socket closed unexpectedly.')
+    const error = child && diagnostics
+      ? this.createUnexpectedExitError(
+        child,
+        diagnostics,
+        child.exitCode,
+        child.signalCode,
+        event.reason === 'error'
+          ? `Codex app-server client socket errored: ${event.error?.message ?? 'unknown error'}`
+          : 'Codex app-server client socket closed unexpectedly.',
+      )
+      : new Error(event.reason === 'error'
+          ? `Codex app-server client socket errored: ${event.error?.message ?? 'unknown error'}`
+          : 'Codex app-server client socket closed unexpectedly.')
     for (const handler of this.exitHandlers) {
       handler(error, 'app_server_client_disconnect')
     }
     void this.stopActiveChild().catch(() => undefined)
   }
 
+  private createUnexpectedExitError(
+    child: ChildProcess,
+    diagnostics: RuntimeChildDiagnostics,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    prefix = 'Codex app-server runtime exited unexpectedly.',
+  ): Error {
+    const elapsedMs = Date.now() - diagnostics.startedAt
+    const stdoutTail = diagnostics.stdoutTail.snapshot()
+    const stderrTail = diagnostics.stderrTail.snapshot()
+    return new Error([
+      prefix,
+      `pid ${child.pid ?? 'unknown'}`,
+      `ws port ${diagnostics.wsPort}`,
+      `ws url ${diagnostics.wsUrl}`,
+      `exit code ${code ?? 'unknown'}`,
+      `signal ${signal ?? 'none'}`,
+      `elapsed ${elapsedMs}ms`,
+      `stdout tail: ${stdoutTail || '(empty)'}`,
+      `stderr tail: ${stderrTail || '(empty)'}`,
+    ].join(' '))
+  }
+
   private async stopActiveChild(): Promise<void> {
-    const ownership = this.ownership
     const child = this.child
+    const ownership = this.ownership
     this.child = null
+    this.childDiagnostics = null
     this.ready = null
     this.statusValue = 'stopped'
 
     if (!ownership) {
-      if (child && child.exitCode === null && child.signalCode === null) {
-        child.kill('SIGTERM')
+      if (!child || child.exitCode !== null || child.signalCode !== null) {
+        return
       }
+      child.kill('SIGTERM')
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) {
+            child.kill('SIGKILL')
+          }
+          resolve()
+        }, this.terminateGraceMs)
+        child.once('exit', () => {
+          clearTimeout(timeout)
+          resolve()
+        })
+      })
       return
     }
 
@@ -1104,13 +1124,13 @@ export class CodexAppServerRuntime {
     const teardown = (async () => {
       await beforeTeardown?.catch(() => undefined)
       try {
-        const stopped = await teardownOwnedProcessGroup(ownership, DEFAULT_TERMINATE_GRACE_MS)
+        const stopped = await teardownOwnedProcessGroup(ownership, this.terminateGraceMs, { activeOwner: true })
         if (!stopped) {
           throw new Error(
             `Codex app-server sidecar process-group teardown failed for ownership ${ownership.metadata.ownershipId}.`,
           )
         }
-        if (stopped && this.ownership === ownership) {
+        if (this.ownership === ownership) {
           this.ownership = null
         }
         this.ownershipTeardownFailure = null
