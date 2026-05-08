@@ -1,3 +1,7 @@
+import { readFileSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
+
 type EnvSource = Record<string, string | undefined>
 
 const OPENCODE_DEFAULT_GOOGLE_MODEL = 'google/gemini-3-pro-preview'
@@ -17,11 +21,27 @@ export function getOpencodeEnvOverrides(env: EnvSource): Record<string, string> 
   return overrides
 }
 
+export function readOpencodeUserConfigModel(): string | undefined {
+  try {
+    const configPath = join(homedir(), '.config', 'opencode', 'opencode.json')
+    const raw = readFileSync(configPath, 'utf-8')
+    const config = JSON.parse(raw)
+    if (config && typeof config.model === 'string' && config.model) {
+      return config.model
+    }
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
 export function resolveOpencodeLaunchModel(
   explicitModel: string | undefined,
   env: EnvSource,
+  opencodeUserConfigModel?: string,
 ): string | undefined {
   if (explicitModel) return explicitModel
+  if (opencodeUserConfigModel) return opencodeUserConfigModel
   if (resolveGoogleApiKey(env)) return OPENCODE_DEFAULT_GOOGLE_MODEL
   if (env.OPENAI_API_KEY) return OPENCODE_DEFAULT_OPENAI_MODEL
   if (env.ANTHROPIC_API_KEY) return OPENCODE_DEFAULT_ANTHROPIC_MODEL

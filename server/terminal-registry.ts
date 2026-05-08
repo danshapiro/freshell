@@ -22,7 +22,7 @@ import type {
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
-import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
+import { getOpencodeEnvOverrides, readOpencodeUserConfigModel, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
@@ -258,7 +258,7 @@ function resolveCodingCliCommand(
     )
   }
   const effectiveModel = mode === 'opencode'
-    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
+    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv }, readOpencodeUserConfigModel())
     : providerSettings?.model
   if (effectiveModel && spec.modelArgs) {
     settingsArgs.push(...spec.modelArgs(effectiveModel))
