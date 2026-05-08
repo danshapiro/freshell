@@ -10,6 +10,7 @@ import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
@@ -96,11 +97,15 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
-  const claudeSession = useAppSelector((state) => (
-    paneContent.provider === 'claude' && paneContent.sessionId
-      ? state.agentChat.sessions[paneContent.sessionId]
-      : undefined
-  ))
+  const claudeSession = useAppSelector((state) => {
+    if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
+    const sessionKey = makeFreshAgentSessionKey({
+      sessionId: paneContent.sessionId,
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
+    })
+    return state.freshAgent.sessions[sessionKey] ?? state.agentChat.sessions[paneContent.sessionId]
+  })
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
@@ -108,6 +113,7 @@ export function FreshAgentView({
   const paneContentRef = useRef(paneContent)
   paneContentRef.current = paneContent
   const restoreTimeoutRef = useRef<number | null>(null)
+  const createSentRef = useRef(false)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
@@ -125,7 +131,7 @@ export function FreshAgentView({
       && !hasRestoreFailure,
   )
 
-  function sendFreshAgentMessage(message: Record<string, unknown>) {
+  const sendFreshAgentMessage = useCallback((message: Record<string, unknown>) => {
     const suppressed = typeof window !== 'undefined'
       && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
     if (suppressed) {
@@ -133,7 +139,27 @@ export function FreshAgentView({
       return
     }
     ws.send(message as never)
+  }, [paneId, ws])
+
+  const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
+  if (prevCreateRequestIdRef.current !== paneContent.createRequestId) {
+    prevCreateRequestIdRef.current = paneContent.createRequestId
+    createSentRef.current = false
   }
+
+  const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => ({
+    type: 'freshAgent.create',
+    requestId: content.createRequestId,
+    sessionType: content.sessionType,
+    provider: content.provider,
+    cwd: content.initialCwd,
+    resumeSessionId: content.resumeSessionId,
+    model: content.model,
+    permissionMode: content.permissionMode,
+    sandbox: content.sandbox,
+    effort: content.effort,
+    plugins: content.plugins,
+  } as const), [])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -157,38 +183,41 @@ export function FreshAgentView({
 
   useEffect(() => {
     if (paneContent.sessionId || hidden) return
-    const createMessage = {
-      type: 'freshAgent.create',
-      requestId: paneContent.createRequestId,
-      sessionType: paneContent.sessionType,
-      provider: paneContent.provider,
-      cwd: paneContent.initialCwd,
-      resumeSessionId: paneContent.resumeSessionId,
-      model: paneContent.model,
-      permissionMode: paneContent.permissionMode,
-      sandbox: paneContent.sandbox,
-      effort: paneContent.effort,
-      plugins: paneContent.plugins,
-    } as const
+    if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
+    if (createSentRef.current) return
+    createSentRef.current = true
     registerFreshAgentCreate(dispatch, paneContent.createRequestId, {
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
     })
-    sendFreshAgentMessage(createMessage)
+    sendFreshAgentMessage(buildCreateMessage(paneContent))
   }, [
+    buildCreateMessage,
     dispatch,
     hidden,
-    paneContent.createRequestId,
-    paneContent.effort,
-    paneContent.initialCwd,
-    paneContent.model,
-    paneContent.permissionMode,
-    paneContent.plugins,
-    paneContent.resumeSessionId,
-    paneContent.sandbox,
+    paneContent,
+    sendFreshAgentMessage,
+  ])
+
+  useEffect(() => {
+    if (hidden) return
+    if (paneContent.sessionId || !createSentRef.current) return
+    if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
+    if (typeof ws.onReconnect !== 'function') return
+    return ws.onReconnect(() => {
+      const current = paneContentRef.current
+      if (current.sessionId) return
+      if (current.status !== 'creating' && current.status !== 'starting') return
+      sendFreshAgentMessage(buildCreateMessage(current))
+    })
+  }, [
+    buildCreateMessage,
+    hidden,
     paneContent.sessionId,
-    paneContent.sessionType,
+    paneContent.status,
+    sendFreshAgentMessage,
+    ws,
   ])
 
   useEffect(() => {
@@ -297,6 +326,7 @@ export function FreshAgentView({
     paneContent.resumeSessionId,
     paneContent.sessionId,
     paneContent.status,
+    paneContent.sessionType,
     paneId,
     snapshotRefreshNonce,
     tabId,
@@ -466,7 +496,7 @@ export function FreshAgentView({
                             ...paneContentRef.current,
                             sessionId: undefined,
                             createRequestId: nextRequestId,
-                            status: 'starting',
+                            status: 'creating',
                             createError: undefined,
                           },
                         }))

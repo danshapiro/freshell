@@ -53,6 +53,7 @@ test.describe('Fresh Agent', () => {
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
+          sessionType: 'freshclaude',
           provider: 'claude',
           threadId: sessionId,
           sessionId,
@@ -150,6 +151,8 @@ test.describe('Fresh Agent', () => {
       permission: {
         type: 'freshAgent.approval.respond',
         sessionId,
+        sessionType: 'freshclaude',
+        provider: 'claude',
         requestId: 'perm-e2e',
         decision: {
           behavior: 'allow',
@@ -158,6 +161,8 @@ test.describe('Fresh Agent', () => {
       question: {
         type: 'freshAgent.question.respond',
         sessionId,
+        sessionType: 'freshclaude',
+        provider: 'claude',
         requestId: 'question-e2e',
         answers: { 'How should Claude proceed?': 'Continue' },
       },
@@ -173,23 +178,30 @@ test.describe('Fresh Agent', () => {
         status: 200,
         contentType: 'application/json',
         body: JSON.stringify({
+          sessionType: 'freshcodex',
           provider: 'codex',
           threadId: 'thread-codex',
           revision: 7,
           status: 'idle',
           summary: 'Freshcodex session',
-          capabilities: { send: false, interrupt: false, fork: false },
+          capabilities: { send: false, interrupt: false, approvals: false, questions: false, fork: false },
           tokenUsage: { totalTokens: 42, inputTokens: 10, outputTokens: 32 },
           worktrees: [{ id: 'wt-1', path: '/tmp/worktree', branch: 'feature/fresh-agent' }],
           diffs: [{ id: 'diff-1', title: 'README.md' }],
-          childThreads: [{ id: 'child-1', threadId: 'child-thread', title: 'Subagent' }],
+          childThreads: [{ id: 'child-1', threadId: 'child-thread', origin: 'codex', title: 'Subagent' }],
           extensions: {
             codex: {
               review: { id: 'review-1', status: 'pending' },
               fork: { parentThreadId: 'thread-parent-1' },
             },
           },
-          turns: [{ id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Codex transcript' }] }],
+          turns: [{
+            id: 'turn-1',
+            turnId: 'turn-1',
+            role: 'assistant',
+            summary: 'Codex transcript',
+            items: [{ id: 'item-1', kind: 'text', text: 'Codex transcript' }],
+          }],
         }),
       })
     })

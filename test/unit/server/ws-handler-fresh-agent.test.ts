@@ -242,4 +242,63 @@ describe('WsHandler fresh-agent routing', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
   })
+
+  it('unsubscribes a late fresh-agent subscription when the client clears the session before subscribe resolves', async () => {
+    let resolveSubscribe!: (off: () => void) => void
+    const off = vi.fn()
+    const runtimeManager = {
+      attach: vi.fn().mockReturnValue({
+        sessionId: 'claude-session-race',
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+      }),
+      subscribe: vi.fn().mockImplementation(async () => (
+        await new Promise<() => void>((resolve) => {
+          resolveSubscribe = resolve
+        })
+      )),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'claude-session-race',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'claude-session-race',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.kill).toHaveBeenCalledWith({
+          sessionId: 'claude-session-race',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+        })
+      })
+
+      resolveSubscribe(off)
+
+      await vi.waitFor(() => {
+        expect(off).toHaveBeenCalledTimes(1)
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
 })

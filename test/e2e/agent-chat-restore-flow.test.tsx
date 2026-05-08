@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import { act, render, screen, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import FreshAgentView from '@/components/fresh-agent/FreshAgentView'
@@ -11,15 +11,57 @@ import tabsReducer from '@/store/tabsSlice'
 import type { FreshAgentPaneContent, PaneNode } from '@/store/paneTypes'
 import type { Tab } from '@/store/types'
 
-const wsSend = vi.fn()
-const wsOnMessage = vi.fn(() => () => {})
+const wsHarness = vi.hoisted(() => {
+  const reconnectHandlers = new Set<() => void>()
+  const messageHandlers = new Set<(message: any) => void>()
+  const send = vi.fn()
+  const onMessage = vi.fn((handler: (message: any) => void) => {
+    messageHandlers.add(handler)
+    return () => messageHandlers.delete(handler)
+  })
+  const onReconnect = vi.fn((handler: () => void) => {
+    reconnectHandlers.add(handler)
+    return () => reconnectHandlers.delete(handler)
+  })
+  return {
+    send,
+    onMessage,
+    onReconnect,
+    reconnect: () => {
+      for (const handler of [...reconnectHandlers]) {
+        handler()
+      }
+    },
+    emit: (message: any) => {
+      for (const handler of [...messageHandlers]) {
+        handler(message)
+      }
+    },
+    reset: () => {
+      reconnectHandlers.clear()
+      messageHandlers.clear()
+      send.mockReset()
+      onMessage.mockReset()
+      onMessage.mockImplementation((handler: (message: any) => void) => {
+        messageHandlers.add(handler)
+        return () => messageHandlers.delete(handler)
+      })
+      onReconnect.mockClear()
+    },
+    freshAgentCreates: () => send.mock.calls
+      .map(([message]) => message)
+      .filter((message: any) => message?.type === 'freshAgent.create'),
+  }
+})
+
+const wsSend = wsHarness.send
 const getFreshAgentThreadSnapshot = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: wsSend,
-    onMessage: wsOnMessage,
-    onReconnect: vi.fn(() => vi.fn()),
+    send: wsHarness.send,
+    onMessage: wsHarness.onMessage,
+    onReconnect: wsHarness.onReconnect,
   }),
 }))
 
@@ -82,9 +124,7 @@ function ReactivePane({ store }: { store: ReturnType<typeof makeStore> }) {
 describe('fresh-agent restore flow', () => {
   afterEach(() => {
     cleanup()
-    wsSend.mockReset()
-    wsOnMessage.mockReset()
-    wsOnMessage.mockImplementation(() => () => {})
+    wsHarness.reset()
     getFreshAgentThreadSnapshot.mockReset()
   })
 
@@ -201,5 +241,91 @@ describe('fresh-agent restore flow', () => {
     })
     expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
+  })
+
+  it('reconnect after freshAgent.create but before freshAgent.created resends the same request and binds one session without a retry loop', async () => {
+    getFreshAgentThreadSnapshot.mockResolvedValue({
+      revision: 1,
+      status: 'idle',
+      summary: 'Fresh-agent reconnected',
+      capabilities: { send: true, interrupt: true, approvals: false, questions: false, fork: false },
+      turns: [],
+    })
+    const store = makeStore()
+    const pane = {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-reconnect-create',
+      status: 'creating',
+    } satisfies FreshAgentPaneContent
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: pane,
+    }))
+
+    render(
+      <Provider store={store}>
+        <ReactivePane store={store} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsHarness.freshAgentCreates()).toEqual([
+        expect.objectContaining({
+          type: 'freshAgent.create',
+          requestId: 'req-reconnect-create',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    await waitFor(() => {
+      expect(wsHarness.freshAgentCreates()).toEqual([
+        expect.objectContaining({
+          type: 'freshAgent.create',
+          requestId: 'req-reconnect-create',
+        }),
+        expect.objectContaining({
+          type: 'freshAgent.create',
+          requestId: 'req-reconnect-create',
+        }),
+      ])
+    })
+
+    act(() => {
+      wsHarness.emit({
+        type: 'freshAgent.created',
+        requestId: 'req-reconnect-create',
+        sessionId: 'fresh-agent-reconnected-1',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+      })
+    })
+
+    await waitFor(() => {
+      const root = store.getState().panes.layouts.t1
+      const leaf = root && findLeaf(root, 'p1')
+      expect(leaf?.content.kind === 'fresh-agent' ? leaf.content.sessionId : undefined).toBe('fresh-agent-reconnected-1')
+    })
+
+    act(() => {
+      wsHarness.reconnect()
+    })
+
+    expect(wsHarness.freshAgentCreates()).toHaveLength(2)
+    const root = store.getState().panes.layouts.t1
+    const leaf = root && findLeaf(root, 'p1')
+    expect(leaf?.content.kind === 'fresh-agent' ? leaf.content : undefined).toEqual(expect.objectContaining({
+      sessionId: 'fresh-agent-reconnected-1',
+      status: 'idle',
+    }))
   })
 })

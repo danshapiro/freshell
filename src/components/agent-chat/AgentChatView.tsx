@@ -487,6 +487,17 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     createSentRef.current = false
   }
 
+  const buildCreatePayload = useCallback((content: AgentChatPaneContent) => ({
+    type: 'sdk.create' as const,
+    requestId: content.createRequestId,
+    model: content.model ?? defaultModel,
+    permissionMode: content.permissionMode ?? defaultPermissionMode,
+    effort: content.effort ?? defaultEffort,
+    ...(content.initialCwd ? { cwd: content.initialCwd } : {}),
+    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+    ...(content.plugins ? { plugins: content.plugins } : {}),
+  }), [defaultEffort, defaultModel, defaultPermissionMode])
+
   // Send sdk.create when the pane first mounts with a createRequestId but no sessionId
   useEffect(() => {
     if (suppressNetworkEffects) return
@@ -644,6 +655,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     ws,
   ])
 
+  // If the socket reconnects before sdk.created arrives, replay the same
+  // idempotent create request instead of leaving the pane stuck in "starting".
+  useEffect(() => {
+    if (suppressNetworkEffects) return
+    if (paneContent.sessionId || !createSentRef.current) return
+    if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
+    return ws.onReconnect(() => {
+      const current = paneContentRef.current
+      if (current.sessionId) return
+      if (current.status !== 'creating' && current.status !== 'starting') return
+      ws.send(buildCreatePayload(current))
+    })
+  }, [buildCreatePayload, paneContent.sessionId, paneContent.status, suppressNetworkEffects, ws])
+
   // Attach to existing session on mount (e.g. after page refresh with persisted pane).
   // Skip when session is already fully hydrated (e.g. split-induced remount) — the WS
   // subscription is connection-scoped so it survives the React unmount/remount cycle.
@@ -705,7 +730,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
     if (isAtBottomRef.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     } else if (session?.messages.length) {
       // New message arrived while scrolled up — show badge
       setHasNewMessages(true)
@@ -713,7 +738,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [session?.messages.length, session?.streamingActive])
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     setHasNewMessages(false)
     setShowScrollButton(false)
     isAtBottomRef.current = true
@@ -994,7 +1019,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   useEffect(() => {
     if (keyboardInsetPx > 0 && prevKeyboardInsetRef.current === 0 && isAtBottomRef.current) {
       // Keyboard just opened -- scroll to bottom (only if user is already at bottom)
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     }
     prevKeyboardInsetRef.current = keyboardInsetPx
   }, [keyboardInsetPx])

@@ -105,6 +105,7 @@ describe('fresh-agent resume history flow', () => {
       type: 'freshAgent.create',
       requestId: 'req-resume',
       sessionType: 'freshclaude',
+      provider: 'claude',
       resumeSessionId: 'cli-session-1',
     }))
 
@@ -117,6 +118,7 @@ describe('fresh-agent resume history flow', () => {
         requestId: 'req-resume',
         sessionId: 'sdk-sess-1',
         sessionType: 'freshclaude',
+        provider: 'claude',
         runtimeProvider: 'claude',
       })
     })
@@ -251,12 +253,16 @@ describe('fresh-agent resume history flow', () => {
     expect(wsSend).toHaveBeenCalledWith({
       type: 'freshAgent.approval.respond',
       sessionId: 'freshclaude-session-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       requestId: 'approval-1',
       decision: { behavior: 'allow', updatedInput: {} },
     })
     expect(wsSend).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
       sessionId: 'freshclaude-session-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       requestId: 'question-1',
       answers: { 'How should Claude proceed?': 'Continue' },
     })

@@ -1752,6 +1752,10 @@ export class WsHandler {
         event,
       })
     }).then((off) => {
+      if (!state.freshAgentSessions.has(key)) {
+        off()
+        return
+      }
       state.freshAgentSubscriptions.set(key, off)
     }).catch(() => undefined)
   }

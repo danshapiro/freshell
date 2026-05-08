@@ -103,6 +103,7 @@ describe('FreshAgentView reload/restore behavior', () => {
         type: 'freshAgent.attach',
         sessionId: 'sdk-session-1',
         sessionType: 'freshclaude',
+        provider: 'claude',
         resumeSessionId: 'cli-session-1',
       })
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
@@ -236,6 +237,8 @@ describe('FreshAgentView reload/restore behavior', () => {
       onMessage({
         type: 'freshAgent.event',
         sessionId: 'sdk-session-live',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         event: { kind: 'thread.updated' },
       })
     })

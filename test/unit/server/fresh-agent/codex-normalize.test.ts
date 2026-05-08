@@ -44,9 +44,9 @@ describe('Codex fresh-agent normalization', () => {
       },
     })
 
-    expect(snapshot.capabilities.send).toBe(false)
+    expect(snapshot.capabilities.send).toBe(true)
     expect(snapshot.capabilities.interrupt).toBe(false)
-    expect(snapshot.capabilities.fork).toBe(false)
+    expect(snapshot.capabilities.fork).toBe(true)
     expect(snapshot.worktrees[0]?.path).toContain('.worktrees')
     expect(snapshot.childThreads[0]?.origin).toBe('subagent')
     expect(snapshot.extensions.codex).toMatchObject({

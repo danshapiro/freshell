@@ -190,4 +190,38 @@ describe('Fresh-agent split-pane regression coverage', () => {
       status: 'idle',
     })
   })
+
+  it('still sends freshAgent.attach after page refresh when the session is not in Redux', () => {
+    const store = createStore()
+
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-refresh',
+        sessionId: 'sess-refresh',
+        status: 'connected',
+        resumeSessionId: 'cli-refresh',
+      },
+    }))
+
+    expect(store.getState().freshAgent.sessions).toEqual({})
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView store={store} tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.attach',
+      sessionId: 'sess-refresh',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      resumeSessionId: 'cli-refresh',
+    })
+  })
 })
