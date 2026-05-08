@@ -630,8 +630,8 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     e.preventDefault()
     e.stopPropagation()
 
-    const isLocal = record.deviceId === deviceId
     const isOpen = record.status === 'open'
+    const isLocal = isOpen && groups.localOpen.some((local) => local.tabKey === record.tabKey)
     const items: MenuItem[] = []
 
     if (isLocal && isOpen) {

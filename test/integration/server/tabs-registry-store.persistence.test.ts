@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { createReadStream, promises as fs } from 'fs'
+import crypto from 'crypto'
 import os from 'os'
 import path from 'path'
 import readline from 'readline'
@@ -35,6 +36,32 @@ async function lineCount(file: string): Promise<number> {
     count += 1
   }
   return count
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b))
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringify(entryValue)}`).join(',')}}`
+}
+
+function objectFor(value: unknown) {
+  const raw = stableStringify(value)
+  const sha256 = crypto.createHash('sha256').update(raw).digest('hex')
+  return {
+    raw,
+    ref: {
+      path: `objects/${sha256}.json`,
+      sha256,
+      bytes: Buffer.byteLength(raw, 'utf-8'),
+    },
+  }
+}
+
+function clientSnapshotKey(deviceId: string, clientInstanceId: string): string {
+  return `${Buffer.from(deviceId, 'utf-8').toString('base64url')}:${Buffer.from(clientInstanceId, 'utf-8').toString('base64url')}`
 }
 
 describe('tabs registry compact persistence', () => {
@@ -196,11 +223,185 @@ describe('tabs registry compact persistence', () => {
     expect(await lineCount(legacyPath)).toBe(1)
   })
 
+  it('fails legacy migration on valid records that exceed pane-count caps', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    await fs.writeFile(legacyPath, `${JSON.stringify(makeRecord({
+      tabKey: 'remote:pane-cap',
+      tabId: 'pane-cap',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      paneCount: 21,
+      panes: Array.from({ length: 21 }, (_, i) => ({ paneId: `pane-${i}`, kind: 'terminal', payload: {} })),
+    }))}\n`, 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/20 panes|migration/i)
+    await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await lineCount(legacyPath)).toBe(1)
+  })
+
+  it('fails legacy migration when migrated open device snapshots exceed the cap', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    const lines = Array.from({ length: 3 }, (_, i) => JSON.stringify(makeRecord({
+      tabKey: `device-${i}:tab`,
+      tabId: `tab-${i}`,
+      deviceId: `device-${i}`,
+      deviceLabel: `Device ${i}`,
+    })))
+    await fs.writeFile(legacyPath, `${lines.join('\n')}\n`, 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxClientSnapshotRefs: 2 },
+    })).rejects.toThrow(/migrated.*snapshots|client snapshots/i)
+    await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('rejects corrupt compact state with a clear error instead of serving empty data', async () => {
     await fs.mkdir(path.join(tempDir, 'v1'), { recursive: true })
     await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), '{"version":1,"openSnapshots":{}}', 'utf-8')
 
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/tabs registry compact state.*invalid|manifest/i)
+  })
+
+  it('rejects compact open snapshot objects that contain closed records', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const closedRecord = makeRecord({
+      tabKey: 'local:closed-in-open',
+      tabId: 'closed-in-open',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'closed',
+      closedAt: NOW,
+      updatedAt: NOW,
+    })
+    const snapshot = {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      lastPushPayloadHash: '0'.repeat(64),
+      snapshotReceivedAt: NOW,
+      records: [closedRecord],
+    }
+    const snapshotObject = objectFor(snapshot)
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/open snapshot.*open records|compact state/i)
+  })
+
+  it('rejects compact state when manifest key does not match snapshot identity', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const snapshot = {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      lastPushPayloadHash: '0'.repeat(64),
+      snapshotReceivedAt: NOW,
+      records: [
+        makeRecord({ tabKey: 'local:open', tabId: 'open', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
+    }
+    const snapshotObject = objectFor(snapshot)
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/snapshot key.*identity|compact state/i)
+  })
+
+  it('rejects manifest object refs that exceed per-object caps before reading the object body', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const oversizedSha = 'a'.repeat(64)
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'objects', `${oversizedSha}.json`), '{}', 'utf-8')
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: {
+        [clientSnapshotKey('local-device', 'window-a')]: {
+          path: `objects/${oversizedSha}.json`,
+          sha256: oversizedSha,
+          bytes: 600 * 1024,
+        },
+      },
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/object.*512 KiB|compact state/i)
+  })
+
+  it('validates an existing content-hash object before referencing it in a new manifest', async () => {
+    const store = await createTabsRegistryStore(tempDir, { now: () => now })
+    const record = makeRecord({
+      tabKey: 'local:open-1',
+      tabId: 'open-1',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    })
+    const storedRecord = { ...record, clientInstanceId: 'window-a' }
+    const snapshot = {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      lastPushPayloadHash: crypto.createHash('sha256').update(stableStringify({
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId: 'window-a',
+        snapshotRevision: 1,
+        records: [record],
+      })).digest('hex'),
+      snapshotReceivedAt: NOW,
+      records: [storedRecord],
+    }
+    const expectedObject = objectFor(snapshot)
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    await fs.writeFile(path.join(tempDir, 'v1', expectedObject.ref.path), '{"wrong":true}', 'utf-8')
+
+    await expect(store.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [record],
+    })).rejects.toThrow(/existing.*object.*hash/i)
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).resolves.toBeTruthy()
   })
 
   it.each([

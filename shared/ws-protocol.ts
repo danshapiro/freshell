@@ -594,14 +594,25 @@ export type TabsSyncAckMessage = {
   closedRecords: number
 }
 
+export type TabsSyncSnapshotOpenRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+}
+
+export type TabsSyncSnapshotClosedRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
+}
+
 export type TabsSyncSnapshotMessage = {
   type: 'tabs.sync.snapshot'
   requestId: string
   data: {
-    localOpen: unknown[]
-    sameDeviceOpen: unknown[]
-    remoteOpen: unknown[]
-    closed: unknown[]
+    localOpen: TabsSyncSnapshotOpenRecord[]
+    sameDeviceOpen: TabsSyncSnapshotOpenRecord[]
+    remoteOpen: TabsSyncSnapshotOpenRecord[]
+    closed: TabsSyncSnapshotClosedRecord[]
     devices: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
   }
 }

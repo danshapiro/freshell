@@ -319,7 +319,9 @@ export class WsClient {
         if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
           this.clearReadyTimeout()
           this.intentionalClose = true
-          const err = new Error('Protocol version mismatch')
+          const err = new Error(typeof msg.message === 'string' && msg.message
+            ? msg.message
+            : 'Protocol version mismatch. Reload this Freshell browser tab to use the latest client bundle.')
           ;(err as any).wsCloseCode = 4010
           finishReject(err)
           return
