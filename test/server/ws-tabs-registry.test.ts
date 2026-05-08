@@ -269,19 +269,23 @@ describe('ws tabs registry protocol', () => {
       clientInstanceId: 'window-a',
       snapshotRevision: 2,
     }))
-    await new Promise((resolve) => setTimeout(resolve, 25))
 
-    ws.send(JSON.stringify({
-      type: 'tabs.sync.query',
-      requestId: 'snapshot-after-retire',
-      deviceId: 'local-device',
-      clientInstanceId: 'window-b',
-      closedTabRetentionDays: 30,
-    }))
-    const snapshot = await waitForMessage(
-      ws,
-      (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'snapshot-after-retire',
-    )
+    let snapshot: any
+    await vi.waitFor(async () => {
+      const requestId = `snapshot-after-retire-${Date.now()}-${Math.random()}`
+      ws.send(JSON.stringify({
+        type: 'tabs.sync.query',
+        requestId,
+        deviceId: 'local-device',
+        clientInstanceId: 'window-b',
+        closedTabRetentionDays: 30,
+      }))
+      snapshot = await waitForMessage(
+        ws,
+        (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === requestId,
+      )
+      expect(snapshot.data.sameDeviceOpen).toHaveLength(0)
+    })
     expect(snapshot.data.localOpen.map((record: any) => record.tabKey)).toEqual(['local:window-b'])
     expect(snapshot.data.sameDeviceOpen).toHaveLength(0)
     ws.close()

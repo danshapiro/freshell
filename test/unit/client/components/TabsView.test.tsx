@@ -226,8 +226,24 @@ describe('TabsView', () => {
 
   it('treats same-device other-window tabs as pullable, not jumpable local tabs', () => {
     const store = createStore()
+    const localRecord = {
+      tabKey: 'same-device:open',
+      tabId: 'local-tab',
+      serverInstanceId: 'srv-local',
+      deviceId: store.getState().tabRegistry.deviceId,
+      deviceLabel: store.getState().tabRegistry.deviceLabel,
+      clientInstanceId: 'this-window',
+      tabName: 'local open',
+      status: 'open',
+      revision: 1,
+      createdAt: 1,
+      updatedAt: 2,
+      paneCount: 1,
+      titleSetByUser: false,
+      panes: [],
+    } as any
     store.dispatch(setTabRegistrySnapshot({
-      localOpen: [],
+      localOpen: [localRecord],
       sameDeviceOpen: [{
         tabKey: 'same-device:open',
         tabId: 'other-window-tab',

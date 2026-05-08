@@ -2,7 +2,6 @@ import crypto from 'crypto'
 import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
-import readline from 'readline'
 import { z } from 'zod'
 import { getFreshellConfigDir } from '../freshell-home.js'
 import { TabRegistryRecordSchema, type RegistryTabRecord } from './types.js'
@@ -105,6 +104,7 @@ type TabsRegistryCaps = {
   maxSerializedDeviceMetadataObjectBytes: number
   maxCompactStateBytes: number
   maxClientSnapshotRefs: number
+  maxDevices: number
   maxClosedTombstones: number
   maxLegacyLineBytes: number
   maxLegacyUniqueTabKeys: number
@@ -124,6 +124,7 @@ const DEFAULT_CAPS: TabsRegistryCaps = {
   maxSerializedDeviceMetadataObjectBytes: 256 * 1024,
   maxCompactStateBytes: 5 * 1024 * 1024,
   maxClientSnapshotRefs: 200,
+  maxDevices: 200,
   maxClosedTombstones: 2000,
   maxLegacyLineBytes: 256 * 1024,
   maxLegacyUniqueTabKeys: 10_000,
@@ -134,6 +135,15 @@ const ObjectRefSchema = z.object({
   path: z.string().regex(/^objects\/[a-f0-9]{64}\.json$/),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
   bytes: z.number().int().nonnegative(),
+}).superRefine((value, ctx) => {
+  const pathDigest = /^objects\/([a-f0-9]{64})\.json$/.exec(value.path)?.[1]
+  if (pathDigest && pathDigest !== value.sha256) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Object reference path must be derived from the content hash',
+      path: ['path'],
+    })
+  }
 })
 
 const ManifestSchema: z.ZodType<TabsRegistryManifestV1> = z.object({
@@ -144,8 +154,8 @@ const ManifestSchema: z.ZodType<TabsRegistryManifestV1> = z.object({
   closedTombstones: ObjectRefSchema,
   devices: ObjectRefSchema,
   settings: z.object({
-    openSnapshotTtlMinutes: z.number().int().positive(),
-    deviceDisplayTtlDays: z.number().int().positive(),
+    openSnapshotTtlMinutes: z.literal(DEFAULT_OPEN_SNAPSHOT_TTL_MINUTES),
+    deviceDisplayTtlDays: z.literal(DEFAULT_DEVICE_DISPLAY_TTL_DAYS),
     maxClosedRetentionDays: z.number().int().min(1).max(30),
   }),
 })
@@ -167,6 +177,17 @@ const ClientOpenSnapshotSchema: z.ZodType<ClientOpenSnapshot> = z.object({
         path: ['records', index, 'status'],
       })
     }
+    if (
+      record.deviceId !== value.deviceId
+      || record.deviceLabel !== value.deviceLabel
+      || record.clientInstanceId !== value.clientInstanceId
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Client open snapshot record identity must match the snapshot identity',
+        path: ['records', index],
+      })
+    }
   }
 })
 
@@ -174,9 +195,37 @@ const DevicesSchema: z.ZodType<Record<string, RegistryDeviceEntry>> = z.record(z
   deviceId: z.string().min(1),
   deviceLabel: z.string().min(1),
   lastSeenAt: z.number().int().nonnegative(),
-}))
+})).superRefine((value, ctx) => {
+  for (const [key, device] of Object.entries(value)) {
+    if (key !== device.deviceId) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Tabs registry devices metadata key must match deviceId',
+        path: [key, 'deviceId'],
+      })
+    }
+  }
+})
 
 const ClosedTombstonesSchema: z.ZodType<Record<string, RegistryTabRecord>> = z.record(z.string().min(1), TabRegistryRecordSchema)
+  .superRefine((value, ctx) => {
+    for (const [key, record] of Object.entries(value)) {
+      if (record.status !== 'closed') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Tabs registry closed tombstones must contain closed records only',
+          path: [key, 'status'],
+        })
+      }
+      if (key !== record.tabKey) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'Tabs registry closed tombstone key must match record tabKey',
+          path: [key, 'tabKey'],
+        })
+      }
+    }
+  })
 
 function resolveStoreDir(baseDir?: string): string {
   if (baseDir) return path.resolve(baseDir)
@@ -253,14 +302,8 @@ function cloneState(state: CompactTabsRegistryStateV1, savedAt: number): Compact
   return {
     ...state,
     savedAt,
-    openSnapshotsByClient: Object.fromEntries(Object.entries(state.openSnapshotsByClient).map(([key, snapshot]) => [
-      key,
-      { ...snapshot, records: snapshot.records.map((record) => ({ ...record, panes: [...record.panes] })) },
-    ])),
-    closedByTabKey: Object.fromEntries(Object.entries(state.closedByTabKey).map(([key, record]) => [
-      key,
-      { ...record, panes: [...record.panes] },
-    ])),
+    openSnapshotsByClient: { ...state.openSnapshotsByClient },
+    closedByTabKey: { ...state.closedByTabKey },
     devicesById: Object.fromEntries(Object.entries(state.devicesById).map(([key, device]) => [key, { ...device }])),
   }
 }
@@ -295,9 +338,13 @@ function validateRecordCaps(records: RegistryTabRecord[], caps: TabsRegistryCaps
       throw new Error(`Tabs registry push contains duplicate tab key: ${record.tabKey}`)
     }
     seen.add(record.tabKey)
-    if (record.panes.length > caps.maxPanesPerRecord || record.paneCount > caps.maxPanesPerRecord) {
-      throw new Error(`Tabs registry record can contain at most ${caps.maxPanesPerRecord} panes`)
-    }
+    validateRecordPaneCaps(record, caps)
+  }
+}
+
+function validateRecordPaneCaps(record: RegistryTabRecord, caps: TabsRegistryCaps): void {
+  if (record.panes.length > caps.maxPanesPerRecord || record.paneCount > caps.maxPanesPerRecord) {
+    throw new Error(`Tabs registry record can contain at most ${caps.maxPanesPerRecord} panes`)
   }
 }
 
@@ -306,9 +353,22 @@ function validateStateCaps(state: CompactTabsRegistryStateV1, caps: TabsRegistry
   if (snapshotCount > caps.maxClientSnapshotRefs) {
     throw new Error(`Tabs registry can retain at most ${caps.maxClientSnapshotRefs} client snapshots`)
   }
+  for (const snapshot of Object.values(state.openSnapshotsByClient)) {
+    if (snapshot.records.length > caps.maxOpenRecordsPerClientSnapshot) {
+      throw new Error(`Tabs registry client snapshot can contain at most ${caps.maxOpenRecordsPerClientSnapshot} open records`)
+    }
+    validateRecordCaps(snapshot.records, caps)
+  }
   const closedCount = Object.keys(state.closedByTabKey).length
   if (closedCount > caps.maxClosedTombstones) {
     throw new Error(`Tabs registry can retain at most ${caps.maxClosedTombstones} closed tombstones`)
+  }
+  for (const record of Object.values(state.closedByTabKey)) {
+    validateRecordPaneCaps(record, caps)
+  }
+  const deviceCount = Object.keys(state.devicesById).length
+  if (deviceCount > caps.maxDevices) {
+    throw new Error(`Tabs registry can retain at most ${caps.maxDevices} devices`)
   }
   const stateBytes = jsonBytes(state)
   if (stateBytes > caps.maxCompactStateBytes) {
@@ -337,25 +397,29 @@ function applyQueuedMaintenance(
 ): CompactTabsRegistryStateV1 {
   const openCutoff = now - state.openSnapshotTtlMinutes * MINUTE_MS
   const deviceCutoff = now - state.deviceDisplayTtlDays * DAY_MS
+  const openSnapshotsByClient = Object.fromEntries(
+    Object.entries(state.openSnapshotsByClient)
+      .filter(([, snapshot]) => snapshot.snapshotReceivedAt >= openCutoff)
+      .sort(([, a], [, b]) => b.snapshotReceivedAt - a.snapshotReceivedAt)
+  )
+  const closedByTabKey = pruneClosedTombstones(
+    state.closedByTabKey,
+    now,
+    state.maxClosedRetentionDays,
+    caps.maxClosedTombstones,
+  )
+  const devicesById = Object.fromEntries(
+    Object.entries(state.devicesById)
+      .filter(([, device]) => device.lastSeenAt >= deviceCutoff)
+      .sort(([, a], [, b]) => b.lastSeenAt - a.lastSeenAt)
+      .slice(0, caps.maxDevices),
+  )
   return {
     ...state,
     savedAt: now,
-    openSnapshotsByClient: Object.fromEntries(
-      Object.entries(state.openSnapshotsByClient)
-        .filter(([, snapshot]) => snapshot.snapshotReceivedAt >= openCutoff)
-        .sort(([, a], [, b]) => b.snapshotReceivedAt - a.snapshotReceivedAt),
-    ),
-    closedByTabKey: pruneClosedTombstones(
-      state.closedByTabKey,
-      now,
-      state.maxClosedRetentionDays,
-      caps.maxClosedTombstones,
-    ),
-    devicesById: Object.fromEntries(
-      Object.entries(state.devicesById)
-        .filter(([, device]) => device.lastSeenAt >= deviceCutoff)
-        .sort(([, a], [, b]) => b.lastSeenAt - a.lastSeenAt),
-    ),
+    openSnapshotsByClient,
+    closedByTabKey,
+    devicesById,
   }
 }
 
@@ -365,14 +429,35 @@ function assertSnapshotRecordOwnership(input: ReplaceClientSnapshotInput, record
   }
 }
 
-function buildPushPayloadHash(input: ReplaceClientSnapshotInput, parsedRecords: RegistryTabRecord[]): string {
+function buildSnapshotPayloadHash(snapshot: Pick<ClientOpenSnapshot, 'deviceId' | 'deviceLabel' | 'clientInstanceId' | 'snapshotRevision' | 'records'>): string {
   return sha256(stableStringify({
-    deviceId: input.deviceId,
-    deviceLabel: input.deviceLabel,
-    clientInstanceId: input.clientInstanceId,
-    snapshotRevision: input.snapshotRevision,
-    records: parsedRecords,
+    deviceId: snapshot.deviceId,
+    deviceLabel: snapshot.deviceLabel,
+    clientInstanceId: snapshot.clientInstanceId,
+    snapshotRevision: snapshot.snapshotRevision,
+    records: snapshot.records,
   }))
+}
+
+function recordMapHasSameEntries<T extends object>(a: Record<string, T>, b: Record<string, T>): boolean {
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length !== bKeys.length) return false
+  return aKeys.every((key) => a[key] === b[key])
+}
+
+function findOpenWinnerForTab(
+  openSnapshotsByClient: Record<string, ClientOpenSnapshot>,
+  tabKey: string,
+): RegistryTabRecord | undefined {
+  let winner: RegistryTabRecord | undefined
+  for (const snapshot of Object.values(openSnapshotsByClient)) {
+    for (const record of snapshot.records) {
+      if (record.tabKey !== tabKey) continue
+      winner = pickEventWinner(winner, record)
+    }
+  }
+  return winner
 }
 
 async function bestEffortFsyncFile(file: string): Promise<void> {
@@ -414,9 +499,44 @@ function archiveTimestamp(date: Date): string {
   ].join('')
 }
 
+async function* readBoundedLegacyLines(legacyPath: string, maxLineBytes: number): AsyncGenerator<string> {
+  const input = fs.createReadStream(legacyPath, { encoding: 'utf-8', highWaterMark: 64 * 1024 })
+  let pending = ''
+  let pendingBytes = 0
+
+  for await (const chunk of input) {
+    let remaining = String(chunk)
+    while (remaining.length > 0) {
+      const newlineIndex = remaining.indexOf('\n')
+      const segment = newlineIndex === -1 ? remaining : remaining.slice(0, newlineIndex)
+      const segmentBytes = Buffer.byteLength(segment, 'utf-8')
+      if (pendingBytes + segmentBytes > maxLineBytes) {
+        input.destroy()
+        throw new Error(`Tabs registry legacy migration cap exceeded: line is larger than ${formatBytes(maxLineBytes)}`)
+      }
+      pending += segment
+      pendingBytes += segmentBytes
+      if (newlineIndex === -1) {
+        break
+      }
+      yield pending.endsWith('\r') ? pending.slice(0, -1) : pending
+      pending = ''
+      pendingBytes = 0
+      remaining = remaining.slice(newlineIndex + 1)
+    }
+  }
+
+  if (pending.length > 0 || pendingBytes > 0) {
+    yield pending.endsWith('\r') ? pending.slice(0, -1) : pending
+  }
+}
+
+type ManifestObjectRefs = Pick<TabsRegistryManifestV1, 'openSnapshots' | 'closedTombstones' | 'devices'>
+
 export class TabsRegistryStore {
   private state: CompactTabsRegistryStateV1
   private manifestRevision = 0
+  private manifestObjectRefs?: ManifestObjectRefs
   private writeQueue: Promise<void> = Promise.resolve()
   private readonly now: () => number
   private readonly caps: TabsRegistryCaps
@@ -428,9 +548,11 @@ export class TabsRegistryStore {
     state: CompactTabsRegistryStateV1,
     manifestRevision: number,
     options: TabsRegistryStoreOptions = {},
+    manifestObjectRefs?: ManifestObjectRefs,
   ) {
     this.state = state
     this.manifestRevision = manifestRevision
+    this.manifestObjectRefs = manifestObjectRefs
     this.now = options.now ?? (() => Date.now())
     this.caps = { ...DEFAULT_CAPS, ...(options.caps ?? {}) }
   }
@@ -444,8 +566,8 @@ export class TabsRegistryStore {
 
     const compactManifestPath = path.join(resolvedRoot, 'v1', 'manifest.json')
     if (fs.existsSync(compactManifestPath)) {
-      const { state, manifestRevision } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
-      return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options)
+      const { state, manifestRevision, manifestObjectRefs } = await TabsRegistryStore.loadCompactState(resolvedRoot, caps)
+      return new TabsRegistryStore(resolvedRoot, state, manifestRevision, options, manifestObjectRefs)
     }
 
     const legacyPath = path.join(resolvedRoot, 'tabs-registry.jsonl')
@@ -471,6 +593,7 @@ export class TabsRegistryStore {
   private static async loadCompactState(rootDir: string, caps: TabsRegistryCaps): Promise<{
     state: CompactTabsRegistryStateV1
     manifestRevision: number
+    manifestObjectRefs: ManifestObjectRefs
   }> {
     const manifestPath = path.join(rootDir, 'v1', 'manifest.json')
     let manifest: TabsRegistryManifestV1
@@ -502,6 +625,9 @@ export class TabsRegistryStore {
       const openEntries = await Promise.all(Object.entries(manifest.openSnapshots).map(async ([key, ref]) => {
         const snapshot = await readObject(ref, ClientOpenSnapshotSchema, caps.maxSerializedClientSnapshotObjectBytes)
         assertClientSnapshotKeyMatchesSnapshot(key, snapshot)
+        if (snapshot.lastPushPayloadHash !== buildSnapshotPayloadHash(snapshot)) {
+          throw new Error('Tabs registry compact state client snapshot payload hash does not match snapshot content')
+        }
         return [key, snapshot] as const
       }))
       const state: CompactTabsRegistryStateV1 = {
@@ -515,7 +641,15 @@ export class TabsRegistryStore {
         devicesById: await readObject(manifest.devices, DevicesSchema, caps.maxSerializedDeviceMetadataObjectBytes),
       }
       validateStateCaps(state, caps)
-      return { state, manifestRevision: manifest.manifestRevision }
+      return {
+        state,
+        manifestRevision: manifest.manifestRevision,
+        manifestObjectRefs: {
+          openSnapshots: manifest.openSnapshots,
+          closedTombstones: manifest.closedTombstones,
+          devices: manifest.devices,
+        },
+      }
     } catch (error) {
       throw new Error(`Tabs registry compact state is invalid: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -528,15 +662,9 @@ export class TabsRegistryStore {
     maxClosedRetentionDays = DEFAULT_CLOSED_RETENTION_DAYS,
   ): Promise<CompactTabsRegistryStateV1> {
     const latestByTabKey = new Map<string, RegistryTabRecord>()
-    const input = fs.createReadStream(legacyPath, { encoding: 'utf-8' })
-    const lines = readline.createInterface({ input, crlfDelay: Infinity })
     let retainedBytes = 0
 
-    for await (const line of lines) {
-      const lineBytes = Buffer.byteLength(line, 'utf-8')
-      if (lineBytes > caps.maxLegacyLineBytes) {
-        throw new Error(`Tabs registry legacy migration cap exceeded: line is larger than ${formatBytes(caps.maxLegacyLineBytes)}`)
-      }
+    for await (const line of readBoundedLegacyLines(legacyPath, caps.maxLegacyLineBytes)) {
       const trimmed = line.trim()
       if (!trimmed) continue
       let parsedJson: unknown
@@ -589,15 +717,25 @@ export class TabsRegistryStore {
       if (openByDevice.size > caps.maxClientSnapshotRefs) {
         throw new Error(`Tabs registry legacy migration cap exceeded: more than ${caps.maxClientSnapshotRefs} migrated open snapshots`)
       }
+      if (records.length > caps.maxOpenRecordsPerClientSnapshot) {
+        throw new Error(`Tabs registry legacy migration cap exceeded: client snapshot has more than ${caps.maxOpenRecordsPerClientSnapshot} open records`)
+      }
       const deviceLabel = records[0]?.deviceLabel ?? deviceId
+      const snapshotRecords = records.map((record) => ({ ...record, deviceLabel, clientInstanceId: 'legacy-migration' }))
       const snapshot: ClientOpenSnapshot = {
         deviceId,
         deviceLabel,
         clientInstanceId: 'legacy-migration',
         snapshotRevision: 1,
-        lastPushPayloadHash: sha256(stableStringify({ deviceId, deviceLabel, clientInstanceId: 'legacy-migration', snapshotRevision: 1, records })),
+        lastPushPayloadHash: buildSnapshotPayloadHash({
+          deviceId,
+          deviceLabel,
+          clientInstanceId: 'legacy-migration',
+          snapshotRevision: 1,
+          records: snapshotRecords,
+        }),
         snapshotReceivedAt: migrationStartedAt,
-        records: records.map((record) => ({ ...record, clientInstanceId: 'legacy-migration' })),
+        records: snapshotRecords,
       }
       state.openSnapshotsByClient[clientSnapshotKey(deviceId, 'legacy-migration')] = snapshot
     }
@@ -658,10 +796,20 @@ export class TabsRegistryStore {
   private async buildManifest(state: CompactTabsRegistryStateV1): Promise<TabsRegistryManifestV1> {
     const openSnapshots: Record<string, ObjectRef> = {}
     for (const [key, snapshot] of Object.entries(state.openSnapshotsByClient)) {
-      openSnapshots[key] = await this.writeObject(snapshot, this.caps.maxSerializedClientSnapshotObjectBytes)
+      const previousSnapshot = this.state.openSnapshotsByClient[key]
+      const previousRef = this.manifestObjectRefs?.openSnapshots[key]
+      openSnapshots[key] = previousRef && previousSnapshot === snapshot
+        ? previousRef
+        : await this.writeObject(snapshot, this.caps.maxSerializedClientSnapshotObjectBytes)
     }
-    const closedTombstones = await this.writeObject(state.closedByTabKey, this.caps.maxSerializedClosedTombstoneObjectBytes)
-    const devices = await this.writeObject(state.devicesById, this.caps.maxSerializedDeviceMetadataObjectBytes)
+    const closedTombstones = this.manifestObjectRefs?.closedTombstones
+      && recordMapHasSameEntries(this.state.closedByTabKey, state.closedByTabKey)
+      ? this.manifestObjectRefs.closedTombstones
+      : await this.writeObject(state.closedByTabKey, this.caps.maxSerializedClosedTombstoneObjectBytes)
+    const devices = this.manifestObjectRefs?.devices
+      && recordMapHasSameEntries(this.state.devicesById, state.devicesById)
+      ? this.manifestObjectRefs.devices
+      : await this.writeObject(state.devicesById, this.caps.maxSerializedDeviceMetadataObjectBytes)
     return {
       version: 1,
       manifestRevision: this.manifestRevision + 1,
@@ -719,6 +867,11 @@ export class TabsRegistryStore {
     await this.publishManifest(manifest)
     this.state = nextState
     this.manifestRevision = manifest.manifestRevision
+    this.manifestObjectRefs = {
+      openSnapshots: manifest.openSnapshots,
+      closedTombstones: manifest.closedTombstones,
+      devices: manifest.devices,
+    }
     await this.garbageCollectObjects(manifest).catch((error) => {
       // The manifest has been published and live state has been swapped. Surface
       // maintenance failures without turning an already-committed mutation into
@@ -762,7 +915,13 @@ export class TabsRegistryStore {
     }
 
     const key = clientSnapshotKey(input.deviceId, input.clientInstanceId)
-    const pushHash = buildPushPayloadHash(input, parsedRecords)
+    const pushHash = buildSnapshotPayloadHash({
+      deviceId: input.deviceId,
+      deviceLabel: input.deviceLabel,
+      clientInstanceId: input.clientInstanceId,
+      snapshotRevision: input.snapshotRevision,
+      records: openRecords,
+    })
 
     return this.enqueueMutation(async () => {
       const current = this.state.openSnapshotsByClient[key]
@@ -780,6 +939,10 @@ export class TabsRegistryStore {
 
       let next = cloneState(this.state, receiptTime)
       for (const closedRecord of closedRecords) {
+        const openWinner = findOpenWinnerForTab(next.openSnapshotsByClient, closedRecord.tabKey)
+        if (openWinner && compareRegistryRecordsByEventTime(openWinner, closedRecord) > 0) {
+          continue
+        }
         next.closedByTabKey[closedRecord.tabKey] = pickEventWinner(next.closedByTabKey[closedRecord.tabKey], closedRecord)
       }
 
@@ -819,7 +982,19 @@ export class TabsRegistryStore {
       if (input.snapshotRevision <= current.snapshotRevision) return { accepted: false }
 
       let next = cloneState(this.state, receiptTime)
-      delete next.openSnapshotsByClient[key]
+      next.openSnapshotsByClient[key] = {
+        ...current,
+        snapshotRevision: input.snapshotRevision,
+        lastPushPayloadHash: buildSnapshotPayloadHash({
+          deviceId: current.deviceId,
+          deviceLabel: current.deviceLabel,
+          clientInstanceId: current.clientInstanceId,
+          snapshotRevision: input.snapshotRevision,
+          records: [],
+        }),
+        snapshotReceivedAt: receiptTime,
+        records: [],
+      }
       next.devicesById[input.deviceId] = {
         deviceId: current.deviceId,
         deviceLabel: current.deviceLabel,

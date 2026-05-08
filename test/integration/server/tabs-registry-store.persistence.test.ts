@@ -64,6 +64,16 @@ function clientSnapshotKey(deviceId: string, clientInstanceId: string): string {
   return `${Buffer.from(deviceId, 'utf-8').toString('base64url')}:${Buffer.from(clientInstanceId, 'utf-8').toString('base64url')}`
 }
 
+function pushHash(input: {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+  snapshotRevision: number
+  records: unknown[]
+}): string {
+  return crypto.createHash('sha256').update(stableStringify(input)).digest('hex')
+}
+
 describe('tabs registry compact persistence', () => {
   let tempDir: string
   let now = NOW
@@ -256,6 +266,52 @@ describe('tabs registry compact persistence', () => {
     await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
+  it('fails legacy migration when one synthetic device snapshot exceeds the open-record cap', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    const lines = Array.from({ length: 3 }, (_, i) => JSON.stringify(makeRecord({
+      tabKey: `remote-device:tab-${i}`,
+      tabId: `tab-${i}`,
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+    })))
+    await fs.writeFile(legacyPath, `${lines.join('\n')}\n`, 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxOpenRecordsPerClientSnapshot: 2 },
+    })).rejects.toThrow(/open records|client snapshot|migration/i)
+    await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('normalizes legacy synthetic snapshot record labels to their snapshot device label', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    await fs.writeFile(legacyPath, [
+      JSON.stringify(makeRecord({
+        tabKey: 'remote-device:old',
+        tabId: 'old',
+        deviceId: 'remote-device',
+        deviceLabel: 'old-label',
+        updatedAt: NOW - 2_000,
+      })),
+      JSON.stringify(makeRecord({
+        tabKey: 'remote-device:new',
+        tabId: 'new',
+        deviceId: 'remote-device',
+        deviceLabel: 'new-label',
+        updatedAt: NOW - 1_000,
+      })),
+      '',
+    ].join('\n'), 'utf-8')
+
+    const migrated = await createTabsRegistryStore(tempDir, { now: () => now })
+    const result = await migrated.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(new Set(result.remoteOpen.map((record) => record.deviceLabel))).toEqual(new Set(['old-label']))
+  })
+
   it('rejects corrupt compact state with a clear error instead of serving empty data', async () => {
     await fs.mkdir(path.join(tempDir, 'v1'), { recursive: true })
     await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), '{"version":1,"openSnapshots":{}}', 'utf-8')
@@ -303,18 +359,180 @@ describe('tabs registry compact persistence', () => {
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/open snapshot.*open records|compact state/i)
   })
 
+  it('rejects compact closed tombstones that are not closed or whose keys do not match record tab keys', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const openInClosed = makeRecord({
+      tabKey: 'actual:open',
+      tabId: 'open',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      status: 'open',
+    })
+    const closedKeyMismatch = makeRecord({
+      tabKey: 'actual:closed',
+      tabId: 'closed',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      status: 'closed',
+      closedAt: NOW,
+      updatedAt: NOW,
+    })
+    const closedObject = objectFor({
+      'manifest-open': openInClosed,
+      'manifest-closed': closedKeyMismatch,
+    })
+    const devicesObject = objectFor({})
+    for (const object of [closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: {},
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/closed tombstone|compact state/i)
+  })
+
+  it('rejects compact open snapshots whose records exceed caps or do not belong to the snapshot identity', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const mismatchedRecord = makeRecord({
+      tabKey: 'remote:open',
+      tabId: 'open',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+    } as Partial<RegistryTabRecord>)
+    const tooManyPanes = makeRecord({
+      tabKey: 'local:pane-cap',
+      tabId: 'pane-cap',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      paneCount: 21,
+      panes: Array.from({ length: 21 }, (_, i) => ({ paneId: `pane-${i}`, kind: 'terminal', payload: {} })),
+    })
+    const snapshot = {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      lastPushPayloadHash: pushHash({
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId: 'window-a',
+        snapshotRevision: 1,
+        records: [mismatchedRecord, tooManyPanes],
+      }),
+      snapshotReceivedAt: NOW,
+      records: [mismatchedRecord, tooManyPanes],
+    }
+    const snapshotObject = objectFor(snapshot)
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/snapshot.*record|20 panes|compact state/i)
+  })
+
+  it('rejects compact manifests with non-v1 liveness settings', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: {},
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 525600, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/manifest|compact state/i)
+  })
+
+  it('rejects compact snapshots whose retry hash does not match their canonical payload', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const record = makeRecord({
+      tabKey: 'local:open',
+      tabId: 'open',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+    } as Partial<RegistryTabRecord>)
+    const snapshot = {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      lastPushPayloadHash: '1'.repeat(64),
+      snapshotReceivedAt: NOW,
+      records: [record],
+    }
+    const snapshotObject = objectFor(snapshot)
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/payload hash|compact state/i)
+  })
+
   it('rejects compact state when manifest key does not match snapshot identity', async () => {
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const record = makeRecord({
+      tabKey: 'local:open',
+      tabId: 'open',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-b',
+    } as Partial<RegistryTabRecord>)
     const snapshot = {
       deviceId: 'local-device',
       deviceLabel: 'local',
       clientInstanceId: 'window-b',
       snapshotRevision: 1,
-      lastPushPayloadHash: '0'.repeat(64),
+      lastPushPayloadHash: pushHash({
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId: 'window-b',
+        snapshotRevision: 1,
+        records: [record],
+      }),
       snapshotReceivedAt: NOW,
-      records: [
-        makeRecord({ tabKey: 'local:open', tabId: 'open', deviceId: 'local-device', deviceLabel: 'local' }),
-      ],
+      records: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -365,6 +583,51 @@ describe('tabs registry compact persistence', () => {
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/object.*512 KiB|compact state/i)
   })
 
+  it('rejects manifest object refs whose filename is not the content hash', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    const mismatchedPath = `objects/${'1'.repeat(64)}.json`
+    await fs.writeFile(path.join(tempDir, 'v1', closedObject.ref.path), closedObject.raw, 'utf-8')
+    await fs.writeFile(path.join(tempDir, 'v1', mismatchedPath), closedObject.raw, 'utf-8')
+    await fs.writeFile(path.join(tempDir, 'v1', devicesObject.ref.path), devicesObject.raw, 'utf-8')
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: {},
+      closedTombstones: { ...closedObject.ref, path: mismatchedPath },
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/content hash|compact state|manifest/i)
+  })
+
+  it('rejects devices metadata whose keys do not match device ids', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({
+      'manifest-device': { deviceId: 'actual-device', deviceLabel: 'actual', lastSeenAt: NOW },
+    })
+    for (const object of [closedObject, devicesObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: {},
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/devices.*key|compact state/i)
+  })
+
   it('validates an existing content-hash object before referencing it in a new manifest', async () => {
     const store = await createTabsRegistryStore(tempDir, { now: () => now })
     const record = makeRecord({
@@ -384,7 +647,7 @@ describe('tabs registry compact persistence', () => {
         deviceLabel: 'local',
         clientInstanceId: 'window-a',
         snapshotRevision: 1,
-        records: [record],
+        records: [storedRecord],
       })).digest('hex'),
       snapshotReceivedAt: NOW,
       records: [storedRecord],
@@ -402,6 +665,50 @@ describe('tabs registry compact persistence', () => {
     })).rejects.toThrow(/existing.*object.*hash/i)
 
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).resolves.toBeTruthy()
+  })
+
+  it('reuses unchanged object refs without rereading compact objects during heartbeat commits', async () => {
+    const writer = await createTabsRegistryStore(tempDir, { now: () => now })
+    const localRecord = makeRecord({
+      tabKey: 'local:open',
+      tabId: 'local',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    })
+    const remoteRecord = makeRecord({
+      tabKey: 'remote:open',
+      tabId: 'remote',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+    })
+    await writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [localRecord],
+    })
+    await writer.replaceClientSnapshot({
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'window-b',
+      snapshotRevision: 1,
+      records: [remoteRecord],
+    })
+
+    const readSpy = vi.spyOn(fs, 'readFile')
+    now += 1
+    await writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [localRecord],
+    })
+
+    const objectReads = readSpy.mock.calls.filter(([file]) => String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`))
+    readSpy.mockRestore()
+    expect(objectReads).toHaveLength(0)
   })
 
   it.each([

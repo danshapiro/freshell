@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { RootState } from '../../../../src/store/store'
-import { HEARTBEAT_INTERVAL_MS, startTabRegistrySync, SYNC_INTERVAL_MS } from '../../../../src/store/tabRegistrySync'
+import {
+  getCurrentTabRegistryClientInstanceId,
+  HEARTBEAT_INTERVAL_MS,
+  startTabRegistrySync,
+  SYNC_INTERVAL_MS,
+} from '../../../../src/store/tabRegistrySync'
 
 type Listener = () => void
 
@@ -123,7 +128,11 @@ describe('tabRegistrySync', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
-    sessionStorage.clear()
+    try {
+      sessionStorage.clear()
+    } catch {
+      // Tests that intentionally block sessionStorage restore globals above.
+    }
     vi.useRealTimers()
   })
 
@@ -223,6 +232,42 @@ describe('tabRegistrySync', () => {
 
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
     expect(ws.sendTabsSyncQuery.mock.calls[0][0].closedTabRetentionDays).toBe(7)
+    stop()
+  })
+
+  it('keeps one in-memory client id for push and direct query helpers when sessionStorage is unavailable', () => {
+    vi.unstubAllGlobals()
+    vi.stubGlobal('sessionStorage', {
+      getItem: vi.fn(() => {
+        throw new Error('blocked')
+      }),
+      setItem: vi.fn(() => {
+        throw new Error('blocked')
+      }),
+      clear: vi.fn(),
+    })
+    vi.stubGlobal('BroadcastChannel', undefined)
+    vi.stubGlobal('navigator', {
+      ...globalThis.navigator,
+      sendBeacon: vi.fn(() => true),
+    })
+    const firstClientId = getCurrentTabRegistryClientInstanceId()
+    expect(getCurrentTabRegistryClientInstanceId()).toBe(firstClientId)
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId).toBe(firstClientId)
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0].clientInstanceId).toBe(firstClientId)
+    expect(getCurrentTabRegistryClientInstanceId()).toBe(firstClientId)
     stop()
   })
 
@@ -328,6 +373,52 @@ describe('tabRegistrySync', () => {
     const stop = startTabRegistrySync(store as any, ws)
     const records = ws.sendTabsSyncPush.mock.calls[0][0].records
     expect(records.some((record: any) => record.tabKey === 'local:stale')).toBe(false)
+    stop()
+  })
+
+  it('normalizes retained local closed records to the current device metadata after rename', () => {
+    state = {
+      ...state,
+      tabRegistry: {
+        ...state.tabRegistry,
+        deviceLabel: 'new-label',
+        localClosed: {
+          renamed: {
+            tabKey: 'local:renamed',
+            tabId: 'renamed',
+            serverInstanceId: 'srv-test',
+            deviceId: 'local-device',
+            deviceLabel: 'old-label',
+            tabName: 'renamed',
+            status: 'closed',
+            revision: 1,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            closedAt: Date.now(),
+            paneCount: 0,
+            titleSetByUser: false,
+            panes: [],
+          },
+        },
+      },
+    }
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    const closedRecord = ws.sendTabsSyncPush.mock.calls[0][0].records.find((record: any) => record.tabKey === 'local:renamed')
+    expect(closedRecord).toMatchObject({
+      deviceId: 'local-device',
+      deviceLabel: 'new-label',
+    })
     stop()
   })
 

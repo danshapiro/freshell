@@ -29,6 +29,8 @@ type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanc
 type RevisionState = Map<string, { fingerprint: string; revision: number }>
 const claimedClientInstanceIds = new Set<string>()
 const TAB_REGISTRY_CLIENT_LEASE_CHANNEL = 'freshell-tabs-registry-client-lease'
+let inMemoryClientInstanceId = ''
+let inMemorySnapshotRevision = 0
 
 function randomClientInstanceId(): string {
   return `client-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
@@ -44,12 +46,27 @@ function safeSessionStorage(): Storage | null {
 
 export function getCurrentTabRegistryClientInstanceId(): string {
   const storage = safeSessionStorage()
-  let clientInstanceId = storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY) || ''
+  let clientInstanceId = ''
+  try {
+    clientInstanceId = storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY) || ''
+  } catch {
+    clientInstanceId = inMemoryClientInstanceId
+  }
+  if (!storage) {
+    clientInstanceId = inMemoryClientInstanceId
+  }
   if (!clientInstanceId) {
     clientInstanceId = randomClientInstanceId()
-    storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
-    storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
+    inMemoryClientInstanceId = clientInstanceId
+    inMemorySnapshotRevision = 0
+    try {
+      storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
+      storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
+    } catch {
+      // Keep the per-window module fallback stable when sessionStorage is unavailable.
+    }
   }
+  inMemoryClientInstanceId = clientInstanceId
   return clientInstanceId
 }
 
@@ -58,21 +75,38 @@ function claimTabRegistryClientInstanceId(): string {
   let clientInstanceId = getCurrentTabRegistryClientInstanceId()
   if (!clientInstanceId || claimedClientInstanceIds.has(clientInstanceId)) {
     clientInstanceId = randomClientInstanceId()
-    storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
-    storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
+    inMemoryClientInstanceId = clientInstanceId
+    inMemorySnapshotRevision = 0
+    try {
+      storage?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
+      storage?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, '0')
+    } catch {
+      // Keep the per-window module fallback stable when sessionStorage is unavailable.
+    }
   }
   claimedClientInstanceIds.add(clientInstanceId)
   return clientInstanceId
 }
 
 function readSnapshotRevision(): number {
-  const raw = safeSessionStorage()?.getItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY)
+  let raw: string | null | undefined
+  try {
+    raw = safeSessionStorage()?.getItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY)
+  } catch {
+    raw = String(inMemorySnapshotRevision)
+  }
+  if (raw == null && inMemorySnapshotRevision > 0) raw = String(inMemorySnapshotRevision)
   const parsed = raw ? Number(raw) : 0
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0
 }
 
 function writeSnapshotRevision(revision: number): void {
-  safeSessionStorage()?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, String(revision))
+  inMemorySnapshotRevision = revision
+  try {
+    safeSessionStorage()?.setItem(TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY, String(revision))
+  } catch {
+    // Keep the per-window module fallback stable when sessionStorage is unavailable.
+  }
 }
 
 function paneLayoutSignature(node: PaneNode | undefined): string {
@@ -139,6 +173,8 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
     if (closedAt < closedCutoff) continue
     const recordBase: RegistryTabRecord = {
       ...closed,
+      deviceId,
+      deviceLabel,
       updatedAt: closed.updatedAt,
       closedAt,
     }
@@ -206,8 +242,13 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     const previousClientInstanceId = clientInstanceId
     claimedClientInstanceIds.delete(previousClientInstanceId)
     clientInstanceId = randomClientInstanceId()
+    inMemoryClientInstanceId = clientInstanceId
     claimedClientInstanceIds.add(clientInstanceId)
-    safeSessionStorage()?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
+    try {
+      safeSessionStorage()?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
+    } catch {
+      // Keep the per-window module fallback stable when sessionStorage is unavailable.
+    }
     snapshotRevision = 0
     writeSnapshotRevision(snapshotRevision)
     lastPushFingerprint = ''
