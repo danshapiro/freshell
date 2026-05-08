@@ -26,7 +26,7 @@ type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanc
   onReconnect?: WsClient['onReconnect']
 }
 
-type RevisionState = Map<string, { fingerprint: string; revision: number }>
+type RevisionState = Map<string, { fingerprint: string; revision: number; updatedAt: number }>
 const claimedClientInstanceIds = new Set<string>()
 const TAB_REGISTRY_CLIENT_LEASE_CHANNEL = 'freshell-tabs-registry-client-lease'
 let inMemoryClientInstanceId = ''
@@ -109,14 +109,23 @@ function writeSnapshotRevision(revision: number): void {
   }
 }
 
+function stableStringifyForFingerprint(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringifyForFingerprint(item)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entryValue]) => entryValue !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b))
+  return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${stableStringifyForFingerprint(entryValue)}`).join(',')}}`
+}
+
 function paneLayoutSignature(node: PaneNode | undefined): string {
   if (!node) return 'none'
-  if (node.type === 'leaf') return `leaf:${node.id}:${node.content.kind}`
+  if (node.type === 'leaf') return `leaf:${node.id}:${stableStringifyForFingerprint(node.content)}`
   return `split:${node.id}:${node.direction}:${paneLayoutSignature(node.children[0])}|${paneLayoutSignature(node.children[1])}`
 }
 
-function nextRevision(record: RegistryTabRecord, revisions: RevisionState): number {
-  const fingerprint = JSON.stringify({
+function recordFingerprint(record: RegistryTabRecord): string {
+  return stableStringifyForFingerprint({
     status: record.status,
     tabName: record.tabName,
     paneCount: record.paneCount,
@@ -124,17 +133,23 @@ function nextRevision(record: RegistryTabRecord, revisions: RevisionState): numb
     panes: record.panes,
     closedAt: record.closedAt,
   })
+}
+
+function nextRecordVersion(record: RegistryTabRecord, revisions: RevisionState, now: number): { revision: number; updatedAt: number } {
+  const fingerprint = recordFingerprint(record)
   const current = revisions.get(record.tabKey)
   if (!current) {
-    revisions.set(record.tabKey, { fingerprint, revision: 1 })
-    return 1
+    const updatedAt = record.updatedAt || now
+    revisions.set(record.tabKey, { fingerprint, revision: 1, updatedAt })
+    return { revision: 1, updatedAt }
   }
   if (current.fingerprint === fingerprint) {
-    return current.revision
+    return { revision: current.revision, updatedAt: current.updatedAt }
   }
   const revision = current.revision + 1
-  revisions.set(record.tabKey, { fingerprint, revision })
-  return revision
+  const updatedAt = Math.max(now, record.updatedAt || 0, current.updatedAt + 1)
+  revisions.set(record.tabKey, { fingerprint, revision, updatedAt })
+  return { revision, updatedAt }
 }
 
 function selectedClosedRetentionDays(state: RootState): number {
@@ -147,6 +162,12 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
   const records: RegistryTabRecord[] = []
   const { deviceId, deviceLabel } = state.tabRegistry
   const closedCutoff = now - selectedClosedRetentionDays(state) * 24 * 60 * 60 * 1000
+  const retainedClosedRecords = Object.values(state.tabRegistry.localClosed).filter((closed) => {
+    if (closed.serverInstanceId !== serverInstanceId) return false
+    const closedAt = closed.closedAt ?? closed.updatedAt
+    return closedAt >= closedCutoff
+  })
+  const retainedClosedTabKeys = new Set(retainedClosedRecords.map((closed) => closed.tabKey))
 
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
@@ -161,16 +182,16 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       revision: 0,
       updatedAt: tab.updatedAt || tab.lastInputAt || tab.createdAt || now,
     })
+    if (retainedClosedTabKeys.has(recordBase.tabKey)) continue
+    const version = nextRecordVersion(recordBase, revisions, now)
     records.push({
       ...recordBase,
-      revision: nextRevision(recordBase, revisions),
+      ...version,
     })
   }
 
-  for (const closed of Object.values(state.tabRegistry.localClosed)) {
-    if (closed.serverInstanceId !== serverInstanceId) continue
+  for (const closed of retainedClosedRecords) {
     const closedAt = closed.closedAt ?? closed.updatedAt
-    if (closedAt < closedCutoff) continue
     const recordBase: RegistryTabRecord = {
       ...closed,
       deviceId,
@@ -178,9 +199,10 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       updatedAt: closed.updatedAt,
       closedAt,
     }
+    const version = nextRecordVersion(recordBase, revisions, now)
     records.push({
       ...recordBase,
-      revision: nextRevision(recordBase, revisions),
+      ...version,
     })
   }
 
@@ -226,7 +248,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   let lastPushFingerprint = ''
   let lastLifecycleFingerprint = lifecycleSignature(store.getState())
   let snapshotRevision = readSnapshotRevision()
-  let lastServerInstanceId = store.getState().connection.serverInstanceId || ws.serverInstanceId
+  let lastServerInstanceId = ws.serverInstanceId || store.getState().connection.serverInstanceId
   let retired = false
   let leaseChannel: BroadcastChannel | null = null
 
@@ -261,12 +283,27 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   if (typeof BroadcastChannel !== 'undefined') {
     leaseChannel = new BroadcastChannel(TAB_REGISTRY_CLIENT_LEASE_CHANNEL)
     leaseChannel.onmessage = (event: MessageEvent) => {
-      const data = event.data as { type?: string; clientInstanceId?: string; leaseId?: string }
+      const data = event.data as { type?: string; clientInstanceId?: string; leaseId?: string; claimantLeaseId?: string }
       if (
         data?.type === 'tabs-registry-client-claim'
         && data.clientInstanceId === clientInstanceId
         && data.leaseId
         && data.leaseId !== leaseId
+      ) {
+        leaseChannel?.postMessage({
+          type: 'tabs-registry-client-active',
+          clientInstanceId,
+          leaseId,
+          claimantLeaseId: data.leaseId,
+        })
+        return
+      }
+      if (
+        data?.type === 'tabs-registry-client-active'
+        && data.clientInstanceId === clientInstanceId
+        && data.leaseId
+        && data.leaseId !== leaseId
+        && data.claimantLeaseId === leaseId
       ) {
         rotateClientInstanceIdAfterCollision()
       }
@@ -291,7 +328,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   const pushNow = (force = false) => {
     if (ws.state !== 'ready') return
     const state = store.getState()
-    const serverInstanceId = state.connection.serverInstanceId || ws.serverInstanceId
+    const serverInstanceId = ws.serverInstanceId || state.connection.serverInstanceId
     if (!serverInstanceId) return
     if (lastServerInstanceId && serverInstanceId !== lastServerInstanceId && Object.keys(state.tabRegistry.localClosed).length > 0) {
       store.dispatch(clearTabRegistryLocalClosed())

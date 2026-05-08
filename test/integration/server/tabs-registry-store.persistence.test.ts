@@ -74,6 +74,41 @@ function pushHash(input: {
   return crypto.createHash('sha256').update(stableStringify(input)).digest('hex')
 }
 
+function makeClientSnapshotObject(input: {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+  snapshotRevision: number
+  snapshotReceivedAt: number
+  records: RegistryTabRecord[]
+  lastPushRecords?: RegistryTabRecord[]
+}) {
+  const openSnapshotPayloadHash = pushHash({
+    deviceId: input.deviceId,
+    deviceLabel: input.deviceLabel,
+    clientInstanceId: input.clientInstanceId,
+    snapshotRevision: input.snapshotRevision,
+    records: input.records,
+  })
+  const lastPushPayloadHash = pushHash({
+    deviceId: input.deviceId,
+    deviceLabel: input.deviceLabel,
+    clientInstanceId: input.clientInstanceId,
+    snapshotRevision: input.snapshotRevision,
+    records: input.lastPushRecords ?? input.records,
+  })
+  return objectFor({
+    deviceId: input.deviceId,
+    deviceLabel: input.deviceLabel,
+    clientInstanceId: input.clientInstanceId,
+    snapshotRevision: input.snapshotRevision,
+    lastPushPayloadHash,
+    openSnapshotPayloadHash,
+    snapshotReceivedAt: input.snapshotReceivedAt,
+    records: input.records,
+  })
+}
+
 describe('tabs registry compact persistence', () => {
   let tempDir: string
   let now = NOW
@@ -233,6 +268,30 @@ describe('tabs registry compact persistence', () => {
     expect(await lineCount(legacyPath)).toBe(1)
   })
 
+  it('fails migration when valid retained legacy records exceed the retained-byte budget', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    await fs.mkdir(tempDir, { recursive: true })
+    const largePanePayload = 'x'.repeat(40 * 1024)
+    const lines = Array.from({ length: 4 }, (_, i) => JSON.stringify(makeRecord({
+      tabKey: `remote:large-${i}`,
+      tabId: `large-${i}`,
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      panes: [{ paneId: 'pane-1', kind: 'terminal', payload: { largePanePayload } }],
+    })))
+    await fs.writeFile(legacyPath, `${lines.join('\n')}\n`, 'utf-8')
+
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: {
+        maxLegacyLineBytes: 256 * 1024,
+        maxMigrationRetainedBytes: 100 * 1024,
+      },
+    })).rejects.toThrow(/retained-byte cap/i)
+    await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await lineCount(legacyPath)).toBe(4)
+  })
+
   it('fails legacy migration on valid records that exceed pane-count caps', async () => {
     const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
     await fs.writeFile(legacyPath, `${JSON.stringify(makeRecord({
@@ -336,13 +395,15 @@ describe('tabs registry compact persistence', () => {
       clientInstanceId: 'window-a',
       snapshotRevision: 1,
       lastPushPayloadHash: '0'.repeat(64),
+      openSnapshotPayloadHash: '0'.repeat(64),
       snapshotReceivedAt: NOW,
       records: [closedRecord],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [snapshotObject, closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -350,6 +411,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -382,7 +444,8 @@ describe('tabs registry compact persistence', () => {
       'manifest-closed': closedKeyMismatch,
     })
     const devicesObject = objectFor({})
-    for (const object of [closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -390,6 +453,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: {},
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -428,13 +492,21 @@ describe('tabs registry compact persistence', () => {
         snapshotRevision: 1,
         records: [mismatchedRecord, tooManyPanes],
       }),
+      openSnapshotPayloadHash: pushHash({
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId: 'window-a',
+        snapshotRevision: 1,
+        records: [mismatchedRecord, tooManyPanes],
+      }),
       snapshotReceivedAt: NOW,
       records: [mismatchedRecord, tooManyPanes],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [snapshotObject, closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -442,6 +514,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -455,7 +528,8 @@ describe('tabs registry compact persistence', () => {
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -463,6 +537,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: {},
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 525600, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -487,13 +562,15 @@ describe('tabs registry compact persistence', () => {
       clientInstanceId: 'window-a',
       snapshotRevision: 1,
       lastPushPayloadHash: '1'.repeat(64),
+      openSnapshotPayloadHash: '1'.repeat(64),
       snapshotReceivedAt: NOW,
       records: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [snapshotObject, closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -501,6 +578,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -531,13 +609,21 @@ describe('tabs registry compact persistence', () => {
         snapshotRevision: 1,
         records: [record],
       }),
+      openSnapshotPayloadHash: pushHash({
+        deviceId: 'local-device',
+        deviceLabel: 'local',
+        clientInstanceId: 'window-b',
+        snapshotRevision: 1,
+        records: [record],
+      }),
       snapshotReceivedAt: NOW,
       records: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [snapshotObject, closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -545,6 +631,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -559,7 +646,8 @@ describe('tabs registry compact persistence', () => {
     const oversizedSha = 'a'.repeat(64)
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
-    for (const object of [closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     await fs.writeFile(path.join(tempDir, 'v1', 'objects', `${oversizedSha}.json`), '{}', 'utf-8')
@@ -574,6 +662,7 @@ describe('tabs registry compact persistence', () => {
           bytes: 600 * 1024,
         },
       },
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -583,19 +672,116 @@ describe('tabs registry compact persistence', () => {
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/object.*512 KiB|compact state/i)
   })
 
+  it('rejects excessive compact manifest snapshot refs before reading object bodies', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    const clientRevisionsObject = objectFor({})
+    const openSnapshots: Record<string, ReturnType<typeof objectFor>['ref']> = {}
+    for (let i = 0; i < 3; i += 1) {
+      const record = makeRecord({
+        tabKey: `device-${i}:tab`,
+        tabId: `tab-${i}`,
+        deviceId: `device-${i}`,
+        deviceLabel: `Device ${i}`,
+        clientInstanceId: 'window',
+      } as Partial<RegistryTabRecord>)
+      const snapshotObject = makeClientSnapshotObject({
+        deviceId: `device-${i}`,
+        deviceLabel: `Device ${i}`,
+        clientInstanceId: 'window',
+        snapshotRevision: 1,
+        snapshotReceivedAt: NOW,
+        records: [record],
+      })
+      openSnapshots[clientSnapshotKey(`device-${i}`, 'window')] = snapshotObject.ref
+      await fs.writeFile(path.join(tempDir, 'v1', snapshotObject.ref.path), snapshotObject.raw, 'utf-8')
+    }
+    for (const object of [closedObject, devicesObject, clientRevisionsObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify({
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots,
+      clientRevisions: clientRevisionsObject.ref,
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }), 'utf-8')
+
+    const readSpy = vi.spyOn(fs, 'readFile')
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxClientSnapshotRefs: 2 },
+    })).rejects.toThrow(/client snapshots|compact state/i)
+    const objectReads = readSpy.mock.calls.filter(([file]) => String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`))
+    readSpy.mockRestore()
+    expect(objectReads).toHaveLength(0)
+  })
+
+  it('rejects excessive compact manifest aggregate bytes before reading object bodies', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const record = makeRecord({
+      tabKey: 'local:large-ref',
+      tabId: 'large-ref',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      panes: [{ paneId: 'pane-1', kind: 'terminal', payload: { text: 'x'.repeat(1024) } }],
+    } as Partial<RegistryTabRecord>)
+    const snapshotObject = makeClientSnapshotObject({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      snapshotReceivedAt: NOW,
+      records: [record],
+    })
+    const closedObject = objectFor({})
+    const devicesObject = objectFor({})
+    const clientRevisionsObject = objectFor({})
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify({
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('local-device', 'window-a')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }), 'utf-8')
+
+    const readSpy = vi.spyOn(fs, 'readFile')
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxCompactStateBytes: 200 },
+    })).rejects.toThrow(/compact state exceeds|compact state/i)
+    const objectReads = readSpy.mock.calls.filter(([file]) => String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`))
+    readSpy.mockRestore()
+    expect(objectReads).toHaveLength(0)
+  })
+
   it('rejects manifest object refs whose filename is not the content hash', async () => {
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
     const closedObject = objectFor({})
     const devicesObject = objectFor({})
+    const clientRevisionsObject = objectFor({})
     const mismatchedPath = `objects/${'1'.repeat(64)}.json`
     await fs.writeFile(path.join(tempDir, 'v1', closedObject.ref.path), closedObject.raw, 'utf-8')
     await fs.writeFile(path.join(tempDir, 'v1', mismatchedPath), closedObject.raw, 'utf-8')
     await fs.writeFile(path.join(tempDir, 'v1', devicesObject.ref.path), devicesObject.raw, 'utf-8')
+    await fs.writeFile(path.join(tempDir, 'v1', clientRevisionsObject.ref.path), clientRevisionsObject.raw, 'utf-8')
     const manifest = {
       version: 1,
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: {},
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: { ...closedObject.ref, path: mismatchedPath },
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -611,7 +797,8 @@ describe('tabs registry compact persistence', () => {
     const devicesObject = objectFor({
       'manifest-device': { deviceId: 'actual-device', deviceLabel: 'actual', lastSeenAt: NOW },
     })
-    for (const object of [closedObject, devicesObject]) {
+    const clientRevisionsObject = objectFor({})
+    for (const object of [closedObject, devicesObject, clientRevisionsObject]) {
       await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
     }
     const manifest = {
@@ -619,6 +806,7 @@ describe('tabs registry compact persistence', () => {
       manifestRevision: 1,
       committedAt: NOW,
       openSnapshots: {},
+      clientRevisions: clientRevisionsObject.ref,
       closedTombstones: closedObject.ref,
       devices: devicesObject.ref,
       settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
@@ -637,18 +825,20 @@ describe('tabs registry compact persistence', () => {
       deviceLabel: 'local',
     })
     const storedRecord = { ...record, clientInstanceId: 'window-a' }
+    const expectedSnapshotHash = crypto.createHash('sha256').update(stableStringify({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [storedRecord],
+    })).digest('hex')
     const snapshot = {
       deviceId: 'local-device',
       deviceLabel: 'local',
       clientInstanceId: 'window-a',
       snapshotRevision: 1,
-      lastPushPayloadHash: crypto.createHash('sha256').update(stableStringify({
-        deviceId: 'local-device',
-        deviceLabel: 'local',
-        clientInstanceId: 'window-a',
-        snapshotRevision: 1,
-        records: [storedRecord],
-      })).digest('hex'),
+      lastPushPayloadHash: expectedSnapshotHash,
+      openSnapshotPayloadHash: expectedSnapshotHash,
       snapshotReceivedAt: NOW,
       records: [storedRecord],
     }
@@ -709,6 +899,115 @@ describe('tabs registry compact persistence', () => {
     const objectReads = readSpy.mock.calls.filter(([file]) => String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`))
     readSpy.mockRestore()
     expect(objectReads).toHaveLength(0)
+  })
+
+  it('does not reread closed tombstone objects when a heartbeat repeats retained closed records unchanged', async () => {
+    const writer = await createTabsRegistryStore(tempDir, { now: () => now })
+    const openRecord = makeRecord({
+      tabKey: 'local:open',
+      tabId: 'open',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    })
+    const closedRecord = makeRecord({
+      tabKey: 'local:closed',
+      tabId: 'closed',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'closed',
+      updatedAt: NOW - 500,
+      closedAt: NOW - 500,
+    })
+    await writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [openRecord, closedRecord],
+    })
+
+    const readSpy = vi.spyOn(fs, 'readFile')
+    now += 1
+    await writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [openRecord, closedRecord],
+    })
+
+    const objectReads = readSpy.mock.calls.filter(([file]) => String(file).includes(`${path.sep}v1${path.sep}objects${path.sep}`))
+    readSpy.mockRestore()
+    expect(objectReads).toHaveLength(0)
+  })
+
+  it('keeps query pure while ignoring closed tombstones beyond server retention for conflict resolution', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
+    const openRecord = makeRecord({
+      tabKey: 'remote:aged-conflict',
+      tabId: 'aged-conflict',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      status: 'open',
+      revision: 1,
+      updatedAt: NOW,
+    } as Partial<RegistryTabRecord>)
+    const expiredClosedRecord = makeRecord({
+      ...openRecord,
+      status: 'closed',
+      revision: 5,
+      updatedAt: NOW + 1_000,
+      closedAt: NOW - 31 * 24 * 60 * 60 * 1000,
+      clientInstanceId: 'remote-closer',
+    } as Partial<RegistryTabRecord>)
+    const snapshotObject = makeClientSnapshotObject({
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      clientInstanceId: 'remote-window',
+      snapshotRevision: 1,
+      snapshotReceivedAt: NOW,
+      records: [openRecord],
+    })
+    const closedObject = objectFor({ [expiredClosedRecord.tabKey]: expiredClosedRecord })
+    const devicesObject = objectFor({
+      'remote-device': { deviceId: 'remote-device', deviceLabel: 'remote', lastSeenAt: NOW },
+    })
+    const clientRevisionsObject = objectFor({
+      [clientSnapshotKey('remote-device', 'remote-window')]: {
+        deviceId: 'remote-device',
+        clientInstanceId: 'remote-window',
+        snapshotRevision: 1,
+        lastSeenAt: NOW,
+      },
+    })
+    for (const object of [snapshotObject, closedObject, devicesObject, clientRevisionsObject]) {
+      await fs.writeFile(path.join(tempDir, 'v1', object.ref.path), object.raw, 'utf-8')
+    }
+    const manifest = {
+      version: 1,
+      manifestRevision: 1,
+      committedAt: NOW,
+      openSnapshots: { [clientSnapshotKey('remote-device', 'remote-window')]: snapshotObject.ref },
+      clientRevisions: clientRevisionsObject.ref,
+      closedTombstones: closedObject.ref,
+      devices: devicesObject.ref,
+      settings: { openSnapshotTtlMinutes: 30, deviceDisplayTtlDays: 7, maxClosedRetentionDays: 30 },
+    }
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
+    const beforeManifest = await fs.readFile(path.join(tempDir, 'v1', 'manifest.json'), 'utf-8')
+    const reader = await createTabsRegistryStore(tempDir, { now: () => now })
+
+    const result = await reader.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    const afterManifest = await fs.readFile(path.join(tempDir, 'v1', 'manifest.json'), 'utf-8')
+
+    expect(result.remoteOpen.map((record) => record.tabKey)).toEqual(['remote:aged-conflict'])
+    expect(result.closed).toHaveLength(0)
+    expect(afterManifest).toBe(beforeManifest)
   })
 
   it.each([

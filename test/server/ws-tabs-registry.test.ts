@@ -331,6 +331,37 @@ describe('ws tabs registry protocol', () => {
     ws.close()
   })
 
+  it('serves migrated legacy tabs once websocket startup accepts queries', async () => {
+    const legacyPath = path.join(tempDir, 'tabs-registry.jsonl')
+    await fs.writeFile(legacyPath, `${JSON.stringify(makeRecord({
+      tabKey: 'remote:legacy-open',
+      tabId: 'legacy-open',
+      serverInstanceId: 'legacy-srv',
+      deviceId: 'remote-device',
+      deviceLabel: 'remote',
+      status: 'open',
+    }))}\n`, 'utf-8')
+    const migratedStore = await createTabsRegistryStore(tempDir, { now: () => NOW })
+    await startServer({ tabsRegistryStore: migratedStore })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.query',
+      requestId: 'legacy-after-startup',
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    }))
+    const snapshot = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'tabs.sync.snapshot' && msg.requestId === 'legacy-after-startup',
+    )
+
+    expect(snapshot.data.remoteOpen.map((record: any) => record.tabKey)).toEqual(['remote:legacy-open'])
+    await expect(fs.stat(legacyPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    ws.close()
+  })
+
   it('rejects oversized regular websocket messages before normal parsing with a clear error', async () => {
     process.env.MAX_REGULAR_WS_MESSAGE_BYTES = '256'
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
@@ -349,6 +380,27 @@ describe('ws tabs registry protocol', () => {
           panes: [{ paneId: 'pane-1', kind: 'terminal', payload: { text: 'x'.repeat(512) } }],
         }),
       ],
+    }))
+
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error')
+    expect(error.message).toMatch(/message.*256 bytes/i)
+    ws.close()
+    delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
+  })
+
+  it('does not allow oversized regular websocket messages to bypass the cap with screenshot text in another field', async () => {
+    process.env.MAX_REGULAR_WS_MESSAGE_BYTES = '256'
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      junk: '"type":"ui.screenshot.result"' + 'x'.repeat(512),
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [],
     }))
 
     const error = await waitForMessage(ws, (msg) => msg.type === 'error')
