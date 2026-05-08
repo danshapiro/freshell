@@ -229,6 +229,18 @@ describe('ws tabs registry protocol', () => {
     }))
     const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.requestId === 'bad-retention')
     expect(error.message).toMatch(/closedTabRetentionDays/i)
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.query',
+      requestId: 'missing-client-instance',
+      deviceId: 'local-device',
+      closedTabRetentionDays: 30,
+    }))
+    const missingClientError = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'error' && msg.requestId === 'missing-client-instance',
+    )
+    expect(missingClientError.message).toMatch(/clientInstanceId/i)
     ws.close()
   })
 
@@ -405,6 +417,24 @@ describe('ws tabs registry protocol', () => {
 
     const error = await waitForMessage(ws, (msg) => msg.type === 'error')
     expect(error.message).toMatch(/message.*256 bytes/i)
+    ws.close()
+    delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
+  })
+
+  it('does not allow screenshot-shaped websocket envelopes to carry oversized unknown fields', async () => {
+    process.env.MAX_REGULAR_WS_MESSAGE_BYTES = '256'
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'ui.screenshot.result',
+      requestId: 'unknown-junk',
+      ok: false,
+      junk: 'x'.repeat(512),
+    }))
+
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error')
+    expect(error.message).toMatch(/message.*256 bytes|unknown.*field/i)
     ws.close()
     delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })

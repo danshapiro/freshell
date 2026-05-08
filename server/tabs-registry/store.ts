@@ -33,6 +33,7 @@ type ClientOpenSnapshot = {
   openSnapshotPayloadHash: string
   snapshotReceivedAt: number
   records: RegistryTabRecord[]
+  lastPushRecords: RegistryTabRecord[]
 }
 
 type ClientRevisionWatermark = {
@@ -110,6 +111,7 @@ type TabsRegistryCaps = {
   maxPanesPerRecord: number
   maxSerializedPushBytes: number
   maxSerializedClientSnapshotObjectBytes: number
+  maxSerializedManifestBytes: number
   maxSerializedClosedTombstoneObjectBytes: number
   maxSerializedDeviceMetadataObjectBytes: number
   maxCompactStateBytes: number
@@ -131,6 +133,7 @@ const DEFAULT_CAPS: TabsRegistryCaps = {
   maxPanesPerRecord: 20,
   maxSerializedPushBytes: 1024 * 1024,
   maxSerializedClientSnapshotObjectBytes: 512 * 1024,
+  maxSerializedManifestBytes: 256 * 1024,
   maxSerializedClosedTombstoneObjectBytes: 2 * 1024 * 1024,
   maxSerializedDeviceMetadataObjectBytes: 256 * 1024,
   maxCompactStateBytes: 5 * 1024 * 1024,
@@ -182,6 +185,7 @@ const ClientOpenSnapshotSchema: z.ZodType<ClientOpenSnapshot> = z.object({
   openSnapshotPayloadHash: z.string().regex(/^[a-f0-9]{64}$/),
   snapshotReceivedAt: z.number().int().nonnegative(),
   records: z.array(TabRegistryRecordSchema),
+  lastPushRecords: z.array(TabRegistryRecordSchema),
 }).superRefine((value, ctx) => {
   for (const [index, record] of value.records.entries()) {
     if (record.status !== 'open') {
@@ -202,6 +206,27 @@ const ClientOpenSnapshotSchema: z.ZodType<ClientOpenSnapshot> = z.object({
         path: ['records', index],
       })
     }
+  }
+  for (const [index, record] of value.lastPushRecords.entries()) {
+    if (
+      record.deviceId !== value.deviceId
+      || record.deviceLabel !== value.deviceLabel
+      || record.clientInstanceId !== value.clientInstanceId
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Client last-push record identity must match the snapshot identity',
+        path: ['lastPushRecords', index],
+      })
+    }
+  }
+  const lastPushOpenRecords = value.lastPushRecords.filter((record) => record.status === 'open')
+  if (stableStringify(lastPushOpenRecords) !== stableStringify(value.records)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Client last-push open records must match the persisted open snapshot records',
+      path: ['lastPushRecords'],
+    })
   }
 })
 
@@ -391,6 +416,7 @@ function validateStateCaps(state: CompactTabsRegistryStateV1, caps: TabsRegistry
       throw new Error(`Tabs registry client snapshot can contain at most ${caps.maxOpenRecordsPerClientSnapshot} open records`)
     }
     validateRecordCaps(snapshot.records, caps)
+    validateRecordCaps(snapshot.lastPushRecords, caps)
   }
   const closedCount = Object.keys(state.closedByTabKey).length
   if (closedCount > caps.maxClosedTombstones) {
@@ -595,6 +621,7 @@ export class TabsRegistryStore {
   private readonly caps: TabsRegistryCaps
   private failurePoint?: FailurePoint
   private beforeManifestPublishHook?: () => Promise<void>
+  private afterManifestPublishHook?: () => Promise<void>
 
   private constructor(
     private readonly rootDir: string,
@@ -651,7 +678,15 @@ export class TabsRegistryStore {
     const manifestPath = path.join(rootDir, 'v1', 'manifest.json')
     let manifest: TabsRegistryManifestV1
     try {
-      manifest = ManifestSchema.parse(JSON.parse(await fsp.readFile(manifestPath, 'utf-8')))
+      const manifestStat = await fsp.stat(manifestPath)
+      if (manifestStat.size > caps.maxSerializedManifestBytes) {
+        throw new Error(`Tabs registry compact state manifest exceeds ${formatBytes(caps.maxSerializedManifestBytes)}`)
+      }
+      const rawManifest = await fsp.readFile(manifestPath, 'utf-8')
+      if (Buffer.byteLength(rawManifest, 'utf-8') > caps.maxSerializedManifestBytes) {
+        throw new Error(`Tabs registry compact state manifest exceeds ${formatBytes(caps.maxSerializedManifestBytes)}`)
+      }
+      manifest = ManifestSchema.parse(JSON.parse(rawManifest))
     } catch (error) {
       throw new Error(`Tabs registry compact state manifest is invalid: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -708,6 +743,9 @@ export class TabsRegistryStore {
         assertClientSnapshotKeyMatchesSnapshot(key, snapshot)
         if (snapshot.openSnapshotPayloadHash !== buildSnapshotPayloadHash(snapshot)) {
           throw new Error('Tabs registry compact state client snapshot payload hash does not match snapshot content')
+        }
+        if (snapshot.lastPushPayloadHash !== buildSnapshotPayloadHash({ ...snapshot, records: snapshot.lastPushRecords })) {
+          throw new Error('Tabs registry compact state client snapshot last-push payload hash does not match snapshot content')
         }
         return [key, snapshot] as const
       }))
@@ -821,6 +859,7 @@ export class TabsRegistryStore {
         openSnapshotPayloadHash,
         snapshotReceivedAt: migrationStartedAt,
         records: snapshotRecords,
+        lastPushRecords: snapshotRecords,
       }
       state.openSnapshotsByClient[clientSnapshotKey(deviceId, 'legacy-migration')] = snapshot
       state.clientRevisionsByClient[clientSnapshotKey(deviceId, 'legacy-migration')] = buildClientRevisionWatermark(
@@ -842,6 +881,10 @@ export class TabsRegistryStore {
 
   setTestBeforeManifestPublishHook(hook: (() => Promise<void>) | undefined): void {
     this.beforeManifestPublishHook = hook
+  }
+
+  setTestAfterManifestPublishHook(hook: (() => Promise<void>) | undefined): void {
+    this.afterManifestPublishHook = hook
   }
 
   private maybeFail(point: FailurePoint): void {
@@ -932,6 +975,7 @@ export class TabsRegistryStore {
     this.maybeFail('manifest-rename')
     await fsp.rename(tmpPath, manifestPath)
     await bestEffortFsyncDir(path.dirname(manifestPath))
+    await this.afterManifestPublishHook?.()
   }
 
   private async garbageCollectObjects(manifest: TabsRegistryManifestV1): Promise<void> {
@@ -1070,6 +1114,7 @@ export class TabsRegistryStore {
         openSnapshotPayloadHash,
         snapshotReceivedAt: receiptTime,
         records: openRecords,
+        lastPushRecords: canonicalRecords,
       }
       next.clientRevisionsByClient[key] = buildClientRevisionWatermark(
         input.deviceId,
@@ -1096,7 +1141,22 @@ export class TabsRegistryStore {
       const watermark = this.state.clientRevisionsByClient[key]
       if (!current) {
         if (watermark && input.snapshotRevision <= watermark.snapshotRevision) return { accepted: false }
-        return { accepted: false }
+        let next = cloneState(this.state, receiptTime)
+        next.clientRevisionsByClient[key] = buildClientRevisionWatermark(
+          input.deviceId,
+          input.clientInstanceId,
+          input.snapshotRevision,
+          receiptTime,
+        )
+        const existingDevice = this.state.devicesById[input.deviceId]
+        next.devicesById[input.deviceId] = {
+          deviceId: input.deviceId,
+          deviceLabel: existingDevice?.deviceLabel ?? input.deviceId,
+          lastSeenAt: receiptTime,
+        }
+        next = applyQueuedMaintenance(next, receiptTime, this.caps)
+        await this.commitState(next)
+        return { accepted: true }
       }
       if (input.snapshotRevision <= current.snapshotRevision) return { accepted: false }
 

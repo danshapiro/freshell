@@ -106,6 +106,7 @@ function makeClientSnapshotObject(input: {
     openSnapshotPayloadHash,
     snapshotReceivedAt: input.snapshotReceivedAt,
     records: input.records,
+    lastPushRecords: input.lastPushRecords ?? input.records,
   })
 }
 
@@ -398,6 +399,7 @@ describe('tabs registry compact persistence', () => {
       openSnapshotPayloadHash: '0'.repeat(64),
       snapshotReceivedAt: NOW,
       records: [closedRecord],
+      lastPushRecords: [closedRecord],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -501,6 +503,7 @@ describe('tabs registry compact persistence', () => {
       }),
       snapshotReceivedAt: NOW,
       records: [mismatchedRecord, tooManyPanes],
+      lastPushRecords: [mismatchedRecord, tooManyPanes],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -556,15 +559,23 @@ describe('tabs registry compact persistence', () => {
       deviceLabel: 'local',
       clientInstanceId: 'window-a',
     } as Partial<RegistryTabRecord>)
+    const openSnapshotPayloadHash = pushHash({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [record],
+    })
     const snapshot = {
       deviceId: 'local-device',
       deviceLabel: 'local',
       clientInstanceId: 'window-a',
       snapshotRevision: 1,
       lastPushPayloadHash: '1'.repeat(64),
-      openSnapshotPayloadHash: '1'.repeat(64),
+      openSnapshotPayloadHash,
       snapshotReceivedAt: NOW,
       records: [record],
+      lastPushRecords: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -586,6 +597,20 @@ describe('tabs registry compact persistence', () => {
     await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), stableStringify(manifest), 'utf-8')
 
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/payload hash|compact state/i)
+  })
+
+  it('rejects oversized compact manifest files before reading the manifest body', async () => {
+    await fs.mkdir(path.join(tempDir, 'v1'), { recursive: true })
+    await fs.writeFile(path.join(tempDir, 'v1', 'manifest.json'), 'x'.repeat(1024), 'utf-8')
+
+    const readSpy = vi.spyOn(fs, 'readFile')
+    await expect(createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxSerializedManifestBytes: 64 } as any,
+    })).rejects.toThrow(/manifest.*64 bytes|compact state/i)
+    const manifestReads = readSpy.mock.calls.filter(([file]) => String(file).endsWith(`${path.sep}v1${path.sep}manifest.json`))
+    readSpy.mockRestore()
+    expect(manifestReads).toHaveLength(0)
   })
 
   it('rejects compact state when manifest key does not match snapshot identity', async () => {
@@ -618,6 +643,7 @@ describe('tabs registry compact persistence', () => {
       }),
       snapshotReceivedAt: NOW,
       records: [record],
+      lastPushRecords: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -841,6 +867,7 @@ describe('tabs registry compact persistence', () => {
       openSnapshotPayloadHash: expectedSnapshotHash,
       snapshotReceivedAt: NOW,
       records: [storedRecord],
+      lastPushRecords: [storedRecord],
     }
     const expectedObject = objectFor(snapshot)
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
@@ -1097,5 +1124,65 @@ describe('tabs registry compact persistence', () => {
       closedTabRetentionDays: 30,
     })
     expect(after.localOpen.map((record) => record.tabKey)).toEqual(['local:after'])
+  })
+
+  it('loads committed state and accepts same-revision retry after manifest publish succeeds before ack', async () => {
+    const writer = await createTabsRegistryStore(tempDir, { now: () => now })
+    const beforeRecord = makeRecord({
+      tabKey: 'local:before',
+      tabId: 'before',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    })
+    const afterRecord = makeRecord({
+      tabKey: 'local:after',
+      tabId: 'after',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+    })
+    const afterClosedRecord = makeRecord({
+      tabKey: 'local:closed-after',
+      tabId: 'closed-after',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'closed',
+      updatedAt: NOW,
+      closedAt: NOW,
+    })
+    await writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [beforeRecord],
+    })
+    ;(writer as any).setTestAfterManifestPublishHook(async () => {
+      throw new Error('Injected tabs registry after manifest publish failure')
+    })
+
+    await expect(writer.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [afterRecord, afterClosedRecord],
+    })).rejects.toThrow(/after manifest publish/i)
+
+    const restarted = await createTabsRegistryStore(tempDir, { now: () => now })
+    const rehydrated = await restarted.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(rehydrated.localOpen.map((record) => record.tabKey)).toEqual(['local:after'])
+    expect(rehydrated.closed.map((record) => record.tabKey)).toEqual(['local:closed-after'])
+
+    await expect(restarted.replaceClientSnapshot({
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [afterRecord, afterClosedRecord],
+    })).resolves.toMatchObject({ accepted: true, openRecords: 1, closedRecords: 1 })
   })
 })

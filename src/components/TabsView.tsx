@@ -1,4 +1,4 @@
-import { createElement, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { createElement, memo, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -15,12 +15,10 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
-import { setTabRegistryClosedTabRetentionDays, setTabRegistryLoading } from '@/store/tabRegistrySlice'
-import { getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
+import { setTabRegistryClosedTabRetentionDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { copyText } from '@/lib/clipboard'
@@ -489,7 +487,6 @@ function DeviceSection({
 function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const store = useAppStore()
-  const ws = useMemo(() => getWsClient(), [])
   const groups = useAppSelector(selectTabsRegistryGroups)
   const { deviceId, deviceLabel, deviceAliases, closedTabRetentionDays, searchRangeDays, syncError } = useAppSelector(
     (state) => state.tabRegistry,
@@ -502,7 +499,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const [query, setQuery] = useState('')
   const [filterMode, setFilterMode] = useState<FilterMode>('all')
   const [scopeMode, setScopeMode] = useState<ScopeMode>('all')
-  const didMountRetentionQuery = useRef(false)
   const [contextMenuState, setContextMenuState] = useState<{
     position: { x: number; y: number }
     items: MenuItem[]
@@ -522,23 +518,6 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
       }),
     [deviceAliases, deviceId, deviceLabel],
   )
-
-  /* -- search range sync -------------------------------------------- */
-
-  useEffect(() => {
-    if (!didMountRetentionQuery.current) {
-      didMountRetentionQuery.current = true
-      return
-    }
-    if (ws.state !== 'ready') return
-    dispatch(setTabRegistryLoading(true))
-    ws.sendTabsSyncQuery({
-      requestId: `tabs-range-${Date.now()}`,
-      deviceId,
-      clientInstanceId: getCurrentTabRegistryClientInstanceId(),
-      closedTabRetentionDays: effectiveClosedRetentionDays,
-    })
-  }, [dispatch, ws, deviceId, effectiveClosedRetentionDays])
 
   /* -- filtering ---------------------------------------------------- */
 

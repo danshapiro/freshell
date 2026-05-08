@@ -17,6 +17,7 @@ import {
 
 export const SYNC_INTERVAL_MS = 5000
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
+export const CLIENT_LEASE_GRACE_MS = 50
 
 type AppStore = Store<RootState>
 type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanceId'> & {
@@ -144,6 +145,12 @@ function nextRecordVersion(record: RegistryTabRecord, revisions: RevisionState, 
     return { revision: 1, updatedAt }
   }
   if (current.fingerprint === fingerprint) {
+    const incomingUpdatedAt = record.updatedAt || 0
+    if (incomingUpdatedAt > current.updatedAt) {
+      const revision = current.revision + 1
+      revisions.set(record.tabKey, { fingerprint, revision, updatedAt: incomingUpdatedAt })
+      return { revision, updatedAt: incomingUpdatedAt }
+    }
     return { revision: current.revision, updatedAt: current.updatedAt }
   }
   const revision = current.revision + 1
@@ -232,6 +239,13 @@ function lifecycleSignature(state: RootState): string {
 }
 
 export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): () => void {
+  const storage = safeSessionStorage()
+  let hadStoredClientInstanceId = false
+  try {
+    hadStoredClientInstanceId = !!storage?.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY)
+  } catch {
+    hadStoredClientInstanceId = !!inMemoryClientInstanceId
+  }
   let clientInstanceId = claimTabRegistryClientInstanceId()
   const leaseId = randomClientInstanceId()
   const sendTabsSyncPush = ws.sendTabsSyncPush?.bind(ws)
@@ -247,10 +261,69 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   const pendingRequests = new Set<string>()
   let lastPushFingerprint = ''
   let lastLifecycleFingerprint = lifecycleSignature(store.getState())
+  let lastClosedRetentionDays = selectedClosedRetentionDays(store.getState())
   let snapshotRevision = readSnapshotRevision()
   let lastServerInstanceId = ws.serverInstanceId || store.getState().connection.serverInstanceId
   let retired = false
   let leaseChannel: BroadcastChannel | null = null
+  const shouldVerifyClientLease = hadStoredClientInstanceId && typeof BroadcastChannel !== 'undefined'
+  let leaseSettled = !shouldVerifyClientLease
+  let leaseSettleTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+  let queuedQuery = false
+  let queuedPush = false
+  let queuedForcedPush = false
+  let latestQueryRequestId = ''
+
+  const querySnapshot = (closedTabRetentionDays?: number) => {
+    if (!leaseSettled) {
+      queuedQuery = true
+      return
+    }
+    if (ws.state !== 'ready') return
+    const state = store.getState()
+    const retentionDays = Math.min(30, Math.max(1, closedTabRetentionDays ?? selectedClosedRetentionDays(state)))
+    const requestId = `tabs-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    pendingRequests.add(requestId)
+    latestQueryRequestId = requestId
+    store.dispatch(setTabRegistryLoading(true))
+    sendTabsSyncQuery({
+      requestId,
+      deviceId: state.tabRegistry.deviceId,
+      clientInstanceId,
+      closedTabRetentionDays: retentionDays,
+    })
+  }
+
+  const pushNow = (force = false) => {
+    if (!leaseSettled) {
+      queuedPush = true
+      queuedForcedPush ||= force
+      return
+    }
+    if (ws.state !== 'ready') return
+    const state = store.getState()
+    const serverInstanceId = ws.serverInstanceId || state.connection.serverInstanceId
+    if (!serverInstanceId) return
+    if (lastServerInstanceId && serverInstanceId !== lastServerInstanceId && Object.keys(state.tabRegistry.localClosed).length > 0) {
+      store.dispatch(clearTabRegistryLocalClosed())
+    }
+    lastServerInstanceId = serverInstanceId
+    const records = buildRecords(store.getState(), Date.now(), revisions, serverInstanceId)
+    const fingerprint = JSON.stringify(records)
+    if (!force && fingerprint === lastPushFingerprint) return
+    lastPushFingerprint = fingerprint
+    snapshotRevision += 1
+    writeSnapshotRevision(snapshotRevision)
+    const nextState = store.getState()
+    sendTabsSyncPush({
+      deviceId: nextState.tabRegistry.deviceId,
+      deviceLabel: nextState.tabRegistry.deviceLabel,
+      clientInstanceId,
+      snapshotRevision,
+      records,
+    })
+    store.dispatch(setTabRegistrySyncError(undefined))
+  }
 
   const announceLease = () => {
     leaseChannel?.postMessage({
@@ -258,6 +331,29 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
       clientInstanceId,
       leaseId,
     })
+  }
+
+  const settleClientLease = () => {
+    leaseSettled = true
+    if (leaseSettleTimer) {
+      globalThis.clearTimeout(leaseSettleTimer)
+      leaseSettleTimer = undefined
+    }
+    const shouldQuery = queuedQuery
+    const shouldPush = queuedPush
+    const shouldForcePush = queuedForcedPush
+    queuedQuery = false
+    queuedPush = false
+    queuedForcedPush = false
+    if (shouldQuery) querySnapshot()
+    if (shouldPush) pushNow(shouldForcePush)
+  }
+
+  const beginClientLeaseCheck = () => {
+    leaseSettled = false
+    if (leaseSettleTimer) globalThis.clearTimeout(leaseSettleTimer)
+    announceLease()
+    leaseSettleTimer = globalThis.setTimeout(settleClientLease, CLIENT_LEASE_GRACE_MS)
   }
 
   const rotateClientInstanceIdAfterCollision = () => {
@@ -274,8 +370,10 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     snapshotRevision = 0
     writeSnapshotRevision(snapshotRevision)
     lastPushFingerprint = ''
+    pendingRequests.clear()
+    latestQueryRequestId = ''
     retired = false
-    announceLease()
+    beginClientLeaseCheck()
     querySnapshot()
     pushNow(true)
   }
@@ -308,47 +406,11 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
         rotateClientInstanceIdAfterCollision()
       }
     }
-    announceLease()
-  }
-
-  const querySnapshot = (closedTabRetentionDays?: number) => {
-    if (ws.state !== 'ready') return
-    const state = store.getState()
-    const requestId = `tabs-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    pendingRequests.add(requestId)
-    store.dispatch(setTabRegistryLoading(true))
-    sendTabsSyncQuery({
-      requestId,
-      deviceId: state.tabRegistry.deviceId,
-      clientInstanceId,
-      closedTabRetentionDays: Math.min(30, Math.max(1, closedTabRetentionDays ?? selectedClosedRetentionDays(state))),
-    })
-  }
-
-  const pushNow = (force = false) => {
-    if (ws.state !== 'ready') return
-    const state = store.getState()
-    const serverInstanceId = ws.serverInstanceId || state.connection.serverInstanceId
-    if (!serverInstanceId) return
-    if (lastServerInstanceId && serverInstanceId !== lastServerInstanceId && Object.keys(state.tabRegistry.localClosed).length > 0) {
-      store.dispatch(clearTabRegistryLocalClosed())
+    if (shouldVerifyClientLease) {
+      beginClientLeaseCheck()
+    } else {
+      announceLease()
     }
-    lastServerInstanceId = serverInstanceId
-    const records = buildRecords(store.getState(), Date.now(), revisions, serverInstanceId)
-    const fingerprint = JSON.stringify(records)
-    if (!force && fingerprint === lastPushFingerprint) return
-    lastPushFingerprint = fingerprint
-    snapshotRevision += 1
-    writeSnapshotRevision(snapshotRevision)
-    const nextState = store.getState()
-    sendTabsSyncPush({
-      deviceId: nextState.tabRegistry.deviceId,
-      deviceLabel: nextState.tabRegistry.deviceLabel,
-      clientInstanceId,
-      snapshotRevision,
-      records,
-    })
-    store.dispatch(setTabRegistrySyncError(undefined))
   }
 
   const unsubscribeMessage = ws.onMessage((msg) => {
@@ -360,9 +422,9 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
 
     if (msg?.type === 'tabs.sync.snapshot') {
       const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
-      if (requestId && pendingRequests.has(requestId)) {
-        pendingRequests.delete(requestId)
-      }
+      if (!requestId || !pendingRequests.has(requestId) || requestId !== latestQueryRequestId) return
+      pendingRequests.delete(requestId)
+      pendingRequests.clear()
       const data = (msg.data || {}) as {
         localOpen?: RegistryTabRecord[]
         sameDeviceOpen?: RegistryTabRecord[]
@@ -402,6 +464,11 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     const nextFingerprint = lifecycleSignature(state)
     if (nextFingerprint === lastLifecycleFingerprint) return
     lastLifecycleFingerprint = nextFingerprint
+    const nextRetentionDays = selectedClosedRetentionDays(state)
+    if (nextRetentionDays !== lastClosedRetentionDays) {
+      lastClosedRetentionDays = nextRetentionDays
+      querySnapshot(nextRetentionDays)
+    }
     pushNow()
   })
 
@@ -444,6 +511,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     unsubscribeStore()
     globalThis.clearInterval(interval)
     globalThis.clearInterval(heartbeatInterval)
+    if (leaseSettleTimer) globalThis.clearTimeout(leaseSettleTimer)
     globalThis.removeEventListener?.('pagehide', retire)
     globalThis.removeEventListener?.('beforeunload', retire)
     leaseChannel?.close()
