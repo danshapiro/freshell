@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { RootState } from '../../../../src/store/store'
 import {
+  CLIENT_LEASE_GRACE_MS,
   getCurrentTabRegistryClientInstanceId,
   HEARTBEAT_INTERVAL_MS,
   startTabRegistrySync,
@@ -315,6 +316,60 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('ignores stale tabs.sync.snapshot responses for older retention queries', () => {
+    const mutatingDispatch = vi.fn((action: any) => {
+      dispatch(action)
+      if (action?.type === 'tabRegistry/setTabRegistrySnapshot') {
+        state = {
+          ...state,
+          tabRegistry: {
+            ...state.tabRegistry,
+            ...action.payload,
+            loading: false,
+          },
+        }
+      }
+    })
+    const stop = startTabRegistrySync(createStore(mutatingDispatch) as any, ws)
+    const firstRequestId = ws.sendTabsSyncQuery.mock.calls[0][0].requestId
+    state = {
+      ...state,
+      tabRegistry: {
+        ...state.tabRegistry,
+        closedTabRetentionDays: 7,
+        searchRangeDays: 7,
+      },
+    }
+    listeners.forEach((listener) => listener())
+    const secondRequestId = ws.sendTabsSyncQuery.mock.calls[1][0].requestId
+
+    wsMessageHandlers.forEach((handler) => handler({
+      type: 'tabs.sync.snapshot',
+      requestId: secondRequestId,
+      data: {
+        localOpen: [],
+        sameDeviceOpen: [],
+        remoteOpen: [],
+        closed: [],
+        devices: [],
+      },
+    }))
+    wsMessageHandlers.forEach((handler) => handler({
+      type: 'tabs.sync.snapshot',
+      requestId: firstRequestId,
+      data: {
+        localOpen: [],
+        sameDeviceOpen: [],
+        remoteOpen: [],
+        closed: [{ tabKey: 'closed-10-days' }],
+        devices: [],
+      },
+    }))
+
+    expect(state.tabRegistry.closed.map((record: any) => record.tabKey)).toEqual([])
+    stop()
+  })
+
   it('keeps the original lease stable and rotates only the duplicated sessionStorage client id', () => {
     const store = createStore()
 
@@ -346,9 +401,36 @@ describe('tabRegistrySync', () => {
         claimantLeaseId: initialClaim.leaseId,
       },
     })
+    vi.advanceTimersByTime(CLIENT_LEASE_GRACE_MS)
 
     expect(ws.sendTabsSyncPush.mock.calls.at(-1)?.[0].clientInstanceId).not.toBe(firstClientId)
     expect(sessionStorage.getItem('freshell.tabs.client-instance-id.v1')).not.toBe(firstClientId)
+    stop()
+  })
+
+  it('does not publish under a copied sessionStorage client id before lease collision resolution', () => {
+    const copiedClientId = 'client-copied-window'
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', copiedClientId)
+    sessionStorage.setItem('freshell.tabs.snapshot-revision.v1', '11')
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+    expect(ws.sendTabsSyncPush).not.toHaveBeenCalled()
+    const initialClaim = broadcastChannels[0].postMessage.mock.calls[0][0]
+
+    broadcastChannels[0].onmessage?.({
+      data: {
+        type: 'tabs-registry-client-active',
+        clientInstanceId: copiedClientId,
+        leaseId: 'original-window',
+        claimantLeaseId: initialClaim.leaseId,
+      },
+    })
+    vi.advanceTimersByTime(CLIENT_LEASE_GRACE_MS)
+
+    expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0].clientInstanceId).not.toBe(copiedClientId)
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId).not.toBe(copiedClientId)
     stop()
   })
 
@@ -359,6 +441,7 @@ describe('tabRegistrySync', () => {
 
     ws.sendTabsSyncPush.mockClear()
     const secondStop = startTabRegistrySync(createStore() as any, ws)
+    vi.advanceTimersByTime(CLIENT_LEASE_GRACE_MS)
     const secondPush = ws.sendTabsSyncPush.mock.calls[0][0]
 
     expect(secondPush.clientInstanceId).toBe(firstPush.clientInstanceId)
@@ -591,6 +674,32 @@ describe('tabRegistrySync', () => {
     expect(changedRecord.updatedAt).toBeGreaterThan(initialRecord.updatedAt)
     expect(changedRecord.revision).toBeGreaterThan(initialRecord.revision)
     expect(changedRecord.panes[0].payload.url).toBe('https://example.test/changed')
+    stop()
+  })
+
+  it('advances record updatedAt for timestamp-only tab activity changes', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const initialRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    ws.sendTabsSyncPush.mockClear()
+    vi.setSystemTime(new Date(1_740_000_010_000))
+    state = {
+      ...state,
+      tabs: {
+        ...state.tabs,
+        tabs: state.tabs.tabs.map((tab) => ({
+          ...tab,
+          lastInputAt: 1_740_000_010_000,
+        })),
+      },
+    }
+
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const changedRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    expect(changedRecord.updatedAt).toBeGreaterThan(initialRecord.updatedAt)
+    expect(changedRecord.revision).toBeGreaterThan(initialRecord.revision)
+    expect(changedRecord.panes).toEqual(initialRecord.panes)
     stop()
   })
 

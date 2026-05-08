@@ -290,6 +290,23 @@ describe('TabsRegistryStore compact state', () => {
     expect(result.localOpen).toHaveLength(0)
   })
 
+  it('does not let a no-current retire lose its revision watermark before delayed stale pushes', async () => {
+    const record = makeRecord({ tabKey: 'local:rev2', tabId: 'rev2', deviceId: 'local-device', deviceLabel: 'local' })
+    await expect(store.retireClientSnapshot({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 3,
+    })).resolves.toEqual({ accepted: true })
+
+    await expect(replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 2,
+      records: [record],
+    })).rejects.toThrow(/stale snapshot revision/i)
+  })
+
   it('keeps retired revision watermarks past the open snapshot TTL so stale pushes stay rejected', async () => {
     const record = makeRecord({ tabKey: 'local:rev2', tabId: 'rev2', deviceId: 'local-device', deviceLabel: 'local' })
     await replace(store, {
@@ -524,6 +541,48 @@ describe('TabsRegistryStore compact state', () => {
     })
     expect(result.localOpen).toHaveLength(0)
     expect(result.closed.map((record) => record.tabKey)).toEqual(['local:a'])
+  })
+
+  it('chooses closed over open when open and closed records tie on updatedAt and revision', async () => {
+    const open = makeRecord({
+      tabKey: 'local:exact-tie',
+      tabId: 'open-tie',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      status: 'open',
+      revision: 4,
+      updatedAt: NOW,
+    })
+    const closed = makeRecord({
+      ...open,
+      tabId: 'closed-tie',
+      status: 'closed',
+      closedAt: NOW,
+    })
+
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-open',
+      snapshotRevision: 1,
+      records: [open],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-closed',
+      snapshotRevision: 1,
+      records: [closed],
+    })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-open',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen).toHaveLength(0)
+    expect(result.sameDeviceOpen).toHaveLength(0)
+    expect(result.closed.map((record) => record.tabKey)).toEqual(['local:exact-tie'])
   })
 
   it('lets a newer open delete an older closed tombstone so it cannot return after TTL or restart', async () => {

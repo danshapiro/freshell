@@ -300,7 +300,7 @@ export const UiScreenshotResultSchema = z.object({
   changedFocus: z.boolean().optional(),
   restoredFocus: z.boolean().optional(),
   error: z.string().optional(),
-})
+}).strict()
 
 // Coding CLI session schemas
 export const CodingCliCreateSchema = z.object({

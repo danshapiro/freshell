@@ -159,9 +159,45 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
-function isScreenshotResultEnvelopePreview(data: WebSocket.RawData): boolean {
-  const preview = previewRawData(data, 512)
-  return /^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(preview)
+const UI_SCREENSHOT_RESULT_KEYS = new Set([
+  'type',
+  'requestId',
+  'ok',
+  'mimeType',
+  'imageBase64',
+  'width',
+  'height',
+  'changedFocus',
+  'restoredFocus',
+  'error',
+])
+const MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES = 4096
+
+function isBoundedScreenshotResultEnvelopePreview(data: WebSocket.RawData, config: WsHandlerConfig): boolean {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return false
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch) return false
+  if (Buffer.byteLength(raw, 'utf-8') > config.maxRegularWsMessageBytes + config.maxScreenshotBase64Bytes + MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES) {
+    return false
+  }
+  if (imageMatch[1].length > config.maxScreenshotBase64Bytes) return false
+  const keyPattern = /"((?:\\.|[^"\\])*)"\s*:/g
+  let match: RegExpExecArray | null
+  while ((match = keyPattern.exec(raw)) !== null) {
+    const key = match[1].replace(/\\"/g, '"')
+    if (!UI_SCREENSHOT_RESULT_KEYS.has(key)) return false
+  }
+  return true
+}
+
+function oversizedScreenshotResultRequestId(data: WebSocket.RawData, config: WsHandlerConfig): string | undefined {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return undefined
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch || imageMatch[1].length <= config.maxScreenshotBase64Bytes) return undefined
+  const requestIdMatch = /"requestId"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  return requestIdMatch?.[1]
 }
 
 function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
@@ -352,6 +388,13 @@ function previewRawData(data: WebSocket.RawData, maxBytes: number): string {
   if (Array.isArray(data)) return Buffer.concat(data).subarray(0, maxBytes).toString('utf-8')
   if (data instanceof ArrayBuffer) return Buffer.from(data).subarray(0, maxBytes).toString('utf-8')
   return String(data).slice(0, maxBytes)
+}
+
+function rawDataToString(data: WebSocket.RawData): string {
+  if (Buffer.isBuffer(data)) return data.toString('utf-8')
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf-8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf-8')
+  return String(data)
 }
 
 type HandshakeSnapshot = {
@@ -1683,7 +1726,17 @@ export class WsHandler {
 
     try {
       if (rawBytes > this.config.maxRegularWsMessageBytes) {
-        if (!isScreenshotResultEnvelopePreview(data)) {
+        if (!isBoundedScreenshotResultEnvelopePreview(data, this.config)) {
+          const oversizedScreenshotRequestId = oversizedScreenshotResultRequestId(data, this.config)
+          if (oversizedScreenshotRequestId) {
+            const pending = this.screenshotRequests.get(oversizedScreenshotRequestId)
+            if (pending && (!pending.connectionId || pending.connectionId === ws.connectionId)) {
+              clearTimeout(pending.timeout)
+              this.screenshotRequests.delete(oversizedScreenshotRequestId)
+              pending.reject(new Error('Screenshot payload too large'))
+              return
+            }
+          }
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
             message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
@@ -1694,7 +1747,7 @@ export class WsHandler {
 
       let msg: any
       try {
-        msg = JSON.parse(data.toString())
+        msg = JSON.parse(rawDataToString(data))
       } catch {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
         return
