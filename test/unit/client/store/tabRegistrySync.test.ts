@@ -83,6 +83,7 @@ describe('tabRegistrySync', () => {
 
   beforeEach(() => {
     vi.useFakeTimers()
+    vi.setSystemTime(new Date(1_740_000_000_000))
     listeners = []
     wsMessageHandlers = []
     wsReconnectHandlers = []
@@ -125,6 +126,19 @@ describe('tabRegistrySync', () => {
       sendBeacon: vi.fn(() => true),
     })
   })
+
+  function createStore(customDispatch = dispatch) {
+    return {
+      getState: () => state,
+      dispatch: customDispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+  }
 
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -301,21 +315,13 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
-  it('rotates a duplicated sessionStorage client id when a local lease collision is announced', () => {
-    const store = {
-      getState: () => state,
-      dispatch,
-      subscribe: (listener: Listener) => {
-        listeners.push(listener)
-        return () => {
-          listeners = listeners.filter((item) => item !== listener)
-        }
-      },
-    }
+  it('keeps the original lease stable and rotates only the duplicated sessionStorage client id', () => {
+    const store = createStore()
 
     const stop = startTabRegistrySync(store as any, ws)
     const firstClientId = ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId
     expect(broadcastChannels).toHaveLength(1)
+    const initialClaim = broadcastChannels[0].postMessage.mock.calls[0][0]
 
     broadcastChannels[0].onmessage?.({
       data: {
@@ -325,9 +331,53 @@ describe('tabRegistrySync', () => {
       },
     })
 
+    expect(ws.sendTabsSyncPush.mock.calls.at(-1)?.[0].clientInstanceId).toBe(firstClientId)
+    expect(broadcastChannels[0].postMessage.mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'tabs-registry-client-active',
+      clientInstanceId: firstClientId,
+      claimantLeaseId: 'other-window',
+    })
+
+    broadcastChannels[0].onmessage?.({
+      data: {
+        type: 'tabs-registry-client-active',
+        clientInstanceId: firstClientId,
+        leaseId: 'other-window',
+        claimantLeaseId: initialClaim.leaseId,
+      },
+    })
+
     expect(ws.sendTabsSyncPush.mock.calls.at(-1)?.[0].clientInstanceId).not.toBe(firstClientId)
     expect(sessionStorage.getItem('freshell.tabs.client-instance-id.v1')).not.toBe(firstClientId)
     stop()
+  })
+
+  it('preserves the sessionStorage client id and advances revision across reloads', () => {
+    const firstStop = startTabRegistrySync(createStore() as any, ws)
+    const firstPush = ws.sendTabsSyncPush.mock.calls[0][0]
+    firstStop()
+
+    ws.sendTabsSyncPush.mockClear()
+    const secondStop = startTabRegistrySync(createStore() as any, ws)
+    const secondPush = ws.sendTabsSyncPush.mock.calls[0][0]
+
+    expect(secondPush.clientInstanceId).toBe(firstPush.clientInstanceId)
+    expect(secondPush.snapshotRevision).toBeGreaterThan(firstPush.snapshotRevision)
+    secondStop()
+  })
+
+  it('assigns a distinct client id to another active window without shared sessionStorage', () => {
+    const firstStop = startTabRegistrySync(createStore() as any, ws)
+    const firstClientId = ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId
+
+    sessionStorage.clear()
+    ws.sendTabsSyncPush.mockClear()
+    const secondStop = startTabRegistrySync(createStore() as any, ws)
+    const secondClientId = ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId
+
+    expect(secondClientId).not.toBe(firstClientId)
+    secondStop()
+    firstStop()
   })
 
   it('does not send stale localClosed records from a previous server instance', () => {
@@ -373,6 +423,174 @@ describe('tabRegistrySync', () => {
     const stop = startTabRegistrySync(store as any, ws)
     const records = ws.sendTabsSyncPush.mock.calls[0][0].records
     expect(records.some((record: any) => record.tabKey === 'local:stale')).toBe(false)
+    stop()
+  })
+
+  it('clears stale localClosed records using the fresh websocket server id during reconnect', () => {
+    ws.serverInstanceId = 'srv-old'
+    state = {
+      ...state,
+      connection: {
+        ...state.connection,
+        serverInstanceId: 'srv-old',
+      },
+      tabRegistry: {
+        ...state.tabRegistry,
+        localClosed: {
+          stale: {
+            tabKey: 'local:stale',
+            tabId: 'stale',
+            serverInstanceId: 'srv-old',
+            deviceId: 'local-device',
+            deviceLabel: 'local-label',
+            tabName: 'stale',
+            status: 'closed',
+            revision: 1,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            closedAt: Date.now(),
+            paneCount: 0,
+            titleSetByUser: false,
+            panes: [],
+          },
+        },
+      },
+    }
+    const mutatingDispatch = vi.fn((action: any) => {
+      dispatch(action)
+      if (action?.type === 'tabRegistry/clearTabRegistryLocalClosed') {
+        state = {
+          ...state,
+          tabRegistry: {
+            ...state.tabRegistry,
+            localClosed: {},
+          },
+        }
+      }
+    })
+    const stop = startTabRegistrySync(createStore(mutatingDispatch) as any, ws)
+
+    ws.serverInstanceId = 'srv-new'
+    ws.sendTabsSyncPush.mockClear()
+    wsReconnectHandlers.forEach((handler) => handler())
+
+    expect(mutatingDispatch.mock.calls.some((call) => call[0]?.type === 'tabRegistry/clearTabRegistryLocalClosed')).toBe(true)
+    const records = ws.sendTabsSyncPush.mock.calls[0][0].records
+    expect(records.some((record: any) => record.tabKey === 'local:stale')).toBe(false)
+    expect(records.every((record: any) => record.serverInstanceId === 'srv-new')).toBe(true)
+    stop()
+  })
+
+  it('forces heartbeat pushes without changing record updatedAt when the fingerprint is unchanged', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const initialRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    ws.sendTabsSyncPush.mockClear()
+
+    vi.advanceTimersByTime(HEARTBEAT_INTERVAL_MS)
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const heartbeatRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    expect(heartbeatRecord.updatedAt).toBe(initialRecord.updatedAt)
+    expect(heartbeatRecord.revision).toBe(initialRecord.revision)
+    stop()
+  })
+
+  it('does not send local closed records older than the selected retention window', () => {
+    state = {
+      ...state,
+      tabRegistry: {
+        ...state.tabRegistry,
+        localClosed: {
+          old: {
+            tabKey: 'local:old',
+            tabId: 'old',
+            serverInstanceId: 'srv-test',
+            deviceId: 'local-device',
+            deviceLabel: 'local-label',
+            tabName: 'old',
+            status: 'closed',
+            revision: 1,
+            createdAt: Date.now() - 31 * 24 * 60 * 60 * 1000,
+            updatedAt: Date.now() - 31 * 24 * 60 * 60 * 1000,
+            closedAt: Date.now() - 31 * 24 * 60 * 60 * 1000,
+            paneCount: 0,
+            titleSetByUser: false,
+            panes: [],
+          },
+        },
+      },
+    }
+
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const records = ws.sendTabsSyncPush.mock.calls[0][0].records
+    expect(records.some((record: any) => record.tabKey === 'local:old')).toBe(false)
+    stop()
+  })
+
+  it('sends the closed record rather than duplicate open and closed tab keys during close transitions', () => {
+    state = {
+      ...state,
+      tabRegistry: {
+        ...state.tabRegistry,
+        localClosed: {
+          closing: {
+            tabKey: 'local-device:tab-1',
+            tabId: 'tab-1',
+            serverInstanceId: 'srv-test',
+            deviceId: 'local-device',
+            deviceLabel: 'local-label',
+            tabName: 'freshell',
+            status: 'closed',
+            revision: 1,
+            createdAt: Date.now() - 1_000,
+            updatedAt: Date.now(),
+            closedAt: Date.now(),
+            paneCount: 1,
+            titleSetByUser: false,
+            panes: [],
+          },
+        },
+      },
+    }
+
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const matching = ws.sendTabsSyncPush.mock.calls[0][0].records.filter((record: any) => record.tabKey === 'local-device:tab-1')
+    expect(matching).toHaveLength(1)
+    expect(matching[0].status).toBe('closed')
+    stop()
+  })
+
+  it('advances record updatedAt when pane snapshot content changes', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const initialRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    ws.sendTabsSyncPush.mockClear()
+    vi.setSystemTime(new Date(1_740_000_010_000))
+    state = {
+      ...state,
+      panes: {
+        ...state.panes,
+        layouts: {
+          ...state.panes.layouts,
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'browser',
+              url: 'https://example.test/changed',
+              devToolsOpen: false,
+            },
+          },
+        },
+      },
+    } as RootState
+
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    const changedRecord = ws.sendTabsSyncPush.mock.calls[0][0].records[0]
+    expect(changedRecord.updatedAt).toBeGreaterThan(initialRecord.updatedAt)
+    expect(changedRecord.revision).toBeGreaterThan(initialRecord.revision)
+    expect(changedRecord.panes[0].payload.url).toBe('https://example.test/changed')
     stop()
   })
 

@@ -165,6 +165,11 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
+function isScreenshotResultEnvelopePreview(data: WebSocket.RawData): boolean {
+  const preview = previewRawData(data, 512)
+  return /^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(preview)
+}
+
 function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false
   for (const value of a) {
@@ -1745,8 +1750,7 @@ export class WsHandler {
 
     try {
       if (rawBytes > this.config.maxRegularWsMessageBytes) {
-        const preview = previewRawData(data, 512)
-        if (!preview.includes('"type":"ui.screenshot.result"') && !preview.includes('"type": "ui.screenshot.result"')) {
+        if (!isScreenshotResultEnvelopePreview(data)) {
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',
             message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
@@ -1760,6 +1764,13 @@ export class WsHandler {
         msg = JSON.parse(data.toString())
       } catch {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
+        return
+      }
+      if (rawBytes > this.config.maxRegularWsMessageBytes && msg?.type !== 'ui.screenshot.result') {
+        this.sendError(ws, {
+          code: 'INVALID_MESSAGE',
+          message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
+        })
         return
       }
       const rawSessionRef = (
