@@ -11,11 +11,17 @@ describe('fresh-agent-ws', () => {
       },
     })
 
-    registerFreshAgentCreate(store.dispatch, 'req-1', { resumeSessionId: 'thread-1' })
+    registerFreshAgentCreate(store.dispatch, 'req-1', {
+      resumeSessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.created',
       requestId: 'req-1',
       sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
     })
 
     expect(handled).toBe(true)
@@ -58,6 +64,8 @@ describe('fresh-agent-ws', () => {
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
       sessionId: 'claude-thread-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       event: {
         type: 'sdk.session.snapshot',
         sessionId: 'claude-thread-1',
@@ -71,6 +79,8 @@ describe('fresh-agent-ws', () => {
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
       sessionId: 'claude-thread-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       event: {
         type: 'sdk.error',
         sessionId: 'claude-thread-1',
@@ -79,7 +89,7 @@ describe('fresh-agent-ws', () => {
       },
     })).toBe(true)
 
-    expect(store.getState().freshAgent.sessions['claude-thread-1']).toEqual(expect.objectContaining({
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:claude-thread-1']).toEqual(expect.objectContaining({
       latestTurnId: 'turn-1',
       timelineSessionId: 'cli-session-1',
       timelineRevision: 7,

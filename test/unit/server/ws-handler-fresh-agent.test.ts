@@ -70,6 +70,7 @@ describe('WsHandler fresh-agent routing', () => {
         type: 'freshAgent.create',
         requestId: 'req-1',
         sessionType: 'freshcodex',
+        provider: 'codex',
         cwd: '/workspace',
       }))
       ws.send(JSON.stringify({
@@ -81,6 +82,7 @@ describe('WsHandler fresh-agent routing', () => {
       await vi.waitFor(() => {
         expect(runtimeManager.create).toHaveBeenCalledWith(expect.objectContaining({
           sessionType: 'freshcodex',
+          provider: 'codex',
         }))
         expect(seenMessages.some((message) => message.type === 'freshAgent.created')).toBe(true)
       })
@@ -114,6 +116,7 @@ describe('WsHandler fresh-agent routing', () => {
         type: 'freshAgent.create',
         requestId: 'req-2',
         sessionType: 'freshcodex',
+        provider: 'codex',
       }))
 
       await vi.waitFor(() => {
@@ -123,40 +126,53 @@ describe('WsHandler fresh-agent routing', () => {
       ws.send(JSON.stringify({
         type: 'freshAgent.send',
         sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
         text: 'Ship it',
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.interrupt',
         sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.approval.respond',
         sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
         requestId: 'approval-1',
         decision: { behavior: 'allow', updatedInput: {} },
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.question.respond',
         sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
         requestId: 'question-1',
         answers: { proceed: 'yes' },
       }))
       ws.send(JSON.stringify({
-        type: 'freshAgent.kill',
-        sessionId: 'codex-session-2',
-      }))
-      ws.send(JSON.stringify({
         type: 'freshAgent.fork',
         sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
       }))
 
       await vi.waitFor(() => {
-        expect(runtimeManager.send).toHaveBeenCalledWith('codex-session-2', { text: 'Ship it', images: undefined })
-        expect(runtimeManager.interrupt).toHaveBeenCalledWith('codex-session-2')
-        expect(runtimeManager.resolveApproval).toHaveBeenCalledWith('codex-session-2', 'approval-1', { behavior: 'allow', updatedInput: {} })
-        expect(runtimeManager.answerQuestion).toHaveBeenCalledWith('codex-session-2', 'question-1', { proceed: 'yes' })
-        expect(runtimeManager.kill).toHaveBeenCalledWith('codex-session-2')
-        expect(runtimeManager.fork).toHaveBeenCalledWith('codex-session-2', undefined)
+        const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
+        expect(runtimeManager.send).toHaveBeenCalledWith(locator, { text: 'Ship it', images: undefined })
+        expect(runtimeManager.interrupt).toHaveBeenCalledWith(locator)
+        expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow', updatedInput: {} })
+        expect(runtimeManager.answerQuestion).toHaveBeenCalledWith(locator, 'question-1', { proceed: 'yes' })
+        expect(runtimeManager.fork).toHaveBeenCalledWith(locator, undefined)
+        expect(runtimeManager.kill).toHaveBeenCalledWith(locator)
       })
     } finally {
       handler.close()
@@ -173,10 +189,10 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshclaude',
         runtimeProvider: 'claude',
       }),
-      subscribe: vi.fn().mockImplementation(async (sessionId: string, listener: (message: unknown) => void) => {
-        listeners.set(sessionId, listener)
+      subscribe: vi.fn().mockImplementation(async (locator: unknown, listener: (message: unknown) => void) => {
+        listeners.set(JSON.stringify(locator), listener)
         return () => {
-          listeners.delete(sessionId)
+          listeners.delete(JSON.stringify(locator))
         }
       }),
     }
@@ -193,6 +209,7 @@ describe('WsHandler fresh-agent routing', () => {
         type: 'freshAgent.attach',
         sessionId: 'claude-session-attached',
         sessionType: 'freshclaude',
+        provider: 'claude',
         resumeSessionId: 'cli-session-attached',
       }))
 
@@ -200,19 +217,22 @@ describe('WsHandler fresh-agent routing', () => {
         expect(runtimeManager.attach).toHaveBeenCalledWith({
           sessionId: 'claude-session-attached',
           sessionType: 'freshclaude',
+          provider: 'claude',
         })
         expect(runtimeManager.subscribe).toHaveBeenCalledWith(
-          'claude-session-attached',
+          { sessionId: 'claude-session-attached', sessionType: 'freshclaude', provider: 'claude' },
           expect.any(Function),
         )
       })
 
-      listeners.get('claude-session-attached')?.({ kind: 'thread.updated', revision: 2 })
+      listeners.get(JSON.stringify({ sessionId: 'claude-session-attached', sessionType: 'freshclaude', provider: 'claude' }))?.({ kind: 'thread.updated', revision: 2 })
 
       await vi.waitFor(() => {
         expect(seenMessages).toContainEqual({
           type: 'freshAgent.event',
           sessionId: 'claude-session-attached',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           event: { kind: 'thread.updated', revision: 2 },
         })
       })

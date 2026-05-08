@@ -155,12 +155,16 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.approval.respond',
       sessionId: 'claude-thread-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       requestId: 'approval-1',
       decision: { behavior: 'allow', updatedInput: {} },
     })
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
       sessionId: 'claude-thread-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       requestId: 'question-1',
       answers: { 'How should Claude proceed?': 'Continue' },
     })
@@ -250,6 +254,7 @@ describe('FreshAgentView', () => {
       type: 'freshAgent.create',
       requestId: 'req-create',
       sessionType: 'freshcodex',
+      provider: 'codex',
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -259,6 +264,7 @@ describe('FreshAgentView', () => {
       requestId: 'req-create',
       sessionId: 'thread-created',
       sessionType: 'freshcodex',
+      provider: 'codex',
       runtimeProvider: 'codex',
     })
 
@@ -300,6 +306,8 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.send',
       sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
       text: 'Ship it',
     })
 
@@ -307,12 +315,16 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.interrupt',
       sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
     })
 
     fireEvent.click(screen.getByRole('button', { name: 'Fork' }))
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.fork',
       sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
     })
   })
 
@@ -395,6 +407,8 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.event',
         sessionId: 'dead-session-id',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         event: {
           type: 'sdk.session.snapshot',
           sessionId: 'dead-session-id',
@@ -415,6 +429,8 @@ describe('FreshAgentView', () => {
       onMessage({
         type: 'freshAgent.event',
         sessionId: 'dead-session-id',
+        sessionType: 'freshclaude',
+        provider: 'claude',
         event: {
           type: 'sdk.error',
           sessionId: 'dead-session-id',
@@ -428,6 +444,7 @@ describe('FreshAgentView', () => {
       expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'freshAgent.create',
         sessionType: 'freshclaude',
+        provider: 'claude',
         resumeSessionId: 'cli-session-abc-123',
       }))
     })

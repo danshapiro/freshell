@@ -70,6 +70,7 @@ function createSession(locator: FreshAgentSessionPayload, status: FreshAgentSess
     totalCostUsd: 0,
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    historyLoaded: false,
   }
 }
 
@@ -81,6 +82,21 @@ function ensureSession(
   const key = sessionKey(locator)
   state.sessions[key] ??= createSession(locator, status)
   return state.sessions[key]
+}
+
+function resolveOrEnsureSession(
+  state: FreshAgentState,
+  payload: SessionMutationPayload,
+  status: FreshAgentSessionStatus = 'starting',
+): FreshAgentSessionState | undefined {
+  const key = resolveSessionKey(state, payload)
+  if (key && state.sessions[key]) return state.sessions[key]
+  if (!payload.sessionType || !payload.provider) return undefined
+  return ensureSession(state, {
+    sessionId: payload.sessionId,
+    sessionType: payload.sessionType,
+    provider: payload.provider,
+  }, status)
 }
 
 function resetHydratedTimelineState(session: FreshAgentSessionState): void {
@@ -165,9 +181,8 @@ const freshAgentSlice = createSlice({
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      const session = state.sessions[key]
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
       session.cliSessionId = action.payload.cliSessionId
       session.model = action.payload.model
       session.cwd = action.payload.cwd
@@ -184,9 +199,8 @@ const freshAgentSlice = createSlice({
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      const session = state.sessions[key]
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
       session.timelineSessionId = action.payload.cliSessionId ?? session.timelineSessionId
       session.model = action.payload.model ?? session.model
@@ -205,9 +219,8 @@ const freshAgentSlice = createSlice({
       streamingActive?: boolean
       streamingText?: string
     }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      const session = state.sessions[key]
+      const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
+      if (!session) return
       const shouldRestartHydration = Boolean(
         session.historyLoaded
           && action.payload.revision != null
@@ -263,9 +276,9 @@ const freshAgentSlice = createSlice({
     },
 
     setSessionStatus(state, action: PayloadAction<SessionMutationPayload & { status: FreshAgentSessionStatus }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      state.sessions[key].status = action.payload.status
+      const session = resolveOrEnsureSession(state, action.payload, action.payload.status)
+      if (!session) return
+      session.status = action.payload.status
     },
 
     setAvailableModels(state, action: PayloadAction<Array<{ value: string; displayName: string; description: string }>>) {
@@ -297,9 +310,8 @@ const freshAgentSlice = createSlice({
     },
 
     sessionError(state, action: PayloadAction<SessionMutationPayload & { code?: string; message: string }>) {
-      const key = resolveSessionKey(state, action.payload)
-      if (!key) return
-      const session = state.sessions[key]
+      const session = resolveOrEnsureSession(state, action.payload)
+      if (!session) return
       session.lastError = action.payload.message
       if (action.payload.code?.startsWith('RESTORE_')) {
         session.awaitingDurableHistory = false

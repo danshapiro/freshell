@@ -10,22 +10,29 @@ describe('freshAgentSlice', () => {
   it('tracks pending creates and resolves them into sessions', () => {
     let state = reducer(undefined, registerPendingCreate({
       requestId: 'req-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       expectsHistoryHydration: false,
     }))
 
     state = reducer(state, sessionCreated({
       requestId: 'req-1',
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
     }))
     state = reducer(state, sessionInit({
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       cliSessionId: '00000000-0000-4000-8000-000000000111',
       model: 'claude-opus-4-6',
     }))
 
     expect(state.pendingCreates['req-1']).toMatchObject({ sessionId: 'sess-1' })
-    expect(state.sessions['sess-1']).toMatchObject({
+    expect(state.sessions['freshclaude:claude:sess-1']).toMatchObject({
       sessionId: 'sess-1',
+      sessionKey: 'freshclaude:claude:sess-1',
       cliSessionId: '00000000-0000-4000-8000-000000000111',
       model: 'claude-opus-4-6',
     })

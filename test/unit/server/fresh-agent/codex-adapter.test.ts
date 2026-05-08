@@ -132,4 +132,121 @@ describe('Codex fresh-agent adapter', () => {
       revision: 7,
     })
   })
+
+  it('starts turns with Codex-shaped input/settings and interrupts the active turn', async () => {
+    const runtime = {
+      startThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-new-1',
+        wsUrl: 'ws://127.0.0.1:43123',
+      }),
+      resumeThread: vi.fn(),
+      forkThread: vi.fn(),
+      startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-active-1' }),
+      interruptTurn: vi.fn().mockResolvedValue(undefined),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await adapter.create({
+      requestId: 'req-1',
+      sessionType: 'freshcodex',
+      cwd: '/repo',
+      permissionMode: 'on-request',
+      sandbox: 'workspace-write',
+      effort: 'xhigh',
+      model: 'codex-fixture',
+    })
+
+    await adapter.send?.('thread-new-1', {
+      text: 'Review this image',
+      images: [{ kind: 'data', mediaType: 'image/png', data: 'abc123' }],
+    })
+    await adapter.interrupt?.('thread-new-1')
+
+    expect(runtime.startTurn).toHaveBeenCalledWith({
+      threadId: 'thread-new-1',
+      input: [
+        { type: 'text', text: 'Review this image', text_elements: [] },
+        { type: 'image', url: 'data:image/png;base64,abc123' },
+      ],
+      cwd: '/repo',
+      approvalPolicy: 'on-request',
+      sandboxPolicy: { type: 'workspaceWrite' },
+      model: 'codex-fixture',
+      effort: 'xhigh',
+    })
+    expect(runtime.interruptTurn).toHaveBeenCalledWith({
+      threadId: 'thread-new-1',
+      turnId: 'turn-active-1',
+    })
+  })
+
+  it('rejects Claude-only Freshcodex effort values before app-server calls', async () => {
+    const runtime = {
+      startThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-new-1',
+        wsUrl: 'ws://127.0.0.1:43123',
+      }),
+      resumeThread: vi.fn(),
+      forkThread: vi.fn(),
+      startTurn: vi.fn(),
+      interruptTurn: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.create({
+      requestId: 'req-1',
+      sessionType: 'freshcodex',
+      effort: 'max',
+    })).rejects.toThrow('Freshcodex does not support reasoning effort "max"')
+    expect(runtime.startThread).not.toHaveBeenCalled()
+    expect(runtime.startTurn).not.toHaveBeenCalled()
+  })
+
+  it('forks Codex threads with stored runtime settings and excludeTurns', async () => {
+    const runtime = {
+      startThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-new-1',
+        wsUrl: 'ws://127.0.0.1:43123',
+      }),
+      resumeThread: vi.fn(),
+      forkThread: vi.fn().mockResolvedValue({
+        threadId: 'thread-fork-1',
+        wsUrl: 'ws://127.0.0.1:43123',
+      }),
+      startTurn: vi.fn(),
+      interruptTurn: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await adapter.create({
+      requestId: 'req-1',
+      sessionType: 'freshcodex',
+      cwd: '/repo',
+      model: 'codex-fixture',
+      permissionMode: 'never',
+      sandbox: 'read-only',
+    })
+
+    await expect(adapter.fork?.('thread-new-1')).resolves.toEqual({
+      threadId: 'thread-fork-1',
+      wsUrl: 'ws://127.0.0.1:43123',
+    })
+    expect(runtime.forkThread).toHaveBeenCalledWith({
+      threadId: 'thread-new-1',
+      cwd: '/repo',
+      model: 'codex-fixture',
+      sandbox: 'read-only',
+      approvalPolicy: 'never',
+      excludeTurns: true,
+    })
+  })
 })

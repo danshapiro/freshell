@@ -3,6 +3,35 @@ import { describe, expect, it, vi } from 'vitest'
 import { FreshAgentRuntimeManager } from '../../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../../server/fresh-agent/provider-registry.js'
 
+function makeSnapshot(sessionType: 'freshclaude' | 'kilroy', provider: 'claude', threadId: string) {
+  return {
+    sessionType,
+    provider,
+    threadId,
+    revision: 1,
+    status: 'idle',
+    capabilities: {
+      send: true,
+      interrupt: false,
+      approvals: true,
+      questions: true,
+      fork: false,
+    },
+    tokenUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    },
+    pendingApprovals: [],
+    pendingQuestions: [],
+    worktrees: [],
+    diffs: [],
+    childThreads: [],
+    turns: [],
+    extensions: {},
+  }
+}
+
 describe('FreshAgentRuntimeManager', () => {
   it('routes freshAgent.create through the adapter selected by sessionType', async () => {
     const codexAdapter = {
@@ -85,9 +114,17 @@ describe('FreshAgentRuntimeManager', () => {
       sessionType: 'freshclaude',
     })
 
-    await expect(manager.kill('claude-session-1')).resolves.toBe(true)
+    await expect(manager.kill({
+      sessionId: 'claude-session-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })).resolves.toBe(true)
     expect(claudeAdapter.kill).toHaveBeenCalledWith('claude-session-1')
-    await expect(manager.kill('claude-session-1')).rejects.toThrow(/not tracked/i)
+    await expect(manager.kill({
+      sessionId: 'claude-session-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    })).rejects.toThrow(/not tracked/i)
   })
 
   it('keeps session-type registration separate when hidden sessions share one runtime adapter', async () => {
@@ -95,7 +132,7 @@ describe('FreshAgentRuntimeManager', () => {
       create: vi.fn()
         .mockResolvedValueOnce({ sessionId: 'freshclaude-session-1' })
         .mockResolvedValueOnce({ sessionId: 'kilroy-session-1' }),
-      getSnapshot: vi.fn().mockResolvedValue({ provider: 'claude', threadId: 'freshclaude-session-1' }),
+      getSnapshot: vi.fn().mockResolvedValue(makeSnapshot('freshclaude', 'claude', 'freshclaude-session-1')),
     }
     const registry = createFreshAgentProviderRegistry([
       {

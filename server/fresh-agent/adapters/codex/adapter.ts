@@ -106,6 +106,7 @@ export function createCodexFreshAgentAdapter(deps: {
     runtimeProvider: 'codex',
 
     async create(input: FreshAgentCreateRequest) {
+      toCodexReasoningEffort(input.effort)
       const started = await deps.runtime.startThread({
         cwd: input.cwd,
         model: input.model,
@@ -121,6 +122,7 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!input.resumeSessionId) {
         throw new Error('Codex rich resume requires resumeSessionId')
       }
+      toCodexReasoningEffort(input.effort)
       const resumed = await deps.runtime.resumeThread({
         threadId: input.resumeSessionId,
         cwd: input.cwd,

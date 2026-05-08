@@ -904,7 +904,12 @@ describe('PaneContainer', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
-      expect(mockSend).toHaveBeenCalledWith({ type: 'freshAgent.kill', sessionId: 'thread-codex-1' })
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'thread-codex-1',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      })
     })
 
     it('cancels a pending fresh-agent create when the pane closes before session creation finishes', () => {
