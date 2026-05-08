@@ -158,15 +158,30 @@ export class FreshAgentRuntimeManager {
     await record.adapter.resolveApproval(sessionId, requestId, decision)
   }
 
-  async getSnapshot(input: { provider: FreshAgentRuntimeProvider; threadId: string; revision?: number }) {
-    const registration = this.options.registry.resolveByRuntimeProvider(input.provider)
-    if (!registration?.adapter.getSnapshot) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent snapshot adapter registered for ${input.provider}`)
+  async getSnapshot(input: {
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+    threadId: string
+    revision?: number
+  }) {
+    const registration = this.options.registry.resolveBySessionType(input.sessionType)
+    if (registration && registration.runtimeProvider !== input.provider) {
+      throw new FreshAgentRuntimeUnavailableError(
+        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
+      )
     }
-    return await registration.adapter.getSnapshot({ provider: input.provider, threadId: input.threadId }, input.revision)
+    if (!registration?.adapter.getSnapshot) {
+      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent snapshot adapter registered for ${input.sessionType}`)
+    }
+    return await registration.adapter.getSnapshot({
+      sessionType: input.sessionType,
+      provider: input.provider,
+      threadId: input.threadId,
+    }, input.revision)
   }
 
   async getTurnPage(input: {
+    sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
     threadId: string
     cursor?: string
@@ -175,28 +190,44 @@ export class FreshAgentRuntimeManager {
     limit?: number
     includeBodies?: boolean
   }) {
-    const registration = this.options.registry.resolveByRuntimeProvider(input.provider)
+    const registration = this.options.registry.resolveBySessionType(input.sessionType)
+    if (registration && registration.runtimeProvider !== input.provider) {
+      throw new FreshAgentRuntimeUnavailableError(
+        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
+      )
+    }
     if (!registration?.adapter.getTurnPage) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-page adapter registered for ${input.provider}`)
+      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-page adapter registered for ${input.sessionType}`)
     }
     return await registration.adapter.getTurnPage(
-      { provider: input.provider, threadId: input.threadId },
+      { sessionType: input.sessionType, provider: input.provider, threadId: input.threadId },
       input,
     )
   }
 
   async getTurnBody(input: {
+    sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
     threadId: string
     turnId: string
     revision: number
   }) {
-    const registration = this.options.registry.resolveByRuntimeProvider(input.provider)
+    const registration = this.options.registry.resolveBySessionType(input.sessionType)
+    if (registration && registration.runtimeProvider !== input.provider) {
+      throw new FreshAgentRuntimeUnavailableError(
+        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
+      )
+    }
     if (!registration?.adapter.getTurnBody) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-body adapter registered for ${input.provider}`)
+      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-body adapter registered for ${input.sessionType}`)
     }
     return await registration.adapter.getTurnBody(
-      { provider: input.provider, threadId: input.threadId, turnId: input.turnId },
+      {
+        sessionType: input.sessionType,
+        provider: input.provider,
+        threadId: input.threadId,
+        turnId: input.turnId,
+      },
       input.revision,
     )
   }

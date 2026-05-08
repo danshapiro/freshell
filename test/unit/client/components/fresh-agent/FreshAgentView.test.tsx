@@ -263,7 +263,7 @@ describe('FreshAgentView', () => {
     })
 
     await waitFor(() => {
-      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('codex', 'thread-created', expect.any(Object))
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-created', expect.any(Object))
     })
   })
 

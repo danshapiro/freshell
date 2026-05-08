@@ -15,7 +15,7 @@ describe('fresh-agent router', () => {
     app.use('/api', createFreshAgentRouter({ runtimeManager: manager }))
 
     const response = await request(app)
-      .get('/api/fresh-agent/threads/codex/thread-1/turns/turn-9?revision=4')
+      .get('/api/fresh-agent/threads/freshcodex/codex/thread-1/turns/turn-9?revision=4')
 
     expect(response.status).toBe(409)
     expect(response.body.code).toBe('STALE_THREAD_REVISION')

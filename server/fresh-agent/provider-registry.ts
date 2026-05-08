@@ -14,7 +14,14 @@ export class FreshAgentProviderRegistry {
   constructor(registrations: FreshAgentProviderRegistration[]) {
     for (const registration of registrations) {
       this.registrationsBySessionType.set(registration.sessionType, registration)
-      this.registrationsByRuntimeProvider.set(registration.runtimeProvider, registration)
+      const runtimeRegistration = this.registrationsByRuntimeProvider.get(registration.runtimeProvider)
+      if (!runtimeRegistration) {
+        this.registrationsByRuntimeProvider.set(registration.runtimeProvider, registration)
+      } else if (runtimeRegistration.adapter !== registration.adapter) {
+        throw new Error(
+          `Fresh-agent runtime provider ${registration.runtimeProvider} has multiple adapters; register shared session types with the same adapter instance.`,
+        )
+      }
     }
   }
 

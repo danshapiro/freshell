@@ -89,4 +89,63 @@ describe('FreshAgentRuntimeManager', () => {
     expect(claudeAdapter.kill).toHaveBeenCalledWith('claude-session-1')
     await expect(manager.kill('claude-session-1')).rejects.toThrow(/not tracked/i)
   })
+
+  it('keeps session-type registration separate when hidden sessions share one runtime adapter', async () => {
+    const claudeAdapter = {
+      create: vi.fn()
+        .mockResolvedValueOnce({ sessionId: 'freshclaude-session-1' })
+        .mockResolvedValueOnce({ sessionId: 'kilroy-session-1' }),
+      getSnapshot: vi.fn().mockResolvedValue({ provider: 'claude', threadId: 'freshclaude-session-1' }),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshclaude',
+        runtimeProvider: 'claude',
+        adapter: claudeAdapter as any,
+      },
+      {
+        sessionType: 'kilroy',
+        runtimeProvider: 'claude',
+        adapter: claudeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.create({ requestId: 'req-1', sessionType: 'freshclaude' })
+    await manager.create({ requestId: 'req-2', sessionType: 'kilroy' })
+    await manager.getSnapshot({
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      threadId: 'freshclaude-session-1',
+    })
+
+    expect(claudeAdapter.create).toHaveBeenNthCalledWith(1, expect.objectContaining({ sessionType: 'freshclaude' }))
+    expect(claudeAdapter.create).toHaveBeenNthCalledWith(2, expect.objectContaining({ sessionType: 'kilroy' }))
+    expect(claudeAdapter.getSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionType: 'freshclaude', provider: 'claude' }),
+      undefined,
+    )
+  })
+
+  it('rejects a route locator whose sessionType and provider disagree', async () => {
+    const codexAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'codex-session-1' }),
+      getSnapshot: vi.fn(),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await expect(manager.getSnapshot({
+      sessionType: 'freshcodex',
+      provider: 'claude',
+      threadId: 'codex-session-1',
+    })).rejects.toThrow('uses codex, not claude')
+    expect(codexAdapter.getSnapshot).not.toHaveBeenCalled()
+  })
 })

@@ -48,7 +48,7 @@ test.describe('Fresh Agent', () => {
     const { tabId, paneId } = await getActiveLeaf(harness)
     const sessionId = 'freshclaude-thread-1'
 
-    await page.route(`**/api/fresh-agent/threads/claude/${sessionId}*`, async (route) => {
+    await page.route(`**/api/fresh-agent/threads/freshclaude/claude/${sessionId}*`, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -168,7 +168,7 @@ test.describe('Fresh Agent', () => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)
 
-    await page.route(`${serverInfo.baseUrl}/api/fresh-agent/threads/codex/thread-codex*`, async (route) => {
+    await page.route(`${serverInfo.baseUrl}/api/fresh-agent/threads/freshcodex/codex/thread-codex*`, async (route) => {
       await route.fulfill({
         status: 200,
         contentType: 'application/json',

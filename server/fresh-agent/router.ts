@@ -22,6 +22,7 @@ import {
 } from '../read-models/work-scheduler.js'
 
 const ThreadParamsSchema = z.object({
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   threadId: z.string().min(1),
 })
@@ -58,7 +59,7 @@ export function createFreshAgentRouter(deps: {
     return res.status(500).json({ error: message })
   }
 
-  router.get('/fresh-agent/threads/:provider/:threadId', async (req, res) => {
+  router.get('/fresh-agent/threads/:sessionType/:provider/:threadId', async (req, res) => {
     const params = ThreadParamsSchema.safeParse(req.params)
     const query = z.object({
       priority: ReadModelPrioritySchema.optional(),
@@ -81,6 +82,7 @@ export function createFreshAgentRouter(deps: {
         lane: query.data.priority ?? 'visible',
         signal,
         run: async () => deps.runtimeManager.getSnapshot({
+          sessionType: params.data.sessionType,
           provider: params.data.provider,
           threadId: params.data.threadId,
           revision: query.data.revision,
@@ -97,7 +99,7 @@ export function createFreshAgentRouter(deps: {
     }
   })
 
-  router.get('/fresh-agent/threads/:provider/:threadId/turns', async (req, res) => {
+  router.get('/fresh-agent/threads/:sessionType/:provider/:threadId/turns', async (req, res) => {
     const params = ThreadParamsSchema.safeParse(req.params)
     const query = AgentTimelinePageQuerySchema.safeParse({
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
@@ -120,6 +122,7 @@ export function createFreshAgentRouter(deps: {
         lane: query.data.priority ?? 'visible',
         signal,
         run: async () => deps.runtimeManager.getTurnPage({
+          sessionType: params.data.sessionType,
           provider: params.data.provider,
           threadId: params.data.threadId,
           cursor: query.data.cursor,
@@ -140,7 +143,7 @@ export function createFreshAgentRouter(deps: {
     }
   })
 
-  router.get('/fresh-agent/threads/:provider/:threadId/turns/:turnId', async (req, res) => {
+  router.get('/fresh-agent/threads/:sessionType/:provider/:threadId/turns/:turnId', async (req, res) => {
     const params = TurnParamsSchema.safeParse(req.params)
     const query = AgentTimelineTurnBodyQuerySchema.safeParse({
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
@@ -154,6 +157,7 @@ export function createFreshAgentRouter(deps: {
 
     try {
       const turn = await deps.runtimeManager.getTurnBody({
+        sessionType: params.data.sessionType,
         provider: params.data.provider,
         threadId: params.data.threadId,
         turnId: params.data.turnId,

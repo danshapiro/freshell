@@ -106,6 +106,7 @@ describe('FreshAgentView reload/restore behavior', () => {
         resumeSessionId: 'cli-session-1',
       })
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshclaude',
         'claude',
         'sdk-session-1',
         expect.objectContaining({ signal: expect.any(AbortSignal) }),

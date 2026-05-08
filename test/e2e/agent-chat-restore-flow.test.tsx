@@ -135,6 +135,7 @@ describe('fresh-agent restore flow', () => {
 
     await waitFor(() => {
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshclaude',
         'claude',
         canonicalSessionId,
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
@@ -192,6 +193,7 @@ describe('fresh-agent restore flow', () => {
 
     await waitFor(() => {
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshclaude',
         'claude',
         canonicalSessionId,
         expect.objectContaining({ signal: expect.any(AbortSignal) }),

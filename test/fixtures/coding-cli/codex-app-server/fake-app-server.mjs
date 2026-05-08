@@ -82,6 +82,43 @@ function writeBytes(stream, totalBytes, chunkSize = 16 * 1024) {
   })
 }
 
+function makeTurn(id = 'turn-1') {
+  return {
+    id,
+    status: 'completed',
+    items: [{
+      type: 'agentMessage',
+      id: `${id}:item-0`,
+      text: 'Fixture turn',
+      phase: null,
+      memoryCitation: null,
+    }],
+    error: null,
+    startedAt: 1770000001,
+    completedAt: 1770000002,
+    durationMs: 1000,
+  }
+}
+
+function makeThread(id, params = {}) {
+  const handle = getThreadHandle(id)
+  return {
+    id,
+    sessionId: id,
+    preview: 'Fixture turn',
+    ephemeral: false,
+    modelProvider: 'openai',
+    createdAt: 1770000000,
+    updatedAt: 1770000007,
+    status: { type: 'idle' },
+    cwd: params.cwd ?? process.cwd(),
+    cliVersion: 'codex-cli 0.129.0',
+    source: 'appServer',
+    turns: params.includeTurns ? [makeTurn()] : [],
+    path: handle.path,
+  }
+}
+
 function successResult(method, params) {
   if (method === 'initialize') {
     return {
@@ -93,31 +130,27 @@ function successResult(method, params) {
   }
   if (method === 'thread/start') {
     return {
-      thread: getThreadHandle('thread-new-1'),
+      thread: makeThread('thread-new-1', params),
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      sandbox: {
-        type: 'dangerFullAccess',
-      },
+      sandbox: params?.sandbox ?? 'danger-full-access',
     }
   }
   if (method === 'thread/resume') {
     const threadId = params?.threadId || 'thread-new-1'
     return {
-      thread: getThreadHandle(threadId),
+      thread: makeThread(threadId, params),
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
       modelProvider: 'openai',
       instructionSources: [],
       approvalPolicy: 'never',
       approvalsReviewer: 'user',
-      sandbox: {
-        type: 'dangerFullAccess',
-      },
+      sandbox: params?.sandbox ?? 'danger-full-access',
     }
   }
   if (method === 'turn/start') {
@@ -135,60 +168,10 @@ function successResult(method, params) {
   }
   if (method === 'thread/read') {
     return {
-      threadId: params?.threadId,
-      revision: params?.revision ?? 7,
-      status: 'idle',
-      turns: [{
-        id: 'turn-1',
-        turnId: 'turn-1',
-        messageId: 'msg-1',
-        ordinal: 0,
-        source: 'durable',
-        role: 'assistant',
-        summary: 'Fixture turn',
-        items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
-      }],
-    }
-  }
-  if (method === 'thread/turns/list') {
-    return {
-      revision: params?.revision ?? 7,
-      nextCursor: null,
-      turns: [{
-        id: 'turn-1',
-        turnId: 'turn-1',
-        messageId: 'msg-1',
-        ordinal: 0,
-        source: 'durable',
-        role: 'assistant',
-        summary: 'Fixture turn',
-        items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
-      }],
-      bodies: params?.includeBodies ? {
-        'turn-1': {
-          id: 'turn-1',
-          turnId: 'turn-1',
-          messageId: 'msg-1',
-          ordinal: 0,
-          source: 'durable',
-          role: 'assistant',
-          summary: 'Fixture turn',
-          items: [{ id: 'turn-1:item-0', kind: 'text', text: 'Fixture turn' }],
-        },
-      } : undefined,
-    }
-  }
-  if (method === 'thread/turn/read') {
-    return {
-      id: params?.turnId,
-      turnId: params?.turnId,
-      messageId: 'msg-1',
-      ordinal: 0,
-      source: 'durable',
-      role: 'assistant',
-      summary: 'Fixture turn',
-      revision: params?.revision ?? 7,
-      items: [{ id: `${params?.turnId}:item-0`, kind: 'text', text: 'Fixture turn' }],
+      thread: makeThread(params?.threadId, {
+        ...params,
+        includeTurns: params?.includeTurns === true,
+      }),
     }
   }
   return {}
@@ -303,12 +286,28 @@ wss.on('connection', (socket) => {
   let initialized = false
   socket.on('message', (raw) => {
     const message = JSON.parse(raw.toString())
+    if (!Object.prototype.hasOwnProperty.call(message, 'id')) {
+      if (message.method === 'initialized') {
+        initialized = true
+      }
+      return
+    }
     if (behavior.requireJsonRpc && message.jsonrpc !== '2.0') {
       socket.send(JSON.stringify({
         id: message.id,
         error: {
           code: -32600,
           message: 'Expected jsonrpc: "2.0" request envelope',
+        },
+      }))
+      return
+    }
+    if (behavior.rejectJsonRpc && Object.prototype.hasOwnProperty.call(message, 'jsonrpc')) {
+      socket.send(JSON.stringify({
+        id: message.id,
+        error: {
+          code: -32600,
+          message: 'Expected Codex app-server request envelope without jsonrpc',
         },
       }))
       return

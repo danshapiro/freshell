@@ -18,6 +18,7 @@ export type FreshAgentCreateResult = {
 }
 
 export type FreshAgentThreadLocator = {
+  sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   threadId: string
 }

@@ -52,6 +52,7 @@ describe('Claude fresh-agent restore contract', () => {
     })
 
     const snapshot = await adapter.getSnapshot?.({
+      sessionType: 'freshclaude',
       provider: 'claude',
       threadId: 'sdk-claude-1',
     })

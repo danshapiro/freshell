@@ -123,6 +123,7 @@ describe('fresh-agent resume history flow', () => {
 
     await waitFor(() => {
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshclaude',
         'claude',
         'sdk-sess-1',
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
@@ -178,6 +179,7 @@ describe('fresh-agent resume history flow', () => {
 
     await waitFor(() => {
       expect(getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+        'freshclaude',
         'claude',
         canonicalSessionId,
         expect.objectContaining({ signal: expect.any(AbortSignal) }),

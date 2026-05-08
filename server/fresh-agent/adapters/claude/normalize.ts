@@ -3,6 +3,11 @@ import type { AgentTimelinePage, AgentTimelineTurn } from '../../../agent-timeli
 import type { QuestionDefinition, SdkSessionState } from '../../../sdk-bridge-types.js'
 import type { SdkSessionStatus } from '../../../../shared/ws-protocol.js'
 import type { ContentBlock } from '../../../../shared/ws-protocol.js'
+import {
+  FreshAgentSnapshotSchema,
+  FreshAgentTurnBodySchema,
+  FreshAgentTurnPageSchema,
+} from '../../../../shared/fresh-agent-contract.js'
 
 export type FreshAgentNormalizedItem =
   | { id: string; kind: 'text'; text: string }
@@ -162,7 +167,8 @@ export function normalizeClaudeThreadSnapshot(input: {
   const turns = input.resolved.turns.map((turn) => normalizeClaudeTurn(turn))
   const inputTokens = input.liveSession?.totalInputTokens ?? 0
   const outputTokens = input.liveSession?.totalOutputTokens ?? 0
-  return {
+  return FreshAgentSnapshotSchema.parse({
+    sessionType: 'freshclaude',
     provider: 'claude',
     threadId: input.threadId,
     sessionId,
@@ -198,14 +204,16 @@ export function normalizeClaudeThreadSnapshot(input: {
         readiness: input.resolved.readiness,
       },
     },
-  }
+  }) as FreshAgentClaudeSnapshot
 }
 
 export function normalizeClaudeTurnPage(input: {
   threadId: string
   page: AgentTimelinePage
 }): FreshAgentClaudeTurnPage {
-  return {
+  return FreshAgentTurnPageSchema.parse({
+    sessionType: 'freshclaude',
+    provider: 'claude',
     threadId: input.threadId,
     revision: input.page.revision,
     nextCursor: input.page.nextCursor,
@@ -225,7 +233,7 @@ export function normalizeClaudeTurnPage(input: {
         Object.entries(input.page.bodies).map(([turnId, turn]) => [turnId, normalizeClaudeTurn(turn)]),
       ),
     } : {}),
-  }
+  }) as FreshAgentClaudeTurnPage
 }
 
 export function normalizeClaudeTurnBody(input: {
@@ -233,9 +241,11 @@ export function normalizeClaudeTurnBody(input: {
   revision: number
   threadId: string
 }) {
-  return {
+  return FreshAgentTurnBodySchema.parse({
     ...normalizeClaudeTurn(input.turn),
+    sessionType: 'freshclaude',
+    provider: 'claude',
     threadId: input.threadId,
     revision: input.revision,
-  }
+  })
 }

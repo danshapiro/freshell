@@ -12,10 +12,15 @@ import {
   CodexThreadLifecycleNotificationSchema,
   CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
+  CodexThreadPageParamsSchema,
+  CodexThreadReadParamsSchema,
   CodexThreadReadResultSchema,
+  CodexThreadResumeParamsSchema,
+  CodexThreadStartParamsSchema,
   CodexThreadTurnReadResultSchema,
   CodexThreadTurnsListResultSchema,
   type CodexInitializeResult,
+  type CodexRequestId,
   type CodexRpcError,
   type CodexThreadHandle,
   type CodexThreadOperationResult,
@@ -45,6 +50,13 @@ type PendingRequest = {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000
+
+type CodexThreadStartInput =
+  Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'> & {
+    richClient?: boolean
+  }
+
+type CodexThreadResumeInput = Omit<CodexThreadResumeParams, 'persistExtendedHistory'>
 
 export type CodexThreadLifecycleEvent = {
   kind: 'thread_started'
@@ -77,7 +89,7 @@ export class CodexAppServerClient {
   private connectPromise: Promise<WebSocket> | null = null
   private initializePromise: Promise<CodexInitializeResult> | null = null
   private nextRequestId = 1
-  private pendingRequests = new Map<number, PendingRequest>()
+  private pendingRequests = new Map<CodexRequestId, PendingRequest>()
   private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
   private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly disconnectHandlers = new Set<(event: CodexAppServerDisconnectEvent) => void>()
@@ -97,12 +109,14 @@ export class CodexAppServerClient {
       clientInfo: { name: 'freshell', version: '1.0.0' },
       capabilities: {
         experimentalApi: true,
+        optOutNotificationMethods: ['thread/started'],
       },
-    })).then((result) => {
+    })).then(async (result) => {
       const parsed = CodexInitializeResultSchema.safeParse(result)
       if (!parsed.success) {
         throw new Error('Codex app-server returned an invalid initialize payload.')
       }
+      await this.notify('initialized')
       return parsed.data
     }).catch((error) => {
       this.initializePromise = null
@@ -112,14 +126,13 @@ export class CodexAppServerClient {
     return this.initializePromise
   }
 
-  async startThread(
-    params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
-  ): Promise<CodexThreadOperationResult> {
-    const result = await this.request('thread/start', {
-      ...params,
-      experimentalRawEvents: params.richClient === true,
+  async startThread(params: CodexThreadStartInput): Promise<CodexThreadOperationResult> {
+    const { richClient, ...appServerParams } = params
+    const result = await this.request('thread/start', CodexThreadStartParamsSchema.parse({
+      ...appServerParams,
+      experimentalRawEvents: richClient === true,
       persistExtendedHistory: true,
-    })
+    }))
     const parsed = CodexThreadOperationResultSchema.safeParse(result)
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/start payload.')
@@ -129,14 +142,12 @@ export class CodexAppServerClient {
     }
   }
 
-  async resumeThread(
-    params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
-  ): Promise<CodexThreadOperationResult> {
+  async resumeThread(params: CodexThreadResumeInput): Promise<CodexThreadOperationResult> {
     // Intentionally preserve Codex's default raw-event behavior for resume calls.
-    const result = await this.request('thread/resume', {
+    const result = await this.request('thread/resume', CodexThreadResumeParamsSchema.parse({
       ...params,
       persistExtendedHistory: true,
-    })
+    }))
     const parsed = CodexThreadOperationResultSchema.safeParse(result)
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/resume payload.')
@@ -165,7 +176,7 @@ export class CodexAppServerClient {
   }
 
   async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
-    const result = await this.request('thread/read', params)
+    const result = await this.request('thread/read', CodexThreadReadParamsSchema.parse(params))
     const parsed = CodexThreadReadResultSchema.safeParse(result)
     if (!parsed.success) {
       throw new Error('Codex app-server returned an invalid thread/read payload.')
@@ -174,21 +185,46 @@ export class CodexAppServerClient {
   }
 
   async listThreadTurns(params: CodexThreadTurnsListParams): Promise<CodexThreadTurnsListResult> {
-    const result = await this.request('thread/turns/list', params)
-    const parsed = CodexThreadTurnsListResultSchema.safeParse(result)
+    const parsedParams = CodexThreadPageParamsSchema.parse(params)
+    const result = await this.request('thread/read', {
+      threadId: parsedParams.threadId,
+      includeTurns: true,
+    })
+    const parsedThread = CodexThreadReadResultSchema.safeParse(result)
+    if (!parsedThread.success) {
+      throw new Error('Codex app-server returned an invalid thread/read payload.')
+    }
+    const turns = parsedThread.data.thread.turns.slice(0, parsedParams.limit)
+    const parsed = CodexThreadTurnsListResultSchema.safeParse({
+      revision: Math.max(0, Math.trunc(parsedThread.data.thread.updatedAt)),
+      nextCursor: null,
+      backwardsCursor: null,
+      turns,
+      bodies: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
+    })
     if (!parsed.success) {
-      throw new Error('Codex app-server returned an invalid thread/turns/list payload.')
+      throw new Error('Codex app-server returned an invalid synthesized thread turn page.')
     }
     return parsed.data
   }
 
   async readThreadTurn(params: CodexThreadTurnReadParams): Promise<CodexThreadTurnReadResult> {
-    const result = await this.request('thread/turn/read', params)
-    const parsed = CodexThreadTurnReadResultSchema.safeParse(result)
-    if (!parsed.success) {
-      throw new Error('Codex app-server returned an invalid thread/turn/read payload.')
+    const page = await this.listThreadTurns({
+      threadId: params.threadId,
+    })
+    const turn = page.turns.find((candidate) => candidate.id === params.turnId)
+    if (!turn) {
+      throw new Error(`Codex app-server thread ${params.threadId} does not contain turn ${params.turnId}.`)
     }
-    return parsed.data
+    const parsedTurn = CodexThreadTurnReadResultSchema.safeParse({
+      ...turn,
+      turnId: turn.id,
+      revision: params.revision ?? page.revision,
+    })
+    if (!parsedTurn.success) {
+      throw new Error('Codex app-server returned an invalid synthesized thread turn body.')
+    }
+    return parsedTurn.data
   }
 
   async close(): Promise<void> {
@@ -432,13 +468,19 @@ export class CodexAppServerClient {
         timeout,
       })
 
-      socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }), (error) => {
+      socket.send(JSON.stringify({ id, method, params }), (error) => {
         if (!error) return
         clearTimeout(timeout)
         this.pendingRequests.delete(id)
         reject(error)
       })
     })
+  }
+
+  private async notify(method: string, params?: unknown): Promise<void> {
+    const socket = await this.ensureSocket()
+    const payload = params === undefined ? { method } : { method, params }
+    socket.send(JSON.stringify(payload))
   }
 
   private formatRpcError(method: string, error: CodexRpcError): string {

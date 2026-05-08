@@ -281,7 +281,7 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const resumeSessionId = paneContent.resumeSessionId
     const currentStatus = paneContent.status
-    void getFreshAgentThreadSnapshot(provider, sessionId, { signal: controller.signal })
+    void getFreshAgentThreadSnapshot(paneContent.sessionType, provider, sessionId, { signal: controller.signal })
       .then((next) => {
         const resolved = next as FreshAgentSnapshot
         setSnapshot(resolved)
