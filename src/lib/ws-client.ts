@@ -24,12 +24,20 @@ type HelloExtensionProvider = () => {
 type TabsSyncPushPayload = {
   deviceId: string
   deviceLabel: string
+  clientInstanceId: string
+  snapshotRevision: number
   records: unknown[]
 }
 type TabsSyncQueryPayload = {
   requestId: string
   deviceId: string
-  rangeDays?: number
+  clientInstanceId: string
+  closedTabRetentionDays: number
+}
+type TabsSyncClientRetirePayload = {
+  deviceId: string
+  clientInstanceId: string
+  snapshotRevision: number
 }
 
 type TerminalInputClientMessage = {
@@ -61,7 +69,7 @@ type InFlightCreate = {
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const WS_PROTOCOL_VERSION = 4
+const WS_PROTOCOL_VERSION = 5
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
@@ -311,7 +319,9 @@ export class WsClient {
         if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
           this.clearReadyTimeout()
           this.intentionalClose = true
-          const err = new Error('Protocol version mismatch')
+          const err = new Error(typeof msg.message === 'string' && msg.message
+            ? msg.message
+            : 'Protocol version mismatch. Reload this Freshell browser tab to use the latest client bundle.')
           ;(err as any).wsCloseCode = 4010
           finishReject(err)
           return
@@ -541,6 +551,13 @@ export class WsClient {
   sendTabsSyncQuery(payload: TabsSyncQueryPayload) {
     this.send({
       type: 'tabs.sync.query',
+      ...payload,
+    })
+  }
+
+  sendTabsSyncClientRetire(payload: TabsSyncClientRetirePayload) {
+    this.send({
+      type: 'tabs.sync.client.retire',
       ...payload,
     })
   }

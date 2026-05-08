@@ -165,6 +165,47 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
+const UI_SCREENSHOT_RESULT_KEYS = new Set([
+  'type',
+  'requestId',
+  'ok',
+  'mimeType',
+  'imageBase64',
+  'width',
+  'height',
+  'changedFocus',
+  'restoredFocus',
+  'error',
+])
+const MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES = 4096
+
+function isBoundedScreenshotResultEnvelopePreview(data: WebSocket.RawData, config: WsHandlerConfig): boolean {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return false
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch) return false
+  if (Buffer.byteLength(raw, 'utf-8') > config.maxRegularWsMessageBytes + config.maxScreenshotBase64Bytes + MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES) {
+    return false
+  }
+  if (imageMatch[1].length > config.maxScreenshotBase64Bytes) return false
+  const keyPattern = /"((?:\\.|[^"\\])*)"\s*:/g
+  let match: RegExpExecArray | null
+  while ((match = keyPattern.exec(raw)) !== null) {
+    const key = match[1].replace(/\\"/g, '"')
+    if (!UI_SCREENSHOT_RESULT_KEYS.has(key)) return false
+  }
+  return true
+}
+
+function oversizedScreenshotResultRequestId(data: WebSocket.RawData, config: WsHandlerConfig): string | undefined {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return undefined
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch || imageMatch[1].length <= config.maxScreenshotBase64Bytes) return undefined
+  const requestIdMatch = /"requestId"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  return requestIdMatch?.[1]
+}
+
 function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false
   for (const value of a) {
@@ -313,20 +354,32 @@ const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
   serverInstanceId: true,
   deviceId: true,
   deviceLabel: true,
+  clientInstanceId: true,
 })
 
 const TabsSyncPushSchema = z.object({
   type: z.literal('tabs.sync.push'),
   deviceId: z.string().min(1),
   deviceLabel: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
   records: z.array(TabsSyncPushRecordSchema),
 })
+type TabsSyncPushRecord = z.infer<typeof TabsSyncPushRecordSchema>
 
 const TabsSyncQuerySchema = z.object({
   type: z.literal('tabs.sync.query'),
   requestId: z.string().min(1),
   deviceId: z.string().min(1),
-  rangeDays: z.number().int().positive().optional(),
+  clientInstanceId: z.string().min(1),
+  closedTabRetentionDays: z.number().int().min(1).max(30),
+})
+
+const TabsSyncClientRetireSchema = z.object({
+  type: z.literal('tabs.sync.client.retire'),
+  deviceId: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
 })
 
 type ClientState = {
@@ -343,6 +396,20 @@ type ClientState = {
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
+}
+
+function previewRawData(data: WebSocket.RawData, maxBytes: number): string {
+  if (Buffer.isBuffer(data)) return data.subarray(0, maxBytes).toString('utf-8')
+  if (Array.isArray(data)) return Buffer.concat(data).subarray(0, maxBytes).toString('utf-8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).subarray(0, maxBytes).toString('utf-8')
+  return String(data).slice(0, maxBytes)
+}
+
+function rawDataToString(data: WebSocket.RawData): string {
+  if (Buffer.isBuffer(data)) return data.toString('utf-8')
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf-8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf-8')
+  return String(data)
 }
 
 type HandshakeSnapshot = {
@@ -529,6 +596,7 @@ export class WsHandler {
       OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
+      TabsSyncClientRetireSchema,
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
@@ -1724,11 +1792,38 @@ export class WsHandler {
     if (perfConfig.enabled) payloadBytes = rawBytes
 
     try {
+      if (rawBytes > this.config.maxRegularWsMessageBytes) {
+        if (!isBoundedScreenshotResultEnvelopePreview(data, this.config)) {
+          const oversizedScreenshotRequestId = oversizedScreenshotResultRequestId(data, this.config)
+          if (oversizedScreenshotRequestId) {
+            const pending = this.screenshotRequests.get(oversizedScreenshotRequestId)
+            if (pending && (!pending.connectionId || pending.connectionId === ws.connectionId)) {
+              clearTimeout(pending.timeout)
+              this.screenshotRequests.delete(oversizedScreenshotRequestId)
+              pending.reject(new Error('Screenshot payload too large'))
+              return
+            }
+          }
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
+          })
+          return
+        }
+      }
+
       let msg: any
       try {
-        msg = JSON.parse(data.toString())
+        msg = JSON.parse(rawDataToString(data))
       } catch {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
+        return
+      }
+      if (rawBytes > this.config.maxRegularWsMessageBytes && msg?.type !== 'ui.screenshot.result') {
+        this.sendError(ws, {
+          code: 'INVALID_MESSAGE',
+          message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
+        })
         return
       }
       const rawSessionRef = (
@@ -1749,7 +1844,7 @@ export class WsHandler {
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
           code: 'PROTOCOL_MISMATCH',
-          message: `Expected protocol version ${WS_PROTOCOL_VERSION}`,
+          message: `Expected protocol version ${WS_PROTOCOL_VERSION}. Reload this Freshell browser tab to use the latest client bundle.`,
         })
         ws.close(CLOSE_CODES.PROTOCOL_MISMATCH, 'Protocol version mismatch')
         return
@@ -1765,11 +1860,6 @@ export class WsHandler {
       // discriminated union once provider names become dynamic, so we cast once at the boundary.
       const m = parsed.data as any
       messageType = m.type
-
-      if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {
-        ws.close(1009, 'Message too large')
-        return
-      }
 
       if (m.type === 'ping') {
         // Respond to confirm liveness.
@@ -2494,36 +2584,84 @@ export class WsHandler {
           })
           return
         }
-        for (const record of m.records) {
-          await this.tabsRegistryStore.upsert({
-            ...record,
-            serverInstanceId: this.serverInstanceId,
+        try {
+          const result = await this.tabsRegistryStore.replaceClientSnapshot({
             deviceId: m.deviceId,
             deviceLabel: m.deviceLabel,
+            clientInstanceId: m.clientInstanceId,
+            snapshotRevision: m.snapshotRevision,
+            records: m.records.map((record: TabsSyncPushRecord) => ({
+              ...record,
+              serverInstanceId: this.serverInstanceId,
+              deviceId: m.deviceId,
+              deviceLabel: m.deviceLabel,
+            })),
+          })
+          this.send(ws, {
+            type: 'tabs.sync.ack',
+            accepted: result.accepted,
+            openRecords: result.openRecords,
+            closedRecords: result.closedRecords,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
           })
         }
-        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
+        return
+      }
+
+      case 'tabs.sync.client.retire': {
+        if (!this.tabsRegistryStore) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
+          })
+          return
+        }
+        try {
+          await this.tabsRegistryStore.retireClientSnapshot({
+            deviceId: m.deviceId,
+            clientInstanceId: m.clientInstanceId,
+            snapshotRevision: m.snapshotRevision,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
         return
       }
 
       case 'tabs.sync.query': {
         if (!this.tabsRegistryStore) {
-          this.send(ws, {
-            type: 'tabs.sync.snapshot',
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
             requestId: m.requestId,
-            data: { localOpen: [], remoteOpen: [], closed: [] },
           })
           return
         }
-        const data = await this.tabsRegistryStore.query({
-          deviceId: m.deviceId,
-          rangeDays: m.rangeDays,
-        })
-        this.send(ws, {
-          type: 'tabs.sync.snapshot',
-          requestId: m.requestId,
-          data,
-        })
+        try {
+          const data = await this.tabsRegistryStore.query({
+            deviceId: m.deviceId,
+            clientInstanceId: m.clientInstanceId,
+            closedTabRetentionDays: m.closedTabRetentionDays,
+          })
+          this.send(ws, {
+            type: 'tabs.sync.snapshot',
+            requestId: m.requestId,
+            data,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
+            requestId: m.requestId,
+          })
+        }
         return
       }
 

@@ -173,9 +173,6 @@ describe('crossTabSync', () => {
           sortMode: 'project',
         },
       },
-      tabs: {
-        searchRangeDays: 365,
-      },
     })
 
     window.dispatchEvent(new StorageEvent('storage', {
@@ -185,7 +182,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.localSettings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
   })
 
   it('hydrates browser-preference changes from BroadcastChannel messages', () => {
@@ -224,7 +221,7 @@ describe('crossTabSync', () => {
       })
 
       expect(store.getState().settings.settings.theme).toBe('dark')
-      expect(store.getState().tabRegistry.searchRangeDays).toBe(90)
+      expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
     } finally {
       ;(globalThis as any).BroadcastChannel = original
     }
@@ -291,7 +288,7 @@ describe('crossTabSync', () => {
     }))
 
     expect(store.getState().settings.settings.theme).toBe('dark')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
   })
 
   it('applies sparse browser-preference resets when previously persisted settings or search range are removed', () => {
@@ -355,7 +352,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
@@ -365,9 +362,6 @@ describe('crossTabSync', () => {
         sidebar: {
           sortMode: 'project',
         },
-      },
-      tabs: {
-        searchRangeDays: 365,
       },
     })
   })
@@ -403,7 +397,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
@@ -413,9 +407,6 @@ describe('crossTabSync', () => {
         sidebar: {
           sortMode: 'project',
         },
-      },
-      tabs: {
-        searchRangeDays: 365,
       },
     })
   })

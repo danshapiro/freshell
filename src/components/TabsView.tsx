@@ -1,4 +1,4 @@
-import { createElement, memo, useEffect, useMemo, useState } from 'react'
+import { createElement, memo, useMemo, useState } from 'react'
 import { nanoid } from 'nanoid'
 import {
   Archive,
@@ -15,11 +15,10 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { getWsClient } from '@/lib/ws-client'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
-import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
+import { setTabRegistryClosedTabRetentionDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { copyText } from '@/lib/clipboard'
@@ -43,7 +42,10 @@ import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
 
-type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
+type DisplayRecord = RegistryTabRecord & {
+  displayDeviceLabel: string
+  registryScope: 'local' | 'same-device' | 'remote' | 'closed'
+}
 
 type DeviceGroupData = {
   deviceId: string
@@ -485,11 +487,11 @@ function DeviceSection({
 function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   const dispatch = useAppDispatch()
   const store = useAppStore()
-  const ws = useMemo(() => getWsClient(), [])
   const groups = useAppSelector(selectTabsRegistryGroups)
-  const { deviceId, deviceLabel, deviceAliases, searchRangeDays, syncError } = useAppSelector(
+  const { deviceId, deviceLabel, deviceAliases, closedTabRetentionDays, searchRangeDays, syncError } = useAppSelector(
     (state) => state.tabRegistry,
   )
+  const effectiveClosedRetentionDays = closedTabRetentionDays ?? searchRangeDays
   const localServerInstanceId = useAppSelector((state) => state.connection.serverInstanceId)
   const connectionStatus = useAppSelector((state) => state.connection.status)
   const connectionError = useAppSelector((state) => state.connection.lastError)
@@ -506,8 +508,9 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
 
   const withDisplayDeviceLabel = useMemo(
     () =>
-      (record: RegistryTabRecord): DisplayRecord => ({
+      (record: RegistryTabRecord, registryScope: DisplayRecord['registryScope']): DisplayRecord => ({
         ...record,
+        registryScope,
         displayDeviceLabel:
           record.deviceId === deviceId
             ? deviceLabel
@@ -516,25 +519,15 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     [deviceAliases, deviceId, deviceLabel],
   )
 
-  /* -- search range sync -------------------------------------------- */
-
-  useEffect(() => {
-    if (ws.state !== 'ready') return
-    if (searchRangeDays <= 30) return
-    dispatch(setTabRegistryLoading(true))
-    ws.sendTabsSyncQuery({
-      requestId: `tabs-range-${Date.now()}`,
-      deviceId,
-      rangeDays: searchRangeDays,
-    })
-  }, [dispatch, ws, deviceId, searchRangeDays])
-
   /* -- filtering ---------------------------------------------------- */
 
   const filtered = useMemo(() => {
-    const localOpen = groups.localOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
-    const remoteOpen = groups.remoteOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
-    const closed = groups.closed.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
+    const localOpen = groups.localOpen.map((record) => withDisplayDeviceLabel(record, 'local')).filter((r) => matchRecord(r, query))
+    const remoteOpen = [
+      ...groups.sameDeviceOpen.map((record) => withDisplayDeviceLabel(record, 'same-device')),
+      ...groups.remoteOpen.map((record) => withDisplayDeviceLabel(record, 'remote')),
+    ].filter((r) => matchRecord(r, query))
+    const closed = groups.closed.map((record) => withDisplayDeviceLabel(record, 'closed')).filter((r) => matchRecord(r, query))
 
     const byScope = (records: DisplayRecord[], scope: 'local' | 'remote') => {
       if (scopeMode === 'all') return records
@@ -623,8 +616,8 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     e.preventDefault()
     e.stopPropagation()
 
-    const isLocal = record.deviceId === deviceId
     const isOpen = record.status === 'open'
+    const isLocal = isOpen && record.registryScope === 'local'
     const items: MenuItem[] = []
 
     if (isLocal && isOpen) {
@@ -731,14 +724,15 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
             ariaLabel="Device scope filter"
           />
           <select
-            value={String(searchRangeDays)}
-            onChange={(e) => dispatch(setTabRegistrySearchRangeDays(Number(e.target.value)))}
+            value={String(effectiveClosedRetentionDays)}
+            onChange={(e) => dispatch(setTabRegistryClosedTabRetentionDays(Number(e.target.value)))}
             className="h-7 px-2 text-xs rounded-md border border-border bg-background text-muted-foreground"
             aria-label="Closed range filter"
           >
+            <option value="1">Last 1 day</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
             <option value="30">Last 30 days</option>
-            <option value="90">Last 90 days</option>
-            <option value="365">Last year</option>
           </select>
         </div>
       </div>

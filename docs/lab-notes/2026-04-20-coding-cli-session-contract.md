@@ -38,7 +38,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "codex": {
       "executable": "codex",
       "resolvedPath": "/home/user/.npm-global/bin/codex",
-      "version": "codex-cli 0.128.0",
+      "version": "codex-cli 0.129.0",
       "freshRemoteBootstrapCommand": "codex --remote <ws>",
       "freshRemoteBootstrapEventsBeforeUserTurn": [
         "connection",
@@ -61,8 +61,11 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       ],
       "remoteResumeBootstrapFollowupMethods": [
         "account/rateLimits/read",
+        "command/exec",
+        "hooks/list",
         "skills/list",
-        "skills/list"
+        "skills/list",
+        "thread/goal/get"
       ],
       "freshRemoteAllocatesThreadBeforeUserTurn": true,
       "shellSnapshotGlob": ".codex/shell_snapshots/*.sh",
@@ -95,7 +98,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.14.40",
+      "version": "1.14.41",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -139,10 +142,10 @@ command -v codex
 # /home/user/.npm-global/bin/codex
 
 codex --version
-# codex-cli 0.128.0
+# codex-cli 0.129.0
 ```
 
-This 2026-05-03 version refresh supersedes the older `codex-cli 0.125.0` capture. The current version of record on this machine is `codex-cli 0.128.0`.
+This 2026-05-07 version refresh supersedes the older `codex-cli 0.128.0` capture. The current version of record on this machine is `codex-cli 0.129.0`.
 
 Fresh remote bootstrap was probed with a loopback websocket stub and:
 
@@ -161,7 +164,7 @@ Before any user turn, the CLI opened a connection and issued:
 
 That proves fresh `codex --remote` allocates a thread during bootstrap, before the first user turn, but that thread allocation is not yet the durable contract Freshell may persist.
 
-The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued the stable prefix through `thread/resume`, and then the follow-up `skills/list` and `account/rateLimits/read` calls. The trailing post-resume follow-up order was observed to vary between reruns on the same binary, so only the stable prefix plus the required follow-up method set is treated as contract.
+The remote resume form was re-proved through a websocket proxy in front of the real app-server. Before any user turn, `codex --remote <ws> --no-alt-screen resume <sessionId>` issued the stable prefix through `thread/resume`, and then the follow-up `skills/list`, `account/rateLimits/read`, `command/exec`, `hooks/list`, and `thread/goal/get` calls. The trailing post-resume follow-up order was observed to vary between reruns on the same binary, so only the stable prefix plus the required follow-up method set is treated as contract.
 
 Real provider-owned durability was re-proved against the app-server websocket with:
 
@@ -290,7 +293,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.14.40
+# 1.14.41
 ```
 
 Fresh isolated runs were probed with:
@@ -315,7 +318,7 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.40`.
+- `/global/health` returned a healthy payload with version `1.14.41`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
 
