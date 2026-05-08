@@ -36,6 +36,7 @@ import { CSS } from '@dnd-kit/utilities'
 import type { Tab, TabAttentionStyle } from '@/store/types'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
@@ -132,6 +133,7 @@ const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 interface TabBarProps {
@@ -153,7 +155,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const opencodeActivityByTerminalId = useAppSelector((s) => s.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID)
-  const agentChatSessions = useAppSelector((s) => s.freshAgent?.sessions ?? s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const paneRuntimeActivityByPaneId = useAppSelector(
     (s) => s.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID
   )
@@ -213,7 +216,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     opencodeActivityByTerminalId,
     paneRuntimeActivityByPaneId,
     agentChatSessions,
-  }), [agentChatSessions, codexActivityByTerminalId, opencodeActivityByTerminalId, paneLayouts, paneRuntimeActivityByPaneId])
+    freshAgentSessions,
+  }), [agentChatSessions, codexActivityByTerminalId, freshAgentSessions, opencodeActivityByTerminalId, paneLayouts, paneRuntimeActivityByPaneId])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')

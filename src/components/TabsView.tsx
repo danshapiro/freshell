@@ -179,7 +179,8 @@ function sanitizePaneSnapshot(
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
       permissionMode: payload.permissionMode as string | undefined,
-      effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
+      sandbox: payload.sandbox as 'read-only' | 'workspace-write' | 'danger-full-access' | undefined,
+      effort: payload.effort as 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined,
       plugins: payload.plugins as string[] | undefined,
     }
   }

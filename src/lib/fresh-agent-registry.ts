@@ -17,7 +17,7 @@ export type FreshAgentRegistryEntry = {
   icon: React.ComponentType<{ className?: string }>
   defaultModel: string
   defaultPermissionMode: string
-  defaultEffort: 'low' | 'medium' | 'high' | 'max'
+  defaultEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
   settingsVisibility: {
     model: boolean
     permissionMode: boolean
@@ -58,7 +58,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     label: 'Freshcodex',
     icon: CodexIcon,
     defaultModel: 'gpt-5-codex',
-    defaultPermissionMode: 'bypassPermissions',
+    defaultPermissionMode: 'on-request',
     defaultEffort: 'high',
     settingsVisibility: {
       model: true,

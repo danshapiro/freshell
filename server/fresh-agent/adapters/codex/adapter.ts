@@ -1,4 +1,9 @@
-import type { FreshAgentCreateRequest, FreshAgentRuntimeAdapter } from '../../runtime-adapter.js'
+import type { FreshAgentCreateRequest, FreshAgentInputImage, FreshAgentRuntimeAdapter } from '../../runtime-adapter.js'
+import type {
+  CodexThreadForkParams,
+  CodexTurnInterruptParams,
+  CodexTurnStartParams,
+} from '../../../coding-cli/codex-app-server/protocol.js'
 import {
   normalizeCodexThreadSnapshot,
   normalizeCodexTurnBody,
@@ -11,6 +16,7 @@ type CodexRuntimePort = {
     model?: string
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
     approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never'
+    excludeTurns?: boolean
   }) => Promise<{ threadId: string; wsUrl: string }>
   resumeThread: (input: {
     threadId: string
@@ -19,6 +25,9 @@ type CodexRuntimePort = {
     sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
     approvalPolicy?: 'untrusted' | 'on-failure' | 'on-request' | 'never'
   }) => Promise<{ threadId: string; wsUrl: string }>
+  forkThread?: (input: CodexThreadForkParams) => Promise<{ threadId: string; wsUrl: string }>
+  startTurn?: (input: CodexTurnStartParams) => Promise<{ turnId: string }>
+  interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -36,9 +45,63 @@ function toCodexApprovalPolicy(value: string | undefined) {
   throw new Error(`Freshcodex does not support approval policy "${value}". Choose untrusted, on-failure, on-request, or never.`)
 }
 
+function toCodexReasoningEffort(value: FreshAgentCreateRequest['effort'] | undefined) {
+  if (value === undefined) return undefined
+  if (value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') {
+    return value
+  }
+  throw new Error(`Freshcodex does not support reasoning effort "${value}". Choose none, minimal, low, medium, high, or xhigh.`)
+}
+
+function toCodexSandboxPolicy(value: FreshAgentCreateRequest['sandbox'] | undefined): CodexTurnStartParams['sandboxPolicy'] {
+  switch (value) {
+    case undefined:
+      return undefined
+    case 'danger-full-access':
+      return { type: 'dangerFullAccess' }
+    case 'read-only':
+      return { type: 'readOnly' }
+    case 'workspace-write':
+      return { type: 'workspaceWrite' }
+    default:
+      throw new Error(`Freshcodex does not support sandbox "${String(value)}".`)
+  }
+}
+
+function toCodexUserInput(text: string, images: FreshAgentInputImage[] | undefined): CodexTurnStartParams['input'] {
+  const input: CodexTurnStartParams['input'] = [{
+    type: 'text',
+    text,
+    text_elements: [],
+  }]
+  for (const image of images ?? []) {
+    if (image.kind === 'url') {
+      input.push({ type: 'image', url: image.url })
+    } else if (image.kind === 'local') {
+      input.push({ type: 'localImage', path: image.path })
+    } else {
+      input.push({ type: 'image', url: `data:${image.mediaType};base64,${image.data}` })
+    }
+  }
+  return input
+}
+
+function normalizeCodexThreadStatus(status: unknown): string {
+  if (!status || typeof status !== 'object') return 'idle'
+  const type = (status as { type?: unknown }).type
+  if (type === 'active') return 'running'
+  if (type === 'notLoaded') return 'starting'
+  if (type === 'systemError') return 'exited'
+  if (type === 'idle') return 'idle'
+  return 'idle'
+}
+
 export function createCodexFreshAgentAdapter(deps: {
   runtime: CodexRuntimePort
 }): FreshAgentRuntimeAdapter {
+  const activeTurnByThread = new Map<string, string>()
+  const settingsByThread = new Map<string, FreshAgentCreateRequest>()
+
   return {
     runtimeProvider: 'codex',
 
@@ -46,8 +109,11 @@ export function createCodexFreshAgentAdapter(deps: {
       const started = await deps.runtime.startThread({
         cwd: input.cwd,
         model: input.model,
+        sandbox: input.sandbox,
         approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
+        excludeTurns: true,
       })
+      settingsByThread.set(started.threadId, input)
       return { sessionId: started.threadId }
     },
 
@@ -59,9 +125,60 @@ export function createCodexFreshAgentAdapter(deps: {
         threadId: input.resumeSessionId,
         cwd: input.cwd,
         model: input.model,
+        sandbox: input.sandbox,
         approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
       })
+      settingsByThread.set(resumed.threadId, input)
       return { sessionId: resumed.threadId }
+    },
+
+    async send(sessionId, input) {
+      if (!deps.runtime.startTurn) {
+        throw new Error('Codex app-server runtime does not support turn/start.')
+      }
+      const settings = {
+        ...settingsByThread.get(sessionId),
+        ...input.settings,
+      }
+      const turn = await deps.runtime.startTurn({
+        threadId: sessionId,
+        input: toCodexUserInput(input.text, input.images),
+        cwd: settings.cwd,
+        approvalPolicy: toCodexApprovalPolicy(settings.permissionMode),
+        sandboxPolicy: toCodexSandboxPolicy(settings.sandbox),
+        model: settings.model,
+        effort: toCodexReasoningEffort(settings.effort),
+      })
+      activeTurnByThread.set(sessionId, turn.turnId)
+    },
+
+    async interrupt(sessionId) {
+      if (!deps.runtime.interruptTurn) {
+        throw new Error('Codex app-server runtime does not support turn/interrupt.')
+      }
+      const turnId = activeTurnByThread.get(sessionId)
+      if (!turnId) {
+        throw new Error(`No active Codex turn is tracked for ${sessionId}.`)
+      }
+      await deps.runtime.interruptTurn({ threadId: sessionId, turnId })
+      activeTurnByThread.delete(sessionId)
+    },
+
+    async fork(sessionId, input) {
+      if (!deps.runtime.forkThread) {
+        throw new Error('Codex app-server runtime does not support thread/fork.')
+      }
+      const settings = settingsByThread.get(sessionId)
+      return await deps.runtime.forkThread({
+        threadId: sessionId,
+        cwd: typeof input?.cwd === 'string' ? input.cwd : settings?.cwd,
+        model: typeof input?.model === 'string' ? input.model : settings?.model,
+        sandbox: typeof input?.sandbox === 'string' ? input.sandbox as FreshAgentCreateRequest['sandbox'] : settings?.sandbox,
+        approvalPolicy: toCodexApprovalPolicy(
+          typeof input?.permissionMode === 'string' ? input.permissionMode : settings?.permissionMode,
+        ),
+        excludeTurns: true,
+      })
     },
 
     async getSnapshot(thread, revision) {
@@ -69,7 +186,7 @@ export function createCodexFreshAgentAdapter(deps: {
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0),
-        status: typeof rawSnapshot.thread?.status?.type === 'string' ? rawSnapshot.thread.status.type : 'idle',
+        status: normalizeCodexThreadStatus(rawSnapshot.thread?.status),
         transcript: {
           turns: [],
         },

@@ -224,6 +224,7 @@ export function normalizeCodexThreadSnapshot(input: {
   rawSnapshot: CodexRawSnapshot
 }) {
   const extensions = input.rawSnapshot.extension?.codex ?? {}
+  const isRunning = input.status === 'running' || input.status === 'compacting'
   return FreshAgentSnapshotSchema.parse({
     sessionType: 'freshcodex',
     provider: 'codex' as const,
@@ -232,11 +233,11 @@ export function normalizeCodexThreadSnapshot(input: {
     status: input.status,
     summary: input.rawSnapshot.summary ?? input.transcript.turns[0]?.summary ?? '',
     capabilities: {
-      send: false,
-      interrupt: false,
+      send: !isRunning,
+      interrupt: isRunning,
       approvals: false,
       questions: false,
-      fork: false,
+      fork: !isRunning,
       worktrees: (input.rawSnapshot.worktrees?.length ?? 0) > 0,
       diffs: (input.rawSnapshot.diffs?.length ?? 0) > 0,
       childThreads: (input.rawSnapshot.childThreads?.length ?? 0) > 0,

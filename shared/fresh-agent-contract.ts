@@ -304,8 +304,11 @@ export const FRESH_AGENT_CONTRACT_SCHEMA_NAMES = [
 ] as const
 
 export type FreshAgentThreadLocator = z.infer<typeof FreshAgentThreadLocatorSchema>
+export type FreshAgentRequestId = z.infer<typeof FreshAgentRequestIdSchema>
 export type FreshAgentTranscriptItem = z.infer<typeof FreshAgentTranscriptItemSchema>
 export type FreshAgentTurn = z.infer<typeof FreshAgentTurnSchema>
+export type FreshAgentPendingApproval = z.infer<typeof FreshAgentPendingApprovalSchema>
+export type FreshAgentPendingQuestion = z.infer<typeof FreshAgentPendingQuestionSchema>
 export type FreshAgentSnapshot = z.infer<typeof FreshAgentSnapshotSchema>
 export type FreshAgentTurnPage = z.infer<typeof FreshAgentTurnPageSchema>
 export type FreshAgentTurnBody = z.infer<typeof FreshAgentTurnBodySchema>

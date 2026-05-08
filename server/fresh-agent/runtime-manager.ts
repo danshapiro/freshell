@@ -1,6 +1,22 @@
-import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
+import {
+  makeFreshAgentSessionKey,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../../shared/fresh-agent.js'
+import {
+  FreshAgentSnapshotSchema,
+  FreshAgentTurnBodySchema,
+  FreshAgentTurnPageSchema,
+  type FreshAgentRequestId,
+} from '../../shared/fresh-agent-contract.js'
 import type { FreshAgentProviderRegistry } from './provider-registry.js'
-import type { FreshAgentCreateRequest, FreshAgentCreateResult, FreshAgentRuntimeAdapter } from './runtime-adapter.js'
+import type {
+  FreshAgentCreateRequest,
+  FreshAgentCreateResult,
+  FreshAgentInputImage,
+  FreshAgentRuntimeAdapter,
+  FreshAgentSessionLocator,
+} from './runtime-adapter.js'
 
 export class FreshAgentRuntimeUnavailableError extends Error {
   readonly code = 'FRESH_AGENT_RUNTIME_UNAVAILABLE' as const
@@ -22,6 +38,18 @@ export class FreshAgentLostSessionError extends Error {
   readonly code = 'FRESH_AGENT_LOST_SESSION' as const
 }
 
+export class FreshAgentSessionLocatorMismatchError extends Error {
+  readonly code = 'FRESH_AGENT_SESSION_LOCATOR_MISMATCH' as const
+}
+
+export class FreshAgentContractValidationError extends Error {
+  readonly code = 'FRESH_AGENT_CONTRACT_INVALID' as const
+
+  constructor(readonly surface: 'snapshot' | 'turn-page' | 'turn-body', readonly details: unknown) {
+    super(`Fresh-agent ${surface} did not match the shared contract`)
+  }
+}
+
 type FreshAgentRuntimeManagerOptions = {
   registry: FreshAgentProviderRegistry
 }
@@ -38,15 +66,16 @@ export class FreshAgentRuntimeManager {
   constructor(private readonly options: FreshAgentRuntimeManagerOptions) {}
 
   async create(input: FreshAgentCreateRequest): Promise<FreshAgentCreateResult> {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (!registration) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${input.sessionType}`)
-    }
+    const registration = this.requireRegistration(input.sessionType, input.provider)
 
     const created = input.resumeSessionId && registration.adapter.resume
       ? await registration.adapter.resume(input)
       : await registration.adapter.create(input)
-    this.sessions.set(created.sessionId, {
+    this.sessions.set(this.key({
+      sessionType: input.sessionType,
+      provider: registration.runtimeProvider,
+      sessionId: created.sessionId,
+    }), {
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
@@ -58,13 +87,10 @@ export class FreshAgentRuntimeManager {
     }
   }
 
-  attach(input: { sessionId: string; sessionType: FreshAgentSessionType }): FreshAgentCreateResult {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (!registration) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${input.sessionType}`)
-    }
+  attach(input: FreshAgentSessionLocator): FreshAgentCreateResult {
+    const registration = this.requireRegistration(input.sessionType, input.provider)
 
-    this.sessions.set(input.sessionId, {
+    this.sessions.set(this.key(input), {
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
@@ -78,15 +104,16 @@ export class FreshAgentRuntimeManager {
   }
 
   async resume(input: FreshAgentCreateRequest): Promise<FreshAgentCreateResult> {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (!registration) {
-      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${input.sessionType}`)
-    }
+    const registration = this.requireRegistration(input.sessionType, input.provider)
     if (!registration.adapter.resume) {
       throw new FreshAgentUnsupportedCapabilityError(`Resume is not supported for ${input.sessionType}`)
     }
     const resumed = await registration.adapter.resume(input)
-    this.sessions.set(resumed.sessionId, {
+    this.sessions.set(this.key({
+      sessionType: input.sessionType,
+      provider: registration.runtimeProvider,
+      sessionId: resumed.sessionId,
+    }), {
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
@@ -98,64 +125,64 @@ export class FreshAgentRuntimeManager {
     }
   }
 
-  async subscribe(sessionId: string, listener: (message: unknown) => void) {
-    const record = this.requireSession(sessionId)
+  async subscribe(locator: FreshAgentSessionLocator, listener: (message: unknown) => void) {
+    const record = this.requireSession(locator)
     if (!record.adapter.subscribe) {
       throw new FreshAgentUnsupportedCapabilityError(`Subscribe is not supported for ${record.sessionType}`)
     }
-    return await record.adapter.subscribe(sessionId, listener)
+    return await record.adapter.subscribe(locator.sessionId, listener)
   }
 
-  async send(sessionId: string, input: { text: string; images?: Array<{ mediaType: string; data: string }> }) {
-    const record = this.requireSession(sessionId)
+  async send(locator: FreshAgentSessionLocator, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }) {
+    const record = this.requireSession(locator)
     if (!record.adapter.send) {
       throw new FreshAgentUnsupportedCapabilityError(`Send is not supported for ${record.sessionType}`)
     }
-    await record.adapter.send(sessionId, input)
+    await record.adapter.send(locator.sessionId, input)
   }
 
-  async interrupt(sessionId: string) {
-    const record = this.requireSession(sessionId)
+  async interrupt(locator: FreshAgentSessionLocator) {
+    const record = this.requireSession(locator)
     if (!record.adapter.interrupt) {
       throw new FreshAgentUnsupportedCapabilityError(`Interrupt is not supported for ${record.sessionType}`)
     }
-    await record.adapter.interrupt(sessionId)
+    await record.adapter.interrupt(locator.sessionId)
   }
 
-  async kill(sessionId: string): Promise<boolean> {
-    const record = this.requireSession(sessionId)
+  async kill(locator: FreshAgentSessionLocator): Promise<boolean> {
+    const record = this.requireSession(locator)
     try {
       if (record.adapter.kill) {
-        return await record.adapter.kill(sessionId)
+        return await record.adapter.kill(locator.sessionId)
       }
       return true
     } finally {
-      this.sessions.delete(sessionId)
+      this.sessions.delete(this.key(locator))
     }
   }
 
-  async fork(sessionId: string, input?: Record<string, unknown>) {
-    const record = this.requireSession(sessionId)
+  async fork(locator: FreshAgentSessionLocator, input?: Record<string, unknown>) {
+    const record = this.requireSession(locator)
     if (!record.adapter.fork) {
       throw new FreshAgentUnsupportedCapabilityError(`Fork is not supported for ${record.sessionType}`)
     }
-    return await record.adapter.fork(sessionId, input)
+    return await record.adapter.fork(locator.sessionId, input)
   }
 
-  async answerQuestion(sessionId: string, requestId: string, answers: Record<string, string>) {
-    const record = this.requireSession(sessionId)
+  async answerQuestion(locator: FreshAgentSessionLocator, requestId: FreshAgentRequestId, answers: Record<string, string>) {
+    const record = this.requireSession(locator)
     if (!record.adapter.answerQuestion) {
       throw new FreshAgentUnsupportedCapabilityError(`Questions are not supported for ${record.sessionType}`)
     }
-    await record.adapter.answerQuestion(sessionId, requestId, answers)
+    await record.adapter.answerQuestion(locator.sessionId, requestId, answers)
   }
 
-  async resolveApproval(sessionId: string, requestId: string, decision: Record<string, unknown>) {
-    const record = this.requireSession(sessionId)
+  async resolveApproval(locator: FreshAgentSessionLocator, requestId: FreshAgentRequestId, decision: Record<string, unknown>) {
+    const record = this.requireSession(locator)
     if (!record.adapter.resolveApproval) {
       throw new FreshAgentUnsupportedCapabilityError(`Approvals are not supported for ${record.sessionType}`)
     }
-    await record.adapter.resolveApproval(sessionId, requestId, decision)
+    await record.adapter.resolveApproval(locator.sessionId, requestId, decision)
   }
 
   async getSnapshot(input: {
@@ -164,20 +191,20 @@ export class FreshAgentRuntimeManager {
     threadId: string
     revision?: number
   }) {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (registration && registration.runtimeProvider !== input.provider) {
-      throw new FreshAgentRuntimeUnavailableError(
-        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
-      )
-    }
+    const registration = this.requireRegistration(input.sessionType, input.provider)
     if (!registration?.adapter.getSnapshot) {
       throw new FreshAgentRuntimeUnavailableError(`No fresh-agent snapshot adapter registered for ${input.sessionType}`)
     }
-    return await registration.adapter.getSnapshot({
+    const snapshot = await registration.adapter.getSnapshot({
       sessionType: input.sessionType,
       provider: input.provider,
       threadId: input.threadId,
     }, input.revision)
+    const parsed = FreshAgentSnapshotSchema.safeParse(snapshot)
+    if (!parsed.success) {
+      throw new FreshAgentContractValidationError('snapshot', parsed.error.issues)
+    }
+    return parsed.data
   }
 
   async getTurnPage(input: {
@@ -190,19 +217,19 @@ export class FreshAgentRuntimeManager {
     limit?: number
     includeBodies?: boolean
   }) {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (registration && registration.runtimeProvider !== input.provider) {
-      throw new FreshAgentRuntimeUnavailableError(
-        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
-      )
-    }
+    const registration = this.requireRegistration(input.sessionType, input.provider)
     if (!registration?.adapter.getTurnPage) {
       throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-page adapter registered for ${input.sessionType}`)
     }
-    return await registration.adapter.getTurnPage(
+    const page = await registration.adapter.getTurnPage(
       { sessionType: input.sessionType, provider: input.provider, threadId: input.threadId },
       input,
     )
+    const parsed = FreshAgentTurnPageSchema.safeParse(page)
+    if (!parsed.success) {
+      throw new FreshAgentContractValidationError('turn-page', parsed.error.issues)
+    }
+    return parsed.data
   }
 
   async getTurnBody(input: {
@@ -212,16 +239,11 @@ export class FreshAgentRuntimeManager {
     turnId: string
     revision: number
   }) {
-    const registration = this.options.registry.resolveBySessionType(input.sessionType)
-    if (registration && registration.runtimeProvider !== input.provider) {
-      throw new FreshAgentRuntimeUnavailableError(
-        `Fresh-agent session type ${input.sessionType} uses ${registration.runtimeProvider}, not ${input.provider}`,
-      )
-    }
+    const registration = this.requireRegistration(input.sessionType, input.provider)
     if (!registration?.adapter.getTurnBody) {
       throw new FreshAgentRuntimeUnavailableError(`No fresh-agent turn-body adapter registered for ${input.sessionType}`)
     }
-    return await registration.adapter.getTurnBody(
+    const body = await registration.adapter.getTurnBody(
       {
         sessionType: input.sessionType,
         provider: input.provider,
@@ -230,12 +252,41 @@ export class FreshAgentRuntimeManager {
       },
       input.revision,
     )
+    const parsed = FreshAgentTurnBodySchema.safeParse(body)
+    if (!parsed.success) {
+      throw new FreshAgentContractValidationError('turn-body', parsed.error.issues)
+    }
+    return parsed.data
   }
 
-  private requireSession(sessionId: string): SessionRecord {
-    const record = this.sessions.get(sessionId)
+  private requireRegistration(sessionType: FreshAgentSessionType, provider?: FreshAgentRuntimeProvider) {
+    const registration = this.options.registry.resolveBySessionType(sessionType)
+    if (!registration) {
+      throw new FreshAgentRuntimeUnavailableError(`No fresh-agent adapter registered for ${sessionType}`)
+    }
+    if (provider && registration.runtimeProvider !== provider) {
+      throw new FreshAgentSessionLocatorMismatchError(
+        `Fresh-agent session type ${sessionType} uses ${registration.runtimeProvider}, not ${provider}`,
+      )
+    }
+    return registration
+  }
+
+  private key(locator: FreshAgentSessionLocator): string {
+    return makeFreshAgentSessionKey(locator)
+  }
+
+  private requireSession(locator: FreshAgentSessionLocator): SessionRecord {
+    const record = this.sessions.get(this.key(locator))
     if (!record) {
-      throw new FreshAgentLostSessionError(`Fresh-agent session ${sessionId} is not tracked`)
+      throw new FreshAgentLostSessionError(
+        `Fresh-agent session ${locator.sessionType}/${locator.provider}/${locator.sessionId} is not tracked`,
+      )
+    }
+    if (record.sessionType !== locator.sessionType || record.runtimeProvider !== locator.provider) {
+      throw new FreshAgentSessionLocatorMismatchError(
+        `Fresh-agent session ${locator.sessionId} is tracked as ${record.sessionType}/${record.runtimeProvider}, not ${locator.sessionType}/${locator.provider}`,
+      )
     }
     return record
   }

@@ -1,4 +1,5 @@
 import type { AppDispatch } from '@/store/store'
+import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import {
   clearPendingCreateFailure,
   createFailed,
@@ -16,6 +17,9 @@ type FreshAgentCreatedMessage = {
   type: 'freshAgent.created'
   requestId: string
   sessionId: string
+  sessionType: FreshAgentSessionType
+  provider?: FreshAgentRuntimeProvider
+  runtimeProvider?: FreshAgentRuntimeProvider
 }
 
 type FreshAgentCreateFailedMessage = {
@@ -31,16 +35,24 @@ type FreshAgentClientMessage = FreshAgentCreatedMessage | FreshAgentCreateFailed
 type FreshAgentEventMessage = {
   type: 'freshAgent.event'
   sessionId: string
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
   event: Record<string, unknown>
 }
 
 export function registerFreshAgentCreate(
   dispatch: AppDispatch,
   requestId: string,
-  options: { resumeSessionId?: string } = {},
+  options: {
+    resumeSessionId?: string
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+  },
 ): void {
   dispatch(registerPendingCreate({
     requestId,
+    sessionType: options.sessionType,
+    provider: options.provider,
     expectsHistoryHydration: Boolean(options.resumeSessionId),
   }))
   dispatch(clearPendingCreateFailure({ requestId }))
@@ -53,6 +65,8 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
       dispatch(sessionCreated({
         requestId: created.requestId,
         sessionId: created.sessionId,
+        sessionType: created.sessionType,
+        provider: created.provider ?? created.runtimeProvider,
       }))
       return true
     }
@@ -80,10 +94,16 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
     : (typeof event.sessionId === 'string' ? event.sessionId : undefined)
   if (!sessionId || typeof event?.type !== 'string') return false
 
+  const locator = {
+    sessionId,
+    sessionType: msg.sessionType,
+    provider: msg.provider,
+  }
+
   switch (event.type) {
     case 'sdk.session.snapshot':
       dispatch(sessionSnapshotReceived({
-        sessionId,
+        ...locator,
         latestTurnId: (event.latestTurnId as string | null | undefined) ?? null,
         status: event.status as never,
         timelineSessionId: event.timelineSessionId as string | undefined,
@@ -94,7 +114,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     case 'sdk.session.init':
       dispatch(sessionInit({
-        sessionId,
+        ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
         model: event.model as string | undefined,
         cwd: event.cwd as string | undefined,
@@ -103,7 +123,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     case 'sdk.session.metadata':
       dispatch(sessionMetadataReceived({
-        sessionId,
+        ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
         model: event.model as string | undefined,
         cwd: event.cwd as string | undefined,
@@ -112,16 +132,16 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       return true
     case 'sdk.status':
       dispatch(setSessionStatus({
-        sessionId,
+        ...locator,
         status: event.status as never,
       }))
       return true
     case 'sdk.error':
       if (event.code === 'INVALID_SESSION_ID') {
-        dispatch(markSessionLost({ sessionId }))
+        dispatch(markSessionLost(locator))
       } else {
         dispatch(sessionError({
-          sessionId,
+          ...locator,
           code: event.code as string | undefined,
           message: (event.message as string) || (event.error as string) || 'Unknown error',
         }))

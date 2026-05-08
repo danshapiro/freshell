@@ -89,6 +89,12 @@ import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
 import type { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import {
+  makeFreshAgentSessionKey,
+  resolveFreshAgentRuntimeProvider,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../shared/fresh-agent.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -1721,34 +1727,49 @@ export class WsHandler {
   private registerClientFreshAgentSession(
     ws: LiveWebSocket,
     state: ClientState,
-    sessionId: string,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
   ): void {
-    state.freshAgentSessions.add(sessionId)
-    const existing = state.freshAgentSubscriptions.get(sessionId)
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.add(key)
+    const existing = state.freshAgentSubscriptions.get(key)
     if (existing) {
       return
     }
     if (!this.freshAgentRuntimeManager) {
       return
     }
-    void this.freshAgentRuntimeManager.subscribe(sessionId, (event) => {
-      if (!state.freshAgentSessions.has(sessionId)) return
+    void this.freshAgentRuntimeManager.subscribe(locator, (event) => {
+      if (!state.freshAgentSessions.has(key)) return
       this.safeSend(ws, {
         type: 'freshAgent.event',
-        sessionId,
+        sessionId: locator.sessionId,
+        sessionType: locator.sessionType,
+        provider: locator.provider,
         event,
       })
     }).then((off) => {
-      state.freshAgentSubscriptions.set(sessionId, off)
+      state.freshAgentSubscriptions.set(key, off)
     }).catch(() => undefined)
   }
 
-  private clearClientFreshAgentSession(state: ClientState, sessionId: string): void {
-    state.freshAgentSessions.delete(sessionId)
-    const off = state.freshAgentSubscriptions.get(sessionId)
+  private clearClientFreshAgentSession(
+    state: ClientState,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
+  ): void {
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.delete(key)
+    const off = state.freshAgentSubscriptions.get(key)
     if (off) {
       off()
-      state.freshAgentSubscriptions.delete(sessionId)
+      state.freshAgentSubscriptions.delete(key)
     }
   }
 
@@ -3094,14 +3115,27 @@ export class WsHandler {
           } as const)
           return
         }
+        const provider = m.provider ?? resolveFreshAgentRuntimeProvider(m.sessionType)
+        if (!provider) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: `No runtime provider is registered for ${m.sessionType}`,
+            retryable: false,
+          } as const)
+          return
+        }
         try {
           const created = await this.freshAgentRuntimeManager.create({
             requestId: m.requestId,
             sessionType: m.sessionType,
+            provider,
             cwd: m.cwd,
             resumeSessionId: m.resumeSessionId,
             model: m.model,
             permissionMode: m.permissionMode,
+            sandbox: m.sandbox,
             effort: m.effort,
             plugins: m.plugins,
           })
@@ -3110,9 +3144,14 @@ export class WsHandler {
             requestId: m.requestId,
             sessionId: created.sessionId,
             sessionType: created.sessionType,
+            provider: created.runtimeProvider,
             runtimeProvider: created.runtimeProvider,
           } as const)
-          this.registerClientFreshAgentSession(ws, state, created.sessionId)
+          this.registerClientFreshAgentSession(ws, state, {
+            sessionId: created.sessionId,
+            sessionType: created.sessionType,
+            provider: created.runtimeProvider,
+          })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
           const code = error && typeof error === 'object' && 'code' in error
@@ -3138,8 +3177,13 @@ export class WsHandler {
           const attached = this.freshAgentRuntimeManager.attach({
             sessionId: m.sessionId,
             sessionType: m.sessionType,
+            provider: m.provider,
           })
-          this.registerClientFreshAgentSession(ws, state, attached.sessionId)
+          this.registerClientFreshAgentSession(ws, state, {
+            sessionId: attached.sessionId,
+            sessionType: attached.sessionType,
+            provider: attached.runtimeProvider,
+          })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to attach fresh-agent session'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
@@ -3152,14 +3196,15 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          await this.freshAgentRuntimeManager.send(m.sessionId, {
+          await this.freshAgentRuntimeManager.send(locator, {
             text: m.text,
-            images: m.images,
+            images: m.images?.map((image: { mediaType: string; data: string }) => ({ kind: 'data' as const, ...image })),
           })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to send fresh-agent message'
@@ -3173,12 +3218,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          await this.freshAgentRuntimeManager.interrupt(m.sessionId)
+          await this.freshAgentRuntimeManager.interrupt(locator)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to interrupt fresh-agent session'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
@@ -3191,12 +3237,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          await this.freshAgentRuntimeManager.resolveApproval(m.sessionId, m.requestId, m.decision)
+          await this.freshAgentRuntimeManager.resolveApproval(locator, m.requestId, m.decision)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to resolve fresh-agent approval'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
@@ -3209,12 +3256,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          await this.freshAgentRuntimeManager.answerQuestion(m.sessionId, m.requestId, m.answers)
+          await this.freshAgentRuntimeManager.answerQuestion(locator, m.requestId, m.answers)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to answer fresh-agent question'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
@@ -3227,14 +3275,21 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          const killed = await this.freshAgentRuntimeManager.kill(m.sessionId)
-          this.clearClientFreshAgentSession(state, m.sessionId)
-          this.send(ws, { type: 'freshAgent.killed', sessionId: m.sessionId, success: killed })
+          const killed = await this.freshAgentRuntimeManager.kill(locator)
+          this.clearClientFreshAgentSession(state, locator)
+          this.send(ws, {
+            type: 'freshAgent.killed',
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+            success: killed,
+          })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to kill fresh-agent session'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
@@ -3247,12 +3302,13 @@ export class WsHandler {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
           return
         }
-        if (!state.freshAgentSessions.has(m.sessionId)) {
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
           this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
           return
         }
         try {
-          await this.freshAgentRuntimeManager.fork(m.sessionId, m.input)
+          await this.freshAgentRuntimeManager.fork(locator, m.input)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to fork fresh-agent session'
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message })

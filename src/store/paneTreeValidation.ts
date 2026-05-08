@@ -63,10 +63,17 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.initialCwd)
         && isOptionalString(content.model)
         && isOptionalString(content.permissionMode)
+        && (content.sandbox === undefined
+          || content.sandbox === 'read-only'
+          || content.sandbox === 'workspace-write'
+          || content.sandbox === 'danger-full-access')
         && (content.effort === undefined
+          || content.effort === 'none'
+          || content.effort === 'minimal'
           || content.effort === 'low'
           || content.effort === 'medium'
           || content.effort === 'high'
+          || content.effort === 'xhigh'
           || content.effort === 'max')
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))

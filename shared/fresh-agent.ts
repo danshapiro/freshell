@@ -2,6 +2,16 @@ export type FreshAgentSessionType = 'freshclaude' | 'freshcodex' | 'kilroy' | 'f
 
 export type FreshAgentRuntimeProvider = 'claude' | 'codex' | 'opencode'
 
+export type FreshAgentThreadIdentity = {
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  threadId: string
+}
+
+export type FreshAgentSessionIdentity = Omit<FreshAgentThreadIdentity, 'threadId'> & {
+  sessionId: string
+}
+
 export type FreshAgentCompatibilityShape = {
   kind?: unknown
   provider?: unknown
@@ -72,6 +82,18 @@ export function resolveFreshAgentRuntimeProvider(
   sessionType: string | undefined,
 ): FreshAgentRuntimeProvider | undefined {
   return getFreshAgentDescriptor(sessionType)?.runtimeProvider
+}
+
+export function makeFreshAgentThreadKey(identity: FreshAgentThreadIdentity): string {
+  return `${identity.sessionType}:${identity.provider}:${identity.threadId}`
+}
+
+export function makeFreshAgentSessionKey(identity: FreshAgentSessionIdentity): string {
+  return makeFreshAgentThreadKey({
+    sessionType: identity.sessionType,
+    provider: identity.provider,
+    threadId: identity.sessionId,
+  })
 }
 
 export function normalizeFreshAgentSessionType(

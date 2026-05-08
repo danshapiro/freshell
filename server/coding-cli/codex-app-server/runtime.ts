@@ -14,12 +14,15 @@ import type {
   CodexThreadOperationResult,
   CodexThreadReadParams,
   CodexThreadReadResult,
+  CodexThreadForkParams,
   CodexThreadResumeParams,
   CodexThreadStartParams,
   CodexThreadTurnReadParams,
   CodexThreadTurnReadResult,
   CodexThreadTurnsListParams,
   CodexThreadTurnsListResult,
+  CodexTurnInterruptParams,
+  CodexTurnStartParams,
 } from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
@@ -652,6 +655,21 @@ export class CodexAppServerRuntime {
     return this.client!.watchPath(targetPath, watchId)
   }
 
+  async unwatchPath(watchId: string): Promise<void> {
+    await this.ensureReady()
+    await this.client!.unwatchPath(watchId)
+  }
+
+  async forkThread(
+    params: CodexThreadForkParams,
+  ): Promise<{ threadId: string; wsUrl: string }> {
+    const ready = await this.ensureReady()
+    return {
+      ...(await this.client!.forkThread(params)),
+      wsUrl: ready.wsUrl,
+    }
+  }
+
   async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
     await this.ensureReady()
     return await this.client!.readThread(params)
@@ -667,9 +685,14 @@ export class CodexAppServerRuntime {
     return await this.client!.readThreadTurn(params)
   }
 
-  async unwatchPath(watchId: string): Promise<void> {
+  async startTurn(params: CodexTurnStartParams): Promise<{ turnId: string }> {
     await this.ensureReady()
-    await this.client!.unwatchPath(watchId)
+    return await this.client!.startTurn(params)
+  }
+
+  async interruptTurn(params: CodexTurnInterruptParams): Promise<void> {
+    await this.ensureReady()
+    await this.client!.interruptTurn(params)
   }
 
   async updateOwnershipMetadata(input: {

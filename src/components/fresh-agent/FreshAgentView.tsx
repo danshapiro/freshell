@@ -10,6 +10,7 @@ import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
+import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
@@ -60,57 +61,23 @@ function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLab
   }
 }
 
-type FreshAgentSnapshot = {
-  revision: number
-  status?: string
-  summary?: string
-  capabilities?: Record<string, boolean>
-  extensions?: {
-    codex?: {
-      review?: {
-        id?: string
-        status?: string
-      }
-      fork?: {
-        parentThreadId?: string
-      }
-    }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readCodexReview(value: unknown): { id?: string; status?: string } | undefined {
+  if (!isRecord(value)) return undefined
+  return {
+    id: typeof value.id === 'string' ? value.id : undefined,
+    status: typeof value.status === 'string' ? value.status : undefined,
   }
-  tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number }
-  worktrees?: Array<{ id: string; path: string; branch?: string }>
-  diffs?: Array<{ id: string; path?: string; title?: string }>
-  childThreads?: Array<{ id: string; threadId: string; origin?: string; title?: string }>
-  pendingApprovals?: Array<{
-    requestId: string
-    toolName?: string
-    toolUseID?: string
-    blockedPath?: string
-    decisionReason?: string
-    input?: Record<string, unknown>
-  }>
-  pendingQuestions?: Array<{
-    requestId: string
-    questions?: Array<{
-      question: string
-      header?: string
-      options?: Array<{ label: string; description: string }>
-      multiSelect?: boolean
-    }>
-  }>
-  turns?: Array<{
-    id: string
-    role: 'user' | 'assistant'
-    summary?: string
-    items?: Array<{
-      id: string
-      kind: 'text' | 'thinking' | 'tool_use' | 'tool_result'
-      text?: string
-      name?: string
-      input?: Record<string, unknown>
-      content?: unknown
-      isError?: boolean
-    }>
-  }>
+}
+
+function readCodexFork(value: unknown): { parentThreadId?: string } | undefined {
+  if (!isRecord(value)) return undefined
+  return {
+    parentThreadId: typeof value.parentThreadId === 'string' ? value.parentThreadId : undefined,
+  }
 }
 
 export function FreshAgentView({
@@ -194,14 +161,18 @@ export function FreshAgentView({
       type: 'freshAgent.create',
       requestId: paneContent.createRequestId,
       sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
       cwd: paneContent.initialCwd,
       resumeSessionId: paneContent.resumeSessionId,
       model: paneContent.model,
       permissionMode: paneContent.permissionMode,
+      sandbox: paneContent.sandbox,
       effort: paneContent.effort,
       plugins: paneContent.plugins,
     } as const
     registerFreshAgentCreate(dispatch, paneContent.createRequestId, {
+      sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
     })
     sendFreshAgentMessage(createMessage)
@@ -215,6 +186,7 @@ export function FreshAgentView({
     paneContent.permissionMode,
     paneContent.plugins,
     paneContent.resumeSessionId,
+    paneContent.sandbox,
     paneContent.sessionId,
     paneContent.sessionType,
   ])
@@ -225,9 +197,10 @@ export function FreshAgentView({
       type: 'freshAgent.attach',
       sessionId: paneContent.sessionId,
       sessionType: paneContent.sessionType,
+      provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
     })
-  }, [hidden, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
+  }, [hidden, paneContent.provider, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
@@ -260,10 +233,17 @@ export function FreshAgentView({
           },
         }))
       }
-      if (message.type === 'freshAgent.event' && message.sessionId === paneContent.sessionId) {
+      if (
+        message.type === 'freshAgent.event'
+        && message.sessionId === paneContent.sessionId
+        && message.sessionType === paneContent.sessionType
+        && message.provider === paneContent.provider
+      ) {
         handleFreshAgentTransportEvent(dispatch, {
           type: 'freshAgent.event',
           sessionId: message.sessionId,
+          sessionType: message.sessionType,
+          provider: message.provider,
           event: (message.event ?? {}) as Record<string, unknown>,
         })
         setSnapshotRefreshNonce((value) => value + 1)
@@ -392,8 +372,8 @@ export function FreshAgentView({
     const worktrees = snapshot?.worktrees ?? []
     const childThreads = snapshot?.childThreads ?? []
     const diffs = snapshot?.diffs ?? []
-    const codexReview = snapshot?.extensions?.codex?.review
-    const codexFork = snapshot?.extensions?.codex?.fork
+    const codexReview = readCodexReview(snapshot?.extensions?.codex?.review)
+    const codexFork = readCodexFork(snapshot?.extensions?.codex?.fork)
     const effectiveStatus = paneContent.provider === 'claude'
       ? (claudeSessionStatus ?? paneContent.status)
       : paneContent.status
@@ -441,6 +421,8 @@ export function FreshAgentView({
                   sendFreshAgentMessage({
                     type: 'freshAgent.interrupt',
                     sessionId: paneContent.sessionId,
+                    sessionType: paneContent.sessionType,
+                    provider: paneContent.provider,
                   })
                 }}
               >
@@ -455,6 +437,8 @@ export function FreshAgentView({
                   sendFreshAgentMessage({
                     type: 'freshAgent.fork',
                     sessionId: paneContent.sessionId,
+                    sessionType: paneContent.sessionType,
+                    provider: paneContent.provider,
                   })
                 }}
               >
@@ -497,9 +481,9 @@ export function FreshAgentView({
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
               {pendingApprovals.map((approval) => (
                 <PermissionBanner
-                  key={approval.requestId}
+                  key={String(approval.requestId)}
                   permission={{
-                    requestId: approval.requestId,
+                    requestId: String(approval.requestId),
                     subtype: 'can_use_tool',
                     tool: approval.toolName
                       ? { name: approval.toolName, input: approval.input }
@@ -510,6 +494,8 @@ export function FreshAgentView({
                     sendFreshAgentMessage({
                       type: 'freshAgent.approval.respond',
                       sessionId: paneContent.sessionId,
+                      sessionType: paneContent.sessionType,
+                      provider: paneContent.provider,
                       requestId: approval.requestId,
                       decision: { behavior: 'allow', updatedInput: {} },
                     })
@@ -519,6 +505,8 @@ export function FreshAgentView({
                     sendFreshAgentMessage({
                       type: 'freshAgent.approval.respond',
                       sessionId: paneContent.sessionId,
+                      sessionType: paneContent.sessionType,
+                      provider: paneContent.provider,
                       requestId: approval.requestId,
                       decision: { behavior: 'deny', message: 'Denied by user', interrupt: false },
                     })
@@ -528,9 +516,9 @@ export function FreshAgentView({
               ))}
               {pendingQuestions.map((question) => (
                 <FreshAgentQuestionBanner
-                  key={question.requestId}
+                  key={String(question.requestId)}
                   question={{
-                    requestId: question.requestId,
+                    requestId: String(question.requestId),
                     questions: (question.questions ?? []).map((entry) => ({
                       question: entry.question,
                       header: entry.header ?? 'Question',
@@ -544,6 +532,8 @@ export function FreshAgentView({
                     sendFreshAgentMessage({
                       type: 'freshAgent.question.respond',
                       sessionId: paneContent.sessionId,
+                      sessionType: paneContent.sessionType,
+                      provider: paneContent.provider,
                       requestId: question.requestId,
                       answers,
                     })
@@ -561,6 +551,8 @@ export function FreshAgentView({
                 sendFreshAgentMessage({
                   type: 'freshAgent.send',
                   sessionId: paneContent.sessionId,
+                  sessionType: paneContent.sessionType,
+                  provider: paneContent.provider,
                   text,
                 })
               }}

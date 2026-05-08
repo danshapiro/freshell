@@ -193,6 +193,24 @@ export const CodexThreadResumeParamsSchema = z.object({
   developerInstructions: z.string().nullable().optional(),
   personality: z.unknown().nullable().optional(),
   persistExtendedHistory: z.boolean().optional().default(false),
+  excludeTurns: z.boolean().nullable().optional(),
+}).strict()
+
+export const CodexThreadForkParamsSchema = z.object({
+  threadId: z.string().min(1),
+  cwd: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  modelProvider: z.string().nullable().optional(),
+  serviceTier: z.string().nullable().optional(),
+  sandbox: CodexSandboxModeSchema.nullable().optional(),
+  approvalPolicy: CodexAskForApprovalSchema.nullable().optional(),
+  approvalsReviewer: CodexApprovalsReviewerSchema.nullable().optional(),
+  config: z.record(z.string(), z.unknown()).nullable().optional(),
+  baseInstructions: z.string().nullable().optional(),
+  developerInstructions: z.string().nullable().optional(),
+  personality: z.unknown().nullable().optional(),
+  ephemeral: z.boolean().nullable().optional(),
+  excludeTurns: z.boolean().nullable().optional(),
 }).strict()
 
 export const CodexThreadOperationResultSchema = z.object({
@@ -350,6 +368,7 @@ export type CodexInitializeResult = z.infer<typeof CodexInitializeResultSchema>
 export type CodexThreadHandle = z.infer<typeof CodexThreadSchema>
 export type CodexThreadStartParams = z.input<typeof CodexThreadStartParamsSchema>
 export type CodexThreadResumeParams = z.input<typeof CodexThreadResumeParamsSchema>
+export type CodexThreadForkParams = z.input<typeof CodexThreadForkParamsSchema>
 export type CodexThreadOperationResult = z.infer<typeof CodexThreadOperationResultSchema>
 export type CodexFsWatchParams = z.infer<typeof CodexFsWatchParamsSchema>
 export type CodexFsWatchResult = z.infer<typeof CodexFsWatchResultSchema>
@@ -361,6 +380,10 @@ export type CodexThreadTurnsListParams = CodexThreadPageParams
 export type CodexThreadTurnsListResult = z.infer<typeof CodexThreadTurnsListResultSchema>
 export type CodexThreadTurnReadParams = z.infer<typeof CodexThreadTurnReadParamsSchema>
 export type CodexThreadTurnReadResult = z.infer<typeof CodexThreadTurnReadResultSchema>
+export type CodexTurnStartParams = z.input<typeof CodexTurnStartParamsSchema>
+export type CodexTurnStartResult = z.infer<typeof CodexTurnStartResultSchema>
+export type CodexTurnInterruptParams = z.input<typeof CodexTurnInterruptParamsSchema>
+export type CodexTurnInterruptResult = z.infer<typeof CodexTurnInterruptResultSchema>
 export type CodexRpcError = z.infer<typeof CodexRpcErrorSchema>
 export type CodexThreadStartedNotification = z.infer<typeof CodexThreadStartedNotificationSchema>
 export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNotificationSchema>

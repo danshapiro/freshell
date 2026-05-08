@@ -12,6 +12,8 @@ import {
   FreshAgentStaleThreadRevisionError,
   FreshAgentUnsupportedCapabilityError,
   FreshAgentLostSessionError,
+  FreshAgentSessionLocatorMismatchError,
+  FreshAgentContractValidationError,
 } from './runtime-manager.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
 import { setResponsePerfContext } from '../request-logger.js'
@@ -54,6 +56,17 @@ export function createFreshAgentRouter(deps: {
     }
     if (error instanceof FreshAgentLostSessionError) {
       return res.status(404).json({ error: error.message, code: error.code })
+    }
+    if (error instanceof FreshAgentSessionLocatorMismatchError) {
+      return res.status(409).json({ error: error.message, code: error.code })
+    }
+    if (error instanceof FreshAgentContractValidationError) {
+      return res.status(502).json({
+        error: error.message,
+        code: error.code,
+        surface: error.surface,
+        details: error.details,
+      })
     }
     const message = error instanceof Error ? error.message : 'Fresh-agent request failed'
     return res.status(500).json({ error: message })

@@ -407,11 +407,13 @@ export const FreshAgentCreateSchema = z.object({
   type: z.literal('freshAgent.create'),
   requestId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']).optional(),
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),
-  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
   plugins: z.array(z.string()).optional(),
 })
 
@@ -419,12 +421,15 @@ export const FreshAgentAttachSchema = z.object({
   type: z.literal('freshAgent.attach'),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
   resumeSessionId: z.string().optional(),
 })
 
 export const FreshAgentSendSchema = z.object({
   type: z.literal('freshAgent.send'),
   sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
   text: z.string().min(1),
   images: z.array(z.object({
     mediaType: z.string(),
@@ -435,30 +440,40 @@ export const FreshAgentSendSchema = z.object({
 export const FreshAgentInterruptSchema = z.object({
   type: z.literal('freshAgent.interrupt'),
   sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
 })
 
 export const FreshAgentApprovalRespondSchema = z.object({
   type: z.literal('freshAgent.approval.respond'),
   sessionId: z.string().min(1),
-  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
   decision: z.record(z.string(), z.unknown()),
 })
 
 export const FreshAgentQuestionRespondSchema = z.object({
   type: z.literal('freshAgent.question.respond'),
   sessionId: z.string().min(1),
-  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
   answers: z.record(z.string(), z.string()),
 })
 
 export const FreshAgentKillSchema = z.object({
   type: z.literal('freshAgent.kill'),
   sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
 })
 
 export const FreshAgentForkSchema = z.object({
   type: z.literal('freshAgent.fork'),
   sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
   input: z.record(z.string(), z.unknown()).optional(),
 })
 
@@ -778,10 +793,10 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_STALE_REVISION'
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; runtimeProvider: string }
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
-  | { type: 'freshAgent.event'; sessionId: string; event: unknown }
-  | { type: 'freshAgent.killed'; sessionId: string; success: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }

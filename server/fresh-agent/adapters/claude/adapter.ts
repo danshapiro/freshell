@@ -41,6 +41,13 @@ function mapTimelineError(error: unknown): never {
   throw error
 }
 
+function toClaudeEffort(value: FreshAgentCreateRequest['effort']) {
+  if (value === undefined || value === 'low' || value === 'medium' || value === 'high' || value === 'max') {
+    return value
+  }
+  throw new Error(`Freshclaude does not support reasoning effort "${value}".`)
+}
+
 function mapMissingResult(ok: boolean, message: string): void {
   if (!ok) {
     throw new Error(message)
@@ -78,7 +85,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
         resumeSessionId: input.resumeSessionId,
         model: input.model,
         permissionMode: input.permissionMode,
-        effort: input.effort,
+        effort: toClaudeEffort(input.effort),
         plugins: input.plugins,
       })
       return { sessionId: session.sessionId }
@@ -90,7 +97,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
         resumeSessionId: input.resumeSessionId,
         model: input.model,
         permissionMode: input.permissionMode,
-        effort: input.effort,
+        effort: toClaudeEffort(input.effort),
         plugins: input.plugins,
       })
       return { sessionId: session.sessionId }
@@ -105,8 +112,11 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     },
 
     send(sessionId, input) {
+      const images = input.images?.flatMap((image) => image.kind === 'data'
+        ? [{ mediaType: image.mediaType, data: image.data }]
+        : [])
       mapMissingResult(
-        deps.sdkBridge.sendUserMessage(sessionId, input.text, input.images),
+        deps.sdkBridge.sendUserMessage(sessionId, input.text, images),
         `Claude session ${sessionId} is not available`,
       )
     },
@@ -124,14 +134,14 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
 
     answerQuestion(sessionId, requestId, answers) {
       mapMissingResult(
-        deps.sdkBridge.respondQuestion(sessionId, requestId, answers),
+        deps.sdkBridge.respondQuestion(sessionId, String(requestId), answers),
         `Claude question ${requestId} is not available`,
       )
     },
 
     resolveApproval(sessionId, requestId, decision) {
       mapMissingResult(
-        deps.sdkBridge.respondPermission(sessionId, requestId, decision as never),
+        deps.sdkBridge.respondPermission(sessionId, String(requestId), decision as never),
         `Claude approval ${requestId} is not available`,
       )
     },

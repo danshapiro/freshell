@@ -90,6 +90,7 @@ function normalizePaneContent(
     const provider = migratedInput.kind === 'fresh-agent'
       ? migratedInput.provider
       : resolveFreshAgentRuntimeProvider(sessionType)
+    const sandbox = input.kind === 'fresh-agent' ? input.sandbox : undefined
     if (!sessionType || !provider) {
       return previous ?? { kind: 'picker' }
     }

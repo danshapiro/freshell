@@ -34,10 +34,15 @@ import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatTypes'
+import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
+import {
+  clearPendingCreate as clearFreshAgentPendingCreate,
+  removeSession as removeFreshAgentSession,
+} from '@/store/freshAgentSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
@@ -54,11 +59,13 @@ const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
+const EMPTY_FRESH_AGENT_PENDING_CREATES: Record<string, FreshAgentPendingCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EditorPane = lazy(() => import('./EditorPane'))
 
@@ -167,7 +174,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
   const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
-  const agentChatSessions = useAppSelector((s) => s.freshAgent?.sessions ?? s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
   )
@@ -190,8 +198,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
-  const sdkPendingCreates = useAppSelector(
-    (s) => s.freshAgent?.pendingCreates ?? s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+  const sdkPendingCreates = useAppSelector((s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES)
+  const freshAgentPendingCreates = useAppSelector(
+    (s) => s.freshAgent?.pendingCreates ?? EMPTY_FRESH_AGENT_PENDING_CREATES
   )
 
   // Drag state for snapping: track the original size and accumulated delta
@@ -300,23 +309,32 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     }
     if (content.kind === 'fresh-agent') {
       clearDraft(paneId)
-      const pendingCreate = sdkPendingCreates[content.createRequestId]
+      const pendingCreate = freshAgentPendingCreates[content.createRequestId]
       const pendingSessionId = pendingCreate?.sessionId
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
-        ws.send({ type: 'freshAgent.kill', sessionId })
+        ws.send({
+          type: 'freshAgent.kill',
+          sessionId,
+          sessionType: content.sessionType,
+          provider: content.provider,
+        })
       } else {
         cancelCreate(content.createRequestId)
       }
       if (!content.sessionId && pendingSessionId) {
-        dispatch(removeSession({ sessionId: pendingSessionId }))
-        dispatch(clearPendingCreate({ requestId: content.createRequestId }))
+        dispatch(removeFreshAgentSession({
+          sessionId: pendingSessionId,
+          sessionType: content.sessionType,
+          provider: content.provider,
+        }))
+        dispatch(clearFreshAgentPendingCreate({ requestId: content.createRequestId }))
       }
     }
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, tabId, ws, sdkPendingCreates])
+  }, [dispatch, freshAgentPendingCreates, sdkPendingCreates, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     if (attentionDismiss === 'click' && attentionByPane[paneId]) {
@@ -438,7 +456,16 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
             ? resolveFreshClaudeRuntimeMeta(
               indexedProjects,
               node.content.kind === 'fresh-agent'
-                ? { ...node.content, kind: 'agent-chat', provider: 'freshclaude' }
+                ? {
+                    ...node.content,
+                    kind: 'agent-chat',
+                    provider: 'freshclaude',
+                    effort: (
+                      node.content.effort === 'none'
+                      || node.content.effort === 'minimal'
+                      || node.content.effort === 'xhigh'
+                    ) ? undefined : node.content.effort,
+                  }
                 : node.content,
               node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
             )
@@ -461,6 +488,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       agentChatSessions,
+      freshAgentSessions,
     }).isBusy
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
@@ -574,7 +602,7 @@ function PickerWrapper({
 
     const freshAgentType = resolveFreshAgentType(type)
     if (freshAgentType) {
-      const providerConfig = isAgentChatProviderName(type)
+      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isAgentChatProviderName(type)
         ? getAgentChatProviderConfig(type)
         : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
@@ -666,7 +694,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [agentChatSettings, extensionEntries])
+  }, [agentChatSettings, extensionEntries, settings?.codingCli?.providers])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (resolveFreshAgentType(type)) {

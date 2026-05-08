@@ -13,12 +13,17 @@ import {
   CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
   CodexThreadPageParamsSchema,
+  CodexThreadForkParamsSchema,
   CodexThreadReadParamsSchema,
   CodexThreadReadResultSchema,
   CodexThreadResumeParamsSchema,
   CodexThreadStartParamsSchema,
   CodexThreadTurnReadResultSchema,
   CodexThreadTurnsListResultSchema,
+  CodexTurnInterruptParamsSchema,
+  CodexTurnInterruptResultSchema,
+  CodexTurnStartParamsSchema,
+  CodexTurnStartResultSchema,
   type CodexInitializeResult,
   type CodexRequestId,
   type CodexRpcError,
@@ -26,12 +31,15 @@ import {
   type CodexThreadOperationResult,
   type CodexThreadReadParams,
   type CodexThreadReadResult,
+  type CodexThreadForkParams,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
   type CodexThreadTurnReadParams,
   type CodexThreadTurnReadResult,
   type CodexThreadTurnsListParams,
   type CodexThreadTurnsListResult,
+  type CodexTurnInterruptParams,
+  type CodexTurnStartParams,
 } from './protocol.js'
 
 type CodexAppServerClientOptions = {
@@ -175,6 +183,15 @@ export class CodexAppServerClient {
     }))
   }
 
+  async forkThread(params: CodexThreadForkParams): Promise<{ threadId: string }> {
+    const result = await this.request('thread/fork', CodexThreadForkParamsSchema.parse(params))
+    const parsed = CodexThreadOperationResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid thread/fork payload.')
+    }
+    return { threadId: parsed.data.thread.id }
+  }
+
   async readThread(params: CodexThreadReadParams): Promise<CodexThreadReadResult> {
     const result = await this.request('thread/read', CodexThreadReadParamsSchema.parse(params))
     const parsed = CodexThreadReadResultSchema.safeParse(result)
@@ -225,6 +242,23 @@ export class CodexAppServerClient {
       throw new Error('Codex app-server returned an invalid synthesized thread turn body.')
     }
     return parsedTurn.data
+  }
+
+  async startTurn(params: CodexTurnStartParams): Promise<{ turnId: string }> {
+    const result = await this.request('turn/start', CodexTurnStartParamsSchema.parse(params))
+    const parsed = CodexTurnStartResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid turn/start payload.')
+    }
+    return { turnId: parsed.data.turn.id }
+  }
+
+  async interruptTurn(params: CodexTurnInterruptParams): Promise<void> {
+    const result = await this.request('turn/interrupt', CodexTurnInterruptParamsSchema.parse(params))
+    const parsed = CodexTurnInterruptResultSchema.safeParse(result)
+    if (!parsed.success) {
+      throw new Error('Codex app-server returned an invalid turn/interrupt payload.')
+    }
   }
 
   async close(): Promise<void> {

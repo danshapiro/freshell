@@ -77,6 +77,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
           initialCwd: content.initialCwd,
           model: content.model,
           permissionMode: content.permissionMode,
+          sandbox: content.sandbox,
           effort: content.effort,
           plugins: content.plugins,
         }
