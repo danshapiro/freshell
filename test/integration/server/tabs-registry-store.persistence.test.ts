@@ -81,7 +81,7 @@ function makeClientSnapshotObject(input: {
   snapshotRevision: number
   snapshotReceivedAt: number
   records: RegistryTabRecord[]
-  lastPushRecords?: RegistryTabRecord[]
+  lastPushPayloadHash?: string
 }) {
   const openSnapshotPayloadHash = pushHash({
     deviceId: input.deviceId,
@@ -90,23 +90,15 @@ function makeClientSnapshotObject(input: {
     snapshotRevision: input.snapshotRevision,
     records: input.records,
   })
-  const lastPushPayloadHash = pushHash({
-    deviceId: input.deviceId,
-    deviceLabel: input.deviceLabel,
-    clientInstanceId: input.clientInstanceId,
-    snapshotRevision: input.snapshotRevision,
-    records: input.lastPushRecords ?? input.records,
-  })
   return objectFor({
     deviceId: input.deviceId,
     deviceLabel: input.deviceLabel,
     clientInstanceId: input.clientInstanceId,
     snapshotRevision: input.snapshotRevision,
-    lastPushPayloadHash,
+    lastPushPayloadHash: input.lastPushPayloadHash ?? openSnapshotPayloadHash,
     openSnapshotPayloadHash,
     snapshotReceivedAt: input.snapshotReceivedAt,
     records: input.records,
-    lastPushRecords: input.lastPushRecords ?? input.records,
   })
 }
 
@@ -155,6 +147,20 @@ describe('tabs registry compact persistence', () => {
 
     await expect(fs.stat(path.join(tempDir, 'tabs-registry.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(fs.stat(path.join(tempDir, 'v1', 'manifest.json'))).resolves.toBeTruthy()
+
+    const manifest = JSON.parse(await fs.readFile(path.join(tempDir, 'v1', 'manifest.json'), 'utf-8')) as {
+      openSnapshots: Record<string, { path: string }>
+      closedTombstones: { path: string }
+    }
+    const [snapshotRef] = Object.values(manifest.openSnapshots)
+    const snapshotObject = JSON.parse(await fs.readFile(path.join(tempDir, 'v1', snapshotRef.path), 'utf-8')) as {
+      records: RegistryTabRecord[]
+      lastPushRecords?: RegistryTabRecord[]
+    }
+    expect(snapshotObject.records.map((record) => record.tabKey)).toEqual([openRecord.tabKey])
+    expect(snapshotObject).not.toHaveProperty('lastPushRecords')
+    const closedObject = JSON.parse(await fs.readFile(path.join(tempDir, 'v1', manifest.closedTombstones.path), 'utf-8')) as Record<string, RegistryTabRecord>
+    expect(Object.keys(closedObject)).toEqual([closedRecord.tabKey])
 
     const reader = await createTabsRegistryStore(tempDir, { now: () => now })
     const result = await reader.query({
@@ -399,7 +405,6 @@ describe('tabs registry compact persistence', () => {
       openSnapshotPayloadHash: '0'.repeat(64),
       snapshotReceivedAt: NOW,
       records: [closedRecord],
-      lastPushRecords: [closedRecord],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -503,7 +508,6 @@ describe('tabs registry compact persistence', () => {
       }),
       snapshotReceivedAt: NOW,
       records: [mismatchedRecord, tooManyPanes],
-      lastPushRecords: [mismatchedRecord, tooManyPanes],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -550,7 +554,7 @@ describe('tabs registry compact persistence', () => {
     await expect(createTabsRegistryStore(tempDir, { now: () => now })).rejects.toThrow(/manifest|compact state/i)
   })
 
-  it('rejects compact snapshots whose retry hash does not match their canonical payload', async () => {
+  it('rejects compact snapshots whose open snapshot hash does not match their open records', async () => {
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })
     const record = makeRecord({
       tabKey: 'local:open',
@@ -571,11 +575,10 @@ describe('tabs registry compact persistence', () => {
       deviceLabel: 'local',
       clientInstanceId: 'window-a',
       snapshotRevision: 1,
-      lastPushPayloadHash: '1'.repeat(64),
-      openSnapshotPayloadHash,
+      lastPushPayloadHash: openSnapshotPayloadHash,
+      openSnapshotPayloadHash: '1'.repeat(64),
       snapshotReceivedAt: NOW,
       records: [record],
-      lastPushRecords: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -643,7 +646,6 @@ describe('tabs registry compact persistence', () => {
       }),
       snapshotReceivedAt: NOW,
       records: [record],
-      lastPushRecords: [record],
     }
     const snapshotObject = objectFor(snapshot)
     const closedObject = objectFor({})
@@ -867,7 +869,6 @@ describe('tabs registry compact persistence', () => {
       openSnapshotPayloadHash: expectedSnapshotHash,
       snapshotReceivedAt: NOW,
       records: [storedRecord],
-      lastPushRecords: [storedRecord],
     }
     const expectedObject = objectFor(snapshot)
     await fs.mkdir(path.join(tempDir, 'v1', 'objects'), { recursive: true })

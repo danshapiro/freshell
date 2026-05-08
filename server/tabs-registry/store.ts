@@ -33,7 +33,6 @@ type ClientOpenSnapshot = {
   openSnapshotPayloadHash: string
   snapshotReceivedAt: number
   records: RegistryTabRecord[]
-  lastPushRecords: RegistryTabRecord[]
 }
 
 type ClientRevisionWatermark = {
@@ -185,8 +184,7 @@ const ClientOpenSnapshotSchema: z.ZodType<ClientOpenSnapshot> = z.object({
   openSnapshotPayloadHash: z.string().regex(/^[a-f0-9]{64}$/),
   snapshotReceivedAt: z.number().int().nonnegative(),
   records: z.array(TabRegistryRecordSchema),
-  lastPushRecords: z.array(TabRegistryRecordSchema),
-}).superRefine((value, ctx) => {
+}).strict().superRefine((value, ctx) => {
   for (const [index, record] of value.records.entries()) {
     if (record.status !== 'open') {
       ctx.addIssue({
@@ -206,27 +204,6 @@ const ClientOpenSnapshotSchema: z.ZodType<ClientOpenSnapshot> = z.object({
         path: ['records', index],
       })
     }
-  }
-  for (const [index, record] of value.lastPushRecords.entries()) {
-    if (
-      record.deviceId !== value.deviceId
-      || record.deviceLabel !== value.deviceLabel
-      || record.clientInstanceId !== value.clientInstanceId
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'Client last-push record identity must match the snapshot identity',
-        path: ['lastPushRecords', index],
-      })
-    }
-  }
-  const lastPushOpenRecords = value.lastPushRecords.filter((record) => record.status === 'open')
-  if (stableStringify(lastPushOpenRecords) !== stableStringify(value.records)) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'Client last-push open records must match the persisted open snapshot records',
-      path: ['lastPushRecords'],
-    })
   }
 })
 
@@ -416,7 +393,6 @@ function validateStateCaps(state: CompactTabsRegistryStateV1, caps: TabsRegistry
       throw new Error(`Tabs registry client snapshot can contain at most ${caps.maxOpenRecordsPerClientSnapshot} open records`)
     }
     validateRecordCaps(snapshot.records, caps)
-    validateRecordCaps(snapshot.lastPushRecords, caps)
   }
   const closedCount = Object.keys(state.closedByTabKey).length
   if (closedCount > caps.maxClosedTombstones) {
@@ -744,9 +720,6 @@ export class TabsRegistryStore {
         if (snapshot.openSnapshotPayloadHash !== buildSnapshotPayloadHash(snapshot)) {
           throw new Error('Tabs registry compact state client snapshot payload hash does not match snapshot content')
         }
-        if (snapshot.lastPushPayloadHash !== buildSnapshotPayloadHash({ ...snapshot, records: snapshot.lastPushRecords })) {
-          throw new Error('Tabs registry compact state client snapshot last-push payload hash does not match snapshot content')
-        }
         return [key, snapshot] as const
       }))
       const state: CompactTabsRegistryStateV1 = {
@@ -859,7 +832,6 @@ export class TabsRegistryStore {
         openSnapshotPayloadHash,
         snapshotReceivedAt: migrationStartedAt,
         records: snapshotRecords,
-        lastPushRecords: snapshotRecords,
       }
       state.openSnapshotsByClient[clientSnapshotKey(deviceId, 'legacy-migration')] = snapshot
       state.clientRevisionsByClient[clientSnapshotKey(deviceId, 'legacy-migration')] = buildClientRevisionWatermark(
@@ -1114,7 +1086,6 @@ export class TabsRegistryStore {
         openSnapshotPayloadHash,
         snapshotReceivedAt: receiptTime,
         records: openRecords,
-        lastPushRecords: canonicalRecords,
       }
       next.clientRevisionsByClient[key] = buildClientRevisionWatermark(
         input.deviceId,
