@@ -69,18 +69,27 @@ describe('tabRegistrySync', () => {
   let state: RootState
   let dispatch: ReturnType<typeof vi.fn>
   let ws: any
+  let broadcastChannels: Array<{
+    name: string
+    postMessage: ReturnType<typeof vi.fn>
+    close: ReturnType<typeof vi.fn>
+    onmessage: ((event: { data: any }) => void) | null
+  }>
 
   beforeEach(() => {
     vi.useFakeTimers()
     listeners = []
     wsMessageHandlers = []
     wsReconnectHandlers = []
+    broadcastChannels = []
+    sessionStorage.clear()
     state = createState()
     dispatch = vi.fn()
     ws = {
       state: 'ready',
       sendTabsSyncPush: vi.fn(),
       sendTabsSyncQuery: vi.fn(),
+      sendTabsSyncClientRetire: vi.fn(),
       onMessage: (handler: (msg: any) => void) => {
         wsMessageHandlers.push(handler)
         return () => {
@@ -94,9 +103,27 @@ describe('tabRegistrySync', () => {
         }
       },
     }
+    class MockBroadcastChannel {
+      name: string
+      postMessage = vi.fn()
+      close = vi.fn()
+      onmessage: ((event: { data: any }) => void) | null = null
+
+      constructor(name: string) {
+        this.name = name
+        broadcastChannels.push(this)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', MockBroadcastChannel)
+    vi.stubGlobal('navigator', {
+      ...globalThis.navigator,
+      sendBeacon: vi.fn(() => true),
+    })
   })
 
   afterEach(() => {
+    vi.unstubAllGlobals()
+    sessionStorage.clear()
     vi.useRealTimers()
   })
 
@@ -227,5 +254,106 @@ describe('tabRegistrySync', () => {
 
     expect(dispatch.mock.calls.some((call) => call[0]?.type === 'tabRegistry/setTabRegistrySnapshot')).toBe(true)
     stop()
+  })
+
+  it('rotates a duplicated sessionStorage client id when a local lease collision is announced', () => {
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    const firstClientId = ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId
+    expect(broadcastChannels).toHaveLength(1)
+
+    broadcastChannels[0].onmessage?.({
+      data: {
+        type: 'tabs-registry-client-claim',
+        clientInstanceId: firstClientId,
+        leaseId: 'other-window',
+      },
+    })
+
+    expect(ws.sendTabsSyncPush.mock.calls.at(-1)?.[0].clientInstanceId).not.toBe(firstClientId)
+    expect(sessionStorage.getItem('freshell.tabs.client-instance-id.v1')).not.toBe(firstClientId)
+    stop()
+  })
+
+  it('does not send stale localClosed records from a previous server instance', () => {
+    state = {
+      ...state,
+      connection: {
+        ...state.connection,
+        serverInstanceId: 'srv-new',
+      },
+      tabRegistry: {
+        ...state.tabRegistry,
+        localClosed: {
+          stale: {
+            tabKey: 'local:stale',
+            tabId: 'stale',
+            serverInstanceId: 'srv-old',
+            deviceId: 'local-device',
+            deviceLabel: 'local-label',
+            tabName: 'stale',
+            status: 'closed',
+            revision: 1,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            closedAt: Date.now(),
+            paneCount: 0,
+            titleSetByUser: false,
+            panes: [],
+          },
+        },
+      },
+    }
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    const records = ws.sendTabsSyncPush.mock.calls[0][0].records
+    expect(records.some((record: any) => record.tabKey === 'local:stale')).toBe(false)
+    stop()
+  })
+
+  it('sends unload retire through a keepalive beacon and advances the persisted retire revision', () => {
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    const pushedRevision = ws.sendTabsSyncPush.mock.calls[0][0].snapshotRevision
+    stop()
+
+    expect(ws.sendTabsSyncClientRetire).toHaveBeenCalledWith(expect.objectContaining({
+      snapshotRevision: pushedRevision + 1,
+    }))
+    expect(sessionStorage.getItem('freshell.tabs.snapshot-revision.v1')).toBe(String(pushedRevision + 1))
+    expect(navigator.sendBeacon).toHaveBeenCalledWith(
+      '/api/tabs-sync/client-retire',
+      expect.any(Blob),
+    )
   })
 })

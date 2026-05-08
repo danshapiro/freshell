@@ -114,6 +114,7 @@ describe('ws tabs registry protocol', () => {
   beforeEach(async () => {
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'tabs-sync-token'
+    delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ws-tabs-registry-'))
   })
 
@@ -123,6 +124,7 @@ describe('ws tabs registry protocol', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
     await fs.rm(tempDir, { recursive: true, force: true })
+    delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })
 
   it('uses protocol version 5 and rejects version 4 clients with reload-required mismatch', async () => {
@@ -133,6 +135,7 @@ describe('ws tabs registry protocol', () => {
     ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: 4 }))
     const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH')
     expect(error.message).toMatch(/expected protocol version 5/i)
+    expect(error.message).toMatch(/reload/i)
     ws.close()
   })
 
@@ -211,7 +214,9 @@ describe('ws tabs registry protocol', () => {
 
     expect(snapshot.data.localOpen.map((record: any) => record.tabKey)).toEqual(['local:open-1'])
     expect(snapshot.data.sameDeviceOpen.map((record: any) => record.tabKey)).toEqual(['local:open-2'])
+    expect(snapshot.data.sameDeviceOpen[0].clientInstanceId).toBe('window-b')
     expect(snapshot.data.remoteOpen.map((record: any) => record.tabKey)).toEqual(['remote:open-1'])
+    expect(snapshot.data.remoteOpen[0].clientInstanceId).toBe('remote-window')
     expect(snapshot.data.closed.map((record: any) => record.tabKey)).toEqual(['remote:closed-recent'])
     expect(snapshot.data.devices.map((device: any) => device.deviceId).sort()).toEqual(['local-device', 'remote-device'])
 
@@ -296,5 +301,55 @@ describe('ws tabs registry protocol', () => {
     const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.requestId === 'missing-store')
     expect(error.message).toMatch(/tabs registry unavailable/i)
     ws.close()
+  })
+
+  it('returns clear tabs sync errors for store validation failures instead of crashing', async () => {
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: Array.from({ length: 501 }, (_, i) => makeRecord({
+        tabKey: `local:${i}`,
+        tabId: `tab-${i}`,
+        status: 'open',
+      })),
+    }))
+
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error')
+    expect(error).toMatchObject({ code: 'INVALID_MESSAGE' })
+    expect(error.message).toMatch(/at most 500 records/i)
+    expect(ws.readyState).not.toBe(WebSocket.CLOSED)
+    ws.close()
+  })
+
+  it('rejects oversized regular websocket messages before normal parsing with a clear error', async () => {
+    process.env.MAX_REGULAR_WS_MESSAGE_BYTES = '256'
+    await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
+    const ws = await connect()
+
+    ws.send(JSON.stringify({
+      type: 'tabs.sync.push',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'local:large',
+          tabId: 'large',
+          panes: [{ paneId: 'pane-1', kind: 'terminal', payload: { text: 'x'.repeat(512) } }],
+        }),
+      ],
+    }))
+
+    const error = await waitForMessage(ws, (msg) => msg.type === 'error')
+    expect(error.message).toMatch(/message.*256 bytes/i)
+    ws.close()
+    delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })
 })

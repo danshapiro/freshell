@@ -18,6 +18,7 @@ import {
   DEVICE_LABEL_STORAGE_KEY,
 } from '../../../../src/store/storage-keys'
 import type { RegistryTabRecord } from '../../../../src/store/tabRegistryTypes'
+import { selectTabsRegistryGroups } from '../../../../src/store/selectors/tabsRegistrySelectors'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -45,6 +46,7 @@ describe('tabRegistrySlice', () => {
 
   afterEach(() => {
     localStorage.clear()
+    vi.useRealTimers()
   })
 
   it('uses v2 namespaced device storage keys', () => {
@@ -161,5 +163,47 @@ describe('tabRegistrySlice', () => {
 
     expect(freshReducer(undefined, { type: 'unknown' }).closedTabRetentionDays).toBe(30)
     expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(30)
+  })
+
+  it('filters local closed records by the selected closed retention window', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-07T12:00:00Z'))
+    const now = Date.now()
+    const oldClosed = makeRecord({
+      tabKey: 'local:old',
+      tabId: 'old',
+      status: 'closed',
+      updatedAt: now - 10 * 24 * 60 * 60 * 1000,
+      closedAt: now - 10 * 24 * 60 * 60 * 1000,
+    })
+    const freshClosed = makeRecord({
+      tabKey: 'local:fresh',
+      tabId: 'fresh',
+      status: 'closed',
+      updatedAt: now - 2 * 24 * 60 * 60 * 1000,
+      closedAt: now - 2 * 24 * 60 * 60 * 1000,
+    })
+
+    const groups = selectTabsRegistryGroups({
+      tabs: { tabs: [] },
+      panes: { layouts: {}, paneTitles: {} },
+      connection: { serverInstanceId: 'srv-test' },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'device-1',
+        sameDeviceOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {
+          [oldClosed.tabKey]: oldClosed,
+          [freshClosed.tabKey]: freshClosed,
+        },
+        closedTabRetentionDays: 7,
+        searchRangeDays: 7,
+      },
+    } as any)
+
+    expect(groups.closed.map((record) => record.tabKey)).toEqual(['local:fresh'])
+    vi.useRealTimers()
   })
 })

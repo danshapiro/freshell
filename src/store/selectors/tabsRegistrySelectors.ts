@@ -35,6 +35,9 @@ const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceO
 const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
 const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
+const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1, Math.floor(
+  state.tabRegistry.closedTabRetentionDays ?? state.tabRegistry.searchRangeDays ?? 30,
+)))
 
 export const selectLiveLocalTabRecords = createSelector(
   [selectTabs, selectLayouts, selectPaneTitles, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
@@ -60,11 +63,12 @@ export const selectLiveLocalTabRecords = createSelector(
 )
 
 export const selectMergedClosedRecords = createSelector(
-  [selectClosed, selectLocalClosed],
-  (closed, localClosed): RegistryTabRecord[] => {
+  [selectClosed, selectLocalClosed, selectClosedRetentionDays],
+  (closed, localClosed, closedRetentionDays): RegistryTabRecord[] => {
+    const closedCutoff = Date.now() - closedRetentionDays * 24 * 60 * 60 * 1000
     const merged = dedupeByTabKey([
       ...(closed || []),
-      ...Object.values(localClosed || {}),
+      ...Object.values(localClosed || {}).filter((record) => (record.closedAt ?? record.updatedAt) >= closedCutoff),
     ])
     return merged.sort(sortClosedDesc)
   },

@@ -28,6 +28,7 @@ export const TabRegistryRecordBaseSchema = z.object({
   serverInstanceId: z.string().min(1),
   deviceId: z.string().min(1),
   deviceLabel: z.string().min(1),
+  clientInstanceId: z.string().min(1).optional(),
   tabName: z.string().min(1),
   status: RegistryTabStatusSchema,
   revision: z.number().int().nonnegative(),

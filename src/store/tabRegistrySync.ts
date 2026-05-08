@@ -28,6 +28,7 @@ type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanc
 
 type RevisionState = Map<string, { fingerprint: string; revision: number }>
 const claimedClientInstanceIds = new Set<string>()
+const TAB_REGISTRY_CLIENT_LEASE_CHANNEL = 'freshell-tabs-registry-client-lease'
 
 function randomClientInstanceId(): string {
   return `client-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
@@ -133,6 +134,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
   }
 
   for (const closed of Object.values(state.tabRegistry.localClosed)) {
+    if (closed.serverInstanceId !== serverInstanceId) continue
     const closedAt = closed.closedAt ?? closed.updatedAt
     if (closedAt < closedCutoff) continue
     const recordBase: RegistryTabRecord = {
@@ -172,7 +174,8 @@ function lifecycleSignature(state: RootState): string {
 }
 
 export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): () => void {
-  const clientInstanceId = claimTabRegistryClientInstanceId()
+  let clientInstanceId = claimTabRegistryClientInstanceId()
+  const leaseId = randomClientInstanceId()
   const sendTabsSyncPush = ws.sendTabsSyncPush?.bind(ws)
     ?? ((_payload: { deviceId: string; deviceLabel: string; clientInstanceId: string; snapshotRevision: number; records: RegistryTabRecord[] }) => {})
   const sendTabsSyncQuery = ws.sendTabsSyncQuery?.bind(ws)
@@ -188,6 +191,47 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   let lastLifecycleFingerprint = lifecycleSignature(store.getState())
   let snapshotRevision = readSnapshotRevision()
   let lastServerInstanceId = store.getState().connection.serverInstanceId || ws.serverInstanceId
+  let retired = false
+  let leaseChannel: BroadcastChannel | null = null
+
+  const announceLease = () => {
+    leaseChannel?.postMessage({
+      type: 'tabs-registry-client-claim',
+      clientInstanceId,
+      leaseId,
+    })
+  }
+
+  const rotateClientInstanceIdAfterCollision = () => {
+    const previousClientInstanceId = clientInstanceId
+    claimedClientInstanceIds.delete(previousClientInstanceId)
+    clientInstanceId = randomClientInstanceId()
+    claimedClientInstanceIds.add(clientInstanceId)
+    safeSessionStorage()?.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, clientInstanceId)
+    snapshotRevision = 0
+    writeSnapshotRevision(snapshotRevision)
+    lastPushFingerprint = ''
+    retired = false
+    announceLease()
+    querySnapshot()
+    pushNow(true)
+  }
+
+  if (typeof BroadcastChannel !== 'undefined') {
+    leaseChannel = new BroadcastChannel(TAB_REGISTRY_CLIENT_LEASE_CHANNEL)
+    leaseChannel.onmessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; clientInstanceId?: string; leaseId?: string }
+      if (
+        data?.type === 'tabs-registry-client-claim'
+        && data.clientInstanceId === clientInstanceId
+        && data.leaseId
+        && data.leaseId !== leaseId
+      ) {
+        rotateClientInstanceIdAfterCollision()
+      }
+    }
+    announceLease()
+  }
 
   const querySnapshot = (closedTabRetentionDays?: number) => {
     if (ws.state !== 'ready') return
@@ -284,14 +328,34 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
   })
 
   const retire = () => {
+    if (retired) return
+    retired = true
     const state = store.getState()
-    sendTabsSyncClientRetire({
+    snapshotRevision += 1
+    writeSnapshotRevision(snapshotRevision)
+    const payload = {
       deviceId: state.tabRegistry.deviceId,
       clientInstanceId,
-      snapshotRevision: snapshotRevision + 1,
+      snapshotRevision,
+    }
+    sendTabsSyncClientRetire({
+      ...payload,
     })
+    const body = JSON.stringify(payload)
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const blob = new Blob([body], { type: 'application/json' })
+      navigator.sendBeacon('/api/tabs-sync/client-retire', blob)
+    } else if (typeof fetch === 'function') {
+      void fetch('/api/tabs-sync/client-retire', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+        keepalive: true,
+      }).catch(() => {})
+    }
   }
   globalThis.addEventListener?.('pagehide', retire)
+  globalThis.addEventListener?.('beforeunload', retire)
 
   querySnapshot()
   pushNow(true)
@@ -303,6 +367,8 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     globalThis.clearInterval(interval)
     globalThis.clearInterval(heartbeatInterval)
     globalThis.removeEventListener?.('pagehide', retire)
+    globalThis.removeEventListener?.('beforeunload', retire)
+    leaseChannel?.close()
     claimedClientInstanceIds.delete(clientInstanceId)
     retire()
   }

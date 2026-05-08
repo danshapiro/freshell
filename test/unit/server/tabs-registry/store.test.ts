@@ -188,6 +188,152 @@ describe('TabsRegistryStore compact state', () => {
     expect(result.sameDeviceOpen).toHaveLength(0)
   })
 
+  it('does not let an equal-revision old retire delete a newer reload snapshot', async () => {
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 5,
+      records: [
+        makeRecord({ tabKey: 'local:old', tabId: 'old', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
+    })
+    await replace(store, {
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 6,
+      records: [
+        makeRecord({ tabKey: 'local:new', tabId: 'new', deviceId: 'local-device', deviceLabel: 'local' }),
+      ],
+    })
+
+    await expect(store.retireClientSnapshot({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      snapshotRevision: 6,
+    })).resolves.toEqual({ accepted: false })
+
+    const result = await store.query({
+      deviceId: 'local-device',
+      clientInstanceId: 'window-a',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen.map((record) => record.tabKey)).toEqual(['local:new'])
+  })
+
+  it('rejects fresh client snapshots beyond the snapshot ref cap instead of truncating live state', async () => {
+    const capped = await createTabsRegistryStore(tempDir, {
+      now: () => now,
+      caps: { maxClientSnapshotRefs: 2 },
+    })
+    for (let i = 0; i < 2; i += 1) {
+      now += 1
+      await replace(capped, {
+        deviceId: `device-${i}`,
+        deviceLabel: `Device ${i}`,
+        clientInstanceId: 'window',
+        snapshotRevision: 1,
+        records: [
+          makeRecord({
+            tabKey: `device-${i}:tab`,
+            tabId: `tab-${i}`,
+            deviceId: `device-${i}`,
+            deviceLabel: `Device ${i}`,
+          }),
+        ],
+      })
+    }
+
+    await expect(replace(capped, {
+      deviceId: 'device-2',
+      deviceLabel: 'Device 2',
+      clientInstanceId: 'window',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({
+          tabKey: 'device-2:tab',
+          tabId: 'tab-2',
+          deviceId: 'device-2',
+          deviceLabel: 'Device 2',
+        }),
+      ],
+    })).rejects.toThrow(/client snapshots/i)
+
+    const result = await capped.query({
+      deviceId: 'device-0',
+      clientInstanceId: 'window',
+      closedTabRetentionDays: 30,
+    })
+    expect(result.localOpen.map((record) => record.tabKey)).toEqual(['device-0:tab'])
+    expect(result.remoteOpen.map((record) => record.tabKey)).toEqual(['device-1:tab'])
+  })
+
+  it('uses safe snapshot keys so device and client ids cannot collide', async () => {
+    await replace(store, {
+      deviceId: 'a:b',
+      deviceLabel: 'First',
+      clientInstanceId: 'c',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'first', tabId: 'first', deviceId: 'a:b', deviceLabel: 'First' }),
+      ],
+    })
+    await replace(store, {
+      deviceId: 'a',
+      deviceLabel: 'Second',
+      clientInstanceId: 'b:c',
+      snapshotRevision: 1,
+      records: [
+        makeRecord({ tabKey: 'second', tabId: 'second', deviceId: 'a', deviceLabel: 'Second' }),
+      ],
+    })
+
+    const first = await store.query({ deviceId: 'a:b', clientInstanceId: 'c', closedTabRetentionDays: 30 })
+    const second = await store.query({ deviceId: 'a', clientInstanceId: 'b:c', closedTabRetentionDays: 30 })
+    expect(first.localOpen.map((record) => record.tabKey)).toEqual(['first'])
+    expect(second.localOpen.map((record) => record.tabKey)).toEqual(['second'])
+    expect(store.count()).toBe(2)
+  })
+
+  it('resolves same-event open ties deterministically using client source metadata', async () => {
+    const makeTie = (clientInstanceId: string) => makeRecord({
+      tabKey: 'local:tie',
+      tabId: 'tie',
+      deviceId: 'local-device',
+      deviceLabel: 'local',
+      tabName: clientInstanceId,
+      revision: 1,
+      updatedAt: NOW,
+    })
+
+    async function run(order: string[]) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tabs-registry-tie-'))
+      const tieStore = await createTabsRegistryStore(dir, { now: () => now })
+      try {
+        for (const clientInstanceId of order) {
+          await replace(tieStore, {
+            deviceId: 'local-device',
+            deviceLabel: 'local',
+            clientInstanceId,
+            snapshotRevision: 1,
+            records: [makeTie(clientInstanceId)],
+          })
+        }
+        const result = await tieStore.query({
+          deviceId: 'other-device',
+          clientInstanceId: 'other-window',
+          closedTabRetentionDays: 30,
+        })
+        return result.remoteOpen.map((record) => record.tabName)
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true })
+      }
+    }
+
+    await expect(run(['a', 'b'])).resolves.toEqual(await run(['b', 'a']))
+  })
+
   it('keeps closed tombstones across later omissions and uses updatedAt before revision for LWW', async () => {
     const staleOpen = makeRecord({
       tabKey: 'local:a',
