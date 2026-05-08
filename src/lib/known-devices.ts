@@ -1,5 +1,3 @@
-import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
-
 export type KnownDevice = {
   key: string
   deviceIds: string[]
@@ -14,10 +12,10 @@ type BuildKnownDevicesInput = {
   ownDeviceLabel: string
   deviceAliases?: Record<string, string>
   dismissedDeviceIds?: string[]
-  localOpen?: RegistryTabRecord[]
-  sameDeviceOpen?: RegistryTabRecord[]
-  remoteOpen?: RegistryTabRecord[]
-  closed?: RegistryTabRecord[]
+  localOpen?: unknown[]
+  sameDeviceOpen?: unknown[]
+  remoteOpen?: unknown[]
+  closed?: unknown[]
   devices?: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
 }
 
@@ -27,11 +25,6 @@ type DeviceGroup = {
   baseLabel: string
   isOwn: boolean
   lastSeenAt: number
-}
-
-function pushUnique(values: string[], value: string): void {
-  if (!value || values.includes(value)) return
-  values.push(value)
 }
 
 function resolveEffectiveLabel(deviceIds: string[], aliases: Record<string, string>, fallbackLabel: string): string {
@@ -44,23 +37,22 @@ function resolveEffectiveLabel(deviceIds: string[], aliases: Record<string, stri
   return fallbackLabel
 }
 
-function upsertRemoteGroup(groups: Map<string, DeviceGroup>, record: RegistryTabRecord): void {
-  // Collapse device-id rotations from the same machine into one row using the stored machine label.
-  const key = `remote:${record.deviceLabel}`
+function upsertRemoteDevice(groups: Map<string, DeviceGroup>, device: { deviceId: string; deviceLabel: string; lastSeenAt: number }): void {
+  const key = `remote:${device.deviceId}`
   const current = groups.get(key)
   if (!current) {
     groups.set(key, {
       key,
-      deviceIds: [record.deviceId],
-      baseLabel: record.deviceLabel,
+      deviceIds: [device.deviceId],
+      baseLabel: device.deviceLabel,
       isOwn: false,
-      lastSeenAt: record.closedAt ?? record.updatedAt,
+      lastSeenAt: device.lastSeenAt,
     })
     return
   }
 
-  pushUnique(current.deviceIds, record.deviceId)
-  current.lastSeenAt = Math.max(current.lastSeenAt, record.closedAt ?? record.updatedAt)
+  current.baseLabel = device.deviceLabel
+  current.lastSeenAt = Math.max(current.lastSeenAt, device.lastSeenAt)
 }
 
 export function buildKnownDevices(input: BuildKnownDevicesInput): KnownDevice[] {
@@ -76,28 +68,9 @@ export function buildKnownDevices(input: BuildKnownDevicesInput): KnownDevice[] 
     lastSeenAt: Number.MAX_SAFE_INTEGER,
   })
 
-  for (const record of [
-    ...(input.localOpen ?? []),
-    ...(input.sameDeviceOpen ?? []),
-    ...(input.remoteOpen ?? []),
-  ]) {
-    if (record.deviceId === input.ownDeviceId) {
-      continue
-    }
-    if (dismissedDeviceIds.has(record.deviceId)) {
-      continue
-    }
-    upsertRemoteGroup(groups, record)
-  }
-
   for (const device of input.devices ?? []) {
     if (device.deviceId === input.ownDeviceId || dismissedDeviceIds.has(device.deviceId)) continue
-    const recordLike = {
-      deviceId: device.deviceId,
-      deviceLabel: device.deviceLabel,
-      updatedAt: device.lastSeenAt,
-    } as RegistryTabRecord
-    upsertRemoteGroup(groups, recordLike)
+    upsertRemoteDevice(groups, device)
   }
 
   return [...groups.values()]

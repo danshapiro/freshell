@@ -22,7 +22,7 @@ function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
 }
 
 describe('buildKnownDevices', () => {
-  it('deduplicates remote devices that share the same stored machine label', () => {
+  it('uses server device metadata as the source of truth and preserves distinct ids with the same label', () => {
     const devices = buildKnownDevices({
       ownDeviceId: 'local-device',
       ownDeviceLabel: 'local-device',
@@ -47,9 +47,23 @@ describe('buildKnownDevices', () => {
     })
 
     const remoteDevices = devices.filter((device) => !device.isOwn)
-    expect(remoteDevices).toHaveLength(1)
-    expect(remoteDevices[0]?.baseLabel).toBe('studio-mac')
-    expect([...(remoteDevices[0]?.deviceIds || [])].sort()).toEqual(['remote-a', 'remote-b'])
+    expect(remoteDevices).toHaveLength(2)
+    expect(remoteDevices.map((device) => device.deviceIds)).toEqual([['remote-a'], ['remote-b']])
+    expect(remoteDevices.map((device) => device.baseLabel)).toEqual(['studio-mac', 'studio-mac'])
+  })
+
+  it('does not infer remote device rows from open tab records when server metadata is absent', () => {
+    const devices = buildKnownDevices({
+      ownDeviceId: 'local-device',
+      ownDeviceLabel: 'local-device',
+      remoteOpen: [
+        makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
+      ],
+      devices: [],
+    })
+
+    expect(devices).toHaveLength(1)
+    expect(devices[0]?.isOwn).toBe(true)
   })
 
   it('hides dismissed device ids from the rendered list', () => {

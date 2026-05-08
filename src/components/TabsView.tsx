@@ -44,7 +44,10 @@ import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
 
-type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
+type DisplayRecord = RegistryTabRecord & {
+  displayDeviceLabel: string
+  registryScope: 'local' | 'same-device' | 'remote' | 'closed'
+}
 
 type DeviceGroupData = {
   deviceId: string
@@ -509,8 +512,9 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
 
   const withDisplayDeviceLabel = useMemo(
     () =>
-      (record: RegistryTabRecord): DisplayRecord => ({
+      (record: RegistryTabRecord, registryScope: DisplayRecord['registryScope']): DisplayRecord => ({
         ...record,
+        registryScope,
         displayDeviceLabel:
           record.deviceId === deviceId
             ? deviceLabel
@@ -539,9 +543,12 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
   /* -- filtering ---------------------------------------------------- */
 
   const filtered = useMemo(() => {
-    const localOpen = groups.localOpen.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
-    const remoteOpen = [...groups.sameDeviceOpen, ...groups.remoteOpen].map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
-    const closed = groups.closed.map(withDisplayDeviceLabel).filter((r) => matchRecord(r, query))
+    const localOpen = groups.localOpen.map((record) => withDisplayDeviceLabel(record, 'local')).filter((r) => matchRecord(r, query))
+    const remoteOpen = [
+      ...groups.sameDeviceOpen.map((record) => withDisplayDeviceLabel(record, 'same-device')),
+      ...groups.remoteOpen.map((record) => withDisplayDeviceLabel(record, 'remote')),
+    ].filter((r) => matchRecord(r, query))
+    const closed = groups.closed.map((record) => withDisplayDeviceLabel(record, 'closed')).filter((r) => matchRecord(r, query))
 
     const byScope = (records: DisplayRecord[], scope: 'local' | 'remote') => {
       if (scopeMode === 'all') return records
@@ -631,7 +638,7 @@ function TabsView({ onOpenTab }: { onOpenTab?: () => void }) {
     e.stopPropagation()
 
     const isOpen = record.status === 'open'
-    const isLocal = isOpen && groups.localOpen.some((local) => local.tabKey === record.tabKey)
+    const isLocal = isOpen && record.registryScope === 'local'
     const items: MenuItem[] = []
 
     if (isLocal && isOpen) {

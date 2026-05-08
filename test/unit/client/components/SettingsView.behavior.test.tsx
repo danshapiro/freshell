@@ -476,16 +476,16 @@ describe('SettingsView behavior sections', () => {
       renderSettingsView(store)
       switchSettingsTab('Safety')
 
-      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
+      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
 
-      fireEvent.click(screen.getByRole('button', { name: 'Delete device studio-mac' }))
+      fireEvent.click(screen.getAllByRole('button', { name: 'Delete device studio-mac' })[0])
 
       await act(async () => {
         await Promise.resolve()
       })
 
-      expect(screen.queryByLabelText('Device name for studio-mac')).not.toBeInTheDocument()
-      expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]').sort()).toEqual(['remote-a', 'remote-b'])
+      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
+      expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]')).toEqual(['remote-a'])
     })
   })
 })

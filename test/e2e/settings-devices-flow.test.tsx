@@ -109,7 +109,7 @@ describe('settings devices management flow (e2e)', () => {
     vi.useRealTimers()
   })
 
-  it('collapses duplicate machine rows, deletes a remote device, and renders Devices last', async () => {
+  it('renders server-backed device rows, deletes one remote device, and renders Devices last', async () => {
     const store = createStore({
       remoteOpen: [
         makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
@@ -138,19 +138,19 @@ describe('settings devices management flow (e2e)', () => {
     )
 
     fireEvent.click(screen.getByRole('tab', { name: /^safety$/i }))
-    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
+    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
 
     const devicesHeading = screen.getByText('Devices')
     const networkHeading = screen.getByText('Network Access')
     expect(devicesHeading.compareDocumentPosition(networkHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Delete device studio-mac' }))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Delete device studio-mac' })[0])
 
     await act(async () => {
       await Promise.resolve()
     })
 
-    expect(screen.queryByLabelText('Device name for studio-mac')).not.toBeInTheDocument()
-    expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]').sort()).toEqual(['remote-a', 'remote-b'])
+    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
+    expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]')).toEqual(['remote-a'])
   })
 })
