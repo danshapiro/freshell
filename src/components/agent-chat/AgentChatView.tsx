@@ -487,16 +487,23 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     createSentRef.current = false
   }
 
-  const buildCreatePayload = useCallback((content: AgentChatPaneContent) => ({
-    type: 'sdk.create' as const,
-    requestId: content.createRequestId,
-    model: content.model ?? defaultModel,
-    permissionMode: content.permissionMode ?? defaultPermissionMode,
-    effort: content.effort ?? defaultEffort,
-    ...(content.initialCwd ? { cwd: content.initialCwd } : {}),
-    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
-    ...(content.plugins ? { plugins: content.plugins } : {}),
-  }), [defaultEffort, defaultModel, defaultPermissionMode])
+  const buildCreatePayload = useCallback((content: AgentChatPaneContent) => {
+    const selection = resolveAgentChatModelSelection({
+      providerDefaultModelId,
+      capabilities: providerCapabilitiesRef.current,
+      modelSelection: content.modelSelection,
+    })
+    return {
+      type: 'sdk.create' as const,
+      requestId: content.createRequestId,
+      model: selection.resolvedModelId ?? providerDefaultModelId,
+      permissionMode: content.permissionMode ?? defaultPermissionMode,
+      ...(content.effort ? { effort: content.effort } : {}),
+      ...(content.initialCwd ? { cwd: content.initialCwd } : {}),
+      ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+      ...(content.plugins ? { plugins: content.plugins } : {}),
+    }
+  }, [defaultPermissionMode, providerDefaultModelId])
 
   // Send sdk.create when the pane first mounts with a createRequestId but no sessionId
   useEffect(() => {

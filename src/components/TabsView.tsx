@@ -168,7 +168,6 @@ function sanitizePaneSnapshot(
       payload,
       fallbackProvider: provider,
       fallbackSessionId: resumeSessionId,
-      fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
       kind: 'fresh-agent',

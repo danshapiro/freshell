@@ -632,20 +632,24 @@ export class CodexAppServerRuntime {
 
   async startThread(
     params: Omit<CodexThreadStartParams, 'experimentalRawEvents' | 'persistExtendedHistory'>,
-  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
+  ): Promise<CodexThreadOperationResult & { threadId: string; wsUrl: string }> {
     const ready = await this.ensureReady()
+    const result = await this.client!.startThread(params)
     return {
-      ...(await this.client!.startThread(params)),
+      ...result,
+      threadId: result.thread.id,
       wsUrl: ready.wsUrl,
     }
   }
 
   async resumeThread(
     params: Omit<CodexThreadResumeParams, 'persistExtendedHistory'>,
-  ): Promise<CodexThreadOperationResult & { wsUrl: string }> {
+  ): Promise<CodexThreadOperationResult & { threadId: string; wsUrl: string }> {
     const ready = await this.ensureReady()
+    const result = await this.client!.resumeThread(params)
     return {
-      ...(await this.client!.resumeThread(params)),
+      ...result,
+      threadId: result.thread.id,
       wsUrl: ready.wsUrl,
     }
   }

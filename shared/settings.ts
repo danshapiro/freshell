@@ -1049,7 +1049,9 @@ function normalizeLegacyAgentChatProviderDefaultsInput(
 export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
   const normalizedPatch = sanitizeServerSettingsPatch(patch)
   const codingCliPatch = normalizedPatch.codingCli
-  const freshAgentPatch = normalizedPatch.freshAgent ?? normalizedPatch.agentChat
+  const freshAgentPatch = (normalizedPatch.freshAgent ?? normalizedPatch.agentChat) as
+    | Partial<ServerSettings['freshAgent']>
+    | undefined
 
   return {
     ...base,

@@ -17,6 +17,7 @@ import {
   CodexThreadReadParamsSchema,
   CodexThreadReadResultSchema,
   CodexThreadResumeParamsSchema,
+  CodexThreadSchema,
   CodexThreadStartParamsSchema,
   CodexThreadTurnReadResultSchema,
   CodexThreadTurnsListResultSchema,
@@ -83,12 +84,8 @@ export type CodexAppServerDisconnectEvent = {
   error?: Error
 }
 
-function normalizeThread(thread: CodexThreadHandle): CodexThreadHandle {
-  return {
-    ...thread,
-    path: thread.path ?? null,
-    ephemeral: thread.ephemeral ?? false,
-  }
+function normalizeThread(thread: CodexThreadHandle): CodexThreadOperationResult['thread'] {
+  return CodexThreadSchema.parse(thread)
 }
 
 export class CodexAppServerClient {
@@ -146,6 +143,7 @@ export class CodexAppServerClient {
       throw new Error('Codex app-server returned an invalid thread/start payload.')
     }
     return {
+      ...parsed.data,
       thread: normalizeThread(parsed.data.thread),
     }
   }
@@ -161,6 +159,7 @@ export class CodexAppServerClient {
       throw new Error('Codex app-server returned an invalid thread/resume payload.')
     }
     return {
+      ...parsed.data,
       thread: normalizeThread(parsed.data.thread),
     }
   }
