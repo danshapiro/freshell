@@ -15,11 +15,19 @@
 import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
-import { LAYOUT_STORAGE_KEY, PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState'
+import {
+  LAYOUT_STORAGE_KEY,
+  PANES_SCHEMA_VERSION,
+  LAYOUT_SCHEMA_VERSION,
+  PANES_STORAGE_KEY,
+  TABS_STORAGE_KEY,
+  migrateV2ToV3,
+  parsePersistedLayoutRaw,
+} from './persistedState'
 
 const log = createLogger('StorageMigration')
 
-const STORAGE_VERSION = 4
+const STORAGE_VERSION = 5
 const STORAGE_VERSION_KEY = 'freshell_version'
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LEGACY_BROWSER_PREFERENCE_KEYS = [
@@ -115,11 +123,19 @@ export function runStorageMigration(): void {
     }
 
     const existingLayout = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    let hasValidLayout = false
     if (existingLayout) {
       const migratedLayout = migrateLayoutRecord(existingLayout)
       if (migratedLayout) {
         localStorage.setItem(LAYOUT_STORAGE_KEY, migratedLayout)
+        hasValidLayout = true
       }
+    }
+    if (!hasValidLayout) {
+      hasValidLayout = !!migrateV2ToV3()
+    } else {
+      localStorage.removeItem(TABS_STORAGE_KEY)
+      localStorage.removeItem(PANES_STORAGE_KEY)
     }
 
     const browserPreferences = localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)
