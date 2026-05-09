@@ -356,7 +356,7 @@ describe('panesSlice', () => {
       }
     })
 
-    it('does not synthesize canonical sessionRef from raw agent-chat resumeSessionId', () => {
+    it('normalizes legacy agent-chat freshclaude input with a canonical Claude id to fresh-agent', () => {
       const state = panesReducer(
         initialState,
         initLayout({
@@ -370,19 +370,49 @@ describe('panesSlice', () => {
       )
 
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      if (leaf.content.kind !== 'agent-chat') throw new Error('expected agent-chat')
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      })
+    })
 
-      expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+    it('does not synthesize a portable sessionRef from a named legacy resume alias', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: 'named-resume',
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: 'named-resume',
+      })
       expect(leaf.content.sessionRef).toBeUndefined()
     })
   })
 
   describe('restartAgentChatCreate', () => {
-    it('moves an agent-chat pane into stable create-failed state until an explicit retry restarts it', () => {
+    it('moves a fresh-agent pane into stable create-failed state until an explicit retry restarts it', () => {
       const state = panesReducer(
         stateWithLeaf('pane-agent', {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-1',
           status: 'create-failed' as any,
           createError: {
@@ -396,10 +426,10 @@ describe('panesSlice', () => {
 
       const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(layout.content).toMatchObject({
-        kind: 'agent-chat',
+        kind: 'fresh-agent',
         status: 'creating',
       })
-      if (layout.content.kind === 'agent-chat') {
+      if (layout.content.kind === 'fresh-agent') {
         expect((layout.content as any).createError).toBeUndefined()
         expect(layout.content.createRequestId).not.toBe('req-1')
       }

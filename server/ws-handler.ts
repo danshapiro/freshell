@@ -65,6 +65,14 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentAttachSchema,
+  FreshAgentCreateSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentForkSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentKillSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentSendSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -80,6 +88,13 @@ import {
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
+import type { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import {
+  makeFreshAgentSessionKey,
+  resolveFreshAgentRuntimeProvider,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../shared/fresh-agent.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -110,6 +125,7 @@ export type WsHandlerOptions = {
   codexActivityListProvider?: () => CodexActivityRecord[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  freshAgentRuntimeManager?: FreshAgentRuntimeManager
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -289,6 +305,13 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
     return locators
   }
 
+  if (kind === 'fresh-agent') {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
+      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+    }
+    return locators
+  }
+
   if (kind !== 'terminal') return locators
 
   const mode = CodingCliProviderSchema.safeParse(content.mode)
@@ -390,6 +413,9 @@ type ClientState = {
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
+  freshAgentSessions: Set<string>
+  freshAgentSubscriptions: Map<string, () => void>
+  freshAgentSubscriptionKeysInFlight: Set<string>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
@@ -464,12 +490,20 @@ export class WsHandler {
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
   private agentHistorySource?: AgentHistorySource
+  private readonly freshAgentRuntimeManager?: FreshAgentRuntimeManager
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private sdkCreateLocks = new Map<string, Promise<void>>()
   private createdSdkSessionByRequestId = new Map<string, string>()
   private sdkSessionByCreateOwnerKey = new Map<string, string>()
+  private freshAgentCreateLocks = new Map<string, Promise<void>>()
+  private createdFreshAgentSessionByRequestId = new Map<string, {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    runtimeProvider: FreshAgentRuntimeProvider
+    sessionRef?: { provider: string; sessionId: string }
+  }>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private pendingUiCommands: PendingUiCommand[] = []
   private sessionsRevision = 0
@@ -508,6 +542,7 @@ export class WsHandler {
     this.codingCliManager = options.codingCliManager
     this.codexLaunchPlanner = options.codexLaunchPlanner
     this.sdkBridge = options.sdkBridge
+    this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.sessionRepairService = options.sessionRepairService
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
     this.terminalMetaListProvider = options.terminalMetaListProvider
@@ -600,6 +635,14 @@ export class WsHandler {
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
+      FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentApprovalRespondSchema,
+      FreshAgentQuestionRespondSchema,
+      FreshAgentKillSchema,
+      FreshAgentForkSchema,
       SdkCreateSchema,
       SdkSendSchema,
       SdkPermissionRespondSchema,
@@ -869,6 +912,23 @@ export class WsHandler {
     return current
   }
 
+  private withFreshAgentCreateLock(key: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.freshAgentCreateLocks.get(key) ?? Promise.resolve()
+
+    let current: Promise<void>
+    current = previous
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        if (this.freshAgentCreateLocks.get(key) === current) {
+          this.freshAgentCreateLocks.delete(key)
+        }
+      })
+
+    this.freshAgentCreateLocks.set(key, current)
+    return current
+  }
+
   private async resolveSdkCreateOwnership(
     requestId: string,
     resumeSessionId?: string,
@@ -956,6 +1016,35 @@ export class WsHandler {
     if (liveSession) return liveSession
     this.createdSdkSessionByRequestId.delete(requestId)
     return undefined
+  }
+
+  private rememberCreatedFreshAgentSession(
+    requestId: string,
+    created: { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } },
+  ): void {
+    this.createdFreshAgentSessionByRequestId.set(requestId, created)
+  }
+
+  private resolveCreatedFreshAgentSession(
+    requestId: string,
+  ): { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } } | undefined {
+    return this.createdFreshAgentSessionByRequestId.get(requestId)
+  }
+
+  private clearFreshAgentCreateCachesForSession(locator: {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+  }): void {
+    for (const [requestId, cached] of this.createdFreshAgentSessionByRequestId.entries()) {
+      if (
+        cached.sessionId === locator.sessionId
+        && cached.sessionType === locator.sessionType
+        && cached.runtimeProvider === locator.provider
+      ) {
+        this.createdFreshAgentSessionByRequestId.delete(requestId)
+      }
+    }
   }
 
   private resolveSdkOwnerSession(ownerKey: string): SdkSessionState | undefined {
@@ -1171,6 +1260,9 @@ export class WsHandler {
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
+      freshAgentSessions: new Set(),
+      freshAgentSubscriptions: new Map(),
+      freshAgentSubscriptionKeysInFlight: new Set(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
@@ -1226,6 +1318,12 @@ export class WsHandler {
       off()
     }
     state.sdkSubscriptions.clear()
+    for (const off of state.freshAgentSubscriptions?.values() ?? []) {
+      off()
+    }
+    state.freshAgentSubscriptions?.clear()
+    state.freshAgentSubscriptionKeysInFlight?.clear()
+    state.freshAgentSessions?.clear()
 
     for (const [requestId, pending] of this.screenshotRequests) {
       if (pending.connectionId !== ws.connectionId) continue
@@ -1686,6 +1784,91 @@ export class WsHandler {
         this.safeSend(ws, metadata)
       }
       createReadyForLiveForward = true
+    }
+  }
+
+  private registerClientFreshAgentSession(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
+  ): void {
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.add(key)
+    const existing = state.freshAgentSubscriptions.get(key)
+    if (existing || state.freshAgentSubscriptionKeysInFlight.has(key)) {
+      return
+    }
+    if (!this.freshAgentRuntimeManager) {
+      return
+    }
+    const reportSubscribeFailure = (error: unknown) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
+      const message = error instanceof Error ? error.message : 'Failed to subscribe to fresh-agent session updates'
+      log.warn({ err: error, locator }, 'Fresh-agent session subscription failed')
+      if (!state.freshAgentSessions.has(key)) return
+      this.safeSend(ws, {
+        type: 'freshAgent.event',
+        sessionId: locator.sessionId,
+        sessionType: locator.sessionType,
+        provider: locator.provider,
+        event: {
+          type: 'sdk.error',
+          sessionId: locator.sessionId,
+          code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+          message,
+        },
+      })
+    }
+    state.freshAgentSubscriptionKeysInFlight.add(key)
+    let subscription: Promise<() => void>
+    try {
+      subscription = this.freshAgentRuntimeManager.subscribe(locator, (event) => {
+        if (!state.freshAgentSessions.has(key)) return
+        this.safeSend(ws, {
+          type: 'freshAgent.event',
+          sessionId: locator.sessionId,
+          sessionType: locator.sessionType,
+          provider: locator.provider,
+          event,
+        })
+      })
+    } catch (error) {
+      reportSubscribeFailure(error)
+      return
+    }
+    void subscription.then((off) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
+      if (!state.freshAgentSessions.has(key)) {
+        off()
+        return
+      }
+      if (state.freshAgentSubscriptions.has(key)) {
+        off()
+        return
+      }
+      state.freshAgentSubscriptions.set(key, off)
+    }).catch(reportSubscribeFailure)
+  }
+
+  private clearClientFreshAgentSession(
+    state: ClientState,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
+  ): void {
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.delete(key)
+    state.freshAgentSubscriptionKeysInFlight.delete(key)
+    const off = state.freshAgentSubscriptions.get(key)
+    if (off) {
+      off()
+      state.freshAgentSubscriptions.delete(key)
     }
   }
 
@@ -3017,6 +3200,260 @@ export class WsHandler {
             this.sendSdkCreateFailed(ws, m.requestId, failure)
           }
         })
+        return
+      }
+
+      case 'freshAgent.create': {
+        const freshAgentRuntimeManager = this.freshAgentRuntimeManager
+        if (!freshAgentRuntimeManager) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: 'Fresh-agent runtime not enabled',
+            retryable: true,
+          } as const)
+          return
+        }
+        const provider = m.provider ?? resolveFreshAgentRuntimeProvider(m.sessionType)
+        if (!provider) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: `No runtime provider is registered for ${m.sessionType}`,
+            retryable: false,
+          } as const)
+          return
+        }
+        try {
+          await this.withFreshAgentCreateLock(`request:${m.requestId}`, async () => {
+            const cached = this.resolveCreatedFreshAgentSession(m.requestId)
+            if (cached) {
+              if (cached.sessionType !== m.sessionType || cached.runtimeProvider !== provider) {
+                this.send(ws, {
+                  type: 'freshAgent.create.failed',
+                  requestId: m.requestId,
+                  code: 'FRESH_AGENT_CREATE_REQUEST_CONFLICT',
+                  message: `freshAgent.create request ${m.requestId} already belongs to ${cached.sessionType}/${cached.runtimeProvider}`,
+                  retryable: false,
+                } as const)
+                return
+              }
+              this.send(ws, {
+                type: 'freshAgent.created',
+                requestId: m.requestId,
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+                runtimeProvider: cached.runtimeProvider,
+                sessionRef: cached.sessionRef,
+              } as const)
+              this.registerClientFreshAgentSession(ws, state, {
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+              })
+              return
+            }
+
+            const created = await freshAgentRuntimeManager.create({
+              requestId: m.requestId,
+              sessionType: m.sessionType,
+              provider,
+              cwd: m.cwd,
+              resumeSessionId: m.resumeSessionId,
+              sessionRef: m.sessionRef,
+              model: m.model,
+              modelSelection: m.modelSelection,
+              permissionMode: m.permissionMode,
+              sandbox: m.sandbox,
+              effort: m.effort,
+              plugins: m.plugins,
+            })
+            this.rememberCreatedFreshAgentSession(m.requestId, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
+            })
+            this.send(ws, {
+              type: 'freshAgent.created',
+              requestId: m.requestId,
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+              runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
+            } as const)
+            this.registerClientFreshAgentSession(ws, state, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+            })
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
+          const code = error && typeof error === 'object' && 'code' in error
+            ? String((error as { code?: unknown }).code)
+            : 'FRESH_AGENT_CREATE_FAILED'
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code,
+            message,
+            retryable: true,
+          } as const)
+        }
+        return
+      }
+
+      case 'freshAgent.attach': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        try {
+          const attached = this.freshAgentRuntimeManager.attach({
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+          })
+          this.registerClientFreshAgentSession(ws, state, {
+            sessionId: attached.sessionId,
+            sessionType: attached.sessionType,
+            provider: attached.runtimeProvider,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to attach fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.send': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.send(locator, {
+            text: m.text,
+            images: m.images?.map((image: { mediaType: string; data: string }) => ({ kind: 'data' as const, ...image })),
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to send fresh-agent message'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.interrupt': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.interrupt(locator)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to interrupt fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.approval.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.resolveApproval(locator, m.requestId, m.decision)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to resolve fresh-agent approval'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.question.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.answerQuestion(locator, m.requestId, m.answers)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to answer fresh-agent question'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.kill': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          const killed = await this.freshAgentRuntimeManager.kill(locator)
+          this.clearFreshAgentCreateCachesForSession(locator)
+          this.clearClientFreshAgentSession(state, locator)
+          this.send(ws, {
+            type: 'freshAgent.killed',
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+            success: killed,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to kill fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.fork': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.fork(locator, m.input)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to fork fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
         return
       }
 

@@ -403,7 +403,91 @@ export const SdkQuestionRespondSchema = z.object({
   answers: z.record(z.string(), z.string()),
 })
 
+export const FreshAgentCreateSchema = z.object({
+  type: z.literal('freshAgent.create'),
+  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']).optional(),
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: z.string().optional(),
+  permissionMode: z.string().optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
+  effort: z.string().trim().min(1).optional(),
+  plugins: z.array(z.string()).optional(),
+})
+
+export const FreshAgentAttachSchema = z.object({
+  type: z.literal('freshAgent.attach'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  resumeSessionId: z.string().optional(),
+})
+
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  text: z.string().min(1),
+  images: z.array(z.object({
+    mediaType: z.string(),
+    data: z.string(),
+  })).optional(),
+})
+
+export const FreshAgentInterruptSchema = z.object({
+  type: z.literal('freshAgent.interrupt'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentApprovalRespondSchema = z.object({
+  type: z.literal('freshAgent.approval.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  decision: z.record(z.string(), z.unknown()),
+})
+
+export const FreshAgentQuestionRespondSchema = z.object({
+  type: z.literal('freshAgent.question.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  answers: z.record(z.string(), z.string()),
+})
+
+export const FreshAgentKillSchema = z.object({
+  type: z.literal('freshAgent.kill'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentForkSchema = z.object({
+  type: z.literal('freshAgent.fork'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  input: z.record(z.string(), z.unknown()).optional(),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -436,6 +520,14 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -702,6 +794,12 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
 
+export type FreshAgentServerMessage =
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }
   | {
@@ -818,6 +916,7 @@ export type ServerMessage =
   | CodingCliExitMessage
   | CodingCliStderrMessage
   | CodingCliKilledMessage
+  | FreshAgentServerMessage
   | SdkServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage

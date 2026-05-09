@@ -5,7 +5,7 @@ export const AUDIT_PROFILE_IDS = ['desktop_local', 'mobile_restricted'] as const
 export const AUDIT_SCENARIO_IDS = [
   'auth-required-cold-boot',
   'terminal-cold-boot',
-  'agent-chat-cold-boot',
+  'fresh-agent-cold-boot',
   'sidebar-search-large-corpus',
   'terminal-reconnect-backlog',
   'offscreen-tab-selection',

@@ -18,7 +18,8 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, migrateLegacyAgentChatDurableState, sanitizeSessionRef } from '@shared/session-contract'
+import { migrateLegacyFreshAgentContent, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 
 const log = createLogger('PanesSlice')
@@ -29,7 +30,7 @@ type HydratePanesMeta = {
 }
 
 function buildPreservedSessionRef(
-  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' }>,
+  localContent: Extract<PaneContent, { kind: 'terminal' | 'agent-chat' | 'fresh-agent' }>,
   _preservedResumeSessionId?: string,
 ) {
   return sanitizeSessionRef(localContent.sessionRef)
@@ -79,26 +80,70 @@ function normalizePaneContent(
       devToolsOpen: typeof input.devToolsOpen === 'boolean' ? input.devToolsOpen : false,
     }
   }
-  if (input.kind === 'agent-chat') {
+  if (input.kind === 'fresh-agent' || input.kind === 'agent-chat') {
+    const migratedInput = migrateLegacyFreshAgentContent(input)
+    const sessionType = migratedInput.kind === 'fresh-agent'
+      ? migratedInput.sessionType
+      : previous?.kind === 'fresh-agent'
+        ? previous.sessionType
+        : undefined
+    const provider = migratedInput.kind === 'fresh-agent'
+      ? migratedInput.provider
+      : resolveFreshAgentRuntimeProvider(sessionType)
+    if (!sessionType || !provider) {
+      return previous ?? { kind: 'picker' }
+    }
+    const legacyDurableState = input.kind === 'agent-chat'
+      ? (() => {
+          const legacyInput = input as unknown as Record<string, unknown>
+          return migrateLegacyAgentChatDurableState({
+            sessionRef: input.sessionRef,
+            cliSessionId: typeof legacyInput.cliSessionId === 'string' ? legacyInput.cliSessionId : undefined,
+            timelineSessionId: typeof legacyInput.timelineSessionId === 'string' ? legacyInput.timelineSessionId : undefined,
+            resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+          })
+        })()
+      : {}
+    const codexDurableSessionId = provider === 'codex'
+      ? (typeof input.sessionId === 'string' && input.sessionId.length > 0
+          ? input.sessionId
+          : (typeof input.resumeSessionId === 'string' && input.resumeSessionId.length > 0
+              ? input.resumeSessionId
+              : undefined))
+      : undefined
     const sessionRef = sanitizeSessionRef(input.sessionRef)
+      ?? legacyDurableState.sessionRef
+      ?? (codexDurableSessionId ? { provider: 'codex' as const, sessionId: codexDurableSessionId } : undefined)
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
+    const sandbox = input.kind === 'fresh-agent' ? input.sandbox : undefined
+    const normalizedModelSelection = provider === 'codex'
+      ? undefined
+      : normalizeAgentChatModelSelection(
+          (input as { modelSelection?: unknown }).modelSelection,
+          (input as { model?: unknown }).model,
+        )
+    const normalizedModel = provider === 'codex' && typeof (input as { model?: unknown }).model === 'string'
+      ? (input as { model: string }).model
+      : undefined
     return {
-      kind: 'agent-chat',
-      provider: input.provider,
+      kind: 'fresh-agent',
+      sessionType,
+      provider,
       sessionId: input.sessionId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
-      serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
-      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
+      serverInstanceId: typeof (input as { serverInstanceId?: unknown }).serverInstanceId === 'string'
+        ? (input as { serverInstanceId: string }).serverInstanceId
+        : undefined,
+      ...(!sessionRef && restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
-      modelSelection: normalizeAgentChatModelSelection(
-        (input as { modelSelection?: unknown }).modelSelection,
-        (input as { model?: unknown }).model,
-      ),
+      modelSelection: normalizedModelSelection,
+      model: normalizedModel,
       permissionMode: input.permissionMode,
+      sandbox,
       effort: normalizeAgentChatEffortOverride(input.effort),
       plugins: input.plugins,
       settingsDismissed: input.settingsDismissed,
@@ -116,7 +161,10 @@ function shouldPreferLocalAgentChatPaneDuringHydration(
   incomingContent: PaneContent,
   meta: HydratePanesMeta | undefined,
 ): boolean {
-  if (localContent.kind !== 'agent-chat' || incomingContent.kind !== 'agent-chat') {
+  if (
+    (localContent.kind !== 'agent-chat' && localContent.kind !== 'fresh-agent')
+    || (incomingContent.kind !== 'agent-chat' && incomingContent.kind !== 'fresh-agent')
+  ) {
     return false
   }
 
@@ -130,7 +178,10 @@ function shouldPreferLocalAgentChatPaneDuringHydration(
     return false
   }
 
-  return isValidClaudeSessionId(localContent.resumeSessionId)
+  return (
+    localContent.provider === 'claude'
+    && isValidClaudeSessionId(localContent.resumeSessionId)
+  )
 }
 
 /**
@@ -189,7 +240,11 @@ function collectLegacyDisplayFields(node: unknown): LegacyDisplayFields {
   if (!node || typeof node !== 'object') return {}
   const n = node as { type?: string; content?: Record<string, unknown>; children?: unknown[] }
 
-  if (n.type === 'leaf' && n.content && n.content.kind === 'agent-chat') {
+  if (
+    n.type === 'leaf'
+    && n.content
+    && (n.content.kind === 'agent-chat' || n.content.kind === 'fresh-agent')
+  ) {
     const c = n.content as Record<string, unknown>
     return {
       ...(typeof c.showThinking === 'boolean' && c.showThinking ? { showThinking: true } : {}),
@@ -214,7 +269,7 @@ function collectLegacyDisplayFields(node: unknown): LegacyDisplayFields {
 
 function stripLegacyDisplayFields(node: any): any {
   if (!node) return node
-  if (node.type === 'leaf' && node.content?.kind === 'agent-chat') {
+  if (node.type === 'leaf' && (node.content?.kind === 'agent-chat' || node.content?.kind === 'fresh-agent')) {
     const { showThinking: _st, showTools: _stl, showTimecodes: _stc, ...rest } = node.content
     if (_st === undefined && _stl === undefined && _stc === undefined) return node
     return { ...node, content: rest }
@@ -550,7 +605,7 @@ function mergeTerminalState(
   if (!incomingValid) return localValid ? local : null
   if (!localValid) return incoming
 
-  // If both leaves, apply smart merge for terminal and agent-chat content
+  // If both leaves, apply smart merge for terminal and rich-agent content
   if (incoming.type === 'leaf' && local.type === 'leaf') {
     if (incoming.content?.kind === 'terminal' && local.content?.kind === 'terminal') {
       if (incoming.content.createRequestId === local.content.createRequestId) {
@@ -587,10 +642,13 @@ function mergeTerminalState(
       }
     }
 
-    // Agent-chat panes: prefer local sessionId and status when the local state
+    // Rich-agent panes: prefer local sessionId and status when the local state
     // is more advanced. The persist debounce means incoming (from localStorage)
     // can be stale — e.g. status 'starting' when local has already reached 'connected'.
-    if (incoming.content?.kind === 'agent-chat' && local.content?.kind === 'agent-chat') {
+    if (
+      (incoming.content?.kind === 'agent-chat' || incoming.content?.kind === 'fresh-agent')
+      && (local.content?.kind === 'agent-chat' || local.content?.kind === 'fresh-agent')
+    ) {
       if (shouldPreferLocalAgentChatPaneDuringHydration(local.content, incoming.content, meta)) {
         return local
       }
@@ -690,6 +748,10 @@ function stripStaleIds(content: PaneContent): PaneContentInput {
     return rest
   }
   if (content.kind === 'agent-chat') {
+    const { sessionId: _sessionId, createRequestId: _createRequestId, status: _status, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'fresh-agent') {
     const { sessionId: _sessionId, createRequestId: _createRequestId, status: _status, ...rest } = content
     return rest
   }
@@ -1265,7 +1327,7 @@ export const panesSlice = createSlice({
 
       function restartContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
-          if (node.id !== paneId || node.content.kind !== 'agent-chat') {
+          if (node.id !== paneId || (node.content.kind !== 'agent-chat' && node.content.kind !== 'fresh-agent')) {
             return node
           }
           return {

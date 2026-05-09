@@ -781,7 +781,7 @@ describe('tabsSlice', () => {
       })
     })
 
-    it('repairs a mis-restored single-pane session tab when the reopened session resolves to agent-chat', async () => {
+    it('repairs a mis-restored single-pane session tab when the reopened session resolves to fresh-agent', async () => {
       const store = configureStore({
         reducer: {
           tabs: tabsReducer,
@@ -818,8 +818,10 @@ describe('tabsSlice', () => {
       expect(store.getState().panes.layouts['tab-1']).toMatchObject({
         type: 'leaf',
         content: {
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_CLAUDE_SESSION_ID,

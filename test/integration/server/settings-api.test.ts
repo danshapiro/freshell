@@ -168,6 +168,21 @@ describe('Settings API Integration', () => {
     })
   })
 
+  it('PATCH /api/settings accepts freshAgent settings while preserving the legacy alias', async () => {
+    const res = await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({
+        freshAgent: {
+          defaultPlugins: ['fs', 'search'],
+        },
+      })
+
+    expect(res.status).toBe(200)
+    expect(res.body.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
+    expect(res.body.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+  })
+
   it('PATCH /api/settings preserves runtime CLI providers outside the built-in defaults', async () => {
     const res = await request(app)
       .patch('/api/settings')

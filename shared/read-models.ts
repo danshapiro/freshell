@@ -94,6 +94,12 @@ export const RestoreStaleRevisionResponseSchema = z.object({
   currentRevision: z.number().int().nonnegative(),
 })
 
+export const FreshAgentStaleRevisionResponseSchema = z.object({
+  error: z.string().min(1),
+  code: z.literal('STALE_THREAD_REVISION'),
+  currentRevision: z.number().int().nonnegative(),
+})
+
 export const TerminalScrollbackQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.number().int().positive().max(200).optional(),
@@ -114,5 +120,6 @@ export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema
 export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>
 export type AgentTimelineTurnBodyQuery = z.infer<typeof AgentTimelineTurnBodyQuerySchema>
 export type RestoreStaleRevisionResponse = z.infer<typeof RestoreStaleRevisionResponseSchema>
+export type FreshAgentStaleRevisionResponse = z.infer<typeof FreshAgentStaleRevisionResponseSchema>
 export type TerminalScrollbackQuery = z.infer<typeof TerminalScrollbackQuerySchema>
 export type TerminalSearchQuery = z.infer<typeof TerminalSearchQuerySchema>

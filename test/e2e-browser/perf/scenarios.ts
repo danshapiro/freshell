@@ -3,7 +3,7 @@ import type { AuditProfileId } from './profiles.js'
 export type AuditScenarioId =
   | 'auth-required-cold-boot'
   | 'terminal-cold-boot'
-  | 'agent-chat-cold-boot'
+  | 'fresh-agent-cold-boot'
   | 'sidebar-search-large-corpus'
   | 'terminal-reconnect-backlog'
   | 'offscreen-tab-selection'
@@ -60,8 +60,8 @@ export const AUDIT_SCENARIOS: readonly AuditScenarioDefinition[] = [
     buildUrl: ({ token }) => buildRootUrl(token),
   },
   {
-    id: 'agent-chat-cold-boot',
-    description: 'Cold boot into the seeded long-history agent chat session until the surface is visible.',
+    id: 'fresh-agent-cold-boot',
+    description: 'Cold boot into the seeded long-history fresh-agent session until the surface is visible.',
     focusedReadyMilestone: 'agent_chat.surface_visible',
     allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/agent-sessions/:sessionId/timeline'],
     allowedWsTypesBeforeReady: ['hello', 'ready', 'sdk.session.snapshot', 'sdk.status', 'sdk.stream', 'sdk.assistant', 'sdk.result', 'sdk.error', 'sdk.exit'],

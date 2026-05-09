@@ -222,7 +222,7 @@ describe('PanePicker', () => {
       expect(codexButton.querySelector('img')).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: Freshclaude, CLIs, Editor, Browser, Shell (Kilroy hidden by default)', () => {
+    it('renders options in correct order: Freshclaude, CLIs, Freshcodex, Editor, Browser, Shell (Kilroy hidden by default)', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -233,9 +233,10 @@ describe('PanePicker', () => {
       expect(labels[0]).toBe('Freshclaude')
       expect(labels[1]).toBe('Claude CLI')
       expect(labels[2]).toBe('Codex CLI')
-      expect(labels[3]).toBe('Editor')
-      expect(labels[4]).toBe('Browser')
-      expect(labels[5]).toBe('Shell')
+      expect(labels[3]).toBe('Freshcodex')
+      expect(labels[4]).toBe('Editor')
+      expect(labels[5]).toBe('Browser')
+      expect(labels[6]).toBe('Shell')
       expect(labels).not.toContain('Kilroy')
     })
 
@@ -254,9 +255,10 @@ describe('PanePicker', () => {
       expect(labels[1]).toBe('Claude CLI')
       expect(labels[2]).toBe('Codex CLI')
       expect(labels[3]).toBe('Kilroy')
-      expect(labels[4]).toBe('Editor')
-      expect(labels[5]).toBe('Browser')
-      expect(labels[6]).toBe('Shell')
+      expect(labels[4]).toBe('Freshcodex')
+      expect(labels[5]).toBe('Editor')
+      expect(labels[6]).toBe('Browser')
+      expect(labels[7]).toBe('Shell')
     })
 
     it('shows only non-CLI options when no CLIs are available', () => {
@@ -592,7 +594,7 @@ describe('PanePicker', () => {
   })
 
   describe('balanced icon layout', () => {
-    it('prefers a balanced 3+3 arrangement when six options are visible', () => {
+    it('prefers a balanced 3+2+2 arrangement when seven options are visible', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -600,9 +602,10 @@ describe('PanePicker', () => {
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')
-      expect(rows).toHaveLength(2)
+      expect(rows).toHaveLength(3)
       expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
-      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[2]).getAllByRole('button')).toHaveLength(2)
     })
   })
 

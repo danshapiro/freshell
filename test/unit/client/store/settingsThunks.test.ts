@@ -411,7 +411,7 @@ describe('settingsThunks', () => {
         providers: {
           ...initialServerSettings.agentChat.providers,
           freshclaude: {
-            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
             effort: 'turbo',
           },
         },

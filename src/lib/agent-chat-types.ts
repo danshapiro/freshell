@@ -1,7 +1,8 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { AgentChatModelSelection } from '@shared/agent-chat-capabilities'
+import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
-export type AgentChatProviderName = 'freshclaude' | 'kilroy'
+export type AgentChatProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
 
 export type AgentChatProviderSettings = {
   modelSelection?: AgentChatModelSelection

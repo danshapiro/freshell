@@ -8,6 +8,7 @@
 import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../cli/keys.js'
+import { isCanonicalClaudeSessionId } from '../../shared/session-contract.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -46,7 +47,7 @@ FRESHELL_URL and FRESHELL_TOKEN are already set in your environment.
 ## Mental model
 
 - Tabs contain pane trees (splits). Panes contain content.
-- Pane kinds: terminal, editor, browser, agent-chat (Claude/Codex/etc.), picker (transient).
+- Pane kinds: terminal, editor, browser, fresh-agent (Freshclaude/Freshcodex/etc.), picker (transient).
 - **Picker panes are ephemeral.** A freshly-created tab without mode/browser/editor starts as a picker pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a picker pane for splits or mutations -- use mode/browser/editor params on new-tab/split-pane to skip the picker entirely.
 - Typical workflow: new-tab -> send-keys -> wait-for -> capture-pane/screenshot.
 
@@ -541,7 +542,7 @@ async function routeAction(
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const sessionRef = typeof mode === 'string' && typeof resume === 'string'
+      const sessionRef = typeof mode === 'string' && typeof resume === 'string' && isCanonicalClaudeSessionId(resume)
         ? { provider: mode, sessionId: resume }
         : undefined
       const tabResult = await c.post('/api/tabs', {

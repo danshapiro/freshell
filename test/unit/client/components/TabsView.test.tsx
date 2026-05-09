@@ -169,7 +169,7 @@ describe('TabsView', () => {
           payload: {
             provider: 'freshclaude',
             resumeSessionId: '00000000-0000-4000-8000-000000000444',
-            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+            modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
             permissionMode: 'plan',
             effort: 'turbo',
             plugins: ['planner'],
@@ -192,20 +192,23 @@ describe('TabsView', () => {
     if (!copiedTab) throw new Error('expected copied tab')
 
     const copiedLayout = store.getState().panes.layouts[copiedTab.id] as any
+    expect(copiedTab.mode).toBe('shell')
     expect(copiedLayout.content).toMatchObject({
-      kind: 'agent-chat',
-      provider: 'freshclaude',
-      resumeSessionId: undefined,
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       sessionRef: {
         provider: 'claude',
         sessionId: '00000000-0000-4000-8000-000000000444',
       },
-      serverInstanceId: 'srv-remote',
-      modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
+      modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
       permissionMode: 'plan',
       effort: 'turbo',
       plugins: ['planner'],
     })
+    expect(copiedLayout.content.serverInstanceId).toBeUndefined()
+    expect(copiedLayout.content.resumeSessionId).toBeUndefined()
+    expect(copiedLayout.content.sessionId).toBeUndefined()
   })
 
   it('shows context menu on right-click with appropriate items', () => {

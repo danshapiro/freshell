@@ -3,6 +3,7 @@
  */
 
 import { isNonShellMode } from '@/lib/coding-cli-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
@@ -117,6 +118,13 @@ function extractSessionLocators(content: PaneContent): Array<{
     const sessionId = content.resumeSessionId
     if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
     locators.push({ provider: 'claude', sessionId })
+    return dedupeBy(locators, locatorIdentity)
+  }
+  if (content.kind === 'fresh-agent') {
+    const sessionId = content.resumeSessionId
+    const provider = resolveFreshAgentType(content.sessionType)?.runtimeProvider ?? content.provider
+    if (!sessionId || !provider) return dedupeBy(locators, locatorIdentity)
+    locators.push({ provider, sessionId })
     return dedupeBy(locators, locatorIdentity)
   }
   if (content.kind !== 'terminal') return dedupeBy(locators, locatorIdentity)
@@ -353,6 +361,11 @@ export function findTabIdForSession(
   return selectBestSessionMatch(candidates, sanitizedTarget, localServerInstanceId)?.tabId
 }
 
+/**
+ * Find the tab and pane that contain a specific session.
+ * Walks all tabs' pane trees looking for a pane (terminal, agent-chat, or fresh-agent) matching the provider + sessionId.
+ * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
+ */
 export function findPaneForSession(
   state: RootState,
   target: SessionMatchLocator,

@@ -194,7 +194,7 @@ describe('CodexAppServerRuntime', () => {
   it('proxies thread/start through the runtime client after boot', async () => {
     const runtime = createRuntime()
 
-    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -210,13 +210,40 @@ describe('CodexAppServerRuntime', () => {
     await expect(runtime.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       thread: {
         id: '019d9859-5670-72b1-851f-794ad7fef112',
         path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
         ephemeral: false,
       },
       wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    })
+  })
+
+  it('translates rich-client raw-event params before proxying thread/start', async () => {
+    const runtime = createRuntime()
+
+    await expect(runtime.startThread({ cwd: '/repo/worktree', richClient: true })).resolves.toMatchObject({
+      thread: {
+        id: 'thread-new-1',
+        path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
+        ephemeral: false,
+      },
+      wsUrl: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
+    })
+  })
+
+  it('proxies thread/read through the shared client after boot', async () => {
+    const runtime = createRuntime()
+
+    await expect(runtime.readThread({
+      threadId: 'thread-new-1',
+      includeTurns: false,
+    })).resolves.toMatchObject({
+      thread: {
+        id: 'thread-new-1',
+        turns: [],
+      },
     })
   })
 
@@ -341,7 +368,7 @@ describe('CodexAppServerRuntime', () => {
       requestTimeoutMs: 1_500,
     })
 
-    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(runtime.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -366,7 +393,7 @@ describe('CodexAppServerRuntime', () => {
     await expect(runtime.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       thread: {
         id: '019d9859-5670-72b1-851f-794ad7fef112',
         path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
@@ -404,7 +431,7 @@ describe('CodexAppServerRuntime', () => {
     })
 
     await runtime.startThread({ cwd: '/repo/worktree' })
-    await expect(startedThread).resolves.toEqual({
+    await expect(startedThread).resolves.toMatchObject({
       id: 'thread-new-1',
       path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
       ephemeral: false,

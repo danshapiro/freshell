@@ -16,6 +16,7 @@ type FakeServerBehavior = {
   ignoreMethods?: string[]
   notifyAfterMethodsOnce?: Record<string, Array<{ method: string; params?: unknown }>>
   requireJsonRpc?: boolean
+  rejectJsonRpc?: boolean
   requireInitializeBeforeOtherMethods?: boolean
   overrides?: Record<string, { result?: unknown; error?: { code: number; message: string } }>
 }
@@ -136,7 +137,7 @@ describe('CodexAppServerClient', () => {
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await client.initialize()
-    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -156,7 +157,7 @@ describe('CodexAppServerClient', () => {
     await client.initialize()
     await client.startThread({ cwd: '/repo/worktree' })
 
-    await expect(startedThread).resolves.toEqual({
+    await expect(startedThread).resolves.toMatchObject({
       id: 'thread-new-1',
       path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
       ephemeral: false,
@@ -188,11 +189,11 @@ describe('CodexAppServerClient', () => {
 
     await waitFor(() => expect(lifecycle).toHaveBeenCalledWith({
       kind: 'thread_started',
-      thread: {
+      thread: expect.objectContaining({
         id: 'thread-resume-1',
         path: '/tmp/codex/rollout-thread-resume-1.jsonl',
         ephemeral: false,
-      },
+      }),
     }))
   })
 
@@ -261,12 +262,41 @@ describe('CodexAppServerClient', () => {
     })))
   })
 
-  it('sends JSON-RPC 2.0 envelopes to the app-server', async () => {
-    const server = await startFakeCodexAppServer({ requireJsonRpc: true })
+  it('starts rich Codex threads with raw events enabled when requested', async () => {
+    const server = await startFakeCodexAppServer({
+      overrides: {
+        'thread/start': {
+          result: {
+            thread: { id: 'thread-rich-1', path: null, ephemeral: false },
+            cwd: '/repo/worktree',
+            model: 'fixture-model',
+            modelProvider: 'openai',
+            instructionSources: [],
+            approvalPolicy: 'never',
+            approvalsReviewer: 'user',
+            sandbox: 'danger-full-access',
+          },
+        },
+      },
+    })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await client.initialize()
-    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(client.startThread({ cwd: '/repo/worktree', richClient: true })).resolves.toMatchObject({
+      thread: {
+        id: 'thread-rich-1',
+        path: null,
+        ephemeral: false,
+      },
+    })
+  })
+
+  it('sends Codex app-server envelopes without jsonrpc', async () => {
+    const server = await startFakeCodexAppServer({ rejectJsonRpc: true })
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -276,19 +306,39 @@ describe('CodexAppServerClient', () => {
   })
 
   it('sends thread/resume and returns the exact resumed thread id', async () => {
-    const server = await startFakeCodexAppServer()
+    const server = await startFakeCodexAppServer({
+      overrides: {
+        'thread/resume': {
+          result: {
+            thread: {
+              id: '019d9859-5670-72b1-851f-794ad7fef112',
+              path: '/tmp/rollout-019d9859-5670-72b1-851f-794ad7fef112.jsonl',
+              ephemeral: false,
+            },
+            cwd: '/repo/worktree',
+            model: 'fixture-model',
+            modelProvider: 'openai',
+            instructionSources: [],
+            approvalPolicy: 'never',
+            approvalsReviewer: 'user',
+            sandbox: { type: 'dangerFullAccess' },
+          },
+        },
+      },
+    })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await client.initialize()
     await expect(client.resumeThread({
       threadId: '019d9859-5670-72b1-851f-794ad7fef112',
       cwd: '/repo/worktree',
-    })).resolves.toEqual({
+    })).resolves.toMatchObject({
       thread: {
         id: '019d9859-5670-72b1-851f-794ad7fef112',
         path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
         ephemeral: false,
       },
+      sandbox: { type: 'dangerFullAccess' },
     })
   })
 
@@ -299,7 +349,7 @@ describe('CodexAppServerClient', () => {
     await client.initialize()
     await new Promise((resolve) => setTimeout(resolve, 25))
 
-    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toEqual({
+    await expect(client.startThread({ cwd: '/repo/worktree' })).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -324,7 +374,7 @@ describe('CodexAppServerClient', () => {
       platformFamily: expect.any(String),
       platformOs: expect.any(String),
     })
-    await expect(startThreadPromise).resolves.toEqual({
+    await expect(startThreadPromise).resolves.toMatchObject({
       thread: {
         id: 'thread-new-1',
         path: expect.stringMatching(/\/sessions\/\d{4}\/\d{2}\/\d{2}\/rollout-thread-new-1\.jsonl$/),
@@ -387,5 +437,49 @@ describe('CodexAppServerClient', () => {
     await expect(client.startThread({ cwd: '/repo/worktree' })).rejects.toThrow(
       'Codex app-server returned an invalid thread/start payload.',
     )
+  })
+
+  it('reads thread snapshots from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.readThread({ threadId: 'thread-new-1', includeTurns: false })).resolves.toMatchObject({
+      thread: {
+        id: 'thread-new-1',
+        status: { type: 'idle' },
+        turns: [],
+      },
+    })
+  })
+
+  it('lists thread turns from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.listThreadTurns({
+      threadId: 'thread-new-1',
+    })).resolves.toMatchObject({
+      revision: 1770000007,
+      nextCursor: null,
+      turns: [expect.objectContaining({ id: 'turn-1' })],
+      bodies: { 'turn-1': expect.objectContaining({ id: 'turn-1' }) },
+    })
+  })
+
+  it('reads an individual thread turn from the app-server thread surface', async () => {
+    const server = await startFakeCodexAppServer()
+    const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
+
+    await client.initialize()
+    await expect(client.readThreadTurn({
+      threadId: 'thread-new-1',
+      turnId: 'turn-1',
+      revision: 7,
+    })).resolves.toMatchObject({
+      turnId: 'turn-1',
+      revision: 7,
+    })
   })
 })

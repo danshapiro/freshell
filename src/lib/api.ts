@@ -1,4 +1,10 @@
 import type { CodingCliProviderName } from './coding-cli-types'
+import {
+  FreshAgentSnapshotSchema,
+  FreshAgentTurnBodySchema,
+  FreshAgentTurnPageSchema,
+} from '@shared/fresh-agent-contract'
+import { FreshAgentApiContractError } from '@/lib/fresh-agent-api-error'
 import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
@@ -294,6 +300,81 @@ export async function getAgentTurnBody(
     ])}`,
     { ...options, signal },
   )
+}
+
+export async function getFreshAgentThreadSnapshot(
+  sessionType: string,
+  provider: string,
+  threadId: string,
+  query: { revision?: number; signal?: AbortSignal } = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  const data = await api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
+      ['revision', query.revision],
+    ])}`,
+    { ...options, signal },
+  )
+  const parsed = FreshAgentSnapshotSchema.safeParse(data)
+  if (!parsed.success) {
+    throw new FreshAgentApiContractError('Fresh-agent snapshot response did not match the shared contract.', parsed.error.issues)
+  }
+  return parsed.data
+}
+
+export async function getFreshAgentTurnPage(
+  sessionType: string,
+  provider: string,
+  threadId: string,
+  query: {
+    cursor?: string
+    priority?: string
+    revision: number
+    limit?: number
+    includeBodies?: boolean
+    signal?: AbortSignal
+  },
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  const data = await api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns${buildQueryString([
+      ['revision', query.revision],
+      ['cursor', query.cursor],
+      ['priority', query.priority],
+      ['limit', query.limit],
+      ['includeBodies', query.includeBodies ? 'true' : undefined],
+    ])}`,
+    { ...options, signal },
+  )
+  const parsed = FreshAgentTurnPageSchema.safeParse(data)
+  if (!parsed.success) {
+    throw new FreshAgentApiContractError('Fresh-agent turn page response did not match the shared contract.', parsed.error.issues)
+  }
+  return parsed.data
+}
+
+export async function getFreshAgentTurnBody(
+  sessionType: string,
+  provider: string,
+  threadId: string,
+  turnId: string,
+  query: { revision: number; signal?: AbortSignal },
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const signal = query.signal ?? options.signal
+  const data = await api.get(
+    `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+      ['revision', query.revision],
+    ])}`,
+    { ...options, signal },
+  )
+  const parsed = FreshAgentTurnBodySchema.safeParse(data)
+  if (!parsed.success) {
+    throw new FreshAgentApiContractError('Fresh-agent turn body response did not match the shared contract.', parsed.error.issues)
+  }
+  return parsed.data
 }
 
 export async function getTerminalViewport(

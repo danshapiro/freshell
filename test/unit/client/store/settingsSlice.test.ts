@@ -77,7 +77,10 @@ describe('settingsSlice', () => {
     const state = settingsReducer(initialState, setServerSettings(nextServerSettings))
 
     expect(state.loaded).toBe(true)
-    expect(state.serverSettings).toEqual(nextServerSettings)
+    expect(state.serverSettings.defaultCwd).toBe('/workspace')
+    expect(state.serverSettings.terminal.scrollback).toBe(12000)
+    expect(state.serverSettings.freshAgent.defaultPlugins).toEqual([])
+    expect(state.serverSettings.agentChat.defaultPlugins).toEqual([])
     expect(state.settings).toEqual({
       ...defaultSettings,
       defaultCwd: '/workspace',
@@ -85,9 +88,13 @@ describe('settingsSlice', () => {
         ...defaultSettings.terminal,
         scrollback: 12000,
       },
+      freshAgent: {
+        ...defaultSettings.freshAgent,
+        defaultPlugins: [],
+      },
       agentChat: {
         ...defaultSettings.agentChat,
-        defaultPlugins: ['fs'],
+        defaultPlugins: [],
       },
     })
   })

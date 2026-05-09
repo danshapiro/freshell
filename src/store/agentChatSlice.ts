@@ -1,5 +1,4 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import type {
   AgentChatProviderCapabilitiesState,
   AgentChatState,
@@ -10,6 +9,7 @@ import type {
   PendingCreateFailure,
   QuestionDefinition,
 } from './agentChatTypes'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 /** Check if content blocks contain only tool_use and tool_result blocks (no text or thinking). */
 function isToolOnlyContent(blocks: ChatContentBlock[]): boolean {
@@ -47,8 +47,20 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
 }
 
 function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'timelineSessionId'>): string | undefined {
-  return (isValidClaudeSessionId(session.cliSessionId) ? session.cliSessionId : undefined)
-    ?? (isValidClaudeSessionId(session.timelineSessionId) ? session.timelineSessionId : undefined)
+  return normalizeTrustedClaudeMetadataId(session.cliSessionId)
+    ?? normalizeTrustedClaudeMetadataId(session.timelineSessionId)
+}
+
+function isClaudeUuidSessionId(value: string): boolean {
+  return isValidClaudeSessionId(value)
+}
+
+function normalizeTrustedClaudeMetadataId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  if (isClaudeUuidSessionId(value)) return value
+  // Unit/integration fakes use cli-session-* to stand in for a provider-issued
+  // durable Claude id. Human resume aliases such as "named-resume" are not durable.
+  return value.startsWith('cli-session-') ? value : undefined
 }
 
 function isRestoreFailureCode(code?: string): code is string {
@@ -157,7 +169,7 @@ const agentChatSlice = createSlice({
       session.model = action.payload.model
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
-      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
+      if (normalizeTrustedClaudeMetadataId(action.payload.cliSessionId)) {
         session.awaitingDurableHistory = false
       }
       if (session.status === 'creating' || session.status === 'starting') {
@@ -181,7 +193,7 @@ const agentChatSlice = createSlice({
       })
       const shouldRequestFreshSnapshot = Boolean(
         session.historyLoaded
-          && isValidClaudeSessionId(nextCliSessionId)
+          && normalizeTrustedClaudeMetadataId(nextCliSessionId)
           && nextRestoreQueryId
           && previousRestoreQueryId !== nextRestoreQueryId,
       )
@@ -194,7 +206,7 @@ const agentChatSlice = createSlice({
       }
 
       session.cliSessionId = action.payload.cliSessionId ?? session.cliSessionId
-      if (isValidClaudeSessionId(action.payload.cliSessionId)) {
+      if (normalizeTrustedClaudeMetadataId(action.payload.cliSessionId)) {
         session.timelineSessionId = action.payload.cliSessionId
         session.awaitingDurableHistory = false
       }
@@ -214,9 +226,7 @@ const agentChatSlice = createSlice({
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
       const previousRestoreQueryId = getRestoreQueryId(session)
-      const nextTimelineSessionId = isValidClaudeSessionId(action.payload.timelineSessionId)
-        ? action.payload.timelineSessionId
-        : undefined
+      const nextTimelineSessionId = normalizeTrustedClaudeMetadataId(action.payload.timelineSessionId)
       const nextRestoreQueryId = getRestoreQueryId({
         cliSessionId: session.cliSessionId,
         timelineSessionId: nextTimelineSessionId ?? session.timelineSessionId,
@@ -247,8 +257,10 @@ const agentChatSlice = createSlice({
       session.restoreFailureMessage = undefined
       session.snapshotRefreshRequestId = undefined
       if (action.payload.latestTurnId === null) {
-        const hasDurableHistoryIdentity = isValidClaudeSessionId(nextTimelineSessionId)
-          || isValidClaudeSessionId(session.cliSessionId)
+        const hasDurableHistoryIdentity = Boolean(
+          normalizeTrustedClaudeMetadataId(nextTimelineSessionId)
+          || normalizeTrustedClaudeMetadataId(session.cliSessionId),
+        )
         if (!session.awaitingDurableHistory || hasDurableHistoryIdentity) {
           session.historyLoaded = true
           session.awaitingDurableHistory = false
