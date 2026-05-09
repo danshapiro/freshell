@@ -56,6 +56,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshcodex',
         runtimeProvider: 'codex',
       }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
     }
     const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
 
@@ -93,6 +94,67 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('replays duplicate freshAgent.create request ids without creating duplicate runtime sessions', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-idempotent',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      const createMessage = {
+        type: 'freshAgent.create',
+        requestId: 'req-idempotent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        cwd: '/workspace',
+      }
+
+      ws.send(JSON.stringify(createMessage))
+      await vi.waitFor(() => {
+        expect(seenMessages.filter((message) => message.type === 'freshAgent.created')).toHaveLength(1)
+      })
+
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        const created = seenMessages.filter((message) => message.type === 'freshAgent.created')
+        expect(created).toHaveLength(2)
+        expect(created).toEqual([
+          expect.objectContaining({
+            requestId: 'req-idempotent',
+            sessionId: 'codex-session-idempotent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            runtimeProvider: 'codex',
+          }),
+          expect.objectContaining({
+            requestId: 'req-idempotent',
+            sessionId: 'codex-session-idempotent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            runtimeProvider: 'codex',
+          }),
+        ])
+        expect(runtimeManager.create).toHaveBeenCalledTimes(1)
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('routes freshAgent.send, freshAgent.interrupt, freshAgent approvals/questions, freshAgent.kill, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({
@@ -100,6 +162,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshcodex',
         runtimeProvider: 'codex',
       }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
       send: vi.fn().mockResolvedValue(undefined),
       interrupt: vi.fn().mockResolvedValue(undefined),
       resolveApproval: vi.fn().mockResolvedValue(undefined),
@@ -344,6 +407,52 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         expect(off).toHaveBeenCalledTimes(1)
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('deduplicates concurrent fresh-agent subscription registration while subscribe is pending', async () => {
+    let resolveSubscribe!: (off: () => void) => void
+    const off = vi.fn()
+    const runtimeManager = {
+      attach: vi.fn().mockReturnValue({
+        sessionId: 'codex-session-pending-subscribe',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockImplementation(async () => (
+        await new Promise<() => void>((resolve) => {
+          resolveSubscribe = resolve
+        })
+      )),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const attachMessage = {
+        type: 'freshAgent.attach',
+        sessionId: 'codex-session-pending-subscribe',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }
+
+      ws.send(JSON.stringify(attachMessage))
+      ws.send(JSON.stringify(attachMessage))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.attach).toHaveBeenCalledTimes(2)
+        expect(runtimeManager.subscribe).toHaveBeenCalledTimes(1)
+      })
+
+      resolveSubscribe(off)
+
+      await vi.waitFor(() => {
+        expect(off).not.toHaveBeenCalled()
       })
     } finally {
       handler.close()

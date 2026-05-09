@@ -300,6 +300,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         // No sessionId yet — sdk.created hasn't arrived. Mark the createRequestId as
         // cancelled so the message handler will kill the orphan when it does arrive.
         cancelCreate(content.createRequestId)
+        ws.cancelCreate(content.createRequestId)
       }
       // Clean up Redux state for orphaned pending creates
       if (!content.sessionId && pendingSessionId) {
@@ -321,6 +322,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         })
       } else {
         cancelCreate(content.createRequestId)
+        ws.cancelCreate(content.createRequestId)
       }
       if (!content.sessionId && pendingSessionId) {
         dispatch(removeFreshAgentSession({

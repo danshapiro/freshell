@@ -408,6 +408,7 @@ type ClientState = {
   codingCliSubscriptions: Map<string, () => void>
   freshAgentSessions: Set<string>
   freshAgentSubscriptions: Map<string, () => void>
+  freshAgentSubscriptionKeysInFlight: Set<string>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
@@ -489,6 +490,12 @@ export class WsHandler {
   private sdkCreateLocks = new Map<string, Promise<void>>()
   private createdSdkSessionByRequestId = new Map<string, string>()
   private sdkSessionByCreateOwnerKey = new Map<string, string>()
+  private freshAgentCreateLocks = new Map<string, Promise<void>>()
+  private createdFreshAgentSessionByRequestId = new Map<string, {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    runtimeProvider: FreshAgentRuntimeProvider
+  }>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private pendingUiCommands: PendingUiCommand[] = []
   private sessionsRevision = 0
@@ -897,6 +904,23 @@ export class WsHandler {
     return current
   }
 
+  private withFreshAgentCreateLock(key: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.freshAgentCreateLocks.get(key) ?? Promise.resolve()
+
+    let current: Promise<void>
+    current = previous
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        if (this.freshAgentCreateLocks.get(key) === current) {
+          this.freshAgentCreateLocks.delete(key)
+        }
+      })
+
+    this.freshAgentCreateLocks.set(key, current)
+    return current
+  }
+
   private async resolveSdkCreateOwnership(
     requestId: string,
     resumeSessionId?: string,
@@ -984,6 +1008,35 @@ export class WsHandler {
     if (liveSession) return liveSession
     this.createdSdkSessionByRequestId.delete(requestId)
     return undefined
+  }
+
+  private rememberCreatedFreshAgentSession(
+    requestId: string,
+    created: { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider },
+  ): void {
+    this.createdFreshAgentSessionByRequestId.set(requestId, created)
+  }
+
+  private resolveCreatedFreshAgentSession(
+    requestId: string,
+  ): { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider } | undefined {
+    return this.createdFreshAgentSessionByRequestId.get(requestId)
+  }
+
+  private clearFreshAgentCreateCachesForSession(locator: {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+  }): void {
+    for (const [requestId, cached] of this.createdFreshAgentSessionByRequestId.entries()) {
+      if (
+        cached.sessionId === locator.sessionId
+        && cached.sessionType === locator.sessionType
+        && cached.runtimeProvider === locator.provider
+      ) {
+        this.createdFreshAgentSessionByRequestId.delete(requestId)
+      }
+    }
   }
 
   private resolveSdkOwnerSession(ownerKey: string): SdkSessionState | undefined {
@@ -1201,6 +1254,7 @@ export class WsHandler {
       codingCliSubscriptions: new Map(),
       freshAgentSessions: new Set(),
       freshAgentSubscriptions: new Map(),
+      freshAgentSubscriptionKeysInFlight: new Set(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
@@ -1260,6 +1314,7 @@ export class WsHandler {
       off()
     }
     state.freshAgentSubscriptions?.clear()
+    state.freshAgentSubscriptionKeysInFlight?.clear()
     state.freshAgentSessions?.clear()
 
     for (const [requestId, pending] of this.screenshotRequests) {
@@ -1736,28 +1791,14 @@ export class WsHandler {
     const key = makeFreshAgentSessionKey(locator)
     state.freshAgentSessions.add(key)
     const existing = state.freshAgentSubscriptions.get(key)
-    if (existing) {
+    if (existing || state.freshAgentSubscriptionKeysInFlight.has(key)) {
       return
     }
     if (!this.freshAgentRuntimeManager) {
       return
     }
-    void this.freshAgentRuntimeManager.subscribe(locator, (event) => {
-      if (!state.freshAgentSessions.has(key)) return
-      this.safeSend(ws, {
-        type: 'freshAgent.event',
-        sessionId: locator.sessionId,
-        sessionType: locator.sessionType,
-        provider: locator.provider,
-        event,
-      })
-    }).then((off) => {
-      if (!state.freshAgentSessions.has(key)) {
-        off()
-        return
-      }
-      state.freshAgentSubscriptions.set(key, off)
-    }).catch((error) => {
+    const reportSubscribeFailure = (error: unknown) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
       const message = error instanceof Error ? error.message : 'Failed to subscribe to fresh-agent session updates'
       log.warn({ err: error, locator }, 'Fresh-agent session subscription failed')
       if (!state.freshAgentSessions.has(key)) return
@@ -1773,7 +1814,36 @@ export class WsHandler {
           message,
         },
       })
-    })
+    }
+    state.freshAgentSubscriptionKeysInFlight.add(key)
+    let subscription: Promise<() => void>
+    try {
+      subscription = this.freshAgentRuntimeManager.subscribe(locator, (event) => {
+        if (!state.freshAgentSessions.has(key)) return
+        this.safeSend(ws, {
+          type: 'freshAgent.event',
+          sessionId: locator.sessionId,
+          sessionType: locator.sessionType,
+          provider: locator.provider,
+          event,
+        })
+      })
+    } catch (error) {
+      reportSubscribeFailure(error)
+      return
+    }
+    void subscription.then((off) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
+      if (!state.freshAgentSessions.has(key)) {
+        off()
+        return
+      }
+      if (state.freshAgentSubscriptions.has(key)) {
+        off()
+        return
+      }
+      state.freshAgentSubscriptions.set(key, off)
+    }).catch(reportSubscribeFailure)
   }
 
   private clearClientFreshAgentSession(
@@ -1786,6 +1856,7 @@ export class WsHandler {
   ): void {
     const key = makeFreshAgentSessionKey(locator)
     state.freshAgentSessions.delete(key)
+    state.freshAgentSubscriptionKeysInFlight.delete(key)
     const off = state.freshAgentSubscriptions.get(key)
     if (off) {
       off()
@@ -3125,7 +3196,8 @@ export class WsHandler {
       }
 
       case 'freshAgent.create': {
-        if (!this.freshAgentRuntimeManager) {
+        const freshAgentRuntimeManager = this.freshAgentRuntimeManager
+        if (!freshAgentRuntimeManager) {
           this.send(ws, {
             type: 'freshAgent.create.failed',
             requestId: m.requestId,
@@ -3147,30 +3219,61 @@ export class WsHandler {
           return
         }
         try {
-          const created = await this.freshAgentRuntimeManager.create({
-            requestId: m.requestId,
-            sessionType: m.sessionType,
-            provider,
-            cwd: m.cwd,
-            resumeSessionId: m.resumeSessionId,
-            model: m.model,
-            permissionMode: m.permissionMode,
-            sandbox: m.sandbox,
-            effort: m.effort,
-            plugins: m.plugins,
-          })
-          this.send(ws, {
-            type: 'freshAgent.created',
-            requestId: m.requestId,
-            sessionId: created.sessionId,
-            sessionType: created.sessionType,
-            provider: created.runtimeProvider,
-            runtimeProvider: created.runtimeProvider,
-          } as const)
-          this.registerClientFreshAgentSession(ws, state, {
-            sessionId: created.sessionId,
-            sessionType: created.sessionType,
-            provider: created.runtimeProvider,
+          await this.withFreshAgentCreateLock(`request:${m.requestId}`, async () => {
+            const cached = this.resolveCreatedFreshAgentSession(m.requestId)
+            if (cached) {
+              if (cached.sessionType !== m.sessionType || cached.runtimeProvider !== provider) {
+                this.send(ws, {
+                  type: 'freshAgent.create.failed',
+                  requestId: m.requestId,
+                  code: 'FRESH_AGENT_CREATE_REQUEST_CONFLICT',
+                  message: `freshAgent.create request ${m.requestId} already belongs to ${cached.sessionType}/${cached.runtimeProvider}`,
+                  retryable: false,
+                } as const)
+                return
+              }
+              this.send(ws, {
+                type: 'freshAgent.created',
+                requestId: m.requestId,
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+                runtimeProvider: cached.runtimeProvider,
+              } as const)
+              this.registerClientFreshAgentSession(ws, state, {
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+              })
+              return
+            }
+
+            const created = await freshAgentRuntimeManager.create({
+              requestId: m.requestId,
+              sessionType: m.sessionType,
+              provider,
+              cwd: m.cwd,
+              resumeSessionId: m.resumeSessionId,
+              model: m.model,
+              permissionMode: m.permissionMode,
+              sandbox: m.sandbox,
+              effort: m.effort,
+              plugins: m.plugins,
+            })
+            this.rememberCreatedFreshAgentSession(m.requestId, created)
+            this.send(ws, {
+              type: 'freshAgent.created',
+              requestId: m.requestId,
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+              runtimeProvider: created.runtimeProvider,
+            } as const)
+            this.registerClientFreshAgentSession(ws, state, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+            })
           })
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
@@ -3302,6 +3405,7 @@ export class WsHandler {
         }
         try {
           const killed = await this.freshAgentRuntimeManager.kill(locator)
+          this.clearFreshAgentCreateCachesForSession(locator)
           this.clearClientFreshAgentSession(state, locator)
           this.send(ws, {
             type: 'freshAgent.killed',

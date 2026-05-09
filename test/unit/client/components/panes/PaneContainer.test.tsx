@@ -46,6 +46,7 @@ const {
   mockApiPatch,
   saveServerSettingsPatchSpy,
   cancelCreateSpy,
+  cancelWsCreateSpy,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -68,12 +69,14 @@ const {
     payload: patch,
   })),
   cancelCreateSpy: vi.fn(),
+  cancelWsCreateSpy: vi.fn(),
 }))
 
 // Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
+    cancelCreate: cancelWsCreateSpy,
     onMessage: () => () => {},
   }),
 }))
@@ -330,6 +333,7 @@ describe('PaneContainer', () => {
     mockApiPatch.mockReset()
     saveServerSettingsPatchSpy.mockClear()
     cancelCreateSpy.mockClear()
+    cancelWsCreateSpy.mockClear()
     mockApiGet.mockResolvedValue({ directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
@@ -833,6 +837,47 @@ describe('PaneContainer', () => {
       expect(store.getState().agentChat.pendingCreates['req-1']).toBeUndefined()
     })
 
+    it('cancels pending agent-chat socket create tracking when closing before sdk.created arrives', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-agent-pending',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-agent-pending',
+          status: 'starting',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-agent-pending' },
+        },
+        {},
+        {},
+        {
+          pendingCreates: {
+            'req-agent-pending': {
+              sessionId: undefined,
+              expectsHistoryHydration: false,
+            },
+          },
+        } as Partial<AgentChatState>,
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+
+      expect(cancelCreateSpy).toHaveBeenCalledWith('req-agent-pending')
+      expect(cancelWsCreateSpy).toHaveBeenCalledWith('req-agent-pending')
+      expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.kill' }))
+    })
+
     it('closes second pane when its close button is clicked', () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'
@@ -950,6 +995,7 @@ describe('PaneContainer', () => {
       fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
 
       expect(cancelCreateSpy).toHaveBeenCalledWith('req-fresh-pending')
+      expect(cancelWsCreateSpy).toHaveBeenCalledWith('req-fresh-pending')
       expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
     })
 

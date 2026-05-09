@@ -268,6 +268,13 @@ describe('CodexAppServerClient', () => {
         'thread/start': {
           result: {
             thread: { id: 'thread-rich-1', path: null, ephemeral: false },
+            cwd: '/repo/worktree',
+            model: 'fixture-model',
+            modelProvider: 'openai',
+            instructionSources: [],
+            approvalPolicy: 'never',
+            approvalsReviewer: 'user',
+            sandbox: 'danger-full-access',
           },
         },
       },

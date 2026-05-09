@@ -56,12 +56,17 @@ type SdkCreateClientMessage = {
   requestId: string
 }
 
+type FreshAgentCreateClientMessage = {
+  type: 'freshAgent.create'
+  requestId: string
+}
+
 type TerminalAttachClientMessage = {
   type: 'terminal.attach'
   terminalId: string
 }
 
-type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage
+type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage | FreshAgentCreateClientMessage
 
 type InFlightCreate = {
   message: CreateClientMessage
@@ -83,7 +88,7 @@ function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage
 function isCreateMessage(msg: unknown): msg is CreateClientMessage {
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; requestId?: unknown }
-  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create')
+  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create' || candidate.type === 'freshAgent.create')
     && typeof candidate.requestId === 'string'
     && candidate.requestId.length > 0
 }
@@ -127,6 +132,15 @@ export class WsClient {
   private preReadyCreateQueue = new Map<string, unknown>()
 
   constructor(private url: string) {}
+
+  private clearTrackedCreate(requestId: string): void {
+    this.inFlightCreates.delete(requestId)
+    this.preReadyCreateQueue.delete(requestId)
+  }
+
+  cancelCreate(requestId: string): void {
+    this.clearTrackedCreate(requestId)
+  }
 
   private handleIncomingMessage(msg: ServerMessage): void {
     if (msg.type === 'ready') {
@@ -196,17 +210,18 @@ export class WsClient {
       markTerminalOutputSeen(msg.terminalId)
     }
 
-    if (msg.type === 'terminal.created') {
-      const create = this.inFlightCreates.get(msg.requestId)
-      if (create) {
-        this.inFlightCreates.delete(msg.requestId)
-        this.preReadyCreateQueue.delete(msg.requestId)
-      }
+    if (
+      msg.type === 'terminal.created'
+      || msg.type === 'sdk.created'
+      || msg.type === 'sdk.create.failed'
+      || msg.type === 'freshAgent.created'
+      || msg.type === 'freshAgent.create.failed'
+    ) {
+      this.clearTrackedCreate(msg.requestId)
     }
 
     if (msg.type === 'error' && typeof msg.requestId === 'string') {
-      this.inFlightCreates.delete(msg.requestId)
-      this.preReadyCreateQueue.delete(msg.requestId)
+      this.clearTrackedCreate(msg.requestId)
     }
 
     if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {

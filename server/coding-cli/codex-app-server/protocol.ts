@@ -319,7 +319,7 @@ export const CodexRpcErrorEnvelopeSchema = z.object({
 export const CodexRpcNotificationEnvelopeSchema = z.object({
   method: z.string().min(1),
   params: z.unknown().optional(),
-}).strict()
+}).passthrough()
 
 export const CodexThreadStartedNotificationSchema = z.object({
   method: z.literal('thread/started'),
