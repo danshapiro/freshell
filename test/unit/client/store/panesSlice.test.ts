@@ -356,7 +356,7 @@ describe('panesSlice', () => {
       }
     })
 
-    it('does not synthesize canonical sessionRef from raw agent-chat resumeSessionId', () => {
+    it('normalizes legacy agent-chat freshclaude input with a canonical Claude id to fresh-agent', () => {
       const state = panesReducer(
         initialState,
         initLayout({
@@ -370,9 +370,38 @@ describe('panesSlice', () => {
       )
 
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      if (leaf.content.kind !== 'agent-chat') throw new Error('expected agent-chat')
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      })
+    })
 
-      expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+    it('does not synthesize a portable sessionRef from a named legacy resume alias', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: 'named-resume',
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: 'named-resume',
+      })
       expect(leaf.content.sessionRef).toBeUndefined()
     })
   })

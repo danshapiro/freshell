@@ -18,7 +18,7 @@ import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { RestoreErrorSchema, migrateLegacyAgentChatDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { migrateLegacyFreshAgentContent, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 
@@ -93,9 +93,30 @@ function normalizePaneContent(
     if (!sessionType || !provider) {
       return previous ?? { kind: 'picker' }
     }
-    const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const legacyDurableState = input.kind === 'agent-chat'
+      ? migrateLegacyAgentChatDurableState({
+          sessionRef: input.sessionRef,
+          cliSessionId: typeof (input as { cliSessionId?: unknown }).cliSessionId === 'string'
+            ? (input as { cliSessionId: string }).cliSessionId
+            : undefined,
+          timelineSessionId: typeof (input as { timelineSessionId?: unknown }).timelineSessionId === 'string'
+            ? (input as { timelineSessionId: string }).timelineSessionId
+            : undefined,
+          resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+        })
+      : {}
+    const sessionRef = sanitizeSessionRef(input.sessionRef) ?? legacyDurableState.sessionRef
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     const sandbox = input.kind === 'fresh-agent' ? input.sandbox : undefined
+    const normalizedModelSelection = provider === 'codex'
+      ? undefined
+      : normalizeAgentChatModelSelection(
+          (input as { modelSelection?: unknown }).modelSelection,
+          (input as { model?: unknown }).model,
+        )
+    const normalizedModel = provider === 'codex' && typeof (input as { model?: unknown }).model === 'string'
+      ? (input as { model: string }).model
+      : undefined
     return {
       kind: 'fresh-agent',
       sessionType,
@@ -108,16 +129,11 @@ function normalizePaneContent(
       serverInstanceId: typeof (input as { serverInstanceId?: unknown }).serverInstanceId === 'string'
         ? (input as { serverInstanceId: string }).serverInstanceId
         : undefined,
-      ...(restoreError.success ? { restoreError: restoreError.data } : {}),
+      ...(!sessionRef && restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: input.initialCwd,
       createError: input.createError,
-      modelSelection: normalizeAgentChatModelSelection(
-        (input as { modelSelection?: unknown }).modelSelection,
-        (input as { model?: unknown }).model,
-      ),
-      model: typeof (input as { model?: unknown }).model === 'string'
-        ? (input as { model: string }).model
-        : undefined,
+      modelSelection: normalizedModelSelection,
+      model: normalizedModel,
       permissionMode: input.permissionMode,
       sandbox,
       effort: normalizeAgentChatEffortOverride(input.effort),
