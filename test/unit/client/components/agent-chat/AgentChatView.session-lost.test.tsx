@@ -157,4 +157,77 @@ describe('Fresh-agent lost-session recovery coverage', () => {
       resumeSessionId: 'named-resume',
     }))
   })
+
+  it('falls back to named-resume when no canonical durable id is available', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-named-only',
+        sessionId: 'dead-session-named',
+        status: 'idle',
+        resumeSessionId: 'named-only-fallback',
+      },
+    }))
+    store.dispatch(markSessionLost({ sessionId: 'dead-session-named' }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        resumeSessionId: 'named-only-fallback',
+      }))
+    })
+  })
+
+  it('writes canonical sessionRef when Claude durable id appears after recovery', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-canonical-id-recovery',
+        sessionId: 'dead-session-3',
+        status: 'idle',
+        resumeSessionId: 'named-resume-alt',
+      },
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'dead-session-3',
+      latestTurnId: 'turn-1',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000555',
+      revision: 2,
+    }))
+    store.dispatch(markSessionLost({ sessionId: 'dead-session-3' }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        resumeSessionId: '00000000-0000-4000-8000-000000000555',
+      }))
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      resumeSessionId: 'named-resume-alt',
+    }))
+  })
 })

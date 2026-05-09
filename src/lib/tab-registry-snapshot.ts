@@ -38,49 +38,27 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         viewMode: content.viewMode,
       }
     case 'agent-chat':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId
-            ? {
-                provider: 'claude',
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          provider: content.provider,
-          sessionId: content.sessionId,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-          modelSelection: content.modelSelection,
-          permissionMode: content.permissionMode,
-          effort: content.effort,
-          plugins: content.plugins,
-        }
+      return {
+        provider: content.provider,
+        sessionRef: content.sessionRef,
+        initialCwd: content.initialCwd,
+        modelSelection: content.modelSelection,
+        permissionMode: content.permissionMode,
+        effort: content.effort,
+        plugins: content.plugins,
       }
     case 'fresh-agent':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId
-            ? {
-                provider: content.provider,
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          provider: content.provider,
-          sessionType: content.sessionType,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-          model: content.model,
-          permissionMode: content.permissionMode,
-          sandbox: content.sandbox,
-          effort: content.effort,
-          plugins: content.plugins,
-        }
+      return {
+        provider: content.provider,
+        sessionType: content.sessionType,
+        sessionRef: content.sessionRef,
+        initialCwd: content.initialCwd,
+        model: content.provider === 'codex' ? content.model : undefined,
+        modelSelection: content.provider === 'claude' ? content.modelSelection : undefined,
+        permissionMode: content.permissionMode,
+        sandbox: content.sandbox,
+        effort: content.effort,
+        plugins: content.plugins,
       }
     case 'extension':
       return {

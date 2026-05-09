@@ -244,25 +244,30 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
-      if (message.type === 'freshAgent.created' && message.requestId === paneContent.createRequestId) {
+      if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
-            ...paneContent,
+            ...paneContentRef.current,
             sessionId: message.sessionId,
-            resumeSessionId: paneContent.resumeSessionId ?? message.sessionId,
+            sessionRef: message.sessionRef ?? paneContentRef.current.sessionRef,
+            resumeSessionId: paneContentRef.current.resumeSessionId
+              ?? (message.sessionRef?.provider === paneContentRef.current.provider
+                ? message.sessionRef.sessionId
+                : message.sessionId),
             status: 'connected',
             createError: undefined,
+            restoreError: undefined,
           },
         }))
       }
-      if (message.type === 'freshAgent.create.failed' && message.requestId === paneContent.createRequestId) {
+      if (message.type === 'freshAgent.create.failed' && message.requestId === paneContentRef.current.createRequestId) {
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
-            ...paneContent,
+            ...paneContentRef.current,
             status: 'create-failed',
             createError: {
               code: message.code,
@@ -298,22 +303,21 @@ export function FreshAgentView({
     setLoadError(null)
     const sessionId = snapshotSessionId
     const provider = paneContent.provider
-    const resumeSessionId = paneContent.resumeSessionId
-    const currentStatus = paneContent.status
     void getFreshAgentThreadSnapshot(paneContent.sessionType, provider, sessionId, { signal: controller.signal })
       .then((next) => {
         const resolved = next as FreshAgentSnapshot
         setSnapshot(resolved)
-        const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? currentStatus
-        const nextResumeSessionId = resumeSessionId ?? sessionId
-        if (nextStatus === currentStatus && nextResumeSessionId === resumeSessionId) {
+        const fresh = paneContentRef.current
+        const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
+        const nextResumeSessionId = fresh.resumeSessionId ?? sessionId
+        if (nextStatus === fresh.status && nextResumeSessionId === fresh.resumeSessionId) {
           return
         }
         dispatch(updatePaneContent({
           tabId,
           paneId,
           content: {
-            ...paneContent,
+            ...fresh,
             status: nextStatus,
             resumeSessionId: nextResumeSessionId,
           },

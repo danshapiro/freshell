@@ -7,10 +7,12 @@ export type FreshAgentCreateRequest = {
   provider?: FreshAgentRuntimeProvider
   cwd?: string
   resumeSessionId?: string
+  sessionRef?: { provider: string; sessionId: string }
   model?: string
+  modelSelection?: { kind: string; modelId: string }
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
-  effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  effort?: string
   plugins?: string[]
 }
 
@@ -18,6 +20,7 @@ export type FreshAgentCreateResult = {
   sessionId: string
   sessionType: FreshAgentSessionType
   runtimeProvider: FreshAgentRuntimeProvider
+  sessionRef?: { provider: string; sessionId: string }
 }
 
 export type FreshAgentThreadLocator = {
@@ -39,8 +42,8 @@ export type FreshAgentInputImage =
 
 export interface FreshAgentRuntimeAdapter {
   readonly runtimeProvider: FreshAgentRuntimeProvider
-  create(input: FreshAgentCreateRequest): Promise<{ sessionId: string }>
-  resume?(input: FreshAgentCreateRequest): Promise<{ sessionId: string }>
+  create(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
+  resume?(input: FreshAgentCreateRequest): Promise<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>
   subscribe?(sessionId: string, listener: (message: unknown) => void): Promise<() => void> | (() => void)
   send?(sessionId: string, input: { text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<void> | void
   interrupt?(sessionId: string): Promise<void> | void

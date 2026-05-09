@@ -475,4 +475,194 @@ describe('FreshAgentView', () => {
     expect(await screen.findByText('Stale restore revision')).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent('Stale restore revision')
   })
+
+  it('renders restoreError pane and suppresses automatic freshAgent.create', () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-restore-error',
+            status: 'create-failed',
+            restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'missing_canonical_identity' },
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.attach' }))
+  })
+
+  it('recovers using sessionRef.sessionId for a pane with only sessionRef', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-sessionref-only',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-recover' },
+      },
+    }))
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-sessionref-only',
+      sessionRef: { provider: 'codex', sessionId: 'codex-thread-recover' },
+    }))
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    onMessage({
+      type: 'freshAgent.created',
+      requestId: 'req-sessionref-only',
+      sessionId: 'created-thread-456',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtimeProvider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'codex-thread-recover' },
+    })
+
+    await waitFor(() => {
+      const state = store.getState()
+      const leaf = state.panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.sessionRef).toEqual({ provider: 'codex', sessionId: 'codex-thread-recover' })
+      expect(leaf.content.sessionId).toBe('created-thread-456')
+      expect(leaf.content.status).toBe('connected')
+    })
+    unmount()
+  })
+
+  it('clears stale restoreError when a valid sessionRef appears', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-clear-error',
+        status: 'creating',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'missing_canonical_identity' },
+        sessionRef: { provider: 'codex', sessionId: 'codex-durable-id' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    onMessage({
+      type: 'freshAgent.created',
+      requestId: 'req-clear-error',
+      sessionId: 'created-789',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      runtimeProvider: 'codex',
+      sessionRef: { provider: 'codex', sessionId: 'codex-durable-id' },
+    })
+
+    await waitFor(() => {
+      const state = store.getState()
+      const leaf = state.panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.sessionRef).toEqual({ provider: 'codex', sessionId: 'codex-durable-id' })
+      expect(leaf.content.restoreError).toBeUndefined()
+    })
+  })
+
+  it('freshAgent.created does not write sessionRef for Claude when message has no sessionRef', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-claude-noref',
+        status: 'creating',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    onMessage({
+      type: 'freshAgent.created',
+      requestId: 'req-claude-noref',
+      sessionId: 'runtime-sdk-session-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtimeProvider: 'claude',
+    })
+
+    await waitFor(() => {
+      const state = store.getState()
+      const leaf = state.panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.sessionId).toBe('runtime-sdk-session-id')
+      expect(leaf.content.sessionRef).toBeUndefined()
+    })
+  })
+
+  it('does not clobber newer modelSelection when freshAgent.created arrives late', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-late-created',
+        status: 'creating',
+        modelSelection: { kind: 'exact', modelId: 'ui-selected-model' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
+    // Simulate a late arriving created message that represents a much older snapshot
+    onMessage({
+      type: 'freshAgent.created',
+      requestId: 'req-late-created',
+      sessionId: 'runtime-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      runtimeProvider: 'claude',
+    })
+
+    await waitFor(() => {
+      const state = store.getState()
+      const leaf = state.panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content.sessionId).toBe('runtime-id')
+      expect(leaf.content.modelSelection).toEqual({ kind: 'exact', modelId: 'ui-selected-model' })
+    })
+  })
 })

@@ -251,4 +251,160 @@ describe('FreshAgentView reload/restore behavior', () => {
       expect(screen.queryByText('Before live update')).not.toBeInTheDocument()
     })
   })
+
+  it('resumes a sessionRef-only pane through freshAgent.create instead of freshAgent.attach', async () => {
+    getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('No snapshot'))
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-sessionref-only',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-sessionref' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        requestId: 'req-sessionref-only',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-sessionref' },
+      }))
+    })
+    expect(wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.attach' }))
+  })
+
+  it('does not auto-create a new session when pane has only restoreError', () => {
+    getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('No snapshot'))
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-restore-error',
+        status: 'create-failed',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'missing_canonical_identity' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    expect(wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
+  })
+
+  it('remounts without sending duplicate freshAgent.create when session is connected', async () => {
+    getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('No snapshot'))
+    const store = makeStore()
+
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-remount',
+        sessionId: 'connected-session-id',
+        status: 'connected',
+      },
+    }))
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-remount',
+            sessionId: 'connected-session-id',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/connected/i).length).toBeGreaterThan(0)
+    })
+
+    unmount()
+    wsSend.mockClear()
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-remount',
+            sessionId: 'connected-session-id',
+            status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/connected/i).length).toBeGreaterThan(0)
+    })
+    expect(wsSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.create' }))
+  })
+
+  it('include sessionRef in buildCreateMessage when pane has sessionRef', async () => {
+    getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('No snapshot'))
+    const store = makeStore()
+    store.dispatch(initLayout({
+      tabId: 't1',
+      paneId: 'p1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-build',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'durable-thread-id' },
+        model: 'codex-model',
+        sandbox: 'workspace-write',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsSend).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'freshAgent.create',
+        requestId: 'req-build',
+        sessionRef: { provider: 'codex', sessionId: 'durable-thread-id' },
+        model: 'codex-model',
+        sandbox: 'workspace-write',
+      }))
+    })
+  })
 })

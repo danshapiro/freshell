@@ -413,7 +413,9 @@ export const FreshAgentCreateSchema = z.object({
   model: z.string().optional(),
   permissionMode: z.string().optional(),
   sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-  effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
+  effort: z.string().trim().min(1).optional(),
   plugins: z.array(z.string()).optional(),
 })
 
@@ -793,7 +795,7 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_STALE_REVISION'
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string }
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }

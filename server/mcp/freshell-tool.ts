@@ -8,6 +8,7 @@
 import { z } from 'zod'
 import { createApiClient, resolveConfig, type ApiClient } from './http-client.js'
 import { translateKeys } from '../cli/keys.js'
+import { isCanonicalClaudeSessionId } from '../../shared/session-contract.js'
 
 // Lazy-initialized client -- created on first use so env vars are read at call time.
 let _client: ApiClient | undefined
@@ -541,7 +542,7 @@ async function routeAction(
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const sessionRef = typeof mode === 'string' && typeof resume === 'string'
+      const sessionRef = typeof mode === 'string' && typeof resume === 'string' && isCanonicalClaudeSessionId(resume)
         ? { provider: mode, sessionId: resume }
         : undefined
       const tabResult = await c.post('/api/tabs', {

@@ -60,7 +60,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       permissionMode: 'on-request',
       model: 'codex-fixture',
-    })).resolves.toEqual({ sessionId: 'thread-new-1' })
+    })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
 
     await expect(adapter.resume?.({
       requestId: 'req-2',
@@ -69,7 +69,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       permissionMode: 'never',
       model: 'codex-fixture',
-    })).resolves.toEqual({ sessionId: 'thread-resume-1' })
+    })).resolves.toEqual({ sessionId: 'thread-resume-1', sessionRef: { provider: 'codex', sessionId: 'thread-resume-1' } })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
       cwd: '/repo',

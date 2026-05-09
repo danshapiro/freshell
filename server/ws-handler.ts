@@ -305,6 +305,13 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
     return locators
   }
 
+  if (kind === 'fresh-agent') {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
+      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+    }
+    return locators
+  }
+
   if (kind !== 'terminal') return locators
 
   const mode = CodingCliProviderSchema.safeParse(content.mode)
@@ -495,6 +502,7 @@ export class WsHandler {
     sessionId: string
     sessionType: FreshAgentSessionType
     runtimeProvider: FreshAgentRuntimeProvider
+    sessionRef?: { provider: string; sessionId: string }
   }>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private pendingUiCommands: PendingUiCommand[] = []
@@ -1012,14 +1020,14 @@ export class WsHandler {
 
   private rememberCreatedFreshAgentSession(
     requestId: string,
-    created: { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider },
+    created: { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } },
   ): void {
     this.createdFreshAgentSessionByRequestId.set(requestId, created)
   }
 
   private resolveCreatedFreshAgentSession(
     requestId: string,
-  ): { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider } | undefined {
+  ): { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } } | undefined {
     return this.createdFreshAgentSessionByRequestId.get(requestId)
   }
 
@@ -3239,6 +3247,7 @@ export class WsHandler {
                 sessionType: cached.sessionType,
                 provider: cached.runtimeProvider,
                 runtimeProvider: cached.runtimeProvider,
+                sessionRef: cached.sessionRef,
               } as const)
               this.registerClientFreshAgentSession(ws, state, {
                 sessionId: cached.sessionId,
@@ -3254,13 +3263,20 @@ export class WsHandler {
               provider,
               cwd: m.cwd,
               resumeSessionId: m.resumeSessionId,
+              sessionRef: m.sessionRef,
               model: m.model,
+              modelSelection: m.modelSelection,
               permissionMode: m.permissionMode,
               sandbox: m.sandbox,
               effort: m.effort,
               plugins: m.plugins,
             })
-            this.rememberCreatedFreshAgentSession(m.requestId, created)
+            this.rememberCreatedFreshAgentSession(m.requestId, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
+            })
             this.send(ws, {
               type: 'freshAgent.created',
               requestId: m.requestId,
@@ -3268,6 +3284,7 @@ export class WsHandler {
               sessionType: created.sessionType,
               provider: created.runtimeProvider,
               runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
             } as const)
             this.registerClientFreshAgentSession(ws, state, {
               sessionId: created.sessionId,

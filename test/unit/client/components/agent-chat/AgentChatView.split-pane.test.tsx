@@ -224,4 +224,32 @@ describe('Fresh-agent split-pane regression coverage', () => {
       resumeSessionId: 'cli-refresh',
     })
   })
+
+  it('resumes a sessionRef-only freshcodex pane through freshAgent.create after split', () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-fx-sessionref',
+        status: 'creating',
+        sessionRef: { provider: 'codex', sessionId: 'codex-thread-split' },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView store={store} tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      requestId: 'req-fx-sessionref',
+      sessionRef: { provider: 'codex', sessionId: 'codex-thread-split' },
+    }))
+  })
 })

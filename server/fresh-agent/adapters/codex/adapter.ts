@@ -147,7 +147,7 @@ export function createCodexFreshAgentAdapter(deps: {
         excludeTurns: true,
       })
       settingsByThread.set(started.threadId, input)
-      return { sessionId: started.threadId }
+      return { sessionId: started.threadId, sessionRef: { provider: 'codex', sessionId: started.threadId } }
     },
 
     async resume(input: FreshAgentCreateRequest) {
@@ -163,7 +163,7 @@ export function createCodexFreshAgentAdapter(deps: {
         approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
       })
       settingsByThread.set(resumed.threadId, input)
-      return { sessionId: resumed.threadId }
+      return { sessionId: resumed.threadId, sessionRef: { provider: 'codex', sessionId: resumed.threadId } }
     },
 
     subscribe(sessionId, listener) {

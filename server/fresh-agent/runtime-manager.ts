@@ -84,6 +84,7 @@ export class FreshAgentRuntimeManager {
       sessionId: created.sessionId,
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
+      sessionRef: created.sessionRef,
     }
   }
 
@@ -122,6 +123,7 @@ export class FreshAgentRuntimeManager {
       sessionId: resumed.sessionId,
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
+      sessionRef: resumed.sessionRef,
     }
   }
 
