@@ -10,13 +10,21 @@ describe('config-store fresh-agent settings compatibility', () => {
         agentChat: {
           defaultPlugins: ['/tmp/plugin'],
           providers: {
-            freshclaude: { defaultModel: 'x' },
+            freshclaude: { defaultModel: 'fixture-claude-model', defaultEffort: 'high' },
           },
         },
       },
     )
 
     expect(settings.freshAgent.defaultPlugins).toEqual(['/tmp/plugin'])
-    expect(settings.freshAgent.providers.freshclaude).toEqual({ defaultModel: 'x' })
+    expect(settings.agentChat.defaultPlugins).toEqual(['/tmp/plugin'])
+    expect(settings.freshAgent.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'exact', modelId: 'fixture-claude-model' },
+      effort: 'high',
+    })
+    expect(settings.agentChat.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'exact', modelId: 'fixture-claude-model' },
+      effort: 'high',
+    })
   })
 })
