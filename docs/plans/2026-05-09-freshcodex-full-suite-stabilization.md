@@ -32,15 +32,19 @@ Implement these contracts rather than one-off patches:
 - `fresh-agent` is the canonical production pane kind for rich Claude/Codex panes.
 - Legacy `agent-chat` records are accepted only as compatibility input and are normalized at reducer, persistence, and remote rehydration boundaries.
 - `sessionRef` is the portable durable identity. `resumeSessionId` and `sessionId` are same-server/runtime handles and must not be copied from remote records unless the source is the same server.
+- Portable identity rules apply symmetrically at every boundary that publishes, stores, opens, copies, or creates rich-agent panes: tab-registry snapshots, session-opening helpers, reducers, persisted-state parsers, localStorage migration, remote rehydration, and fresh-agent create/recovery.
 - Named Claude resume aliases are not portable durable identities. A legacy alias may remain a same-server `resumeSessionId`, but it must not be synthesized into `sessionRef`.
 - Valid canonical Claude IDs from `sessionRef`, `cliSessionId`, or `timelineSessionId` must become `sessionRef: { provider: 'claude', sessionId }`.
+- Any remote copied rich-agent pane that cannot be restored from portable identity must show a clear restore error and must not auto-create a replacement session. `FreshAgentView` must render that error and suppress create while it is present.
 - Remote copied tabs containing rich agent panes should have `mode: 'shell'`; do not leave copied `fresh-agent` tabs classified as terminal/CLI `claude`.
 - Fresh-agent create messages must be able to carry `sessionRef`, Claude `modelSelection`, and opaque Claude effort strings. Runtime adapters validate provider-specific fields; the shared WS schema must not reject valid Claude values such as `turbo`.
+- The Claude fresh-agent adapter owns resolution of transported `modelSelection` into the SDK `model` value. The client should not pre-resolve Claude model aliases before sending `freshAgent.create`.
 - Codex panes keep Codex runtime fields (`model`, `sandbox`, Codex effort/settings) and must not gain Claude-shaped `modelSelection` from migration helpers.
 - Claude-backed panes migrate legacy `model` to `modelSelection` and then remove stale `model` at every canonicalization boundary.
 - Settings API patches must not contain own properties with `undefined` at any depth. Clear operations use explicit `null` sentinels where the API supports clearing.
 - Storage migration must be idempotent for users who already ran the broken branch once. Bump the local storage version and run a targeted v2-key repair for stamped clients.
 - `FreshAgentView` async effects must use targeted merges or fresh refs. `freshAgent.created`, create failure, snapshot refresh, retry, and lost-session recovery must not overwrite newer pane fields from captured stale `paneContent`.
+- `freshAgent.created` must persist a canonical `sessionRef` for newly created durable Freshcodex/FreshClaude sessions before persistence strips same-server-only runtime handles. Pending-create tracking must understand `sessionRef`-only restores so restored durable history is not misclassified as a new empty session.
 - Legacy `AgentChatView` tests may mount the legacy component directly, but test wrappers must not unmount the component just because reducer canonicalization turns the backing pane into `fresh-agent`.
 
 Do not weaken, delete, or dilute valid tests to obtain green. When a test is obsolete, replace it with a stronger assertion for the accepted canonical contract.
@@ -50,6 +54,12 @@ Do not weaken, delete, or dilute valid tests to obtain green. When a test is obs
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/TabsView.tsx`
   - Owns remote tab card copy/rehydration. It should convert legacy `agent-chat` snapshots into canonical `fresh-agent` content, preserve only portable durable identity across servers, preserve native Freshcodex fields, and choose copied tab mode from sanitized content.
 
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/tab-registry-snapshot.ts`
+  - Owns publishing local tab/pane records for other devices. It must publish only portable durable identity, must not synthesize `sessionRef` from named aliases or same-server-only handles, and must preserve provider-specific settings such as Claude `modelSelection` and Codex runtime `model`.
+
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/session-type-utils.ts`
+  - Owns programmatic session-opening content such as history/sidebar/context-menu resume flows. It should create `sessionRef` only for canonical durable IDs and leave named aliases as same-server `resumeSessionId`.
+
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/panesSlice.ts`
   - Owns reducer-boundary pane normalization. It should normalize legacy `agent-chat` to `fresh-agent`, derive canonical `sessionRef` only from valid durable Claude IDs, and strip provider-inappropriate model fields.
 
@@ -58,6 +68,9 @@ Do not weaken, delete, or dilute valid tests to obtain green. When a test is obs
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistMiddleware.ts`
   - Owns persisted pane migration/writeback. It should strip stale Claude `model`, preserve Codex runtime `model`, and preserve canonical `sessionRef` while removing same-server-only runtime fields from persisted/cross-tab payloads.
+
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistedState.ts`
+  - Owns persisted layout parsing used by localStorage load, storage migration, and cross-tab sync. It must run the same provider-specific pane canonicalization as reducers and persist middleware.
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/storage-migration.ts`
   - Owns one-time localStorage version repair. It should migrate or salvage v2 tab/pane keys into `freshell.layout.v3`, remove v2 keys after safe migration, and rerun for already-stamped broken branch clients.
@@ -70,6 +83,9 @@ Do not weaken, delete, or dilute valid tests to obtain green. When a test is obs
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/runtime-manager.ts`
   - Owns fresh-agent create/resume routing. It should prefer same-provider `sessionRef.sessionId` when `resumeSessionId` is absent, reject mismatched locators clearly, and pass provider-specific settings through to adapters.
+
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/adapters/claude/adapter.ts`
+  - Owns translating Claude fresh-agent create input into SDK bridge input. It must resolve `modelSelection` into the actual SDK `model` value and must preserve opaque Claude effort values.
 
 - Modify if needed `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/ws-handler.ts`
   - Owns WS create validation and error responses. It should surface clear create failures for mismatched locators or invalid provider-specific create settings.
@@ -95,13 +111,19 @@ Do not weaken, delete, or dilute valid tests to obtain green. When a test is obs
   - Assert remote legacy `agent-chat` rehydrates as canonical `fresh-agent`, copied tab mode is `shell`, named aliases are not portable, and remote same-server-only handles are dropped.
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabsView.fresh-agent.test.tsx`
-  - Assert native Freshcodex remote snapshots preserve `sessionRef` and Codex runtime fields while dropping remote `resumeSessionId` / `sessionId`.
+  - Assert native Freshcodex remote snapshots preserve `sessionRef` and Codex runtime fields while dropping remote `resumeSessionId` / `sessionId`, and reject `resumeSessionId`-only remote snapshots as non-portable.
+
+- Modify or create `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/tab-registry-snapshot.test.ts`
+  - Assert local tab-registry publication preserves only portable identities and provider-specific settings for legacy agent-chat and fresh-agent panes.
+
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/session-type-utils.test.ts`
+  - Assert `buildResumeContent()` does not create invalid portable Claude identities from named aliases and still preserves canonical durable IDs.
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesSlice.test.ts`
   - Replace obsolete raw `agent-chat` expectations with reducer-boundary canonicalization coverage, including valid canonical IDs and named-alias non-portability.
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesPersistence.test.ts`
-  - Assert Claude-backed migrated panes drop stale `model` and Codex panes keep runtime `model` without gaining `modelSelection`.
+  - Assert Claude-backed migrated panes drop stale `model`, Codex panes keep runtime `model` without gaining `modelSelection`, and persisted parser/cross-tab paths cannot bypass the canonicalization.
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/storage-migration.test.ts`
   - Assert v2 keys migrate into v3 layout before removal, already-stamped broken clients are repaired, and corrupt layout plus valid v2 data is salvaged.
@@ -130,6 +152,9 @@ Do not weaken, delete, or dilute valid tests to obtain green. When a test is obs
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/runtime-manager.test.ts`
   - Assert create/resume locator precedence, mismatch errors, and provider-specific create payload handling.
 
+- Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/claude-adapter.test.ts`
+  - Assert Claude adapter resolves transported `modelSelection` into the SDK bridge `model` field and preserves opaque effort values.
+
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/ws-handler-fresh-agent.test.ts`
   - Assert WS create accepts valid Claude dynamic effort/modelSelection, rejects mismatched locators clearly, and preserves Freshcodex create settings.
 
@@ -147,6 +172,8 @@ These known failures are in scope and must be green before the work is complete:
 npm run test:vitest -- --run \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesPersistence.test.ts \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/client/store/settingsThunks.test.ts \
@@ -162,6 +189,7 @@ npm run test:vitest -- --run \
 npm run test:server -- --run \
   test/unit/server/config-store.fresh-agent-settings.test.ts \
   test/unit/server/config-store.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 ```
@@ -182,10 +210,14 @@ If coordinated `npm run check` reports additional failures touching fresh-agent,
 
 **Files:**
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/TabsView.tsx`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/tab-registry-snapshot.ts`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/session-type-utils.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/panesSlice.ts`
 - Modify or create: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/pane-content.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabsView.test.tsx`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabsView.fresh-agent.test.tsx`
+- Modify or create: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/tab-registry-snapshot.test.ts`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/session-type-utils.test.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesSlice.test.ts`
 
 - [ ] **Step 1: Identify the failing tests**
@@ -196,10 +228,12 @@ Run:
 npm run test:vitest -- --run \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesSlice.test.ts
 ```
 
-Expected before changes: remote legacy `agent-chat` snapshots either remain `agent-chat`, keep stale `tab.mode: 'claude'`, synthesize non-portable resume aliases, or fail to preserve native Freshcodex durable identity correctly.
+Expected before changes: remote legacy `agent-chat` snapshots either remain `agent-chat`, keep stale `tab.mode: 'claude'`, synthesize non-portable resume aliases, publish invalid portable identities, or fail to preserve native Freshcodex durable identity correctly.
 
 - [ ] **Step 2: Update tests to assert the steady-state identity contract**
 
@@ -246,6 +280,24 @@ expect(copiedLayout.content.resumeSessionId).toBeUndefined()
 expect(copiedLayout.content.sessionId).toBeUndefined()
 expect(copiedLayout.content.modelSelection).toBeUndefined()
 ```
+
+Add a negative native `fresh-agent` remote snapshot test where the payload has only `resumeSessionId: 'codex-runtime-handle'` and no `sessionRef`. Assert the copied pane has no `sessionRef`, no remote `resumeSessionId`, and a visible `restoreError`. This covers the canonical `fresh-agent` steady-state case, not only legacy `agent-chat` snapshots.
+
+Add a multi-pane context-menu test for `openPaneInNewTab()`: make the remote record's first pane a terminal or legacy agent pane, open a later sanitized rich-agent pane in its own tab, and assert the new tab uses `mode: 'shell'` derived from the clicked pane's sanitized content rather than `deriveModeFromRecord(record)`.
+
+In `test/unit/client/lib/tab-registry-snapshot.test.ts`, add publication tests for `buildOpenTabRegistryRecord()` / `collectPaneSnapshots()`:
+
+- legacy `agent-chat` with a canonical Claude durable ID publishes `sessionRef` and `modelSelection`;
+- legacy `agent-chat` with `resumeSessionId: 'named-resume'` does not publish `sessionRef`;
+- native `fresh-agent` Codex publishes explicit `sessionRef`, Codex `model`, and Codex runtime fields;
+- native `fresh-agent` with only `resumeSessionId` does not synthesize a portable `sessionRef`.
+
+In `test/unit/client/lib/session-type-utils.test.ts`, add `buildResumeContent()` coverage:
+
+- `freshclaude` / `kilroy` with a canonical Claude durable ID include `sessionRef`;
+- `freshclaude` / `kilroy` with a named alias keep `resumeSessionId` but omit `sessionRef`;
+- `freshcodex` with a Codex durable thread ID includes `sessionRef`;
+- provider-specific defaults remain provider-specific (`modelSelection` for Claude-backed sessions, runtime `model` for Codex).
 
 In `test/unit/client/store/panesSlice.test.ts`, replace the obsolete assertion that no `sessionRef` is synthesized with two stronger cases:
 
@@ -308,10 +360,12 @@ Run:
 npm run test:vitest -- --run \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesSlice.test.ts
 ```
 
-Expected: failures point to missing remote conversion, stale tab mode, missing native Freshcodex assertions, or reducer sessionRef derivation.
+Expected: failures point to missing remote conversion, stale tab mode, invalid publisher/session-helper identity synthesis, missing native Freshcodex assertions, or reducer sessionRef derivation.
 
 - [ ] **Step 4: Implement canonicalization at reducer and remote snapshot boundaries**
 
@@ -350,9 +404,13 @@ export function normalizeFreshAgentPaneModelFields(input: {
 
 In `src/components/TabsView.tsx`, change `sanitizePaneSnapshot()` so `snapshot.kind === 'agent-chat'` returns canonical `fresh-agent` content. Use durable-state migration, not raw `resumeSessionId`, to build portable `sessionRef`. Preserve `resumeSessionId` and `sessionId` only when `sameServer` is true. For remote named aliases, return a clear `restoreError` rather than silently starting a new session.
 
-For native `snapshot.kind === 'fresh-agent'`, preserve `sessionRef`, preserve Freshcodex runtime fields, and drop remote `resumeSessionId` / `sessionId` unless `sameServer` is true.
+For native `snapshot.kind === 'fresh-agent'`, preserve explicit `sessionRef`, preserve Freshcodex runtime fields, and drop remote `resumeSessionId` / `sessionId` unless `sameServer` is true. Do not use `resumeSessionId` as a `sessionRef` fallback for remote native fresh-agent snapshots; if no portable identity remains, set `restoreError`.
 
-Update copied tab mode derivation so mode is based on sanitized content. A copied tab whose first pane sanitizes to `fresh-agent` must be `mode: 'shell'`, even if the remote registry snapshot was legacy `agent-chat`.
+Update copied tab mode derivation so mode is based on sanitized content. A copied tab whose first pane sanitizes to `fresh-agent` must be `mode: 'shell'`, even if the remote registry snapshot was legacy `agent-chat`. Apply the same rule in `openPaneInNewTab()`: derive mode from the sanitized clicked pane, not from the whole remote record's first pane.
+
+In `src/lib/tab-registry-snapshot.ts`, use the same durable-state helper to publish portable identity. Never synthesize `sessionRef` from a named alias or a same-server-only handle. Preserve `modelSelection` for Claude-backed panes and Codex runtime `model` / `sandbox` / settings for Codex panes.
+
+In `src/lib/session-type-utils.ts`, update `buildResumeContent()` so explicit `sessionRef` is created only when `opts.sessionId` is a canonical durable ID for the runtime provider. Non-canonical Claude aliases remain `resumeSessionId` only.
 
 - [ ] **Step 5: Refactor and verify**
 
@@ -362,6 +420,8 @@ Run:
 npm run test:vitest -- --run \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesSlice.test.ts
 ```
 
@@ -372,10 +432,14 @@ Expected: all selected tests pass for the canonical identity contract.
 ```bash
 git add \
   src/components/TabsView.tsx \
+  src/lib/tab-registry-snapshot.ts \
+  src/lib/session-type-utils.ts \
   src/store/panesSlice.ts \
   src/lib/pane-content.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesSlice.test.ts
 git commit -m "Canonicalize fresh-agent pane identity"
 ```
@@ -388,9 +452,11 @@ If `src/lib/pane-content.ts` was not created, omit it from `git add`.
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/shared/ws-protocol.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/runtime-adapter.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/runtime-manager.ts`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/adapters/claude/adapter.ts`
 - Modify if needed: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/ws-handler.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/fresh-agent/FreshAgentView.tsx`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/fresh-agent-ws.test.ts`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/claude-adapter.test.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/runtime-manager.test.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/ws-handler-fresh-agent.test.ts`
 
@@ -401,11 +467,12 @@ Run:
 ```bash
 npm run test:vitest -- --run test/unit/client/lib/fresh-agent-ws.test.ts
 npm run test:server -- --run \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 ```
 
-Expected before changes: fresh-agent create does not support enough provider-specific fields or locator semantics to resume remote copied Freshcodex/FreshClaude panes safely.
+Expected before changes: fresh-agent create does not support enough provider-specific fields, adapter settings resolution, or locator semantics to resume remote copied Freshcodex/FreshClaude panes safely.
 
 - [ ] **Step 2: Add tests for provider-aware create payloads**
 
@@ -447,6 +514,13 @@ In `test/unit/server/fresh-agent/runtime-manager.test.ts`, assert create/resume 
 - Codex create preserves `model`, `sandbox`, and Codex effort/settings.
 - Claude create preserves `modelSelection` and opaque effort strings.
 
+In `test/unit/server/fresh-agent/claude-adapter.test.ts`, assert the Claude adapter resolves `modelSelection` into the actual `sdkBridge.createSession({ model })` value:
+
+- `{ kind: 'exact', modelId: 'claude-opus-4-6' }` becomes `model: 'claude-opus-4-6'`;
+- tracked/alias model selections are resolved by the same helper used by legacy AgentChat where possible, or by a small shared resolver if the legacy helper is client-only;
+- no `modelSelection` means the adapter uses the existing provider default behavior;
+- opaque effort strings such as `turbo` are passed through without the shared transport rejecting them.
+
 In `test/unit/client/lib/fresh-agent-ws.test.ts`, assert create cancellation/late-created handling still works when create messages include `sessionRef` and `modelSelection`.
 
 - [ ] **Step 3: Run tests to verify they fail**
@@ -456,6 +530,7 @@ Run:
 ```bash
 npm run test:vitest -- --run test/unit/client/lib/fresh-agent-ws.test.ts
 npm run test:server -- --run \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 ```
@@ -483,6 +558,8 @@ In `server/fresh-agent/runtime-manager.ts`, resolve create identity as:
 
 Do not silently ignore mismatched locators.
 
+In `server/fresh-agent/adapters/claude/adapter.ts`, resolve `input.modelSelection` before calling the SDK bridge. Prefer an existing shared resolver if one exists; otherwise extract a server-safe helper whose contract is covered by `claude-adapter.test.ts`. The adapter, not `FreshAgentView`, owns converting `modelSelection` to the SDK `model` field so FreshClaude/FreshAgent behavior stays consistent across REST/WS callers.
+
 - [ ] **Step 5: Refactor and verify**
 
 Run:
@@ -490,6 +567,7 @@ Run:
 ```bash
 npm run test:vitest -- --run test/unit/client/lib/fresh-agent-ws.test.ts
 npm run test:server -- --run \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 ```
@@ -503,9 +581,11 @@ git add \
   shared/ws-protocol.ts \
   server/fresh-agent/runtime-adapter.ts \
   server/fresh-agent/runtime-manager.ts \
+  server/fresh-agent/adapters/claude/adapter.ts \
   server/ws-handler.ts \
   src/components/fresh-agent/FreshAgentView.tsx \
   test/unit/client/lib/fresh-agent-ws.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 git commit -m "Support provider-aware fresh-agent create"
@@ -517,6 +597,7 @@ Omit `server/ws-handler.ts` if it did not change.
 
 **Files:**
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistMiddleware.ts`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistedState.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/storage-migration.ts`
 - Modify or create: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/pane-content.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesPersistence.test.ts`
@@ -558,7 +639,7 @@ expect(content.model).toBe('codex-model')
 expect(content.modelSelection).toBeUndefined()
 ```
 
-Add or extend cross-tab/persisted hydration coverage if needed so `parsePersistedLayoutRaw()` / `hydratePanes()` cannot keep stale Claude `model` via a path that bypasses `loadPersistedPanes()`.
+Add or extend cross-tab/persisted hydration coverage so `parsePersistedLayoutRaw()` / `parsePersistedPanesRaw()` / `hydratePanes()` cannot keep stale Claude `model` via a path that bypasses `loadPersistedPanes()`. This must cover `src/store/persistedState.ts`, because storage migration and cross-tab sync use that parser boundary directly.
 
 In `test/unit/client/store/storage-migration.test.ts`, strengthen v2 migration coverage:
 
@@ -581,13 +662,15 @@ Expected: failures point to stale provider model cleanup and storage repair gaps
 
 - [ ] **Step 4: Implement provider-specific pane persistence migration**
 
-In `persistMiddleware.ts`, use the same provider-specific model normalization contract as `panesSlice.ts`:
+In `persistMiddleware.ts` and `persistedState.ts`, use the same provider-specific model normalization contract as `panesSlice.ts`:
 
 - `agent-chat`: migrate `model` into `modelSelection`, omit `model`.
 - `fresh-agent` with `provider === 'claude'`: migrate `model` into `modelSelection`, omit `model`.
 - `fresh-agent` with `provider === 'codex'`: preserve runtime `model`, omit stale `modelSelection`, preserve valid Codex runtime fields.
 
 Update `stripTransientSessionFields()` so fresh-agent persisted/cross-tab payloads keep `sessionRef` but strip same-server-only `resumeSessionId` when appropriate. Do not strip portable `sessionRef`.
+
+In `persistedState.ts`, normalize parsed pane content before it is returned to callers. The invariant is that any persisted, cross-tab, or migrated rich-agent payload leaving this parser is already canonical: legacy `agent-chat` has become `fresh-agent`, Claude `model` has been migrated to `modelSelection` and removed, Codex runtime `model` is preserved, and invalid provider/session fields are stripped.
 
 - [ ] **Step 5: Implement idempotent storage repair**
 
@@ -620,6 +703,7 @@ Expected: all selected tests pass.
 ```bash
 git add \
   src/store/persistMiddleware.ts \
+  src/store/persistedState.ts \
   src/store/storage-migration.ts \
   src/lib/pane-content.ts \
   test/unit/client/store/panesPersistence.test.ts \
@@ -751,7 +835,14 @@ if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'agentChat')) {
 }
 ```
 
-If a provider patch has an own `modelSelection` or `effort` property with value `undefined`, convert it to `null`. Preserve existing clear behavior for coding CLI provider fields.
+After alias-specific normalization, run a general recursive sanitizer over the outgoing API patch:
+
+- remove own properties whose value is `undefined` when the key has no defined clear sentinel;
+- convert known clearable agent-provider fields such as `modelSelection`, `effort`, and provider default fields to `null`;
+- recurse through nested objects and arrays without mutating the caller's input;
+- never create a top-level `freshAgent` or `agentChat` sibling just to hold `undefined` children.
+
+Preserve existing clear behavior for coding CLI provider fields. The final payload passed to `api.patch()` must satisfy `expectNoUndefinedOwnProperties()` at every depth, not only inside `freshAgent.providers`.
 
 - [ ] **Step 5: Verify shared/server settings migration**
 
@@ -799,9 +890,11 @@ Omit `server/config-store.ts` if it did not change.
 
 **Files:**
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/fresh-agent/FreshAgentView.tsx`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/fresh-agent-ws.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistControl.ts`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx`
 - Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+- Modify: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/fresh-agent-ws.test.ts`
 
 - [ ] **Step 1: Identify the failing tests**
 
@@ -810,10 +903,11 @@ Run:
 ```bash
 npm run test:vitest -- --run \
   test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx \
-  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx \
+  test/unit/client/lib/fresh-agent-ws.test.ts
 ```
 
-Expected before changes: lost-session recovery can use `named-resume` instead of the canonical durable ID, and stale async updates can overwrite newer pane fields.
+Expected before changes: lost-session recovery can use `named-resume` instead of the canonical durable ID, stale async updates can overwrite newer pane fields, remote restore errors can still auto-create a replacement session, and sessionRef-only resumes may not hydrate history correctly.
 
 - [ ] **Step 2: Strengthen recovery and stale-update tests**
 
@@ -830,11 +924,25 @@ Add a fallback test where no valid `timelineSessionId` or `cliSessionId` exists 
 
 In `FreshAgentView.test.tsx`, add stale-update coverage for these cases:
 
+- `paneContent.restoreError` is rendered as a clear user-facing error and suppresses automatic `freshAgent.create`;
 - `freshAgent.created` merges `sessionId`, `status`, and `createError` without clobbering a newer `model`, `modelSelection`, `permissionMode`, `plugins`, `sessionRef`, or `settingsDismissed`.
+- `freshAgent.created` for a newly created durable Freshcodex session writes `sessionRef: { provider: 'codex', sessionId: message.sessionId }` before the pane can be persisted without `resumeSessionId`.
 - `freshAgent.create.failed` merges `status` and `createError` without clobbering newer fields.
 - snapshot refresh merges `status` / canonical resume identity without clobbering newer pane settings.
 - retry/recovery resets lifecycle fields but preserves current provider-specific settings and writes canonical `sessionRef`.
 - when a canonical Claude durable ID appears after a named resume, the pane gets `sessionRef: { provider: 'claude', sessionId }`, clears or deprioritizes the named resume for durable persistence as appropriate, and dispatches `flushPersistedLayoutNow()`.
+
+In `fresh-agent-ws.test.ts`, add a sessionRef-only restore case:
+
+```ts
+registerFreshAgentCreate(dispatch, 'req-1', {
+  sessionType: 'freshcodex',
+  provider: 'codex',
+  sessionRef: { provider: 'codex', sessionId: 'codex-thread-123' },
+})
+```
+
+Assert pending-create state is marked as expecting history hydration even though `resumeSessionId` is absent. This prevents remote copied panes that intentionally drop runtime handles from being treated as new empty sessions.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -843,7 +951,8 @@ Run:
 ```bash
 npm run test:vitest -- --run \
   test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx \
-  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx \
+  test/unit/client/lib/fresh-agent-ws.test.ts
 ```
 
 Expected: tests fail until recovery uses fresh refs and async handlers stop dispatching whole captured pane objects.
@@ -874,6 +983,14 @@ sessionRef: { provider: 'claude', sessionId: recoveryResumeSessionId }
 
 Use `mergePaneContent()` for targeted recovery updates unless a full replacement is genuinely required. Do not send a direct ad hoc `freshAgent.create` from recovery; recovery should continue to flow through pane state and the existing idempotent create effect.
 
+At the create effect boundary, add an explicit guard:
+
+```ts
+if (paneContent.restoreError) return
+```
+
+Render `paneContent.restoreError.message` in the same visible error area as create/load/restore failures. A pane copied from another device with no portable identity is a restore failure, not a request to start a fresh unrelated session.
+
 - [ ] **Step 5: Implement persisted identity and no-clobber lifecycle updates**
 
 If needed, add a `buildFreshAgentPersistedIdentityUpdate()` helper in `persistControl.ts`, analogous to `buildAgentChatPersistedIdentityUpdate()`, for Claude-backed `fresh-agent` panes.
@@ -882,8 +999,11 @@ In `FreshAgentView.tsx`:
 
 - Replace async `updatePaneContent({ content: { ...paneContent, ... } })` calls from `freshAgent.created`, `freshAgent.create.failed`, and snapshot refresh with `mergePaneContent()` targeted updates or with a freshly-read `paneContentRef.current`.
 - When canonical durable identity changes, merge `sessionRef` and dispatch `flushPersistedLayoutNow()`.
+- When `freshAgent.created` arrives and there is no current `sessionRef`, derive one from the runtime provider and created durable session id when the provider's durable identity contract supports it. This is required for new Freshcodex threads before `resumeSessionId` is stripped from persisted payloads.
 - Preserve current provider-specific settings on retry/recovery.
 - Keep create idempotency and reconnect behavior intact.
+
+In `fresh-agent-ws.ts`, extend `registerFreshAgentCreate()` options to accept `sessionRef`. Set `expectsHistoryHydration` when either `resumeSessionId` exists or `sessionRef` exists. Do not weaken late-create cancellation behavior.
 
 - [ ] **Step 6: Refactor and verify**
 
@@ -892,7 +1012,8 @@ Run:
 ```bash
 npm run test:vitest -- --run \
   test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx \
-  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx \
+  test/unit/client/lib/fresh-agent-ws.test.ts
 ```
 
 Expected: all selected tests pass.
@@ -902,9 +1023,11 @@ Expected: all selected tests pass.
 ```bash
 git add \
   src/components/fresh-agent/FreshAgentView.tsx \
+  src/lib/fresh-agent-ws.ts \
   src/store/persistControl.ts \
   test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx \
-  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx \
+  test/unit/client/lib/fresh-agent-ws.test.ts
 git commit -m "Harden fresh-agent recovery identity"
 ```
 
@@ -1013,6 +1136,8 @@ Run:
 npm run test:vitest -- --run \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/components/TabsView.fresh-agent.test.tsx \
+  test/unit/client/lib/tab-registry-snapshot.test.ts \
+  test/unit/client/lib/session-type-utils.test.ts \
   test/unit/client/store/panesPersistence.test.ts \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/client/store/settingsThunks.test.ts \
@@ -1030,6 +1155,7 @@ Run:
 npm run test:server -- --run \
   test/unit/server/config-store.fresh-agent-settings.test.ts \
   test/unit/server/config-store.test.ts \
+  test/unit/server/fresh-agent/claude-adapter.test.ts \
   test/unit/server/fresh-agent/runtime-manager.test.ts \
   test/unit/server/ws-handler-fresh-agent.test.ts
 ```
