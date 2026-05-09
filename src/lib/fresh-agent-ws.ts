@@ -1,5 +1,6 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
+import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import {
   clearPendingCreateFailure,
@@ -50,6 +51,7 @@ export function registerFreshAgentCreate(
   requestId: string,
   options: {
     resumeSessionId?: string
+    sessionRef?: SessionRef
     sessionType: FreshAgentSessionType
     provider: FreshAgentRuntimeProvider
   },
@@ -58,7 +60,7 @@ export function registerFreshAgentCreate(
     requestId,
     sessionType: options.sessionType,
     provider: options.provider,
-    expectsHistoryHydration: Boolean(options.resumeSessionId),
+    expectsHistoryHydration: Boolean(options.resumeSessionId || options.sessionRef),
   }))
   dispatch(clearPendingCreateFailure({ requestId }))
 }

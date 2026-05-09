@@ -60,6 +60,11 @@ export const CodexSandboxPolicySchema = z.discriminatedUnion('type', [
   }).strict(),
 ])
 
+export const CodexSandboxResultSchema = z.union([
+  CodexSandboxModeSchema,
+  CodexSandboxPolicySchema,
+])
+
 export const CodexUserInputSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('text'),
@@ -220,7 +225,7 @@ export const CodexThreadOperationResultSchema = z.object({
   cwd: z.string(),
   model: z.string(),
   modelProvider: z.string(),
-  sandbox: CodexSandboxModeSchema,
+  sandbox: CodexSandboxResultSchema,
   serviceTier: z.string().nullable().optional().default(null),
   instructionSources: z.array(z.unknown()).optional().default([]),
   reasoningEffort: CodexReasoningEffortSchema.nullable().optional().default(null),

@@ -6,7 +6,6 @@ import {
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import type {
-  FreshAgentPendingCreate,
   FreshAgentPermissionRequest,
   FreshAgentQuestionRequest,
   FreshAgentSessionState,

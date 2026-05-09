@@ -112,6 +112,8 @@ export function FreshAgentView({
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const paneContentRef = useRef(paneContent)
   paneContentRef.current = paneContent
+  const snapshotSessionId = paneContent.sessionId
+    ?? (paneContent.sessionRef?.provider === paneContent.provider ? paneContent.sessionRef.sessionId : undefined)
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
@@ -154,6 +156,8 @@ export function FreshAgentView({
     provider: content.provider,
     cwd: content.initialCwd,
     resumeSessionId: content.resumeSessionId,
+    sessionRef: content.sessionRef,
+    modelSelection: content.modelSelection,
     model: content.model,
     permissionMode: content.permissionMode,
     sandbox: content.sandbox,
@@ -183,13 +187,19 @@ export function FreshAgentView({
 
   useEffect(() => {
     if (paneContent.sessionId || hidden) return
-    if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
+    if (paneContent.restoreError) return
+    if (
+      paneContent.status !== 'creating'
+      && paneContent.status !== 'starting'
+      && !paneContent.sessionRef
+    ) return
     if (createSentRef.current) return
     createSentRef.current = true
     registerFreshAgentCreate(dispatch, paneContent.createRequestId, {
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
+      sessionRef: paneContent.sessionRef,
     })
     sendFreshAgentMessage(buildCreateMessage(paneContent))
   }, [
@@ -282,11 +292,11 @@ export function FreshAgentView({
   }, [dispatch, paneContent, paneContent.createRequestId, paneId, tabId, ws])
 
   useEffect(() => {
-    if (!paneContent.sessionId) return
+    if (!snapshotSessionId) return
     if (paneContent.provider === 'claude' && claudeSession?.lost) return
     const controller = new AbortController()
     setLoadError(null)
-    const sessionId = paneContent.sessionId
+    const sessionId = snapshotSessionId
     const provider = paneContent.provider
     const resumeSessionId = paneContent.resumeSessionId
     const currentStatus = paneContent.status
@@ -328,6 +338,7 @@ export function FreshAgentView({
     paneContent.status,
     paneContent.sessionType,
     paneId,
+    snapshotSessionId,
     snapshotRefreshNonce,
     tabId,
   ])

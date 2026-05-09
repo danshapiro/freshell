@@ -306,7 +306,26 @@ describe('CodexAppServerClient', () => {
   })
 
   it('sends thread/resume and returns the exact resumed thread id', async () => {
-    const server = await startFakeCodexAppServer()
+    const server = await startFakeCodexAppServer({
+      overrides: {
+        'thread/resume': {
+          result: {
+            thread: {
+              id: '019d9859-5670-72b1-851f-794ad7fef112',
+              path: '/tmp/rollout-019d9859-5670-72b1-851f-794ad7fef112.jsonl',
+              ephemeral: false,
+            },
+            cwd: '/repo/worktree',
+            model: 'fixture-model',
+            modelProvider: 'openai',
+            instructionSources: [],
+            approvalPolicy: 'never',
+            approvalsReviewer: 'user',
+            sandbox: { type: 'dangerFullAccess' },
+          },
+        },
+      },
+    })
     const client = new CodexAppServerClient({ wsUrl: server.wsUrl })
 
     await client.initialize()
@@ -319,6 +338,7 @@ describe('CodexAppServerClient', () => {
         path: expect.stringMatching(/rollout-019d9859-5670-72b1-851f-794ad7fef112\.jsonl$/),
         ephemeral: false,
       },
+      sandbox: { type: 'dangerFullAccess' },
     })
   })
 

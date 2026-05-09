@@ -94,18 +94,26 @@ function normalizePaneContent(
       return previous ?? { kind: 'picker' }
     }
     const legacyDurableState = input.kind === 'agent-chat'
-      ? migrateLegacyAgentChatDurableState({
-          sessionRef: input.sessionRef,
-          cliSessionId: typeof (input as { cliSessionId?: unknown }).cliSessionId === 'string'
-            ? (input as { cliSessionId: string }).cliSessionId
-            : undefined,
-          timelineSessionId: typeof (input as { timelineSessionId?: unknown }).timelineSessionId === 'string'
-            ? (input as { timelineSessionId: string }).timelineSessionId
-            : undefined,
-          resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
-        })
+      ? (() => {
+          const legacyInput = input as unknown as Record<string, unknown>
+          return migrateLegacyAgentChatDurableState({
+            sessionRef: input.sessionRef,
+            cliSessionId: typeof legacyInput.cliSessionId === 'string' ? legacyInput.cliSessionId : undefined,
+            timelineSessionId: typeof legacyInput.timelineSessionId === 'string' ? legacyInput.timelineSessionId : undefined,
+            resumeSessionId: typeof input.resumeSessionId === 'string' ? input.resumeSessionId : undefined,
+          })
+        })()
       : {}
-    const sessionRef = sanitizeSessionRef(input.sessionRef) ?? legacyDurableState.sessionRef
+    const codexDurableSessionId = provider === 'codex'
+      ? (typeof input.sessionId === 'string' && input.sessionId.length > 0
+          ? input.sessionId
+          : (typeof input.resumeSessionId === 'string' && input.resumeSessionId.length > 0
+              ? input.resumeSessionId
+              : undefined))
+      : undefined
+    const sessionRef = sanitizeSessionRef(input.sessionRef)
+      ?? legacyDurableState.sessionRef
+      ?? (codexDurableSessionId ? { provider: 'codex' as const, sessionId: codexDurableSessionId } : undefined)
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     const sandbox = input.kind === 'fresh-agent' ? input.sandbox : undefined
     const normalizedModelSelection = provider === 'codex'

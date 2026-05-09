@@ -45,15 +45,6 @@ function readStorageVersion(): number {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
-function clearFreshellKeysExcept(keep: string[]): void {
-  const keepSet = new Set(keep)
-  for (const key of Object.keys(localStorage)) {
-    if ((key.startsWith('freshell.') || key === STORAGE_VERSION_KEY) && !keepSet.has(key)) {
-      localStorage.removeItem(key)
-    }
-  }
-}
-
 function migrateBrowserPreferencesRecord(raw: string): string | undefined {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>

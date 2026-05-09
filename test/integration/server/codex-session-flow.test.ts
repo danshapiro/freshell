@@ -246,7 +246,7 @@ async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
 
 async function waitForCondition(
   predicate: () => Promise<boolean> | boolean,
-  timeoutMs = 3_000,
+  timeoutMs = MESSAGE_TIMEOUT_MS,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {

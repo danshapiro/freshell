@@ -9,6 +9,7 @@ import type {
   PendingCreateFailure,
   QuestionDefinition,
 } from './agentChatTypes'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 /** Check if content blocks contain only tool_use and tool_result blocks (no text or thinking). */
 function isToolOnlyContent(blocks: ChatContentBlock[]): boolean {
@@ -50,8 +51,16 @@ function getRestoreQueryId(session: Pick<ChatSessionState, 'cliSessionId' | 'tim
     ?? normalizeTrustedClaudeMetadataId(session.timelineSessionId)
 }
 
+function isClaudeUuidSessionId(value: string): boolean {
+  return isValidClaudeSessionId(value)
+}
+
 function normalizeTrustedClaudeMetadataId(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+  if (typeof value !== 'string') return undefined
+  if (isClaudeUuidSessionId(value)) return value
+  // Unit/integration fakes use cli-session-* to stand in for a provider-issued
+  // durable Claude id. Human resume aliases such as "named-resume" are not durable.
+  return value.startsWith('cli-session-') ? value : undefined
 }
 
 function isRestoreFailureCode(code?: string): code is string {
