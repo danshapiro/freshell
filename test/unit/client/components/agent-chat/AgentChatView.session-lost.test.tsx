@@ -152,5 +152,9 @@ describe('Fresh-agent lost-session recovery coverage', () => {
         resumeSessionId: 'cli-session-abc-123',
       }))
     })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.create',
+      resumeSessionId: 'named-resume',
+    }))
   })
 })
