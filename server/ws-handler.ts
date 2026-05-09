@@ -1757,7 +1757,23 @@ export class WsHandler {
         return
       }
       state.freshAgentSubscriptions.set(key, off)
-    }).catch(() => undefined)
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : 'Failed to subscribe to fresh-agent session updates'
+      log.warn({ err: error, locator }, 'Fresh-agent session subscription failed')
+      if (!state.freshAgentSessions.has(key)) return
+      this.safeSend(ws, {
+        type: 'freshAgent.event',
+        sessionId: locator.sessionId,
+        sessionType: locator.sessionType,
+        provider: locator.provider,
+        event: {
+          type: 'sdk.error',
+          sessionId: locator.sessionId,
+          code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+          message,
+        },
+      })
+    })
   }
 
   private clearClientFreshAgentSession(

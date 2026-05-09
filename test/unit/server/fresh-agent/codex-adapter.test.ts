@@ -103,18 +103,22 @@ describe('Codex fresh-agent adapter', () => {
   })
 
   it('reads snapshots and turns from the official Codex thread APIs', async () => {
+    const durableTurn = makeCodexTurn('turn-1')
     const runtime = {
       startThread: vi.fn(),
       resumeThread: vi.fn(),
       readThread: vi.fn().mockResolvedValue({
-        thread: makeCodexThread('thread-new-1'),
+        thread: {
+          ...makeCodexThread('thread-new-1'),
+          turns: [durableTurn],
+        },
       }),
       listThreadTurns: vi.fn().mockResolvedValue({
         revision: 7,
         nextCursor: null,
-        turns: [makeCodexTurn('turn-1')],
+        turns: [durableTurn],
       }),
-      readThreadTurn: vi.fn().mockResolvedValue(makeCodexTurn('turn-1')),
+      readThreadTurn: vi.fn().mockResolvedValue(durableTurn),
     }
     const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
 
@@ -122,7 +126,9 @@ describe('Codex fresh-agent adapter', () => {
       provider: 'codex',
       threadId: 'thread-new-1',
       revision: 7,
+      turns: [{ id: 'turn-1', turnId: 'turn-1' }],
     })
+    expect(runtime.readThread).toHaveBeenCalledWith({ threadId: 'thread-new-1', includeTurns: true })
     await expect(adapter.getTurnPage?.({ sessionType: 'freshcodex', provider: 'codex', threadId: 'thread-new-1' }, { revision: 7 })).resolves.toMatchObject({
       revision: 7,
       turns: [{ id: 'turn-1', turnId: 'turn-1' }],
@@ -131,6 +137,69 @@ describe('Codex fresh-agent adapter', () => {
       turnId: 'turn-1',
       revision: 7,
     })
+  })
+
+  it('subscribes to Codex lifecycle notifications and projects matching thread updates', async () => {
+    let lifecycleHandler: ((event: any) => void) | undefined
+    const off = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn((handler) => {
+        lifecycleHandler = handler
+        return off
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+
+    expect(runtime.onThreadLifecycle).toHaveBeenCalledWith(expect.any(Function))
+
+    lifecycleHandler?.({
+      kind: 'thread_status_changed',
+      threadId: 'other-thread',
+      status: { type: 'active', activeFlags: [] },
+    })
+    expect(listener).not.toHaveBeenCalled()
+
+    lifecycleHandler?.({
+      kind: 'thread_status_changed',
+      threadId: 'thread-new-1',
+      status: { type: 'active', activeFlags: [] },
+    })
+    lifecycleHandler?.({
+      kind: 'thread_status_changed',
+      threadId: 'thread-new-1',
+      status: { type: 'idle' },
+    })
+    lifecycleHandler?.({
+      kind: 'thread_closed',
+      threadId: 'thread-new-1',
+    })
+
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.session.snapshot',
+      sessionId: 'thread-new-1',
+      status: 'running',
+    }))
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'sdk.session.snapshot',
+      sessionId: 'thread-new-1',
+      status: 'idle',
+    }))
+    expect(listener).toHaveBeenCalledWith({
+      type: 'sdk.status',
+      sessionId: 'thread-new-1',
+      status: 'exited',
+    })
+
+    unsubscribe?.()
+    expect(off).toHaveBeenCalledTimes(1)
   })
 
   it('starts turns with Codex-shaped input/settings and interrupts the active turn', async () => {

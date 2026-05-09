@@ -243,6 +243,56 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('reports fresh-agent subscription failures instead of silently dropping live updates', async () => {
+    const runtimeManager = {
+      attach: vi.fn().mockReturnValue({
+        sessionId: 'codex-session-no-subscribe',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockRejectedValue(new Error('Codex app-server lifecycle subscription failed')),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'codex-session-no-subscribe',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          { sessionId: 'codex-session-no-subscribe', sessionType: 'freshcodex', provider: 'codex' },
+          expect.any(Function),
+        )
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.event',
+          sessionId: 'codex-session-no-subscribe',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          event: {
+            type: 'sdk.error',
+            sessionId: 'codex-session-no-subscribe',
+            code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+            message: 'Codex app-server lifecycle subscription failed',
+          },
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('unsubscribes a late fresh-agent subscription when the client clears the session before subscribe resolves', async () => {
     let resolveSubscribe!: (off: () => void) => void
     const off = vi.fn()

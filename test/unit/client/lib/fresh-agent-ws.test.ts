@@ -1,9 +1,14 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { cancelCreate, _resetCancelledCreates } from '@/lib/sdk-message-handler'
 
 describe('fresh-agent-ws', () => {
+  beforeEach(() => {
+    _resetCancelledCreates()
+  })
+
   it('registers resumed creates with history hydration and handles freshAgent.created', () => {
     const store = configureStore({
       reducer: {
@@ -29,6 +34,38 @@ describe('fresh-agent-ws', () => {
       sessionId: 'thread-1',
       expectsHistoryHydration: true,
     })
+  })
+
+  it('kills a late freshAgent.created session when its create request was cancelled', () => {
+    const store = configureStore({
+      reducer: {
+        freshAgent: freshAgentReducer,
+      },
+    })
+    const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-orphan', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    cancelCreate('req-orphan')
+
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-orphan',
+      sessionId: 'thread-orphan',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws)
+
+    expect(handled).toBe(true)
+    expect(ws.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-orphan',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    expect(store.getState().freshAgent.sessions['freshcodex:codex:thread-orphan']).toBeUndefined()
   })
 
   it('handles freshAgent.create.failed', () => {

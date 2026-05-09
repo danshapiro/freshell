@@ -6,9 +6,29 @@ import type {
 } from '../../../coding-cli/codex-app-server/protocol.js'
 import {
   normalizeCodexThreadSnapshot,
+  normalizeCodexTurn,
   normalizeCodexTurnBody,
   normalizeCodexTurnPage,
 } from './normalize.js'
+
+type CodexThreadLifecycleEvent =
+  | {
+    kind: 'thread_started'
+    thread: {
+      id: string
+      updatedAt?: number
+      status?: unknown
+    }
+  }
+  | {
+    kind: 'thread_closed'
+    threadId: string
+  }
+  | {
+    kind: 'thread_status_changed'
+    threadId: string
+    status: unknown
+  }
 
 type CodexRuntimePort = {
   startThread: (input: {
@@ -28,6 +48,7 @@ type CodexRuntimePort = {
   forkThread?: (input: CodexThreadForkParams) => Promise<{ threadId: string; wsUrl: string }>
   startTurn?: (input: CodexTurnStartParams) => Promise<{ turnId: string }>
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
+  onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -96,6 +117,17 @@ function normalizeCodexThreadStatus(status: unknown): string {
   return 'idle'
 }
 
+function makeCodexStatusEvent(sessionId: string, status: unknown, revision?: number) {
+  return {
+    type: 'sdk.session.snapshot',
+    sessionId,
+    latestTurnId: null,
+    status: normalizeCodexThreadStatus(status),
+    timelineSessionId: sessionId,
+    revision,
+  }
+}
+
 export function createCodexFreshAgentAdapter(deps: {
   runtime: CodexRuntimePort
 }): FreshAgentRuntimeAdapter {
@@ -132,6 +164,35 @@ export function createCodexFreshAgentAdapter(deps: {
       })
       settingsByThread.set(resumed.threadId, input)
       return { sessionId: resumed.threadId }
+    },
+
+    subscribe(sessionId, listener) {
+      if (!deps.runtime.onThreadLifecycle) {
+        throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
+      }
+      return deps.runtime.onThreadLifecycle((event) => {
+        if (event.kind === 'thread_started') {
+          if (event.thread.id !== sessionId) return
+          listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
+          return
+        }
+        if (event.kind === 'thread_closed') {
+          if (event.threadId !== sessionId) return
+          activeTurnByThread.delete(sessionId)
+          listener({
+            type: 'sdk.status',
+            sessionId,
+            status: 'exited',
+          })
+          return
+        }
+        if (event.threadId !== sessionId) return
+        const status = normalizeCodexThreadStatus(event.status)
+        if (status !== 'running' && status !== 'starting') {
+          activeTurnByThread.delete(sessionId)
+        }
+        listener(makeCodexStatusEvent(sessionId, event.status))
+      })
     },
 
     async send(sessionId, input) {
@@ -184,13 +245,19 @@ export function createCodexFreshAgentAdapter(deps: {
     },
 
     async getSnapshot(thread, revision) {
-      const rawSnapshot = await deps.runtime.readThread({ threadId: thread.threadId, includeTurns: false })
+      const rawSnapshot = await deps.runtime.readThread({ threadId: thread.threadId, includeTurns: true })
+      const rawThreadTurns: unknown[] = Array.isArray(rawSnapshot.thread?.turns)
+        ? rawSnapshot.thread.turns
+        : []
+      const rawTurns = rawThreadTurns
+        .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
+        .map((turn, index) => normalizeCodexTurn(turn, index))
       return normalizeCodexThreadSnapshot({
         threadId: thread.threadId,
         revision: Number(rawSnapshot.thread?.updatedAt ?? revision ?? 0),
         status: normalizeCodexThreadStatus(rawSnapshot.thread?.status),
         transcript: {
-          turns: [],
+          turns: rawTurns,
         },
         rawSnapshot,
       })

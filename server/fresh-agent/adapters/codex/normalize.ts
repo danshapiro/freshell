@@ -6,19 +6,11 @@ import {
   type FreshAgentTurn,
 } from '../../../../shared/fresh-agent-contract.js'
 
-type CodexTranscriptTurn = {
-  id: string
-  turnId: string
-  messageId: string
-  ordinal: number
-  source: 'durable' | 'live'
-  role: 'user' | 'assistant'
-  summary: string
-  timestamp?: string
-  items: Array<Record<string, unknown>>
-}
-
 type CodexRawSnapshot = {
+  thread?: {
+    preview?: string
+    turns?: unknown[]
+  }
   summary?: string
   tokenUsage?: {
     inputTokens: number
@@ -220,7 +212,7 @@ export function normalizeCodexThreadSnapshot(input: {
   threadId: string
   revision: number
   status: string
-  transcript: { turns: CodexTranscriptTurn[] }
+  transcript: { turns: FreshAgentTurn[] }
   rawSnapshot: CodexRawSnapshot
 }) {
   const extensions = input.rawSnapshot.extension?.codex ?? {}
@@ -231,7 +223,7 @@ export function normalizeCodexThreadSnapshot(input: {
     threadId: input.threadId,
     revision: input.revision,
     status: input.status,
-    summary: input.rawSnapshot.summary ?? input.transcript.turns[0]?.summary ?? '',
+    summary: input.rawSnapshot.summary ?? input.rawSnapshot.thread?.preview ?? input.transcript.turns[0]?.summary ?? '',
     capabilities: {
       send: !isRunning,
       interrupt: isRunning,

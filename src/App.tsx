@@ -936,7 +936,7 @@ export default function App() {
           dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
-        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>)
+        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
         // SDK message handling (freshclaude compatibility surface)
         handleSdkMessage(dispatch, msg as Record<string, unknown>, ws)
       })

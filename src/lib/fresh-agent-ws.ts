@@ -1,5 +1,6 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
+import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import {
   clearPendingCreateFailure,
   createFailed,
@@ -32,6 +33,10 @@ type FreshAgentCreateFailedMessage = {
 
 type FreshAgentClientMessage = FreshAgentCreatedMessage | FreshAgentCreateFailedMessage
 
+interface FreshAgentMessageSink {
+  send: (msg: unknown) => void
+}
+
 type FreshAgentEventMessage = {
   type: 'freshAgent.event'
   sessionId: string
@@ -58,15 +63,27 @@ export function registerFreshAgentCreate(
   dispatch(clearPendingCreateFailure({ requestId }))
 }
 
-export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<string, unknown>): boolean {
+export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<string, unknown>, ws?: FreshAgentMessageSink): boolean {
   switch (msg.type) {
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
+      const provider = created.provider ?? created.runtimeProvider
+      if (consumeCancelledCreate(created.requestId)) {
+        if (provider) {
+          ws?.send({
+            type: 'freshAgent.kill',
+            sessionId: created.sessionId,
+            sessionType: created.sessionType,
+            provider,
+          })
+        }
+        return true
+      }
       dispatch(sessionCreated({
         requestId: created.requestId,
         sessionId: created.sessionId,
         sessionType: created.sessionType,
-        provider: created.provider ?? created.runtimeProvider,
+        provider,
       }))
       return true
     }
