@@ -7,6 +7,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
 
 export interface SidebarSessionItem {
   id: string
@@ -34,10 +35,12 @@ export interface SidebarSessionItem {
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
 const EMPTY_STRINGS: string[] = []
+const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 
 const selectProjects = (state: RootState) => state.sessions.windows?.sidebar?.projects ?? state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectPanes = (state: RootState) => state.panes
+const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT
 const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'activity'
 const selectSessionActivityForSort = (state: RootState) => {
   const sortMode = state.settings.settings.sidebar?.sortMode || 'activity'
@@ -67,6 +70,7 @@ export function buildSessionItems(
   terminals: BackgroundTerminal[],
   sessionActivity: Record<string, number>,
   worktreeGrouping: WorktreeGrouping = 'repo',
+  paneLastInputAt: Record<string, number | undefined> = EMPTY_PANE_LAST_INPUT_AT,
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
   const itemsByKey = new Map<string, SidebarSessionItem>()
@@ -217,7 +221,11 @@ export function buildSessionItems(
     }
 
     const paneTitle = paneTitles?.[tab.id]?.[node.id]
-    const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
+    const fallbackTimestamp = deriveTabRecencyAt({
+      tab,
+      layout: panes.layouts?.[tab.id],
+      paneLastInputAt,
+    })
 
     if (node.content.kind === 'agent-chat') {
       const sessionRef = node.content.sessionRef
@@ -270,7 +278,11 @@ export function buildSessionItems(
       sessionType: metadata?.sessionType || provider,
       title: tab.title,
       cwd: undefined,
-      timestamp: tab.lastInputAt ?? tab.createdAt ?? 0,
+      timestamp: deriveTabRecencyAt({
+        tab,
+        layout: undefined,
+        paneLastInputAt,
+      }),
       metadata,
     })
   }
@@ -446,6 +458,7 @@ export const makeSelectSortedSessionItems = () =>
       selectProjects,
       selectTabs,
       selectPanes,
+      selectPaneLastInputAt,
       selectSessionActivityForSort,
       selectSortMode,
       selectWorktreeGrouping,
@@ -464,6 +477,7 @@ export const makeSelectSortedSessionItems = () =>
       projects,
       tabs,
       panes,
+      paneLastInputAt,
       sessionActivity,
       sortMode,
       worktreeGrouping,
@@ -478,7 +492,7 @@ export const makeSelectSortedSessionItems = () =>
       terminals,
       filter
     ) => {
-      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping)
+      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity, worktreeGrouping, paneLastInputAt)
       const visible = filterSessionItemsByVisibility(items, {
         showSubagents,
         ignoreCodexSubagents,

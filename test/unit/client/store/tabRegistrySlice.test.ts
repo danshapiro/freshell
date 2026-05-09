@@ -206,4 +206,47 @@ describe('tabRegistrySlice', () => {
     expect(groups.closed.map((record) => record.tabKey)).toEqual(['local:fresh'])
     vi.useRealTimers()
   })
+
+  it('derives local open tab recency from minute-bucketed pane activity', () => {
+    const result = selectTabsRegistryGroups({
+      tabs: {
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Active Tab',
+          status: 'running',
+          mode: 'shell',
+          createdAt: 1_740_000_000_000,
+          updatedAt: 1_740_000_999_999,
+        }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_080_000,
+        },
+      },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'Device',
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+      },
+      connection: {
+        serverInstanceId: 'srv-test',
+      },
+    } as any)
+
+    expect(result.localOpen[0].updatedAt).toBe(1_740_000_060_000)
+  })
 })

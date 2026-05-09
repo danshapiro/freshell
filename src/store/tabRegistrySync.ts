@@ -14,6 +14,7 @@ import {
   TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY,
   TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY,
 } from './storage-keys'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
 
 export const SYNC_INTERVAL_MS = 5000
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000
@@ -140,12 +141,12 @@ function nextRecordVersion(record: RegistryTabRecord, revisions: RevisionState, 
   const fingerprint = recordFingerprint(record)
   const current = revisions.get(record.tabKey)
   if (!current) {
-    const updatedAt = record.updatedAt || now
+    const updatedAt = record.updatedAt ?? now
     revisions.set(record.tabKey, { fingerprint, revision: 1, updatedAt })
     return { revision: 1, updatedAt }
   }
   if (current.fingerprint === fingerprint) {
-    const incomingUpdatedAt = record.updatedAt || 0
+    const incomingUpdatedAt = record.updatedAt ?? 0
     if (incomingUpdatedAt > current.updatedAt) {
       const revision = current.revision + 1
       revisions.set(record.tabKey, { fingerprint, revision, updatedAt: incomingUpdatedAt })
@@ -154,7 +155,7 @@ function nextRecordVersion(record: RegistryTabRecord, revisions: RevisionState, 
     return { revision: current.revision, updatedAt: current.updatedAt }
   }
   const revision = current.revision + 1
-  const updatedAt = Math.max(now, record.updatedAt || 0, current.updatedAt + 1)
+  const updatedAt = Math.max(now, record.updatedAt ?? 0, current.updatedAt + 1)
   revisions.set(record.tabKey, { fingerprint, revision, updatedAt })
   return { revision, updatedAt }
 }
@@ -179,6 +180,11 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (!layout) continue
+    const updatedAt = deriveTabRecencyAt({
+      tab,
+      layout,
+      paneLastInputAt: state.tabRecency?.paneLastInputAt ?? {},
+    })
     const recordBase = buildOpenTabRegistryRecord({
       tab,
       layout,
@@ -187,7 +193,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       deviceId,
       deviceLabel,
       revision: 0,
-      updatedAt: tab.updatedAt || tab.lastInputAt || tab.createdAt || now,
+      updatedAt,
     })
     if (retainedClosedTabKeys.has(recordBase.tabKey)) continue
     const version = nextRecordVersion(recordBase, revisions, now)
@@ -226,8 +232,11 @@ function lifecycleSignature(state: RootState): string {
       status: tab.status,
       mode: tab.mode,
       titleSetByUser: !!tab.titleSetByUser,
-      updatedAt: tab.updatedAt,
-      lastInputAt: tab.lastInputAt,
+      recencyAt: deriveTabRecencyAt({
+        tab,
+        layout: state.panes.layouts[tab.id],
+        paneLastInputAt: state.tabRecency?.paneLastInputAt ?? {},
+      }),
     })),
     panes: Object.entries(state.panes.layouts).map(([tabId, node]) => ({
       tabId,
