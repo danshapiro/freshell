@@ -64,6 +64,141 @@ Implement these contracts rather than one-off patches:
 
 Do not weaken, delete, or dilute valid tests to obtain green. When a test is obsolete, replace it with a stronger assertion for the accepted canonical contract.
 
+## Boundary Closure Matrix
+
+This is the matrix-first closure artifact for the plan. Implementation is not complete because a file is mentioned elsewhere in the plan; it is complete only when every boundary below has a production owner, one canonical enforcement point, and direct proof. If implementation discovers a new rich-agent identity boundary, add or update a row here before patching code.
+
+Every row uses the same identity vocabulary:
+
+- Portable durable identity means `sessionRef` only.
+- Current-server runtime handles mean `sessionId`, `resumeSessionId`, and `serverInstanceId`.
+- Remote, cross-server, tab-registry, and durable persisted payloads must not publish current-server runtime handles when a valid `sessionRef` exists.
+- Same-server local UI state may keep runtime handles only while they are tagged with the current `serverInstanceId` and no durable `sessionRef` is available yet.
+- A pane may have a valid `sessionRef` or a `restoreError`, but never both after canonicalization.
+- Claude-backed panes use `modelSelection`; Codex-backed panes use runtime `model` / `sandbox` fields.
+
+Matrix rows:
+
+1. Shared identity grammar and canonicalization policy.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/shared/session-contract.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/claude-session-id.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/claude-session-id.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/pane-content.ts`.
+   - Inputs: legacy `agent-chat` content, native `fresh-agent` content, create locators, restored tab identity, tab-registry snapshots, and server layout payloads.
+   - Enforcement: one shared Claude durable-ID predicate; one context-aware rich-agent canonicalizer for local reducer, local persistence, cross-tab, remote publication, server layout, and create/open contexts. Bare named Claude aliases remain same-server aliases locally, never portable `sessionRef`. Remote/cross-server payloads with only a nonportable alias receive `restoreError`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/shared/session-contract.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/claude-session-id.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/terminal-registry.test.ts`, plus boundary tests that import the shared canonicalizer instead of duplicating string checks.
+
+2. Reducer ingress and pane update ingress.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/panesSlice.ts`.
+   - Inputs: `initLayout`, `updatePaneContent`, `mergePaneContent`, split/new-pane content, restored layouts, and any dispatched rich-agent pane content.
+   - Enforcement: every reducer path that writes pane content runs the same canonicalizer. Legacy `agent-chat` becomes canonical `fresh-agent`; valid durable IDs become `sessionRef`; named aliases remain local `resumeSessionId` only; Claude stale `model` is migrated to `modelSelection` and removed; Codex `model` is preserved.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesSlice.test.ts` must cover init, update, and merge paths so the plan cannot repeat the previous gap where only `initLayout` was canonicalized.
+
+3. Persisted-state parsing and hydration.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistedState.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistMiddleware.ts`.
+   - Inputs: `freshell.layout.v3`, legacy panes/tabs payloads, storage-migration output, cross-tab storage event payloads, and raw hydrated pane trees.
+   - Enforcement: parsed rich-agent content leaves this boundary already canonical. Legacy `agent-chat` is not returned to production callers; Claude stale `model` cannot survive through alternate parse paths; Codex runtime `model` cannot gain Claude `modelSelection`; runtime handles restored before WebSocket `ready` remain provisional.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesPersistence.test.ts` must exercise `parsePersistedLayoutRaw()`, `parsePersistedPanesRaw()`, and hydrated reducer ingestion, not only the highest-level load helper.
+
+4. Persisted and cross-tab writeback stripping.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistMiddleware.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/crossTabSync.ts`.
+   - Inputs: current Redux pane state being written to localStorage or same-browser cross-tab sync.
+   - Enforcement: keep `sessionRef`; strip `sessionId` and `resumeSessionId` when `sessionRef` exists. Keep runtime-only handles only for a same-server local payload with matching `serverInstanceId` and no `sessionRef`. Never write a runtime-only handle into a remote/cross-server publication boundary.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/panesPersistence.test.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/crossTabSync.test.ts` must assert both durable and same-server runtime-only cases.
+
+5. Storage-key migration and already-stamped repair.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/storage-migration.ts`.
+   - Inputs: `freshell.tabs.v2`, `freshell.panes.v2`, `freshell.layout.v3`, and clients already stamped by the broken branch.
+   - Enforcement: recoverable v2 tabs/panes are migrated into a valid v3 layout before old keys are removed. Valid v3 layout wins over stale v2 data. Corrupt v3 layout plus valid v2 data is salvaged. The storage version bump reruns repair for already-stamped clients.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/storage-migration.test.ts`.
+
+6. Same-browser cross-tab synchronization.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/crossTabSync.ts`.
+   - Inputs: storage events, cross-tab writeback, current `serverInstanceId`, and pre-ready restored state.
+   - Enforcement: inbound and outbound payloads run through the canonicalizer with current-server context. Named aliases are never promoted to portable `sessionRef`. Runtime-only panes accepted before WebSocket `ready` reconcile after the current server ID is known to same-server attach, durable `sessionRef` resume, or explicit `restoreError`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/crossTabSync.test.ts`.
+
+7. Tab-registry publication, including retained closed records.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/tab-registry-snapshot.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/tabRegistrySync.ts`.
+   - Inputs: open local tabs, pane snapshots, and retained `localClosed` records captured before or after canonicalization.
+   - Enforcement: published rich-agent content is canonical `fresh-agent` and contains only portable identity or explicit `restoreError`. Do not publish legacy `agent-chat`, `sessionId`, `resumeSessionId`, or `serverInstanceId`. Preserve provider-specific settings that are portable: Claude `modelSelection` and Codex runtime model/sandbox settings.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/tab-registry-snapshot.test.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/tabRegistrySync.test.ts`.
+
+8. Remote tab rehydration and copy UI.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/TabsView.tsx`.
+   - Inputs: remote tab-registry records, remote closed records, context-menu whole-tab copy, and `openPaneInNewTab()` for a selected remote pane.
+   - Enforcement: remote rich-agent snapshots rehydrate as canonical `fresh-agent`; remote runtime handles are dropped; remote named aliases become visible `restoreError`; Freshcodex `sessionRef` and Codex settings are preserved; copied tab mode is derived from sanitized content across the copied tree, and a copied rich-agent pane opens in `mode: 'shell'`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabsView.test.tsx` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabsView.fresh-agent.test.tsx`.
+
+9. Local tab opening, fallback identity, no-layout restore, and reopen stack.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/tabsSlice.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/TabContent.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/tab-fallback-identity.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/session-type-utils.ts`.
+   - Inputs: `openSessionTab`, `recordClosedTabSnapshot`, `pushReopenEntry`, `reopenClosedTab`, tab-level identity, no-layout tab restore, and history/sidebar/context-menu resume requests.
+   - Enforcement: tab-level fallback identity reads canonical `fresh-agent.sessionRef`. Closed-tab snapshots are sanitized before storage and reopening. No-layout restore creates canonical fresh-agent content from durable tab identity and shows `restoreError` for nonportable identity instead of recreating legacy `agent-chat`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/tabsSlice.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/TabContent.test.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/tab-fallback-identity.test.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/session-type-utils.test.ts`.
+
+10. Client session locators and UI projections.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/session-utils.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/selectors/sidebarSelectors.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/pane-activity.ts`.
+   - Inputs: canonicalized pane trees used for focus/dedupe, sidebar fallback rows, and busy/active grouping.
+   - Enforcement: project durable keys from `sessionRef` first. Use runtime handles only for current-server live grouping when no durable identity exists. Named aliases may keep same-server visibility but cannot become durable or cross-device keys. SessionRef-only panes remain visible after persistence strips runtime handles.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/session-utils.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/selectors/sidebarSelectors.test.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/pane-activity.test.ts`.
+
+11. Server-orchestrated tab creation and command replay.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/ui-commands.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/agent-api/router.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/mcp/freshell-tool.ts`.
+   - Inputs: UI command replay, `/api/tabs` requests, and MCP tool requests with raw mode/provider/resume values.
+   - Enforcement: these paths call the same canonical content builder as the UI, not custom `sessionRef` construction. Provider/session-type mapping is explicit. Invalid or nonportable identities are rejected clearly or converted to explicit restore errors before Redux ingestion.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/ui-commands.test.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/mcp/freshell-tool.test.ts`.
+
+12. Server layout sync, layout schema, and layout store.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/layoutMirrorMiddleware.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/ws-handler.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/agent-api/layout-schema.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/agent-api/layout-store.ts`.
+   - Inputs: live `ui.layout.sync`, server layout API writes, and server layout reads.
+   - Enforcement: live layout sync advertises canonical `sessionRef` first and may include same-server runtime handles only for live runtime-only Claude panes. Server persisted layout ingress is not opaque for rich-agent content; it validates/canonicalizes `fresh-agent`, rejects `sessionRef` plus `restoreError`, and does not store legacy or stale runtime identity.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/ws-handler-fresh-agent.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/server/ws-tabs-registry.test.ts` if needed for integration fidelity, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/agent-layout-schema.test.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/agent-api/layout-store.fresh-agent.test.ts`.
+
+13. Fresh-agent WebSocket create transport and reconnect replay.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/shared/ws-protocol.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/fresh-agent-ws.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/lib/ws-client.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/ws-handler.ts`.
+   - Inputs: `freshAgent.create`, reconnect reliable-message replay, duplicate `requestId` idempotency, and `freshAgent.created` responses.
+   - Enforcement: create payloads accept and preserve `sessionRef`, Claude `modelSelection`, opaque effort strings, Codex runtime settings, and request IDs. Reconnect replay sends the original complete create message, not a reconstructed minimal shape. Cached `freshAgent.created` replay preserves the original durable `sessionRef`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/fresh-agent-ws.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/lib/ws-client.test.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/ws-handler-fresh-agent.test.ts`.
+
+14. Runtime manager and provider adapters.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/runtime-adapter.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/runtime-manager.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/adapters/claude/adapter.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/fresh-agent/adapters/codex/adapter.ts`.
+   - Inputs: provider create requests containing `sessionRef`, `resumeSessionId`, provider settings, and runtime options.
+   - Enforcement: validate all supplied locators before precedence. Provider mismatches and conflicting durable IDs fail clearly. Codex `resumeSessionId` is durable and conflicts with a different Codex `sessionRef`; Claude noncanonical aliases may coexist only as same-server live attach handles. Codex create/resume returns durable `sessionRef`; Claude returns `sessionRef` only from trusted canonical history/timeline metadata. Claude adapter resolves transported `modelSelection` into SDK model input.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/runtime-manager.test.ts` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/fresh-agent/claude-adapter.test.ts`.
+
+15. Fresh-agent client lifecycle and recovery.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/fresh-agent/FreshAgentView.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/persistControl.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/freshAgentSlice.ts`.
+   - Inputs: create requests, `freshAgent.created`, create failures, snapshot refresh, retry, lost-session recovery, split/reload restore, and sessionRef-only restored panes.
+   - Enforcement: async updates use fresh refs or targeted merges and do not clobber newer pane fields. `restoreError` suppresses automatic new-session create until valid durable identity appears. Recovery prefers canonical `sessionRef`; valid durable identity clears stale `restoreError` and flushes persistence. SessionRef-only restores use create/resume and wait for durable history hydration.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/freshAgentSlice.test.ts`.
+
+16. Provider-aware new pane creation.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/panes/PaneContainer.tsx`.
+   - Inputs: user-created FreshClaude/FreshAgent/Freshcodex panes.
+   - Enforcement: Claude-backed panes start with `modelSelection` and opaque Claude effort fields, not runtime `model`. Freshcodex panes keep Codex `model`, `sandbox`, and Codex settings and do not gain Claude `modelSelection`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/panes/PaneContainer.createContent.test.tsx`.
+
+17. Settings normalization and clear sentinels.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/shared/settings.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/settings-router.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/server/config-store.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/settingsThunks.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/settingsSlice.ts`.
+   - Inputs: outgoing client patches, `/api/settings` route patches, config-store load/merge, server broadcasts, reducer hydration, and optimistic preview state.
+   - Enforcement: no own `undefined` properties at any depth. Clear operations use explicit `null` sentinels where supported. `agentChat` and `freshAgent` aliases normalize to the same provider settings contract; legacy `defaultModel` / `defaultEffort` become `modelSelection` / `effort` without leaking stale fields.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/settingsThunks.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/settingsSlice.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/shared/settings.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/config-store.fresh-agent-settings.test.ts`, `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/server/config-store.test.ts`, and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/integration/server/settings-api.test.ts`.
+
+18. Pane-tree validation.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/store/paneTreeValidation.ts`.
+   - Inputs: persisted, cross-tab, server-layout, and restored pane trees before they are trusted by the UI.
+   - Enforcement: validate `fresh-agent.sessionRef`, `restoreError`, `modelSelection`, opaque non-empty Claude effort, and Codex sandbox/provider fields. Reject malformed variants and reject `sessionRef` plus `restoreError`.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/store/paneTreeValidation.test.ts`.
+
+19. Legacy harness fidelity and selector stability.
+   - Owners: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/e2e/agent-chat-capability-settings-flow.test.tsx` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/context-menu/ContextMenuProvider.tsx`.
+   - Inputs: legacy `AgentChatView` component harnesses after reducer canonicalization and context-menu selectors with empty fallback values.
+   - Enforcement: legacy component tests may mount `AgentChatView` directly, but the wrapper must keep the component mounted after production canonicalization and still pass updated settings/retry props. Context-menu selectors use stable module-level empty objects/arrays.
+   - Proof: `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/e2e/agent-chat-capability-settings-flow.test.tsx` and `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/test/unit/client/components/ContextMenuProvider.test.tsx`.
+
+20. Final verification and integration base.
+   - Owners: this plan and the implementation branch `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation`.
+   - Inputs: all task commits after the plan, branch sync against `origin/dev`, browser smoke coverage, build, lint, typecheck, and coordinated full suite.
+   - Enforcement: compare and integrate against `origin/dev`, not `origin/main`. Final verification includes focused unit/server tests, browser e2e for fresh-agent desktop and mobile, `npm run build`, `npm run lint`, `npm run typecheck`, `FRESHELL_TEST_SUMMARY="freshcodex full-suite blocker closure" npm run check`, and `git diff --check`.
+   - Proof: final handoff records exact command output and any remaining unrelated failures with paths and evidence.
+
 ## File Structure
 
 - Modify `/home/user/code/freshell/.worktrees/freshcodex-contract-foundation/src/components/TabsView.tsx`
