@@ -9,6 +9,7 @@ import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalActivityReducer from './terminalActivitySlice'
 import terminalDirectoryReducer from './terminalDirectorySlice'
+import tabRecencyReducer from './tabRecencySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
@@ -27,6 +28,10 @@ import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
 import { tabFallbackIdentityMiddleware } from './tabFallbackIdentityMiddleware'
+import {
+  pruneTabRecencyToCurrentLayout,
+  tabRecencyPruneMiddleware,
+} from './tabRecencyPruneMiddleware'
 
 enableMapSet()
 
@@ -43,6 +48,7 @@ export const store = configureStore({
     sessionActivity: sessionActivityReducer,
     terminalActivity: terminalActivityReducer,
     terminalDirectory: terminalDirectoryReducer,
+    tabRecency: tabRecencyReducer,
 
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
@@ -62,6 +68,7 @@ export const store = configureStore({
     }).concat(
       perfMiddleware,
       tabFallbackIdentityMiddleware,
+      tabRecencyPruneMiddleware,
       persistMiddleware,
       serverSettingsSaveStateMiddleware,
       browserPreferencesPersistenceMiddleware,
@@ -69,6 +76,8 @@ export const store = configureStore({
       sessionActivityPersistMiddleware,
     ),
 })
+
+pruneTabRecencyToCurrentLayout(store)
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
 // initial states (see tabsSlice.ts and panesSlice.ts). This ensures the state

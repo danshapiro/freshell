@@ -7,6 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
+import tabRecencyReducer from '@/store/tabRecencySlice'
 import TerminalView from '@/components/TerminalView'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
@@ -71,7 +72,11 @@ describe('TerminalView - lastInputAt updates', () => {
 
   const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
-  function createStore(opts?: { resumeSessionId?: string; provider?: 'claude' | 'codex' }) {
+  function createStore(opts?: {
+    resumeSessionId?: string
+    provider?: 'claude' | 'codex'
+    paneLastInputAt?: Record<string, number>
+  }) {
     const provider = opts?.provider || (opts?.resumeSessionId ? 'claude' : undefined)
     return configureStore({
       reducer: {
@@ -80,6 +85,7 @@ describe('TerminalView - lastInputAt updates', () => {
         settings: settingsReducer,
         connection: connectionReducer,
         sessionActivity: sessionActivityReducer,
+        tabRecency: tabRecencyReducer,
       },
       preloadedState: {
         tabs: {
@@ -109,12 +115,19 @@ describe('TerminalView - lastInputAt updates', () => {
         sessionActivity: {
           sessions: {},
         },
+        tabRecency: {
+          paneLastInputAt: opts?.paneLastInputAt ?? {},
+        },
       },
     })
   }
 
-  it('dispatches updateTab with lastInputAt when user types', async () => {
+  it('records one minute-bucketed tab recency action per pane per minute without mutating tabs', async () => {
+    vi.setSystemTime(new Date(1_740_000_010_000))
     const store = createStore()
+    const originalDispatch = store.dispatch
+    const dispatchSpy = vi.fn((action) => originalDispatch(action))
+    store.dispatch = dispatchSpy as typeof store.dispatch
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-1',
@@ -135,13 +148,63 @@ describe('TerminalView - lastInputAt updates', () => {
     )
 
     expect(onDataCallback).not.toBeNull()
-    const beforeInput = Date.now()
+    dispatchSpy.mockClear()
     onDataCallback!('hello')
-    const afterInput = Date.now()
 
-    const tab = store.getState().tabs.tabs[0]
-    expect(tab.lastInputAt).toBeGreaterThanOrEqual(beforeInput)
-    expect(tab.lastInputAt).toBeLessThanOrEqual(afterInput)
+    expect(store.getState().tabRecency.paneLastInputAt['pane-1']).toBe(1_740_000_000_000)
+    expect(store.getState().tabs.tabs[0].lastInputAt).toBeUndefined()
+
+    onDataCallback!('same-minute')
+    onDataCallback!('same-minute-again')
+
+    const actionTypes = dispatchSpy.mock.calls.map((call) => call[0]?.type)
+    expect(actionTypes.filter((type) => type === 'tabRecency/recordPaneTabActivity')).toHaveLength(1)
+    expect(actionTypes.filter((type) => type === 'tabs/updateTab')).toHaveLength(0)
+
+    vi.setSystemTime(new Date(1_740_000_060_000))
+    onDataCallback!('next-minute')
+
+    const nextActionTypes = dispatchSpy.mock.calls.map((call) => call[0]?.type)
+    expect(nextActionTypes.filter((type) => type === 'tabRecency/recordPaneTabActivity')).toHaveLength(2)
+    expect(store.getState().tabRecency.paneLastInputAt['pane-1']).toBe(1_740_000_060_000)
+  })
+
+  it('does not dispatch a same-minute no-op recency action after reload', async () => {
+    vi.setSystemTime(new Date(1_740_000_050_000))
+    const store = createStore({
+      paneLastInputAt: {
+        'pane-1': 1_740_000_000_000,
+      },
+    })
+    const originalDispatch = store.dispatch
+    const dispatchSpy = vi.fn((action) => originalDispatch(action))
+    store.dispatch = dispatchSpy as typeof store.dispatch
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-1',
+      terminalId: 'term-1',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+    }
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={paneContent}
+        />
+      </Provider>
+    )
+
+    expect(onDataCallback).not.toBeNull()
+    dispatchSpy.mockClear()
+    onDataCallback!('same-minute-after-reload')
+
+    const actionTypes = dispatchSpy.mock.calls.map((call) => call[0]?.type)
+    expect(actionTypes.filter((type) => type === 'tabRecency/recordPaneTabActivity')).toHaveLength(0)
+    expect(actionTypes.filter((type) => type === 'tabs/updateTab')).toHaveLength(0)
   })
 
   it('updates sessionActivity for Claude sessions with resumeSessionId', async () => {

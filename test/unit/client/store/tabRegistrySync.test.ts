@@ -18,6 +18,7 @@ function createState(): RootState {
       }],
       activeTabId: 'tab-1',
       renameRequestTabId: null,
+      tombstones: [],
     },
     panes: {
       layouts: {
@@ -39,6 +40,10 @@ function createState(): RootState {
       renameRequestTabId: null,
       renameRequestPaneId: null,
       zoomedPane: {},
+      refreshRequestsByPane: {},
+    },
+    tabRecency: {
+      paneLastInputAt: {},
     },
     tabRegistry: {
       deviceId: 'local-device',
@@ -66,6 +71,19 @@ describe('tabRegistrySync', () => {
   let state: RootState
   let dispatch: ReturnType<typeof vi.fn>
   let ws: any
+
+  function createStore() {
+    return {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+  }
 
   beforeEach(() => {
     vi.useFakeTimers()
@@ -98,16 +116,7 @@ describe('tabRegistrySync', () => {
   })
 
   it('pushes tabs.sync only when lifecycle changes', () => {
-    const store = {
-      getState: () => state,
-      dispatch,
-      subscribe: (listener: Listener) => {
-        listeners.push(listener)
-        return () => {
-          listeners = listeners.filter((item) => item !== listener)
-        }
-      },
-    }
+    const store = createStore()
 
     const stop = startTabRegistrySync(store as any, ws)
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
@@ -140,16 +149,7 @@ describe('tabRegistrySync', () => {
       },
     }
 
-    const store = {
-      getState: () => state,
-      dispatch,
-      subscribe: (listener: Listener) => {
-        listeners.push(listener)
-        return () => {
-          listeners = listeners.filter((item) => item !== listener)
-        }
-      },
-    }
+    const store = createStore()
 
     const stop = startTabRegistrySync(store as any, ws)
     expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
@@ -166,16 +166,7 @@ describe('tabRegistrySync', () => {
       },
     }
 
-    const store = {
-      getState: () => state,
-      dispatch,
-      subscribe: (listener: Listener) => {
-        listeners.push(listener)
-        return () => {
-          listeners = listeners.filter((item) => item !== listener)
-        }
-      },
-    }
+    const store = createStore()
 
     const stop = startTabRegistrySync(store as any, ws)
     ws.sendTabsSyncQuery.mockClear()
@@ -188,16 +179,7 @@ describe('tabRegistrySync', () => {
   })
 
   it('applies tabs.sync.snapshot responses into store dispatch', () => {
-    const store = {
-      getState: () => state,
-      dispatch,
-      subscribe: (listener: Listener) => {
-        listeners.push(listener)
-        return () => {
-          listeners = listeners.filter((item) => item !== listener)
-        }
-      },
-    }
+    const store = createStore()
 
     const stop = startTabRegistrySync(store as any, ws)
     const queryCall = ws.sendTabsSyncQuery.mock.calls[0][0]
@@ -214,6 +196,122 @@ describe('tabRegistrySync', () => {
     }))
 
     expect(dispatch.mock.calls.some((call) => call[0]?.type === 'tabRegistry/setTabRegistrySnapshot')).toBe(true)
+    stop()
+  })
+
+  it('sends at most one activity snapshot for repeated terminal input in the same minute bucket', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    ws.sendTabsSyncPush.mockClear()
+
+    state = {
+      ...state,
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_010_000,
+        },
+      },
+    } as RootState
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].updatedAt).toBe(1_740_000_000_000)
+
+    state = {
+      ...state,
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_050_000,
+        },
+      },
+    } as RootState
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    stop()
+  })
+
+  it('sends a new activity snapshot when terminal input enters the next minute bucket', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    ws.sendTabsSyncPush.mockClear()
+
+    state = {
+      ...state,
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_010_000,
+        },
+      },
+    } as RootState
+    listeners.forEach((listener) => listener())
+
+    state = {
+      ...state,
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_060_000,
+        },
+      },
+    } as RootState
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(2)
+    expect(ws.sendTabsSyncPush.mock.calls[1][0].records[0].updatedAt).toBe(1_740_000_060_000)
+    stop()
+  })
+
+  it('still pushes real tab changes immediately even when recency bucket does not change', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    ws.sendTabsSyncPush.mockClear()
+
+    state = {
+      ...state,
+      tabs: {
+        ...state.tabs,
+        tabs: state.tabs.tabs.map((tab) => ({ ...tab, title: 'renamed tab' })),
+      },
+    }
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].tabName).toBe('renamed tab')
+    stop()
+  })
+
+  it('does not push when only tab.updatedAt changes', () => {
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    ws.sendTabsSyncPush.mockClear()
+
+    state = {
+      ...state,
+      tabs: {
+        ...state.tabs,
+        tabs: state.tabs.tabs.map((tab) => ({ ...tab, updatedAt: 1_740_000_999_999 })),
+      },
+    }
+    listeners.forEach((listener) => listener())
+
+    expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(0)
+    stop()
+  })
+
+  it('preserves a zero recency bucket without falling back to Date.now', () => {
+    vi.setSystemTime(new Date(1_740_000_010_123))
+    state = {
+      ...state,
+      tabs: {
+        ...state.tabs,
+        tabs: state.tabs.tabs.map((tab) => ({
+          ...tab,
+          createdAt: 0,
+          updatedAt: 0,
+          lastInputAt: undefined,
+        })),
+      },
+    } as RootState
+
+    const stop = startTabRegistrySync(createStore() as any, ws)
+
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].updatedAt).toBe(0)
     stop()
   })
 })

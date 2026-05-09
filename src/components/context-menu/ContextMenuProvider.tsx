@@ -30,6 +30,7 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
@@ -51,6 +52,8 @@ import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
+const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
+const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
 
 
 type MenuState = {
@@ -107,9 +110,10 @@ export function ContextMenuProvider({
   const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
-  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
+  const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT)
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
@@ -523,7 +527,14 @@ export function ContextMenuProvider({
       return refs.some((ref) => ref.provider === keyProvider && ref.sessionId === sessionId)
     })
     const hasTab = relatedTabs.length > 0
-    const tabLastInputAt = relatedTabs.reduce((max, tab) => Math.max(max, tab.lastInputAt ?? 0), 0) || undefined
+    const tabLastInputAt = relatedTabs.reduce((max, tab) => {
+      const layout = panes[tab.id]
+      return Math.max(max, deriveTabRecencyAt({
+        tab,
+        layout,
+        paneLastInputAt,
+      }))
+    }, 0)
     const runningTerminalId =
       menuState?.target.kind === 'sidebar-session' && menuState?.target.sessionId === sessionId
         ? menuState?.target.runningTerminalId
@@ -544,14 +555,14 @@ export function ContextMenuProvider({
       archived: session.archived,
       sourceFile: session.sourceFile,
       hasTab,
-      tabLastInputAt,
-      tabLastInputAtIso: tabLastInputAt ? new Date(tabLastInputAt).toISOString() : null,
+      tabLastInputAt: hasTab ? tabLastInputAt : undefined,
+      tabLastInputAtIso: hasTab ? new Date(tabLastInputAt).toISOString() : null,
       isRunning: !!runningTerminalId,
       runningTerminalId: runningTerminalId || null,
       projectColor: project.color,
     }
     await copyText(JSON.stringify(metadata, null, 2))
-  }, [getSessionInfo, tabsState.tabs, panes, menuState?.target])
+  }, [getSessionInfo, tabsState.tabs, panes, paneLastInputAt, menuState?.target])
 
   const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string) => {
     const command = buildResumeCommand(provider, sessionId, extensionEntries)

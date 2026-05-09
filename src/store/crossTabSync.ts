@@ -8,7 +8,13 @@ import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPers
 import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
+import { collectLiveTerminalPaneIds } from './tabRecencyPruneMiddleware'
+import {
+  loadPersistedTabRecency,
+  mergeHydratedTabRecency,
+  prunePaneTabActivityToLiveTerminalPanes,
+} from './tabRecencySlice'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 
 type StoreLike = {
@@ -24,6 +30,12 @@ const zPersistBroadcastMsg = z.object({
   raw: z.string(),
   sourceId: z.string(),
 })
+
+const CROSS_TAB_SYNC_STORAGE_KEYS = [
+  LAYOUT_STORAGE_KEY,
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  TAB_RECENCY_STORAGE_KEY,
+] as const
 
 function collectPaneIdsSafe(node: unknown): string[] {
   const ids: string[] = []
@@ -260,6 +272,17 @@ function handleIncomingRaw(
     dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
+  } else if (key === TAB_RECENCY_STORAGE_KEY) {
+    store.dispatch({
+      ...mergeHydratedTabRecency(loadPersistedTabRecency(raw)),
+      meta: { skipPersist: true, source: 'cross-tab' },
+    })
+    store.dispatch({
+      ...prunePaneTabActivityToLiveTerminalPanes({
+        paneIds: collectLiveTerminalPaneIds(store.getState()),
+      }),
+      meta: { source: 'cross-tab' },
+    })
   }
 }
 
@@ -270,7 +293,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
   let currentLocalLayoutPersistedAt: number | undefined
-  for (const key of [LAYOUT_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
+  for (const key of CROSS_TAB_SYNC_STORAGE_KEYS) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
@@ -307,10 +330,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // then diverge locally (persisted raw changes), a later remote event with the original raw
   // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
-    if (
-      msg.key !== LAYOUT_STORAGE_KEY
-      && msg.key !== BROWSER_PREFERENCES_STORAGE_KEY
-    ) {
+    if (!CROSS_TAB_SYNC_STORAGE_KEYS.includes(msg.key as any)) {
       return
     }
     lastProcessedRawByKey.set(msg.key, msg.raw)
@@ -322,10 +342,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const onStorage = (e: StorageEvent) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
-    if (
-      key !== LAYOUT_STORAGE_KEY
-      && key !== BROWSER_PREFERENCES_STORAGE_KEY
-    ) {
+    if (typeof key !== 'string' || !CROSS_TAB_SYNC_STORAGE_KEYS.includes(key as any)) {
       return
     }
     if (typeof e.newValue !== 'string') return

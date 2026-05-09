@@ -9,6 +9,7 @@ import {
 } from './tabRegistrySlice'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import type { PaneNode } from './paneTypes'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
 
 export const SYNC_INTERVAL_MS = 5000
 
@@ -49,13 +50,18 @@ function nextRevision(record: RegistryTabRecord, revisions: RevisionState): numb
   return revision
 }
 
-function buildRecords(state: RootState, now: number, revisions: RevisionState, serverInstanceId: string): RegistryTabRecord[] {
+function buildRecords(state: RootState, revisions: RevisionState, serverInstanceId: string): RegistryTabRecord[] {
   const records: RegistryTabRecord[] = []
   const { deviceId, deviceLabel } = state.tabRegistry
 
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (!layout) continue
+    const updatedAt = deriveTabRecencyAt({
+      tab,
+      layout,
+      paneLastInputAt: state.tabRecency?.paneLastInputAt ?? {},
+    })
     const recordBase = buildOpenTabRegistryRecord({
       tab,
       layout,
@@ -64,7 +70,7 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
       deviceId,
       deviceLabel,
       revision: 0,
-      updatedAt: tab.lastInputAt || tab.createdAt || now,
+      updatedAt,
     })
     records.push({
       ...recordBase,
@@ -97,6 +103,11 @@ function lifecycleSignature(state: RootState): string {
       status: tab.status,
       mode: tab.mode,
       titleSetByUser: !!tab.titleSetByUser,
+      recencyAt: deriveTabRecencyAt({
+        tab,
+        layout: state.panes.layouts[tab.id],
+        paneLastInputAt: state.tabRecency?.paneLastInputAt ?? {},
+      }),
     })),
     panes: Object.entries(state.panes.layouts).map(([tabId, node]) => ({
       tabId,
@@ -140,7 +151,7 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     // Do not publish snapshot records until the server identity is known.
     // Without this, tabs can be attributed to a synthetic/unstable server key.
     if (!serverInstanceId) return
-    const records = buildRecords(state, Date.now(), revisions, serverInstanceId)
+    const records = buildRecords(state, revisions, serverInstanceId)
     const fingerprint = JSON.stringify(records)
     if (!force && fingerprint === lastPushFingerprint) return
     lastPushFingerprint = fingerprint

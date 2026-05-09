@@ -3,6 +3,9 @@ import type { RootState } from '@/store/store'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
+
+const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 
 function sortUpdatedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   return b.updatedAt - a.updatedAt
@@ -28,6 +31,7 @@ function dedupeByTabKey(records: RegistryTabRecord[]): RegistryTabRecord[] {
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectLayouts = (state: RootState) => state.panes.layouts
 const selectPaneTitles = (state: RootState) => state.panes.paneTitles
+const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
@@ -36,13 +40,17 @@ const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
-  (tabs, layouts, paneTitles, deviceId, deviceLabel, serverInstanceId): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
+  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
       if (!layout) continue
-      const updatedAt = tab.lastInputAt || tab.createdAt || 0
+      const updatedAt = deriveTabRecencyAt({
+        tab,
+        layout,
+        paneLastInputAt,
+      })
       records.push(buildOpenTabRegistryRecord({
         tab,
         layout,

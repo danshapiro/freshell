@@ -6,11 +6,18 @@ import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
-import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
+import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
+import {
+  loadPersistedTabRecency,
+  mergeTabRecencyStatesByMax,
+  prunePaneTabActivityToLiveTerminalPanes,
+  serializePersistableTabRecency,
+  type TabRecencyState,
+} from './tabRecencySlice'
 
 
 const log = createLogger('PanesPersist')
@@ -403,13 +410,16 @@ function migratePanesData(parsed: any): any | null {
 }
 
 type PersistState = {
-  tabs: TabsState
-  panes: PanesState
+  tabs?: TabsState
+  panes?: PanesState
+  tabRecency?: TabRecencyState
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   let tabsDirty = false
   let panesDirty = false
+  let tabRecencyDirty = false
+  let tabRecencyPruneDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
 
   const canUseStorage = () => typeof localStorage !== 'undefined'
@@ -417,63 +427,88 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   const flush = () => {
     flushTimer = null
     if (!canUseStorage()) return
-    if (!tabsDirty && !panesDirty) return
+    if (!tabsDirty && !panesDirty && !tabRecencyDirty) return
 
     const state = store.getState()
 
     try {
-      // Prune tombstones older than 1 hour
-      const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
-      const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
-      const tombstones = (state.tabs.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
+      if (tabsDirty || panesDirty) {
+        // Prune tombstones older than 1 hour
+        const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
+        const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
+        const tombstones = (state.tabs?.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
 
-      const sanitizedLayouts: Record<string, any> = {}
-      if (state.panes?.layouts) {
-        for (const [tabId, node] of Object.entries(state.panes.layouts)) {
-          sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+        const sanitizedLayouts: Record<string, any> = {}
+        if (state.panes?.layouts) {
+          for (const [tabId, node] of Object.entries(state.panes.layouts)) {
+            sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+          }
         }
-      }
 
-      let persistablePanesSection: Record<string, any> = {
-        layouts: sanitizedLayouts,
-        version: PANES_SCHEMA_VERSION,
-      }
-      if (state.panes) {
-        const {
-          renameRequestTabId: _rrt,
-          renameRequestPaneId: _rrp,
-          zoomedPane: _zp,
-          refreshRequestsByPane: _rrbp,
-          restoreFallbackAttemptsByPane: _rfabp,
-          ...persistablePanes
-        } = state.panes
-        persistablePanesSection = {
-          ...persistablePanes,
+        let persistablePanesSection: Record<string, any> = {
           layouts: sanitizedLayouts,
           version: PANES_SCHEMA_VERSION,
         }
+        if (state.panes) {
+          const {
+            renameRequestTabId: _rrt,
+            renameRequestPaneId: _rrp,
+            zoomedPane: _zp,
+            refreshRequestsByPane: _rrbp,
+            restoreFallbackAttemptsByPane: _rfabp,
+            ...persistablePanes
+          } = state.panes
+          persistablePanesSection = {
+            ...persistablePanes,
+            layouts: sanitizedLayouts,
+            version: PANES_SCHEMA_VERSION,
+          }
+        }
+
+        const layoutPayload = {
+          persistedAt: Date.now(),
+          version: LAYOUT_SCHEMA_VERSION,
+          tabs: {
+            activeTabId: state.tabs?.activeTabId ?? null,
+            tabs: (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
+          },
+          panes: persistablePanesSection,
+          tombstones,
+        }
+
+        const raw = JSON.stringify(layoutPayload)
+        localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
+        broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
       }
 
-      const layoutPayload = {
-        persistedAt: Date.now(),
-        version: LAYOUT_SCHEMA_VERSION,
-        tabs: {
-          activeTabId: state.tabs.activeTabId,
-          tabs: state.tabs.tabs.map(stripTabVolatileFields),
-        },
-        panes: persistablePanesSection,
-        tombstones,
+      if (tabRecencyDirty) {
+        const liveTabIds = new Set((state.tabs?.tabs ?? []).map((tab) => tab.id))
+        const nextTabRecency = serializePersistableTabRecency(
+          state.tabRecency ?? { paneLastInputAt: {} },
+          tabRecencyPruneDirty ? state.panes?.layouts ?? {} : undefined,
+          tabRecencyPruneDirty ? liveTabIds : undefined,
+        )
+        const persistedTabRecency = tabRecencyPruneDirty
+          ? nextTabRecency
+          : mergeTabRecencyStatesByMax(
+            loadPersistedTabRecency(localStorage.getItem(TAB_RECENCY_STORAGE_KEY)),
+            { paneLastInputAt: nextTabRecency.paneLastInputAt },
+          )
+        const rawTabRecency = JSON.stringify({
+          version: 1,
+          paneLastInputAt: persistedTabRecency.paneLastInputAt,
+        })
+        localStorage.setItem(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
+        broadcastPersistedRaw(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
       }
-
-      const raw = JSON.stringify(layoutPayload)
-      localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
-      broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
     } catch (err) {
       log.error('Failed to save to localStorage:', err)
     }
 
     tabsDirty = false
     panesDirty = false
+    tabRecencyDirty = false
+    tabRecencyPruneDirty = false
   }
 
   const scheduleFlush = () => {
@@ -492,7 +527,9 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   registerFlushCallback(flushNow)
 
   return (next) => (action) => {
+    const previousState = store.getState()
     const result = next(action)
+    const state = store.getState()
 
     const a = action as any
     if (a?.type === flushPersistedLayoutNow.type) {
@@ -504,12 +541,23 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     }
 
     if (typeof a?.type === 'string') {
-      if (a.type.startsWith('tabs/')) {
+      const tabsChanged = state.tabs !== previousState.tabs
+      const panesChanged = state.panes !== previousState.panes
+      const tabRecencyChanged = state.tabRecency !== previousState.tabRecency
+
+      if (a.type.startsWith('tabs/') && tabsChanged) {
         tabsDirty = true
         scheduleFlush()
       }
-      if (a.type.startsWith('panes/')) {
+      if (a.type.startsWith('panes/') && panesChanged) {
         panesDirty = true
+        scheduleFlush()
+      }
+      if (a.type.startsWith('tabRecency/') && tabRecencyChanged) {
+        tabRecencyDirty = true
+        if (a.type === prunePaneTabActivityToLiveTerminalPanes.type) {
+          tabRecencyPruneDirty = true
+        }
         scheduleFlush()
       }
     }

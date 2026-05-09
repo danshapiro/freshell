@@ -18,6 +18,7 @@ import {
   DEVICE_LABEL_STORAGE_KEY,
 } from '../../../../src/store/storage-keys'
 import type { RegistryTabRecord } from '../../../../src/store/tabRegistryTypes'
+import { selectTabsRegistryGroups } from '../../../../src/store/selectors/tabsRegistrySelectors'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -160,5 +161,48 @@ describe('tabRegistrySlice', () => {
     const freshReducer = freshModule.default
 
     expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(365)
+  })
+
+  it('derives local open tab recency from minute-bucketed pane activity', () => {
+    const result = selectTabsRegistryGroups({
+      tabs: {
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Active Tab',
+          status: 'running',
+          mode: 'shell',
+          createdAt: 1_740_000_000_000,
+          updatedAt: 1_740_000_999_999,
+        }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_080_000,
+        },
+      },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'Device',
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+      },
+      connection: {
+        serverInstanceId: 'srv-test',
+      },
+    } as any)
+
+    expect(result.localOpen[0].updatedAt).toBe(1_740_000_060_000)
   })
 })
