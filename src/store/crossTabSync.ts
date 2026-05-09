@@ -285,7 +285,7 @@ function handleIncomingRaw(
       ...prunePaneTabActivityToLiveTerminalPanes({
         paneIds: collectLiveTerminalPaneIds(store.getState()),
       }),
-      meta: { source: 'cross-tab' },
+      meta: { skipPersist: true, source: 'cross-tab' },
     })
   }
 }
