@@ -1,7 +1,8 @@
 import { lazy, Suspense, type ReactNode } from 'react'
+import { withChunkErrorRecovery } from '@/lib/import-retry'
 
 const MarkdownRenderer = lazy(() =>
-  import('./MarkdownRenderer').then((module) => ({ default: module.MarkdownRenderer }))
+  withChunkErrorRecovery(import('./MarkdownRenderer')).then((module) => ({ default: module.MarkdownRenderer }))
 )
 
 type LazyMarkdownProps = {
