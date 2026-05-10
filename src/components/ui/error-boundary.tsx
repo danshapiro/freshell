@@ -1,5 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
-import { isChunkLoadError } from '@/lib/import-retry'
+import { isChunkLoadError, shouldReload } from '@/lib/import-retry'
 
 type ErrorBoundaryProps = {
   children: ReactNode
@@ -33,10 +33,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   private handleReset = () => {
     const err = this.state.error
     if (err != null && isChunkLoadError(err)) {
-      const key = 'freshell.chunk-reload'
-      const last = sessionStorage.getItem(key)
-      if (!last || Date.now() - parseInt(last, 10) >= 10_000) {
-        sessionStorage.setItem(key, String(Date.now()))
+      if (shouldReload()) {
         window.location.reload()
         return
       }
