@@ -22,7 +22,7 @@ interface TabBarScrollResult extends TabBarScrollState {
 const SCROLL_THRESHOLD = 2 // px tolerance for scroll boundary detection
 const HOLD_SCROLL_SPEED = 4 // px per frame (~240px/s at 60fps)
 
-export function useTabBarScroll(activeTabId: string | null, tabCount: number): TabBarScrollResult {
+export function useTabBarScroll(activeTabId: string | null, tabCount: number, disabled = false): TabBarScrollResult {
   const nodeRef = useRef<HTMLDivElement | null>(null)
   const cleanupRef = useRef<(() => void) | null>(null)
   const holdRafRef = useRef<number | null>(null)
@@ -34,15 +34,20 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
 
   const updateOverflow = useCallback((el: HTMLDivElement | null) => {
     if (!el) {
-      setOverflow({ canScrollLeft: false, canScrollRight: false })
+      setOverflow(prev =>
+        (prev.canScrollLeft === false && prev.canScrollRight === false) ? prev : { canScrollLeft: false, canScrollRight: false }
+      )
       return
     }
 
     const { scrollLeft, scrollWidth, clientWidth } = el
-    setOverflow({
-      canScrollLeft: scrollLeft > SCROLL_THRESHOLD,
-      canScrollRight: scrollLeft + clientWidth < scrollWidth - SCROLL_THRESHOLD,
-    })
+    const canScrollLeft = scrollLeft > SCROLL_THRESHOLD
+    const canScrollRight = scrollLeft + clientWidth < scrollWidth - SCROLL_THRESHOLD
+    setOverflow(prev =>
+      (prev.canScrollLeft === canScrollLeft && prev.canScrollRight === canScrollRight)
+        ? prev
+        : { canScrollLeft, canScrollRight }
+    )
   }, [])
 
   const callbackRef = useCallback((node: HTMLDivElement | null) => {
@@ -54,7 +59,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
 
     nodeRef.current = node
 
-    if (!node) {
+    if (!node || disabled) {
       updateOverflow(null)
       return
     }
@@ -83,7 +88,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
 
     // Initial overflow check
     updateOverflow(node)
-  }, [updateOverflow])
+  }, [updateOverflow, disabled])
 
   // Clean up on unmount
   useEffect(() => {
