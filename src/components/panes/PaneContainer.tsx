@@ -17,6 +17,7 @@ import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
 import { cn } from '@/lib/utils'
+import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { resolvePaneActivity } from '@/lib/pane-activity'
@@ -58,7 +59,7 @@ const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecor
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
-const EditorPane = lazy(() => import('./EditorPane'))
+const EditorPane = lazy(() => withChunkErrorRecovery(import('./EditorPane')))
 
 interface PaneContainerProps {
   tabId: string
