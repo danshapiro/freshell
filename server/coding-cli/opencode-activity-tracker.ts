@@ -1,7 +1,9 @@
+import path from 'node:path'
 import { EventEmitter } from 'events'
 import { z } from 'zod'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import { logger } from '../logger.js'
+import { defaultOpencodeDataHome } from './providers/opencode.js'
 import {
   confirmOpencodeAssociation,
   createOpencodeOwnershipState,
@@ -82,10 +84,22 @@ const SessionIdleEventSchema = z.object({
   }).passthrough(),
 }).passthrough()
 
+const SessionCreatedEventSchema = z.object({
+  type: z.literal('session.created'),
+  properties: z.object({
+    sessionID: z.string().min(1),
+    info: z.object({
+      id: z.string().min(1),
+      parentID: z.string().nullable().optional(),
+    }).passthrough(),
+  }).passthrough(),
+}).passthrough()
+
 const OpencodeEventSchema = z.discriminatedUnion('type', [
   ServerConnectedEventSchema,
   SessionStatusEventSchema,
   SessionIdleEventSchema,
+  SessionCreatedEventSchema,
 ])
 
 const OpencodeEventTypeSchema = z.object({
@@ -96,6 +110,7 @@ const KNOWN_OPENCODE_EVENT_TYPES = new Set<z.infer<typeof OpencodeEventSchema>['
   'server.connected',
   'session.status',
   'session.idle',
+  'session.created',
 ])
 
 type FetchLike = typeof fetch
@@ -113,6 +128,12 @@ type MonitorState = {
   reconnectTimer?: ReturnType<typeof setTimeout>
   reconnectResolve?: () => void
   ownership: OpencodeOwnershipState
+  lastSnapshot?: {
+    cycleId: number
+    streamId: number
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>
+    at: number
+  }
 }
 
 function createAbortError(): Error {
@@ -172,12 +193,14 @@ function parseOpencodeEvent(data: string): z.infer<typeof OpencodeEventSchema> |
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
   private readonly monitors = new Map<string, MonitorState>()
+  private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly fetchImpl: FetchLike
   private readonly log: TrackerLogger
   private readonly now: () => number
   private readonly setTimeoutFn: typeof setTimeout
   private readonly clearTimeoutFn: typeof clearTimeout
   private readonly random: () => number
+  private readonly dbPath?: string
   private nextCycleId = 0
   private nextStreamId = 0
 
@@ -188,6 +211,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     setTimeoutFn?: typeof setTimeout
     clearTimeoutFn?: typeof clearTimeout
     random?: () => number
+    homeDir?: string
   } = {}) {
     super()
     this.fetchImpl = input.fetchImpl ?? fetch
@@ -196,6 +220,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.setTimeoutFn = input.setTimeoutFn ?? setTimeout
     this.clearTimeoutFn = input.clearTimeoutFn ?? clearTimeout
     this.random = input.random ?? Math.random
+    const homeDir = input.homeDir ?? defaultOpencodeDataHome()
+    this.dbPath = path.join(homeDir, 'opencode.db')
   }
 
   list(): OpencodeActivityRecord[] {
@@ -215,6 +241,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       && !existing.disposed
     ) {
       existing.ownership = createOpencodeOwnershipState(input.sessionId)
+      this.childSessionIds.delete(input.terminalId)
       return
     }
 
@@ -228,6 +255,9 @@ export class OpencodeActivityTracker extends EventEmitter {
       ownership: createOpencodeOwnershipState(input.sessionId),
     }
     this.monitors.set(input.terminalId, monitor)
+    if (input.sessionId) {
+      void this.seedFromDb(monitor, [input.sessionId])
+    }
     void this.runMonitor(monitor)
   }
 
@@ -235,6 +265,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     const monitor = this.monitors.get(input.terminalId)
     if (monitor) {
       monitor.disposed = true
+      monitor.lastSnapshot = undefined
       monitor.controller?.abort()
       if (monitor.reconnectTimer) {
         this.clearTimeoutFn(monitor.reconnectTimer)
@@ -244,6 +275,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       monitor.reconnectResolve = undefined
       this.monitors.delete(input.terminalId)
     }
+    this.childSessionIds.delete(input.terminalId)
     this.removeRecord(input.terminalId)
   }
 
@@ -322,12 +354,25 @@ export class OpencodeActivityTracker extends EventEmitter {
       throw new Error('OpenCode session status response did not match the expected schema.')
     }
 
+    const activeSessionIds = Object.keys(parsed.data)
+    void this.resyncFromDb(monitor, activeSessionIds)
+
+    const children = this.childSessionIds.get(monitor.terminalId)
+    const filtered: Record<string, z.infer<typeof SessionStatusSchema>> = {}
+    for (const [sessionId, status] of Object.entries(parsed.data)) {
+      if (!children?.has(sessionId)) {
+        filtered[sessionId] = status
+      }
+    }
+
+    const at = this.now()
+    monitor.lastSnapshot = { cycleId, streamId, statuses: parsed.data, at }
     this.observe(monitor, {
       kind: 'snapshot',
       cycleId,
       streamId,
-      statuses: parsed.data,
-      at: this.now(),
+      statuses: filtered,
+      at,
     })
   }
 
@@ -414,6 +459,39 @@ export class OpencodeActivityTracker extends EventEmitter {
     streamId: number,
     event: Exclude<z.infer<typeof OpencodeEventSchema>, { type: 'server.connected' }>,
   ): void {
+    if (event.type === 'session.created') {
+      const parentId = event.properties.info.parentID
+      if (parentId) {
+        this.registerChildSession(monitor.terminalId, event.properties.sessionID)
+        if (monitor.lastSnapshot && monitor.ownership.kind === 'ambiguous') {
+          monitor.ownership = { ...monitor.ownership, knownSessionId: parentId }
+          const children = this.childSessionIds.get(monitor.terminalId)
+          const filtered: Record<string, z.infer<typeof SessionStatusSchema>> = {}
+          for (const [sessionId, status] of Object.entries(monitor.lastSnapshot.statuses)) {
+            if (!children?.has(sessionId)) {
+              filtered[sessionId] = status
+            }
+          }
+          this.observe(monitor, {
+            kind: 'snapshot',
+            cycleId: monitor.lastSnapshot.cycleId,
+            streamId: monitor.lastSnapshot.streamId,
+            statuses: filtered,
+            at: monitor.lastSnapshot.at,
+          })
+        }
+      }
+      return
+    }
+
+    const children = this.childSessionIds.get(monitor.terminalId)
+    if (children?.has(event.properties.sessionID)) {
+      if (event.type === 'session.idle') {
+        children.delete(event.properties.sessionID)
+      }
+      return
+    }
+
     if (event.type === 'session.idle') {
       this.observe(monitor, {
         kind: 'sse',
@@ -570,5 +648,56 @@ export class OpencodeActivityTracker extends EventEmitter {
       upsert: [],
       remove: [terminalId],
     } satisfies OpencodeActivityChange)
+  }
+
+  private registerChildSession(terminalId: string, sessionId: string): void {
+    let children = this.childSessionIds.get(terminalId)
+    if (!children) {
+      children = new Set()
+      this.childSessionIds.set(terminalId, children)
+    }
+    children.add(sessionId)
+  }
+
+  private async resyncFromDb(monitor: MonitorState, activeSessionIds: string[]): Promise<void> {
+    if (!this.dbPath || activeSessionIds.length === 0) return
+    let sqlite: typeof import('node:sqlite') | undefined
+    let db: InstanceType<typeof import('node:sqlite').DatabaseSync> | undefined
+    try {
+      sqlite = await import('node:sqlite')
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true })
+      const placeholders = activeSessionIds.map(() => '?').join(',')
+      const rows = db.prepare(
+        `SELECT id, parent_id FROM session WHERE id IN (${placeholders}) AND parent_id IS NOT NULL`
+      ).all(...activeSessionIds) as Array<{ id: string; parent_id: string }>
+      for (const row of rows) {
+        this.registerChildSession(monitor.terminalId, row.id)
+      }
+    } catch {
+      // DB unavailable or node:sqlite not supported — children unfiltered in this snapshot
+    } finally {
+      db?.close()
+    }
+  }
+
+  private async seedFromDb(monitor: MonitorState, parentIds: string[]): Promise<void> {
+    if (!this.dbPath || parentIds.length === 0) return
+    let sqlite: typeof import('node:sqlite') | undefined
+    let db: InstanceType<typeof import('node:sqlite').DatabaseSync> | undefined
+    try {
+      sqlite = await import('node:sqlite')
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true })
+      const placeholders = parentIds.map(() => '?').join(',')
+      const rows = db.prepare(
+        `SELECT id FROM session WHERE parent_id IN (${placeholders}) AND time_archived IS NULL`
+      ).all(...parentIds) as Array<{ id: string }>
+      for (const row of rows) {
+        this.registerChildSession(monitor.terminalId, row.id)
+      }
+    } catch {
+      // DB unavailable — first snapshot will catch via resyncFromDb
+    } finally {
+      db?.close()
+    }
   }
 }

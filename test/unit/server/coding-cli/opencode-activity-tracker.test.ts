@@ -434,7 +434,7 @@ describe('OpencodeActivityTracker', () => {
       throw new Error(`Unexpected URL: ${url}`)
     })
 
-    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0, homeDir: '/tmp/nonexistent' })
     const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
     tracker.on('changed', (payload) => changes.push(payload))
 
@@ -609,6 +609,226 @@ describe('OpencodeActivityTracker', () => {
     await vi.advanceTimersByTimeAsync(OPENCODE_RECONNECT_BASE_MS * 4)
 
     expect(fetchImpl).toHaveBeenCalledTimes(fetchCallsBeforeStop)
+    tracker.dispose()
+  })
+
+  it('registers child sessions from session.created events and filters them from SSE', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.created',
+            properties: {
+              sessionID: 'child-1', info: { id: 'child-1', parentID: 'parent-1' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'child-1',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'parent-1',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.idle',
+            properties: {
+              sessionID: 'parent-1',
+            },
+          },
+        ])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    tracker.on('changed', (payload) => changes.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const upserts = changes.filter(c => c.upsert.length > 0)
+    expect(upserts).toContainEqual({
+      upsert: [{
+        terminalId: 'term-oc',
+        sessionId: 'parent-1',
+        phase: 'busy',
+        updatedAt: expect.any(Number),
+      }],
+      remove: [],
+    })
+
+    expect(changes).toContainEqual({
+      upsert: [],
+      remove: ['term-oc'],
+    })
+
+    tracker.dispose()
+  })
+
+  it('filters child sessions from snapshot after session.created registers them', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          'parent-1': { type: 'busy' },
+          'child-1': { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.created',
+            properties: {
+              sessionID: 'child-1', info: { id: 'child-1', parentID: 'parent-1' },
+            },
+          },
+        ])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      random: () => 0,
+    })
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    tracker.on('changed', (payload) => changes.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(changes).toContainEqual({
+      upsert: [{
+        terminalId: 'term-oc',
+        sessionId: 'parent-1',
+        phase: 'busy',
+        updatedAt: expect.any(Number),
+      }],
+      remove: [],
+    })
+
+    tracker.dispose()
+  })
+
+  it('cleans up childSessionIds on untrackTerminal', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.created',
+            properties: {
+              sessionID: 'child-1', info: { id: 'child-1', parentID: 'parent-1' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'child-1',
+              status: { type: 'busy' },
+            },
+          },
+        ])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    tracker.untrackTerminal({ terminalId: 'term-oc' })
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    tracker.on('changed', (payload) => changes.push(payload))
+
+    await vi.advanceTimersByTimeAsync(OPENCODE_RECONNECT_BASE_MS)
+
+    tracker.dispose()
+  })
+
+  it('resets childSessionIds on trackTerminal early return when re-tracking same endpoint', async () => {
+    vi.useFakeTimers()
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) {
+        return createJsonResponse({ ok: true })
+      }
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({})
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.created',
+            properties: {
+              sessionID: 'child-1', info: { id: 'child-1', parentID: 'parent-1' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'child-1',
+              status: { type: 'busy' },
+            },
+          },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'parent-1',
+              status: { type: 'busy' },
+            },
+          },
+        ])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+
+    const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
+    const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    tracker.on('changed', (payload) => changes.push(payload))
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT, sessionId: 'parent-1' })
+    await vi.advanceTimersByTimeAsync(0)
+
     tracker.dispose()
   })
 })
