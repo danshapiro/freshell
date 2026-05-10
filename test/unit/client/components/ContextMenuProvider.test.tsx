@@ -10,6 +10,7 @@ import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
+import tabRecencyReducer from '@/store/tabRecencySlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -587,6 +588,22 @@ describe('ContextMenuProvider', () => {
     cleanup()
     vi.clearAllMocks()
   })
+
+  it('does not emit selector instability warnings when feature flags are absent', () => {
+    const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { store } = renderWithProvider(
+        <div data-context={ContextIds.Global}>Global area</div>,
+      )
+
+      store.dispatch({ type: 'test/unrelated' })
+
+      expect(consoleWarnSpy.mock.calls.map((call) => String(call[0])).join('\n')).not.toContain('Selector')
+    } finally {
+      consoleWarnSpy.mockRestore()
+    }
+  })
+
   it('opens menu on right click and dispatches close tab', async () => {
     const user = userEvent.setup()
     const { store } = renderWithProvider(
@@ -874,8 +891,10 @@ describe('ContextMenuProvider', () => {
       expect(newPane).toBeDefined()
       if (newPane?.type === 'leaf') {
         expect(newPane.content).toMatchObject({
-          kind: 'agent-chat',
-          provider: 'freshclaude',
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          resumeSessionId: VALID_SESSION_ID,
           sessionRef: {
             provider: 'claude',
             sessionId: VALID_SESSION_ID,
@@ -999,6 +1018,246 @@ describe('ContextMenuProvider', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('copies session metadata with minute-bucketed open-tab recency', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+        extensions: extensionsReducer,
+        tabRecency: tabRecencyReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Claude Tab',
+              status: 'running',
+              mode: 'claude',
+              createdAt: 1_740_000_000_000,
+              updatedAt: 1_740_000_999_999,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: VALID_SESSION_ID,
+              },
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                status: 'running',
+                createRequestId: 'req-1',
+                sessionRef: {
+                  provider: 'claude',
+                  sessionId: VALID_SESSION_ID,
+                },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Claude Tab' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+        tabRecency: {
+          paneLastInputAt: {
+            'pane-1': 1_740_000_080_000,
+          },
+        },
+        sessions: {
+          projects: [
+            {
+              projectPath: '/test/project',
+              sessions: [
+                {
+                  sessionId: VALID_SESSION_ID,
+                  provider: 'claude',
+                  title: 'Test Session',
+                  cwd: '/test/project',
+                  createdAt: 1000,
+                  lastActivityAt: 2000,
+                  messageCount: 5,
+                },
+              ],
+            },
+          ],
+          expandedProjects: new Set<string>(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy full metadata' }))
+
+    const copied = JSON.parse(clipboardMocks.copyText.mock.calls.at(-1)?.[0] ?? '{}')
+    expect(copied.tabLastInputAt).toBe(1_740_000_060_000)
+    expect(copied.tabLastInputAtIso).toBe(new Date(1_740_000_060_000).toISOString())
+  })
+
+  it('copies session metadata when open-tab recency is the zero bucket', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+        settings: settingsReducer,
+        extensions: extensionsReducer,
+        tabRecency: tabRecencyReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Claude Tab',
+              status: 'running',
+              mode: 'claude',
+              createdAt: 0,
+              updatedAt: 999_999,
+              sessionRef: {
+                provider: 'claude',
+                sessionId: VALID_SESSION_ID,
+              },
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                status: 'running',
+                createRequestId: 'req-1',
+                sessionRef: {
+                  provider: 'claude',
+                  sessionId: VALID_SESSION_ID,
+                },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: { 'tab-1': { 'pane-1': 'Claude Tab' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+        tabRecency: {
+          paneLastInputAt: {
+            'pane-1': 0,
+          },
+        },
+        sessions: {
+          projects: [
+            {
+              projectPath: '/test/project',
+              sessions: [
+                {
+                  sessionId: VALID_SESSION_ID,
+                  provider: 'claude',
+                  title: 'Test Session',
+                  cwd: '/test/project',
+                  createdAt: 1000,
+                  lastActivityAt: 2000,
+                  messageCount: 5,
+                },
+              ],
+            },
+          ],
+          expandedProjects: new Set<string>(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy full metadata' }))
+
+    const copied = JSON.parse(clipboardMocks.copyText.mock.calls.at(-1)?.[0] ?? '{}')
+    expect(copied.tabLastInputAt).toBe(0)
+    expect(copied.tabLastInputAtIso).toBe(new Date(0).toISOString())
   })
 
   it('copies resume command from terminal pane context menu for codex pane', async () => {

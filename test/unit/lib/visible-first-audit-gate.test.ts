@@ -151,13 +151,13 @@ describe('evaluateVisibleFirstAuditGate', () => {
   it('fails on a positive mobile_restricted focusedReadyMs delta', () => {
     const base = createArtifact()
     const candidate = createArtifact()
-    setMetric(candidate, 'agent-chat-cold-boot', 'mobile_restricted', 'focusedReadyMs', 151)
+    setMetric(candidate, 'fresh-agent-cold-boot', 'mobile_restricted', 'focusedReadyMs', 151)
 
     expect(evaluateVisibleFirstAuditGate(base, candidate)).toEqual({
       ok: false,
       violations: [
         {
-          scenarioId: 'agent-chat-cold-boot',
+          scenarioId: 'fresh-agent-cold-boot',
           profileId: 'mobile_restricted',
           metric: 'focusedReadyMs',
           base: 150,
@@ -229,7 +229,7 @@ describe('evaluateVisibleFirstAuditGate', () => {
   it('prints JSON only and exits non-zero on violations', async () => {
     const base = createArtifact()
     const candidate = createArtifact()
-    setMetric(candidate, 'agent-chat-cold-boot', 'mobile_restricted', 'focusedReadyMs', 151)
+    setMetric(candidate, 'fresh-agent-cold-boot', 'mobile_restricted', 'focusedReadyMs', 151)
 
     const { tempDir, basePath, candidatePath } = await writeArtifacts(base, candidate)
     tempDirs.add(tempDir)
@@ -255,7 +255,7 @@ describe('evaluateVisibleFirstAuditGate', () => {
       ok: false,
       violations: [
         {
-          scenarioId: 'agent-chat-cold-boot',
+          scenarioId: 'fresh-agent-cold-boot',
           profileId: 'mobile_restricted',
           metric: 'focusedReadyMs',
           base: 150,

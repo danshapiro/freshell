@@ -100,6 +100,19 @@ export class LayoutStore {
       }
     }
 
+    if (content.kind === 'fresh-agent') {
+      switch (content.sessionType) {
+        case 'freshclaude':
+          return 'Freshclaude'
+        case 'freshcodex':
+          return 'Freshcodex'
+        case 'kilroy':
+          return 'Kilroy'
+        default:
+          return 'Fresh Agent'
+      }
+    }
+
     if (content.kind === 'extension') {
       return typeof content.extensionName === 'string' && content.extensionName
         ? content.extensionName
@@ -145,6 +158,12 @@ export class LayoutStore {
   updateFromUi(snapshot: UiSnapshot, connectionId: string) {
     this.snapshot = snapshot
     this.sourceConnectionId = connectionId
+    for (const tab of snapshot.tabs) {
+      const leaves = this.collectLeaves(snapshot.layouts?.[tab.id], [])
+      for (const leaf of leaves) {
+        this.seedPaneTitle(tab.id, leaf.id, leaf.content)
+      }
+    }
   }
 
   getSourceConnectionId() {
@@ -307,6 +326,17 @@ export class LayoutStore {
       const leaves = this.collectLeaves(root, [])
       const match = leaves.find((leaf) => leaf.id === paneId)
       if (match?.content?.terminalId) return match.content.terminalId
+    }
+    return undefined
+  }
+
+  findPaneByTerminalId(terminalId: string): { tabId: string; paneId: string } | undefined {
+    if (!this.snapshot) return undefined
+    for (const tab of this.snapshot.tabs) {
+      const root = this.snapshot.layouts?.[tab.id]
+      const leaves = this.collectLeaves(root, [])
+      const match = leaves.find((leaf) => leaf.content?.terminalId === terminalId)
+      if (match) return { tabId: tab.id, paneId: match.id }
     }
     return undefined
   }

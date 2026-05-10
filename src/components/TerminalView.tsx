@@ -21,6 +21,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { buildTerminalDurableSessionRefUpdate, flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
+import { bucketTabRecencyAt } from '@/lib/tab-recency'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getCreateSessionStateFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
@@ -91,6 +92,7 @@ import {
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
 import { buildRestoreError } from '@shared/session-contract'
+import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 
 const log = createLogger('TerminalView')
 
@@ -299,6 +301,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const hasAttentionRef = useRef(hasAttention)
   const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])
   const hasPaneAttentionRef = useRef(hasPaneAttention)
+  const paneTabRecencyBucket = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -335,6 +338,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const hiddenRef = useRef(hidden)
   const hydrationRegisteredRef = useRef(false)
   const lastSessionActivityAtRef = useRef(0)
+  const lastPaneTabRecencyBucketRef = useRef<number | undefined>(paneTabRecencyBucket)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
@@ -475,6 +479,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       contentRef.current = terminalContent
     }
   }, [terminalContent, paneId, applySeqState])
+
+  useEffect(() => {
+    lastPaneTabRecencyBucketRef.current = paneTabRecencyBucket
+  }, [paneId, paneTabRecencyBucket])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -706,7 +714,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
     if (lines !== 0) {
       if (!translateScrollLinesToInput(term, lines)) {
-        term.scrollLines(lines)
+        if (term.buffer.active.type !== 'alternate') {
+          term.scrollLines(lines)
+        }
       }
 
       touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE
@@ -1322,7 +1332,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       const currentContent = contentRef.current
       if (currentTab) {
         const now = Date.now()
-        dispatch(updateTab({ id: currentTab.id, updates: { lastInputAt: now } }))
+        const bucket = bucketTabRecencyAt(now)
+        const previousBucket = lastPaneTabRecencyBucketRef.current
+        if (bucket !== undefined && (previousBucket === undefined || bucket > previousBucket)) {
+          lastPaneTabRecencyBucketRef.current = bucket
+          dispatch(recordPaneTabActivity({ paneId, at: now }))
+        }
         const resumeSessionId = currentContent?.resumeSessionId
         if (resumeSessionId && currentContent?.mode && currentContent.mode !== 'shell') {
           if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {

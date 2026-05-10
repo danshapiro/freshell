@@ -15,7 +15,7 @@ type OpencodeSessionRow = {
   projectPath: string | null
 }
 
-function defaultOpencodeDataHome(): string {
+export function defaultOpencodeDataHome(): string {
   if (process.env.XDG_DATA_HOME) {
     return path.join(process.env.XDG_DATA_HOME, 'opencode')
   }

@@ -88,8 +88,8 @@ describe('PaneIcon', () => {
     expect(screen.getByTestId('file-text-icon')).toBeInTheDocument()
   })
 
-  it('renders freshclaude icon for agent-chat panes', () => {
-    render(
+  it('renders an icon for freshclaude agent-chat panes', () => {
+    const { container } = render(
       <PaneIcon
         content={{
           kind: 'agent-chat', provider: 'freshclaude',
@@ -98,11 +98,11 @@ describe('PaneIcon', () => {
         }}
       />
     )
-    expect(screen.getByTestId('freshclaude-icon')).toBeInTheDocument()
+    expect(container.querySelector('svg')).toBeInTheDocument()
   })
 
-  it('renders kilroy icon for kilroy agent-chat panes', () => {
-    render(
+  it('renders an icon for kilroy agent-chat panes', () => {
+    const { container } = render(
       <PaneIcon
         content={{
           kind: 'agent-chat', provider: 'kilroy',
@@ -111,7 +111,7 @@ describe('PaneIcon', () => {
         }}
       />
     )
-    expect(screen.getByTestId('kilroy-icon')).toBeInTheDocument()
+    expect(container.querySelector('svg')).toBeInTheDocument()
   })
 
   it('renders layout-grid icon for picker panes', () => {

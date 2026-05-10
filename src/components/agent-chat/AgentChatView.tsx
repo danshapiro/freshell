@@ -52,10 +52,10 @@ import {
   buildAgentChatPersistedIdentityUpdate,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
-  getPreferredResumeSessionId,
 } from '@/store/persistControl'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
+import { buildRestoreError } from '@shared/session-contract'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -136,6 +136,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const currentTab = useAppSelector((s) => (
     (s as { tabs?: { tabs?: Tab[] } }).tabs?.tabs?.find((entry) => entry.id === tabId)
   ))
+  const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
   const providerCapabilitiesState = useAppSelector(
     (s) => s.agentChat.capabilitiesByProvider?.[paneContent.provider],
@@ -177,18 +178,15 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
-    ? paneContent.resumeSessionId
-    : undefined
+  const persistedTimelineSessionId = (
+    paneContent.sessionRef?.provider === 'claude'
+    && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
+  )
+    ? paneContent.sessionRef.sessionId
+    : (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
-  const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
-  const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
-  const attachResumeSessionId = getPreferredResumeSessionId(session)
-    ?? (
-      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
-        ? paneContent.resumeSessionId
-        : undefined
-    )
+  const restoreHistoryQueryId = canonicalDurableSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = canonicalDurableSessionId
   const attachPayload = useMemo(() => {
     if (!paneContent.sessionId) return null
     return {
@@ -236,21 +234,47 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   )
   const isRestoring = !!paneContent.sessionId && !session?.historyLoaded && !hasRestoreFailure
 
-  // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
-  // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
+  // Shared recovery logic: clears stale SDK sessionId and recreates through the
+  // canonical durable identity when one is available.
   const triggerRecovery = useCallback(() => {
+    const durableResumeSessionId = getCanonicalDurableSessionId(sessionRef.current)
+      ?? (
+        paneContentRef.current.sessionRef?.provider === 'claude'
+        && isValidClaudeSessionId(paneContentRef.current.sessionRef.sessionId)
+          ? paneContentRef.current.sessionRef.sessionId
+          : (isValidClaudeSessionId(paneContentRef.current.resumeSessionId) ? paneContentRef.current.resumeSessionId : undefined)
+      )
+    if (!durableResumeSessionId) {
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: {
+          ...paneContentRef.current,
+          sessionId: undefined,
+          status: 'idle' as const,
+          restoreError: buildRestoreError('dead_live_handle'),
+        },
+      }))
+      createSentRef.current = false
+      attachSentRef.current = false
+      return
+    }
+
     const newRequestId = nanoid()
-    const resumeSessionId = getPreferredResumeSessionId(sessionRef.current)
-      ?? paneContentRef.current.resumeSessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
       content: {
         ...paneContentRef.current,
         sessionId: undefined,
-        resumeSessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: durableResumeSessionId,
+        },
+        resumeSessionId: undefined,
         createRequestId: newRequestId,
         status: 'creating' as const,
+        restoreError: undefined,
       },
     }))
     createSentRef.current = false
@@ -410,7 +434,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     const identityUpdate = buildAgentChatPersistedIdentityUpdate({
       session,
       paneContent: paneContentRef.current,
-      currentTab,
+      currentTab: tabHasSinglePane ? currentTab : undefined,
       metadataProvider,
     })
     if (!identityUpdate) return
@@ -433,7 +457,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (identityUpdate.shouldFlush) {
       dispatch(flushPersistedLayoutNow())
     }
-  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabId])
+  }, [currentTab, dispatch, paneId, providerConfig?.codingCliProvider, session, tabHasSinglePane, tabId])
 
   // Tag this Claude Code session as belonging to this agent-chat provider.
   // Fires once when cliSessionId first becomes available (including resumes).
@@ -441,21 +465,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const taggedSessionRef = useRef<string | null>(null)
   useEffect(() => {
     if (suppressNetworkEffects) return
-    const preferredResumeSessionId = getPreferredResumeSessionId(session)
-    if (!preferredResumeSessionId) return
-    if (taggedSessionRef.current === preferredResumeSessionId) return
-    taggedSessionRef.current = preferredResumeSessionId
+    if (!canonicalDurableSessionId) return
+    if (taggedSessionRef.current === canonicalDurableSessionId) return
+    taggedSessionRef.current = canonicalDurableSessionId
 
     if (providerConfig?.codingCliProvider) {
       setSessionMetadata(
         providerConfig.codingCliProvider,
-        preferredResumeSessionId,
+        canonicalDurableSessionId,
         paneContent.provider,
       ).catch((err) => {
         console.warn('Failed to tag session metadata:', err)
       })
     }
-  }, [paneContent.provider, providerConfig?.codingCliProvider, session?.cliSessionId, session?.timelineSessionId, suppressNetworkEffects])
+  }, [canonicalDurableSessionId, paneContent.provider, providerConfig?.codingCliProvider, suppressNetworkEffects])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -464,11 +487,30 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     createSentRef.current = false
   }
 
+  const buildCreatePayload = useCallback((content: AgentChatPaneContent) => {
+    const selection = resolveAgentChatModelSelection({
+      providerDefaultModelId,
+      capabilities: providerCapabilitiesRef.current,
+      modelSelection: content.modelSelection,
+    })
+    return {
+      type: 'sdk.create' as const,
+      requestId: content.createRequestId,
+      model: selection.resolvedModelId ?? providerDefaultModelId,
+      permissionMode: content.permissionMode ?? defaultPermissionMode,
+      ...(content.effort ? { effort: content.effort } : {}),
+      ...(content.initialCwd ? { cwd: content.initialCwd } : {}),
+      ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+      ...(content.plugins ? { plugins: content.plugins } : {}),
+    }
+  }, [defaultPermissionMode, providerDefaultModelId])
+
   // Send sdk.create when the pane first mounts with a createRequestId but no sessionId
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (paneContent.sessionId || createSentRef.current) return
     if (paneContent.status !== 'creating') return
+    if (paneContent.restoreError) return
 
     const requestId = paneContent.createRequestId
     createSentRef.current = true
@@ -620,6 +662,20 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     ws,
   ])
 
+  // If the socket reconnects before sdk.created arrives, replay the same
+  // idempotent create request instead of leaving the pane stuck in "starting".
+  useEffect(() => {
+    if (suppressNetworkEffects) return
+    if (paneContent.sessionId || !createSentRef.current) return
+    if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
+    return ws.onReconnect(() => {
+      const current = paneContentRef.current
+      if (current.sessionId) return
+      if (current.status !== 'creating' && current.status !== 'starting') return
+      ws.send(buildCreatePayload(current))
+    })
+  }, [buildCreatePayload, paneContent.sessionId, paneContent.status, suppressNetworkEffects, ws])
+
   // Attach to existing session on mount (e.g. after page refresh with persisted pane).
   // Skip when session is already fully hydrated (e.g. split-induced remount) — the WS
   // subscription is connection-scoped so it survives the React unmount/remount cycle.
@@ -681,7 +737,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
     if (isAtBottomRef.current) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     } else if (session?.messages.length) {
       // New message arrived while scrolled up — show badge
       setHasNewMessages(true)
@@ -689,7 +745,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   }, [session?.messages.length, session?.streamingActive])
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     setHasNewMessages(false)
     setShowScrollButton(false)
     isAtBottomRef.current = true
@@ -970,7 +1026,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   useEffect(() => {
     if (keyboardInsetPx > 0 && prevKeyboardInsetRef.current === 0 && isAtBottomRef.current) {
       // Keyboard just opened -- scroll to bottom (only if user is already at bottom)
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+      messagesEndRef.current?.scrollIntoView?.({ behavior: 'smooth' })
     }
     prevKeyboardInsetRef.current = keyboardInsetPx
   }, [keyboardInsetPx])

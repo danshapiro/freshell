@@ -12,6 +12,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Repo Rules
 - Always work in a worktree (in \.worktrees\)
+- New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs to `origin/main`; local `dev` only consumes PR heads.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
@@ -26,16 +27,19 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
 
-## Merging to Main (CRITICAL - Read This)
+## Branch Model And Self-Hosting (CRITICAL - Read This)
 
-**You are running inside Freshell right now. This session, the terminal the user is typing in, is served by the main branch. If you break main, you kill yourself mid-operation and the user has to clean up your mess with a separate agent.**
+**This checkout is self-hosted from local `dev`, not local `main`.**
 
-- Never run `git merge` directly on main - merge conflicts write `<<<<<<< HEAD` markers into source files, which crashes the server instantly
-- Always merge main INTO the feature branch in the worktree first, resolve any conflicts there
-- Before fast-forwarding main, run `npm test` and confirm all tests pass (not just related tests)
-- If you find failing tests, you must stop everything to understand them and make improvements, even if you do not think you were responsible for them.
-- Then fast-forward main: `git merge --ff-only feature/branch` - this is atomic (pointer move, no intermediate states)
-- If `--ff-only` fails, go back to the worktree and rebase/merge until it can fast-forward
+- Local `main` is a mirror of `origin/main`; do not commit to it, merge into it, or self-host from it.
+- Local `dev` is the self-hosted integration branch. It is rebuilt from `origin/main` plus pending PR heads.
+- The repo root normally remains on local `main`; use `.worktrees/dev` as the self-hosted integration checkout and create separate worktrees for authored changes.
+- Do not edit production behavior directly on `dev`.
+- If a change is needed on `dev`, create or update a PR against `origin/main`, then apply that PR head to `dev`.
+- If applying a PR to `dev` needs semantic conflict resolution, stop and fix the PR branch or create a replacement PR. Do not hide behavior changes in a local-only `dev` merge commit.
+- Never run `git merge` directly on `main`.
+- Never reset, force-push, or fast-forward local `main` during ordinary work. If the user explicitly asks to refresh the mirror, first verify Freshell is self-hosting from `dev` and local `main` has no work to preserve.
+- We cannot approve our own PRs. `dev` may contain unapproved pending work, but `origin/main` changes still require independent review.
 
 ## Process Safety (CRITICAL)
 
@@ -46,6 +50,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
+- **The self-hosted dev server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.

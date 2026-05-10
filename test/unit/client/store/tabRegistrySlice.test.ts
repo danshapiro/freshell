@@ -18,6 +18,7 @@ import {
   DEVICE_LABEL_STORAGE_KEY,
 } from '../../../../src/store/storage-keys'
 import type { RegistryTabRecord } from '../../../../src/store/tabRegistryTypes'
+import { selectTabsRegistryGroups } from '../../../../src/store/selectors/tabsRegistrySelectors'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -45,6 +46,7 @@ describe('tabRegistrySlice', () => {
 
   afterEach(() => {
     localStorage.clear()
+    vi.useRealTimers()
   })
 
   it('uses v2 namespaced device storage keys', () => {
@@ -148,7 +150,7 @@ describe('tabRegistrySlice', () => {
     })
   })
 
-  it('initializes searchRangeDays from browser preferences instead of always resetting to 30', async () => {
+  it('clamps legacy searchRangeDays from browser preferences to the closed retention limit', async () => {
     localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
       tabs: {
         searchRangeDays: 365,
@@ -159,6 +161,92 @@ describe('tabRegistrySlice', () => {
     const freshModule = await import('../../../../src/store/tabRegistrySlice')
     const freshReducer = freshModule.default
 
-    expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(365)
+    expect(freshReducer(undefined, { type: 'unknown' }).closedTabRetentionDays).toBe(30)
+    expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(30)
+  })
+
+  it('filters local closed records by the selected closed retention window', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-07T12:00:00Z'))
+    const now = Date.now()
+    const oldClosed = makeRecord({
+      tabKey: 'local:old',
+      tabId: 'old',
+      status: 'closed',
+      updatedAt: now - 10 * 24 * 60 * 60 * 1000,
+      closedAt: now - 10 * 24 * 60 * 60 * 1000,
+    })
+    const freshClosed = makeRecord({
+      tabKey: 'local:fresh',
+      tabId: 'fresh',
+      status: 'closed',
+      updatedAt: now - 2 * 24 * 60 * 60 * 1000,
+      closedAt: now - 2 * 24 * 60 * 60 * 1000,
+    })
+
+    const groups = selectTabsRegistryGroups({
+      tabs: { tabs: [] },
+      panes: { layouts: {}, paneTitles: {} },
+      connection: { serverInstanceId: 'srv-test' },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'device-1',
+        sameDeviceOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {
+          [oldClosed.tabKey]: oldClosed,
+          [freshClosed.tabKey]: freshClosed,
+        },
+        closedTabRetentionDays: 7,
+        searchRangeDays: 7,
+      },
+    } as any)
+
+    expect(groups.closed.map((record) => record.tabKey)).toEqual(['local:fresh'])
+    vi.useRealTimers()
+  })
+
+  it('derives local open tab recency from minute-bucketed pane activity', () => {
+    const result = selectTabsRegistryGroups({
+      tabs: {
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Active Tab',
+          status: 'running',
+          mode: 'shell',
+          createdAt: 1_740_000_000_000,
+          updatedAt: 1_740_000_999_999,
+        }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      tabRecency: {
+        paneLastInputAt: {
+          'pane-1': 1_740_000_080_000,
+        },
+      },
+      tabRegistry: {
+        deviceId: 'device-1',
+        deviceLabel: 'Device',
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+      },
+      connection: {
+        serverInstanceId: 'srv-test',
+      },
+    } as any)
+
+    expect(result.localOpen[0].updatedAt).toBe(1_740_000_060_000)
   })
 })

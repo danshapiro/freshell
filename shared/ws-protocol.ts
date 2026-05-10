@@ -32,7 +32,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 4 as const
+export const WS_PROTOCOL_VERSION = 5 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -125,6 +125,14 @@ export const OpencodeActivityUpdatedSchema = z.object({
   type: z.literal('opencode.activity.updated'),
   upsert: z.array(OpencodeActivityRecordSchema),
   remove: z.array(z.string().min(1)),
+})
+
+export const TerminalTurnCompleteSchema = z.object({
+  type: z.literal('terminal.turn.complete'),
+  terminalId: z.string().min(1),
+  provider: z.literal('opencode'),
+  sessionId: z.string().min(1),
+  at: z.number().int().nonnegative(),
 })
 
 // ──────────────────────────────────────────────────────────────
@@ -300,7 +308,7 @@ export const UiScreenshotResultSchema = z.object({
   changedFocus: z.boolean().optional(),
   restoredFocus: z.boolean().optional(),
   error: z.string().optional(),
-})
+}).strict()
 
 // Coding CLI session schemas
 export const CodingCliCreateSchema = z.object({
@@ -395,7 +403,91 @@ export const SdkQuestionRespondSchema = z.object({
   answers: z.record(z.string(), z.string()),
 })
 
+export const FreshAgentCreateSchema = z.object({
+  type: z.literal('freshAgent.create'),
+  requestId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']).optional(),
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: z.string().optional(),
+  permissionMode: z.string().optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+  sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).optional(),
+  modelSelection: z.object({ kind: z.string().min(1), modelId: z.string().min(1) }).optional().or(z.null()),
+  effort: z.string().trim().min(1).optional(),
+  plugins: z.array(z.string()).optional(),
+})
+
+export const FreshAgentAttachSchema = z.object({
+  type: z.literal('freshAgent.attach'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  resumeSessionId: z.string().optional(),
+})
+
+export const FreshAgentSendSchema = z.object({
+  type: z.literal('freshAgent.send'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  text: z.string().min(1),
+  images: z.array(z.object({
+    mediaType: z.string(),
+    data: z.string(),
+  })).optional(),
+})
+
+export const FreshAgentInterruptSchema = z.object({
+  type: z.literal('freshAgent.interrupt'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentApprovalRespondSchema = z.object({
+  type: z.literal('freshAgent.approval.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  decision: z.record(z.string(), z.unknown()),
+})
+
+export const FreshAgentQuestionRespondSchema = z.object({
+  type: z.literal('freshAgent.question.respond'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  requestId: z.union([z.string().min(1), z.number().int()]),
+  answers: z.record(z.string(), z.string()),
+})
+
+export const FreshAgentKillSchema = z.object({
+  type: z.literal('freshAgent.kill'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+})
+
+export const FreshAgentForkSchema = z.object({
+  type: z.literal('freshAgent.fork'),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  input: z.record(z.string(), z.unknown()).optional(),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -428,6 +520,14 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentCreateSchema,
+  FreshAgentAttachSchema,
+  FreshAgentSendSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentKillSchema,
+  FreshAgentForkSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -550,6 +650,8 @@ export type OpencodeActivityListResponseMessage = z.infer<typeof OpencodeActivit
 
 export type OpencodeActivityUpdatedMessage = z.infer<typeof OpencodeActivityUpdatedSchema>
 
+export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
+
 // -- Sessions --
 
 export type SessionsChangedMessage = {
@@ -589,16 +691,31 @@ export type ConfigFallbackMessage = {
 
 export type TabsSyncAckMessage = {
   type: 'tabs.sync.ack'
-  updated: number
+  accepted: boolean
+  openRecords: number
+  closedRecords: number
+}
+
+export type TabsSyncSnapshotOpenRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
+  clientInstanceId: string
+}
+
+export type TabsSyncSnapshotClosedRecord = Record<string, unknown> & {
+  deviceId: string
+  deviceLabel: string
 }
 
 export type TabsSyncSnapshotMessage = {
   type: 'tabs.sync.snapshot'
   requestId: string
   data: {
-    localOpen: unknown[]
-    remoteOpen: unknown[]
-    closed: unknown[]
+    localOpen: TabsSyncSnapshotOpenRecord[]
+    sameDeviceOpen: TabsSyncSnapshotOpenRecord[]
+    remoteOpen: TabsSyncSnapshotOpenRecord[]
+    closed: TabsSyncSnapshotClosedRecord[]
+    devices: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
   }
 }
 
@@ -676,6 +793,12 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_INTERNAL'
   | 'RESTORE_DIVERGED'
   | 'RESTORE_STALE_REVISION'
+
+export type FreshAgentServerMessage =
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
+  | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 export type SdkServerMessage =
   | { type: 'sdk.created'; requestId: string; sessionId: string }
@@ -778,6 +901,7 @@ export type ServerMessage =
   | CodexActivityUpdatedMessage
   | OpencodeActivityListResponseMessage
   | OpencodeActivityUpdatedMessage
+  | TerminalTurnCompleteMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
@@ -792,6 +916,7 @@ export type ServerMessage =
   | CodingCliExitMessage
   | CodingCliStderrMessage
   | CodingCliKilledMessage
+  | FreshAgentServerMessage
   | SdkServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage

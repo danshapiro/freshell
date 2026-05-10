@@ -285,6 +285,49 @@ function migrateLegacyFreshClaudeSettings(rawSettings: Record<string, unknown>):
   return migrated
 }
 
+function normalizeFreshAgentCompatSettings(rawSettings: Record<string, unknown>): Record<string, unknown> {
+  const freshAgent = isRecord(rawSettings.freshAgent) ? rawSettings.freshAgent : undefined
+  const agentChat = isRecord(rawSettings.agentChat) ? rawSettings.agentChat : undefined
+
+  if (!freshAgent && !agentChat) {
+    return rawSettings
+  }
+
+  const merged: Record<string, unknown> = {
+    ...(agentChat || {}),
+    ...(freshAgent || {}),
+  }
+
+  const freshPlugins = Array.isArray(freshAgent?.defaultPlugins) ? freshAgent.defaultPlugins : undefined
+  const agentPlugins = Array.isArray(agentChat?.defaultPlugins) ? agentChat.defaultPlugins : undefined
+  if ((freshPlugins?.length ?? 0) > 0) {
+    merged.defaultPlugins = freshPlugins
+  } else if (agentPlugins) {
+    merged.defaultPlugins = agentPlugins
+  }
+
+  const freshProviders = isRecord(freshAgent?.providers) ? freshAgent.providers : undefined
+  const agentProviders = isRecord(agentChat?.providers) ? agentChat.providers : undefined
+  if (freshProviders || agentProviders) {
+    merged.providers = {
+      ...(agentProviders || {}),
+      ...(freshProviders || {}),
+    }
+  }
+
+  if (typeof freshAgent?.initialSetupDone === 'boolean') {
+    merged.initialSetupDone = freshAgent.initialSetupDone
+  } else if (typeof agentChat?.initialSetupDone === 'boolean') {
+    merged.initialSetupDone = agentChat.initialSetupDone
+  }
+
+  return {
+    ...rawSettings,
+    freshAgent: merged,
+    agentChat: merged,
+  }
+}
+
 export class ConfigStore {
   private cache: UserConfig | null = null
   private writeMutex = new Mutex()
@@ -310,9 +353,9 @@ export class ConfigStore {
     this.lastReadError = error
     if (existing) {
       this.lastReadError = undefined
-      const rawSettings = migrateLegacyFreshClaudeSettings(
+      const rawSettings = normalizeFreshAgentCompatSettings(migrateLegacyFreshClaudeSettings(
         isRecord(existing.settings) ? { ...existing.settings } : {},
-      )
+      ))
       const extractedLegacyLocalSettingsSeed = extractLegacyLocalSettingsSeed(rawSettings)
       const storedLegacyLocalSettingsSeed = isRecord(existing.legacyLocalSettingsSeed)
         ? extractLegacyLocalSettingsSeed(existing.legacyLocalSettingsSeed)

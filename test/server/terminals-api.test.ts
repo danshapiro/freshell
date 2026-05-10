@@ -261,6 +261,24 @@ describe('Terminals API', () => {
       expect(secondTerminal.mode).toBe('claude')
     })
 
+    it('includes the last emitted terminal line', async () => {
+      const terminal = registry.addTerminal({
+        terminalId: 'term_last_line',
+        title: 'Repo push',
+        mode: 'shell',
+      })
+      terminal.buffer.append('first line\nsecond line\nvagrant@gf-software-factory-vm:/workspace/project$ ')
+
+      const response = await request(app)
+        .get('/api/terminals')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      const item = response.body.find((t: any) => t.terminalId === 'term_last_line')
+      expect(item.lastLine).toBe('second line')
+      expect(item.last_line).toBe('second line')
+    })
+
     it('applies title override from config', async () => {
       registry.addTerminal({
         terminalId: 'term_with_override',

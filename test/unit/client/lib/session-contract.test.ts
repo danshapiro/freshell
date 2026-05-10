@@ -21,6 +21,7 @@ describe('client session-contract helpers', () => {
       {
         provider: 'codex',
         sessionId: 'codex-session-1',
+        serverInstanceId: 'srv-local',
       },
       {
         provider: 'codex',

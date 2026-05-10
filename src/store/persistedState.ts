@@ -6,6 +6,8 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { migrateLegacyFreshAgentNode } from '@shared/fresh-agent'
+import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -201,14 +203,62 @@ function normalizeAgentChatContent(content: Record<string, unknown>): Record<str
   )
     ? content.restoreError
     : undefined
-  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+  const {
+    resumeSessionId: _resumeSessionId,
+    sessionRef: _legacySessionRef,
+    restoreError: _legacyRestoreError,
+    model: legacyModel,
+    effort: legacyEffort,
+    ...rest
+  } = content
 
   return {
     ...rest,
+    modelSelection: normalizeAgentChatModelSelection(content.modelSelection, legacyModel),
+    effort: normalizeAgentChatEffortOverride(legacyEffort),
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
     ...((durableState.restoreError ?? existingRestoreError)
       ? { restoreError: durableState.restoreError ?? existingRestoreError }
       : {}),
+  }
+}
+
+function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
+  const provider = typeof content.provider === 'string' ? content.provider : undefined
+  const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
+  const existingRestoreError = (
+    content.restoreError
+    && typeof content.restoreError === 'object'
+    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
+    && typeof (content.restoreError as any).reason === 'string'
+  )
+    ? content.restoreError
+    : undefined
+  const {
+    sessionRef: _legacySessionRef,
+    restoreError: _legacyRestoreError,
+    model: legacyModel,
+    modelSelection: legacyModelSelection,
+    effort: legacyEffort,
+    ...rest
+  } = content
+
+  if (provider === 'codex') {
+    return {
+      ...rest,
+      ...(typeof legacyModel === 'string' ? { model: legacyModel } : {}),
+      effort: normalizeAgentChatEffortOverride(legacyEffort),
+      ...(sanitizedSessionRef ? { sessionRef: sanitizedSessionRef } : {}),
+      ...(!sanitizedSessionRef && existingRestoreError ? { restoreError: existingRestoreError } : {}),
+    }
+  }
+
+  return {
+    ...rest,
+    modelSelection: normalizeAgentChatModelSelection(legacyModelSelection, legacyModel),
+    effort: normalizeAgentChatEffortOverride(legacyEffort),
+    ...(sanitizedSessionRef ? { sessionRef: sanitizedSessionRef } : {}),
+    ...(!sanitizedSessionRef && existingRestoreError ? { restoreError: existingRestoreError } : {}),
   }
 }
 
@@ -223,6 +273,8 @@ function normalizePersistedNode(node: unknown): unknown {
       nextContent = normalizeTerminalContent(content)
     } else if (content.kind === 'agent-chat') {
       nextContent = normalizeAgentChatContent(content)
+    } else if (content.kind === 'fresh-agent') {
+      nextContent = normalizeFreshAgentContent(content)
     } else if ('sessionRef' in content) {
       const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
       const { sessionRef: _legacySessionRef, ...rest } = content
@@ -252,7 +304,10 @@ function normalizePersistedNode(node: unknown): unknown {
 
 function normalizePersistedLayouts(layouts: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(layouts).map(([tabId, node]) => [tabId, normalizePersistedNode(node)]),
+    Object.entries(layouts).map(([tabId, node]) => [
+      tabId,
+      migrateLegacyFreshAgentNode(normalizePersistedNode(node)),
+    ]),
   )
 }
 

@@ -2,9 +2,10 @@ import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type { FreshAgentPaneInput, AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export interface SessionTypeConfig {
@@ -13,6 +14,14 @@ export interface SessionTypeConfig {
 }
 
 export function resolveSessionTypeConfig(sessionType: string, extensions?: ClientExtensionEntry[]): SessionTypeConfig {
+  const freshAgentType = resolveFreshAgentType(sessionType)
+  if (freshAgentType) {
+    return {
+      icon: freshAgentType.icon,
+      label: freshAgentType.label,
+    }
+  }
+
   // 1. Check agent-chat providers first (they have explicit configs)
   const agentConfig = getAgentChatProviderConfig(sessionType)
   if (agentConfig) {
@@ -47,17 +56,36 @@ export function buildResumeContent(opts: {
   sessionId: string
   cwd?: string
   agentChatProviderSettings?: AgentChatProviderSettings
-}): TerminalPaneInput | AgentChatPaneInput {
+}): TerminalPaneInput | FreshAgentPaneInput | AgentChatPaneInput {
+  const freshAgentType = resolveFreshAgentType(opts.sessionType)
+  if (freshAgentType) {
+    const agentConfig = getAgentChatProviderConfig(opts.sessionType)
+    const ps = opts.agentChatProviderSettings
+    return {
+      kind: 'fresh-agent',
+      sessionType: freshAgentType.sessionType,
+      provider: freshAgentType.runtimeProvider,
+      resumeSessionId: opts.sessionId,
+      sessionRef: {
+        provider: freshAgentType.runtimeProvider,
+        sessionId: opts.sessionId,
+      },
+      initialCwd: opts.cwd,
+      modelSelection: ps?.modelSelection,
+      model: freshAgentType.defaultModel,
+      permissionMode: ps?.defaultPermissionMode ?? agentConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode,
+      effort: ps?.effort,
+    }
+  }
+
   const agentConfig = getAgentChatProviderConfig(opts.sessionType)
   if (agentConfig) {
     const ps = opts.agentChatProviderSettings
     return {
-      kind: 'agent-chat',
-      provider: agentConfig.name as AgentChatProviderName,
-      sessionRef: {
-        provider: agentConfig.codingCliProvider ?? 'claude',
-        sessionId: opts.sessionId,
-      },
+      kind: 'fresh-agent',
+      sessionType: agentConfig.name as AgentChatProviderName,
+      provider: 'claude',
+      resumeSessionId: opts.sessionId,
       initialCwd: opts.cwd,
       modelSelection: ps?.modelSelection,
       permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,

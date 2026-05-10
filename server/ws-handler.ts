@@ -1,13 +1,14 @@
 import type http from 'http'
 import { randomUUID } from 'crypto'
+import { nanoid } from 'nanoid'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
-import { modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
-import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
+import { buildFreshellTerminalEnv, modeSupportsResume } from './terminal-registry.js'
+import type { TerminalEnvContext, TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
@@ -22,6 +23,8 @@ import type {
   OpencodeActivityRecord,
   SdkServerMessage,
   SdkSessionStatus,
+  TerminalTurnCompleteMessage,
+  TerminalStatusMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -33,7 +36,7 @@ import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-reg
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
-import type { CodexLaunchPlan, CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { runCodexLaunchWithRetry, type CodexLaunchFactory, type CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
@@ -43,6 +46,7 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
+  SessionLocatorSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
@@ -50,6 +54,7 @@ import {
   OpencodeActivityListResponseSchema,
   OpencodeActivityListSchema,
   OpencodeActivityUpdatedSchema,
+  TerminalTurnCompleteSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -60,6 +65,14 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  FreshAgentAttachSchema,
+  FreshAgentCreateSchema,
+  FreshAgentApprovalRespondSchema,
+  FreshAgentForkSchema,
+  FreshAgentInterruptSchema,
+  FreshAgentKillSchema,
+  FreshAgentQuestionRespondSchema,
+  FreshAgentSendSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
@@ -74,6 +87,14 @@ import {
 } from '../shared/ws-protocol.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
+import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
+import type { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
+import {
+  makeFreshAgentSessionKey,
+  resolveFreshAgentRuntimeProvider,
+  type FreshAgentRuntimeProvider,
+  type FreshAgentSessionType,
+} from '../shared/fresh-agent.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -104,6 +125,7 @@ export type WsHandlerOptions = {
   codexActivityListProvider?: () => CodexActivityRecord[]
   agentHistorySource?: AgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
+  freshAgentRuntimeManager?: FreshAgentRuntimeManager
 }
 
 function readWsHandlerConfig(): WsHandlerConfig {
@@ -159,6 +181,47 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
+const UI_SCREENSHOT_RESULT_KEYS = new Set([
+  'type',
+  'requestId',
+  'ok',
+  'mimeType',
+  'imageBase64',
+  'width',
+  'height',
+  'changedFocus',
+  'restoredFocus',
+  'error',
+])
+const MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES = 4096
+
+function isBoundedScreenshotResultEnvelopePreview(data: WebSocket.RawData, config: WsHandlerConfig): boolean {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return false
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch) return false
+  if (Buffer.byteLength(raw, 'utf-8') > config.maxRegularWsMessageBytes + config.maxScreenshotBase64Bytes + MAX_SCREENSHOT_ENVELOPE_OVERHEAD_BYTES) {
+    return false
+  }
+  if (imageMatch[1].length > config.maxScreenshotBase64Bytes) return false
+  const keyPattern = /"((?:\\.|[^"\\])*)"\s*:/g
+  let match: RegExpExecArray | null
+  while ((match = keyPattern.exec(raw)) !== null) {
+    const key = match[1].replace(/\\"/g, '"')
+    if (!UI_SCREENSHOT_RESULT_KEYS.has(key)) return false
+  }
+  return true
+}
+
+function oversizedScreenshotResultRequestId(data: WebSocket.RawData, config: WsHandlerConfig): string | undefined {
+  const raw = rawDataToString(data)
+  if (!/^\s*\{\s*"type"\s*:\s*"ui\.screenshot\.result"\s*,/.test(raw.slice(0, 512))) return undefined
+  const imageMatch = /"imageBase64"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  if (!imageMatch || imageMatch[1].length <= config.maxScreenshotBase64Bytes) return undefined
+  const requestIdMatch = /"requestId"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/.exec(raw)
+  return requestIdMatch?.[1]
+}
+
 function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false
   for (const value of a) {
@@ -169,6 +232,20 @@ function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean 
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+function buildCanonicalTerminalSessionRef(
+  mode: TerminalMode,
+  resumeSessionId?: string,
+): { provider: string; sessionId: string } | undefined {
+  if (mode === 'shell' || !isNonEmptyString(resumeSessionId)) return undefined
+  if (mode === 'claude' && !isValidClaudeSessionId(resumeSessionId)) {
+    return undefined
+  }
+  return {
+    provider: mode,
+    sessionId: resumeSessionId,
+  }
 }
 
 const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
@@ -198,27 +275,17 @@ function formatExitedTerminalAttachMessage(record: Pick<TerminalRecord, 'title' 
   return `${label} is no longer running${exitSuffix}.`
 }
 
-function assertCodexCreateTerminalRunning(record: Pick<TerminalRecord, 'status'>): void {
-  if (record.status !== 'running') {
-    throw new Error('Codex terminal PTY exited before create completed.')
-  }
-}
-
 function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as {
     provider?: unknown
     sessionId?: unknown
-    serverInstanceId?: unknown
   }
   const provider = CodingCliProviderSchema.safeParse(candidate.provider)
   if (!provider.success || !isNonEmptyString(candidate.sessionId)) return undefined
   return {
     provider: provider.data,
     sessionId: candidate.sessionId,
-    ...(isNonEmptyString(candidate.serverInstanceId)
-      ? { serverInstanceId: candidate.serverInstanceId }
-      : {}),
   }
 }
 
@@ -232,7 +299,14 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
 
   const kind = content.kind
   if (kind === 'agent-chat') {
-    if (isNonEmptyString(content.resumeSessionId)) {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
+      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+    }
+    return locators
+  }
+
+  if (kind === 'fresh-agent') {
+    if (isNonEmptyString(content.resumeSessionId) && isValidClaudeSessionId(content.resumeSessionId)) {
       locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
     }
     return locators
@@ -241,7 +315,12 @@ function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): 
   if (kind !== 'terminal') return locators
 
   const mode = CodingCliProviderSchema.safeParse(content.mode)
-  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+  if (
+    !mode.success
+    || mode.data !== 'claude'
+    || !isNonEmptyString(content.resumeSessionId)
+    || !isValidClaudeSessionId(content.resumeSessionId)
+  ) {
     return locators
   }
 
@@ -298,20 +377,32 @@ const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
   serverInstanceId: true,
   deviceId: true,
   deviceLabel: true,
+  clientInstanceId: true,
 })
 
 const TabsSyncPushSchema = z.object({
   type: z.literal('tabs.sync.push'),
   deviceId: z.string().min(1),
   deviceLabel: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
   records: z.array(TabsSyncPushRecordSchema),
 })
+type TabsSyncPushRecord = z.infer<typeof TabsSyncPushRecordSchema>
 
 const TabsSyncQuerySchema = z.object({
   type: z.literal('tabs.sync.query'),
   requestId: z.string().min(1),
   deviceId: z.string().min(1),
-  rangeDays: z.number().int().positive().optional(),
+  clientInstanceId: z.string().min(1),
+  closedTabRetentionDays: z.number().int().min(1).max(30),
+})
+
+const TabsSyncClientRetireSchema = z.object({
+  type: z.literal('tabs.sync.client.retire'),
+  deviceId: z.string().min(1),
+  clientInstanceId: z.string().min(1),
+  snapshotRevision: z.number().int().nonnegative(),
 })
 
 type ClientState = {
@@ -322,12 +413,29 @@ type ClientState = {
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
+  freshAgentSessions: Set<string>
+  freshAgentSubscriptions: Map<string, () => void>
+  freshAgentSubscriptionKeysInFlight: Set<string>
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   sdkSessionTargets: Map<string, string>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
+}
+
+function previewRawData(data: WebSocket.RawData, maxBytes: number): string {
+  if (Buffer.isBuffer(data)) return data.subarray(0, maxBytes).toString('utf-8')
+  if (Array.isArray(data)) return Buffer.concat(data).subarray(0, maxBytes).toString('utf-8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).subarray(0, maxBytes).toString('utf-8')
+  return String(data).slice(0, maxBytes)
+}
+
+function rawDataToString(data: WebSocket.RawData): string {
+  if (Buffer.isBuffer(data)) return data.toString('utf-8')
+  if (Array.isArray(data)) return Buffer.concat(data).toString('utf-8')
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf-8')
+  return String(data)
 }
 
 type HandshakeSnapshot = {
@@ -350,18 +458,16 @@ type PendingScreenshot = {
 }
 
 type ScreenshotErrorCode = 'NO_SCREENSHOT_CLIENT' | 'SCREENSHOT_TIMEOUT' | 'SCREENSHOT_CONNECTION_CLOSED'
+type UiCommand = { command: string; payload?: any }
+type PendingUiCommand = { command: UiCommand; expiresAt: number }
+const UI_COMMAND_REPLAY_TTL_MS = 15_000
+const UI_COMMAND_RECENT_CONNECTION_MS = 3_000
 
 function createScreenshotError(code: ScreenshotErrorCode, message: string): Error & { code: ScreenshotErrorCode } {
   const err = new Error(message) as Error & { code: ScreenshotErrorCode }
   err.code = code
   return err
 }
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-class TerminalCreateAdmissionError extends Error {}
 
 export class WsHandler {
   private readonly config: WsHandlerConfig
@@ -384,13 +490,22 @@ export class WsHandler {
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
   private agentHistorySource?: AgentHistorySource
+  private readonly freshAgentRuntimeManager?: FreshAgentRuntimeManager
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private sdkCreateLocks = new Map<string, Promise<void>>()
   private createdSdkSessionByRequestId = new Map<string, string>()
   private sdkSessionByCreateOwnerKey = new Map<string, string>()
+  private freshAgentCreateLocks = new Map<string, Promise<void>>()
+  private createdFreshAgentSessionByRequestId = new Map<string, {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    runtimeProvider: FreshAgentRuntimeProvider
+    sessionRef?: { provider: string; sessionId: string }
+  }>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
+  private pendingUiCommands: PendingUiCommand[] = []
   private sessionsRevision = 0
   private terminalsRevision = 0
 
@@ -402,6 +517,13 @@ export class WsHandler {
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
+  }
+  private onTerminalStatusBound = (payload: Omit<TerminalStatusMessage, 'type'>) => {
+    if (!payload?.terminalId) return
+    this.broadcast({
+      type: 'terminal.status',
+      ...payload,
+    } satisfies TerminalStatusMessage)
   }
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
@@ -420,6 +542,7 @@ export class WsHandler {
     this.codingCliManager = options.codingCliManager
     this.codexLaunchPlanner = options.codexLaunchPlanner
     this.sdkBridge = options.sdkBridge
+    this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.sessionRepairService = options.sessionRepairService
     this.handshakeSnapshotProvider = options.handshakeSnapshotProvider
     this.terminalMetaListProvider = options.terminalMetaListProvider
@@ -466,11 +589,12 @@ export class WsHandler {
       }),
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
-      resumeSessionId: z.string().optional(),
+      sessionRef: SessionLocatorSchema.optional(),
+      liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
-    })
+    }).strict()
 
     const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
       if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
@@ -507,9 +631,18 @@ export class WsHandler {
       OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
+      TabsSyncClientRetireSchema,
       dynamicCodingCliCreateSchema,
       CodingCliInputSchema,
       CodingCliKillSchema,
+      FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentApprovalRespondSchema,
+      FreshAgentQuestionRespondSchema,
+      FreshAgentKillSchema,
+      FreshAgentForkSchema,
       SdkCreateSchema,
       SdkSendSchema,
       SdkPermissionRespondSchema,
@@ -526,6 +659,7 @@ export class WsHandler {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.on?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.on?.('terminal.status', this.onTerminalStatusBound)
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -679,12 +813,16 @@ export class WsHandler {
     cwd: string | undefined,
     resumeSessionId: string | undefined,
     providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
   ) {
     if (!this.codexLaunchPlanner) {
-      throw new Error('Codex terminal launch requires the app-server launch planner.')
+      throw new Error('Codex terminal launch requires the per-terminal app-server sidecar planner.')
     }
     return this.codexLaunchPlanner.planCreate({
       cwd,
+      terminalId,
+      env: buildFreshellTerminalEnv(terminalId, envContext),
       resumeSessionId,
       model: providerSettings?.model,
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
@@ -692,10 +830,41 @@ export class WsHandler {
     })
   }
 
-  private assertTerminalCreateAccepted(): void {
-    if (this.closed) {
-      throw new TerminalCreateAdmissionError('Server is shutting down; terminal.create is no longer accepted.')
-    }
+  private createCodexLaunchFactory(
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+  ): CodexLaunchFactory {
+    return async (input) => this.planCodexLaunch(
+      input.cwd,
+      input.resumeSessionId,
+      input.providerSettings ?? providerSettings,
+      input.terminalId,
+      input.envContext ?? {},
+    )
+  }
+
+  private async planCodexLaunchWithRetry(
+    cwd: string | undefined,
+    resumeSessionId: string | undefined,
+    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    terminalId: string,
+    envContext: TerminalEnvContext,
+    requestId: string,
+  ): ReturnType<WsHandler['planCodexLaunch']> {
+    return runCodexLaunchWithRetry(
+      () => this.planCodexLaunch(cwd, resumeSessionId, providerSettings, terminalId, envContext),
+      {
+        shouldRetry: (error) => !(error instanceof CodexLaunchConfigError),
+        onFailedAttempt: ({ attempt, delayMs, error }) => {
+          log.warn({
+            err: error,
+            requestId,
+            terminalId,
+            attempt,
+            nextDelayMs: delayMs,
+          }, 'Codex initial launch planning failed; retrying before terminal.create')
+        },
+      },
+    )
   }
 
   private terminalCreateLockKey(
@@ -740,6 +909,23 @@ export class WsHandler {
       })
 
     this.sdkCreateLocks.set(key, current)
+    return current
+  }
+
+  private withFreshAgentCreateLock(key: string, task: () => Promise<void>): Promise<void> {
+    const previous = this.freshAgentCreateLocks.get(key) ?? Promise.resolve()
+
+    let current: Promise<void>
+    current = previous
+      .catch(() => undefined)
+      .then(task)
+      .finally(() => {
+        if (this.freshAgentCreateLocks.get(key) === current) {
+          this.freshAgentCreateLocks.delete(key)
+        }
+      })
+
+    this.freshAgentCreateLocks.set(key, current)
     return current
   }
 
@@ -830,6 +1016,35 @@ export class WsHandler {
     if (liveSession) return liveSession
     this.createdSdkSessionByRequestId.delete(requestId)
     return undefined
+  }
+
+  private rememberCreatedFreshAgentSession(
+    requestId: string,
+    created: { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } },
+  ): void {
+    this.createdFreshAgentSessionByRequestId.set(requestId, created)
+  }
+
+  private resolveCreatedFreshAgentSession(
+    requestId: string,
+  ): { sessionId: string; sessionType: FreshAgentSessionType; runtimeProvider: FreshAgentRuntimeProvider; sessionRef?: { provider: string; sessionId: string } } | undefined {
+    return this.createdFreshAgentSessionByRequestId.get(requestId)
+  }
+
+  private clearFreshAgentCreateCachesForSession(locator: {
+    sessionId: string
+    sessionType: FreshAgentSessionType
+    provider: FreshAgentRuntimeProvider
+  }): void {
+    for (const [requestId, cached] of this.createdFreshAgentSessionByRequestId.entries()) {
+      if (
+        cached.sessionId === locator.sessionId
+        && cached.sessionType === locator.sessionType
+        && cached.runtimeProvider === locator.provider
+      ) {
+        this.createdFreshAgentSessionByRequestId.delete(requestId)
+      }
+    }
   }
 
   private resolveSdkOwnerSession(ownerKey: string): SdkSessionState | undefined {
@@ -1000,11 +1215,6 @@ export class WsHandler {
   }
 
   private onConnection(ws: LiveWebSocket, req: http.IncomingMessage) {
-    if (this.closed) {
-      ws.close(CLOSE_CODES.SERVER_SHUTDOWN, 'Server shutting down')
-      return
-    }
-
     if (this.connections.size >= this.config.maxConnections) {
       ws.close(CLOSE_CODES.MAX_CONNECTIONS, 'Too many connections')
       return
@@ -1050,6 +1260,9 @@ export class WsHandler {
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
+      freshAgentSessions: new Set(),
+      freshAgentSubscriptions: new Map(),
+      freshAgentSubscriptionKeysInFlight: new Set(),
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       sdkSessionTargets: new Map(),
@@ -1105,6 +1318,12 @@ export class WsHandler {
       off()
     }
     state.sdkSubscriptions.clear()
+    for (const off of state.freshAgentSubscriptions?.values() ?? []) {
+      off()
+    }
+    state.freshAgentSubscriptions?.clear()
+    state.freshAgentSubscriptionKeysInFlight?.clear()
+    state.freshAgentSessions?.clear()
 
     for (const [requestId, pending] of this.screenshotRequests) {
       if (pending.connectionId !== ws.connectionId) continue
@@ -1568,6 +1787,91 @@ export class WsHandler {
     }
   }
 
+  private registerClientFreshAgentSession(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
+  ): void {
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.add(key)
+    const existing = state.freshAgentSubscriptions.get(key)
+    if (existing || state.freshAgentSubscriptionKeysInFlight.has(key)) {
+      return
+    }
+    if (!this.freshAgentRuntimeManager) {
+      return
+    }
+    const reportSubscribeFailure = (error: unknown) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
+      const message = error instanceof Error ? error.message : 'Failed to subscribe to fresh-agent session updates'
+      log.warn({ err: error, locator }, 'Fresh-agent session subscription failed')
+      if (!state.freshAgentSessions.has(key)) return
+      this.safeSend(ws, {
+        type: 'freshAgent.event',
+        sessionId: locator.sessionId,
+        sessionType: locator.sessionType,
+        provider: locator.provider,
+        event: {
+          type: 'sdk.error',
+          sessionId: locator.sessionId,
+          code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+          message,
+        },
+      })
+    }
+    state.freshAgentSubscriptionKeysInFlight.add(key)
+    let subscription: Promise<() => void>
+    try {
+      subscription = this.freshAgentRuntimeManager.subscribe(locator, (event) => {
+        if (!state.freshAgentSessions.has(key)) return
+        this.safeSend(ws, {
+          type: 'freshAgent.event',
+          sessionId: locator.sessionId,
+          sessionType: locator.sessionType,
+          provider: locator.provider,
+          event,
+        })
+      })
+    } catch (error) {
+      reportSubscribeFailure(error)
+      return
+    }
+    void subscription.then((off) => {
+      state.freshAgentSubscriptionKeysInFlight.delete(key)
+      if (!state.freshAgentSessions.has(key)) {
+        off()
+        return
+      }
+      if (state.freshAgentSubscriptions.has(key)) {
+        off()
+        return
+      }
+      state.freshAgentSubscriptions.set(key, off)
+    }).catch(reportSubscribeFailure)
+  }
+
+  private clearClientFreshAgentSession(
+    state: ClientState,
+    locator: {
+      sessionId: string
+      sessionType: FreshAgentSessionType
+      provider: FreshAgentRuntimeProvider
+    },
+  ): void {
+    const key = makeFreshAgentSessionKey(locator)
+    state.freshAgentSessions.delete(key)
+    state.freshAgentSubscriptionKeysInFlight.delete(key)
+    const off = state.freshAgentSubscriptions.get(key)
+    if (off) {
+      off()
+      state.freshAgentSubscriptions.delete(key)
+    }
+  }
+
   /**
    * Wait for ws.bufferedAmount to drop below threshold.
    * Returns true if drained, false if timed out, connection closed, or cancelled.
@@ -1627,7 +1931,21 @@ export class WsHandler {
       }
 
       // Send terminal inventory so the client knows what's alive
-      const terminals = this.registry.list()
+      const terminals = this.registry.list().map((terminal) => {
+        const sessionRef = buildCanonicalTerminalSessionRef(terminal.mode, terminal.resumeSessionId)
+        return {
+          terminalId: terminal.terminalId,
+          title: terminal.title,
+          description: terminal.description,
+          mode: terminal.mode,
+          ...(sessionRef ? { sessionRef } : {}),
+          createdAt: terminal.createdAt,
+          lastActivityAt: terminal.lastActivityAt,
+          status: terminal.status,
+          ...(terminal.runtimeStatus ? { runtimeStatus: terminal.runtimeStatus } : {}),
+          cwd: terminal.cwd,
+        }
+      })
       const terminalMeta = this.terminalMetaListProvider?.() ?? []
       this.safeSend(ws, {
         type: 'terminal.inventory',
@@ -1657,18 +1975,59 @@ export class WsHandler {
     if (perfConfig.enabled) payloadBytes = rawBytes
 
     try {
+      if (rawBytes > this.config.maxRegularWsMessageBytes) {
+        if (!isBoundedScreenshotResultEnvelopePreview(data, this.config)) {
+          const oversizedScreenshotRequestId = oversizedScreenshotResultRequestId(data, this.config)
+          if (oversizedScreenshotRequestId) {
+            const pending = this.screenshotRequests.get(oversizedScreenshotRequestId)
+            if (pending && (!pending.connectionId || pending.connectionId === ws.connectionId)) {
+              clearTimeout(pending.timeout)
+              this.screenshotRequests.delete(oversizedScreenshotRequestId)
+              pending.reject(new Error('Screenshot payload too large'))
+              return
+            }
+          }
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
+          })
+          return
+        }
+      }
+
       let msg: any
       try {
-        msg = JSON.parse(data.toString())
+        msg = JSON.parse(rawDataToString(data))
       } catch {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid JSON' })
         return
       }
+      if (rawBytes > this.config.maxRegularWsMessageBytes && msg?.type !== 'ui.screenshot.result') {
+        this.sendError(ws, {
+          code: 'INVALID_MESSAGE',
+          message: `WebSocket message exceeds ${this.config.maxRegularWsMessageBytes} bytes`,
+        })
+        return
+      }
+      const rawSessionRef = (
+        msg?.sessionRef
+        && typeof msg.sessionRef === 'object'
+        && typeof msg.sessionRef.provider === 'string'
+        && msg.sessionRef.provider.length > 0
+        && typeof msg.sessionRef.sessionId === 'string'
+        && msg.sessionRef.sessionId.length > 0
+      )
+        ? {
+            provider: msg.sessionRef.provider,
+            sessionId: msg.sessionRef.sessionId,
+          }
+        : undefined
+      const rawRestoreRequested = msg?.restore === true
 
       if (msg?.type === 'hello' && msg?.protocolVersion !== WS_PROTOCOL_VERSION) {
         this.sendError(ws, {
           code: 'PROTOCOL_MISMATCH',
-          message: `Expected protocol version ${WS_PROTOCOL_VERSION}`,
+          message: `Expected protocol version ${WS_PROTOCOL_VERSION}. Reload this Freshell browser tab to use the latest client bundle.`,
         })
         ws.close(CLOSE_CODES.PROTOCOL_MISMATCH, 'Protocol version mismatch')
         return
@@ -1684,11 +2043,6 @@ export class WsHandler {
       // discriminated union once provider names become dynamic, so we cast once at the boundary.
       const m = parsed.data as any
       messageType = m.type
-
-      if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {
-        ws.close(1009, 'Message too large')
-        return
-      }
 
       if (m.type === 'ping') {
         // Respond to confirm liveness.
@@ -1738,21 +2092,13 @@ export class WsHandler {
           bootId: this.bootId,
         })
         this.scheduleHandshakeSnapshot(ws, state)
+        this.flushPendingUiCommands(ws)
         return
       }
 
       if (!state.authenticated) {
         this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Send hello first' })
         ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Not authenticated')
-        return
-      }
-
-      if (this.closed && m.type === 'terminal.create') {
-        this.sendError(ws, {
-          code: 'INTERNAL_ERROR',
-          message: 'Server is shutting down; terminal.create is no longer accepted.',
-          requestId: m.requestId,
-        })
         return
       }
 
@@ -1806,12 +2152,25 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
+        const requestedSessionRef = (
+          m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
+            ? m.sessionRef
+            : (rawSessionRef?.provider === m.mode ? rawSessionRef : undefined)
+        )
+        const canonicalSessionId = requestedSessionRef?.sessionId
+        const restoreRequested = m.restore === true || rawRestoreRequested
+        const localLiveTerminalId = (
+          m.liveTerminal?.serverInstanceId === this.serverInstanceId
+          && typeof m.liveTerminal?.terminalId === 'string'
+        )
+          ? m.liveTerminal.terminalId
+          : undefined
         log.debug({
           requestId: m.requestId,
           connectionId: ws.connectionId,
           mode: m.mode,
-          resumeSessionId: m.resumeSessionId,
-        }, '[TRACE resumeSessionId] terminal.create received')
+          sessionRef: requestedSessionRef,
+        }, '[TRACE sessionRef] terminal.create received')
         recordSessionLifecycleEvent({
           kind: 'terminal_create_requested',
           requestId: m.requestId,
@@ -1820,9 +2179,9 @@ export class WsHandler {
           ...(m.paneId ? { paneId: m.paneId } : {}),
           ...(m.cwd ? { cwd: m.cwd } : {}),
           mode: m.mode as TerminalMode,
-          restoreRequested: m.restore === true,
-          hasRequestedSessionRef: false,
-          ...(m.resumeSessionId ? { requestedSessionId: m.resumeSessionId } : {}),
+          restoreRequested,
+          hasRequestedSessionRef: !!requestedSessionRef,
+          ...(canonicalSessionId ? { requestedSessionId: canonicalSessionId } : {}),
         })
         const endCreateTimer = startPerfTimer(
           'terminal_create',
@@ -1830,14 +2189,13 @@ export class WsHandler {
           { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
         )
         let terminalId: string | undefined
-        let pendingCodexPlan: CodexLaunchPlan | undefined
         let reused = false
         let error = false
         let rateLimited = false
-        let effectiveResumeSessionId = m.resumeSessionId
+        let restoreSessionId = canonicalSessionId
         try {
           await this.withTerminalCreateLock(
-            this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
+            this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
             async () => {
               const resolveExistingRequestTerminalId = (requestId: string): string | undefined => {
                 const local = state.createdByRequestId.get(requestId)
@@ -1855,7 +2213,6 @@ export class WsHandler {
                 requestId: string
                 terminalId: string
                 createdAt: number
-                effectiveResumeSessionId?: string
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -1866,22 +2223,26 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
+              }
+
+              const recordHasSessionRef = (record: unknown): boolean => {
+                const maybeRecord = record as { sessionRef?: { sessionId?: unknown }; resumeSessionId?: unknown } | null | undefined
+                return typeof maybeRecord?.sessionRef?.sessionId === 'string'
+                  || typeof maybeRecord?.resumeSessionId === 'string'
               }
 
               const attachReusedTerminal = async (
                 reusedTerminalId: string,
                 createdAt: number,
-                resumeSessionId?: string,
+                hasSessionRef = false,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
                   terminalId: reusedTerminalId,
                   createdAt,
-                  effectiveResumeSessionId: resumeSessionId,
                 })
                 if (!sent) {
                   return false
@@ -1900,7 +2261,7 @@ export class WsHandler {
                   ...(m.cwd ? { cwd: m.cwd } : {}),
                   mode: m.mode as TerminalMode,
                   reused: true,
-                  hasSessionRef: !!resumeSessionId,
+                  hasSessionRef,
                 })
                 this.broadcastTerminalsChanged()
                 return true
@@ -1915,7 +2276,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -1923,23 +2284,31 @@ export class WsHandler {
                 this.forgetCreatedRequestId(m.requestId)
               }
 
-              if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
+                  return
+                }
+              }
+
+              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
-                  effectiveResumeSessionId,
+                  canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -1959,7 +2328,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -1967,7 +2336,7 @@ export class WsHandler {
               }
 
               // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
-              if (!m.restore) {
+              if (!restoreRequested) {
                 const now = Date.now()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
                   (t) => now - t < this.config.terminalCreateRateWindowMs
@@ -1983,23 +2352,31 @@ export class WsHandler {
 
               // Re-check session ownership after async config loading in case another request
               // created or repaired a matching running session while we were waiting.
-              if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
+              if (localLiveTerminalId) {
+                const liveTerminal = this.registry.get(localLiveTerminalId)
+                if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
+                  return
+                }
+              }
+
+              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
-                  effectiveResumeSessionId,
+                  canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
-                    effectiveResumeSessionId,
+                    canonicalSessionId,
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -2007,12 +2384,12 @@ export class WsHandler {
               // Session repair is Claude-specific (uses JSONL session files).
               // Other providers (codex, opencode, etc.) don't use the same file
               // structure, so this block correctly remains gated on mode === 'claude'.
-              if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
-                const sessionId = effectiveResumeSessionId
+              if (m.mode === 'claude' && restoreSessionId && isValidClaudeSessionId(restoreSessionId) && this.sessionRepairService) {
+                const sessionId = restoreSessionId
                 const cached = this.sessionRepairService.getResult(sessionId)
                 if (cached?.status === 'missing') {
                   log.info({ sessionId, connectionId: ws.connectionId }, 'Session previously marked missing; resume will start fresh')
-                  effectiveResumeSessionId = undefined
+                  restoreSessionId = undefined
                 } else {
                   // Reserve requestId to prevent same-socket duplicate creates during async repair wait.
                   state.createdByRequestId.set(m.requestId, REPAIR_PENDING_SENTINEL)
@@ -2026,13 +2403,31 @@ export class WsHandler {
                     endRepairTimer({ status: result.status })
                     if (result.status === 'missing') {
                       log.info({ sessionId, connectionId: ws.connectionId }, 'Session file missing; resume will start fresh')
-                      effectiveResumeSessionId = undefined
+                      restoreSessionId = undefined
                     }
                   } catch (err) {
                     endRepairTimer({ error: err instanceof Error ? err.message : String(err) })
                     log.debug({ err, sessionId, connectionId: ws.connectionId }, 'Session repair wait failed, proceeding with resume')
                   }
                 }
+              }
+
+              if (m.mode === 'opencode' && restoreRequested && !canonicalSessionId) {
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'OpenCode restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
+              if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(restoreSessionId)) {
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'Claude restore requires a canonical durable session id',
+                  requestId: m.requestId,
+                })
+                return
               }
 
               // After async repair wait, check if the client disconnected
@@ -2048,178 +2443,137 @@ export class WsHandler {
               log.debug({
                 requestId: m.requestId,
                 connectionId: ws.connectionId,
-                originalResumeSessionId: m.resumeSessionId,
-                effectiveResumeSessionId,
-              }, '[TRACE resumeSessionId] about to create terminal')
+                sessionRef: requestedSessionRef,
+                restoreSessionId,
+              }, '[TRACE sessionRef] about to create terminal')
 
               const requestedCodexResumeSessionId = m.mode === 'codex'
-                ? effectiveResumeSessionId
+                ? canonicalSessionId
                 : undefined
-              this.assertTerminalCreateAccepted()
-              const codexPlan = m.mode === 'codex'
-                ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
+              let codexPlan: Awaited<ReturnType<WsHandler['planCodexLaunch']>> | undefined
+              const preallocatedTerminalId = nanoid()
+              const terminalEnvContext = { tabId: m.tabId, paneId: m.paneId }
+              const codexLaunchFactory = m.mode === 'codex'
+                ? this.createCodexLaunchFactory(providerSettings)
                 : undefined
-              pendingCodexPlan = codexPlan
+              try {
+                codexPlan = m.mode === 'codex'
+                  ? await this.planCodexLaunchWithRetry(
+                    m.cwd,
+                    requestedCodexResumeSessionId,
+                    providerSettings,
+                    preallocatedTerminalId,
+                    terminalEnvContext,
+                    m.requestId,
+                  )
+                  : undefined
 
-              if (codexPlan) {
-                effectiveResumeSessionId = codexPlan.sessionId
-              }
-              this.assertTerminalCreateAccepted()
-
-              const codexRecovery = codexPlan
-                ? {
-                    planCreate: (input: { cwd?: string; resumeSessionId: string }) =>
-                      this.planCodexLaunch(input.cwd ?? m.cwd, input.resumeSessionId, providerSettings),
-                  }
-                : undefined
-
-              const spawnProviderSettings = (
-                providerSettings
-                  ? {
-                    ...(m.mode === 'codex'
-                      ? {}
-                      : {
-                        permissionMode: providerSettings.permissionMode,
-                        model: providerSettings.model,
-                        sandbox: providerSettings.sandbox,
-                      }),
-                    ...(m.mode === 'opencode'
-                      ? { opencodeServer: await allocateLocalhostPort() }
-                      : {}),
-                    ...(codexPlan ? {
-                      codexAppServer: {
-                        ...codexPlan.remote,
-                        sidecar: codexPlan.sidecar,
-                        recovery: codexRecovery,
-                        deferLifecycleUntilPublished: true,
-                      },
-                    } : {}),
-                  }
-                  : (codexPlan
+                const spawnProviderSettings = (
+                  providerSettings
                     ? {
-                      codexAppServer: {
-                        ...codexPlan.remote,
-                        sidecar: codexPlan.sidecar,
-                        recovery: codexRecovery,
-                        deferLifecycleUntilPublished: true,
-                      },
+                      ...(m.mode === 'codex'
+                        ? {}
+                        : {
+                          permissionMode: providerSettings.permissionMode,
+                          model: providerSettings.model,
+                          sandbox: providerSettings.sandbox,
+                        }),
+                      ...(m.mode === 'opencode'
+                        ? { opencodeServer: await allocateLocalhostPort() }
+                        : {}),
+                      ...(codexPlan ? { codexAppServer: codexPlan.remote } : {}),
                     }
-                    : undefined)
-              )
+                    : (codexPlan
+                      ? { codexAppServer: codexPlan.remote }
+                      : undefined)
+                )
 
-              this.assertTerminalCreateAccepted()
-              const record = this.registry.create({
-                mode: m.mode as TerminalMode,
-                shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
-                cwd: m.cwd,
-                resumeSessionId: effectiveResumeSessionId,
-                ...(codexPlan
-                  ? {
-                      sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
-                    }
-                  : {}),
-                envContext: { tabId: m.tabId, paneId: m.paneId },
-                providerSettings: spawnProviderSettings,
-              })
-              terminalId = record.terminalId
-              this.assertTerminalCreateAccepted()
-              if (codexPlan) {
-                await codexPlan.sidecar.adopt({ terminalId: record.terminalId, generation: 0 })
-                this.assertTerminalCreateAccepted()
-                if (requestedCodexResumeSessionId) {
-                  await codexPlan.sidecar.waitForLoadedThread(requestedCodexResumeSessionId)
-                  this.assertTerminalCreateAccepted()
+                const record = this.registry.create({
+                  terminalId: preallocatedTerminalId,
+                  mode: m.mode as TerminalMode,
+                  shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
+                  cwd: m.cwd,
+                  resumeSessionId: restoreSessionId,
+                  ...(requestedCodexResumeSessionId
+                    ? {
+                        sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
+                      }
+                    : {}),
+                  envContext: terminalEnvContext,
+                  providerSettings: spawnProviderSettings,
+                  ...(m.mode === 'codex' ? { codexLaunchBaseProviderSettings: providerSettings } : {}),
+                  ...(codexPlan ? { codexSidecar: codexPlan.sidecar } : {}),
+                  ...(codexLaunchFactory ? { codexLaunchFactory } : {}),
+                })
+                if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
+                  const recentDirectory = m.cwd.trim()
+                  void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
+                    log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                  })
                 }
-                assertCodexCreateTerminalRunning(record)
-                this.assertTerminalCreateAccepted()
-                this.registry.publishCodexSidecar?.(record.terminalId)
-                pendingCodexPlan = undefined
-                if (effectiveResumeSessionId) {
+
+                state.createdByRequestId.set(m.requestId, record.terminalId)
+                this.rememberCreatedRequestId(m.requestId, record.terminalId)
+                terminalId = record.terminalId
+
+                const sent = await sendCreateResult({
+                  ws,
+                  requestId: m.requestId,
+                  terminalId: record.terminalId,
+                  createdAt: record.createdAt,
+                })
+                if (!sent) {
+                  // Terminal may still exist even if created delivery failed (for
+                  // example: socket closed after create). Broadcast inventory so
+                  // other clients can discover it.
+                  this.broadcastTerminalsChanged()
+                  return
+                }
+
+                const observedCodexSessionId = m.mode === 'codex'
+                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
+                  : undefined
+                if (observedCodexSessionId) {
                   recordSessionLifecycleEvent({
                     kind: 'codex_durable_session_observed',
                     provider: 'codex',
                     terminalId: record.terminalId,
-                    sessionId: effectiveResumeSessionId,
+                    sessionId: observedCodexSessionId,
                     generation: 0,
                     source: 'sidecar',
                   })
                 }
-              }
-              this.assertTerminalCreateAccepted()
-
-              if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
-                const recentDirectory = m.cwd.trim()
-                void configStore.pushRecentDirectory(recentDirectory).catch((err) => {
-                  log.warn({ err, recentDirectory }, 'Failed to record recent directory')
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: record.terminalId,
+                  ...(m.tabId ? { tabId: m.tabId } : {}),
+                  ...(m.paneId ? { paneId: m.paneId } : {}),
+                  ...(m.cwd ? { cwd: m.cwd } : {}),
+                  mode: m.mode as TerminalMode,
+                  reused: false,
+                  hasSessionRef: !!observedCodexSessionId || !!restoreSessionId || !!requestedSessionRef,
                 })
-              }
 
-              state.createdByRequestId.set(m.requestId, record.terminalId)
-              this.rememberCreatedRequestId(m.requestId, record.terminalId)
-
-              const sent = await sendCreateResult({
-                ws,
-                requestId: m.requestId,
-                terminalId: record.terminalId,
-                createdAt: record.createdAt,
-                effectiveResumeSessionId,
-              })
-              if (!sent) {
-                // Terminal may still exist even if created delivery failed (for
-                // example: socket closed after create). Broadcast inventory so
-                // other clients can discover it.
+                // Notify all clients that list changed
                 this.broadcastTerminalsChanged()
-                return
+              } catch (error) {
+                await codexPlan?.sidecar.shutdown().catch(() => undefined)
+                throw error
               }
-
-              recordSessionLifecycleEvent({
-                kind: 'terminal_created',
-                requestId: m.requestId,
-                connectionId: ws.connectionId || 'unknown',
-                terminalId: record.terminalId,
-                ...(m.tabId ? { tabId: m.tabId } : {}),
-                ...(m.paneId ? { paneId: m.paneId } : {}),
-                ...(m.cwd ? { cwd: m.cwd } : {}),
-                mode: m.mode as TerminalMode,
-                reused: false,
-                hasSessionRef: !!effectiveResumeSessionId,
-              })
-
-              // Notify all clients that list changed
-              this.broadcastTerminalsChanged()
             },
           )
         } catch (err: any) {
           error = true
-          const cleanupErrors: string[] = []
-          const cleanupTerminalId = terminalId ?? terminalIdFromCreateError(err)
-          if (typeof cleanupTerminalId === 'string') {
-            await this.registry.killAndWait(cleanupTerminalId).catch((killErr) => {
-              cleanupErrors.push(`created terminal cleanup failed: ${errorMessage(killErr)}`)
-              log.warn({ err: killErr, terminalId: cleanupTerminalId }, 'terminal.create cleanup failed')
-            })
-          }
-          if (pendingCodexPlan) {
-            await pendingCodexPlan.sidecar.shutdown().catch((shutdownErr) => {
-              cleanupErrors.push(`Codex sidecar cleanup failed: ${errorMessage(shutdownErr)}`)
-              log.warn({ err: shutdownErr }, 'terminal.create pending Codex sidecar cleanup failed')
-            })
-          }
-          const errorMessageText = cleanupErrors.length > 0
-            ? `${err?.message || 'Failed to spawn PTY'}; cleanup failed: ${cleanupErrors.join('; ')}`
-            : err?.message || 'Failed to spawn PTY'
           // Clean up repair sentinel if terminal creation failed
           if (state.createdByRequestId.get(m.requestId) === REPAIR_PENDING_SENTINEL) {
             state.createdByRequestId.delete(m.requestId)
           }
           log.warn({ err, connectionId: ws.connectionId }, 'terminal.create failed')
           this.sendError(ws, {
-            code: err instanceof CodexLaunchConfigError
-              ? 'INVALID_MESSAGE'
-              : err instanceof TerminalCreateAdmissionError
-                ? 'INTERNAL_ERROR'
-                : 'PTY_SPAWN_FAILED',
-            message: errorMessageText,
+            code: err instanceof CodexLaunchConfigError ? 'INVALID_MESSAGE' : 'PTY_SPAWN_FAILED',
+            message: err?.message || 'Failed to spawn PTY',
             requestId: m.requestId,
           })
         } finally {
@@ -2323,7 +2677,7 @@ export class WsHandler {
               terminalId: m.terminalId,
               connectionId: ws.connectionId || 'unknown',
               operation: 'terminal.input',
-              attemptedInputBytes: typeof m.data === 'string' ? Buffer.byteLength(m.data) : 0,
+              attemptedInputBytes: Buffer.byteLength(m.data),
             })
           }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
@@ -2348,25 +2702,16 @@ export class WsHandler {
       }
 
       case 'terminal.kill': {
-        let ok: boolean
-        try {
-          ok = await this.registry.killAndWait(m.terminalId)
-        } catch (err) {
-          log.warn({ err, terminalId: m.terminalId, connectionId: ws.connectionId }, 'terminal.kill failed')
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: `Failed to kill terminal: ${errorMessage(err)}`,
-            terminalId: m.terminalId,
-          })
-          return
-        }
+        const ok = this.registry.kill(m.terminalId)
         if (!ok) {
-          recordSessionLifecycleEvent({
-            kind: 'invalid_terminal_id_without_session_ref',
-            terminalId: m.terminalId,
-            connectionId: ws.connectionId || 'unknown',
-            operation: 'terminal.kill',
-          })
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.kill',
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -2422,36 +2767,84 @@ export class WsHandler {
           })
           return
         }
-        for (const record of m.records) {
-          await this.tabsRegistryStore.upsert({
-            ...record,
-            serverInstanceId: this.serverInstanceId,
+        try {
+          const result = await this.tabsRegistryStore.replaceClientSnapshot({
             deviceId: m.deviceId,
             deviceLabel: m.deviceLabel,
+            clientInstanceId: m.clientInstanceId,
+            snapshotRevision: m.snapshotRevision,
+            records: m.records.map((record: TabsSyncPushRecord) => ({
+              ...record,
+              serverInstanceId: this.serverInstanceId,
+              deviceId: m.deviceId,
+              deviceLabel: m.deviceLabel,
+            })),
+          })
+          this.send(ws, {
+            type: 'tabs.sync.ack',
+            accepted: result.accepted,
+            openRecords: result.openRecords,
+            closedRecords: result.closedRecords,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
           })
         }
-        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
+        return
+      }
+
+      case 'tabs.sync.client.retire': {
+        if (!this.tabsRegistryStore) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
+          })
+          return
+        }
+        try {
+          await this.tabsRegistryStore.retireClientSnapshot({
+            deviceId: m.deviceId,
+            clientInstanceId: m.clientInstanceId,
+            snapshotRevision: m.snapshotRevision,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
         return
       }
 
       case 'tabs.sync.query': {
         if (!this.tabsRegistryStore) {
-          this.send(ws, {
-            type: 'tabs.sync.snapshot',
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
             requestId: m.requestId,
-            data: { localOpen: [], remoteOpen: [], closed: [] },
           })
           return
         }
-        const data = await this.tabsRegistryStore.query({
-          deviceId: m.deviceId,
-          rangeDays: m.rangeDays,
-        })
-        this.send(ws, {
-          type: 'tabs.sync.snapshot',
-          requestId: m.requestId,
-          data,
-        })
+        try {
+          const data = await this.tabsRegistryStore.query({
+            deviceId: m.deviceId,
+            clientInstanceId: m.clientInstanceId,
+            closedTabRetentionDays: m.closedTabRetentionDays,
+          })
+          this.send(ws, {
+            type: 'tabs.sync.snapshot',
+            requestId: m.requestId,
+            data,
+          })
+        } catch (error) {
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: error instanceof Error ? error.message : String(error),
+            requestId: m.requestId,
+          })
+        }
         return
       }
 
@@ -2810,6 +3203,260 @@ export class WsHandler {
         return
       }
 
+      case 'freshAgent.create': {
+        const freshAgentRuntimeManager = this.freshAgentRuntimeManager
+        if (!freshAgentRuntimeManager) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: 'Fresh-agent runtime not enabled',
+            retryable: true,
+          } as const)
+          return
+        }
+        const provider = m.provider ?? resolveFreshAgentRuntimeProvider(m.sessionType)
+        if (!provider) {
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code: 'FRESH_AGENT_RUNTIME_UNAVAILABLE',
+            message: `No runtime provider is registered for ${m.sessionType}`,
+            retryable: false,
+          } as const)
+          return
+        }
+        try {
+          await this.withFreshAgentCreateLock(`request:${m.requestId}`, async () => {
+            const cached = this.resolveCreatedFreshAgentSession(m.requestId)
+            if (cached) {
+              if (cached.sessionType !== m.sessionType || cached.runtimeProvider !== provider) {
+                this.send(ws, {
+                  type: 'freshAgent.create.failed',
+                  requestId: m.requestId,
+                  code: 'FRESH_AGENT_CREATE_REQUEST_CONFLICT',
+                  message: `freshAgent.create request ${m.requestId} already belongs to ${cached.sessionType}/${cached.runtimeProvider}`,
+                  retryable: false,
+                } as const)
+                return
+              }
+              this.send(ws, {
+                type: 'freshAgent.created',
+                requestId: m.requestId,
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+                runtimeProvider: cached.runtimeProvider,
+                sessionRef: cached.sessionRef,
+              } as const)
+              this.registerClientFreshAgentSession(ws, state, {
+                sessionId: cached.sessionId,
+                sessionType: cached.sessionType,
+                provider: cached.runtimeProvider,
+              })
+              return
+            }
+
+            const created = await freshAgentRuntimeManager.create({
+              requestId: m.requestId,
+              sessionType: m.sessionType,
+              provider,
+              cwd: m.cwd,
+              resumeSessionId: m.resumeSessionId,
+              sessionRef: m.sessionRef,
+              model: m.model,
+              modelSelection: m.modelSelection,
+              permissionMode: m.permissionMode,
+              sandbox: m.sandbox,
+              effort: m.effort,
+              plugins: m.plugins,
+            })
+            this.rememberCreatedFreshAgentSession(m.requestId, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
+            })
+            this.send(ws, {
+              type: 'freshAgent.created',
+              requestId: m.requestId,
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+              runtimeProvider: created.runtimeProvider,
+              sessionRef: created.sessionRef,
+            } as const)
+            this.registerClientFreshAgentSession(ws, state, {
+              sessionId: created.sessionId,
+              sessionType: created.sessionType,
+              provider: created.runtimeProvider,
+            })
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to create fresh-agent session'
+          const code = error && typeof error === 'object' && 'code' in error
+            ? String((error as { code?: unknown }).code)
+            : 'FRESH_AGENT_CREATE_FAILED'
+          this.send(ws, {
+            type: 'freshAgent.create.failed',
+            requestId: m.requestId,
+            code,
+            message,
+            retryable: true,
+          } as const)
+        }
+        return
+      }
+
+      case 'freshAgent.attach': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        try {
+          const attached = this.freshAgentRuntimeManager.attach({
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+          })
+          this.registerClientFreshAgentSession(ws, state, {
+            sessionId: attached.sessionId,
+            sessionType: attached.sessionType,
+            provider: attached.runtimeProvider,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to attach fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.send': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.send(locator, {
+            text: m.text,
+            images: m.images?.map((image: { mediaType: string; data: string }) => ({ kind: 'data' as const, ...image })),
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to send fresh-agent message'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.interrupt': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.interrupt(locator)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to interrupt fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.approval.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.resolveApproval(locator, m.requestId, m.decision)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to resolve fresh-agent approval'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.question.respond': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.answerQuestion(locator, m.requestId, m.answers)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to answer fresh-agent question'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.kill': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          const killed = await this.freshAgentRuntimeManager.kill(locator)
+          this.clearFreshAgentCreateCachesForSession(locator)
+          this.clearClientFreshAgentSession(state, locator)
+          this.send(ws, {
+            type: 'freshAgent.killed',
+            sessionId: m.sessionId,
+            sessionType: m.sessionType,
+            provider: m.provider,
+            success: killed,
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to kill fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
+      case 'freshAgent.fork': {
+        if (!this.freshAgentRuntimeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Fresh-agent runtime not enabled' })
+          return
+        }
+        const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!state.freshAgentSessions.has(makeFreshAgentSessionKey(locator))) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this fresh-agent session' })
+          return
+        }
+        try {
+          await this.freshAgentRuntimeManager.fork(locator, m.input)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to fork fresh-agent session'
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message })
+        }
+        return
+      }
+
       case 'sdk.send': {
         if (!this.sdkBridge) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
@@ -3156,8 +3803,76 @@ export class WsHandler {
     }
   }
 
-  broadcastUiCommand(command: { command: string; payload?: any }) {
-    this.broadcast({ type: 'ui.command', ...command })
+  private authenticatedUiConnections(): LiveWebSocket[] {
+    return [...this.connections].filter((ws) => {
+      if (ws.readyState !== WebSocket.OPEN) return false
+      return !!this.clientStates.get(ws)?.authenticated
+    })
+  }
+
+  private uiCommandKey(command: UiCommand): string {
+    return JSON.stringify(command)
+  }
+
+  private queueUiCommand(command: UiCommand, now = Date.now()): void {
+    const key = this.uiCommandKey(command)
+    this.pendingUiCommands = this.pendingUiCommands.filter((item) => (
+      item.expiresAt > now && this.uiCommandKey(item.command) !== key
+    ))
+    this.pendingUiCommands.push({ command, expiresAt: now + UI_COMMAND_REPLAY_TTL_MS })
+  }
+
+  private flushPendingUiCommands(target?: LiveWebSocket): void {
+    const now = Date.now()
+    const pending = this.pendingUiCommands.filter((item) => item.expiresAt > now)
+    this.pendingUiCommands = []
+    if (!pending.length) return
+
+    const targets = target ? [target] : this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.pendingUiCommands.push(...pending)
+      return
+    }
+
+    for (const item of pending) {
+      for (const ws of targets) {
+        if (ws.readyState === WebSocket.OPEN) {
+          this.send(ws, { type: 'ui.command', ...item.command })
+        }
+      }
+    }
+  }
+
+  broadcastUiCommand(command: UiCommand) {
+    const targets = this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.queueUiCommand(command)
+      return
+    }
+
+    for (const ws of targets) {
+      this.send(ws, { type: 'ui.command', ...command })
+    }
+  }
+
+  broadcastUiCommandWithReplay(command: UiCommand) {
+    const now = Date.now()
+    const targets = this.authenticatedUiConnections()
+    if (!targets.length) {
+      this.queueUiCommand(command, now)
+      return
+    }
+
+    const hasRecentTarget = targets.some((ws) => (
+      typeof ws.connectedAt === 'number' && now - ws.connectedAt <= UI_COMMAND_RECENT_CONNECTION_MS
+    ))
+    if (!hasRecentTarget) {
+      this.queueUiCommand(command, now)
+    }
+
+    for (const ws of targets) {
+      this.send(ws, { type: 'ui.command', ...command })
+    }
   }
 
   broadcastSessionsChanged(revision: number): void {
@@ -3222,6 +3937,20 @@ export class WsHandler {
     this.broadcastAuthenticated(parsed.data)
   }
 
+  broadcastTerminalTurnComplete(msg: Omit<TerminalTurnCompleteMessage, 'type'>): void {
+    const parsed = TerminalTurnCompleteSchema.safeParse({
+      type: 'terminal.turn.complete',
+      ...msg,
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid terminal.turn.complete payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
   /**
    * Prepare for hot rebind: close all client connections and set the closed
    * flag so the patched server.close() → this.close() is a no-op.
@@ -3280,6 +4009,7 @@ export class WsHandler {
       off?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.off?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.off?.('terminal.status', this.onTerminalStatusBound)
 
     if (this.sessionRepairService && this.sessionRepairListeners) {
       this.sessionRepairService.off('scanned', this.sessionRepairListeners.scanned)

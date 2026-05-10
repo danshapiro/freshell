@@ -19,7 +19,7 @@
     "supportsModel": true,
     "terminalBehavior": {
       "preferredRenderer": "canvas",
-      "scrollInputPolicy": "fallbackToCursorKeysWhenAltScreenMouseCapture"
+      "scrollInputPolicy": "native"
     }
   },
   "picker": {

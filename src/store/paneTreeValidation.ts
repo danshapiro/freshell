@@ -53,6 +53,38 @@ function isPaneContentShape(content: unknown): boolean {
         && (content.viewMode === 'source' || content.viewMode === 'preview')
     case 'picker':
       return true
+    case 'fresh-agent': {
+      const isFreshAgentEffortValid = content.provider === 'claude'
+        ? (content.effort === undefined || (typeof content.effort === 'string' && content.effort.length > 0))
+        : (content.effort === undefined
+          || content.effort === 'none' || content.effort === 'minimal' || content.effort === 'low'
+          || content.effort === 'medium' || content.effort === 'high' || content.effort === 'xhigh'
+          || content.effort === 'max')
+      const hasSessionRef = content.sessionRef !== undefined
+        && (typeof content.sessionRef === 'object' || !!(content.sessionRef as object))
+      const hasRestoreError = content.restoreError !== undefined
+      return typeof content.sessionType === 'string'
+        && typeof content.provider === 'string'
+        && typeof content.createRequestId === 'string'
+        && typeof content.status === 'string'
+        && isOptionalString(content.sessionId)
+        && isOptionalString(content.resumeSessionId)
+        && isOptionalString(content.initialCwd)
+        && isOptionalString(content.model)
+        && isOptionalString(content.permissionMode)
+        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
+        && (content.sandbox === undefined
+          || content.sandbox === 'read-only'
+          || content.sandbox === 'workspace-write'
+          || content.sandbox === 'danger-full-access')
+        && isFreshAgentEffortValid
+        && isSessionRefShape(content.sessionRef)
+        && isRestoreErrorShape(content.restoreError)
+        && !(hasSessionRef && hasRestoreError)
+        && (content.plugins === undefined
+          || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
+        && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
+    }
     case 'agent-chat':
       return typeof content.provider === 'string'
         && typeof content.createRequestId === 'string'

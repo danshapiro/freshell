@@ -20,7 +20,15 @@ type TimelineCursorPayload = {
 
 type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
 
+export type AgentTimelineSnapshot = {
+  sessionId: string
+  latestTurnId: string | null
+  revision: number
+  turns: CanonicalTurn[]
+}
+
 export type AgentTimelineService = {
+  getSnapshot: (query: { sessionId: string; revision?: number; signal?: AbortSignal }) => Promise<AgentTimelineSnapshot>
   getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
   getTurnBody: (query: AgentTimelineTurnBodyQuery & { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
 }
@@ -134,6 +142,30 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
   }
 
   return {
+    async getSnapshot({ sessionId, revision, signal }) {
+      throwIfAborted(signal)
+      const timeline = await loadTimeline(sessionId)
+      throwIfAborted(signal)
+      if (revision != null && revision !== timeline.revision) {
+        throw new RestoreStaleRevisionError(revision, timeline.revision)
+      }
+      return {
+        sessionId: timeline.sessionId,
+        latestTurnId: timeline.latestTurnId,
+        revision: timeline.revision,
+        turns: timeline.records
+          .slice()
+          .reverse()
+          .map((record) => ({
+            turnId: record.turnId,
+            messageId: record.messageId,
+            ordinal: record.ordinal,
+            source: record.source,
+            message: record.message,
+          })),
+      }
+    },
+
     async getTimelinePage(query) {
       throwIfAborted(query.signal)
       if (query.revision == null) {

@@ -1,7 +1,18 @@
+import path from 'node:path'
 import { EventEmitter } from 'events'
 import { z } from 'zod'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import { logger } from '../logger.js'
+import { defaultOpencodeDataHome } from './providers/opencode.js'
+import {
+  confirmOpencodeAssociation,
+  createOpencodeOwnershipState,
+  reduceOpencodeOwnership,
+  rejectOpencodeAssociation,
+  type OpencodeObservation,
+  type OpencodeOwnershipAction,
+  type OpencodeOwnershipState,
+} from './opencode-ownership-reducer.js'
 
 export const OPENCODE_HEALTH_POLL_MS = 200
 // Applies per health-wait cycle; connection failures restart the cycle after backoff.
@@ -21,6 +32,17 @@ export type OpencodeActivityRecord = {
 export type OpencodeActivityChange = {
   upsert: OpencodeActivityRecord[]
   remove: string[]
+}
+
+export type OpencodeAssociationRequestedEvent = {
+  terminalId: string
+  sessionId: string
+}
+
+export type OpencodeTurnCompleteEvent = {
+  terminalId: string
+  sessionId: string
+  at: number
 }
 
 const SessionIdleStatusSchema = z.object({
@@ -62,10 +84,22 @@ const SessionIdleEventSchema = z.object({
   }).passthrough(),
 }).passthrough()
 
+const SessionCreatedEventSchema = z.object({
+  type: z.literal('session.created'),
+  properties: z.object({
+    sessionID: z.string().min(1),
+    info: z.object({
+      id: z.string().min(1),
+      parentID: z.string().nullable().optional(),
+    }).passthrough(),
+  }).passthrough(),
+}).passthrough()
+
 const OpencodeEventSchema = z.discriminatedUnion('type', [
   ServerConnectedEventSchema,
   SessionStatusEventSchema,
   SessionIdleEventSchema,
+  SessionCreatedEventSchema,
 ])
 
 const OpencodeEventTypeSchema = z.object({
@@ -76,6 +110,7 @@ const KNOWN_OPENCODE_EVENT_TYPES = new Set<z.infer<typeof OpencodeEventSchema>['
   'server.connected',
   'session.status',
   'session.idle',
+  'session.created',
 ])
 
 type FetchLike = typeof fetch
@@ -92,6 +127,13 @@ type MonitorState = {
   reconnectDelayMs: number
   reconnectTimer?: ReturnType<typeof setTimeout>
   reconnectResolve?: () => void
+  ownership: OpencodeOwnershipState
+  lastSnapshot?: {
+    cycleId: number
+    streamId: number
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>
+    at: number
+  }
 }
 
 function createAbortError(): Error {
@@ -148,30 +190,19 @@ function parseOpencodeEvent(data: string): z.infer<typeof OpencodeEventSchema> |
   return parsedEvent.data
 }
 
-function extractBusySessionId(
-  snapshot: Record<string, z.infer<typeof SessionStatusSchema>>,
-  currentSessionId?: string,
-): string | undefined {
-  const busySessionIds = Object.entries(snapshot)
-    .filter(([, status]) => status.type !== 'idle')
-    .map(([sessionId]) => sessionId)
-    .sort()
-  if (busySessionIds.length === 0) return undefined
-  if (currentSessionId && busySessionIds.includes(currentSessionId)) {
-    return currentSessionId
-  }
-  return busySessionIds[0]
-}
-
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
   private readonly monitors = new Map<string, MonitorState>()
+  private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly fetchImpl: FetchLike
   private readonly log: TrackerLogger
   private readonly now: () => number
   private readonly setTimeoutFn: typeof setTimeout
   private readonly clearTimeoutFn: typeof clearTimeout
   private readonly random: () => number
+  private readonly dbPath?: string
+  private nextCycleId = 0
+  private nextStreamId = 0
 
   constructor(input: {
     fetchImpl?: FetchLike
@@ -180,6 +211,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     setTimeoutFn?: typeof setTimeout
     clearTimeoutFn?: typeof clearTimeout
     random?: () => number
+    homeDir?: string
   } = {}) {
     super()
     this.fetchImpl = input.fetchImpl ?? fetch
@@ -188,6 +220,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.setTimeoutFn = input.setTimeoutFn ?? setTimeout
     this.clearTimeoutFn = input.clearTimeoutFn ?? clearTimeout
     this.random = input.random ?? Math.random
+    const homeDir = input.homeDir ?? defaultOpencodeDataHome()
+    this.dbPath = path.join(homeDir, 'opencode.db')
   }
 
   list(): OpencodeActivityRecord[] {
@@ -198,7 +232,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     return this.records.get(terminalId)
   }
 
-  trackTerminal(input: { terminalId: string; endpoint: OpencodeServerEndpoint }): void {
+  trackTerminal(input: { terminalId: string; endpoint: OpencodeServerEndpoint; sessionId?: string }): void {
     const existing = this.monitors.get(input.terminalId)
     if (
       existing
@@ -206,6 +240,8 @@ export class OpencodeActivityTracker extends EventEmitter {
       && existing.endpoint.port === input.endpoint.port
       && !existing.disposed
     ) {
+      existing.ownership = createOpencodeOwnershipState(input.sessionId)
+      this.childSessionIds.delete(input.terminalId)
       return
     }
 
@@ -216,8 +252,12 @@ export class OpencodeActivityTracker extends EventEmitter {
       endpoint: input.endpoint,
       disposed: false,
       reconnectDelayMs: OPENCODE_RECONNECT_BASE_MS,
+      ownership: createOpencodeOwnershipState(input.sessionId),
     }
     this.monitors.set(input.terminalId, monitor)
+    if (input.sessionId) {
+      void this.seedFromDb(monitor, [input.sessionId])
+    }
     void this.runMonitor(monitor)
   }
 
@@ -225,6 +265,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     const monitor = this.monitors.get(input.terminalId)
     if (monitor) {
       monitor.disposed = true
+      monitor.lastSnapshot = undefined
       monitor.controller?.abort()
       if (monitor.reconnectTimer) {
         this.clearTimeoutFn(monitor.reconnectTimer)
@@ -234,6 +275,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       monitor.reconnectResolve = undefined
       this.monitors.delete(input.terminalId)
     }
+    this.childSessionIds.delete(input.terminalId)
     this.removeRecord(input.terminalId)
   }
 
@@ -247,11 +289,11 @@ export class OpencodeActivityTracker extends EventEmitter {
     while (!monitor.disposed) {
       const controller = new AbortController()
       monitor.controller = controller
+      const cycleId = ++this.nextCycleId
       try {
         await this.waitForHealth(monitor, controller.signal)
-        await this.refreshSnapshot(monitor, controller.signal)
         monitor.reconnectDelayMs = OPENCODE_RECONNECT_BASE_MS
-        await this.consumeEvents(monitor, controller.signal)
+        await this.consumeEvents(monitor, cycleId, controller.signal)
       } catch (error) {
         if (monitor.disposed || isAbortError(error)) {
           return
@@ -294,7 +336,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private async refreshSnapshot(monitor: MonitorState, signal: AbortSignal): Promise<void> {
+  private async refreshSnapshot(
+    monitor: MonitorState,
+    cycleId: number,
+    streamId: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     const response = await this.fetchImpl(this.buildUrl(monitor.endpoint, '/session/status'), {
       signal,
     })
@@ -307,22 +354,29 @@ export class OpencodeActivityTracker extends EventEmitter {
       throw new Error('OpenCode session status response did not match the expected schema.')
     }
 
-    const current = this.records.get(monitor.terminalId)
-    const busySessionId = extractBusySessionId(parsed.data, current?.sessionId)
-    if (!busySessionId) {
-      this.removeRecord(monitor.terminalId)
-      return
+    const activeSessionIds = Object.keys(parsed.data)
+    void this.resyncFromDb(monitor, activeSessionIds)
+
+    const children = this.childSessionIds.get(monitor.terminalId)
+    const filtered: Record<string, z.infer<typeof SessionStatusSchema>> = {}
+    for (const [sessionId, status] of Object.entries(parsed.data)) {
+      if (!children?.has(sessionId)) {
+        filtered[sessionId] = status
+      }
     }
 
-    this.upsertRecord({
-      terminalId: monitor.terminalId,
-      sessionId: busySessionId,
-      phase: 'busy',
-      updatedAt: this.now(),
+    const at = this.now()
+    monitor.lastSnapshot = { cycleId, streamId, statuses: parsed.data, at }
+    this.observe(monitor, {
+      kind: 'snapshot',
+      cycleId,
+      streamId,
+      statuses: filtered,
+      at,
     })
   }
 
-  private async consumeEvents(monitor: MonitorState, signal: AbortSignal): Promise<void> {
+  private async consumeEvents(monitor: MonitorState, cycleId: number, signal: AbortSignal): Promise<void> {
     const response = await this.fetchImpl(this.buildUrl(monitor.endpoint, '/event'), {
       signal,
       headers: { accept: 'text/event-stream' },
@@ -335,6 +389,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     const decoder = new TextDecoder()
     const abortPromise = createAbortPromise(signal)
     let buffer = ''
+    let connected = false
+    const streamId = ++this.nextStreamId
 
     try {
       while (true) {
@@ -355,7 +411,13 @@ export class OpencodeActivityTracker extends EventEmitter {
         while (separatorIndex >= 0) {
           const block = buffer.slice(0, separatorIndex)
           buffer = buffer.slice(separatorIndex + 2)
-          this.handleSseBlock(monitor.terminalId, block)
+          const event = this.parseSseBlock(monitor.terminalId, block)
+          if (event?.type === 'server.connected' && !connected) {
+            connected = true
+            await this.refreshSnapshot(monitor, cycleId, streamId, signal)
+          } else if (event && event.type !== 'server.connected') {
+            this.handleOpencodeEvent(monitor, cycleId, streamId, event)
+          }
           separatorIndex = buffer.indexOf('\n\n')
         }
       }
@@ -368,9 +430,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private handleSseBlock(terminalId: string, block: string): void {
+  private parseSseBlock(
+    terminalId: string,
+    block: string,
+  ): z.infer<typeof OpencodeEventSchema> | undefined {
     const data = parseSseData(block)
-    if (!data) return
+    if (!data) return undefined
 
     let event: z.infer<typeof OpencodeEventSchema> | undefined
     try {
@@ -382,26 +447,132 @@ export class OpencodeActivityTracker extends EventEmitter {
         endpoint,
         err: error,
       }, 'OpenCode event payload was invalid; skipping payload.')
+      return undefined
+    }
+
+    return event
+  }
+
+  private handleOpencodeEvent(
+    monitor: MonitorState,
+    cycleId: number,
+    streamId: number,
+    event: Exclude<z.infer<typeof OpencodeEventSchema>, { type: 'server.connected' }>,
+  ): void {
+    if (event.type === 'session.created') {
+      const parentId = event.properties.info.parentID
+      if (parentId) {
+        this.registerChildSession(monitor.terminalId, event.properties.sessionID)
+        if (monitor.lastSnapshot && monitor.ownership.kind === 'ambiguous') {
+          monitor.ownership = { ...monitor.ownership, knownSessionId: parentId }
+          const children = this.childSessionIds.get(monitor.terminalId)
+          const filtered: Record<string, z.infer<typeof SessionStatusSchema>> = {}
+          for (const [sessionId, status] of Object.entries(monitor.lastSnapshot.statuses)) {
+            if (!children?.has(sessionId)) {
+              filtered[sessionId] = status
+            }
+          }
+          this.observe(monitor, {
+            kind: 'snapshot',
+            cycleId: monitor.lastSnapshot.cycleId,
+            streamId: monitor.lastSnapshot.streamId,
+            statuses: filtered,
+            at: monitor.lastSnapshot.at,
+          })
+        }
+      }
       return
     }
 
-    if (!event) return
-    if (event.type === 'server.connected') return
+    const children = this.childSessionIds.get(monitor.terminalId)
+    if (children?.has(event.properties.sessionID)) {
+      if (event.type === 'session.idle') {
+        children.delete(event.properties.sessionID)
+      }
+      return
+    }
+
     if (event.type === 'session.idle') {
-      this.removeRecordForSession(terminalId, event.properties.sessionID)
-      return
-    }
-    if (event.properties.status.type === 'idle') {
-      this.removeRecordForSession(terminalId, event.properties.sessionID)
+      this.observe(monitor, {
+        kind: 'sse',
+        cycleId,
+        streamId,
+        sessionId: event.properties.sessionID,
+        status: 'idle',
+        at: this.now(),
+      })
       return
     }
 
-    this.upsertRecord({
-      terminalId,
+    this.observe(monitor, {
+      kind: 'sse',
+      cycleId,
+      streamId,
       sessionId: event.properties.sessionID,
-      phase: 'busy',
-      updatedAt: this.now(),
+      status: event.properties.status.type,
+      at: this.now(),
     })
+  }
+
+  confirmSessionAssociation(input: { terminalId: string; sessionId: string }): void {
+    const monitor = this.monitors.get(input.terminalId)
+    if (!monitor || monitor.disposed) return
+    const result = confirmOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
+
+  rejectSessionAssociation(input: { terminalId: string; sessionId: string }): void {
+    const monitor = this.monitors.get(input.terminalId)
+    if (!monitor || monitor.disposed) return
+    const result = rejectOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
+
+  private observe(monitor: MonitorState, observation: OpencodeObservation): void {
+    const result = reduceOpencodeOwnership(monitor.ownership, observation)
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
+
+  private applyActions(terminalId: string, actions: OpencodeOwnershipAction[]): void {
+    for (const action of actions) {
+      if (action.kind === 'activityUpsert') {
+        this.upsertRecord({
+          terminalId,
+          sessionId: action.sessionId,
+          phase: 'busy',
+          updatedAt: action.at,
+        })
+        continue
+      }
+      if (action.kind === 'activityRemove') {
+        this.removeRecord(terminalId)
+        continue
+      }
+      if (action.kind === 'requestAssociation') {
+        this.emit('association.requested', {
+          terminalId,
+          sessionId: action.sessionId,
+        } satisfies OpencodeAssociationRequestedEvent)
+        continue
+      }
+      if (action.kind === 'turnComplete') {
+        this.emit('turn.complete', {
+          terminalId,
+          sessionId: action.sessionId,
+          at: action.at,
+        } satisfies OpencodeTurnCompleteEvent)
+        continue
+      }
+      if (action.kind === 'warnAmbiguous') {
+        this.log.warn({
+          terminalId,
+          sessionIds: action.sessionIds,
+        }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
+      }
+    }
   }
 
   private async sleepWithBackoff(monitor: MonitorState): Promise<void> {
@@ -454,13 +625,6 @@ export class OpencodeActivityTracker extends EventEmitter {
     return `http://${endpoint.hostname}:${endpoint.port}${pathname}`
   }
 
-  private removeRecordForSession(terminalId: string, sessionId: string): void {
-    const existing = this.records.get(terminalId)
-    if (!existing) return
-    if (existing.sessionId && existing.sessionId !== sessionId) return
-    this.removeRecord(terminalId)
-  }
-
   private upsertRecord(record: OpencodeActivityRecord): void {
     const previous = this.records.get(record.terminalId)
     if (
@@ -484,5 +648,56 @@ export class OpencodeActivityTracker extends EventEmitter {
       upsert: [],
       remove: [terminalId],
     } satisfies OpencodeActivityChange)
+  }
+
+  private registerChildSession(terminalId: string, sessionId: string): void {
+    let children = this.childSessionIds.get(terminalId)
+    if (!children) {
+      children = new Set()
+      this.childSessionIds.set(terminalId, children)
+    }
+    children.add(sessionId)
+  }
+
+  private async resyncFromDb(monitor: MonitorState, activeSessionIds: string[]): Promise<void> {
+    if (!this.dbPath || activeSessionIds.length === 0) return
+    let sqlite: typeof import('node:sqlite') | undefined
+    let db: InstanceType<typeof import('node:sqlite').DatabaseSync> | undefined
+    try {
+      sqlite = await import('node:sqlite')
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true })
+      const placeholders = activeSessionIds.map(() => '?').join(',')
+      const rows = db.prepare(
+        `SELECT id, parent_id FROM session WHERE id IN (${placeholders}) AND parent_id IS NOT NULL`
+      ).all(...activeSessionIds) as Array<{ id: string; parent_id: string }>
+      for (const row of rows) {
+        this.registerChildSession(monitor.terminalId, row.id)
+      }
+    } catch {
+      // DB unavailable or node:sqlite not supported — children unfiltered in this snapshot
+    } finally {
+      db?.close()
+    }
+  }
+
+  private async seedFromDb(monitor: MonitorState, parentIds: string[]): Promise<void> {
+    if (!this.dbPath || parentIds.length === 0) return
+    let sqlite: typeof import('node:sqlite') | undefined
+    let db: InstanceType<typeof import('node:sqlite').DatabaseSync> | undefined
+    try {
+      sqlite = await import('node:sqlite')
+      db = new sqlite.DatabaseSync(this.dbPath, { readOnly: true })
+      const placeholders = parentIds.map(() => '?').join(',')
+      const rows = db.prepare(
+        `SELECT id FROM session WHERE parent_id IN (${placeholders}) AND time_archived IS NULL`
+      ).all(...parentIds) as Array<{ id: string }>
+      for (const row of rows) {
+        this.registerChildSession(monitor.terminalId, row.id)
+      }
+    } catch {
+      // DB unavailable — first snapshot will catch via resyncFromDb
+    } finally {
+      db?.close()
+    }
   }
 }

@@ -2,13 +2,19 @@ import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { hydratePanes } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
-import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
+import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
 import { parsePersistedLayoutRaw, LAYOUT_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
-import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
+import { collectLiveTerminalPaneIds } from './tabRecencyPruneMiddleware'
+import {
+  loadPersistedTabRecency,
+  mergeHydratedTabRecency,
+  prunePaneTabActivityToLiveTerminalPanes,
+} from './tabRecencySlice'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 
 type StoreLike = {
@@ -16,7 +22,7 @@ type StoreLike = {
   getState: () => any
 }
 
-const DEFAULT_SEARCH_RANGE_DAYS = 30
+const DEFAULT_CLOSED_TAB_RETENTION_DAYS = 30
 
 const zPersistBroadcastMsg = z.object({
   type: z.literal('persist'),
@@ -24,6 +30,12 @@ const zPersistBroadcastMsg = z.object({
   raw: z.string(),
   sourceId: z.string(),
 })
+
+const CROSS_TAB_SYNC_STORAGE_KEYS = [
+  LAYOUT_STORAGE_KEY,
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  TAB_RECENCY_STORAGE_KEY,
+] as const
 
 function collectPaneIdsSafe(node: unknown): string[] {
   const ids: string[] = []
@@ -80,7 +92,7 @@ function buildCanonicalClaudeSessionRef(localContent: any, localResumeSessionId:
   }
 
   if (
-    localContent?.kind === 'agent-chat'
+    (localContent?.kind === 'agent-chat' || localContent?.kind === 'fresh-agent')
     || (localContent?.kind === 'terminal' && localContent?.mode === 'claude')
   ) {
     return {
@@ -100,7 +112,11 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
       const localResumeSessionId = localContent?.resumeSessionId
       const remoteResumeSessionId = candidate.content?.resumeSessionId
       if (
-        (candidate.content?.kind === 'terminal' || candidate.content?.kind === 'agent-chat')
+        (
+          candidate.content?.kind === 'terminal'
+          || candidate.content?.kind === 'agent-chat'
+          || candidate.content?.kind === 'fresh-agent'
+        )
         && shouldPreserveLocalCanonicalResumeSessionId(localResumeSessionId, remoteResumeSessionId)
       ) {
         const preservedSessionRef = buildCanonicalClaudeSessionRef(localContent, localResumeSessionId)
@@ -212,8 +228,10 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
 
   const previousParsed = previousRaw ? parseBrowserPreferencesRaw(previousRaw) : null
   const remoteResetSettingsToDefaults = previousParsed?.settings !== undefined && parsed.settings === undefined
-  const remoteResetSearchRangeToDefault =
-    previousParsed?.tabs?.searchRangeDays !== undefined && parsed.tabs?.searchRangeDays === undefined
+  const previousRetention = previousParsed?.tabs?.closedTabRetentionDays ?? previousParsed?.tabs?.searchRangeDays
+  const parsedRetention = parsed.tabs?.closedTabRetentionDays ?? parsed.tabs?.searchRangeDays
+  const remoteResetRetentionToDefault =
+    previousRetention !== undefined && parsedRetention === undefined
   const pendingWriteState = getPendingBrowserPreferencesWriteState(store)
   const remoteSettingsPatch = parsed.settings ?? {}
   let mergedSettingsPatch = remoteSettingsPatch
@@ -223,9 +241,11 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
   const nextSettings = pendingWriteState.settingsPatch
     ? resolveLocalSettings(mergedSettingsPatch)
     : resolveBrowserPreferenceSettings(parsed)
-  const nextSearchRangeDays = pendingWriteState.hasPendingSearchRangeDays
-    ? pendingWriteState.searchRangeDays
-    : (parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS)
+  const hasPendingRetention = pendingWriteState.hasPendingClosedTabRetentionDays ?? pendingWriteState.hasPendingSearchRangeDays
+  const pendingRetention = pendingWriteState.closedTabRetentionDays ?? pendingWriteState.searchRangeDays
+  const nextClosedTabRetentionDays = hasPendingRetention
+    ? pendingRetention
+    : (parsedRetention ?? DEFAULT_CLOSED_TAB_RETENTION_DAYS)
 
   if (
     parsed.settings
@@ -238,12 +258,12 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
     })
   }
   if (
-    parsed.tabs?.searchRangeDays !== undefined
-    || remoteResetSearchRangeToDefault
-    || pendingWriteState.hasPendingSearchRangeDays
+    parsedRetention !== undefined
+    || remoteResetRetentionToDefault
+    || hasPendingRetention
   ) {
     store.dispatch({
-      ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
+      ...setTabRegistryClosedTabRetentionDays(nextClosedTabRetentionDays),
       meta: { skipPersist: true, source: 'cross-tab' },
     })
   }
@@ -260,6 +280,17 @@ function handleIncomingRaw(
     dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
     dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
+  } else if (key === TAB_RECENCY_STORAGE_KEY) {
+    store.dispatch({
+      ...mergeHydratedTabRecency(loadPersistedTabRecency(raw)),
+      meta: { skipPersist: true, source: 'cross-tab' },
+    })
+    store.dispatch({
+      ...prunePaneTabActivityToLiveTerminalPanes({
+        paneIds: collectLiveTerminalPaneIds(store.getState()),
+      }),
+      meta: { skipPersist: true, source: 'cross-tab' },
+    })
   }
 }
 
@@ -270,7 +301,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
   let currentLocalLayoutPersistedAt: number | undefined
-  for (const key of [LAYOUT_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
+  for (const key of CROSS_TAB_SYNC_STORAGE_KEYS) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
@@ -307,10 +338,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // then diverge locally (persisted raw changes), a later remote event with the original raw
   // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
-    if (
-      msg.key !== LAYOUT_STORAGE_KEY
-      && msg.key !== BROWSER_PREFERENCES_STORAGE_KEY
-    ) {
+    if (!CROSS_TAB_SYNC_STORAGE_KEYS.includes(msg.key as any)) {
       return
     }
     lastProcessedRawByKey.set(msg.key, msg.raw)
@@ -322,10 +350,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const onStorage = (e: StorageEvent) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
-    if (
-      key !== LAYOUT_STORAGE_KEY
-      && key !== BROWSER_PREFERENCES_STORAGE_KEY
-    ) {
+    if (typeof key !== 'string' || !CROSS_TAB_SYNC_STORAGE_KEYS.includes(key as any)) {
       return
     }
     if (typeof e.newValue !== 'string') return

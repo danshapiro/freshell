@@ -66,6 +66,7 @@ function createSelectorState(options: {
   appliedQuery?: string
   appliedSearchTier?: 'title' | 'userMessages' | 'fullText'
   sessionActivity?: Record<string, number>
+  tabRecency?: { paneLastInputAt: Record<string, number> }
 } = {}) {
   const projects = options.projects ?? []
   return {
@@ -104,6 +105,9 @@ function createSelectorState(options: {
     },
     sessionActivity: {
       sessions: options.sessionActivity ?? {},
+    },
+    tabRecency: options.tabRecency ?? {
+      paneLastInputAt: {},
     },
   } as any
 }
@@ -556,6 +560,42 @@ describe('sidebarSelectors', () => {
           isSubagent: true,
           isNonInteractive: true,
           isFallback: undefined,
+        }),
+      ])
+    })
+
+    it('uses minute-bucketed pane activity for open-tab fallback timestamps', () => {
+      const fallback = createFallbackTab('tab-restored', 'codex-restored', 'Restored Session', '/tmp/restored-project')
+      const selectSortedItems = makeSelectSortedSessionItems()
+
+      const items = selectSortedItems(createSelectorState({
+        tabs: [{
+          ...fallback.tab,
+          createdAt: 1_740_000_000_000,
+          updatedAt: 1_740_000_999_999,
+        }],
+        panes: {
+          layouts: {
+            [fallback.tab.id]: fallback.layout,
+          },
+          activePane: {
+            [fallback.tab.id]: fallback.paneId,
+          },
+          paneTitles: {
+            [fallback.tab.id]: { [fallback.paneId]: fallback.tab.title },
+          },
+        },
+        tabRecency: {
+          paneLastInputAt: {
+            [fallback.paneId]: 1_740_000_080_000,
+          },
+        },
+      }), [], '')
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: 'codex-restored',
+          timestamp: 1_740_000_060_000,
         }),
       ])
     })

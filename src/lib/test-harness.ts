@@ -1,5 +1,6 @@
 import type { store as appStore } from '@/store/store'
 import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
+import type { ServerMessage } from '@shared/ws-protocol'
 
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
@@ -8,6 +9,7 @@ export interface FreshellTestHarness {
   waitForConnection: (timeoutMs?: number) => Promise<void>
   forceDisconnect: () => void
   sendWsMessage: (msg: unknown) => void
+  receiveWsMessage?: (msg: ServerMessage) => void
   setAgentChatNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isAgentChatNetworkEffectsSuppressed: (paneId: string) => boolean
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
@@ -41,9 +43,19 @@ export function installTestHarness(
   waitForWsReady: (timeoutMs?: number) => Promise<void>,
   forceWsDisconnect: () => void,
   sendWsMessage: (msg: unknown) => void,
+  receiveWsMessageOrGetPerfAuditSnapshot?: ((msg: ServerMessage) => void) | (() => PerfAuditSnapshot | null),
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null = () => null,
 ): void {
   if (typeof window === 'undefined') return
+
+  let resolvedReceiveWsMessage: ((msg: ServerMessage) => void) | undefined
+  let resolvedGetPerfAuditSnapshot = getPerfAuditSnapshot
+  if (arguments.length <= 6) {
+    resolvedGetPerfAuditSnapshot = (receiveWsMessageOrGetPerfAuditSnapshot as (() => PerfAuditSnapshot | null) | undefined)
+      ?? (() => null)
+  } else if (receiveWsMessageOrGetPerfAuditSnapshot) {
+    resolvedReceiveWsMessage = receiveWsMessageOrGetPerfAuditSnapshot as (msg: ServerMessage) => void
+  }
 
   // Registry of terminal buffer accessors, keyed by terminalId.
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
@@ -67,6 +79,7 @@ export function installTestHarness(
     waitForConnection: waitForWsReady,
     forceDisconnect: forceWsDisconnect,
     sendWsMessage: sendWsMessage,
+    receiveWsMessage: resolvedReceiveWsMessage,
     getTerminalBuffer: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalBuffers.get(terminalId)
@@ -99,7 +112,7 @@ export function installTestHarness(
     unregisterTerminalBuffer: (terminalId: string) => {
       terminalBuffers.delete(terminalId)
     },
-    getPerfAuditSnapshot,
+    getPerfAuditSnapshot: resolvedGetPerfAuditSnapshot,
     getSentWsMessages: () => [...sentWsMessages],
     clearSentWsMessages: () => {
       sentWsMessages.length = 0

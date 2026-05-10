@@ -22,7 +22,7 @@ describe('browser preferences', () => {
         },
       },
       tabs: {
-        searchRangeDays: 90,
+        closedTabRetentionDays: 30,
       },
     }))
 
@@ -34,7 +34,7 @@ describe('browser preferences', () => {
         },
       },
       tabs: {
-        searchRangeDays: 90,
+        closedTabRetentionDays: 30,
       },
     })
   })
@@ -123,13 +123,13 @@ describe('browser preferences', () => {
     })
   })
 
-  it('reads search-range preferences from the new blob', () => {
+  it('clamps legacy search-range preferences to the new retention limit', () => {
     patchBrowserPreferencesRecord({
       tabs: {
         searchRangeDays: 365,
       },
     })
 
-    expect(getSearchRangeDaysPreference()).toBe(365)
+    expect(getSearchRangeDaysPreference()).toBe(30)
   })
 })

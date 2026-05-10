@@ -62,12 +62,7 @@ describe('collectPaneSnapshots', () => {
       title: undefined,
       payload: {
         provider: 'freshclaude',
-        resumeSessionId: '00000000-0000-4000-8000-000000000123',
-        sessionRef: {
-          provider: 'claude',
-          sessionId: '00000000-0000-4000-8000-000000000123',
-          serverInstanceId: 'server-1',
-        },
+        sessionRef: undefined,
         initialCwd: undefined,
         modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         permissionMode: 'default',

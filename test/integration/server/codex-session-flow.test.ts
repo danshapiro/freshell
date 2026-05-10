@@ -1,14 +1,16 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import fsp from 'fs/promises'
 import http from 'http'
 import os from 'os'
 import path from 'path'
+import { createRequire } from 'node:module'
 import express from 'express'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler.js'
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
 import { CodexAppServerRuntime } from '../../../server/coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from '../../../server/coding-cli/codex-app-server/launch-planner.js'
+import { CodexTerminalSidecar } from '../../../server/coding-cli/codex-app-server/sidecar.js'
 import { configStore } from '../../../server/config-store.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
@@ -30,7 +32,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 process.env.AUTH_TOKEN = 'test-token'
@@ -40,61 +42,148 @@ const FAKE_APP_SERVER_PATH = path.resolve(
   process.cwd(),
   'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 )
+const require = createRequire(import.meta.url)
+const WS_MODULE_PATH = require.resolve('ws')
 
 async function writeFakeCodexExecutable(binaryPath: string) {
   const script = `#!/usr/bin/env node
 const fs = require('fs')
-
-function appendJsonLine(filePath, value) {
-  if (!filePath) return
-  fs.appendFileSync(filePath, JSON.stringify(value) + '\\n', 'utf8')
-}
+const WebSocket = require(${JSON.stringify(WS_MODULE_PATH)})
 
 const argLogPath = process.env.FAKE_CODEX_ARG_LOG
 if (argLogPath) {
   fs.writeFileSync(argLogPath, JSON.stringify(process.argv.slice(2)), 'utf8')
 }
 
-appendJsonLine(process.env.FAKE_CODEX_LAUNCH_LOG, {
-  pid: process.pid,
-  args: process.argv.slice(2),
-})
-
-let isFirstLaunch = false
-if (process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH) {
-  try {
-    fs.writeFileSync(process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH, String(process.pid), { flag: 'wx' })
-    isFirstLaunch = true
-  } catch {
-    isFirstLaunch = false
-  }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-process.stdin.on('data', (chunk) => {
-  appendJsonLine(process.env.FAKE_CODEX_INPUT_LOG, {
-    pid: process.pid,
-    data: chunk.toString('utf8'),
+async function maybeDriveRemote() {
+  const rawBehavior = process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+  if (!rawBehavior) {
+    return
+  }
+
+  const args = process.argv.slice(2)
+  const remoteIndex = args.indexOf('--remote')
+  if (remoteIndex === -1 || remoteIndex === args.length - 1) {
+    return
+  }
+
+  const wsUrl = args[remoteIndex + 1]
+  const resumeIndex = args.indexOf('resume')
+  const resumeSessionId = resumeIndex === -1 ? undefined : args[resumeIndex + 1]
+  const behavior = JSON.parse(rawBehavior)
+
+  if (behavior.recordStdinPath) {
+    process.stdin.on('data', (chunk) => {
+      fs.appendFileSync(behavior.recordStdinPath, chunk)
+    })
+    process.stdin.resume()
+  }
+
+  const socket = new WebSocket(wsUrl)
+  const pending = new Map()
+  let nextId = 1
+
+  const waitForOpen = new Promise((resolve, reject) => {
+    socket.once('open', resolve)
+    socket.once('error', reject)
   })
-})
 
-process.on('SIGTERM', () => process.exit(0))
-process.stdout.write('codex remote attached\\n')
-if (process.env.FAKE_CODEX_STAY_ALIVE === '1') {
-  if (
-    process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS
-    && (process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY !== '1' || isFirstLaunch)
-  ) {
-    setInterval(() => {
-      if (fs.existsSync(process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS)) {
-        process.exit(0)
-      }
-    }, 10)
+  socket.on('message', (raw) => {
+    let message
+    try {
+      message = JSON.parse(raw.toString())
+    } catch {
+      return
+    }
+    if (typeof message.id !== 'number') {
+      return
+    }
+    const pendingRequest = pending.get(message.id)
+    if (!pendingRequest) {
+      return
+    }
+    pending.delete(message.id)
+    if (message.error) {
+      pendingRequest.reject(new Error(message.error.message || 'remote app-server request failed'))
+      return
+    }
+    pendingRequest.resolve(message.result)
+  })
+
+  function request(method, params) {
+    return new Promise((resolve, reject) => {
+      const id = nextId++
+      pending.set(id, { resolve, reject })
+      socket.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method,
+        params,
+      }), (error) => {
+        if (!error) {
+          return
+        }
+        pending.delete(id)
+        reject(error)
+      })
+    })
   }
-  process.stdin.resume()
-  setInterval(() => undefined, 1000)
-} else {
-  setTimeout(() => process.exit(0), 50)
+
+  await waitForOpen
+  await request('initialize', {
+    clientInfo: { name: 'fake-codex-cli', version: '1.0.0' },
+    capabilities: { experimentalApi: true },
+  })
+
+  let threadId = resumeSessionId
+  if (resumeSessionId) {
+    await request('thread/resume', {
+      threadId: resumeSessionId,
+      cwd: process.cwd(),
+      persistExtendedHistory: true,
+    })
+  } else {
+    const started = await request('thread/start', {
+      cwd: process.cwd(),
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    })
+    threadId = started?.thread?.id
+  }
+
+  if ((behavior.sendTurnStart || (behavior.sendTurnStartOnFreshOnly && !resumeSessionId)) && threadId) {
+    await request('turn/start', {
+      threadId,
+      input: 'fake turn',
+    })
+  }
+
+  if (behavior.recordRemoteThreadIdPath && threadId) {
+    fs.writeFileSync(behavior.recordRemoteThreadIdPath, threadId, 'utf8')
+  }
+
+  if (behavior.sleepMs) {
+    await sleep(behavior.sleepMs)
+  }
+
+  await new Promise((resolve) => socket.close(() => resolve()))
 }
+
+Promise.resolve()
+  .then(() => maybeDriveRemote())
+  .then(() => {
+    process.stdout.write('codex remote attached\\n')
+    setTimeout(() => process.exit(0), 50)
+  })
+  .catch((error) => {
+    const message = error instanceof Error ? error.stack || error.message : String(error)
+    process.stderr.write(message + '\\n')
+    process.exit(1)
+  })
 `
 
   await fsp.writeFile(binaryPath, script, 'utf8')
@@ -155,57 +244,31 @@ async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
   throw new Error(`Timed out waiting for file: ${filePath}`)
 }
 
-async function waitForPidFile(filePath: string, timeoutMs = 5_000): Promise<number> {
+async function waitForCondition(
+  predicate: () => Promise<boolean> | boolean,
+  timeoutMs = MESSAGE_TIMEOUT_MS,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const raw = await fsp.readFile(filePath, 'utf8').catch(() => '')
-    const pid = Number(raw.trim())
-    if (Number.isInteger(pid) && pid > 0) return pid
-    await new Promise((resolve) => setTimeout(resolve, 25))
+    if (await predicate()) {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50))
   }
-  throw new Error(`Timed out waiting for pid file: ${filePath}`)
+  throw new Error('Timed out waiting for condition')
 }
 
-async function isProcessAlive(pid: number): Promise<boolean> {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
-    throw error
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (!(await isProcessAlive(pid))) return
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  throw new Error(`Timed out waiting for process ${pid} to exit`)
-}
-
-async function readJsonLines(filePath: string): Promise<any[]> {
-  const raw = await fsp.readFile(filePath, 'utf8').catch(() => '')
-  return raw
+async function readThreadOperations(filePath: string): Promise<Array<{ method: string; threadId: string }>> {
+  await waitForFile(filePath)
+  return (await fsp.readFile(filePath, 'utf8'))
+    .trim()
     .split('\n')
     .filter(Boolean)
-    .map((line) => JSON.parse(line))
-}
-
-async function waitForJsonLine(
-  filePath: string,
-  predicate: (line: any) => boolean,
-  timeoutMs = 3_000,
-): Promise<any> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    const lines = await readJsonLines(filePath)
-    const match = lines.find(predicate)
-    if (match) return match
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  throw new Error(`Timed out waiting for matching JSON line in ${filePath}`)
+    .map((line) => JSON.parse(line) as { method: string; threadId: string })
 }
 
 async function createAuthenticatedWs(port: number): Promise<WebSocket> {
@@ -258,47 +321,58 @@ describe('Codex Session Flow Integration', () => {
   let tempDir: string
   let fakeCodexPath: string
   let argLogPath: string
+  let appServerArgLogPath: string
+  let remoteThreadLogPath: string
+  let remoteInputLogPath: string
+  let threadOperationLogPath: string
+  let appServerCloseMarkerPath: string
+  let providerLossMarkerPath: string
+  let codexHomePath: string
   let previousCodexCmd: string | undefined
   let previousFakeCodexArgLog: string | undefined
+  let previousFakeCodexAppServerArgLog: string | undefined
+  let previousFakeCodexRemoteBehavior: string | undefined
+  let previousCodexHome: string | undefined
   let server: http.Server
   let port: number
   let wsHandler: WsHandler
   let registry: TerminalRegistry
-  let runtimes: Set<CodexAppServerRuntime>
-  let planner: CodexLaunchPlanner | null
-
-  const createPlanner = () => new CodexLaunchPlanner(() => {
-    const runtime = new CodexAppServerRuntime({
-      command: process.execPath,
-      commandArgs: [FAKE_APP_SERVER_PATH],
-    })
-    runtimes.add(runtime)
-    return runtime
-  })
+  let planner: CodexLaunchPlanner
 
   beforeAll(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-flow-'))
     fakeCodexPath = path.join(tempDir, 'fake-codex')
     argLogPath = path.join(tempDir, 'args.json')
+    appServerArgLogPath = path.join(tempDir, 'app-server-args.json')
+    remoteThreadLogPath = path.join(tempDir, 'remote-thread.txt')
+    remoteInputLogPath = path.join(tempDir, 'remote-input.txt')
+    threadOperationLogPath = path.join(tempDir, 'thread-ops.jsonl')
+    appServerCloseMarkerPath = path.join(tempDir, 'app-server-close-once.marker')
+    providerLossMarkerPath = path.join(tempDir, 'provider-loss-once.marker')
+    codexHomePath = path.join(tempDir, '.codex-home')
     await writeFakeCodexExecutable(fakeCodexPath)
 
     previousCodexCmd = process.env.CODEX_CMD
     previousFakeCodexArgLog = process.env.FAKE_CODEX_ARG_LOG
+    previousFakeCodexAppServerArgLog = process.env.FAKE_CODEX_APP_SERVER_ARG_LOG
+    previousFakeCodexRemoteBehavior = process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    previousCodexHome = process.env.CODEX_HOME
     process.env.CODEX_CMD = fakeCodexPath
     process.env.FAKE_CODEX_ARG_LOG = argLogPath
+    process.env.FAKE_CODEX_APP_SERVER_ARG_LOG = appServerArgLogPath
+    process.env.CODEX_HOME = codexHomePath
 
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    runtimes = new Set()
-    planner = createPlanner()
-    const plannerDelegate = {
-      planCreate: (input: Parameters<CodexLaunchPlanner['planCreate']>[0]) => {
-        if (!planner) throw new Error('Codex launch planner is not initialized')
-        return planner.planCreate(input)
-      },
-    } as CodexLaunchPlanner
-    wsHandler = new WsHandler(server, registry, { codexLaunchPlanner: plannerDelegate })
+    planner = new CodexLaunchPlanner((input) => new CodexTerminalSidecar({
+      runtime: new CodexAppServerRuntime({
+        command: process.execPath,
+        commandArgs: [FAKE_APP_SERVER_PATH, ...input.commandArgs],
+        env: input.env,
+      }),
+    }))
+    wsHandler = new WsHandler(server, registry, { codexLaunchPlanner: planner })
 
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
@@ -310,10 +384,9 @@ describe('Codex Session Flow Integration', () => {
 
   beforeEach(async () => {
     delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
-    await planner?.shutdown()
-    await Promise.all([...runtimes].map((runtime) => runtime.shutdown()))
-    runtimes.clear()
-    planner = createPlanner()
+    delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    await fsp.rm(codexHomePath, { recursive: true, force: true })
+    await fsp.mkdir(codexHomePath, { recursive: true })
     vi.mocked(configStore.snapshot).mockResolvedValue({
       settings: {
         codingCli: {
@@ -328,6 +401,18 @@ describe('Codex Session Flow Integration', () => {
       },
     })
     await fsp.rm(argLogPath, { force: true })
+    await fsp.rm(appServerArgLogPath, { force: true })
+    await fsp.rm(remoteThreadLogPath, { force: true })
+    await fsp.rm(remoteInputLogPath, { force: true })
+    await fsp.rm(threadOperationLogPath, { force: true })
+    await fsp.rm(appServerCloseMarkerPath, { force: true })
+    await fsp.rm(providerLossMarkerPath, { force: true })
+  })
+
+  afterEach(() => {
+    for (const terminal of registry.list()) {
+      registry.remove(terminal.terminalId)
+    }
   })
 
   afterAll(async () => {
@@ -341,17 +426,32 @@ describe('Codex Session Flow Integration', () => {
     } else {
       process.env.FAKE_CODEX_ARG_LOG = previousFakeCodexArgLog
     }
+    if (previousFakeCodexAppServerArgLog === undefined) {
+      delete process.env.FAKE_CODEX_APP_SERVER_ARG_LOG
+    } else {
+      process.env.FAKE_CODEX_APP_SERVER_ARG_LOG = previousFakeCodexAppServerArgLog
+    }
+    if (previousFakeCodexRemoteBehavior === undefined) {
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    } else {
+      process.env.FAKE_CODEX_REMOTE_BEHAVIOR = previousFakeCodexRemoteBehavior
+    }
+    if (previousCodexHome === undefined) {
+      delete process.env.CODEX_HOME
+    } else {
+      process.env.CODEX_HOME = previousCodexHome
+    }
 
-    await planner?.shutdown()
-    await Promise.all([...runtimes].map((runtime) => runtime.shutdown()))
-    runtimes.clear()
     registry.shutdown()
     wsHandler.close()
     await new Promise<void>((resolve) => server.close(() => resolve()))
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('starts the exact codex thread before PTY spawn and launches the TUI in remote mode', async () => {
+  it('launches a fresh codex terminal in remote mode without promoting a provisional thread id to durable identity', async () => {
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      recordRemoteThreadIdPath: remoteThreadLogPath,
+    })
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -373,10 +473,13 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       const record = registry.get(created.terminalId)
-      expect(record?.resumeSessionId).toBe('thread-new-1')
+      expect(record?.resumeSessionId).toBeUndefined()
+      await waitForFile(remoteThreadLogPath)
+      expect(await fsp.readFile(remoteThreadLogPath, 'utf8')).toBe('thread-new-1')
+      expect(record?.resumeSessionId).toBeUndefined()
 
       await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
@@ -384,19 +487,690 @@ describe('Codex Session Flow Integration', () => {
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
-      expect(recordedArgs).toContain('resume')
-      expect(recordedArgs).toContain('thread-new-1')
-      expect(recordedArgs).toContain('tui.notification_method=bel')
+      expect(recordedArgs).not.toContain('resume')
+      expect(recordedArgs).not.toContain('thread-new-1')
+      expect(recordedArgs).not.toContain('tui.notification_method=bel')
+      expect(recordedArgs).not.toContain("tui.notifications=['agent-turn-complete']")
       expect(recordedArgs).not.toContain('--model')
       expect(recordedArgs).not.toContain('--sandbox')
+
+      await waitForFile(appServerArgLogPath)
+      const appServerLaunch = JSON.parse(await fsp.readFile(appServerArgLogPath, 'utf8'))
+      expect(appServerLaunch.argv).toContain('app-server')
+      expect(appServerLaunch.argv).toContain('mcp_servers.freshell.command="node"')
+      expect(appServerLaunch.argv.some((arg: string) => arg.startsWith('mcp_servers.freshell.args=['))).toBe(true)
+      expect(appServerLaunch.argv.indexOf('mcp_servers.freshell.command="node"')).toBeLessThan(
+        appServerLaunch.argv.indexOf('app-server'),
+      )
+      expect(appServerLaunch.env.FRESHELL_TERMINAL_ID).toBe(created.terminalId)
+      expect(appServerLaunch.env.FRESHELL_TOKEN).toBe('test-token')
     } finally {
       await closeWebSocket(ws)
     }
   })
 
-  it('restores a persisted Codex session without calling thread/resume on the app-server', async () => {
+  it('promotes a fresh codex terminal only after notification plus durable artifact proof', async () => {
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      sendTurnStart: true,
+      recordRemoteThreadIdPath: remoteThreadLogPath,
+      sleepMs: 500,
+    })
+    const ws = await createAuthenticatedWs(port)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-promotion',
+        mode: 'codex',
+        cwd: tempDir,
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-promotion'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
+
+      await waitForFile(remoteThreadLogPath)
+      expect(await fsp.readFile(remoteThreadLogPath, 'utf8')).toBe('thread-new-1')
+      await waitForCondition(() => registry.get(created.terminalId)?.resumeSessionId === 'thread-new-1')
+
+      const record = registry.get(created.terminalId)
+      expect(record?.resumeSessionId).toBe('thread-new-1')
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it('keeps the terminal alive when the owning Codex sidecar dies after launch', async () => {
     process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
-      loadedThreadIds: ['thread-existing-1'],
+      appendThreadOperationLogPath: threadOperationLogPath,
+      assertNoDuplicateActiveThread: true,
+      exitProcessAfterMethodsOnce: ['turn/start'],
+    })
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      recordRemoteThreadIdPath: remoteThreadLogPath,
+      recordStdinPath: remoteInputLogPath,
+      sendTurnStartOnFreshOnly: true,
+      sleepMs: 5_000,
+    })
+    const ws = await createAuthenticatedWs(port)
+    const receivedMessages: any[] = []
+    ws.on('message', (raw) => {
+      receivedMessages.push(JSON.parse(raw.toString()))
+    })
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-sidecar-dies',
+        mode: 'codex',
+        cwd: tempDir,
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-sidecar-dies'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForCondition(() => registry.get(created.terminalId)?.resumeSessionId === 'thread-new-1')
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'recovering'
+      )))
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'running'
+      )))
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.exit'
+        && msg.terminalId === created.terminalId
+      ))).toBe(false)
+
+      const record = registry.get(created.terminalId)
+      expect(record?.status).toBe('running')
+      expect(record?.codex?.durableSessionId).toBe('thread-new-1')
+      expect(record?.terminalId).toBe(created.terminalId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId: created.terminalId,
+        data: 'after-recovery-input\n',
+      }))
+      await waitForCondition(async () => {
+        try {
+          return (await fsp.readFile(remoteInputLogPath, 'utf8')).includes('after-recovery-input')
+        } catch {
+          return false
+        }
+      })
+
+      await waitForCondition(async () => {
+        const operations = await readThreadOperations(threadOperationLogPath).catch(() => [])
+        return operations.some((entry) => (
+          entry.method === 'thread/resume'
+          && entry.threadId === 'thread-new-1'
+        ))
+      })
+      const operations = await readThreadOperations(threadOperationLogPath)
+      expect(operations.some((entry) => entry.method === 'thread/start')).toBe(true)
+      expect(operations.some((entry) => entry.method === 'thread/resume' && entry.threadId === 'thread-new-1')).toBe(true)
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it('recovers when the Codex app-server client socket disconnects while the child stays alive', async () => {
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      appendThreadOperationLogPath: threadOperationLogPath,
+      assertNoDuplicateActiveThread: true,
+      closeSocketAfterMethodsOnce: ['fs/watch'],
+      closeSocketAfterMethodsOnceMarkerPath: appServerCloseMarkerPath,
+    })
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      recordStdinPath: remoteInputLogPath,
+      sleepMs: 5_000,
+    })
+    const ws = await createAuthenticatedWs(port)
+    const receivedMessages: any[] = []
+    ws.on('message', (raw) => {
+      receivedMessages.push(JSON.parse(raw.toString()))
+    })
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-app-server-client-disconnect',
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-app-server-client-disconnect'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'recovering'
+        && msg.reason === 'app_server_client_disconnect'
+      )))
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'running'
+      )))
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.exit'
+        && msg.terminalId === created.terminalId
+      ))).toBe(false)
+
+      const record = registry.get(created.terminalId)
+      expect(record?.status).toBe('running')
+      expect(record?.codex?.durableSessionId).toBe('thread-existing-1')
+      expect(record?.terminalId).toBe(created.terminalId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId: created.terminalId,
+        data: 'after-client-disconnect-recovery\n',
+      }))
+      await waitForCondition(async () => {
+        try {
+          return (await fsp.readFile(remoteInputLogPath, 'utf8')).includes('after-client-disconnect-recovery')
+        } catch {
+          return false
+        }
+      })
+
+      const operations = await readThreadOperations(threadOperationLogPath)
+      expect(operations.filter((entry) => (
+        entry.method === 'thread/resume'
+        && entry.threadId === 'thread-existing-1'
+      )).length).toBeGreaterThanOrEqual(2)
+      expect(operations.some((entry) => entry.method === 'thread/start')).toBe(false)
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it('recovers when the provider reports the active durable thread closed', async () => {
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      appendThreadOperationLogPath: threadOperationLogPath,
+      assertNoDuplicateActiveThread: true,
+      threadClosedAfterMethodsOnce: ['thread/resume'],
+      threadClosedAfterMethodsOnceMarkerPath: providerLossMarkerPath,
+    })
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      recordStdinPath: remoteInputLogPath,
+      sleepMs: 5_000,
+    })
+    const ws = await createAuthenticatedWs(port)
+    const receivedMessages: any[] = []
+    ws.on('message', (raw) => {
+      receivedMessages.push(JSON.parse(raw.toString()))
+    })
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-thread-closed-recovery',
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-thread-closed-recovery'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'recovering'
+        && msg.reason === 'provider_thread_lifecycle_loss'
+      )))
+      await waitForCondition(() => receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'running'
+      )))
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.exit'
+        && msg.terminalId === created.terminalId
+      ))).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId: created.terminalId,
+        data: 'after-thread-closed-recovery\n',
+      }))
+      await waitForCondition(async () => {
+        try {
+          return (await fsp.readFile(remoteInputLogPath, 'utf8')).includes('after-thread-closed-recovery')
+        } catch {
+          return false
+        }
+      })
+
+      const record = registry.get(created.terminalId)
+      expect(record?.status).toBe('running')
+      expect(record?.codex?.durableSessionId).toBe('thread-existing-1')
+      expect(record?.terminalId).toBe(created.terminalId)
+
+      const operations = await readThreadOperations(threadOperationLogPath)
+      expect(operations.filter((entry) => (
+        entry.method === 'thread/resume'
+        && entry.threadId === 'thread-existing-1'
+      ))).toHaveLength(2)
+      expect(operations.some((entry) => entry.method === 'thread/start')).toBe(false)
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it.each(['notLoaded', 'systemError'])(
+    'recovers when the provider reports active durable thread status %s',
+    async (statusType) => {
+      process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+        appendThreadOperationLogPath: threadOperationLogPath,
+        assertNoDuplicateActiveThread: true,
+        threadStatusChangedAfterMethodsOnceMarkerPath: providerLossMarkerPath,
+        threadStatusChangedAfterMethodsOnce: {
+          'thread/resume': [
+            {
+              threadId: 'thread-existing-1',
+              status: { type: statusType },
+            },
+          ],
+        },
+      })
+      process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+        recordStdinPath: remoteInputLogPath,
+        sleepMs: 5_000,
+      })
+      const ws = await createAuthenticatedWs(port)
+      const receivedMessages: any[] = []
+      ws.on('message', (raw) => {
+        receivedMessages.push(JSON.parse(raw.toString()))
+      })
+
+      try {
+        ws.send(JSON.stringify({
+          type: 'terminal.create',
+          requestId: `test-req-codex-thread-status-${statusType}`,
+          mode: 'codex',
+          cwd: tempDir,
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'thread-existing-1',
+          },
+        }))
+
+        const created = await waitForMessage(
+          ws,
+          (msg) => (
+            msg.requestId === `test-req-codex-thread-status-${statusType}`
+            && (msg.type === 'terminal.created' || msg.type === 'error')
+          ),
+        )
+        if (created.type === 'error') {
+          throw new Error(`terminal.create failed: ${created.message}`)
+        }
+
+        await waitForCondition(() => receivedMessages.some((msg) => (
+          msg.type === 'terminal.status'
+          && msg.terminalId === created.terminalId
+          && msg.status === 'recovering'
+          && msg.reason === 'provider_thread_lifecycle_loss'
+        )))
+        await waitForCondition(() => receivedMessages.some((msg) => (
+          msg.type === 'terminal.status'
+          && msg.terminalId === created.terminalId
+          && msg.status === 'running'
+        )))
+        expect(receivedMessages.some((msg) => (
+          msg.type === 'terminal.exit'
+          && msg.terminalId === created.terminalId
+        ))).toBe(false)
+
+        const operations = await readThreadOperations(threadOperationLogPath)
+        expect(operations.filter((entry) => (
+          entry.method === 'thread/resume'
+          && entry.threadId === 'thread-existing-1'
+        ))).toHaveLength(2)
+        expect(operations.some((entry) => entry.method === 'thread/start')).toBe(false)
+      } finally {
+        await closeWebSocket(ws)
+        delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+        delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+      }
+    },
+  )
+
+  it('ignores provider lifecycle-loss notifications for other durable threads', async () => {
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      appendThreadOperationLogPath: threadOperationLogPath,
+      assertNoDuplicateActiveThread: true,
+      notifyAfterMethodsOnce: {
+        'thread/resume': [
+          {
+            method: 'thread/closed',
+            params: { threadId: 'thread-other-1' },
+          },
+          {
+            method: 'thread/status/changed',
+            params: {
+              threadId: 'thread-other-2',
+              status: { type: 'notLoaded' },
+            },
+          },
+        ],
+      },
+    })
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      sleepMs: 800,
+    })
+    const ws = await createAuthenticatedWs(port)
+    const receivedMessages: any[] = []
+    ws.on('message', (raw) => {
+      receivedMessages.push(JSON.parse(raw.toString()))
+    })
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-ignore-other-thread-loss',
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-ignore-other-thread-loss'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForCondition(async () => {
+        const operations = await readThreadOperations(threadOperationLogPath)
+        return operations.some((entry) => (
+          entry.method === 'thread/resume'
+          && entry.threadId === 'thread-existing-1'
+        ))
+      })
+      await sleep(350)
+
+      const record = registry.get(created.terminalId)
+      expect(record?.status).toBe('running')
+      expect(record?.codex?.workerGeneration).toBe(1)
+      expect(record?.codex?.recoveryState).toBe('running_durable')
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.status'
+        && msg.terminalId === created.terminalId
+        && msg.status === 'recovering'
+      ))).toBe(false)
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.exit'
+        && msg.terminalId === created.terminalId
+      ))).toBe(false)
+    } finally {
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it('recovers a durable Codex PTY exit by resuming the existing upstream thread', async () => {
+    const durableSessionId = 'thread-existing-1'
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      assertNoDuplicateActiveThread: true,
+      appendThreadOperationLogPath: threadOperationLogPath,
+    })
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      sleepMs: 100,
+    })
+    const ws = await createAuthenticatedWs(port)
+    const terminalStatusMessages: any[] = []
+    const onMessage = (raw: WebSocket.Data) => {
+      const msg = JSON.parse(raw.toString())
+      if (msg.type === 'terminal.status' || msg.type === 'terminal.exit') {
+        terminalStatusMessages.push(msg)
+      }
+    }
+    ws.on('message', onMessage)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-durable-recovery',
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: durableSessionId,
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-durable-recovery'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForMessage(
+        ws,
+        (msg) => msg.type === 'terminal.status'
+          && msg.terminalId === created.terminalId
+          && msg.status === 'recovering',
+      )
+      await waitForMessage(
+        ws,
+        (msg) => msg.type === 'terminal.status'
+          && msg.terminalId === created.terminalId
+          && msg.status === 'running',
+      )
+      await waitForCondition(() => (registry.get(created.terminalId)?.codex?.workerGeneration ?? 0) >= 2)
+
+      const record = registry.get(created.terminalId)
+      expect(record?.status).toBe('running')
+      expect(record?.codex?.durableSessionId).toBe(durableSessionId)
+      expect(record?.terminalId).toBe(created.terminalId)
+
+      expect(terminalStatusMessages.some((msg) => (
+        msg.type === 'terminal.status' && msg.status === 'recovery_failed'
+      ))).toBe(false)
+      expect(terminalStatusMessages.some((msg) => (
+        msg.type === 'terminal.exit' && msg.terminalId === created.terminalId
+      ))).toBe(false)
+
+      const operations = await readThreadOperations(threadOperationLogPath)
+      expect(operations.filter((entry) => entry.method === 'thread/resume')).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ threadId: durableSessionId }),
+        ]),
+      )
+      expect(operations.filter((entry) => (
+        entry.method === 'thread/resume' && entry.threadId === durableSessionId
+      )).length).toBeGreaterThanOrEqual(2)
+      expect(operations.some((entry) => entry.method === 'thread/start')).toBe(false)
+    } finally {
+      ws.off('message', onMessage)
+      await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  })
+
+  it('keeps retrying replacement launch failures until durable resume succeeds', async () => {
+    const durableSessionId = 'thread-existing-1'
+    let planCreateSpy: ReturnType<typeof vi.spyOn> | undefined
+    let ws: WebSocket | undefined
+
+    try {
+      process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+        appendThreadOperationLogPath: threadOperationLogPath,
+        assertNoDuplicateActiveThread: true,
+      })
+      process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+        sleepMs: 30_000,
+      })
+
+      ws = await createAuthenticatedWs(port)
+      const receivedMessages: any[] = []
+      ws.on('message', (raw) => {
+        receivedMessages.push(JSON.parse(raw.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-retry-until-resume',
+        mode: 'codex',
+        cwd: tempDir,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: durableSessionId,
+        },
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-retry-until-resume'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await waitForCondition(async () => {
+        const operations = await readThreadOperations(threadOperationLogPath).catch(() => [])
+        return operations.some((entry) => (
+          entry.method === 'thread/resume'
+          && entry.threadId === durableSessionId
+        ))
+      })
+
+      const originalPlanCreate = planner.planCreate.bind(planner)
+      let plannedFailures = 5
+      planCreateSpy = vi.spyOn(planner, 'planCreate').mockImplementation(async (input) => {
+        if (input.resumeSessionId === durableSessionId && plannedFailures > 0) {
+          const failureNumber = 6 - plannedFailures
+          plannedFailures -= 1
+          throw new Error(`planned replacement failure ${failureNumber}`)
+        }
+        return originalPlanCreate(input)
+      })
+
+      const record = registry.get(created.terminalId)
+      expect(record?.codex?.durableSessionId).toBe(durableSessionId)
+      record?.pty.kill()
+
+      await waitForMessage(
+        ws,
+        (msg) => msg.type === 'terminal.status'
+          && msg.terminalId === created.terminalId
+          && msg.status === 'running',
+        20_000,
+      )
+
+      await waitForCondition(async () => {
+        const operations = await readThreadOperations(threadOperationLogPath).catch(() => [])
+        return operations.filter((entry) => (
+          entry.method === 'thread/resume'
+          && entry.threadId === durableSessionId
+        )).length >= 2
+      }, 20_000)
+
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.status' && msg.status === 'recovery_failed'
+      ))).toBe(false)
+      expect(receivedMessages.some((msg) => (
+        msg.type === 'terminal.exit' && msg.terminalId === created.terminalId
+      ))).toBe(false)
+      expect(receivedMessages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'terminal.status', status: 'recovering' }),
+        expect.objectContaining({ type: 'terminal.status', status: 'running' }),
+      ]))
+
+      const operations = await readThreadOperations(threadOperationLogPath)
+      const resumeOperations = operations.filter((entry) => (
+        entry.method === 'thread/resume' && entry.threadId === durableSessionId
+      ))
+      const startOperations = operations.filter((entry) => entry.method === 'thread/start')
+      expect(resumeOperations.length).toBeGreaterThanOrEqual(2)
+      expect(resumeOperations.every((entry) => entry.threadId === durableSessionId)).toBe(true)
+      expect(startOperations).toHaveLength(0)
+      expect(planCreateSpy.mock.calls.filter(([input]) => (
+        input.resumeSessionId === durableSessionId
+      )).length).toBeGreaterThanOrEqual(6)
+    } finally {
+      planCreateSpy?.mockRestore()
+      if (ws) await closeWebSocket(ws)
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
+    }
+  }, 25_000)
+
+  it('restores a persisted Codex session through the exact durable CLI form', async () => {
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
       overrides: {
         'thread/resume': {
           error: {
@@ -406,7 +1180,9 @@ describe('Codex Session Flow Integration', () => {
         },
       },
     })
-
+    process.env.FAKE_CODEX_REMOTE_BEHAVIOR = JSON.stringify({
+      sleepMs: 300,
+    })
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -415,7 +1191,10 @@ describe('Codex Session Flow Integration', () => {
         requestId: 'test-req-codex-restore',
         mode: 'codex',
         cwd: tempDir,
-        resumeSessionId: 'thread-existing-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
       }))
 
       const created = await waitForMessage(
@@ -429,10 +1208,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-existing-1')
-
-      const record = registry.get(created.terminalId)
-      expect(record?.resumeSessionId).toBe('thread-existing-1')
+      expect(created).not.toHaveProperty('effectiveResumeSessionId')
 
       await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
@@ -445,139 +1221,7 @@ describe('Codex Session Flow Integration', () => {
     } finally {
       await closeWebSocket(ws)
       delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
-    }
-  })
-
-  it('retires the previous wrapper/native app-server during recovery replacement and routes later input only to the replacement', async () => {
-    const testDir = await fsp.mkdtemp(path.join(tempDir, 'recovery-retire-'))
-    const metadataDir = path.join(testDir, 'metadata')
-    const oldNativePidFile = path.join(testDir, 'old-native.pid')
-    const replacementNativePidFile = path.join(testDir, 'replacement-native.pid')
-    const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
-    const inputLogPath = path.join(testDir, 'codex-input.jsonl')
-    const oldSidecarShutdownSignalPath = path.join(testDir, 'old-sidecar-shutdown.signal')
-    const firstLaunchClaimPath = path.join(testDir, 'first-tui.claim')
-    await fsp.mkdir(metadataDir, { recursive: true })
-
-    const previousStayAlive = process.env.FAKE_CODEX_STAY_ALIVE
-    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
-    const previousInputLog = process.env.FAKE_CODEX_INPUT_LOG
-    const previousExitWhenFileExists = process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS
-    const previousFirstLaunchOnly = process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY
-    const previousFirstLaunchClaim = process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH
-    process.env.FAKE_CODEX_STAY_ALIVE = '1'
-    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
-    process.env.FAKE_CODEX_INPUT_LOG = inputLogPath
-    process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS = oldSidecarShutdownSignalPath
-    process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY = '1'
-    process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH = firstLaunchClaimPath
-
-    const oldRuntime = new CodexAppServerRuntime({
-      command: process.execPath,
-      commandArgs: [FAKE_APP_SERVER_PATH],
-      metadataDir,
-      serverInstanceId: 'srv-codex-recovery-old',
-      env: {
-        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
-          spawnNativeChild: true,
-          nativePidFile: oldNativePidFile,
-          wrapperLeavesNativeOnSigterm: true,
-          signalFileOnSigterm: oldSidecarShutdownSignalPath,
-          delayExitOnSigtermMs: 200,
-          loadedThreadIds: ['thread-existing-1'],
-        }),
-      },
-    })
-    const replacementRuntime = new CodexAppServerRuntime({
-      command: process.execPath,
-      commandArgs: [FAKE_APP_SERVER_PATH],
-      metadataDir,
-      serverInstanceId: 'srv-codex-recovery-replacement',
-      env: {
-        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
-          spawnNativeChild: true,
-          nativePidFile: replacementNativePidFile,
-          wrapperLeavesNativeOnSigterm: true,
-          loadedThreadIds: ['thread-existing-1'],
-        }),
-      },
-    })
-    runtimes.add(oldRuntime)
-    runtimes.add(replacementRuntime)
-    const oldPlanner = new CodexLaunchPlanner(oldRuntime)
-    const replacementPlanner = new CodexLaunchPlanner(replacementRuntime)
-    let terminalId: string | undefined
-
-    try {
-      const oldPlan = await oldPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })
-      const oldNativePid = await waitForPidFile(oldNativePidFile)
-      const recovery = {
-        planCreate: vi.fn(() => replacementPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })),
-        retryDelayMs: 0,
-        readinessTimeoutMs: 1_000,
-        readinessPollMs: 25,
-      }
-      const term = registry.create({
-        mode: 'codex',
-        resumeSessionId: 'thread-existing-1',
-        cwd: tempDir,
-        providerSettings: {
-          codexAppServer: {
-            wsUrl: oldPlan.remote.wsUrl,
-            sidecar: oldPlan.sidecar,
-            recovery,
-          },
-        } as any,
-      })
-      terminalId = term.terminalId
-      const oldPtyPid = term.pty.pid
-      await waitForJsonLine(launchLogPath, (line) => line.pid === oldPtyPid)
-
-      await (registry as any).runCodexRecoveryAttempt(
-        registry.get(term.terminalId),
-        'thread-existing-1',
-      )
-
-      const replacementNativePid = await waitForPidFile(replacementNativePidFile)
-      await waitForProcessExit(oldNativePid)
-      await waitForProcessExit(oldPtyPid)
-      expect(await isProcessAlive(replacementNativePid)).toBe(true)
-
-      const latest = registry.get(term.terminalId)
-      const replacementPtyPid = latest?.pty.pid
-      expect(replacementPtyPid).toEqual(expect.any(Number))
-      expect(replacementPtyPid).not.toBe(oldPtyPid)
-
-      expect(registry.input(term.terminalId, 'after recovery replacement\n')).toBe(true)
-      await waitForJsonLine(
-        inputLogPath,
-        (line) => line.pid === replacementPtyPid && line.data.includes('after recovery replacement'),
-      )
-      const inputLines = await readJsonLines(inputLogPath)
-      expect(inputLines.some((line) => line.pid === oldPtyPid && line.data.includes('after recovery replacement'))).toBe(false)
-    } finally {
-      if (terminalId) {
-        await registry.killAndWait(terminalId).catch(() => undefined)
-      }
-      await replacementPlanner.shutdown().catch(() => undefined)
-      await oldPlanner.shutdown().catch(() => undefined)
-      await replacementRuntime.shutdown().catch(() => undefined)
-      await oldRuntime.shutdown().catch(() => undefined)
-      runtimes.delete(oldRuntime)
-      runtimes.delete(replacementRuntime)
-      if (previousStayAlive === undefined) delete process.env.FAKE_CODEX_STAY_ALIVE
-      else process.env.FAKE_CODEX_STAY_ALIVE = previousStayAlive
-      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
-      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
-      if (previousInputLog === undefined) delete process.env.FAKE_CODEX_INPUT_LOG
-      else process.env.FAKE_CODEX_INPUT_LOG = previousInputLog
-      if (previousExitWhenFileExists === undefined) delete process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS
-      else process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS = previousExitWhenFileExists
-      if (previousFirstLaunchOnly === undefined) delete process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY
-      else process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY = previousFirstLaunchOnly
-      if (previousFirstLaunchClaim === undefined) delete process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH
-      else process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH = previousFirstLaunchClaim
-      await fsp.rm(testDir, { recursive: true, force: true })
+      delete process.env.FAKE_CODEX_REMOTE_BEHAVIOR
     }
   })
 })

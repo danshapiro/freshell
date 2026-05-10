@@ -147,7 +147,7 @@ describe('TabContent', () => {
       expect(mockPaneLayout).not.toHaveBeenCalled()
     })
 
-    it('restores agent-chat default content for no-layout tabs using persisted session metadata', () => {
+    it('restores fresh-agent default content for no-layout tabs using persisted session metadata', () => {
       const store = createStore([
         {
           id: 'tab-1',
@@ -173,8 +173,10 @@ describe('TabContent', () => {
       expect(mockPaneLayout).toHaveBeenCalledWith(
         expect.objectContaining({
           defaultContent: expect.objectContaining({
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
             sessionRef: {
               provider: 'claude',
               sessionId: '550e8400-e29b-41d4-a716-446655440000',
@@ -185,7 +187,7 @@ describe('TabContent', () => {
       )
     })
 
-    it('restores agent-chat default content for shell-mode no-layout tabs using persisted codingCliProvider metadata', () => {
+    it('restores fresh-agent default content for shell-mode no-layout tabs using persisted codingCliProvider metadata', () => {
       const store = createStore([
         {
           id: 'tab-1',
@@ -212,8 +214,10 @@ describe('TabContent', () => {
       expect(mockPaneLayout).toHaveBeenCalledWith(
         expect.objectContaining({
           defaultContent: expect.objectContaining({
-            kind: 'agent-chat',
-            provider: 'freshclaude',
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            resumeSessionId: '550e8400-e29b-41d4-a716-446655440001',
             sessionRef: {
               provider: 'claude',
               sessionId: '550e8400-e29b-41d4-a716-446655440001',

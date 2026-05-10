@@ -3,16 +3,22 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
+import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
 import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '../../../../src/store/tabRegistrySlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
+import {
+  persistMiddleware,
+  PERSIST_DEBOUNCE_MS,
+  resetPersistFlushListenersForTests,
+} from '../../../../src/store/persistMiddleware'
 import {
   BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS,
   browserPreferencesPersistenceMiddleware,
   resetBrowserPreferencesFlushListenersForTests,
 } from '../../../../src/store/browserPreferencesPersistence'
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from '../../../../src/store/storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '../../../../src/store/storage-keys'
 import { resolveLocalSettings } from '@shared/settings'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
@@ -22,7 +28,9 @@ describe('crossTabSync', () => {
   afterEach(() => {
     vi.useRealTimers()
     localStorage.clear()
+    vi.restoreAllMocks()
     resetBrowserPreferencesFlushListenersForTests()
+    resetPersistFlushListenersForTests()
     resetPersistBroadcastForTests()
     for (const cleanup of cleanups.splice(0)) cleanup()
   })
@@ -117,6 +125,63 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
   })
 
+  it('preserves canonical resume identity when cross-tab sync rehydrates a fresh-agent pane', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-a',
+          content: {
+            kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-a',
+              status: 'idle',
+              resumeSessionId: '123e4567-e89b-12d3-a456-426614174000',
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-a' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshclaude',
+              provider: 'claude',
+              createRequestId: 'req-a',
+              status: 'idle',
+              resumeSessionId: 'not-a-canonical-id',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout.content.resumeSessionId).toBe('123e4567-e89b-12d3-a456-426614174000')
+  })
+
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {
@@ -173,9 +238,6 @@ describe('crossTabSync', () => {
           sortMode: 'project',
         },
       },
-      tabs: {
-        searchRangeDays: 365,
-      },
     })
 
     window.dispatchEvent(new StorageEvent('storage', {
@@ -185,7 +247,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.localSettings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
   })
 
   it('hydrates browser-preference changes from BroadcastChannel messages', () => {
@@ -224,7 +286,7 @@ describe('crossTabSync', () => {
       })
 
       expect(store.getState().settings.settings.theme).toBe('dark')
-      expect(store.getState().tabRegistry.searchRangeDays).toBe(90)
+      expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
     } finally {
       ;(globalThis as any).BroadcastChannel = original
     }
@@ -291,7 +353,7 @@ describe('crossTabSync', () => {
     }))
 
     expect(store.getState().settings.settings.theme).toBe('dark')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
   })
 
   it('applies sparse browser-preference resets when previously persisted settings or search range are removed', () => {
@@ -322,6 +384,165 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('system')
     expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
+  })
+
+  it('merges tab recency sidecar events without rewriting layout or echoing the sidecar', () => {
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, tabRecency: tabRecencyReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [{
+          id: 'tab-1',
+          createRequestId: 'tab-1',
+          title: 'Tab 1',
+          status: 'running',
+          mode: 'shell',
+          createdAt: 1,
+        }],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      } as any),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      } as any),
+      meta: { skipPersist: true },
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+    const setItemSpy = vi.spyOn(localStorage, 'setItem')
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: TAB_RECENCY_STORAGE_KEY,
+      newValue: JSON.stringify({
+        version: 1,
+        paneLastInputAt: {
+          'pane-1': 1_740_000_059_999,
+        },
+      }),
+    }))
+
+    expect(store.getState().tabRecency.paneLastInputAt['pane-1']).toBe(1_740_000_000_000)
+    vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
+    expect(setItemSpy).not.toHaveBeenCalledWith(LAYOUT_STORAGE_KEY, expect.any(String))
+    expect(setItemSpy).not.toHaveBeenCalledWith(TAB_RECENCY_STORAGE_KEY, expect.any(String))
+  })
+
+  it('merges tab recency sidecars by max and persists pruned local terminal panes', () => {
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, tabRecency: tabRecencyReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Tab 1',
+            status: 'running',
+            mode: 'shell',
+            createdAt: 1,
+          }],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+          tombstones: [],
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'split',
+              id: 'root',
+              direction: 'horizontal',
+              sizes: [50, 50],
+              children: [
+                {
+                  type: 'leaf',
+                  id: 'pane-local',
+                  content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-local', status: 'running' },
+                },
+                {
+                  type: 'split',
+                  id: 'right',
+                  direction: 'vertical',
+                  sizes: [50, 50],
+                  children: [
+                    {
+                      type: 'leaf',
+                      id: 'pane-shared',
+                      content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-shared', status: 'running' },
+                    },
+                    {
+                      type: 'leaf',
+                      id: 'pane-remote',
+                      content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-remote', status: 'running' },
+                    },
+                  ],
+                },
+              ],
+            } as any,
+          },
+          activePane: { 'tab-1': 'pane-local' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+        tabRecency: {
+          paneLastInputAt: {
+            'pane-local': 1_740_000_120_000,
+            'pane-shared': 1_740_000_120_000,
+          },
+        },
+      } as any,
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+    const setItemSpy = vi.spyOn(localStorage, 'setItem')
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: TAB_RECENCY_STORAGE_KEY,
+      newValue: JSON.stringify({
+        version: 1,
+        paneLastInputAt: {
+          'pane-shared': 1_740_000_000_000,
+          'pane-remote': 1_740_000_060_000,
+          'pane-stale': 1_740_000_180_000,
+        },
+      }),
+    }))
+
+    expect(store.getState().tabRecency.paneLastInputAt).toEqual({
+      'pane-local': 1_740_000_120_000,
+      'pane-remote': 1_740_000_060_000,
+      'pane-shared': 1_740_000_120_000,
+    })
+    vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS)
+    expect(setItemSpy).not.toHaveBeenCalledWith(LAYOUT_STORAGE_KEY, expect.any(String))
+    expect(JSON.parse(localStorage.getItem(TAB_RECENCY_STORAGE_KEY) || '{}')).toEqual({
+      version: 1,
+      paneLastInputAt: {
+        'pane-local': 1_740_000_120_000,
+        'pane-remote': 1_740_000_060_000,
+        'pane-shared': 1_740_000_120_000,
+      },
+    })
   })
 
   it('merges remote browser-preference writes without clobbering dirty local settings', () => {
@@ -355,7 +576,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
@@ -365,9 +586,6 @@ describe('crossTabSync', () => {
         sidebar: {
           sortMode: 'project',
         },
-      },
-      tabs: {
-        searchRangeDays: 365,
       },
     })
   })
@@ -403,7 +621,7 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
-    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
 
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
 
@@ -413,9 +631,6 @@ describe('crossTabSync', () => {
         sidebar: {
           sortMode: 'project',
         },
-      },
-      tabs: {
-        searchRangeDays: 365,
       },
     })
   })

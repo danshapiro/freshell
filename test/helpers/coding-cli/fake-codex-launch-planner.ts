@@ -1,66 +1,73 @@
 export const DEFAULT_CODEX_REMOTE_WS_URL = 'ws://127.0.0.1:43123'
 
-export class FakeCodexLaunchSidecar {
-  adoptCalls: Array<{ terminalId: string; generation: number }> = []
+export class FakeCodexTerminalSidecar {
+  attachedTerminalId?: string
+  durableSessionHandlers = new Set<(sessionId: string) => void>()
+  fatalHandlers = new Set<(error: Error, source?: 'sidecar_fatal' | 'app_server_exit' | 'app_server_client_disconnect') => void>()
   shutdownCalls = 0
-  waitForLoadedThreadCalls: Array<{ threadId: string; options?: { timeoutMs?: number; pollMs?: number } }> = []
-  waitForLoadedThreadError: Error | null = null
-  shutdownError: Error | null = null
-  shutdownStarted = false
-  private lifecycleLossHandlers = new Set<(event: unknown) => void>()
 
-  async adopt(input: { terminalId: string; generation: number }) {
-    this.adoptCalls.push(input)
-  }
-
-  async listLoadedThreads() {
-    return ['thread-new-1']
+  attachTerminal(input: {
+    terminalId: string
+    onDurableSession: (sessionId: string) => void
+    onThreadLifecycle?: (event: unknown) => void
+    onFatal: (error: Error, source?: 'sidecar_fatal' | 'app_server_exit' | 'app_server_client_disconnect') => void
+  }) {
+    this.attachedTerminalId = input.terminalId
+    this.durableSessionHandlers.add(input.onDurableSession)
+    this.fatalHandlers.add(input.onFatal)
   }
 
   async shutdown() {
-    if (this.shutdownStarted) return
-    this.shutdownStarted = true
     this.shutdownCalls += 1
-    if (this.shutdownError) throw this.shutdownError
   }
 
-  async waitForLoadedThread(threadId: string, options?: { timeoutMs?: number; pollMs?: number }) {
-    this.waitForLoadedThreadCalls.push({ threadId, options })
-    if (this.waitForLoadedThreadError) throw this.waitForLoadedThreadError
+  emitDurableSession(sessionId: string) {
+    for (const handler of this.durableSessionHandlers) {
+      handler(sessionId)
+    }
   }
 
-  onLifecycleLoss(handler: (event: unknown) => void) {
-    this.lifecycleLossHandlers.add(handler)
-    return () => this.lifecycleLossHandlers.delete(handler)
-  }
-
-  emitLifecycleLoss(event: unknown) {
-    for (const handler of this.lifecycleLossHandlers) {
-      handler(event)
+  emitFatal(
+    message = 'fake codex sidecar failed',
+    source: 'sidecar_fatal' | 'app_server_exit' | 'app_server_client_disconnect' = 'sidecar_fatal',
+  ) {
+    const error = new Error(message)
+    for (const handler of this.fatalHandlers) {
+      handler(error, source)
     }
   }
 }
 
 export class FakeCodexLaunchPlanner {
   planCreateCalls: any[] = []
-  sidecar = new FakeCodexLaunchSidecar()
+  readonly sidecar: FakeCodexTerminalSidecar
+  private failuresRemaining = 0
 
   constructor(
     private readonly plan: {
-      sessionId: string
+      sessionId?: string
       remote: { wsUrl: string }
-      sidecar?: FakeCodexLaunchSidecar
+      sidecar?: FakeCodexTerminalSidecar
     } = {
-      sessionId: 'thread-new-1',
       remote: { wsUrl: DEFAULT_CODEX_REMOTE_WS_URL },
     },
-  ) {}
+  ) {
+    this.sidecar = this.plan.sidecar ?? new FakeCodexTerminalSidecar()
+  }
+
+  failNext(count: number) {
+    this.failuresRemaining = count
+  }
 
   async planCreate(input: any) {
     this.planCreateCalls.push(input)
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1
+      throw new Error('fake Codex launch failed')
+    }
     return {
       ...this.plan,
-      sidecar: this.plan.sidecar ?? this.sidecar,
+      sidecar: this.sidecar,
     }
   }
 }

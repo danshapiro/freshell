@@ -3,6 +3,9 @@ import type { RootState } from '@/store/store'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
+import { deriveTabRecencyAt } from '@/lib/tab-recency'
+
+const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 
 function sortUpdatedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   return b.updatedAt - a.updatedAt
@@ -28,21 +31,30 @@ function dedupeByTabKey(records: RegistryTabRecord[]): RegistryTabRecord[] {
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectLayouts = (state: RootState) => state.panes.layouts
 const selectPaneTitles = (state: RootState) => state.panes.paneTitles
+const selectPaneLastInputAt = (state: RootState) => state.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT
 const selectDeviceId = (state: RootState) => state.tabRegistry.deviceId
 const selectDeviceLabel = (state: RootState) => state.tabRegistry.deviceLabel
 const selectServerInstanceId = (state: RootState) => state.connection.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+const selectSameDeviceOpen = (state: RootState) => state.tabRegistry.sameDeviceOpen
 const selectRemoteOpen = (state: RootState) => state.tabRegistry.remoteOpen
 const selectClosed = (state: RootState) => state.tabRegistry.closed
 const selectLocalClosed = (state: RootState) => state.tabRegistry.localClosed
+const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1, Math.floor(
+  state.tabRegistry.closedTabRetentionDays ?? state.tabRegistry.searchRangeDays ?? 30,
+)))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
-  (tabs, layouts, paneTitles, deviceId, deviceLabel, serverInstanceId): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId],
+  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
       if (!layout) continue
-      const updatedAt = tab.lastInputAt || tab.createdAt || 0
+      const updatedAt = deriveTabRecencyAt({
+        tab,
+        layout,
+        paneLastInputAt,
+      })
       records.push(buildOpenTabRegistryRecord({
         tab,
         layout,
@@ -59,20 +71,22 @@ export const selectLiveLocalTabRecords = createSelector(
 )
 
 export const selectMergedClosedRecords = createSelector(
-  [selectClosed, selectLocalClosed],
-  (closed, localClosed): RegistryTabRecord[] => {
+  [selectClosed, selectLocalClosed, selectClosedRetentionDays],
+  (closed, localClosed, closedRetentionDays): RegistryTabRecord[] => {
+    const closedCutoff = Date.now() - closedRetentionDays * 24 * 60 * 60 * 1000
     const merged = dedupeByTabKey([
       ...(closed || []),
-      ...Object.values(localClosed || {}),
+      ...Object.values(localClosed || {}).filter((record) => (record.closedAt ?? record.updatedAt) >= closedCutoff),
     ])
     return merged.sort(sortClosedDesc)
   },
 )
 
 export const selectTabsRegistryGroups = createSelector(
-  [selectLiveLocalTabRecords, selectRemoteOpen, selectMergedClosedRecords],
-  (localOpen, remoteOpen, closed) => ({
+  [selectLiveLocalTabRecords, selectSameDeviceOpen, selectRemoteOpen, selectMergedClosedRecords],
+  (localOpen, sameDeviceOpen, remoteOpen, closed) => ({
     localOpen,
+    sameDeviceOpen: [...(sameDeviceOpen || [])].sort(sortUpdatedDesc),
     remoteOpen: [...(remoteOpen || [])].sort(sortUpdatedDesc),
     closed,
   }),

@@ -114,8 +114,10 @@ export default function SafetySettings({
     deviceAliases: {} as Record<string, string>,
     dismissedDeviceIds: [] as string[],
     localOpen: [],
+    sameDeviceOpen: [],
     remoteOpen: [],
     closed: [],
+    devices: [],
   }
 
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
@@ -440,8 +442,10 @@ export default function SafetySettings({
       deviceAliases: tabRegistry.deviceAliases,
       dismissedDeviceIds: tabRegistry.dismissedDeviceIds,
       localOpen: tabRegistry.localOpen,
+      sameDeviceOpen: tabRegistry.sameDeviceOpen,
       remoteOpen: tabRegistry.remoteOpen,
       closed: tabRegistry.closed,
+      devices: tabRegistry.devices,
     })
   }, [tabRegistry])
 

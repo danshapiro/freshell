@@ -90,9 +90,20 @@ describe('session-contract', () => {
       })
     })
 
-    it('marks legacy raw agent-chat resume ids as restore-unavailable when no canonical Claude id exists', () => {
+    it('promotes canonical Claude legacy resume ids for agent-chat panes', () => {
       expect(migrateLegacyAgentChatDurableState({
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      })).toEqual({
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      })
+    })
+
+    it('marks legacy raw agent-chat resume ids as restore-unavailable when no canonical Claude id exists', () => {
+      expect(migrateLegacyAgentChatDurableState({
+        resumeSessionId: 'named-resume',
       })).toEqual({
         restoreError: {
           code: 'RESTORE_UNAVAILABLE',

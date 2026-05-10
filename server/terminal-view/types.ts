@@ -13,6 +13,8 @@ export type TerminalDirectoryItem = {
   status: 'running' | 'exited'
   hasClients: boolean
   cwd?: string
+  lastLine?: string
+  last_line?: string
 }
 
 export type TerminalDirectoryPage = {

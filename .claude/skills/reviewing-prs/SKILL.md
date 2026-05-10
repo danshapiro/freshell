@@ -17,7 +17,7 @@ We never push work back onto contributors. Our goal is to harvest **good ideas f
 
 1. Create a detached worktree for all PR work:
    ```bash
-   git worktree add .worktrees/pr-review --detach HEAD
+   git worktree add .worktrees/pr-review --detach origin/main
    ```
 2. List open PRs with `gh pr list`
 3. Process oldest-to-newest (reduces cascading merge conflicts)
@@ -28,11 +28,11 @@ We never push work back onto contributors. Our goal is to harvest **good ideas f
 
 ```bash
 cd .worktrees/pr-review
-git fetch origin && git checkout --detach origin/main
+git fetch origin && git switch --detach origin/main
 gh pr checkout <N>
 ```
 
-Always reset the worktree to latest main before each PR.
+Always reset the worktree to latest `origin/main` before each PR.
 
 ### 2. Review the Diff
 
@@ -85,7 +85,7 @@ Present build, test, and fresheyes results to the user. Include:
 
 Address all fresheyes findings and test failures before merging:
 - Commit fixes on the PR branch with detailed messages
-- **Show the diff and get approval before pushing** to the PR branch or main
+- **Show the diff and get approval before pushing** to the PR branch
 - Re-build and re-test after fixes
 
 ### 7. Merge (only after user approves)
@@ -96,14 +96,9 @@ gh pr merge <N> --merge
 ```
 
 **If GitHub's merge state is stale** (common after rebase/force-push):
-```bash
-# In the main repo (not the worktree)
-git fetch origin && git merge --ff-only origin/main
-git merge --no-ff <branch> -m "Merge pull request #N from ..."
-git push origin main
-```
+refresh the PR branch on `origin/main`, force-push it with `--force-with-lease`, and use GitHub merge after the merge state updates. Do not merge locally into `main` or push `main` directly.
 
-**If conflicts exist:** rebase the PR branch on main, resolve, rebuild, retest, force-push, then merge.
+**If conflicts exist:** rebase the PR branch on `origin/main`, resolve, rebuild, retest, force-push with `--force-with-lease`, then merge through GitHub.
 
 ### 8. Comment and Close
 
@@ -116,7 +111,7 @@ Leave an effusive comment summarizing:
 gh pr comment <N> --body "..."
 ```
 
-Then ensure the PR is closed. Local merges (the fallback path) don't trigger GitHub's auto-close:
+Then ensure the PR is closed:
 
 ```bash
 # Check if still open; close if needed
@@ -128,10 +123,6 @@ gh pr view <N> --json state -q '.state' | grep -q OPEN && gh pr close <N>
 Once all PRs are landed and there is no unfinished work, clean up:
 
 ```bash
-# Switch back to main in the primary repo
-cd <primary-repo>
-git checkout main && git pull --ff-only origin main
-
 # Remove the pr-review worktree
 git worktree remove .worktrees/pr-review
 ```
@@ -192,7 +183,7 @@ The user may respond with:
 
 ##### c. Fix (if approved)
 
-- Create a branch: `git checkout -b fix/issue-<N> origin/main`
+- Create a branch in a worktree from `origin/main`.
 - Implement the fix in the worktree
 - Build and run targeted tests
 - **Show the diff and get approval before pushing**
@@ -219,7 +210,7 @@ Always sign the comment `— Codex CLI`.
 | Tests | `go test ./...` (targeted) | — |
 | Present results | Build/test/fresheyes summary | **User approval (Gate 2)** |
 | Fix | Commit + show diff + get approval before push | Build + tests green |
-| Merge | `gh pr merge` or local merge | All fixes landed + user says merge |
+| Merge | `gh pr merge` | All fixes landed + user says merge |
 | Comment + Close | `gh pr comment` + `gh pr close` if still open | Merge complete |
 | Reset | `git checkout --detach origin/main` | Before next PR |
 | Teardown | `git worktree remove .worktrees/pr-review` | Queue empty, all landed |
@@ -248,10 +239,10 @@ If you catch yourself thinking any of these, you are about to violate a gate:
 | Proceeding without user approval | There are TWO hard gates. Always wait at both. |
 | Treating ambiguous signals as approval | Only explicit approval words count. When in doubt, ask. |
 | Merging after build+fresheyes without asking | Gate 2 requires presenting results and waiting for go/no-go. |
-| Pushing fixes to main without showing diff | Show the diff first. Get approval before any push. |
+| Pushing fixes without showing diff | Show the diff first. Get approval before any push to the PR branch. |
 | Merging with fresheyes FAILED | Fix all findings first. Never merge a failed review. |
 | Forgetting to update worktree between PRs | Stale base causes unnecessary conflicts. Always reset to origin/main. |
-| Forgetting to close after local merge | Local merges don't trigger GitHub auto-close. Always check and `gh pr close` if still open. |
+| Pushing directly to `main` | `main` mirrors `origin/main`. Use PR branches and GitHub merge. |
 | Signing comment as "Codex" or "Claude" | Always sign as `— Codex CLI`. |
 | Processing PRs newest-first | Oldest-first minimizes cascading conflicts since earlier PRs often touch files later ones depend on. |
 | Processing issues oldest-first | Issue triage is newest-first so the most recent reports and follow-ups are evaluated first. |

@@ -18,7 +18,7 @@ import type {
 import type { RootState } from '@/store/store'
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
-const OTHER_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
+const OTHER_SESSION_ID = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
 
 function terminalContent(
   mode: TerminalPaneContent['mode'],
