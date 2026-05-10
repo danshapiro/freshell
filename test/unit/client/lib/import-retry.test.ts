@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { withChunkErrorRecovery } from '@/lib/import-retry'
+import { withChunkErrorRecovery, shouldReload, isChunkLoadError } from '@/lib/import-retry'
 
 describe('withChunkErrorRecovery', () => {
   const originalReload = window.location.reload
@@ -99,5 +99,46 @@ describe('withChunkErrorRecovery', () => {
       'string failure'
     )
     expect(window.location.reload).not.toHaveBeenCalled()
+  })
+})
+
+describe('shouldReload', () => {
+  beforeEach(() => {
+    sessionStorage.clear()
+  })
+
+  it('returns true on first call', () => {
+    expect(shouldReload()).toBe(true)
+  })
+
+  it('returns false if called within cooldown window', () => {
+    sessionStorage.setItem('freshell.chunk-reload', String(Date.now()))
+    expect(shouldReload()).toBe(false)
+  })
+
+  it('returns true after cooldown expires', () => {
+    sessionStorage.setItem('freshell.chunk-reload', String(Date.now() - 20_000))
+    expect(shouldReload()).toBe(true)
+  })
+
+  it('returns true when sessionStorage is unavailable', () => {
+    const originalGetItem = sessionStorage.getItem
+    sessionStorage.getItem = () => { throw new DOMException('SecurityError') }
+    expect(shouldReload()).toBe(true)
+    sessionStorage.getItem = originalGetItem
+  })
+})
+
+describe('isChunkLoadError', () => {
+  it('returns false for non-TypeError errors', () => {
+    const err = new RangeError(
+      'Failed to fetch dynamically imported module: http://localhost/assets/chunk.js'
+    )
+    expect(isChunkLoadError(err)).toBe(false)
+  })
+
+  it('returns false for matching message in regular Error', () => {
+    const err = new Error('importing a module script')
+    expect(isChunkLoadError(err)).toBe(false)
   })
 })

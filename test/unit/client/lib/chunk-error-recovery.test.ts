@@ -57,4 +57,12 @@ describe('initChunkErrorRecovery', () => {
     window.dispatchEvent(event)
     expect(window.location.reload).not.toHaveBeenCalled()
   })
+
+  it('is idempotent — calling initChunkErrorRecovery multiple times does not double-fire', () => {
+    initChunkErrorRecovery()
+    initChunkErrorRecovery()
+    const event = new Event('vite:preloadError', { cancelable: true })
+    window.dispatchEvent(event)
+    expect(window.location.reload).toHaveBeenCalledTimes(1)
+  })
 })

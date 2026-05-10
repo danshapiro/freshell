@@ -1,20 +1,24 @@
 const CHUNK_ERROR_RE =
   /(?:failed to fetch|error loading).*dynamically imported module|importing a module script|loading chunk \d+ failed/i
 
-const RELOAD_KEY = 'freshell.chunk-reload'
+export const RELOAD_KEY = 'freshell.chunk-reload'
 const RELOAD_COOLDOWN_MS = 10_000
 
 export function isChunkLoadError(err: unknown): boolean {
   return err instanceof TypeError && CHUNK_ERROR_RE.test(err.message)
 }
 
-function shouldReload(): boolean {
-  const last = sessionStorage.getItem(RELOAD_KEY)
-  if (last && Date.now() - parseInt(last, 10) < RELOAD_COOLDOWN_MS) {
-    return false
+export function shouldReload(): boolean {
+  try {
+    const last = sessionStorage.getItem(RELOAD_KEY)
+    if (last && Date.now() - parseInt(last, 10) < RELOAD_COOLDOWN_MS) {
+      return false
+    }
+    sessionStorage.setItem(RELOAD_KEY, String(Date.now()))
+    return true
+  } catch {
+    return true
   }
-  sessionStorage.setItem(RELOAD_KEY, String(Date.now()))
-  return true
 }
 
 export function withChunkErrorRecovery<T>(importPromise: Promise<T>): Promise<T> {
@@ -30,7 +34,12 @@ export function withChunkErrorRecovery<T>(importPromise: Promise<T>): Promise<T>
   })
 }
 
+let recoveryInitialized = false
+
 export function initChunkErrorRecovery(): void {
+  if (recoveryInitialized) return
+  recoveryInitialized = true
+
   window.addEventListener('vite:preloadError', (event) => {
     if (shouldReload()) {
       event.preventDefault()
