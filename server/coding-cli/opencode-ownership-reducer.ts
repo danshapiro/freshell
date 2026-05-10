@@ -278,15 +278,44 @@ function reduceSnapshot(
         actions: [{ kind: 'activityRemove', at: observation.at }],
       }
     }
-    const blockedSessionIds = uniqueSorted([...state.blockedSessionIds, ...busySessionIds])
+    const blockedSessionIds = uniqueSorted(busySessionIds)
+    if (blockedSessionIds.length === 1) {
+      const singleSessionId = blockedSessionIds[0]
+      if (state.knownSessionId && singleSessionId === state.knownSessionId) {
+        return {
+          state: {
+            kind: 'knownBusy',
+            sessionId: state.knownSessionId,
+            startedBy: 'snapshot',
+            cycleId: observation.cycleId,
+            streamId: observation.streamId,
+          },
+          actions: [{ kind: 'activityUpsert', sessionId: state.knownSessionId, at: observation.at }],
+        }
+      }
+      if (!state.knownSessionId) {
+        return {
+          state: {
+            kind: 'candidate',
+            sessionId: singleSessionId,
+            startedBy: 'snapshot',
+            cycleId: observation.cycleId,
+            streamId: observation.streamId,
+          },
+          actions: [],
+        }
+      }
+    }
+    const changed = blockedSessionIds.length !== state.blockedSessionIds.length
+      || blockedSessionIds.some((id, i) => id !== state.blockedSessionIds[i])
     return {
       state: { ...state, blockedSessionIds },
-      actions: blockedSessionIds.length === state.blockedSessionIds.length
-        ? [{ kind: 'activityUpsert', at: observation.at }]
-        : [
+      actions: changed
+        ? [
           { kind: 'activityUpsert', at: observation.at },
           { kind: 'warnAmbiguous', sessionIds: blockedSessionIds },
-        ],
+        ]
+        : [{ kind: 'activityUpsert', at: observation.at }],
     }
   }
 

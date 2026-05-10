@@ -329,4 +329,249 @@ describe('opencode ownership reducer', () => {
     expect(result.state).toEqual(state)
     expect(result.actions).toEqual([])
   })
+
+  it('recomputes blockedSessionIds from snapshot instead of unioning stale sessions', () => {
+    let state = createOpencodeOwnershipState()
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    }).state
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    }).state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    const result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'candidate',
+      sessionId: 'session-a',
+      startedBy: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+    })
+  })
+
+  it('transitions from ambiguous to knownBusy when snapshot shows single known session', () => {
+    let state = createOpencodeOwnershipState('session-a')
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    }).state
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    }).state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: 'session-a',
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    const result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'knownBusy',
+      sessionId: 'session-a',
+      startedBy: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+    })
+    expect(result.actions).toEqual([
+      { kind: 'activityUpsert', sessionId: 'session-a', at: 20 },
+    ])
+  })
+
+  it('transitions from ambiguous to candidate when snapshot shows single unknown session', () => {
+    let state = createOpencodeOwnershipState()
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    }).state
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    }).state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    const result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+      },
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'candidate',
+      sessionId: 'session-a',
+      startedBy: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+    })
+  })
+
+  it('does not re-emit warnAmbiguous when snapshot shows same set of sessions', () => {
+    let state = createOpencodeOwnershipState()
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    }).state
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    }).state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    const result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+        'session-b': { type: 'busy' },
+      },
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+    expect(result.actions).toEqual([
+      { kind: 'activityUpsert', at: 20 },
+    ])
+  })
+
+  it('re-emits warnAmbiguous when snapshot shows different set of sessions', () => {
+    let state = createOpencodeOwnershipState()
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-a',
+      status: 'busy',
+      at: 10,
+    }).state
+
+    state = reduceOpencodeOwnership(state, {
+      kind: 'sse',
+      cycleId: 1,
+      streamId: 1,
+      sessionId: 'session-b',
+      status: 'busy',
+      at: 11,
+    }).state
+
+    expect(state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-b'],
+      since: 11,
+    })
+
+    const result = reduceOpencodeOwnership(state, {
+      kind: 'snapshot',
+      cycleId: 1,
+      streamId: 1,
+      statuses: {
+        'session-a': { type: 'busy' },
+        'session-c': { type: 'busy' },
+      },
+      at: 20,
+    })
+
+    expect(result.state).toEqual({
+      kind: 'ambiguous',
+      knownSessionId: undefined,
+      blockedSessionIds: ['session-a', 'session-c'],
+      since: 11,
+    })
+    expect(result.actions).toEqual([
+      { kind: 'activityUpsert', at: 20 },
+      { kind: 'warnAmbiguous', sessionIds: ['session-a', 'session-c'] },
+    ])
+  })
 })

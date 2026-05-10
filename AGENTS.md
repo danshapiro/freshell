@@ -50,6 +50,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
+- **The self-hosted dev server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.
