@@ -432,23 +432,23 @@ export default function Sidebar({
       return
     }
 
-	    dispatch(addPane({
-	      tabId: currentActiveTabId,
-	      newContent: buildResumeContent({
-	        sessionType,
-	        sessionId: item.sessionId,
-	        cwd: item.cwd,
-	        agentChatProviderSettings: providerSettings,
-	        ...(runningTerminalId && localServerInstanceId
-	          ? {
-	              liveTerminal: {
-	                terminalId: runningTerminalId,
-	                serverInstanceId: localServerInstanceId,
-	              },
-	            }
-	          : {}),
-	      }),
-	    }))
+    dispatch(addPane({
+      tabId: currentActiveTabId,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: item.sessionId,
+        cwd: item.cwd,
+        agentChatProviderSettings: providerSettings,
+        ...(runningTerminalId && localServerInstanceId
+          ? {
+              liveTerminal: {
+                terminalId: runningTerminalId,
+                serverInstanceId: localServerInstanceId,
+              },
+            }
+          : {}),
+      }),
+    }))
     const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
     const sessionMetadataByKey = mergeSessionMetadataByKey(
       activeTab?.sessionMetadataByKey,
@@ -879,13 +879,13 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               : 'hover:bg-muted/50'
           )}
           data-context={ContextIds.SidebarSession}
-	          data-session-id={item.sessionId}
-	          data-provider={item.provider}
-	          data-session-type={item.sessionType}
-	          data-is-running={item.isRunning ? 'true' : 'false'}
-	          data-running-terminal-id={item.runningTerminalId ?? ''}
-	          data-has-tab={item.hasTab ? 'true' : 'false'}
-	        >
+          data-session-id={item.sessionId}
+          data-provider={item.provider}
+          data-session-type={item.sessionType}
+          data-is-running={item.isRunning ? 'true' : 'false'}
+          data-running-terminal-id={item.runningTerminalId ?? ''}
+          data-has-tab={item.hasTab ? 'true' : 'false'}
+        >
           {/* Provider icon */}
           <div className="flex-shrink-0">
             <div className="relative">

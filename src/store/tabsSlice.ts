@@ -789,14 +789,14 @@ export const openSessionTab = createAsyncThunk(
       }))
       dispatch(initLayout({
         tabId,
-	        content: {
-	          kind: 'terminal',
-	          mode: resolvedProvider,
-	          terminalId,
-	          serverInstanceId: localServerInstanceId,
-	          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
-	          initialCwd: cwd,
-	          status: 'running',
+        content: {
+          kind: 'terminal',
+          mode: resolvedProvider,
+          terminalId,
+          serverInstanceId: localServerInstanceId,
+          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+          initialCwd: cwd,
+          status: 'running',
         },
       }))
       return
