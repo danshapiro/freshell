@@ -168,4 +168,69 @@ describe('sidebarSelectors running session mapping', () => {
 
     expect(visible.map((item) => item.sessionId)).toEqual(['ses_live_opencode'])
   })
+
+  it('adds a live-only item for running coding terminals without session refs', () => {
+    const items = buildSessionItems(
+      [],
+      [{
+        id: 'tab-opencode',
+        title: 'OpenCode',
+        mode: 'opencode',
+        createRequestId: 'tab-opencode',
+        status: 'running',
+        createdAt: 1_000,
+      }] as any,
+      {
+        layouts: {
+          'tab-opencode': {
+            type: 'leaf',
+            id: 'pane-opencode',
+            content: {
+              kind: 'terminal',
+              mode: 'opencode',
+              terminalId: 'term-opencode-live',
+              status: 'running',
+            },
+          },
+        },
+        activePaneByTabId: {
+          'tab-opencode': 'pane-opencode',
+        },
+        activePane: {
+          'tab-opencode': 'pane-opencode',
+        },
+        paneTitles: {
+          'tab-opencode': {
+            'pane-opencode': 'OpenCode',
+          },
+        },
+      } as any,
+      [{
+        terminalId: 'term-opencode-live',
+        title: 'OpenCode',
+        createdAt: 1_100,
+        lastActivityAt: 1_200,
+        status: 'running',
+        hasClients: true,
+        mode: 'opencode',
+        cwd: '/repo/live',
+      }],
+      {},
+      'repo',
+    )
+
+    expect(items).toEqual([
+      expect.objectContaining({
+        provider: 'opencode',
+        sessionId: 'terminal:term-opencode-live',
+        title: 'OpenCode',
+        subtitle: 'live',
+        hasTab: true,
+        isRunning: true,
+        runningTerminalId: 'term-opencode-live',
+        runningTerminalIds: ['term-opencode-live'],
+        liveTerminalOnly: true,
+      }),
+    ])
+  })
 })

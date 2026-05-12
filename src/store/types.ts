@@ -98,6 +98,7 @@ export interface CodingCliSession {
   isNonInteractive?: boolean
   isRunning?: boolean
   runningTerminalId?: string
+  liveTerminalOnly?: boolean
   gitBranch?: string
   isDirty?: boolean
   tokenUsage?: TokenSummary

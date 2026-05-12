@@ -395,6 +395,78 @@ describe('querySessionDirectory', () => {
     })
   })
 
+  it('exposes running coding terminals before a provider session id is known', async () => {
+    const page = await querySessionDirectory({
+      projects: [],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-opencode-live',
+          provider: 'opencode',
+          cwd: '/repo/live',
+          checkoutRoot: '/repo/live',
+          updatedAt: 1_900,
+        }),
+      ],
+      query: {
+        priority: 'visible',
+        includeEmpty: false,
+        includeSubagents: true,
+        includeNonInteractive: true,
+        limit: 50,
+      },
+    })
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        provider: 'opencode',
+        sessionId: 'terminal:term-opencode-live',
+        projectPath: '/repo/live',
+        checkoutPath: '/repo/live',
+        title: 'OpenCode',
+        cwd: '/repo/live',
+        sessionType: 'opencode',
+        isRunning: true,
+        runningTerminalId: 'term-opencode-live',
+        liveTerminalOnly: true,
+      }),
+    ])
+    expect(page.revision).toBe(1_900)
+  })
+
+  it('exposes running session ids that are not indexed yet', async () => {
+    const page = await querySessionDirectory({
+      projects: [],
+      terminalMeta: [
+        makeTerminalMeta({
+          terminalId: 'term-codex-live',
+          provider: 'codex',
+          sessionId: 'codex-session-new',
+          cwd: '/repo/live',
+          updatedAt: 1_900,
+        }),
+      ],
+      query: {
+        priority: 'visible',
+        includeEmpty: false,
+        includeSubagents: true,
+        includeNonInteractive: true,
+        limit: 50,
+      },
+    })
+
+    expect(page.items).toEqual([
+      expect.objectContaining({
+        provider: 'codex',
+        sessionId: 'codex-session-new',
+        projectPath: '/repo/live',
+        title: 'Codex CLI',
+        isRunning: true,
+        runningTerminalId: 'term-codex-live',
+        liveTerminalOnly: false,
+      }),
+    ])
+  })
+
   it('caps page size at 50 even when a larger limit is requested', async () => {
     const manyProjects: ProjectGroup[] = [
       makeProject('/repo/many', Array.from({ length: 75 }, (_, index) => makeSession({

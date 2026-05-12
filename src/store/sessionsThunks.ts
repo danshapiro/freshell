@@ -84,6 +84,7 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
       isNonInteractive: result.isNonInteractive,
       isRunning: result.isRunning,
       runningTerminalId: result.runningTerminalId,
+      liveTerminalOnly: result.liveTerminalOnly,
     })
 
     grouped.set(result.projectPath, existing)

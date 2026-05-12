@@ -1,12 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { nanoid } from '@reduxjs/toolkit'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import NetworkQuickAccess from '@/components/NetworkQuickAccess'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
-import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, setActivePane } from '@/store/panesSlice'
+import { addTab, openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { addPane, initLayout, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -19,7 +20,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
-import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
+import { selectPaneLocationByTerminalId, selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
@@ -86,6 +87,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
+      ai.liveTerminalOnly !== bi.liveTerminalOnly ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -138,6 +140,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback &&
+    a.liveTerminalOnly === b.liveTerminalOnly &&
     a.ratchetedActivity === b.ratchetedActivity &&
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
@@ -336,6 +339,39 @@ export default function Sidebar({
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
+
+    if (item.liveTerminalOnly && runningTerminalId) {
+      const existing = selectPaneLocationByTerminalId(state, runningTerminalId)
+      if (existing) {
+        dispatch(setActiveTab(existing.tabId))
+        dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
+        onNavigate('terminal')
+        return
+      }
+
+      const tabId = nanoid()
+      dispatch(addTab({
+        id: tabId,
+        title: item.title,
+        status: 'running',
+        mode: provider,
+        codingCliProvider: provider,
+        initialCwd: item.cwd,
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: {
+          kind: 'terminal',
+          mode: provider,
+          terminalId: runningTerminalId,
+          serverInstanceId: localServerInstanceId,
+          initialCwd: item.cwd,
+          status: 'running',
+        },
+      }))
+      onNavigate('terminal')
+      return
+    }
 
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(
@@ -822,7 +858,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
-    a.isFallback === b.isFallback
+    a.isFallback === b.isFallback &&
+    a.liveTerminalOnly === b.liveTerminalOnly
   )
 }
 

@@ -410,6 +410,121 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.queryByText('Shell')).not.toBeInTheDocument()
     })
 
+    it('shows live coding terminals before a provider session id exists', async () => {
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: 'term-opencode-live',
+          title: 'OpenCode',
+          createdAt: Date.now() - 1000,
+          lastActivityAt: Date.now(),
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+          cwd: '/home/user/code/freshell',
+        },
+      ]
+
+      const store = createTestStore({
+        projects: [],
+        tabs: [{
+          id: 'tab-opencode',
+          terminalId: 'term-opencode-live',
+          mode: 'opencode',
+          status: 'running',
+        }],
+        activeTabId: null,
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      const item = screen.getByRole('button', { name: /OpenCode/i })
+      expect(item).toHaveAttribute('data-provider', 'opencode')
+      expect(item).toHaveAttribute('data-session-id', 'terminal:term-opencode-live')
+      expect(item).toHaveAttribute('data-is-running', 'true')
+      expect(item).toHaveAttribute('data-running-terminal-id', 'term-opencode-live')
+    })
+
+    it('focuses an existing pane when a live-only terminal item is clicked', async () => {
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: 'term-opencode-live',
+          title: 'OpenCode',
+          createdAt: Date.now() - 1000,
+          lastActivityAt: Date.now(),
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+          cwd: '/home/user/code/freshell',
+        },
+      ]
+      const store = createTestStore({
+        projects: [],
+        tabs: [
+          { id: 'tab-shell', mode: 'shell', status: 'running' },
+          { id: 'tab-opencode', terminalId: 'term-opencode-live', mode: 'opencode', status: 'running' },
+        ],
+        activeTabId: 'tab-shell',
+      })
+      const { onNavigate } = renderSidebar(store, terminals)
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      fireEvent.click(screen.getByRole('button', { name: /OpenCode/i }))
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-opencode')
+      expect(store.getState().panes.activePane['tab-opencode']).toBe('pane-tab-opencode')
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+    })
+
+    it('opens a live-only terminal without inventing a sessionRef when no pane owns it', async () => {
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: 'term-opencode-live',
+          title: 'OpenCode',
+          createdAt: Date.now() - 1000,
+          lastActivityAt: Date.now(),
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+          cwd: '/home/user/code/freshell',
+        },
+      ]
+      const store = createTestStore({
+        projects: [],
+        tabs: [],
+        activeTabId: null,
+        serverInstanceId: 'srv-local',
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      fireEvent.click(screen.getByRole('button', { name: /OpenCode/i }))
+
+      const state = store.getState()
+      const tab = state.tabs.tabs.find((candidate) => candidate.title === 'OpenCode')
+      expect(tab).toBeTruthy()
+      const layout = tab ? state.panes.layouts[tab.id] : undefined
+      expect(layout).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'terminal',
+          mode: 'opencode',
+          terminalId: 'term-opencode-live',
+          serverInstanceId: 'srv-local',
+          status: 'running',
+        },
+      })
+      expect((layout as any)?.content?.sessionRef).toBeUndefined()
+    })
+
     it('shows session title, not terminal title', async () => {
       const projects: ProjectGroup[] = [
         {

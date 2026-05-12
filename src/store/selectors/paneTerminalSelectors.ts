@@ -74,6 +74,13 @@ export function selectTabPaneByTerminalId(
   return undefined
 }
 
+export function selectPaneLocationByTerminalId(
+  state: RootState,
+  terminalId: string,
+): { tabId: string; paneId: string } | undefined {
+  return selectTabPaneByTerminalId(state, terminalId)
+}
+
 function findFirstTerminalId(node: PaneNode): string | undefined {
   if (node.type === 'leaf') {
     return node.content.kind === 'terminal' ? node.content.terminalId : undefined

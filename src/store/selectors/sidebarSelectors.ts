@@ -6,6 +6,7 @@ import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getSessionMetadata } from '@/lib/session-metadata'
+import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
 import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
@@ -32,6 +33,7 @@ export interface SidebarSessionItem {
   firstUserMessage?: string
   hasTitle: boolean
   isFallback?: true
+  liveTerminalOnly?: boolean
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
@@ -64,6 +66,42 @@ function getProjectName(projectPath: string): string {
   return getLeafDirectoryName(projectPath) ?? projectPath
 }
 
+function liveTerminalSessionId(terminalId: string): string {
+  return `terminal:${terminalId}`
+}
+
+function collectTerminalPaneTitles(
+  tabs: RootState['tabs']['tabs'],
+  panes: RootState['panes'],
+): Map<string, { title?: string; hasTab: boolean }> {
+  const result = new Map<string, { title?: string; hasTab: boolean }>()
+  const paneTitles = panes?.paneTitles ?? {}
+
+  const visit = (
+    node: RootState['panes']['layouts'][string],
+    tab: RootState['tabs']['tabs'][number],
+  ) => {
+    if (!node) return
+    if (node.type !== 'leaf') {
+      visit(node.children[0], tab)
+      visit(node.children[1], tab)
+      return
+    }
+    if (node.content.kind !== 'terminal' || !node.content.terminalId) return
+    result.set(node.content.terminalId, {
+      title: paneTitles?.[tab.id]?.[node.id] || tab.title,
+      hasTab: true,
+    })
+  }
+
+  for (const tab of tabs || []) {
+    const layout = panes.layouts?.[tab.id]
+    if (layout) visit(layout, tab)
+  }
+
+  return result
+}
+
 export function buildSessionItems(
   projects: RootState['sessions']['projects'],
   tabs: RootState['tabs']['tabs'],
@@ -77,6 +115,7 @@ export function buildSessionItems(
   const itemsByKey = new Map<string, SidebarSessionItem>()
   const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[] }>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
+  const terminalPaneTitles = collectTerminalPaneTitles(tabs, panes)
 
   for (const terminal of terminals || []) {
     if (terminal.status === 'running' && terminal.sessionRef) {
@@ -137,6 +176,7 @@ export function buildSessionItems(
         isNonInteractive: session.isNonInteractive,
         firstUserMessage: session.firstUserMessage,
         isFallback: undefined,
+        liveTerminalOnly: session.liveTerminalOnly,
       }
       items.push(item)
       itemsByKey.set(key, item)
@@ -304,6 +344,41 @@ export function buildSessionItems(
       }),
       metadata,
     })
+  }
+
+  for (const terminal of terminals || []) {
+    if (terminal.status !== 'running') continue
+    if (terminal.sessionRef) continue
+    if (!terminal.mode || terminal.mode === 'shell' || !isNonShellMode(terminal.mode)) continue
+
+    const provider = terminal.mode as CodingCliProviderName
+    const sessionId = liveTerminalSessionId(terminal.terminalId)
+    const key = `${provider}:${sessionId}`
+    if (itemsByKey.has(key)) continue
+
+    const paneInfo = terminalPaneTitles.get(terminal.terminalId)
+    const fallbackTitle = paneInfo?.title?.trim() || terminal.title?.trim() || getProviderLabel(provider)
+    const item: SidebarSessionItem = {
+      id: `session-${provider}-${sessionId}`,
+      sessionId,
+      provider,
+      sessionType: provider,
+      title: fallbackTitle,
+      hasTitle: fallbackTitle.length > 0,
+      subtitle: terminal.cwd ? getProjectName(terminal.cwd) : undefined,
+      projectPath: terminal.cwd,
+      timestamp: terminal.lastActivityAt ?? terminal.createdAt,
+      cwd: terminal.cwd,
+      hasTab: paneInfo?.hasTab ?? false,
+      ratchetedActivity: sessionActivity[key],
+      isRunning: true,
+      runningTerminalId: terminal.terminalId,
+      runningTerminalIds: [terminal.terminalId],
+      isFallback: true,
+      liveTerminalOnly: true,
+    }
+    items.push(item)
+    itemsByKey.set(key, item)
   }
 
   return items

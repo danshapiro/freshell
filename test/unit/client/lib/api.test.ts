@@ -403,6 +403,34 @@ describe('visible-first read-model helpers', () => {
     })
   })
 
+  it('preserves live-terminal-only state in sidebar snapshots', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'terminal:term-opencode-live',
+        provider: 'opencode',
+        projectPath: '/repo/live',
+        title: 'OpenCode',
+        sessionType: 'opencode',
+        isRunning: true,
+        runningTerminalId: 'term-opencode-live',
+        liveTerminalOnly: true,
+        lastActivityAt: 1_700,
+      }],
+      nextCursor: null,
+      revision: 1_700,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response.projects[0].sessions[0]).toMatchObject({
+      provider: 'opencode',
+      sessionId: 'terminal:term-opencode-live',
+      isRunning: true,
+      runningTerminalId: 'term-opencode-live',
+      liveTerminalOnly: true,
+    })
+  })
+
   it('encodes session-directory cursors with lastActivityAt', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
@@ -480,6 +508,34 @@ describe('visible-first read-model helpers', () => {
       sessionId: 'ses_live_opencode',
       isRunning: true,
       runningTerminalId: 'term-opencode-1',
+    })
+  })
+
+  it('preserves live-terminal-only state in search results', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'terminal:term-opencode-live',
+        provider: 'opencode',
+        projectPath: '/repo/live',
+        title: 'OpenCode',
+        matchedIn: 'title',
+        isRunning: true,
+        runningTerminalId: 'term-opencode-live',
+        liveTerminalOnly: true,
+        lastActivityAt: 1_800,
+      }],
+      nextCursor: null,
+      revision: 1_800,
+    }))
+
+    const response = await searchSessions({ query: 'OpenCode', tier: 'title' })
+
+    expect(response.results[0]).toMatchObject({
+      provider: 'opencode',
+      sessionId: 'terminal:term-opencode-live',
+      isRunning: true,
+      runningTerminalId: 'term-opencode-live',
+      liveTerminalOnly: true,
     })
   })
 })
