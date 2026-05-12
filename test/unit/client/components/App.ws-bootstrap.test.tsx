@@ -115,6 +115,8 @@ vi.mock('@/lib/ws-client', () => ({
 
 const apiGet = vi.hoisted(() => vi.fn())
 const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
+const getTerminalDirectoryPage = vi.hoisted(() => vi.fn())
+const searchTerminalView = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', () => ({
   api: {
     get: (url: string) => apiGet(url),
@@ -122,6 +124,8 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({}),
   },
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  getTerminalDirectoryPage: (options?: unknown, init?: unknown) => getTerminalDirectoryPage(options, init),
+  searchTerminalView: (terminalId: string, query: string, options?: unknown) => searchTerminalView(terminalId, query, options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
@@ -261,6 +265,10 @@ describe('App WS bootstrap recovery', () => {
 
     fetchSidebarSessionsSnapshot.mockReset()
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    getTerminalDirectoryPage.mockReset()
+    getTerminalDirectoryPage.mockResolvedValue({ items: [], revision: 1, nextCursor: null })
+    searchTerminalView.mockReset()
+    searchTerminalView.mockResolvedValue({ matches: [] })
 
     // Keep API calls fast and deterministic.
     apiGet.mockImplementation((url: string) => {
@@ -1276,6 +1284,89 @@ describe('App WS bootstrap recovery', () => {
           ]),
         }),
       ])
+    })
+  })
+
+  it('refreshes terminal directory and loaded session rows after terminal metadata invalidation', async () => {
+    const initialProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-live-1',
+        projectPath: '/repo',
+        lastActivityAt: 1,
+        title: 'Live Codex',
+      }],
+    }]
+    const refreshedProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-live-1',
+        projectPath: '/repo',
+        lastActivityAt: 2,
+        title: 'Live Codex',
+        isRunning: true,
+        runningTerminalId: 'term-1',
+      }],
+    }]
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            resultVersion: 1,
+          },
+        },
+      },
+    })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: refreshedProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 2,
+      oldestIncludedSessionId: 'codex:codex-live-1',
+      hasMore: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.meta.updated',
+        upsert: [{
+          terminalId: 'term-1',
+          provider: 'codex',
+          sessionId: 'codex-live-1',
+          updatedAt: 1_700,
+        }],
+        remove: [],
+      })
+      messageHandler?.({
+        type: 'terminals.changed',
+        revision: 2,
+      })
+    })
+
+    expect(store.getState().sessions.projects[0]?.sessions[0]).toMatchObject({
+      isRunning: true,
+      runningTerminalId: 'term-1',
+    })
+
+    await waitFor(() => {
+      expect(getTerminalDirectoryPage).toHaveBeenCalledTimes(1)
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     })
   })
 

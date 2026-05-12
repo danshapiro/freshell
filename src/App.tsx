@@ -4,6 +4,7 @@ import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setS
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
+  patchSessionRunningStateFromTerminalMeta,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
@@ -13,6 +14,8 @@ import {
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
+import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
+import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -728,6 +731,15 @@ export default function App() {
         }
       }
 
+      const terminalInvalidationHandler = createTerminalInvalidationHandler({
+        dispatch: (action) => appStore.dispatch(action as any),
+        upsertTerminalMeta,
+        removeTerminalMeta,
+        patchSessionRunningStateFromTerminalMeta,
+        queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
+        fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
+      })
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -785,16 +797,8 @@ export default function App() {
             send: (payload) => ws.send(payload),
           })
         }
-        if (msg.type === 'terminal.meta.updated') {
-          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
-          if (upsert.length > 0) {
-            dispatch(upsertTerminalMeta(upsert))
-          }
-
-          const remove = Array.isArray(msg.remove) ? msg.remove : []
-          for (const terminalId of remove) {
-            dispatch(removeTerminalMeta(terminalId))
-          }
+        if (terminalInvalidationHandler.handle(msg as any)) {
+          return
         }
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
@@ -943,6 +947,7 @@ export default function App() {
       })
 
       cleanup = () => {
+        terminalInvalidationHandler.dispose()
         stopWsDisconnectSync?.()
         unsubscribe()
       }
