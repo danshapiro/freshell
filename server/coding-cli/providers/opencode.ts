@@ -19,6 +19,17 @@ type OpencodeSessionSchema = {
   hasParentId: boolean
 }
 
+type OpencodeDatabaseMessageClass =
+  | 'missing_db'
+  | 'empty_db'
+  | 'sqlite_unavailable'
+  | 'sqlite_open_failed'
+  | 'schema_error'
+  | 'read_error'
+  | 'schema_missing_parent_id'
+
+type OpencodeDatabaseLogLevel = 'debug' | 'info' | 'warn'
+
 export type OpencodeRootResolution = {
   rootsBySessionId: Map<string, string>
   unresolvedSessionIds: Set<string>
@@ -43,6 +54,7 @@ export class OpencodeProvider implements CodingCliProvider {
   readonly name = 'opencode' as const
   readonly displayName = 'OpenCode'
   private sessionSchemaCache?: OpencodeSessionSchema
+  private readonly loggedDatabaseStates = new Set<string>()
 
   constructor(readonly homeDir: string = defaultOpencodeDataHome()) {}
 
@@ -55,27 +67,78 @@ export class OpencodeProvider implements CodingCliProvider {
     return [dbPath, `${dbPath}-wal`]
   }
 
+  private databaseLogFields(
+    messageClass: OpencodeDatabaseMessageClass,
+    error?: unknown,
+    extra?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      provider: this.name,
+      dbPathLabel: '<opencode-data>/opencode.db',
+      dbFile: 'opencode.db',
+      pathSanitized: true,
+      messageClass,
+      ...(error instanceof Error ? { errorName: error.name } : {}),
+      ...(extra ?? {}),
+    }
+  }
+
+  private logDatabaseStateOnce(
+    level: OpencodeDatabaseLogLevel,
+    messageClass: OpencodeDatabaseMessageClass,
+    message: string,
+    options: {
+      scope?: string
+      error?: unknown
+      extra?: Record<string, unknown>
+    } = {},
+  ): void {
+    const key = `${options.scope ?? 'default'}:${messageClass}:${level}`
+    if (this.loggedDatabaseStates.has(key)) return
+    this.loggedDatabaseStates.add(key)
+    logger[level](this.databaseLogFields(messageClass, options.error, options.extra), message)
+  }
+
+  private classifyDatabaseFailure(phase: 'open' | 'schema' | 'query' | 'map'): OpencodeDatabaseMessageClass {
+    switch (phase) {
+      case 'open':
+        return 'sqlite_open_failed'
+      case 'schema':
+        return 'schema_error'
+      case 'query':
+      case 'map':
+        return 'read_error'
+    }
+  }
+
   async listSessionsDirect(): Promise<CodingCliSession[]> {
     const dbPath = this.getDatabasePath()
     try {
       await fsp.access(dbPath)
     } catch {
+      this.logDatabaseStateOnce('info', 'missing_db', 'OpenCode sessions database is not available')
       return []
     }
 
     let sqlite: typeof import('node:sqlite')
     try {
       sqlite = await import('node:sqlite')
-    } catch {
-      logger.warn({ provider: this.name, nodeVersion: process.version }, 'node:sqlite unavailable — OpenCode sessions will not appear. Upgrade to Node 22.5+ to enable.')
+    } catch (err) {
+      this.logDatabaseStateOnce('warn', 'sqlite_unavailable', 'node:sqlite unavailable — OpenCode sessions will not appear. Upgrade to Node 22.5+ to enable.', {
+        error: err,
+        extra: { nodeVersion: process.version },
+      })
       return []
     }
 
     let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
+    let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
     try {
       db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+      phase = 'schema'
       const schema = this.inspectSessionSchema(db)
       const rootFilter = schema.hasParentId ? 'AND s.parent_id IS NULL' : ''
+      phase = 'query'
       const rows = db.prepare(`
         SELECT
           s.id AS sessionId,
@@ -92,6 +155,13 @@ export class OpencodeProvider implements CodingCliProvider {
         ORDER BY s.time_updated DESC
       `).all() as OpencodeSessionRow[]
 
+      if (rows.length === 0) {
+        this.logDatabaseStateOnce('info', 'empty_db', 'OpenCode sessions database has no active root sessions', {
+          extra: { rowCount: 0 },
+        })
+      }
+
+      phase = 'map'
       const sessions: CodingCliSession[] = []
       for (const row of rows) {
         if (typeof row.cwd !== 'string' || !row.cwd) continue
@@ -108,7 +178,9 @@ export class OpencodeProvider implements CodingCliProvider {
       }
       return sessions
     } catch (err) {
-      logger.warn({ err, dbPath, provider: this.name }, 'Failed to read OpenCode sessions database')
+      this.logDatabaseStateOnce('warn', this.classifyDatabaseFailure(phase), 'Failed to read OpenCode sessions database', {
+        error: err,
+      })
       return []
     } finally {
       db?.close()
@@ -128,7 +200,10 @@ export class OpencodeProvider implements CodingCliProvider {
       await fsp.access(dbPath)
     } catch {
       for (const id of requestedIds) unresolvedSessionIds.add(id)
-      logger.debug({ provider: this.name, dbPath, sessionIds: requestedIds }, 'OpenCode database missing during root resolution')
+      this.logDatabaseStateOnce('debug', 'missing_db', 'OpenCode database missing during root resolution', {
+        scope: 'resolve',
+        extra: { requestedSessionCount: requestedIds.length },
+      })
       return { rootsBySessionId, unresolvedSessionIds }
     }
 
@@ -136,14 +211,23 @@ export class OpencodeProvider implements CodingCliProvider {
     try {
       sqlite = await import('node:sqlite')
     } catch (err) {
-      logger.warn({ err, provider: this.name, nodeVersion: process.version }, 'node:sqlite unavailable while resolving OpenCode roots')
+      this.logDatabaseStateOnce('warn', 'sqlite_unavailable', 'node:sqlite unavailable while resolving OpenCode roots', {
+        scope: 'resolve',
+        error: err,
+        extra: {
+          nodeVersion: process.version,
+          requestedSessionCount: requestedIds.length,
+        },
+      })
       for (const id of requestedIds) unresolvedSessionIds.add(id)
       return { rootsBySessionId, unresolvedSessionIds }
     }
 
     let db: InstanceType<typeof sqlite.DatabaseSync> | undefined
+    let phase: 'open' | 'schema' | 'query' | 'map' = 'open'
     try {
       db = new sqlite.DatabaseSync(dbPath, { readOnly: true })
+      phase = 'schema'
       const schema = this.inspectSessionSchema(db)
       if (!schema.hasParentId) {
         for (const id of requestedIds) rootsBySessionId.set(id, id)
@@ -152,6 +236,7 @@ export class OpencodeProvider implements CodingCliProvider {
 
       const rowsById = new Map<string, string | null>()
       let pending = requestedIds
+      phase = 'query'
       while (pending.length > 0) {
         const placeholders = pending.map(() => '?').join(',')
         const rows = db.prepare(
@@ -168,6 +253,7 @@ export class OpencodeProvider implements CodingCliProvider {
         pending = Array.from(new Set(nextPending))
       }
 
+      phase = 'map'
       for (const requestedId of requestedIds) {
         let current: string | null | undefined = requestedId
         const seen = new Set<string>()
@@ -191,7 +277,11 @@ export class OpencodeProvider implements CodingCliProvider {
       }
       return { rootsBySessionId, unresolvedSessionIds }
     } catch (err) {
-      logger.warn({ err, dbPath, provider: this.name, sessionIds: requestedIds }, 'Failed to resolve OpenCode root sessions')
+      this.logDatabaseStateOnce('warn', this.classifyDatabaseFailure(phase), 'Failed to resolve OpenCode root sessions', {
+        scope: 'resolve',
+        error: err,
+        extra: { requestedSessionCount: requestedIds.length },
+      })
       for (const id of requestedIds) unresolvedSessionIds.add(id)
       return { rootsBySessionId, unresolvedSessionIds }
     } finally {
@@ -209,7 +299,7 @@ export class OpencodeProvider implements CodingCliProvider {
       hasParentId: columnNames.has('parent_id'),
     }
     if (!schema.hasParentId) {
-      logger.warn({ provider: this.name }, 'OpenCode session schema does not expose parent_id; treating sessions as flat roots')
+      this.logDatabaseStateOnce('warn', 'schema_missing_parent_id', 'OpenCode session schema does not expose parent_id; treating sessions as flat roots')
     }
     this.sessionSchemaCache = schema
     return schema

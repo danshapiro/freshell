@@ -480,6 +480,28 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
   return err
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+class TerminalCreateAdmissionError extends Error {}
+
+const WS_ERROR_SUPPRESSION_WINDOW_MS = 5_000
+const WS_ERROR_SUPPRESSION_MAX_KEYS = 1_000
+const WS_ERROR_SUPPRESSION_FLUSH_MS = 30_000
+
+type WsErrorSuppressionEntry = {
+  code: z.infer<typeof ErrorCode>
+  messageClass: string
+  terminalId?: string
+  connectionId: string
+  suppressedCount: number
+  totalCount: number
+  firstRequestId?: string
+  lastRequestId?: string
+  windowStartedAt: number
+  windowEndedAt: number
+}
 export class WsHandler {
   private readonly config: WsHandlerConfig
   private readonly authToken: string
@@ -519,6 +541,8 @@ export class WsHandler {
   private pendingUiCommands: PendingUiCommand[] = []
   private sessionsRevision = 0
   private terminalsRevision = 0
+  private wsErrorSuppression = new Map<string, WsErrorSuppressionEntry>()
+  private wsErrorSuppressionFlushInterval: NodeJS.Timeout | null = null
 
   private readonly serverInstanceId: string
   private readonly bootId: string
@@ -574,6 +598,10 @@ export class WsHandler {
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
+    this.wsErrorSuppressionFlushInterval = setInterval(() => {
+      this.flushSuppressedWsErrors('periodic')
+    }, WS_ERROR_SUPPRESSION_FLUSH_MS)
+    this.wsErrorSuppressionFlushInterval.unref?.()
 
     // Build the set of valid CLI provider/mode names from extensions
     const extensionManager = this.extensionManager
@@ -1317,6 +1345,7 @@ export class WsHandler {
 
   private onClose(ws: LiveWebSocket, state: ClientState, code?: number, reason?: Buffer) {
     if (state.helloTimer) clearTimeout(state.helloTimer)
+    this.flushSuppressedWsErrors('connection_close', ws.connectionId || 'unknown')
     this.connections.delete(ws)
     this.clientStates.delete(ws)
 
@@ -1459,10 +1488,139 @@ export class WsHandler {
     }
   }
 
+  private classifyWsErrorMessage(params: { code: z.infer<typeof ErrorCode>; message: string }): string {
+    switch (params.code) {
+      case 'INVALID_TERMINAL_ID':
+        if (/unknown terminalid/i.test(params.message)) return 'unknown_terminal_id'
+        if (/not running|exited/i.test(params.message)) return 'terminal_not_running'
+        return 'invalid_terminal_id'
+      case 'RESTORE_UNAVAILABLE':
+        return 'restore_unavailable'
+      case 'RATE_LIMITED':
+        return 'rate_limited'
+      case 'INVALID_CREATE_REQUEST':
+        return 'invalid_create_request'
+      case 'INVALID_MESSAGE':
+        return 'invalid_message'
+      default:
+        return params.code.toLowerCase()
+    }
+  }
+
+  private wsErrorSuppressionKey(
+    ws: LiveWebSocket,
+    params: { code: z.infer<typeof ErrorCode>; terminalId?: string },
+    messageClass: string,
+  ): string {
+    return [
+      ws.connectionId || 'unknown',
+      params.code,
+      params.terminalId || '-',
+      messageClass,
+    ].join('|')
+  }
+
+  private flushSuppressedWsErrorEntry(entry: WsErrorSuppressionEntry, reason: string): void {
+    if (entry.suppressedCount <= 0) return
+    log.warn({
+      event: 'ws_send_error_suppressed_summary',
+      reason,
+      code: entry.code,
+      messageClass: entry.messageClass,
+      connectionId: entry.connectionId,
+      terminalId: entry.terminalId,
+      suppressedCount: entry.suppressedCount,
+      totalCount: entry.totalCount,
+      firstRequestId: entry.firstRequestId,
+      lastRequestId: entry.lastRequestId,
+      windowStartedAt: new Date(entry.windowStartedAt).toISOString(),
+      windowEndedAt: new Date(entry.windowEndedAt).toISOString(),
+    }, 'ws_send_error_suppressed_summary')
+  }
+
+  private resetSuppressedWsErrorEntry(key: string, entry: WsErrorSuppressionEntry): void {
+    const now = Date.now()
+    entry.suppressedCount = 0
+    entry.totalCount = 1
+    entry.firstRequestId = entry.lastRequestId
+    entry.windowStartedAt = now
+    entry.windowEndedAt = now
+    this.wsErrorSuppression.set(key, entry)
+  }
+
+  private flushSuppressedWsErrors(reason: string, connectionId?: string): void {
+    const keepEntries = reason === 'periodic'
+    for (const [key, entry] of [...this.wsErrorSuppression.entries()]) {
+      if (connectionId && entry.connectionId !== connectionId) continue
+      this.flushSuppressedWsErrorEntry(entry, reason)
+      if (keepEntries) {
+        if (entry.suppressedCount > 0) {
+          this.resetSuppressedWsErrorEntry(key, entry)
+        }
+      } else {
+        this.wsErrorSuppression.delete(key)
+      }
+    }
+  }
+
+  private logWsError(
+    ws: LiveWebSocket,
+    params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string },
+  ): void {
+    const messageClass = this.classifyWsErrorMessage(params)
+    const key = this.wsErrorSuppressionKey(ws, params, messageClass)
+    const now = Date.now()
+    const existing = this.wsErrorSuppression.get(key)
+
+    if (existing && now - existing.windowStartedAt < WS_ERROR_SUPPRESSION_WINDOW_MS) {
+      existing.suppressedCount += 1
+      existing.totalCount += 1
+      existing.lastRequestId = params.requestId
+      existing.windowEndedAt = now
+      this.wsErrorSuppression.delete(key)
+      this.wsErrorSuppression.set(key, existing)
+      return
+    }
+
+    if (existing) {
+      this.flushSuppressedWsErrorEntry(existing, 'window_rollover')
+      this.wsErrorSuppression.delete(key)
+    }
+
+    while (this.wsErrorSuppression.size >= WS_ERROR_SUPPRESSION_MAX_KEYS) {
+      const oldest = this.wsErrorSuppression.entries().next().value as [string, WsErrorSuppressionEntry] | undefined
+      if (!oldest) break
+      this.flushSuppressedWsErrorEntry(oldest[1], 'evicted')
+      this.wsErrorSuppression.delete(oldest[0])
+    }
+
+    this.wsErrorSuppression.set(key, {
+      code: params.code,
+      messageClass,
+      terminalId: params.terminalId,
+      connectionId: ws.connectionId || 'unknown',
+      suppressedCount: 0,
+      totalCount: 1,
+      firstRequestId: params.requestId,
+      lastRequestId: params.requestId,
+      windowStartedAt: now,
+      windowEndedAt: now,
+    })
+    log.warn({
+      event: 'ws_send_error',
+      code: params.code,
+      messageClass,
+      requestId: params.requestId,
+      terminalId: params.terminalId,
+      connectionId: ws.connectionId || 'unknown',
+    }, 'ws_send_error')
+  }
+
   private sendError(
     ws: LiveWebSocket,
     params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string }
   ) {
+    this.logWsError(ws, params)
     this.send(ws, {
       type: 'error',
       code: params.code,
@@ -2731,7 +2889,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Terminal not running',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (record.status !== 'running') {
@@ -2744,6 +2907,7 @@ export class WsHandler {
           this.sendError(ws, {
             code: 'INVALID_TERMINAL_ID',
             message: formatExitedTerminalAttachMessage(record),
+            requestId: m.attachRequestId,
             terminalId: m.terminalId,
           })
           return
@@ -2771,6 +2935,7 @@ export class WsHandler {
             this.sendError(ws, {
               code: 'INVALID_TERMINAL_ID',
               message: formatExitedTerminalAttachMessage(latestRecord),
+              requestId: m.attachRequestId,
               terminalId: m.terminalId,
             })
             return
@@ -2781,7 +2946,12 @@ export class WsHandler {
             connectionId: ws.connectionId || 'unknown',
             operation: 'terminal.attach',
           })
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
+          this.sendError(ws, {
+            code: 'INVALID_TERMINAL_ID',
+            message: 'Unknown terminalId',
+            requestId: m.attachRequestId,
+            terminalId: m.terminalId,
+          })
           return
         }
         if (attachResult === 'duplicate') return
@@ -4163,6 +4333,12 @@ export class WsHandler {
       clearInterval(this.pingInterval)
       this.pingInterval = null
     }
+    if (this.wsErrorSuppressionFlushInterval) {
+      clearInterval(this.wsErrorSuppressionFlushInterval)
+      this.wsErrorSuppressionFlushInterval = null
+    }
+    this.flushSuppressedWsErrors('server_close')
+    this.wsErrorSuppression.clear()
 
     this.terminalStreamBroker.close()
 

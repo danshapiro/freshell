@@ -3,6 +3,20 @@ import os from 'os'
 import fsp from 'fs/promises'
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  debug: vi.fn(),
+  error: vi.fn(),
+  child: vi.fn(),
+}))
+loggerMock.child.mockReturnValue(loggerMock)
+
+vi.mock('../../../../server/logger.js', () => ({
+  logger: loggerMock,
+  sessionLifecycleLogger: loggerMock,
+}))
+
 type FakeProjectRow = {
   id: string
   worktree: string
@@ -26,6 +40,8 @@ const fakeDatabaseState = new Map<string, {
 }>()
 
 class FakeDatabaseSync {
+  private static openFailures: Error[] = []
+
   static seed(
     dbPath: string,
     rows: {
@@ -37,7 +53,18 @@ class FakeDatabaseSync {
     fakeDatabaseState.set(dbPath, rows)
   }
 
-  constructor(private readonly dbPath: string) {}
+  static failOpenOnce(err: Error): void {
+    this.openFailures.push(err)
+  }
+
+  static reset(): void {
+    this.openFailures = []
+  }
+
+  constructor(private readonly dbPath: string) {
+    const failure = FakeDatabaseSync.openFailures.shift()
+    if (failure) throw failure
+  }
 
   prepare(sql: string) {
     return {
@@ -102,10 +129,13 @@ describe('OpencodeProvider', () => {
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-opencode-provider-'))
     fakeDatabaseState.clear()
+    FakeDatabaseSync.reset()
+    vi.clearAllMocks()
   })
 
   afterEach(async () => {
     fakeDatabaseState.clear()
+    FakeDatabaseSync.reset()
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
@@ -179,6 +209,65 @@ describe('OpencodeProvider', () => {
     expect(glob).not.toContain('*')
     expect(provider.getSessionRoots()).toEqual([dbPath])
     expect(provider.getSessionWatchBases()).toEqual([path.dirname(tempDir)])
+  })
+
+  it('logs missing OpenCode database as unavailable, not as a successful empty session list', async () => {
+    const provider = new OpencodeProvider(tempDir)
+
+    await expect(provider.listSessionsDirect()).resolves.toEqual([])
+
+    expect(loggerMock.info).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'opencode',
+      dbPathLabel: '<opencode-data>/opencode.db',
+      dbFile: 'opencode.db',
+      pathSanitized: true,
+      messageClass: 'missing_db',
+    }), 'OpenCode sessions database is not available')
+    expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain(tempDir)
+    expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain(os.tmpdir())
+  })
+
+  it('logs OpenCode database read failures distinctly from an empty database', async () => {
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.failOpenOnce(new Error('bad sqlite'))
+    const provider = new OpencodeProvider(tempDir)
+
+    await expect(provider.listSessionsDirect()).resolves.toEqual([])
+
+    expect(loggerMock.warn).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'opencode',
+      dbPathLabel: '<opencode-data>/opencode.db',
+      dbFile: 'opencode.db',
+      pathSanitized: true,
+      errorName: 'Error',
+      messageClass: 'sqlite_open_failed',
+    }), 'Failed to read OpenCode sessions database')
+    const serializedCalls = JSON.stringify(loggerMock.warn.mock.calls)
+    expect(serializedCalls).not.toContain(tempDir)
+    expect(serializedCalls).not.toContain(os.tmpdir())
+    expect(serializedCalls).not.toContain('bad sqlite')
+  })
+
+  it('logs an empty OpenCode database as empty, not broken', async () => {
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.seed(dbPath, {
+      projects: [],
+      sessions: [],
+    })
+    const provider = new OpencodeProvider(tempDir)
+
+    await expect(provider.listSessionsDirect()).resolves.toEqual([])
+
+    expect(loggerMock.info).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'opencode',
+      dbPathLabel: '<opencode-data>/opencode.db',
+      dbFile: 'opencode.db',
+      pathSanitized: true,
+      messageClass: 'empty_db',
+      rowCount: 0,
+    }), 'OpenCode sessions database has no active root sessions')
   })
 
   it('maps OpenCode child session ids to sqlite root session ids', async () => {

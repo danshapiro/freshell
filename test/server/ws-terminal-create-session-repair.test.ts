@@ -13,12 +13,25 @@ const REPAIR_WAIT_MS = 75
 const REPAIR_STAGGER_MS = 20
 const DUPLICATE_SETTLE_MS = 100
 const DISCONNECT_SETTLE_MS = 150
+const loggerMock = vi.hoisted(() => ({
+  warn: vi.fn(),
+  info: vi.fn(),
+  debug: vi.fn(),
+  error: vi.fn(),
+  child: vi.fn(),
+}))
 const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   version: 1,
   settings: {},
   sessionOverrides: {},
   terminalOverrides: {},
   projectColors: {},
+}))
+loggerMock.child.mockReturnValue(loggerMock)
+
+vi.mock('../../server/logger', () => ({
+  logger: loggerMock,
+  sessionLifecycleLogger: loggerMock,
 }))
 
 vi.mock('../../server/config-store', () => ({
@@ -129,6 +142,19 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 500): Promise<void> {
     })
     ws.close()
   })
+}
+
+async function waitForLoggerWarn(
+  predicate: (call: [Record<string, any>, string?]) => boolean,
+  timeoutMs = 1000,
+): Promise<[Record<string, any>, string?]> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const call = loggerMock.warn.mock.calls.find((entry) => predicate(entry as [Record<string, any>, string?]))
+    if (call) return call as [Record<string, any>, string?]
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('Timed out waiting for logger warn call')
 }
 
 class FakeBuffer {
@@ -316,6 +342,10 @@ describe('terminal.create session repair wait', () => {
     registry.lastCreateOpts = null
     registry.createCallCount = 0
     registry.forceAttachFailure = false
+    loggerMock.warn.mockClear()
+    loggerMock.info.mockClear()
+    loggerMock.debug.mockClear()
+    loggerMock.error.mockClear()
   }, HOOK_TIMEOUT_MS)
 
   afterEach(async () => {
@@ -866,6 +896,94 @@ describe('terminal.create session repair wait', () => {
       }
       registry.forceAttachFailure = false
     }
+  })
+
+  it('logs websocket errors server-side before sending them to the client', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID',
+      )
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: 'missing-term',
+        attachRequestId: 'attach-missing-term',
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+      }))
+
+      await responsePromise
+
+      expect(loggerMock.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'ws_send_error',
+        code: 'INVALID_TERMINAL_ID',
+        messageClass: 'terminal_not_running',
+        terminalId: 'missing-term',
+        requestId: 'attach-missing-term',
+      }), 'ws_send_error')
+      expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain('Terminal not running')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('summarizes repeated websocket errors without logging request text', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      for (const requestId of ['attach-loop-1', 'attach-loop-2', 'attach-loop-3']) {
+        const responsePromise = waitForMessage(
+          ws,
+          (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID',
+        )
+        ws.send(JSON.stringify({
+          type: 'terminal.attach',
+          terminalId: 'missing-term',
+          attachRequestId: requestId,
+          intent: 'viewport_hydrate',
+          cols: 80,
+          rows: 24,
+        }))
+        await responsePromise
+      }
+
+      const firstLogCalls = loggerMock.warn.mock.calls.filter((call) => (
+        call[0]?.event === 'ws_send_error'
+        && call[0]?.code === 'INVALID_TERMINAL_ID'
+        && call[0]?.terminalId === 'missing-term'
+      ))
+      expect(firstLogCalls).toHaveLength(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+
+    const [summary] = await waitForLoggerWarn((call) => (
+      call[0]?.event === 'ws_send_error_suppressed_summary'
+      && call[0]?.code === 'INVALID_TERMINAL_ID'
+      && call[0]?.terminalId === 'missing-term'
+    ))
+    expect(summary).toMatchObject({
+      event: 'ws_send_error_suppressed_summary',
+      reason: 'connection_close',
+      code: 'INVALID_TERMINAL_ID',
+      messageClass: 'terminal_not_running',
+      terminalId: 'missing-term',
+      suppressedCount: 2,
+      totalCount: 3,
+      firstRequestId: 'attach-loop-1',
+      lastRequestId: 'attach-loop-3',
+    })
+    const serializedCalls = JSON.stringify(loggerMock.warn.mock.calls)
+    expect(serializedCalls).not.toContain('Terminal not running')
   })
 
   it('does not skip resume for healthy sessions with inline-progress resume issue', async () => {
