@@ -9,7 +9,7 @@ import {
 
 type TerminalProvider = Exclude<TerminalMode, 'shell'>
 
-type TerminalSeedRecord = {
+export type TerminalSeedRecord = {
   terminalId: string
   mode: TerminalMode
   resumeSessionId?: string
@@ -157,6 +157,24 @@ export class TerminalMetadataService {
       ...current,
       provider,
       sessionId,
+    }
+
+    return this.commitIfChanged(next)
+  }
+
+  clearSessionAssociation(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+  ): TerminalMeta | undefined {
+    const current = this.byTerminalId.get(terminalId)
+    if (!current) return undefined
+    if (current.provider !== provider || current.sessionId !== sessionId) return undefined
+
+    const next: TerminalMeta = {
+      ...current,
+      provider: undefined,
+      sessionId: undefined,
     }
 
     return this.commitIfChanged(next)

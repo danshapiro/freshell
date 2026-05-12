@@ -56,6 +56,7 @@ export const SessionDirectoryItemSchema = z.object({
   isNonInteractive: z.boolean().optional(),
   isRunning: z.boolean(),
   runningTerminalId: z.string().optional(),
+  liveTerminalOnly: z.boolean().optional(),
 })
 
 export const SessionDirectoryPageSchema = z.object({

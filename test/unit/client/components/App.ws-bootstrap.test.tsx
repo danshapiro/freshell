@@ -93,6 +93,16 @@ const wsMocks = vi.hoisted(() => ({
   serverInstanceId: undefined as string | undefined,
 }))
 
+const terminalRestoreMocks = vi.hoisted(() => ({
+  addTerminalRestoreRequestId: vi.fn(),
+  addTerminalFreshRecoveryRequestId: vi.fn(),
+}))
+
+vi.mock('@/lib/terminal-restore', () => ({
+  addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
+  addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
+}))
+
 let messageHandler: ((msg: any) => void) | null = null
 let disconnectHandler: (() => void) | null = null
 
@@ -115,6 +125,8 @@ vi.mock('@/lib/ws-client', () => ({
 
 const apiGet = vi.hoisted(() => vi.fn())
 const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
+const getTerminalDirectoryPage = vi.hoisted(() => vi.fn())
+const searchTerminalView = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', () => ({
   api: {
     get: (url: string) => apiGet(url),
@@ -122,6 +134,8 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({}),
   },
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  getTerminalDirectoryPage: (options?: unknown, init?: unknown) => getTerminalDirectoryPage(options, init),
+  searchTerminalView: (terminalId: string, query: string, options?: unknown) => searchTerminalView(terminalId, query, options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
@@ -251,6 +265,8 @@ describe('App WS bootstrap recovery', () => {
     })
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
+    terminalRestoreMocks.addTerminalRestoreRequestId.mockClear()
+    terminalRestoreMocks.addTerminalFreshRecoveryRequestId.mockClear()
     messageHandler = null
     disconnectHandler = null
 
@@ -261,6 +277,10 @@ describe('App WS bootstrap recovery', () => {
 
     fetchSidebarSessionsSnapshot.mockReset()
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    getTerminalDirectoryPage.mockReset()
+    getTerminalDirectoryPage.mockResolvedValue({ items: [], revision: 1, nextCursor: null })
+    searchTerminalView.mockReset()
+    searchTerminalView.mockResolvedValue({ matches: [] })
 
     // Keep API calls fast and deterministic.
     apiGet.mockImplementation((url: string) => {
@@ -824,6 +844,97 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
+  it('registers regenerated restart request ids for durable restore and explicit fresh recovery', async () => {
+    const store = createStore({
+      tabs: [{ id: 'tab-restart', mode: 'codex', status: 'running' }],
+      panes: {
+        layouts: {
+          'tab-restart': {
+            type: 'split',
+            id: 'split-root',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-codex',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-codex-old',
+                  status: 'running',
+                  mode: 'codex',
+                  shell: 'system',
+                  terminalId: 'term-codex-old',
+                  serverInstanceId: 'srv-old',
+                  sessionRef: {
+                    provider: 'codex',
+                    sessionId: 'codex-session-1',
+                  },
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-shell',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-shell-old',
+                  status: 'running',
+                  mode: 'shell',
+                  shell: 'system',
+                  terminalId: 'term-shell-old',
+                  serverInstanceId: 'srv-old',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'tab-restart': 'pane-codex' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [],
+        terminalMeta: [],
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-restart']
+      if (!layout || layout.type !== 'split') throw new Error('expected split layout')
+      const codexPane = layout.children[0]
+      const shellPane = layout.children[1]
+      if (codexPane.type !== 'leaf' || shellPane.type !== 'leaf') throw new Error('expected leaf panes')
+      const codexContent = codexPane.content
+      const shellContent = shellPane.content
+      if (codexContent.kind !== 'terminal' || shellContent.kind !== 'terminal') throw new Error('expected terminal panes')
+
+      expect(codexContent.terminalId).toBeUndefined()
+      expect(codexContent.status).toBe('creating')
+      expect(codexContent.createRequestId).not.toBe('req-codex-old')
+      expect(terminalRestoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(codexContent.createRequestId)
+
+      expect(shellContent.terminalId).toBeUndefined()
+      expect(shellContent.status).toBe('creating')
+      expect(shellContent.createRequestId).not.toBe('req-shell-old')
+      expect(terminalRestoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
+        shellContent.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
+    })
+  })
+
   it('mounts with legacy ws clients that do not implement onDisconnect', async () => {
     const store = createStore()
     const originalOnDisconnect = wsMocks.onDisconnect
@@ -1276,6 +1387,178 @@ describe('App WS bootstrap recovery', () => {
           ]),
         }),
       ])
+    })
+  })
+
+  it('refreshes terminal directory and loaded session rows after terminal metadata invalidation', async () => {
+    const initialProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-live-1',
+        projectPath: '/repo',
+        lastActivityAt: 1,
+        title: 'Live Codex',
+      }],
+    }]
+    const refreshedProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-live-1',
+        projectPath: '/repo',
+        lastActivityAt: 2,
+        title: 'Live Codex',
+        isRunning: true,
+        runningTerminalId: 'term-1',
+      }],
+    }]
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            resultVersion: 1,
+          },
+        },
+      },
+    })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: refreshedProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 2,
+      oldestIncludedSessionId: 'codex:codex-live-1',
+      hasMore: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.meta.updated',
+        upsert: [{
+          terminalId: 'term-1',
+          provider: 'codex',
+          sessionId: 'codex-live-1',
+          updatedAt: 1_700,
+        }],
+        remove: [],
+      })
+      messageHandler?.({
+        type: 'terminals.changed',
+        revision: 2,
+      })
+    })
+
+    expect(store.getState().sessions.projects[0]?.sessions[0]).toMatchObject({
+      isRunning: true,
+      runningTerminalId: 'term-1',
+    })
+
+    await waitFor(() => {
+      expect(getTerminalDirectoryPage).toHaveBeenCalledTimes(1)
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('uses terminal inventory metadata to refresh terminal surfaces and mark loaded sessions running', async () => {
+    const initialProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-inventory-1',
+        projectPath: '/repo',
+        lastActivityAt: 1,
+        title: 'Inventory Codex',
+      }],
+    }]
+    const refreshedProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-inventory-1',
+        projectPath: '/repo',
+        lastActivityAt: 2,
+        title: 'Inventory Codex',
+        isRunning: true,
+        runningTerminalId: 'term-inventory-1',
+      }],
+    }]
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            resultVersion: 1,
+          },
+        },
+      },
+    })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: refreshedProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 2,
+      oldestIncludedSessionId: 'codex:codex-inventory-1',
+      hasMore: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    getTerminalDirectoryPage.mockClear()
+    fetchSidebarSessionsSnapshot.mockClear()
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: 'term-inventory-1',
+          title: 'Codex',
+          mode: 'codex',
+          createdAt: 1_000,
+          lastActivityAt: 1_700,
+          status: 'running',
+        }],
+        terminalMeta: [{
+          terminalId: 'term-inventory-1',
+          provider: 'codex',
+          sessionId: 'codex-inventory-1',
+          updatedAt: 1_700,
+        }],
+      })
+    })
+
+    expect(store.getState().sessions.projects[0]?.sessions[0]).toMatchObject({
+      isRunning: true,
+      runningTerminalId: 'term-inventory-1',
+    })
+
+    await waitFor(() => {
+      expect(getTerminalDirectoryPage).toHaveBeenCalledTimes(1)
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     })
   })
 

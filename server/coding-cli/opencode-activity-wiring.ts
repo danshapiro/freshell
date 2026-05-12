@@ -4,6 +4,7 @@ import type {
   OpencodeTurnCompleteEvent,
 } from './opencode-activity-tracker.js'
 import { OpencodeSessionController } from './opencode-session-controller.js'
+import type { OpencodeRootResolution } from './providers/opencode.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import type { BindSessionResult, TerminalRecord } from '../terminal-registry.js'
 import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
@@ -33,6 +34,7 @@ export function wireOpencodeActivityTracker(input: {
   setTimeoutFn?: typeof setTimeout
   clearTimeoutFn?: typeof clearTimeout
   random?: () => number
+  resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
   onActivityChanged?: (payload: OpencodeActivityChange) => void
   onAssociated?: (payload: OpencodeSessionAssociatedEvent) => void
   onTurnComplete?: (payload: OpencodeTurnCompleteEvent) => void
@@ -43,6 +45,7 @@ export function wireOpencodeActivityTracker(input: {
     setTimeoutFn: input.setTimeoutFn,
     clearTimeoutFn: input.clearTimeoutFn,
     random: input.random,
+    resolveOpencodeSessionRoots: input.resolveOpencodeSessionRoots,
   })
   if (input.onActivityChanged) {
     tracker.on('changed', input.onActivityChanged)

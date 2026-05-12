@@ -4,6 +4,7 @@ import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setS
 import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
+  patchSessionRunningStateFromTerminalMeta,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
@@ -13,6 +14,8 @@ import {
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
+import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
+import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -56,7 +59,7 @@ import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { clearDeadTerminals } from '@/store/panesSlice'
-import { addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
@@ -728,6 +731,15 @@ export default function App() {
         }
       }
 
+      const terminalInvalidationHandler = createTerminalInvalidationHandler({
+        dispatch: (action) => appStore.dispatch(action as any),
+        upsertTerminalMeta,
+        removeTerminalMeta,
+        patchSessionRunningStateFromTerminalMeta,
+        queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
+        fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
+      })
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -785,36 +797,52 @@ export default function App() {
             send: (payload) => ws.send(payload),
           })
         }
-        if (msg.type === 'terminal.meta.updated') {
-          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
-          if (upsert.length > 0) {
-            dispatch(upsertTerminalMeta(upsert))
-          }
-
-          const remove = Array.isArray(msg.remove) ? msg.remove : []
-          for (const terminalId of remove) {
-            dispatch(removeTerminalMeta(terminalId))
-          }
+        if (terminalInvalidationHandler.handle(msg as any)) {
+          return
         }
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
           const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
+          const terminalMetaRequestedAt = Date.now()
+          const previousTerminalMeta = appStore.getState().terminalMeta?.byTerminalId ?? {}
+          const incomingTerminalMetaIds = new Set(
+            terminalMeta
+              .map((record: any) => record?.terminalId)
+              .filter((terminalId: unknown): terminalId is string => typeof terminalId === 'string'),
+          )
+          const removedTerminalMetaIds = Object.entries(previousTerminalMeta)
+            .filter(([terminalId, record]) => (
+              !incomingTerminalMetaIds.has(terminalId)
+              && !(typeof record?.updatedAt === 'number' && record.updatedAt > terminalMetaRequestedAt)
+            ))
+            .map(([terminalId]) => terminalId)
           const liveIds = terminals
             .filter((t: any) => t.status === 'running')
             .map((t: any) => t.terminalId as string)
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
           dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
-          // Register new createRequestIds with the restore set so the
-          // subsequent terminal.create messages include restore: true
-          // and bypass the server's rate limiter.
+          // Register regenerated createRequestIds with the correct explicit
+          // recovery path after stale terminal handles are cleared.
           const layouts = appStore.getState().panes.layouts
-          for (const layout of Object.values(layouts)) {
+          const fallbackAttempts = appStore.getState().panes.restoreFallbackAttemptsByPane || {}
+          for (const [tabId, layout] of Object.entries(layouts)) {
             ;(function walk(node: any) {
               if (!node) return
               if (node.type === 'leaf') {
                 if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
-                  addTerminalRestoreRequestId(node.content.createRequestId)
+                  const fallbackAttempt = fallbackAttempts[tabId]?.[node.id]
+                  if (
+                    fallbackAttempt?.requestId === node.content.createRequestId
+                    && !node.content.sessionRef
+                  ) {
+                    addTerminalFreshRecoveryRequestId(
+                      node.content.createRequestId,
+                      'fresh_after_restore_unavailable',
+                    )
+                  } else if (node.content.sessionRef) {
+                    addTerminalRestoreRequestId(node.content.createRequestId)
+                  }
                 }
                 return
               }
@@ -823,7 +851,16 @@ export default function App() {
               }
             })(layout)
           }
-          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: Date.now() }))
+          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
+          dispatch(patchSessionRunningStateFromTerminalMeta({
+            upsert: terminalMeta,
+            remove: removedTerminalMetaIds,
+          }))
+          void appStore.dispatch(fetchTerminalDirectoryWindow({
+            surface: 'sidebar',
+            priority: 'visible',
+          }) as any)
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
@@ -943,6 +980,7 @@ export default function App() {
       })
 
       cleanup = () => {
+        terminalInvalidationHandler.dispose()
         stopWsDisconnectSync?.()
         unsubscribe()
       }

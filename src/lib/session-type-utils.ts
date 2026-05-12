@@ -56,6 +56,10 @@ export function buildResumeContent(opts: {
   sessionId: string
   cwd?: string
   agentChatProviderSettings?: AgentChatProviderSettings
+  liveTerminal?: {
+    terminalId: string
+    serverInstanceId: string
+  }
 }): TerminalPaneInput | FreshAgentPaneInput | AgentChatPaneInput {
   const freshAgentType = resolveFreshAgentType(opts.sessionType)
   if (freshAgentType) {
@@ -99,6 +103,13 @@ export function buildResumeContent(opts: {
   return {
     kind: 'terminal',
     mode: provider,
+    ...(opts.liveTerminal
+      ? {
+          terminalId: opts.liveTerminal.terminalId,
+          serverInstanceId: opts.liveTerminal.serverInstanceId,
+          status: 'running' as const,
+        }
+      : {}),
     sessionRef: {
       provider,
       sessionId: opts.sessionId,

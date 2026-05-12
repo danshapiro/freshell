@@ -243,6 +243,12 @@ export interface PaneRefreshRequest {
   target: PaneRefreshTarget
 }
 
+export type RestoreFallbackAttempt = {
+  staleTerminalId: string
+  requestId: string
+  reason: 'dead_live_handle_without_session_ref'
+}
+
 /**
  * Recursive tree structure for pane layouts.
  * A leaf is a single pane with content.
@@ -284,6 +290,11 @@ export interface PanesState {
    * Must never be persisted.
    */
   refreshRequestsByPane: Record<string, Record<string, PaneRefreshRequest>>
+  /**
+   * Ephemeral one-shot fresh recovery guards keyed by tab and pane id.
+   * Must never be persisted.
+   */
+  restoreFallbackAttemptsByPane: Record<string, Record<string, RestoreFallbackAttempt>>
 }
 
 /**

@@ -94,13 +94,60 @@ function joinRunningState(item: SessionDirectoryItem, terminalMeta: TerminalMeta
   }
 }
 
+function providerDisplayName(provider: string): string {
+  switch (provider) {
+    case 'claude':
+      return 'Claude CLI'
+    case 'codex':
+      return 'Codex CLI'
+    case 'opencode':
+      return 'OpenCode'
+    default:
+      return provider
+  }
+}
+
+function buildLiveTerminalSessionItem(meta: TerminalMeta): SessionDirectoryItem | undefined {
+  if (!meta.provider) return undefined
+
+  const sessionId = meta.sessionId || `terminal:${meta.terminalId}`
+  const projectPath = meta.checkoutRoot || meta.repoRoot || meta.cwd || `terminal:${meta.terminalId}`
+
+  return {
+    provider: meta.provider,
+    sessionId,
+    projectPath,
+    checkoutPath: meta.checkoutRoot,
+    title: providerDisplayName(meta.provider),
+    lastActivityAt: meta.updatedAt,
+    createdAt: meta.updatedAt,
+    cwd: meta.cwd,
+    sessionType: meta.provider,
+    isRunning: true,
+    runningTerminalId: meta.terminalId,
+    liveTerminalOnly: !meta.sessionId,
+  }
+}
+
 function toItems(projects: ProjectGroup[], terminalMeta: TerminalMeta[]): SessionDirectoryItem[] {
-  return buildSessionDirectoryComparableSnapshot(projects).map((item) => (
+  const items = buildSessionDirectoryComparableSnapshot(projects).map((item) => (
     joinRunningState({
       ...item,
       isRunning: false,
     }, terminalMeta)
   ))
+  const existingKeys = new Set(items.map(buildSessionKey))
+
+  for (const meta of terminalMeta) {
+    const item = buildLiveTerminalSessionItem(meta)
+    if (!item) continue
+    const key = buildSessionKey(item)
+    if (existingKeys.has(key)) continue
+    items.push(item)
+    existingKeys.add(key)
+  }
+
+  return items
 }
 
 async function applyFileSearch(
@@ -201,7 +248,7 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items = items.filter((item) => !item.isNonInteractive)
   }
   if (!input.query.includeEmpty) {
-    items = items.filter((item) => item.title != null && item.title !== '')
+    items = items.filter((item) => item.isRunning || !!item.title?.trim())
   }
 
   if (cursor) {

@@ -5,6 +5,7 @@ import { EventEmitter } from 'events'
 import type { SessionScanResult } from '../../server/session-scanner/types.js'
 import { configStore } from '../../server/config-store.js'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const HOOK_TIMEOUT_MS = 30000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -12,6 +13,13 @@ const REPAIR_WAIT_MS = 75
 const REPAIR_STAGGER_MS = 20
 const DUPLICATE_SETTLE_MS = 100
 const DISCONNECT_SETTLE_MS = 150
+const loggerMock = vi.hoisted(() => ({
+  warn: vi.fn(),
+  info: vi.fn(),
+  debug: vi.fn(),
+  error: vi.fn(),
+  child: vi.fn(),
+}))
 const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   version: 1,
   settings: {},
@@ -19,10 +27,17 @@ const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
   terminalOverrides: {},
   projectColors: {},
 }))
+loggerMock.child.mockReturnValue(loggerMock)
+
+vi.mock('../../server/logger', () => ({
+  logger: loggerMock,
+  sessionLifecycleLogger: loggerMock,
+}))
 
 vi.mock('../../server/config-store', () => ({
   configStore: {
     snapshot: vi.fn().mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT),
+    pushRecentDirectory: vi.fn().mockResolvedValue(undefined),
   },
 }))
 
@@ -129,6 +144,19 @@ function closeWebSocket(ws: WebSocket, timeoutMs = 500): Promise<void> {
   })
 }
 
+async function waitForLoggerWarn(
+  predicate: (call: [Record<string, any>, string?]) => boolean,
+  timeoutMs = 1000,
+): Promise<[Record<string, any>, string?]> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const call = loggerMock.warn.mock.calls.find((entry) => predicate(entry as [Record<string, any>, string?]))
+    if (call) return call as [Record<string, any>, string?]
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('Timed out waiting for logger warn call')
+}
+
 class FakeBuffer {
   private s = ''
   append(t: string) { this.s += t }
@@ -140,6 +168,9 @@ class FakeRegistry {
   lastCreateOpts: any = null
   createCallCount = 0
   forceAttachFailure = false
+  killAndWait = vi.fn(async (terminalId: string) => {
+    this.records.delete(terminalId)
+  })
 
   create(opts: any) {
     this.lastCreateOpts = opts
@@ -293,7 +324,10 @@ describe('terminal.create session repair wait', () => {
 
     sessionRepairService = new FakeSessionRepairService()
     registry = new FakeRegistry()
-    new WsHandler(server, registry as any, { sessionRepairService: sessionRepairService as any })
+    new WsHandler(server, registry as any, {
+      sessionRepairService: sessionRepairService as any,
+      codexLaunchPlanner: new FakeCodexLaunchPlanner(),
+    })
 
     const info = await listen(server)
     port = info.port
@@ -308,6 +342,10 @@ describe('terminal.create session repair wait', () => {
     registry.lastCreateOpts = null
     registry.createCallCount = 0
     registry.forceAttachFailure = false
+    loggerMock.warn.mockClear()
+    loggerMock.info.mockClear()
+    loggerMock.debug.mockClear()
+    loggerMock.error.mockClear()
   }, HOOK_TIMEOUT_MS)
 
   afterEach(async () => {
@@ -860,6 +898,94 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
+  it('logs websocket errors server-side before sending them to the client', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID',
+      )
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: 'missing-term',
+        attachRequestId: 'attach-missing-term',
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+      }))
+
+      await responsePromise
+
+      expect(loggerMock.warn).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'ws_send_error',
+        code: 'INVALID_TERMINAL_ID',
+        messageClass: 'terminal_not_running',
+        terminalId: 'missing-term',
+        requestId: 'attach-missing-term',
+      }), 'ws_send_error')
+      expect(JSON.stringify(loggerMock.warn.mock.calls)).not.toContain('Terminal not running')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('summarizes repeated websocket errors without logging request text', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      for (const requestId of ['attach-loop-1', 'attach-loop-2', 'attach-loop-3']) {
+        const responsePromise = waitForMessage(
+          ws,
+          (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID',
+        )
+        ws.send(JSON.stringify({
+          type: 'terminal.attach',
+          terminalId: 'missing-term',
+          attachRequestId: requestId,
+          intent: 'viewport_hydrate',
+          cols: 80,
+          rows: 24,
+        }))
+        await responsePromise
+      }
+
+      const firstLogCalls = loggerMock.warn.mock.calls.filter((call) => (
+        call[0]?.event === 'ws_send_error'
+        && call[0]?.code === 'INVALID_TERMINAL_ID'
+        && call[0]?.terminalId === 'missing-term'
+      ))
+      expect(firstLogCalls).toHaveLength(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+
+    const [summary] = await waitForLoggerWarn((call) => (
+      call[0]?.event === 'ws_send_error_suppressed_summary'
+      && call[0]?.code === 'INVALID_TERMINAL_ID'
+      && call[0]?.terminalId === 'missing-term'
+    ))
+    expect(summary).toMatchObject({
+      event: 'ws_send_error_suppressed_summary',
+      reason: 'connection_close',
+      code: 'INVALID_TERMINAL_ID',
+      messageClass: 'terminal_not_running',
+      terminalId: 'missing-term',
+      suppressedCount: 2,
+      totalCount: 3,
+      firstRequestId: 'attach-loop-1',
+      lastRequestId: 'attach-loop-3',
+    })
+    const serializedCalls = JSON.stringify(loggerMock.warn.mock.calls)
+    expect(serializedCalls).not.toContain('Terminal not running')
+  })
+
   it('does not skip resume for healthy sessions with inline-progress resume issue', async () => {
     // Simulate: getResult returns a cached result with resumeIssue
     sessionRepairService.result = {
@@ -909,6 +1035,147 @@ describe('terminal.create session repair wait', () => {
       expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
       // waitForSession should have been called despite cached result
       expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('uses sessionRef as canonical restore identity over legacy resumeSessionId', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'resume-session-ref-wins'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        resumeSessionId: 'legacy_wrong_session',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      }))
+
+      await createdPromise
+
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
+      expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
+      expect(sessionRepairService.waitForSessionCalls).not.toContain('legacy_wrong_session')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('reuses a same-server live terminal handle without creating a duplicate terminal', async () => {
+    const existing = registry.create({
+      mode: 'claude',
+      shell: 'system',
+      resumeSessionId: VALID_SESSION_ID,
+    })
+    registry.lastCreateOpts = null
+    registry.createCallCount = 0
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-live-terminal'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: existing.terminalId,
+          serverInstanceId: ready.serverInstanceId,
+        },
+      }))
+
+      const created = await createdPromise
+
+      expect(created.terminalId).toBe(existing.terminalId)
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('falls through from a stale live terminal handle to durable session restore', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-stale-live-with-session-ref'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'missing-live-terminal',
+          serverInstanceId: ready.serverInstanceId,
+        },
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      }))
+
+      await createdPromise
+
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('rejects stale live terminal restore when no durable session identity exists', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-stale-live-missing-session-ref'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'missing-live-terminal',
+          serverInstanceId: ready.serverInstanceId,
+        },
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
     } finally {
       await closeWebSocket(ws)
     }
@@ -982,6 +1249,113 @@ describe('terminal.create session repair wait', () => {
       expect(response).toMatchObject({
         type: 'error',
         code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it.each(['codex', 'claude', 'opencode'] as const)('rejects %s restore when durable identity is missing', async (mode) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = `req-${mode}-missing-ref`
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.requestId === requestId && (m.type === 'terminal.created' || m.type === 'error'),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode,
+        restore: true,
+        cwd: '/repo/project',
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+        requestId,
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it.each(['shell', 'codex', 'claude', 'opencode'] as const)('creates a fresh %s terminal for explicit restore-failure recovery', async (mode) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = `req-${mode}-fresh-recovery`
+      const createdPromise = waitForCreated(ws, requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode,
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        cwd: '/repo/project',
+      }))
+
+      await createdPromise
+
+      expect(registry.createCallCount).toBe(1)
+      expect(registry.records.size).toBe(1)
+      expect(registry.lastCreateOpts).toMatchObject({
+        mode,
+        cwd: '/repo/project',
+      })
+      if (mode !== 'codex') {
+        expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
+      }
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('rejects fresh recovery when restore identity is also supplied', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'req-invalid-fresh-recovery'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.requestId === requestId && (m.type === 'terminal.created' || m.type === 'error'),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'INVALID_CREATE_REQUEST',
+        requestId,
       })
       expect(registry.createCallCount).toBe(0)
       expect(registry.records.size).toBe(0)

@@ -69,9 +69,33 @@ export class OpencodeSessionController extends EventEmitter {
     this.associatedSessionIds.clear()
   }
 
+  private rejectAssociation(
+    request: OpencodeAssociationRequestedEvent,
+    reason: string,
+    extra: Record<string, unknown> = {},
+  ): void {
+    this.log.warn({
+      terminalId: request.terminalId,
+      sessionId: request.sessionId,
+      reason,
+      ...extra,
+    }, 'Rejected OpenCode association request')
+  }
+
   private promoteAssociation(request: OpencodeAssociationRequestedEvent): void {
     const terminal = this.registry.get(request.terminalId)
-    if (!terminal || terminal.mode !== 'opencode' || terminal.status !== 'running') {
+    if (!terminal) {
+      this.rejectAssociation(request, 'terminal_missing_or_not_running')
+      this.tracker.rejectSessionAssociation(request)
+      return
+    }
+    if (terminal.mode !== 'opencode') {
+      this.rejectAssociation(request, 'terminal_not_opencode', { mode: terminal.mode })
+      this.tracker.rejectSessionAssociation(request)
+      return
+    }
+    if (terminal.status !== 'running') {
+      this.rejectAssociation(request, 'terminal_missing_or_not_running', { status: terminal.status })
       this.tracker.rejectSessionAssociation(request)
       return
     }
@@ -86,11 +110,10 @@ export class OpencodeSessionController extends EventEmitter {
     const result = this.registry.bindSession(request.terminalId, 'opencode', request.sessionId, 'association')
 
     if (!result.ok) {
-      this.log.warn({
-        terminalId: request.terminalId,
-        sessionId: request.sessionId,
-        reason: result.reason,
-      }, 'Failed to promote OpenCode durable session from authoritative control data')
+      this.rejectAssociation(request, result.reason, {
+        ...(previousSessionId ? { previousSessionId } : {}),
+        ...('owner' in result ? { ownerTerminalId: result.owner } : {}),
+      })
       this.tracker.rejectSessionAssociation(request)
       return
     }

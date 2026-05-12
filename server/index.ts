@@ -49,7 +49,7 @@ import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
-import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
+import { createTerminalSessionAssociationPublisher } from './session-association-broadcast.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
@@ -457,6 +457,12 @@ async function main() {
     wsHandler.broadcastTerminalMetaUpdated({ upsert: [], remove: [terminalId] })
   }
 
+  const associationPublisher = createTerminalSessionAssociationPublisher({
+    wsHandler,
+    terminalMetadata,
+    broadcastTerminalMetaUpserts,
+  })
+
   const findCodingCliSession = (provider: CodingCliProviderName, sessionId: string): CodingCliSession | undefined => {
     for (const project of codingCliIndexer.getProjects()) {
       const found = project.sessions.find((session) => (
@@ -469,15 +475,12 @@ async function main() {
 
   await Promise.all(
     registry.list().map(async (terminal) => {
-      await terminalMetadata.seedFromTerminal(terminal)
+      await associationPublisher.seedFromTerminal(terminal)
     }),
   )
 
   registry.on('terminal.created', (record: TerminalRecord) => {
-    void terminalMetadata.seedFromTerminal(record)
-      .then((upsert) => {
-        if (upsert) broadcastTerminalMetaUpserts([upsert])
-      })
+    void associationPublisher.seedFromTerminal(record)
       .catch((err) => {
         log.warn({ err, terminalId: record?.terminalId }, 'Failed to seed terminal metadata')
       })
@@ -486,6 +489,7 @@ async function main() {
   registry.on('terminal.exit', (payload) => {
     const terminalId = (payload as { terminalId?: string })?.terminalId
     if (!terminalId) return
+    associationPublisher.forgetTerminal(terminalId)
     // Retire instead of remove: keeps the provider/sessionId association so
     // rename cascades still work after the terminal process exits.
     if (terminalMetadata.retire(terminalId)) {
@@ -495,15 +499,18 @@ async function main() {
 
   opencodeActivity = wireOpencodeActivityTracker({
     registry,
+    resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds),
     onActivityChanged: (payload) => {
       wsHandler.broadcastOpencodeActivityUpdated(payload)
     },
     onAssociated: ({ terminalId, sessionId }) => {
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_associated',
+      })
+      log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
       try {
-        broadcastTerminalSessionAssociation({
-          wsHandler,
-          terminalMetadata,
-          broadcastTerminalMetaUpserts,
+        associationPublisher.publish({
           provider: 'opencode',
           terminalId,
           sessionId,
@@ -524,6 +531,11 @@ async function main() {
         log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
         return
       }
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_turn_complete',
+      })
+      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
       wsHandler.broadcastTerminalTurnComplete({
         terminalId,
         provider: 'opencode',
@@ -653,7 +665,6 @@ async function main() {
   // Coding CLI watcher hooks
   codingCliIndexer.onUpdate((projects) => {
     sessionsSync.publish(projects)
-    const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
     for (const { session, terminalId } of collectAppliedSessionAssociations(associationCoordinator, projects)) {
       log.info({
@@ -663,10 +674,7 @@ async function main() {
         provider: session.provider,
       }, 'session_bind_applied')
       try {
-        broadcastTerminalSessionAssociation({
-          wsHandler,
-          terminalMetadata,
-          broadcastTerminalMetaUpserts: (upserts) => associationMetaUpserts.push(...upserts),
+        associationPublisher.publish({
           provider: session.provider,
           terminalId,
           sessionId: session.sessionId,
@@ -694,10 +702,6 @@ async function main() {
           }
         }
       }
-    }
-
-    if (associationMetaUpserts.length > 0) {
-      broadcastTerminalMetaUpserts(associationMetaUpserts)
     }
 
     if (pendingMetadataSync.size > 0) {
@@ -748,10 +752,7 @@ async function main() {
       sessionId: session.sessionId,
     }, 'session_bind_applied')
     try {
-      broadcastTerminalSessionAssociation({
-        wsHandler,
-        terminalMetadata,
-        broadcastTerminalMetaUpserts,
+      associationPublisher.publish({
         provider: 'claude',
         terminalId,
         sessionId: session.sessionId,

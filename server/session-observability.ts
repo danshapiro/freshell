@@ -29,6 +29,25 @@ export type SessionLifecycleEvent =
     reused: boolean
     hasSessionRef: boolean
   })
+  | (OptionalUiContext & {
+    kind: 'restore_unavailable'
+    requestId: string
+    connectionId: string
+    mode: TerminalMode
+    reason: 'missing_canonical_session_id'
+    restoreRequested: true
+    hasSessionRef: boolean
+  })
+  | (OptionalUiContext & {
+    kind: 'restore_unavailable_fresh_fallback'
+    requestId: string
+    connectionId: string
+    mode: TerminalMode
+    reason: 'fresh_after_restore_unavailable'
+    restoreRequested: false
+    treatedAsFresh: true
+    hasSessionRef: false
+  })
   | {
     kind: 'codex_durable_session_observed'
     provider: 'codex'
@@ -99,6 +118,8 @@ function isIncidentEvent(kind: SessionLifecycleEvent['kind']): boolean {
   return kind === 'terminal_exit_without_durable_session'
     || kind === 'invalid_terminal_id_without_session_ref'
     || kind === 'client_restore_unavailable'
+    || kind === 'restore_unavailable'
+    || kind === 'restore_unavailable_fresh_fallback'
 }
 
 function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
@@ -133,6 +154,31 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         cwd: event.cwd,
         mode: event.mode,
         reused: event.reused,
+        hasSessionRef: event.hasSessionRef,
+      }
+    case 'restore_unavailable':
+      return {
+        ...base,
+        requestId: event.requestId,
+        connectionId: event.connectionId,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        mode: event.mode,
+        reason: event.reason,
+        restoreRequested: event.restoreRequested,
+        hasSessionRef: event.hasSessionRef,
+      }
+    case 'restore_unavailable_fresh_fallback':
+      return {
+        ...base,
+        requestId: event.requestId,
+        connectionId: event.connectionId,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        mode: event.mode,
+        reason: event.reason,
+        restoreRequested: event.restoreRequested,
+        treatedAsFresh: event.treatedAsFresh,
         hasSessionRef: event.hasSessionRef,
       }
     case 'codex_durable_session_observed':

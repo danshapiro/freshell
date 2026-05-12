@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { ProjectGroup } from './types'
+import type { TerminalMetaRecord } from './terminalMetaSlice'
 
 export type SessionWindowLoadingKind = 'initial' | 'search' | 'background' | 'pagination'
 
@@ -181,6 +182,49 @@ function syncAllWindowsFromTopLevel(state: SessionsState) {
   }
 }
 
+function patchProjectRunningState(
+  projects: ProjectGroup[],
+  payload: {
+    upsert: TerminalMetaRecord[]
+    remove: string[]
+  },
+) {
+  const clearedTerminalIds = new Set(payload.remove)
+  for (const record of payload.upsert) {
+    if (!record.provider || !record.sessionId) {
+      clearedTerminalIds.add(record.terminalId)
+    }
+  }
+
+  const runningBySessionKey = new Map<string, string>()
+  for (const record of payload.upsert) {
+    if (!record.provider || !record.sessionId) continue
+    runningBySessionKey.set(`${record.provider}:${record.sessionId}`, record.terminalId)
+  }
+
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const sessionRecord = session as typeof session & {
+        isRunning?: boolean
+        runningTerminalId?: string
+      }
+      if (
+        sessionRecord.runningTerminalId
+        && clearedTerminalIds.has(sessionRecord.runningTerminalId)
+      ) {
+        sessionRecord.isRunning = false
+        sessionRecord.runningTerminalId = undefined
+      }
+
+      const runningTerminalId = runningBySessionKey.get(`${session.provider || 'claude'}:${session.sessionId}`)
+      if (runningTerminalId) {
+        sessionRecord.isRunning = true
+        sessionRecord.runningTerminalId = runningTerminalId
+      }
+    }
+  }
+}
+
 export const sessionsSlice = createSlice({
   name: 'sessions',
   initialState,
@@ -350,6 +394,20 @@ export const sessionsSlice = createSlice({
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
       syncAllWindowsFromTopLevel(state)
     },
+    patchSessionRunningStateFromTerminalMeta: (
+      state,
+      action: PayloadAction<{
+        upsert: TerminalMetaRecord[]
+        remove: string[]
+      }>,
+    ) => {
+      patchProjectRunningState(state.projects, action.payload)
+      if (!state.windows) return
+      for (const window of Object.values(state.windows)) {
+        if (!window) continue
+        patchProjectRunningState(window.projects, action.payload)
+      }
+    },
     clearPaginationMeta: (state) => {
       state.totalSessions = undefined
       state.oldestLoadedTimestamp = undefined
@@ -449,6 +507,7 @@ export const {
   clearProjects,
   mergeProjects,
   applySessionsPatch,
+  patchSessionRunningStateFromTerminalMeta,
   clearPaginationMeta,
   setPaginationMeta,
   appendSessionsPage,

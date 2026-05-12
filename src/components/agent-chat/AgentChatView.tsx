@@ -52,6 +52,7 @@ import {
   buildAgentChatPersistedIdentityUpdate,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
+  getPreferredResumeSessionId,
 } from '@/store/persistControl'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
@@ -178,15 +179,23 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = (
-    paneContent.sessionRef?.provider === 'claude'
+  const persistedSessionRefId = paneContent.sessionRef?.provider === 'claude'
     && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
-  )
     ? paneContent.sessionRef.sessionId
-    : (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
+    : undefined
+  const persistedTimelineSessionId = persistedSessionRefId
+    ?? (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
+  const preferredResumeSessionId = getPreferredResumeSessionId(session)
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
-  const restoreHistoryQueryId = canonicalDurableSessionId ?? paneContent.sessionId
-  const attachResumeSessionId = canonicalDurableSessionId
+  const timelineSessionId = preferredResumeSessionId ?? canonicalDurableSessionId
+  const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
+  const attachResumeSessionId = preferredResumeSessionId
+    ?? canonicalDurableSessionId
+    ?? (
+      typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
+        ? paneContent.resumeSessionId
+        : undefined
+    )
   const attachPayload = useMemo(() => {
     if (!paneContent.sessionId) return null
     return {

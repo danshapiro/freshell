@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
+import { useAppSelector } from '@/store/hooks'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
@@ -66,6 +67,16 @@ vi.mock('@xterm/addon-fit', () => ({
 vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
 import TerminalView from '@/components/TerminalView'
+
+function TerminalViewFromStore({ tabId, paneId }: { tabId: string; paneId: string }) {
+  const paneContent = useAppSelector((state) => {
+    const layout = state.panes.layouts[tabId]
+    if (!layout || layout.type !== 'leaf') return null
+    return layout.content
+  })
+  if (!paneContent || paneContent.kind !== 'terminal') return null
+  return <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+}
 
 class MockResizeObserver {
   observe = vi.fn()
@@ -321,6 +332,119 @@ describe('TerminalView durable session contract', () => {
         provider: 'claude',
         sessionId: VALID_CLAUDE_SESSION_ID,
       })
+    })
+  })
+
+  it('creates a fresh terminal once after invalid terminal id with no durable session ref', async () => {
+    const tabId = 'tab-opencode'
+    const paneId = 'pane-opencode'
+    let messageHandler: ((msg: any) => void) | null = null
+
+    wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
+      messageHandler = handler
+      return () => {}
+    })
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-opencode-fresh-fallback',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      terminalId: 'dead-term-1',
+      serverInstanceId: 'srv-old',
+      initialCwd: '/repo/project',
+    }
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'opencode',
+            status: 'running',
+            title: 'OpenCode',
+            titleSetByUser: false,
+            createRequestId: 'req-opencode-fresh-fallback',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    wsMocks.send.mockClear()
+
+    messageHandler?.({
+      type: 'error',
+      code: 'INVALID_TERMINAL_ID',
+      terminalId: 'dead-term-1',
+      message: 'Unknown terminalId',
+    })
+
+    await waitFor(() => {
+      const createMessage = wsMocks.send.mock.calls.find(([msg]) => (
+        msg.type === 'terminal.create'
+        && msg.mode === 'opencode'
+        && msg.recoveryIntent === 'fresh_after_restore_unavailable'
+      ))?.[0]
+      expect(createMessage).toMatchObject({
+        type: 'terminal.create',
+        mode: 'opencode',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+      })
+      expect(createMessage).not.toHaveProperty('restore')
+      expect(createMessage).not.toHaveProperty('sessionRef')
+      expect(createMessage).not.toHaveProperty('liveTerminal')
+      expect(createMessage).not.toHaveProperty('resumeSessionId')
+    })
+
+    const firstFreshCreates = wsMocks.send.mock.calls.filter(([msg]) => (
+      msg.type === 'terminal.create'
+      && msg.mode === 'opencode'
+      && msg.recoveryIntent === 'fresh_after_restore_unavailable'
+      && msg.restore !== true
+      && !('sessionRef' in msg)
+      && !('liveTerminal' in msg)
+    ))
+    expect(firstFreshCreates).toHaveLength(1)
+
+    wsMocks.send.mockClear()
+    messageHandler?.({
+      type: 'error',
+      code: 'INVALID_TERMINAL_ID',
+      terminalId: 'dead-term-1',
+      message: 'Unknown terminalId',
+    })
+
+    await waitFor(() => {
+      const secondFreshCreates = wsMocks.send.mock.calls.filter(([msg]) => (
+        msg.type === 'terminal.create'
+        && msg.mode === 'opencode'
+        && msg.recoveryIntent === 'fresh_after_restore_unavailable'
+      ))
+      expect(secondFreshCreates).toHaveLength(0)
     })
   })
 })
