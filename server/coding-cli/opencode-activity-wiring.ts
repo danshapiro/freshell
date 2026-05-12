@@ -34,6 +34,8 @@ export function wireOpencodeActivityTracker(input: {
   setTimeoutFn?: typeof setTimeout
   clearTimeoutFn?: typeof clearTimeout
   random?: () => number
+  onAssociated?: (event: { terminalId: string; sessionId: string }) => void
+  onTurnComplete?: (event: { terminalId: string; sessionId: string; at: number }) => void
 }) {
   const tracker = new OpencodeActivityTracker({
     fetchImpl: input.fetchImpl,
@@ -65,8 +67,13 @@ export function wireOpencodeActivityTracker(input: {
     tracker.untrackTerminal({ terminalId: event.terminalId })
   }
 
+  const onAssociated = (event: { terminalId: string; sessionId: string }) => {
+    input.onAssociated?.(event)
+  }
+
   input.registry.on('terminal.created', onCreated)
   input.registry.on('terminal.exit', onExit)
+  controller.on('associated', onAssociated)
 
   for (const listed of input.registry.list()) {
     const record = input.registry.get(listed.terminalId)
@@ -80,6 +87,7 @@ export function wireOpencodeActivityTracker(input: {
     dispose(): void {
       input.registry.off('terminal.created', onCreated)
       input.registry.off('terminal.exit', onExit)
+      controller.off('associated', onAssociated)
       controller.dispose()
       tracker.dispose()
     },

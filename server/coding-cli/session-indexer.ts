@@ -622,13 +622,36 @@ export class CodingCliSessionIndexer {
     return match
   }
 
+  scheduleProviderRefresh(
+    providerName: CodingCliProviderName,
+    options: { urgent?: boolean; reason?: string } = {},
+  ): void {
+    const provider = this.providers.find((candidate) => candidate.name === providerName)
+    if (!provider?.listSessionsDirect) {
+      logger.warn(
+        { provider: providerName, reason: options.reason },
+        'Ignoring provider refresh for non-direct provider',
+      )
+      return
+    }
+    this.dirtyProviders.add(providerName)
+    if (options.urgent) {
+      this.urgentRefreshNeeded = true
+    }
+    logger.debug({
+      provider: providerName,
+      reason: options.reason,
+      urgent: !!options.urgent,
+    }, 'Scheduled provider refresh')
+    this.scheduleRefresh()
+  }
+
   private markDirty(filePath: string) {
     const normalized = normalizeFilePath(filePath)
     const provider = this.resolveProviderForFile(filePath)
     if (provider?.listSessionsDirect) {
       this.dirtyProviders.add(provider.name)
       this.deletedFiles.delete(normalized)
-      this.urgentRefreshNeeded = true
       return
     }
     this.deletedFiles.delete(normalized)
@@ -919,7 +942,7 @@ export class CodingCliSessionIndexer {
         ? (this.throttleMs > 0 ? Math.min(URGENT_THROTTLE_MS, this.throttleMs) : 0)
         : this.throttleMs
       const fireElapsed = Date.now() - this.lastRefreshAt
-      if (effectiveThrottle > 0 && fireElapsed < effectiveThrottle) {
+      if (this.lastRefreshAt > 0 && effectiveThrottle > 0 && fireElapsed < effectiveThrottle) {
         this.refreshTimer = setTimeout(() => {
           this.refreshTimer = null
           this.refresh().catch((err) => logger.warn({ err }, 'Refresh failed'))

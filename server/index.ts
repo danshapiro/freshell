@@ -196,7 +196,16 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
-  const opencodeActivity = wireOpencodeActivityTracker({ registry })
+  const opencodeActivity = wireOpencodeActivityTracker({
+    registry,
+    onAssociated: ({ terminalId, sessionId }) => {
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_associated',
+      })
+      log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
+    },
+  })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
