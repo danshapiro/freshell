@@ -1176,9 +1176,18 @@ describe('ws protocol', () => {
       messages.push(JSON.parse(data.toString()))
     })
 
-    // Restore requests should bypass rate limiting even when bursting.
+    // Restore requests with a canonical durable identity should bypass rate limiting even when bursting.
     for (let i = 0; i < 10; i++) {
-      ws.send(JSON.stringify({ type: 'terminal.create', requestId: `restore-test-${i}`, mode: 'shell', restore: true }))
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: `restore-test-${i}`,
+        mode: 'claude',
+        restore: true,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: '00000000-0000-4000-8000-000000000123',
+        },
+      }))
     }
     ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'restore-test-extra', mode: 'shell' }))
 
