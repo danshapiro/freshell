@@ -37,6 +37,8 @@ const terminalThemeMocks = vi.hoisted(() => ({
 const restoreMocks = vi.hoisted(() => ({
   consumeTerminalRestoreRequestId: vi.fn(() => false),
   addTerminalRestoreRequestId: vi.fn(),
+  consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
+  addTerminalFreshRecoveryRequestId: vi.fn(),
 }))
 
 const runtimeMocks = vi.hoisted(() => ({
@@ -59,6 +61,8 @@ vi.mock('@/lib/terminal-themes', () => ({
 vi.mock('@/lib/terminal-restore', () => ({
   consumeTerminalRestoreRequestId: restoreMocks.consumeTerminalRestoreRequestId,
   addTerminalRestoreRequestId: restoreMocks.addTerminalRestoreRequestId,
+  consumeTerminalFreshRecoveryRequest: restoreMocks.consumeTerminalFreshRecoveryRequest,
+  addTerminalFreshRecoveryRequestId: restoreMocks.addTerminalFreshRecoveryRequestId,
 }))
 
 vi.mock('lucide-react', () => ({
@@ -2798,7 +2802,7 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
-  it('surfaces restore-unavailable for a live-only INVALID_TERMINAL_ID reconnect', async () => {
+  it('starts explicit fresh recovery for a live-only INVALID_TERMINAL_ID reconnect', async () => {
     const tabId = 'tab-clear-tid'
     const paneId = 'pane-clear-tid'
 
@@ -2869,18 +2873,21 @@ describe('TerminalView lifecycle updates', () => {
         expect(layout.content.terminalId).toBeUndefined()
       })
 
-      // Verify tab status was set to an explicit restore failure
+      // Verify tab status moved into explicit fresh recovery rather than a permanent restore error
       const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
-      expect(tab?.status).toBe('error')
+      expect(tab?.status).toBe('creating')
 
       // Verify pane content was also updated
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
       expect(layout.content.terminalId).toBeUndefined()
-      expect(layout.content.status).toBe('error')
-      expect(layout.content.restoreError).toEqual({
-        code: 'RESTORE_UNAVAILABLE',
-        reason: 'dead_live_handle',
-      })
+      expect(layout.content.serverInstanceId).toBeUndefined()
+      expect(layout.content.status).toBe('creating')
+      expect(layout.content.restoreError).toBeUndefined()
+      expect(layout.content.createRequestId).not.toBe('req-clear')
+      expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
+        layout.content.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining('[TerminalView]'),
         'restore_unavailable',

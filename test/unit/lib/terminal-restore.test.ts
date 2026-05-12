@@ -40,4 +40,33 @@ describe('terminal-restore', () => {
       expect(consumeTerminalRestoreRequestId(id)).toBe(false)
     }
   })
+
+  it('fresh recovery request ids are one-shot and separate from restore ids', async () => {
+    const {
+      addTerminalFreshRecoveryRequestId,
+      consumeTerminalFreshRecoveryRequest,
+      consumeTerminalRestoreRequestId,
+    } = await import('@/lib/terminal-restore')
+
+    addTerminalFreshRecoveryRequestId('fresh-id-1', 'fresh_after_restore_unavailable')
+
+    expect(consumeTerminalRestoreRequestId('fresh-id-1')).toBe(false)
+    expect(consumeTerminalFreshRecoveryRequest('fresh-id-1')).toBe('fresh_after_restore_unavailable')
+    expect(consumeTerminalFreshRecoveryRequest('fresh-id-1')).toBeUndefined()
+  })
+
+  it('prefers explicit fresh recovery when a request id is mistakenly registered for both paths', async () => {
+    const {
+      addTerminalFreshRecoveryRequestId,
+      addTerminalRestoreRequestId,
+      consumeTerminalFreshRecoveryRequest,
+      consumeTerminalRestoreRequestId,
+    } = await import('@/lib/terminal-restore')
+
+    addTerminalRestoreRequestId('dual-id')
+    addTerminalFreshRecoveryRequestId('dual-id', 'fresh_after_restore_unavailable')
+
+    expect(consumeTerminalFreshRecoveryRequest('dual-id')).toBe('fresh_after_restore_unavailable')
+    expect(consumeTerminalRestoreRequestId('dual-id')).toBe(false)
+  })
 })

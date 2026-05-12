@@ -305,6 +305,85 @@ describe('websocket session observability', () => {
     }
   })
 
+  it('records restore unavailable lifecycle events without creating a terminal', async () => {
+    const ws = await connectReady(port)
+
+    try {
+      const errorPromise = waitForMessage(
+        ws,
+        (msg) => msg.type === 'error' && msg.requestId === 'req-restore-missing',
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'req-restore-missing',
+        tabId: 'tab-restore',
+        paneId: 'pane-restore',
+        cwd: '/home/user/project',
+        mode: 'opencode',
+        shell: 'system',
+        restore: true,
+      }))
+
+      await errorPromise
+
+      await waitForLifecycleEvent({
+        kind: 'restore_unavailable',
+        requestId: 'req-restore-missing',
+        connectionId: 'conn-1',
+        tabId: 'tab-restore',
+        paneId: 'pane-restore',
+        mode: 'opencode',
+        reason: 'missing_canonical_session_id',
+        restoreRequested: true,
+        hasSessionRef: false,
+      })
+      expect(registry.create).not.toHaveBeenCalled()
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('records explicit fresh restore-fallback lifecycle events', async () => {
+    const ws = await connectReady(port)
+
+    try {
+      const createdPromise = waitForMessage(
+        ws,
+        (msg) => msg.type === 'terminal.created' && msg.requestId === 'req-fresh-fallback',
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'req-fresh-fallback',
+        tabId: 'tab-fresh',
+        paneId: 'pane-fresh',
+        cwd: '/home/user/project',
+        mode: 'shell',
+        shell: 'system',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+      }))
+
+      await createdPromise
+
+      await waitForLifecycleEvent({
+        kind: 'restore_unavailable_fresh_fallback',
+        requestId: 'req-fresh-fallback',
+        connectionId: 'conn-1',
+        tabId: 'tab-fresh',
+        paneId: 'pane-fresh',
+        mode: 'shell',
+        reason: 'fresh_after_restore_unavailable',
+        restoreRequested: false,
+        treatedAsFresh: true,
+        hasSessionRef: false,
+      })
+      expect(registry.create).toHaveBeenCalledTimes(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('records stale terminal input without logging input data', async () => {
     registry.input.mockReturnValue(false)
     const ws = await connectReady(port)

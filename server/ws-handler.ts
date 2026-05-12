@@ -604,6 +604,7 @@ export class WsHandler {
       sessionRef: SessionLocatorSchema.optional(),
       liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
+      recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
     }).strict()
@@ -2166,6 +2167,7 @@ export class WsHandler {
       case 'terminal.create': {
         const mode = m.mode as TerminalMode
         const restoreRequested = m.restore === true || rawRestoreRequested
+        const freshRecoveryRequested = m.recoveryIntent === 'fresh_after_restore_unavailable'
         const requestedSessionRef = m.sessionRef ?? rawSessionRef
         const legacyResumeSessionId = isNonEmptyString(m.resumeSessionId) ? m.resumeSessionId : undefined
         const supportsLegacyResumeSessionId = mode === 'claude' || mode === 'codex'
@@ -2225,6 +2227,35 @@ export class WsHandler {
         let rateLimited = false
         let restoreSessionId = canonicalSessionId
         try {
+          if (
+            freshRecoveryRequested
+            && (
+              restoreRequested
+              || !!canonicalSessionId
+              || !!requestedSessionRef
+              || !!m.liveTerminal
+              || !!legacyResumeSessionId
+            )
+          ) {
+            error = true
+            log.warn({
+              requestId: m.requestId,
+              connectionId: ws.connectionId,
+              mode,
+              recoveryIntent: m.recoveryIntent,
+              restoreRequested,
+              hasRequestedSessionRef: !!requestedSessionRef,
+              hasLiveTerminal: !!m.liveTerminal,
+              hasLegacyResumeSessionId: !!legacyResumeSessionId,
+            }, 'terminal.create fresh recovery rejected because restore identity was also supplied')
+            this.sendError(ws, {
+              code: 'INVALID_CREATE_REQUEST',
+              message: 'Fresh recovery create cannot also request restore identity.',
+              requestId: m.requestId,
+            })
+            return
+          }
+
           if (unsupportedLegacyResumeSessionId) {
             error = true
             log.warn({
@@ -2239,6 +2270,21 @@ export class WsHandler {
               requestId: m.requestId,
             })
             return
+          }
+
+          if (freshRecoveryRequested) {
+            recordSessionLifecycleEvent({
+              kind: 'restore_unavailable_fresh_fallback',
+              requestId: m.requestId,
+              connectionId: ws.connectionId || 'unknown',
+              ...(m.tabId ? { tabId: m.tabId } : {}),
+              ...(m.paneId ? { paneId: m.paneId } : {}),
+              mode,
+              reason: 'fresh_after_restore_unavailable',
+              restoreRequested: false,
+              treatedAsFresh: true,
+              hasSessionRef: false,
+            })
           }
 
           if (invalidRequestedSessionRef) {
@@ -2367,6 +2413,17 @@ export class WsHandler {
                   hasLegacyResumeSessionId: !!legacyResumeSessionId,
                   liveTerminalServerInstanceId: m.liveTerminal?.serverInstanceId,
                 }, 'terminal.create restore unavailable')
+                recordSessionLifecycleEvent({
+                  kind: 'restore_unavailable',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  ...(m.tabId ? { tabId: m.tabId } : {}),
+                  ...(m.paneId ? { paneId: m.paneId } : {}),
+                  mode,
+                  reason: 'missing_canonical_session_id',
+                  restoreRequested: true,
+                  hasSessionRef: !!requestedSessionRef,
+                })
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'Unable to restore terminal because no durable session identity was available.',
@@ -2419,7 +2476,7 @@ export class WsHandler {
               }
 
               // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
-              if (!restoreRequested) {
+              if (!restoreRequested && !freshRecoveryRequested) {
                 const now = Date.now()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
                   (t) => now - t < this.config.terminalCreateRateWindowMs
