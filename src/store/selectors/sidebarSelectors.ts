@@ -101,7 +101,8 @@ export function buildSessionItems(
       const provider = session.provider || 'claude'
       const key = `${provider}:${session.sessionId}`
       const runningTerminal = runningSessionMap.get(key)
-      const runningTerminalId = runningTerminal?.terminalId
+      const serverRunningTerminalId = session.isRunning ? session.runningTerminalId : undefined
+      const runningTerminalId = runningTerminal?.terminalId ?? serverRunningTerminalId
       const runningTerminalIds = runningTerminal?.allTerminalIds
       const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
