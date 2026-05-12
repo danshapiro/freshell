@@ -127,6 +127,26 @@ describe('buildResumeContent', () => {
     expect(content.resumeSessionId).toBeUndefined()
   })
 
+  it('returns terminal content with live terminal fields when supplied', () => {
+    const content = buildResumeContent({
+      sessionType: 'codex',
+      sessionId: 'def-456',
+      liveTerminal: {
+        terminalId: 'term-codex-1',
+        serverInstanceId: 'srv-local',
+      },
+    })
+
+    expect(content.kind).toBe('terminal')
+    if (content.kind !== 'terminal') throw new Error('expected terminal')
+    expect(content).toMatchObject({
+      terminalId: 'term-codex-1',
+      serverInstanceId: 'srv-local',
+      status: 'running',
+    })
+    expect('liveTerminal' in content).toBe(false)
+  })
+
   it('agent-chat panes have no terminalId', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',

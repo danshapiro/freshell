@@ -1458,6 +1458,141 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs[0].mode).toBe('claude')
     })
 
+    it('opens a running detached session in tab mode with the live terminal locality', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'codex-live-tab',
+              projectPath: '/home/user/project',
+              lastActivityAt: Date.now(),
+              title: 'Live Codex Tab',
+              cwd: '/home/user/project',
+              isRunning: true,
+              runningTerminalId: 'term-codex-live-tab',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        serverInstanceId: 'srv-local',
+      })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Live Codex Tab').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      const tab = state.tabs.tabs[0]
+      const layout = state.panes.layouts[tab.id]
+      expect(layout.type).toBe('leaf')
+      if (layout.type !== 'leaf') throw new Error('expected leaf layout')
+      expect(layout.content).toMatchObject({
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 'term-codex-live-tab',
+        serverInstanceId: 'srv-local',
+        status: 'running',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-live-tab',
+        },
+      })
+    })
+
+    it('opens a running detached session in split mode with the live terminal locality', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'codex-live-split',
+              projectPath: '/home/user/project',
+              lastActivityAt: Date.now(),
+              title: 'Live Codex Split',
+              cwd: '/home/user/project',
+              isRunning: true,
+              runningTerminalId: 'term-codex-live-split',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          mode: 'shell' as const,
+        },
+      ]
+
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        panes,
+        activeTabId: 'tab-1',
+        serverInstanceId: 'srv-local',
+        sessionOpenMode: 'split',
+      })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Live Codex Split').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      const layout = state.panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      const sessionPane = collectLeafPanes(layout).find((pane) => (
+        pane.type === 'leaf'
+        && pane.content.kind === 'terminal'
+        && pane.content.sessionRef?.provider === 'codex'
+        && pane.content.sessionRef?.sessionId === 'codex-live-split'
+      ))
+      expect(sessionPane?.content).toMatchObject({
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 'term-codex-live-split',
+        serverInstanceId: 'srv-local',
+        status: 'running',
+      })
+      expect(sessionPane?.content).not.toHaveProperty('liveTerminal')
+    })
+
     it('switches to existing tab when clicking non-running session that is already open', async () => {
       const projects: ProjectGroup[] = [
         {
