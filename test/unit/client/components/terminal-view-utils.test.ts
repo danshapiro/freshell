@@ -54,4 +54,41 @@ describe('terminal-view-utils', () => {
       },
     })
   })
+
+  it('does not derive partial live terminal handles', () => {
+    const ref: { current: TerminalPaneContent | null } = {
+      current: {
+        kind: 'terminal',
+        createRequestId: 'req-3',
+        status: 'running',
+        mode: 'codex',
+        shell: 'system',
+        terminalId: 'term-live-1',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
+      },
+    }
+
+    expect(getCreateSessionStateFromRef(ref)).toEqual({
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      },
+    })
+
+    ref.current = {
+      ...ref.current,
+      terminalId: undefined,
+      serverInstanceId: 'srv-local',
+    }
+
+    expect(getCreateSessionStateFromRef(ref)).toEqual({
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-session-1',
+      },
+    })
+  })
 })
