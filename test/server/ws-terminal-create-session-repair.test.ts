@@ -914,6 +914,147 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
+  it('uses sessionRef as canonical restore identity over legacy resumeSessionId', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'resume-session-ref-wins'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        resumeSessionId: 'legacy_wrong_session',
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      }))
+
+      await createdPromise
+
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
+      expect(sessionRepairService.waitForSessionCalls).toContain(VALID_SESSION_ID)
+      expect(sessionRepairService.waitForSessionCalls).not.toContain('legacy_wrong_session')
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('reuses a same-server live terminal handle without creating a duplicate terminal', async () => {
+    const existing = registry.create({
+      mode: 'claude',
+      shell: 'system',
+      resumeSessionId: VALID_SESSION_ID,
+    })
+    registry.lastCreateOpts = null
+    registry.createCallCount = 0
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-live-terminal'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: existing.terminalId,
+          serverInstanceId: ready.serverInstanceId,
+        },
+      }))
+
+      const created = await createdPromise
+
+      expect(created.terminalId).toBe(existing.terminalId)
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('falls through from a stale live terminal handle to durable session restore', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-stale-live-with-session-ref'
+      const createdPromise = waitForCreated(ws, requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'missing-live-terminal',
+          serverInstanceId: ready.serverInstanceId,
+        },
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+        },
+      }))
+
+      await createdPromise
+
+      expect(registry.lastCreateOpts?.resumeSessionId).toBe(VALID_SESSION_ID)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('rejects stale live terminal restore when no durable session identity exists', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const ready = await waitForReady(ws)
+
+      const requestId = 'resume-stale-live-missing-session-ref'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => (
+          m.requestId === requestId
+          && (m.type === 'terminal.created' || m.type === 'error')
+        ),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'missing-live-terminal',
+          serverInstanceId: ready.serverInstanceId,
+        },
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('fails closed when Claude restore is requested with a non-canonical sessionRef', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 

@@ -201,7 +201,7 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
     items = items.filter((item) => !item.isNonInteractive)
   }
   if (!input.query.includeEmpty) {
-    items = items.filter((item) => item.title != null && item.title !== '')
+    items = items.filter((item) => item.isRunning || !!item.title?.trim())
   }
 
   if (cursor) {

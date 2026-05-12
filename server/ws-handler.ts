@@ -248,6 +248,17 @@ function buildCanonicalTerminalSessionRef(
   }
 }
 
+function terminalCreateSessionProvider(mode: TerminalMode): string | undefined {
+  return mode === 'shell' ? undefined : mode
+}
+
+function isCanonicalSessionRefForMode(mode: TerminalMode, sessionRef: { provider: string; sessionId: string }): boolean {
+  const provider = terminalCreateSessionProvider(mode)
+  if (!provider || sessionRef.provider !== provider) return false
+  if (provider === 'claude') return isValidClaudeSessionId(sessionRef.sessionId)
+  return isNonEmptyString(sessionRef.sessionId)
+}
+
 const TERMINAL_FAILURE_SUMMARY_MAX_CHARS = 200
 
 function summarizeTerminalFailureOutput(snapshot: string): string | undefined {
@@ -589,6 +600,7 @@ export class WsHandler {
       }),
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
       sessionRef: SessionLocatorSchema.optional(),
       liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
@@ -2152,13 +2164,30 @@ export class WsHandler {
         return
       }
       case 'terminal.create': {
-        const requestedSessionRef = (
-          m.sessionRef?.provider === m.mode && typeof m.sessionRef?.sessionId === 'string'
-            ? m.sessionRef
-            : (rawSessionRef?.provider === m.mode ? rawSessionRef : undefined)
-        )
-        const canonicalSessionId = requestedSessionRef?.sessionId
+        const mode = m.mode as TerminalMode
         const restoreRequested = m.restore === true || rawRestoreRequested
+        const requestedSessionRef = m.sessionRef ?? rawSessionRef
+        const legacyResumeSessionId = isNonEmptyString(m.resumeSessionId) ? m.resumeSessionId : undefined
+        const supportsLegacyResumeSessionId = mode === 'claude' || mode === 'codex'
+        const unsupportedLegacyResumeSessionId = !!legacyResumeSessionId && !supportsLegacyResumeSessionId
+        let canonicalSessionRef: { provider: string; sessionId: string } | undefined
+        let invalidRequestedSessionRef = false
+        if (requestedSessionRef) {
+          if (isCanonicalSessionRefForMode(mode, requestedSessionRef)) {
+            canonicalSessionRef = requestedSessionRef
+          } else {
+            invalidRequestedSessionRef = true
+          }
+        } else if (supportsLegacyResumeSessionId && legacyResumeSessionId) {
+          const provider = terminalCreateSessionProvider(mode)
+          if (provider) {
+            canonicalSessionRef = {
+              provider,
+              sessionId: legacyResumeSessionId,
+            }
+          }
+        }
+        const canonicalSessionId = canonicalSessionRef?.sessionId
         const localLiveTerminalId = (
           m.liveTerminal?.serverInstanceId === this.serverInstanceId
           && typeof m.liveTerminal?.terminalId === 'string'
@@ -2168,8 +2197,10 @@ export class WsHandler {
         log.debug({
           requestId: m.requestId,
           connectionId: ws.connectionId,
-          mode: m.mode,
+          mode,
           sessionRef: requestedSessionRef,
+          resumeSessionId: legacyResumeSessionId,
+          requestedSessionId: canonicalSessionId,
         }, '[TRACE sessionRef] terminal.create received')
         recordSessionLifecycleEvent({
           kind: 'terminal_create_requested',
@@ -2178,7 +2209,7 @@ export class WsHandler {
           ...(m.tabId ? { tabId: m.tabId } : {}),
           ...(m.paneId ? { paneId: m.paneId } : {}),
           ...(m.cwd ? { cwd: m.cwd } : {}),
-          mode: m.mode as TerminalMode,
+          mode,
           restoreRequested,
           hasRequestedSessionRef: !!requestedSessionRef,
           ...(canonicalSessionId ? { requestedSessionId: canonicalSessionId } : {}),
@@ -2194,8 +2225,41 @@ export class WsHandler {
         let rateLimited = false
         let restoreSessionId = canonicalSessionId
         try {
+          if (unsupportedLegacyResumeSessionId) {
+            error = true
+            log.warn({
+              requestId: m.requestId,
+              connectionId: ws.connectionId,
+              mode,
+              restoreRequested,
+            }, 'terminal.create rejected legacy resumeSessionId for unsupported provider')
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: 'terminal.create must use sessionRef for provider session restore.',
+              requestId: m.requestId,
+            })
+            return
+          }
+
+          if (invalidRequestedSessionRef) {
+            error = true
+            log.warn({
+              requestId: m.requestId,
+              connectionId: ws.connectionId,
+              mode,
+              requestedProvider: requestedSessionRef?.provider,
+              hasLegacyResumeSessionId: !!legacyResumeSessionId,
+            }, 'terminal.create restore rejected because sessionRef was not canonical for mode')
+            this.sendError(ws, {
+              code: 'RESTORE_UNAVAILABLE',
+              message: 'Unable to restore terminal because the requested session identity is not valid for this mode.',
+              requestId: m.requestId,
+            })
+            return
+          }
+
           await this.withTerminalCreateLock(
-            this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, canonicalSessionId),
+            this.terminalCreateLockKey(mode, m.requestId, canonicalSessionId),
             async () => {
               const resolveExistingRequestTerminalId = (requestId: string): string | undefined => {
                 const local = state.createdByRequestId.get(requestId)
@@ -2292,18 +2356,37 @@ export class WsHandler {
                 }
               }
 
-              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
+              if (restoreRequested && !canonicalSessionId) {
+                error = true
+                log.warn({
+                  code: 'RESTORE_UNAVAILABLE',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId,
+                  mode,
+                  hasRequestedSessionRef: !!requestedSessionRef,
+                  hasLegacyResumeSessionId: !!legacyResumeSessionId,
+                  liveTerminalServerInstanceId: m.liveTerminal?.serverInstanceId,
+                }, 'terminal.create restore unavailable')
+                this.sendError(ws, {
+                  code: 'RESTORE_UNAVAILABLE',
+                  message: 'Unable to restore terminal because no durable session identity was available.',
+                  requestId: m.requestId,
+                })
+                return
+              }
+
+              if (modeSupportsResume(mode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
-                  m.mode as TerminalMode,
+                  mode,
                   canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
-                    m.mode as TerminalMode,
+                    mode,
                     canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
-                    m.mode as TerminalMode,
+                    mode,
                     canonicalSessionId,
                   )
                 }
@@ -2360,18 +2443,18 @@ export class WsHandler {
                 }
               }
 
-              if (modeSupportsResume(m.mode as TerminalMode) && canonicalSessionId) {
+              if (modeSupportsResume(mode) && canonicalSessionId) {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
-                  m.mode as TerminalMode,
+                  mode,
                   canonicalSessionId,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
-                    m.mode as TerminalMode,
+                    mode,
                     canonicalSessionId,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
-                    m.mode as TerminalMode,
+                    mode,
                     canonicalSessionId,
                   )
                 }
