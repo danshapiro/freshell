@@ -363,6 +363,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     const at = this.now()
     const classified = await this.classifySnapshotStatuses(monitor, parsed.data)
     monitor.lastSnapshot = { cycleId, streamId, statuses: classified.statuses, at }
+    this.warnIfMultipleActiveRoots(monitor.terminalId, classified.statuses, classified.unresolvedSessionIds)
     if (classified.unresolvedSessionIds.size > 0) {
       this.upsertRecord({
         terminalId: monitor.terminalId,
@@ -677,6 +678,26 @@ export class OpencodeActivityTracker extends EventEmitter {
       if (next === current) return current
       current = next
     }
+  }
+
+  private warnIfMultipleActiveRoots(
+    terminalId: string,
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>,
+    unresolvedSessionIds: Set<string>,
+  ): void {
+    const activeSessionIds = Object.entries(statuses)
+      .filter(([, status]) => status.type !== 'idle')
+      .map(([sessionId]) => sessionId)
+      .sort()
+    const rootSessionIds = activeSessionIds.filter((sessionId) => !unresolvedSessionIds.has(sessionId))
+    const unresolvedActiveSessionIds = activeSessionIds.filter((sessionId) => unresolvedSessionIds.has(sessionId))
+    if (rootSessionIds.length + unresolvedActiveSessionIds.length <= 1) return
+
+    this.log.warn({
+      terminalId,
+      rootSessionIds,
+      unresolvedSessionIds: unresolvedActiveSessionIds,
+    }, 'OpenCode reported multiple active root sessions; leaving terminal activity unbound.')
   }
 
   private async classifySnapshotStatuses(
