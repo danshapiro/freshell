@@ -93,6 +93,16 @@ const wsMocks = vi.hoisted(() => ({
   serverInstanceId: undefined as string | undefined,
 }))
 
+const terminalRestoreMocks = vi.hoisted(() => ({
+  addTerminalRestoreRequestId: vi.fn(),
+  addTerminalFreshRecoveryRequestId: vi.fn(),
+}))
+
+vi.mock('@/lib/terminal-restore', () => ({
+  addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
+  addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
+}))
+
 let messageHandler: ((msg: any) => void) | null = null
 let disconnectHandler: (() => void) | null = null
 
@@ -255,6 +265,8 @@ describe('App WS bootstrap recovery', () => {
     })
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
+    terminalRestoreMocks.addTerminalRestoreRequestId.mockClear()
+    terminalRestoreMocks.addTerminalFreshRecoveryRequestId.mockClear()
     messageHandler = null
     disconnectHandler = null
 
@@ -830,6 +842,97 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
+  })
+
+  it('registers regenerated restart request ids for durable restore and explicit fresh recovery', async () => {
+    const store = createStore({
+      tabs: [{ id: 'tab-restart', mode: 'codex', status: 'running' }],
+      panes: {
+        layouts: {
+          'tab-restart': {
+            type: 'split',
+            id: 'split-root',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-codex',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-codex-old',
+                  status: 'running',
+                  mode: 'codex',
+                  shell: 'system',
+                  terminalId: 'term-codex-old',
+                  serverInstanceId: 'srv-old',
+                  sessionRef: {
+                    provider: 'codex',
+                    sessionId: 'codex-session-1',
+                  },
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-shell',
+                content: {
+                  kind: 'terminal',
+                  createRequestId: 'req-shell-old',
+                  status: 'running',
+                  mode: 'shell',
+                  shell: 'system',
+                  terminalId: 'term-shell-old',
+                  serverInstanceId: 'srv-old',
+                },
+              },
+            ],
+          },
+        },
+        activePane: { 'tab-restart': 'pane-codex' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [],
+        terminalMeta: [],
+      })
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-restart']
+      if (!layout || layout.type !== 'split') throw new Error('expected split layout')
+      const codexPane = layout.children[0]
+      const shellPane = layout.children[1]
+      if (codexPane.type !== 'leaf' || shellPane.type !== 'leaf') throw new Error('expected leaf panes')
+      const codexContent = codexPane.content
+      const shellContent = shellPane.content
+      if (codexContent.kind !== 'terminal' || shellContent.kind !== 'terminal') throw new Error('expected terminal panes')
+
+      expect(codexContent.terminalId).toBeUndefined()
+      expect(codexContent.status).toBe('creating')
+      expect(codexContent.createRequestId).not.toBe('req-codex-old')
+      expect(terminalRestoreMocks.addTerminalRestoreRequestId).toHaveBeenCalledWith(codexContent.createRequestId)
+
+      expect(shellContent.terminalId).toBeUndefined()
+      expect(shellContent.status).toBe('creating')
+      expect(shellContent.createRequestId).not.toBe('req-shell-old')
+      expect(terminalRestoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
+        shellContent.createRequestId,
+        'fresh_after_restore_unavailable',
+      )
+    })
   })
 
   it('mounts with legacy ws clients that do not implement onDisconnect', async () => {
