@@ -40,6 +40,11 @@ export class OpencodeProvider implements CodingCliProvider {
     return path.join(this.homeDir, 'opencode.db')
   }
 
+  private getWatchedDatabasePaths(): [string, string] {
+    const dbPath = this.getDatabasePath()
+    return [dbPath, `${dbPath}-wal`]
+  }
+
   async listSessionsDirect(): Promise<CodingCliSession[]> {
     const dbPath = this.getDatabasePath()
     try {
@@ -99,7 +104,8 @@ export class OpencodeProvider implements CodingCliProvider {
   }
 
   getSessionGlob(): string {
-    return this.getDatabasePath()
+    const [dbPath, walPath] = this.getWatchedDatabasePaths()
+    return `{${dbPath},${walPath}}`
   }
 
   getSessionRoots(): string[] {

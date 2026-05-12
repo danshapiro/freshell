@@ -447,9 +447,6 @@ async function main() {
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
-  opencodeActivity.tracker.on('changed', (payload) => {
-    wsHandler.broadcastOpencodeActivityUpdated(payload)
-  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -464,19 +461,6 @@ async function main() {
     wsHandler,
     terminalMetadata,
     broadcastTerminalMetaUpserts,
-  })
-
-  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
-    try {
-      associationPublisher.publish({
-        provider: 'opencode',
-        terminalId,
-        sessionId,
-        source: 'opencode_controller',
-      })
-    } catch (err) {
-      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
-    }
   })
 
   const findCodingCliSession = (provider: CodingCliProviderName, sessionId: string): CodingCliSession | undefined => {
@@ -519,11 +503,13 @@ async function main() {
       wsHandler.broadcastOpencodeActivityUpdated(payload)
     },
     onAssociated: ({ terminalId, sessionId }) => {
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_associated',
+      })
+      log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
       try {
-        broadcastTerminalSessionAssociation({
-          wsHandler,
-          terminalMetadata,
-          broadcastTerminalMetaUpserts,
+        associationPublisher.publish({
           provider: 'opencode',
           terminalId,
           sessionId,

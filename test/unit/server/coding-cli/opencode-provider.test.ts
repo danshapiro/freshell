@@ -136,4 +136,17 @@ describe('OpencodeProvider', () => {
       },
     ])
   })
+
+  it('watches OpenCode sqlite database and WAL but not SHM', () => {
+    const provider = new OpencodeProvider(tempDir)
+    const dbPath = path.join(tempDir, 'opencode.db')
+    const glob = provider.getSessionGlob()
+
+    expect(glob).toContain('opencode.db')
+    expect(glob).toContain('opencode.db-wal')
+    expect(glob).not.toContain('opencode.db-shm')
+    expect(glob).not.toContain('*')
+    expect(provider.getSessionRoots()).toEqual([dbPath])
+    expect(provider.getSessionWatchBases()).toEqual([path.dirname(tempDir)])
+  })
 })
