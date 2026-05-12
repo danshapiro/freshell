@@ -199,6 +199,40 @@ describe('sessionsThunks', () => {
     expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
   })
 
+  it('preserves running state when grouping search results into projects', async () => {
+    searchSessions.mockResolvedValueOnce({
+      results: [{
+        provider: 'opencode',
+        sessionId: 'ses-live-opencode',
+        projectPath: '/tmp/project-live',
+        title: 'Live OpenCode',
+        matchedIn: 'title',
+        lastActivityAt: 1_800,
+        isRunning: true,
+        runningTerminalId: 'term-opencode-1',
+      }],
+      tier: 'title',
+      query: 'live',
+      totalScanned: 1,
+    })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      query: 'live',
+    }) as any)
+
+    expect(store.getState().sessions.windows.sidebar.projects[0]?.sessions[0]).toMatchObject({
+      provider: 'opencode',
+      sessionId: 'ses-live-opencode',
+      isRunning: true,
+      runningTerminalId: 'term-opencode-1',
+    })
+  })
+
   it('keeps tier changes and clearing a non-empty query in the visible search intent', async () => {
     const tierChange = createDeferred<any>()
     const clearSearch = createDeferred<any>()

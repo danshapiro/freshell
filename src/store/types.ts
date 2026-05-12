@@ -96,6 +96,8 @@ export interface CodingCliSession {
   sourceFile?: string
   isSubagent?: boolean
   isNonInteractive?: boolean
+  isRunning?: boolean
+  runningTerminalId?: string
   gitBranch?: string
   isDirty?: boolean
   tokenUsage?: TokenSummary
