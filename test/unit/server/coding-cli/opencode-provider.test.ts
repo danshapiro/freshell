@@ -22,6 +22,7 @@ type FakeSessionRow = {
 const fakeDatabaseState = new Map<string, {
   projects: FakeProjectRow[]
   sessions: FakeSessionRow[]
+  hasParentId?: boolean
 }>()
 
 class FakeDatabaseSync {
@@ -30,6 +31,7 @@ class FakeDatabaseSync {
     rows: {
       projects: FakeProjectRow[]
       sessions: FakeSessionRow[]
+      hasParentId?: boolean
     },
   ): void {
     fakeDatabaseState.set(dbPath, rows)
@@ -37,12 +39,41 @@ class FakeDatabaseSync {
 
   constructor(private readonly dbPath: string) {}
 
-  prepare() {
+  prepare(sql: string) {
     return {
-      all: () => {
-        const rows = fakeDatabaseState.get(this.dbPath) ?? { projects: [], sessions: [] }
+      all: (...params: unknown[]) => {
+        const rows = fakeDatabaseState.get(this.dbPath) ?? { projects: [], sessions: [], hasParentId: true }
+        const hasParentId = rows.hasParentId ?? true
+        if (/PRAGMA\s+table_info\(session\)/i.test(sql)) {
+          return [
+            { name: 'id' },
+            { name: 'project_id' },
+            ...(hasParentId ? [{ name: 'parent_id' }] : []),
+            { name: 'directory' },
+            { name: 'title' },
+            { name: 'time_created' },
+            { name: 'time_updated' },
+            { name: 'time_archived' },
+          ]
+        }
+        if (/SELECT\s+id,\s+parent_id\s+FROM\s+session/i.test(sql)) {
+          if (!hasParentId) throw new Error('no such column: parent_id')
+          const requested = new Set(params)
+          return rows.sessions
+            .filter((session) => requested.has(session.id))
+            .map((session) => ({
+              id: session.id,
+              parent_id: session.parent_id,
+            }))
+        }
+        if (!hasParentId && /parent_id/i.test(sql)) {
+          throw new Error('no such column: parent_id')
+        }
         return rows.sessions
-          .filter((session) => session.parent_id === null && session.time_archived === null)
+          .filter((session) => (
+            session.time_archived === null
+            && (!hasParentId || session.parent_id === null)
+          ))
           .sort((left, right) => (right.time_updated ?? 0) - (left.time_updated ?? 0))
           .map((session) => ({
             sessionId: session.id,
@@ -148,5 +179,77 @@ describe('OpencodeProvider', () => {
     expect(glob).not.toContain('*')
     expect(provider.getSessionRoots()).toEqual([dbPath])
     expect(provider.getSessionWatchBases()).toEqual([path.dirname(tempDir)])
+  })
+
+  it('maps OpenCode child session ids to sqlite root session ids', async () => {
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.seed(dbPath, {
+      projects: [],
+      sessions: [
+        {
+          id: 'root_session',
+          project_id: 'project-1',
+          parent_id: null,
+          directory: '/repo/root',
+          title: 'Root',
+          time_created: 1000,
+          time_updated: 2000,
+          time_archived: null,
+        },
+        {
+          id: 'child_session',
+          project_id: 'project-1',
+          parent_id: 'root_session',
+          directory: '/repo/root',
+          title: 'Child',
+          time_created: 1001,
+          time_updated: 2001,
+          time_archived: null,
+        },
+      ],
+    })
+
+    const provider = new OpencodeProvider(tempDir)
+    const resolved = await provider.resolveOpencodeSessionRoots(['child_session'])
+
+    expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
+    expect(resolved.unresolvedSessionIds.size).toBe(0)
+  })
+
+  it('treats an OpenCode schema without parent_id as flat roots', async () => {
+    const dbPath = path.join(tempDir, 'opencode.db')
+    await fsp.writeFile(dbPath, 'fake sqlite file', 'utf8')
+    FakeDatabaseSync.seed(dbPath, {
+      projects: [
+        { id: 'project-1', worktree: '/repo/root' },
+      ],
+      hasParentId: false,
+      sessions: [
+        {
+          id: 'flat_session',
+          project_id: 'project-1',
+          parent_id: null,
+          directory: '/repo/root',
+          title: 'Flat',
+          time_created: 1000,
+          time_updated: 2000,
+          time_archived: null,
+        },
+      ],
+    })
+
+    const provider = new OpencodeProvider(tempDir)
+    const resolved = await provider.resolveOpencodeSessionRoots(['flat_session'])
+    const sessions = await provider.listSessionsDirect()
+
+    expect(resolved.rootsBySessionId.get('flat_session')).toBe('flat_session')
+    expect(resolved.unresolvedSessionIds.size).toBe(0)
+    expect(sessions).toEqual([
+      expect.objectContaining({
+        provider: 'opencode',
+        sessionId: 'flat_session',
+      }),
+    ])
   })
 })

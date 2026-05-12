@@ -89,6 +89,7 @@ export class OpencodeSessionController extends EventEmitter {
       this.log.warn({
         terminalId: request.terminalId,
         sessionId: request.sessionId,
+        ...(previousSessionId ? { previousSessionId } : {}),
         reason: result.reason,
       }, 'Failed to promote OpenCode durable session from authoritative control data')
       this.tracker.rejectSessionAssociation(request)

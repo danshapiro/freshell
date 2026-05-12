@@ -92,4 +92,43 @@ describe('OpencodeSessionController', () => {
 
     controller.dispose()
   })
+
+  it('logs rejected association requests with previous session context', () => {
+    const tracker = new FakeTracker()
+    const log = { warn: vi.fn() }
+    const registry = {
+      get: vi.fn(() => ({
+        terminalId: 'term-1',
+        mode: 'opencode',
+        status: 'running',
+        resumeSessionId: 'previous-session',
+      })),
+      bindSession: vi.fn(() => ({
+        ok: false as const,
+        reason: 'session_already_owned',
+        owner: 'other-terminal',
+      })),
+      on: vi.fn(),
+      off: vi.fn(),
+    }
+    const controller = new OpencodeSessionController({
+      tracker: tracker as any,
+      registry: registry as any,
+      log,
+    })
+
+    tracker.emit('association.requested', {
+      terminalId: 'term-1',
+      sessionId: 'next-session',
+    })
+
+    expect(log.warn).toHaveBeenCalledWith({
+      terminalId: 'term-1',
+      sessionId: 'next-session',
+      previousSessionId: 'previous-session',
+      reason: 'session_already_owned',
+    }, 'Failed to promote OpenCode durable session from authoritative control data')
+
+    controller.dispose()
+  })
 })

@@ -831,4 +831,81 @@ describe('OpencodeActivityTracker', () => {
 
     tracker.dispose()
   })
+
+  it('maps snapshot child activity to its OpenCode root before ownership reduction', async () => {
+    vi.useFakeTimers()
+    const resolveOpencodeSessionRoots = vi.fn(async () => ({
+      rootsBySessionId: new Map([
+        ['child-session', 'root-session'],
+      ]),
+      unresolvedSessionIds: new Set<string>(),
+    }))
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) return createJsonResponse({ ok: true })
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          'child-session': { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) return createSseResponse([{ type: 'server.connected', properties: {} }])
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      random: () => 0,
+      resolveOpencodeSessionRoots,
+    })
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(resolveOpencodeSessionRoots).toHaveBeenCalledWith(['child-session'])
+    expect(tracker.list()).toEqual([
+      expect.objectContaining({
+        terminalId: 'term-oc',
+        sessionId: 'root-session',
+        phase: 'busy',
+      }),
+    ])
+
+    tracker.dispose()
+  })
+
+  it('does not adopt an unresolved singleton OpenCode snapshot as a durable session', async () => {
+    vi.useFakeTimers()
+    const resolveOpencodeSessionRoots = vi.fn(async () => ({
+      rootsBySessionId: new Map<string, string>(),
+      unresolvedSessionIds: new Set(['child-session']),
+    }))
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) return createJsonResponse({ ok: true })
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          'child-session': { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) return createSseResponse([{ type: 'server.connected', properties: {} }])
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      random: () => 0,
+      resolveOpencodeSessionRoots,
+    })
+
+    tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(tracker.list()).toEqual([
+      expect.objectContaining({
+        terminalId: 'term-oc',
+        phase: 'busy',
+      }),
+    ])
+    expect(tracker.list()[0]).not.toHaveProperty('sessionId')
+
+    tracker.dispose()
+  })
 })

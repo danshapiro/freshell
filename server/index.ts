@@ -499,6 +499,7 @@ async function main() {
 
   opencodeActivity = wireOpencodeActivityTracker({
     registry,
+    resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds),
     onActivityChanged: (payload) => {
       wsHandler.broadcastOpencodeActivityUpdated(payload)
     },
@@ -530,6 +531,11 @@ async function main() {
         log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
         return
       }
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_turn_complete',
+      })
+      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
       wsHandler.broadcastTerminalTurnComplete({
         terminalId,
         provider: 'opencode',
