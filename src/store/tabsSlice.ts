@@ -575,7 +575,76 @@ export const openSessionTab = createAsyncThunk(
       }))
     }
 
-    const repairExistingTabLayout = (tab: Tab | undefined) => {
+    const targetSessionRef = sanitizeSessionRef({ provider: resolvedProvider, sessionId })
+
+    const isTargetSessionRef = (sessionRef: unknown) => {
+      const sanitized = sanitizeSessionRef(sessionRef)
+      return Boolean(
+        sanitized
+        && sanitized.provider === resolvedProvider
+        && sanitized.sessionId === sessionId,
+      )
+    }
+
+    const hasNonEmptyResumeSessionId = (content: unknown) => (
+      typeof (content as { resumeSessionId?: unknown }).resumeSessionId === 'string'
+      && ((content as { resumeSessionId: string }).resumeSessionId.trim().length > 0)
+    )
+
+    const paneHasOwnDurableIdentity = (content: unknown) => (
+      Boolean(sanitizeSessionRef((content as { sessionRef?: unknown }).sessionRef))
+      || hasNonEmptyResumeSessionId(content)
+    )
+
+    const collectLeafNodes = (node: PaneNode): Array<Extract<PaneNode, { type: 'leaf' }>> => {
+      if (node.type === 'leaf') return [node]
+      return [
+        ...collectLeafNodes(node.children[0]),
+        ...collectLeafNodes(node.children[1]),
+      ]
+    }
+
+    const isKnownCurrentLiveTerminal = (content: unknown) => {
+      if (!localServerInstanceId) return false
+      const terminalContent = content as {
+        kind?: unknown
+        terminalId?: unknown
+        serverInstanceId?: unknown
+      }
+      return terminalContent.kind === 'terminal'
+        && typeof terminalContent.terminalId === 'string'
+        && terminalContent.terminalId.length > 0
+        && typeof terminalContent.serverInstanceId === 'string'
+        && terminalContent.serverInstanceId === localServerInstanceId
+    }
+
+    const findStaleSinglePaneTabFallback = (): Tab | undefined => {
+      if (!targetSessionRef || desiredResumeContent.kind !== 'terminal') return undefined
+
+      for (const tab of state.tabs.tabs) {
+        if (!isTargetSessionRef(tab.sessionRef)) continue
+        const layout = state.panes.layouts[tab.id]
+        if (!layout) continue
+
+        const leaves = collectLeafNodes(layout)
+        if (leaves.length !== 1) continue
+
+        const [{ content }] = leaves
+        if (content.kind !== 'terminal') continue
+        if (content.mode !== desiredResumeContent.mode) continue
+        if (paneHasOwnDurableIdentity(content)) continue
+        if (isKnownCurrentLiveTerminal(content)) continue
+
+        return tab
+      }
+
+      return undefined
+    }
+
+    const repairExistingTabLayout = (
+      tab: Tab | undefined,
+      options: { tabFallbackMissingPaneLocator?: boolean } = {},
+    ) => {
       if (!tab) return
       const layout = state.panes.layouts[tab.id]
       if (!layout) return
@@ -614,8 +683,67 @@ export const openSessionTab = createAsyncThunk(
 
       visit(layout)
 
-      if (matchingLeaves.length !== 1) return
-      const [{ id: paneId, content }] = matchingLeaves
+      let selectedLeaves = matchingLeaves
+      if (selectedLeaves.length === 0 && options.tabFallbackMissingPaneLocator) {
+        const leaves = collectLeafNodes(layout)
+        if (leaves.length === 1) {
+          const [{ id, content }] = leaves
+          if (
+            targetSessionRef
+            && desiredResumeContent.kind === 'terminal'
+            && content.kind === 'terminal'
+            && content.mode === desiredResumeContent.mode
+            && !paneHasOwnDurableIdentity(content)
+            && !isKnownCurrentLiveTerminal(content)
+          ) {
+            selectedLeaves = [{ id, content }]
+          }
+        }
+      }
+
+      if (selectedLeaves.length !== 1) return
+      const [{ id: paneId, content }] = selectedLeaves
+      const paneOwnsTarget = matchingLeaves.some((leaf) => leaf.id === paneId)
+      const tabFallbackMissingPaneLocator = Boolean(options.tabFallbackMissingPaneLocator && !paneOwnsTarget)
+
+      if (
+        targetSessionRef
+        && desiredResumeContent.kind === 'terminal'
+        && content.kind === 'terminal'
+        && content.mode === desiredResumeContent.mode
+        && (paneOwnsTarget || tabFallbackMissingPaneLocator)
+      ) {
+        const existingSessionRef = sanitizeSessionRef(content.sessionRef)
+        const resumeSessionId = typeof content.resumeSessionId === 'string'
+          ? content.resumeSessionId.trim()
+          : ''
+        const hasDifferentSessionRef = Boolean(
+          existingSessionRef
+          && (
+            existingSessionRef.provider !== targetSessionRef.provider
+            || existingSessionRef.sessionId !== targetSessionRef.sessionId
+          ),
+        )
+        const hasDifferentResumeSessionId = Boolean(resumeSessionId && resumeSessionId !== sessionId)
+        if (hasDifferentSessionRef || hasDifferentResumeSessionId) return
+
+        if (
+          !existingSessionRef
+          || existingSessionRef.provider !== targetSessionRef.provider
+          || existingSessionRef.sessionId !== targetSessionRef.sessionId
+        ) {
+          dispatch(updatePaneContent({
+            tabId: tab.id,
+            paneId,
+            content: {
+              ...content,
+              sessionRef: targetSessionRef,
+            },
+          }))
+        }
+        return
+      }
+
       if (content.kind === 'terminal' && content.terminalId) return
 
       const needsRepair = desiredResumeContent.kind === 'fresh-agent'
@@ -680,11 +808,18 @@ export const openSessionTab = createAsyncThunk(
         { provider: resolvedProvider, sessionId },
         localServerInstanceId,
       )
-      if (existingTabId) {
-        const existingTab = state.tabs.tabs.find((tab) => tab.id === existingTabId)
-        updateExistingTabMetadata(existingTab)
-        repairExistingTabLayout(existingTab)
-        dispatch(setActiveTab(existingTabId))
+      const staleSinglePaneFallbackTab = existingTabId ? undefined : findStaleSinglePaneTabFallback()
+      const tabToOpen = existingTabId
+        ? state.tabs.tabs.find((tab) => tab.id === existingTabId)
+        : staleSinglePaneFallbackTab
+      if (tabToOpen) {
+        const selectedExistingTabId = existingTabId ?? tabToOpen.id
+        const usingStaleSinglePaneFallback = !existingTabId && staleSinglePaneFallbackTab?.id === tabToOpen.id
+        updateExistingTabMetadata(tabToOpen)
+        repairExistingTabLayout(tabToOpen, {
+          tabFallbackMissingPaneLocator: usingStaleSinglePaneFallback,
+        })
+        dispatch(setActiveTab(selectedExistingTabId))
         return
       }
     }
