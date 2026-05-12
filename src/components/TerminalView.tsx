@@ -91,6 +91,7 @@ import {
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
 import { buildRestoreError } from '@shared/session-contract'
+import type { CodingCliProviderName } from '@/store/types'
 
 const log = createLogger('TerminalView')
 
@@ -111,6 +112,10 @@ const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
+
+function isCodingCliProviderMode(mode: TerminalPaneContent['mode'] | undefined): mode is CodingCliProviderName {
+  return mode !== undefined && mode !== 'shell'
+}
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
@@ -287,6 +292,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const dispatch = useAppDispatch()
   const isMobile = useMobile()
   const connectionStatus = useAppSelector((s) => s.connection.status)
+  const serverInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabHasSinglePane = useAppSelector((s) => s.panes.layouts[tabId]?.type === 'leaf')
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -416,6 +422,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     requestId: string
     terminalId: string
   } | null>(null)
+  const serverInstanceIdRef = useRef(serverInstanceId)
   const searchTerminalIdCleanupRef = useRef<string | null>(terminalContent?.terminalId ?? null)
   const deferredAttachStateRef = useRef<DeferredAttachState>({
     mode: 'none',
@@ -802,6 +809,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       content: next,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
+
+  useEffect(() => {
+    serverInstanceIdRef.current = serverInstanceId
+  }, [serverInstanceId])
 
   const requestTerminalLayout = useCallback((options: {
     fit?: boolean
@@ -1453,6 +1464,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     tabHasSinglePaneRef.current = tabHasSinglePane
   }, [tabHasSinglePane])
 
+  const persistDurableSessionIdentity = useCallback((
+    provider: CodingCliProviderName,
+    sessionId: string,
+  ) => {
+    const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
+    const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
+      provider,
+      sessionId,
+      paneSessionRef: contentRef.current?.sessionRef,
+      tabSessionRef: currentTab?.sessionRef,
+      paneResumeSessionId: contentRef.current?.resumeSessionId,
+      tabResumeSessionId: currentTab?.resumeSessionId,
+    })
+    if (durableIdentityUpdate?.paneUpdates) {
+      updateContent(durableIdentityUpdate.paneUpdates)
+    }
+    if (currentTab && durableIdentityUpdate?.tabUpdates) {
+      dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
+    }
+    if (durableIdentityUpdate?.shouldFlush) {
+      dispatch(flushPersistedLayoutNow())
+    }
+  }, [dispatch, updateContent])
+
   // Ref for paneId to avoid stale closures in title handlers
   const paneIdRef = useRef(paneId)
   useEffect(() => {
@@ -2033,7 +2068,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           terminalIdRef.current = newId
-          updateContent({ terminalId: newId, status: 'running' })
+          updateContent({
+            terminalId: newId,
+            serverInstanceId: serverInstanceIdRef.current,
+            status: 'running',
+          })
+          const currentMode = contentRef.current?.mode
+          if (
+            typeof msg.effectiveResumeSessionId === 'string'
+            && msg.effectiveResumeSessionId.length > 0
+            && isCodingCliProviderMode(currentMode)
+          ) {
+            persistDurableSessionIdentity(currentMode, msg.effectiveResumeSessionId)
+          }
           // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
@@ -2132,24 +2179,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             oldResumeSessionId: contentRef.current?.resumeSessionId,
             sessionRef,
           })
-          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
-          const durableIdentityUpdate = buildTerminalDurableSessionRefUpdate({
-            provider: sessionRef.provider,
-            sessionId: sessionRef.sessionId,
-            paneSessionRef: contentRef.current?.sessionRef,
-            tabSessionRef: currentTab?.sessionRef,
-            paneResumeSessionId: contentRef.current?.resumeSessionId,
-            tabResumeSessionId: currentTab?.resumeSessionId,
-          })
-          if (durableIdentityUpdate?.paneUpdates) {
-            updateContent(durableIdentityUpdate.paneUpdates)
-          }
-          if (currentTab && durableIdentityUpdate?.tabUpdates) {
-            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
-          }
-          if (durableIdentityUpdate?.shouldFlush) {
-            dispatch(flushPersistedLayoutNow())
-          }
+          persistDurableSessionIdentity(sessionRef.provider, sessionRef.sessionId)
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {

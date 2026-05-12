@@ -456,7 +456,7 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
-  it('does not echo durable session ids from reused codex terminals via terminal.created', async () => {
+  it('echoes canonical durable session ids from reused codex terminals via terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -471,13 +471,15 @@ describe('terminal.create reuse running codex terminal', () => {
         sessionRef: { provider: 'codex', sessionId: CODEX_SESSION_ID },
       }))
       const created = await createdPromise
-      expect(created).not.toHaveProperty('effectiveResumeSessionId')
+      expect(created).toMatchObject({
+        effectiveResumeSessionId: CODEX_SESSION_ID,
+      })
     } finally {
       await closeWebSocket(ws)
     }
   })
 
-  it('creates a fresh codex terminal without persisting a provisional session id', async () => {
+  it('creates a fresh codex terminal with the sidecar-selected durable session id', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -495,7 +497,9 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
 
       expect(created.terminalId).toBe('term-codex-existing')
-      expect(created).not.toHaveProperty('effectiveResumeSessionId')
+      expect(created).toMatchObject({
+        effectiveResumeSessionId: 'thread-new-1',
+      })
       expect(codexLaunchPlanner.planCreateCalls).toHaveLength(1)
       const planCreate = codexLaunchPlanner.planCreateCalls[0]
       expect(planCreate).toEqual(expect.objectContaining({
@@ -504,21 +508,12 @@ describe('terminal.create reuse running codex terminal', () => {
         model: undefined,
         sandbox: undefined,
         approvalPolicy: undefined,
-        terminalId: expect.any(String),
-        env: expect.objectContaining({
-          FRESHELL: '1',
-          FRESHELL_TERMINAL_ID: expect.any(String),
-          FRESHELL_TOKEN: 'testtoken-testtoken',
-          FRESHELL_URL: 'http://localhost:3001',
-        }),
       }))
-      expect(planCreate.env.FRESHELL_TERMINAL_ID).toBe(planCreate.terminalId)
       expect(registry.createCalls).toHaveLength(1)
       expect(registry.createCalls[0]).toMatchObject({
-        terminalId: planCreate.terminalId,
         mode: 'codex',
         cwd: '/repo/worktree',
-        resumeSessionId: undefined,
+        resumeSessionId: 'thread-new-1',
         providerSettings: {
           codexAppServer: {
             wsUrl: CODEX_REMOTE_WS_URL,

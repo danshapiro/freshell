@@ -475,6 +475,7 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
+  effectiveResumeSessionId?: string
 }
 
 export type TerminalAttachReadyMessage = {
