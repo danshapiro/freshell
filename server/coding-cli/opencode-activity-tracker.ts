@@ -322,7 +322,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       .map(([sessionId]) => sessionId)
       .sort()
     if (activeSessionIds.length === 0) {
-      this.removeRecord(monitor.terminalId)
+      this.removeRecordForIdleTerminal(monitor.terminalId)
       return
     }
 
@@ -479,6 +479,16 @@ export class OpencodeActivityTracker extends EventEmitter {
       return
     }
 
+    const rootSessionIds = Array.from(rootIds).sort()
+    const unresolvedSessionIds = Array.from(resolution.unresolvedSessionIds).sort()
+    if (rootSessionIds.length + unresolvedSessionIds.length > 1) {
+      this.log.warn({
+        terminalId,
+        rootSessionIds,
+        unresolvedSessionIds,
+      }, 'OpenCode reported multiple active root sessions; leaving terminal activity unbound.')
+    }
+
     this.upsertRecord({
       terminalId,
       phase: 'busy',
@@ -540,14 +550,24 @@ export class OpencodeActivityTracker extends EventEmitter {
     const existing = this.records.get(terminalId)
     if (!existing) return
     if (existing.sessionId && existing.sessionId !== sessionId) return
-    if (existing.sessionId) {
-      this.emit('turn.complete', {
-        terminalId,
-        sessionId: existing.sessionId,
-        at: this.now(),
-      })
-    }
+    this.emitTurnComplete(existing)
     this.removeRecord(terminalId)
+  }
+
+  private removeRecordForIdleTerminal(terminalId: string): void {
+    const existing = this.records.get(terminalId)
+    if (!existing) return
+    this.emitTurnComplete(existing)
+    this.removeRecord(terminalId)
+  }
+
+  private emitTurnComplete(record: OpencodeActivityRecord): void {
+    if (!record.sessionId) return
+    this.emit('turn.complete', {
+      terminalId: record.terminalId,
+      sessionId: record.sessionId,
+      at: this.now(),
+    })
   }
 
   private resolveTopologyRoot(monitor: MonitorState, sessionId: string): string {

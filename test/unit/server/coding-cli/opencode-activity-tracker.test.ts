@@ -162,7 +162,9 @@ describe('OpencodeActivityTracker', () => {
 
     const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
     const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    const completed: unknown[] = []
     tracker.on('changed', (payload) => changes.push(payload))
+    tracker.on('turn.complete', (event) => completed.push(event))
 
     tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
     await vi.advanceTimersByTimeAsync(0)
@@ -180,6 +182,13 @@ describe('OpencodeActivityTracker', () => {
       upsert: [],
       remove: ['term-oc'],
     })
+    expect(completed).toEqual([
+      {
+        terminalId: 'term-oc',
+        sessionId: 'session-oc',
+        at: expect.any(Number),
+      },
+    ])
     expect(tracker.list()).toEqual([])
 
     tracker.dispose()
@@ -250,7 +259,9 @@ describe('OpencodeActivityTracker', () => {
 
     const tracker = new OpencodeActivityTracker({ fetchImpl: fetchImpl as typeof fetch, random: () => 0 })
     const changes: Array<{ upsert: unknown[]; remove: string[] }> = []
+    const completed: unknown[] = []
     tracker.on('changed', (payload) => changes.push(payload))
+    tracker.on('turn.complete', (event) => completed.push(event))
 
     tracker.trackTerminal({ terminalId: 'term-oc', endpoint: TEST_ENDPOINT })
     await vi.advanceTimersByTimeAsync(0)
@@ -267,6 +278,13 @@ describe('OpencodeActivityTracker', () => {
       upsert: [],
       remove: ['term-oc'],
     })
+    expect(completed).toEqual([
+      {
+        terminalId: 'term-oc',
+        sessionId: 'session-oc',
+        at: expect.any(Number),
+      },
+    ])
     expect(tracker.list()).toEqual([])
 
     tracker.dispose()
@@ -477,9 +495,11 @@ describe('OpencodeActivityTracker', () => {
       }
       throw new Error(`Unexpected URL: ${url}`)
     })
+    const log = { warn: vi.fn() }
     const tracker = new OpencodeActivityTracker({
       fetchImpl: fetchImpl as typeof fetch,
       resolveOpencodeSessionRoots,
+      log,
     })
 
     tracker.trackTerminal({ terminalId: 'term-opencode-1', endpoint: TEST_ENDPOINT })
@@ -492,6 +512,11 @@ describe('OpencodeActivityTracker', () => {
       }),
     ])
     expect(tracker.list()[0]).not.toHaveProperty('sessionId')
+    expect(log.warn).toHaveBeenCalledWith({
+      terminalId: 'term-opencode-1',
+      rootSessionIds: ['root_a', 'root_b'],
+      unresolvedSessionIds: [],
+    }, 'OpenCode reported multiple active root sessions; leaving terminal activity unbound.')
 
     tracker.dispose()
   })
