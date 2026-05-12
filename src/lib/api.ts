@@ -443,6 +443,8 @@ export type SearchResult = {
   firstUserMessage?: string
   isSubagent?: boolean
   isNonInteractive?: boolean
+  isRunning?: boolean
+  runningTerminalId?: string
 }
 
 export type SearchResponse = {
@@ -492,11 +494,13 @@ function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
       cwd: item.cwd,
       title: item.title,
       summary: item.summary,
-      isSubagent: item.isSubagent,
-      isNonInteractive: item.isNonInteractive,
-      firstUserMessage: item.firstUserMessage,
-      sessionType: item.sessionType,
-    })),
+	      isSubagent: item.isSubagent,
+	      isNonInteractive: item.isNonInteractive,
+	      isRunning: item.isRunning,
+	      runningTerminalId: item.runningTerminalId,
+	      firstUserMessage: item.firstUserMessage,
+	      sessionType: item.sessionType,
+	    })),
   }))
 }
 
@@ -582,10 +586,12 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
       archived: item.archived,
       cwd: item.cwd,
       sessionType: item.sessionType,
-      firstUserMessage: item.firstUserMessage,
-      isSubagent: item.isSubagent,
-      isNonInteractive: item.isNonInteractive,
-    })),
+	      firstUserMessage: item.firstUserMessage,
+	      isSubagent: item.isSubagent,
+	      isNonInteractive: item.isNonInteractive,
+	      isRunning: item.isRunning,
+	      runningTerminalId: item.runningTerminalId,
+	    })),
     tier,
     query,
     totalScanned: page.items.length,

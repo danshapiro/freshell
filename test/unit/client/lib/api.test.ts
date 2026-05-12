@@ -377,6 +377,32 @@ describe('visible-first read-model helpers', () => {
     ])
   })
 
+  it('preserves session-directory running state in sidebar snapshots', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'codex-live-1',
+        provider: 'codex',
+        projectPath: '/repo/live',
+        title: 'Live Codex',
+        sessionType: 'codex',
+        isRunning: true,
+        runningTerminalId: 'term-codex-1',
+        lastActivityAt: 1_700,
+      }],
+      nextCursor: null,
+      revision: 1_700,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response.projects[0].sessions[0]).toMatchObject({
+      provider: 'codex',
+      sessionId: 'codex-live-1',
+      isRunning: true,
+      runningTerminalId: 'term-codex-1',
+    })
+  })
+
   it('encodes session-directory cursors with lastActivityAt', async () => {
     mockFetch.mockResolvedValueOnce(mockJson({
       items: [],
@@ -429,6 +455,32 @@ describe('visible-first read-model helpers', () => {
         isNonInteractive: true,
       }),
     ])
+  })
+
+  it('preserves session-directory running state in search results', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'ses_live_opencode',
+        provider: 'opencode',
+        projectPath: '/repo/live',
+        title: 'Live OpenCode',
+        matchedIn: 'title',
+        isRunning: true,
+        runningTerminalId: 'term-opencode-1',
+        lastActivityAt: 1_800,
+      }],
+      nextCursor: null,
+      revision: 1_800,
+    }))
+
+    const response = await searchSessions({ query: 'live', tier: 'title' })
+
+    expect(response.results[0]).toMatchObject({
+      provider: 'opencode',
+      sessionId: 'ses_live_opencode',
+      isRunning: true,
+      runningTerminalId: 'term-opencode-1',
+    })
   })
 })
 
