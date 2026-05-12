@@ -1473,6 +1473,95 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
+  it('uses terminal inventory metadata to refresh terminal surfaces and mark loaded sessions running', async () => {
+    const initialProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-inventory-1',
+        projectPath: '/repo',
+        lastActivityAt: 1,
+        title: 'Inventory Codex',
+      }],
+    }]
+    const refreshedProjects = [{
+      projectPath: '/repo',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-inventory-1',
+        projectPath: '/repo',
+        lastActivityAt: 2,
+        title: 'Inventory Codex',
+        isRunning: true,
+        runningTerminalId: 'term-inventory-1',
+      }],
+    }]
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            resultVersion: 1,
+          },
+        },
+      },
+    })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: refreshedProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 2,
+      oldestIncludedSessionId: 'codex:codex-inventory-1',
+      hasMore: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).toBeTypeOf('function')
+    })
+
+    getTerminalDirectoryPage.mockClear()
+    fetchSidebarSessionsSnapshot.mockClear()
+
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.inventory',
+        terminals: [{
+          terminalId: 'term-inventory-1',
+          title: 'Codex',
+          mode: 'codex',
+          createdAt: 1_000,
+          lastActivityAt: 1_700,
+          status: 'running',
+        }],
+        terminalMeta: [{
+          terminalId: 'term-inventory-1',
+          provider: 'codex',
+          sessionId: 'codex-inventory-1',
+          updatedAt: 1_700,
+        }],
+      })
+    })
+
+    expect(store.getState().sessions.projects[0]?.sessions[0]).toMatchObject({
+      isRunning: true,
+      runningTerminalId: 'term-inventory-1',
+    })
+
+    await waitFor(() => {
+      expect(getTerminalDirectoryPage).toHaveBeenCalledTimes(1)
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('ignores legacy sessions.patch messages when bootstrapping against an already-ready socket', async () => {
     const baselineProjects = [
       {

@@ -803,6 +803,19 @@ export default function App() {
         if (msg.type === 'terminal.inventory') {
           const terminals = Array.isArray(msg.terminals) ? msg.terminals : []
           const terminalMeta = Array.isArray(msg.terminalMeta) ? msg.terminalMeta : []
+          const terminalMetaRequestedAt = Date.now()
+          const previousTerminalMeta = appStore.getState().terminalMeta?.byTerminalId ?? {}
+          const incomingTerminalMetaIds = new Set(
+            terminalMeta
+              .map((record: any) => record?.terminalId)
+              .filter((terminalId: unknown): terminalId is string => typeof terminalId === 'string'),
+          )
+          const removedTerminalMetaIds = Object.entries(previousTerminalMeta)
+            .filter(([terminalId, record]) => (
+              !incomingTerminalMetaIds.has(terminalId)
+              && !(typeof record?.updatedAt === 'number' && record.updatedAt > terminalMetaRequestedAt)
+            ))
+            .map(([terminalId]) => terminalId)
           const liveIds = terminals
             .filter((t: any) => t.status === 'running')
             .map((t: any) => t.terminalId as string)
@@ -838,7 +851,16 @@ export default function App() {
               }
             })(layout)
           }
-          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: Date.now() }))
+          dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
+          dispatch(patchSessionRunningStateFromTerminalMeta({
+            upsert: terminalMeta,
+            remove: removedTerminalMetaIds,
+          }))
+          void appStore.dispatch(fetchTerminalDirectoryWindow({
+            surface: 'sidebar',
+            priority: 'visible',
+          }) as any)
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''

@@ -421,7 +421,7 @@ export class OpencodeActivityTracker extends EventEmitter {
             connected = true
             await this.refreshSnapshot(monitor, cycleId, streamId, signal)
           } else if (event && event.type !== 'server.connected') {
-            this.handleOpencodeEvent(monitor, cycleId, streamId, event)
+            await this.handleOpencodeEvent(monitor, cycleId, streamId, event)
           }
           separatorIndex = buffer.indexOf('\n\n')
         }
@@ -458,12 +458,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     return event
   }
 
-  private handleOpencodeEvent(
+  private async handleOpencodeEvent(
     monitor: MonitorState,
     cycleId: number,
     streamId: number,
     event: Exclude<z.infer<typeof OpencodeEventSchema>, { type: 'server.connected' }>,
-  ): void {
+  ): Promise<void> {
     if (event.type === 'session.created') {
       const parentId = event.properties.info.parentID
       if (parentId) {
@@ -482,17 +482,28 @@ export class OpencodeActivityTracker extends EventEmitter {
       return
     }
 
-    const observedSessionId = this.resolveKnownRoot(monitor.terminalId, event.properties.sessionID)
-      ?? event.properties.sessionID
+    const observedSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
+    const observedStatus = event.type === 'session.idle'
+      ? 'idle'
+      : event.properties.status.type
 
-    if (event.type === 'session.idle') {
+    if (observedStatus === 'idle') {
       this.observe(monitor, {
         kind: 'sse',
         cycleId,
         streamId,
-        sessionId: observedSessionId,
+        sessionId: observedSessionId ?? event.properties.sessionID,
         status: 'idle',
         at: this.now(),
+      })
+      return
+    }
+
+    if (!observedSessionId) {
+      this.upsertRecord({
+        terminalId: monitor.terminalId,
+        phase: 'busy',
+        updatedAt: this.now(),
       })
       return
     }
@@ -502,9 +513,32 @@ export class OpencodeActivityTracker extends EventEmitter {
       cycleId,
       streamId,
       sessionId: observedSessionId,
-      status: event.properties.status.type,
+      status: observedStatus,
       at: this.now(),
     })
+  }
+
+  private async resolveRootForEvent(
+    monitor: MonitorState,
+    sessionId: string,
+  ): Promise<string | undefined> {
+    const knownRoot = this.resolveKnownRoot(monitor.terminalId, sessionId)
+    if (knownRoot) return knownRoot
+
+    try {
+      const resolved = await this.resolveOpencodeSessionRoots([sessionId])
+      for (const [resolvedSessionId, rootSessionId] of resolved.rootsBySessionId) {
+        this.registerSessionRoot(monitor.terminalId, resolvedSessionId, rootSessionId)
+      }
+      return resolved.rootsBySessionId.get(sessionId)
+    } catch (err) {
+      this.log.warn({
+        err,
+        terminalId: monitor.terminalId,
+        sessionId,
+      }, 'Failed to resolve OpenCode root session for activity event')
+      return undefined
+    }
   }
 
   confirmSessionAssociation(input: { terminalId: string; sessionId: string }): void {
