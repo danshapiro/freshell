@@ -2481,7 +2481,6 @@ export class WsHandler {
                 requestId: string
                 terminalId: string
                 createdAt: number
-                effectiveResumeSessionId?: string
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -2492,7 +2491,6 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(mode === 'codex' && opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
@@ -2514,7 +2512,6 @@ export class WsHandler {
                   requestId: m.requestId,
                   terminalId: reusedTerminalId,
                   createdAt,
-                  effectiveResumeSessionId: resumeSessionId,
                 })
                 if (!sent) {
                   return false
@@ -2834,15 +2831,11 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, record.terminalId)
                 terminalId = record.terminalId
 
-                const observedCodexSessionId = m.mode === 'codex'
-                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
-                  : undefined
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
                   terminalId: record.terminalId,
                   createdAt: record.createdAt,
-                  effectiveResumeSessionId: observedCodexSessionId,
                 })
                 if (!sent) {
                   // Terminal may still exist even if created delivery failed (for
@@ -2852,16 +2845,6 @@ export class WsHandler {
                   return
                 }
 
-                if (observedCodexSessionId) {
-                  recordSessionLifecycleEvent({
-                    kind: 'codex_durable_session_observed',
-                    provider: 'codex',
-                    terminalId: record.terminalId,
-                    sessionId: observedCodexSessionId,
-                    generation: 0,
-                    source: 'sidecar',
-                  })
-                }
                 recordSessionLifecycleEvent({
                   kind: 'terminal_created',
                   requestId: m.requestId,
@@ -2872,7 +2855,7 @@ export class WsHandler {
                   ...(m.cwd ? { cwd: m.cwd } : {}),
                   mode: m.mode as TerminalMode,
                   reused: false,
-                  hasSessionRef: !!observedCodexSessionId || !!restoreSessionId || !!requestedSessionRef,
+                  hasSessionRef: !!restoreSessionId || !!requestedSessionRef,
                 })
 
                 // Notify all clients that list changed

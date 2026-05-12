@@ -8,7 +8,6 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
-import type { TerminalCreatedMessage } from '@shared/ws-protocol'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -238,103 +237,6 @@ describe('TerminalView durable session contract', () => {
       expect(content.content.terminalId).toBe('term-1')
       expect(content.content.resumeSessionId).toBeUndefined()
       expect(content.content.sessionRef).toBeUndefined()
-    })
-  })
-
-  it('types and persists Codex durable identity from terminal.created effectiveResumeSessionId', async () => {
-    const created: TerminalCreatedMessage = {
-      type: 'terminal.created',
-      requestId: 'req-codex-created',
-      terminalId: 'term-codex-1',
-      createdAt: 1_700,
-      effectiveResumeSessionId: 'codex-associated-session-1',
-    }
-    expect(created.effectiveResumeSessionId).toBe('codex-associated-session-1')
-
-    const tabId = 'tab-codex'
-    const paneId = 'pane-codex'
-    let messageHandler: ((msg: any) => void) | null = null
-
-    wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
-      messageHandler = handler
-      return () => {}
-    })
-
-    const paneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-codex-created',
-      status: 'creating',
-      mode: 'codex',
-      shell: 'system',
-      initialCwd: '/tmp',
-    }
-
-    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
-
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        settings: settingsReducer,
-        connection: connectionReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [{
-            id: tabId,
-            mode: 'codex',
-            status: 'running',
-            title: 'Codex',
-            titleSetByUser: false,
-            createRequestId: 'req-codex-created',
-          }],
-          activeTabId: tabId,
-        },
-        panes: {
-          layouts: { [tabId]: root },
-          activePane: { [tabId]: paneId },
-          paneTitles: {},
-        },
-        settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>
-    )
-
-    await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'terminal.create',
-        requestId: 'req-codex-created',
-      }))
-    })
-
-    messageHandler?.(created)
-
-    await waitFor(() => {
-      const layout = store.getState().panes.layouts[tabId]
-      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
-      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
-      expect(layout.content).toMatchObject({
-        terminalId: 'term-codex-1',
-        serverInstanceId: 'srv-local',
-        sessionRef: {
-          provider: 'codex',
-          sessionId: 'codex-associated-session-1',
-        },
-      })
-
-      const tab = store.getState().tabs.tabs.find((entry) => entry.id === tabId)
-      expect(tab).toMatchObject({
-        sessionRef: {
-          provider: 'codex',
-          sessionId: 'codex-associated-session-1',
-        },
-      })
     })
   })
 

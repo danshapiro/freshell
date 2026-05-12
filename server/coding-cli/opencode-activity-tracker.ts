@@ -568,7 +568,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       if (action.kind === 'activityUpsert') {
         this.upsertRecord({
           terminalId,
-          sessionId: action.sessionId,
+          ...(action.sessionId ? { sessionId: action.sessionId } : {}),
           phase: 'busy',
           updatedAt: action.at,
         })

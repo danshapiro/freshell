@@ -128,10 +128,6 @@ const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
 
-function isCodingCliProviderMode(mode: TerminalPaneContent['mode'] | undefined): mode is CodingCliProviderName {
-  return mode !== undefined && mode !== 'shell'
-}
-
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
@@ -2124,14 +2120,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             restoreError: undefined,
           })
           dispatch(clearRestoreFallbackAttempt({ tabId, paneId: paneIdRef.current }))
-          const currentMode = contentRef.current?.mode
-          if (
-            typeof msg.effectiveResumeSessionId === 'string'
-            && msg.effectiveResumeSessionId.length > 0
-            && isCodingCliProviderMode(currentMode)
-          ) {
-            persistDurableSessionIdentity(currentMode, msg.effectiveResumeSessionId)
-          }
           // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
