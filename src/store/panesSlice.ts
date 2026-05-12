@@ -8,6 +8,7 @@ import {
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
+  type RestoreFallbackAttempt,
 } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
@@ -157,6 +158,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
     const nextPaneTitles = { ...state.paneTitles }
     const nextPaneTitleSetByUser = { ...state.paneTitleSetByUser }
     const nextRefreshRequestsByPane = { ...state.refreshRequestsByPane }
+    const nextRestoreFallbackAttemptsByPane = { ...state.restoreFallbackAttemptsByPane }
 
     for (const tabId of orphaned) {
       delete nextLayouts[tabId]
@@ -164,6 +166,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
       delete nextPaneTitles[tabId]
       delete nextPaneTitleSetByUser[tabId]
       delete nextRefreshRequestsByPane[tabId]
+      delete nextRestoreFallbackAttemptsByPane[tabId]
     }
 
     return {
@@ -173,6 +176,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
       paneTitles: nextPaneTitles,
       paneTitleSetByUser: nextPaneTitleSetByUser,
       refreshRequestsByPane: nextRefreshRequestsByPane,
+      restoreFallbackAttemptsByPane: nextRestoreFallbackAttemptsByPane,
     }
   } catch {
     return state
@@ -272,6 +276,7 @@ function loadInitialPanesState(): PanesState {
     renameRequestPaneId: null,
     zoomedPane: {},
     refreshRequestsByPane: {},
+    restoreFallbackAttemptsByPane: {},
   }
 
   try {
@@ -288,6 +293,7 @@ function loadInitialPanesState(): PanesState {
       renameRequestPaneId: null,
       zoomedPane: {},
       refreshRequestsByPane: {},
+      restoreFallbackAttemptsByPane: {},
     }
     state = cleanOrphanedLayouts(state)
     state = migrateLegacyAgentChatDisplaySettings(state)
@@ -503,6 +509,16 @@ function clearPaneRefreshRequest(state: PanesState, tabId: string, paneId: strin
   delete tabRequests[paneId]
   if (Object.keys(tabRequests).length === 0) {
     delete state.refreshRequestsByPane?.[tabId]
+  }
+}
+
+function clearRestoreFallbackAttemptForPane(state: PanesState, tabId: string, paneId: string) {
+  const tabAttempts = state.restoreFallbackAttemptsByPane?.[tabId]
+  if (!tabAttempts?.[paneId]) return
+
+  delete tabAttempts[paneId]
+  if (Object.keys(tabAttempts).length === 0) {
+    delete state.restoreFallbackAttemptsByPane?.[tabId]
   }
 }
 
@@ -746,6 +762,7 @@ export const panesSlice = createSlice({
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
       reconcileRefreshRequestsForTab(state, tabId)
+      delete state.restoreFallbackAttemptsByPane?.[tabId]
     },
 
     restoreLayout: (
@@ -780,6 +797,7 @@ export const panesSlice = createSlice({
       state.activePane[tabId] = paneId
       state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
       reconcileRefreshRequestsForTab(state, tabId)
+      delete state.restoreFallbackAttemptsByPane?.[tabId]
     },
 
     splitPane: (
@@ -950,6 +968,7 @@ export const panesSlice = createSlice({
         if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
           delete state.paneTitleSetByUser[tabId][paneId]
         }
+        clearRestoreFallbackAttemptForPane(state, tabId, paneId)
 
         // Clear zoom if the zoomed pane was closed
         if (state.zoomedPane?.[tabId] === paneId) {
@@ -1160,6 +1179,7 @@ export const panesSlice = createSlice({
       if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
         delete state.paneTitleSetByUser[tabId][paneId]
       }
+      clearRestoreFallbackAttemptForPane(state, tabId, paneId)
 
       reconcileRefreshRequestsForTab(state, tabId)
     },
@@ -1362,6 +1382,38 @@ export const panesSlice = createSlice({
       clearPaneRefreshRequest(state, tabId, paneId)
     },
 
+    recordRestoreFallbackAttempt: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string } & RestoreFallbackAttempt>
+    ) => {
+      const { tabId, paneId, staleTerminalId, requestId, reason } = action.payload
+      if (!state.restoreFallbackAttemptsByPane) state.restoreFallbackAttemptsByPane = {}
+      if (!state.restoreFallbackAttemptsByPane[tabId]) state.restoreFallbackAttemptsByPane[tabId] = {}
+      state.restoreFallbackAttemptsByPane[tabId][paneId] = {
+        staleTerminalId,
+        requestId,
+        reason,
+      }
+    },
+
+    clearRestoreFallbackAttempt: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      clearRestoreFallbackAttemptForPane(state, action.payload.tabId, action.payload.paneId)
+    },
+
+    clearRestoreFallbackAttemptsForTab: (
+      state,
+      action: PayloadAction<{ tabId: string }>
+    ) => {
+      delete state.restoreFallbackAttemptsByPane?.[action.payload.tabId]
+    },
+
+    clearAllRestoreFallbackAttempts: (state) => {
+      state.restoreFallbackAttemptsByPane = {}
+    },
+
     removeLayout: (
       state,
       action: PayloadAction<{ tabId: string }>
@@ -1378,6 +1430,9 @@ export const panesSlice = createSlice({
       }
       if (state.refreshRequestsByPane) {
         delete state.refreshRequestsByPane[tabId]
+      }
+      if (state.restoreFallbackAttemptsByPane) {
+        delete state.restoreFallbackAttemptsByPane[tabId]
       }
     },
 
@@ -1426,6 +1481,7 @@ export const panesSlice = createSlice({
       state.renameRequestPaneId = null
       state.zoomedPane = {}
       state.refreshRequestsByPane = {}
+      state.restoreFallbackAttemptsByPane = {}
     },
 
     updatePaneTitle: (
@@ -1510,16 +1566,30 @@ export const panesSlice = createSlice({
     clearDeadTerminals: (state, action: PayloadAction<{ liveTerminalIds: string[] }>) => {
       const liveSet = new Set(action.payload.liveTerminalIds)
 
-      function clearDeadInNode(node: PaneNode): boolean {
+      function clearDeadInNode(node: PaneNode, tabId: string): boolean {
         if (node.type === 'leaf') {
           if (
             node.content?.kind === 'terminal' &&
             node.content.terminalId &&
             !liveSet.has(node.content.terminalId)
           ) {
+            const staleTerminalId = node.content.terminalId
+            const nextRequestId = nanoid()
             node.content.terminalId = undefined
+            node.content.serverInstanceId = undefined
             node.content.status = 'creating'
-            node.content.createRequestId = nanoid()
+            node.content.createRequestId = nextRequestId
+            if (!sanitizeSessionRef(node.content.sessionRef)) {
+              if (!state.restoreFallbackAttemptsByPane) state.restoreFallbackAttemptsByPane = {}
+              if (!state.restoreFallbackAttemptsByPane[tabId]) state.restoreFallbackAttemptsByPane[tabId] = {}
+              state.restoreFallbackAttemptsByPane[tabId][node.id] = {
+                staleTerminalId,
+                requestId: nextRequestId,
+                reason: 'dead_live_handle_without_session_ref',
+              }
+            } else {
+              clearRestoreFallbackAttemptForPane(state, tabId, node.id)
+            }
             return true
           }
           return false
@@ -1527,15 +1597,15 @@ export const panesSlice = createSlice({
         if (node.type === 'split' && Array.isArray(node.children)) {
           let changed = false
           for (const child of node.children) {
-            if (clearDeadInNode(child)) changed = true
+            if (clearDeadInNode(child, tabId)) changed = true
           }
           return changed
         }
         return false
       }
 
-      for (const layout of Object.values(state.layouts)) {
-        clearDeadInNode(layout)
+      for (const [tabId, layout] of Object.entries(state.layouts)) {
+        clearDeadInNode(layout, tabId)
       }
     },
   },
@@ -1561,6 +1631,10 @@ export const {
   requestPaneRefresh,
   requestTabRefresh,
   consumePaneRefreshRequest,
+  recordRestoreFallbackAttempt,
+  clearRestoreFallbackAttempt,
+  clearRestoreFallbackAttemptsForTab,
+  clearAllRestoreFallbackAttempts,
   removeLayout,
   hydratePanes,
   updatePaneTitle,

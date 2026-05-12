@@ -444,6 +444,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           renameRequestPaneId: _rrp,
           zoomedPane: _zp,
           refreshRequestsByPane: _rrbp,
+          restoreFallbackAttemptsByPane: _rfabp,
           ...persistablePanes
         } = state.panes
         persistablePanesSection = {

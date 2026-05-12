@@ -22,6 +22,7 @@ export const ErrorCode = z.enum([
   'INVALID_TERMINAL_ID',
   'INVALID_SESSION_ID',
   'RESTORE_UNAVAILABLE',
+  'INVALID_CREATE_REQUEST',
   'PTY_SPAWN_FAILED',
   'FILE_WATCHER_ERROR',
   'INTERNAL_ERROR',
@@ -221,6 +222,7 @@ export const TerminalCreateSchema = z.object({
   sessionRef: SessionLocatorSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
   restore: z.boolean().optional(),
+  recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
 }).strict()

@@ -7,6 +7,8 @@ type PaneNode = {
 }
 
 const restoredCreateRequestIds = new Set<string>()
+export type TerminalFreshRecoveryIntent = 'fresh_after_restore_unavailable'
+const freshRecoveryRequestIds = new Map<string, TerminalFreshRecoveryIntent>()
 
 function collectCreateRequestIds(node: PaneNode | null | undefined): void {
   if (!node) return
@@ -31,11 +33,31 @@ if (persisted?.layouts && typeof persisted.layouts === 'object') {
 }
 
 export function consumeTerminalRestoreRequestId(requestId: string): boolean {
+  if (freshRecoveryRequestIds.has(requestId)) return false
   if (!restoredCreateRequestIds.has(requestId)) return false
   restoredCreateRequestIds.delete(requestId)
   return true
 }
 
 export function addTerminalRestoreRequestId(requestId: string): void {
+  if (freshRecoveryRequestIds.has(requestId)) return
   restoredCreateRequestIds.add(requestId)
+}
+
+export function consumeTerminalFreshRecoveryRequest(
+  requestId: string,
+): TerminalFreshRecoveryIntent | undefined {
+  const intent = freshRecoveryRequestIds.get(requestId)
+  if (!intent) return undefined
+  freshRecoveryRequestIds.delete(requestId)
+  restoredCreateRequestIds.delete(requestId)
+  return intent
+}
+
+export function addTerminalFreshRecoveryRequestId(
+  requestId: string,
+  intent: TerminalFreshRecoveryIntent,
+): void {
+  restoredCreateRequestIds.delete(requestId)
+  freshRecoveryRequestIds.set(requestId, intent)
 }

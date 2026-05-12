@@ -5,6 +5,7 @@ import { EventEmitter } from 'events'
 import type { SessionScanResult } from '../../server/session-scanner/types.js'
 import { configStore } from '../../server/config-store.js'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { FakeCodexLaunchPlanner } from '../helpers/coding-cli/fake-codex-launch-planner.js'
 
 const HOOK_TIMEOUT_MS = 30000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -23,6 +24,7 @@ const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
 vi.mock('../../server/config-store', () => ({
   configStore: {
     snapshot: vi.fn().mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT),
+    pushRecentDirectory: vi.fn().mockResolvedValue(undefined),
   },
 }))
 
@@ -140,6 +142,9 @@ class FakeRegistry {
   lastCreateOpts: any = null
   createCallCount = 0
   forceAttachFailure = false
+  killAndWait = vi.fn(async (terminalId: string) => {
+    this.records.delete(terminalId)
+  })
 
   create(opts: any) {
     this.lastCreateOpts = opts
@@ -293,7 +298,10 @@ describe('terminal.create session repair wait', () => {
 
     sessionRepairService = new FakeSessionRepairService()
     registry = new FakeRegistry()
-    new WsHandler(server, registry as any, { sessionRepairService: sessionRepairService as any })
+    new WsHandler(server, registry as any, {
+      sessionRepairService: sessionRepairService as any,
+      codexLaunchPlanner: new FakeCodexLaunchPlanner(),
+    })
 
     const info = await listen(server)
     port = info.port
@@ -1123,6 +1131,113 @@ describe('terminal.create session repair wait', () => {
       expect(response).toMatchObject({
         type: 'error',
         code: 'RESTORE_UNAVAILABLE',
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it.each(['codex', 'claude', 'opencode'] as const)('rejects %s restore when durable identity is missing', async (mode) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = `req-${mode}-missing-ref`
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.requestId === requestId && (m.type === 'terminal.created' || m.type === 'error'),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode,
+        restore: true,
+        cwd: '/repo/project',
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'RESTORE_UNAVAILABLE',
+        requestId,
+      })
+      expect(registry.createCallCount).toBe(0)
+      expect(registry.records.size).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it.each(['shell', 'codex', 'claude', 'opencode'] as const)('creates a fresh %s terminal for explicit restore-failure recovery', async (mode) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = `req-${mode}-fresh-recovery`
+      const createdPromise = waitForCreated(ws, requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode,
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        cwd: '/repo/project',
+      }))
+
+      await createdPromise
+
+      expect(registry.createCallCount).toBe(1)
+      expect(registry.records.size).toBe(1)
+      expect(registry.lastCreateOpts).toMatchObject({
+        mode,
+        cwd: '/repo/project',
+      })
+      if (mode !== 'codex') {
+        expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
+      }
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('rejects fresh recovery when restore identity is also supplied', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'req-invalid-fresh-recovery'
+      const responsePromise = waitForMessage(
+        ws,
+        (m) => m.requestId === requestId && (m.type === 'terminal.created' || m.type === 'error'),
+      )
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'codex-session-1',
+        },
+      }))
+
+      const response = await responsePromise
+
+      expect(response).toMatchObject({
+        type: 'error',
+        code: 'INVALID_CREATE_REQUEST',
+        requestId,
       })
       expect(registry.createCallCount).toBe(0)
       expect(registry.records.size).toBe(0)
