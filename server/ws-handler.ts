@@ -2481,6 +2481,7 @@ export class WsHandler {
                 requestId: string
                 terminalId: string
                 createdAt: number
+                effectiveResumeSessionId?: string
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -2491,26 +2492,29 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
+                  ...(mode === 'codex' && opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
 
-              const recordHasSessionRef = (record: unknown): boolean => {
+              const recordSessionId = (record: unknown): string | undefined => {
                 const maybeRecord = record as { sessionRef?: { sessionId?: unknown }; resumeSessionId?: unknown } | null | undefined
-                return typeof maybeRecord?.sessionRef?.sessionId === 'string'
-                  || typeof maybeRecord?.resumeSessionId === 'string'
+                if (typeof maybeRecord?.sessionRef?.sessionId === 'string') return maybeRecord.sessionRef.sessionId
+                if (typeof maybeRecord?.resumeSessionId === 'string') return maybeRecord.resumeSessionId
+                return undefined
               }
 
               const attachReusedTerminal = async (
                 reusedTerminalId: string,
                 createdAt: number,
-                hasSessionRef = false,
+                resumeSessionId?: string,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
                   terminalId: reusedTerminalId,
                   createdAt,
+                  effectiveResumeSessionId: resumeSessionId,
                 })
                 if (!sent) {
                   return false
@@ -2529,7 +2533,7 @@ export class WsHandler {
                   ...(m.cwd ? { cwd: m.cwd } : {}),
                   mode: m.mode as TerminalMode,
                   reused: true,
-                  hasSessionRef,
+                  hasSessionRef: !!resumeSessionId,
                 })
                 this.broadcastTerminalsChanged()
                 return true
@@ -2544,7 +2548,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordSessionId(existing))
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -2555,7 +2559,11 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
+                  await attachReusedTerminal(
+                    liveTerminal.terminalId,
+                    liveTerminal.createdAt,
+                    recordSessionId(liveTerminal) ?? canonicalSessionId,
+                  )
                   return
                 }
               }
@@ -2606,7 +2614,11 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
+                  await attachReusedTerminal(
+                    existing.terminalId,
+                    existing.createdAt,
+                    recordSessionId(existing) ?? canonicalSessionId,
+                  )
                   return
                 }
               }
@@ -2626,7 +2638,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordSessionId(existing))
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -2653,7 +2665,11 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
+                  await attachReusedTerminal(
+                    liveTerminal.terminalId,
+                    liveTerminal.createdAt,
+                    recordSessionId(liveTerminal) ?? canonicalSessionId,
+                  )
                   return
                 }
               }
@@ -2674,7 +2690,11 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
+                  await attachReusedTerminal(
+                    existing.terminalId,
+                    existing.createdAt,
+                    recordSessionId(existing) ?? canonicalSessionId,
+                  )
                   return
                 }
               }
@@ -2814,11 +2834,15 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, record.terminalId)
                 terminalId = record.terminalId
 
+                const observedCodexSessionId = m.mode === 'codex'
+                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
+                  : undefined
                 const sent = await sendCreateResult({
                   ws,
                   requestId: m.requestId,
                   terminalId: record.terminalId,
                   createdAt: record.createdAt,
+                  effectiveResumeSessionId: observedCodexSessionId,
                 })
                 if (!sent) {
                   // Terminal may still exist even if created delivery failed (for
@@ -2828,9 +2852,6 @@ export class WsHandler {
                   return
                 }
 
-                const observedCodexSessionId = m.mode === 'codex'
-                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
-                  : undefined
                 if (observedCodexSessionId) {
                   recordSessionLifecycleEvent({
                     kind: 'codex_durable_session_observed',
