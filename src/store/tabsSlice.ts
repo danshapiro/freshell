@@ -530,7 +530,7 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, isRestorable }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -541,6 +541,7 @@ export const openSessionTab = createAsyncThunk(
       firstUserMessage?: string
       isSubagent?: boolean
       isNonInteractive?: boolean
+      isRestorable?: boolean
     },
     { dispatch, getState }
   ) => {
@@ -562,6 +563,7 @@ export const openSessionTab = createAsyncThunk(
 
     const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
       mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
+    const shouldPersistSessionRef = isRestorable !== false
 
     const desiredResumeContent = buildResumeContent({
       sessionType: resolvedSessionType,
@@ -653,10 +655,10 @@ export const openSessionTab = createAsyncThunk(
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
-        sessionRef: desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat'
+        sessionRef: shouldPersistSessionRef && (desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat')
           ? desiredResumeContent.sessionRef
           : undefined,
-        sessionMetadataByKey: buildSessionMetadataByKey(),
+        sessionMetadataByKey: shouldPersistSessionRef ? buildSessionMetadataByKey() : undefined,
       }))
       dispatch(initLayout({
         tabId,
@@ -664,7 +666,7 @@ export const openSessionTab = createAsyncThunk(
           kind: 'terminal',
           mode: resolvedProvider,
           terminalId,
-          sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+          sessionRef: shouldPersistSessionRef && desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
           initialCwd: cwd,
           status: 'running',
         },

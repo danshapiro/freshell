@@ -879,6 +879,41 @@ describe('tabsSlice', () => {
       }
     })
 
+    it('opens a non-restorable running Codex terminal without persisting a fake session identity', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'thread-pre-durable',
+        provider: 'codex',
+        terminalId: 'term-codex-pre-durable',
+        title: 'Codex CLI',
+        isRestorable: false,
+      }))
+
+      const tabs = store.getState().tabs.tabs
+      expect(tabs).toHaveLength(1)
+      expect(tabs[0]).toMatchObject({
+        title: 'Codex CLI',
+        mode: 'codex',
+        status: 'running',
+      })
+      expect(tabs[0].sessionRef).toBeUndefined()
+      expect(tabs[0].sessionMetadataByKey).toBeUndefined()
+
+      const layout = store.getState().panes.layouts[tabs[0].id]
+      expect(layout).toBeDefined()
+      if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
+        expect(layout.content.terminalId).toBe('term-codex-pre-durable')
+        expect(layout.content.mode).toBe('codex')
+        expect(layout.content.sessionRef).toBeUndefined()
+      }
+    })
+
     it('uses capitalized provider label for codex tab title', async () => {
       const store = configureStore({
         reducer: {

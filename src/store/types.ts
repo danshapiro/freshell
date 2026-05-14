@@ -79,6 +79,7 @@ export interface BackgroundTerminal {
   hasClients: boolean
   mode?: TabMode
   sessionRef?: SessionLocator
+  codexDurability?: CodexDurabilityRef
 }
 
 export interface CodingCliSession {

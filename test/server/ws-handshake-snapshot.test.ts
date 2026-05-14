@@ -360,6 +360,113 @@ describe('ws handshake snapshot', () => {
     }
   })
 
+  it('does not synthesize Codex sessionRef from resumeSessionId until durability is proven', async () => {
+    registry.setTerminals([
+      {
+        terminalId: 'term-codex-unproven',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: 'thread-unproven',
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'captured_pre_turn',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-unproven',
+            rolloutPath: '/home/user/.codex/sessions/unproven.jsonl',
+            source: 'thread_start_response',
+            capturedAt: 1,
+          },
+        },
+        createdAt: 1,
+        lastActivityAt: 2,
+        status: 'running',
+      },
+      {
+        terminalId: 'term-codex-durable',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: 'thread-durable',
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-durable',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-durable',
+            rolloutPath: '/home/user/.codex/sessions/durable.jsonl',
+            source: 'thread_start_response',
+            capturedAt: 1,
+          },
+          turnCompletedAt: 2,
+        },
+        createdAt: 3,
+        lastActivityAt: 4,
+        status: 'running',
+      },
+      {
+        terminalId: 'term-codex-mismatch',
+        title: 'Codex CLI',
+        mode: 'codex',
+        resumeSessionId: 'thread-legacy',
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-proof',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-proof',
+            rolloutPath: '/home/user/.codex/sessions/mismatch.jsonl',
+            source: 'thread_start_response',
+            capturedAt: 1,
+          },
+          turnCompletedAt: 2,
+        },
+        createdAt: 5,
+        lastActivityAt: 6,
+        status: 'running',
+      },
+      {
+        terminalId: 'term-claude-legacy',
+        title: 'Claude CLI',
+        mode: 'claude',
+        resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+        createdAt: 7,
+        lastActivityAt: 8,
+        status: 'running',
+      },
+    ])
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const inventoryPromise = waitForMessage(ws, (m) => m.type === 'terminal.inventory', 10_000)
+      await waitForReady(ws, 10_000)
+
+      const inventory = await inventoryPromise
+      const byId = new Map(inventory.terminals.map((terminal: any) => [terminal.terminalId, terminal]))
+      expect(byId.get('term-codex-unproven')).not.toHaveProperty('sessionRef')
+      expect(byId.get('term-codex-unproven')).not.toHaveProperty('resumeSessionId')
+      expect(byId.get('term-codex-durable')).toMatchObject({
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-durable',
+        },
+      })
+      expect(byId.get('term-codex-mismatch')).not.toHaveProperty('sessionRef')
+      expect(byId.get('term-claude-legacy')).toMatchObject({
+        sessionRef: {
+          provider: 'claude',
+          sessionId: '550e8400-e29b-41d4-a716-446655440000',
+        },
+      })
+    } finally {
+      await closeWs(ws)
+    }
+  })
+
   it('keeps inventory lifetime status separate from runtime recovery status', async () => {
     registry.setTerminals([
       {

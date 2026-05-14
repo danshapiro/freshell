@@ -7,6 +7,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
+import type { CodexDurabilityRef } from '../../../shared/codex-durability.js'
 
 export interface SidebarSessionItem {
   id: string
@@ -30,6 +31,7 @@ export interface SidebarSessionItem {
   firstUserMessage?: string
   hasTitle: boolean
   isFallback?: true
+  isRestorable?: boolean
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
@@ -60,6 +62,14 @@ function getProjectName(projectPath: string): string {
   return getLeafDirectoryName(projectPath) ?? projectPath
 }
 
+function getCodexDurabilitySessionId(durability?: CodexDurabilityRef): string | undefined {
+  return durability?.durableThreadId ?? durability?.candidate?.candidateThreadId
+}
+
+function isCodexDurabilityRestorable(durability?: CodexDurabilityRef): boolean {
+  return Boolean(durability?.state === 'durable' && durability.durableThreadId)
+}
+
 export function buildSessionItems(
   projects: RootState['sessions']['projects'],
   tabs: RootState['tabs']['tabs'],
@@ -70,21 +80,35 @@ export function buildSessionItems(
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
   const itemsByKey = new Map<string, SidebarSessionItem>()
-  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[] }>()
+  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[]; isRestorable?: boolean }>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
-    if (terminal.status === 'running' && terminal.sessionRef) {
-      const sessionKey = `${terminal.sessionRef.provider}:${terminal.sessionRef.sessionId}`
+    if (terminal.status === 'running') {
+      const codexDurabilitySessionId = terminal.mode === 'codex'
+        ? getCodexDurabilitySessionId(terminal.codexDurability)
+        : undefined
+      const sessionRef = terminal.sessionRef ?? (
+        codexDurabilitySessionId
+          ? { provider: 'codex' as const, sessionId: codexDurabilitySessionId }
+          : undefined
+      )
+      if (!sessionRef) continue
+
+      const sessionKey = `${sessionRef.provider}:${sessionRef.sessionId}`
+      const isRestorable = sessionRef === terminal.sessionRef
+        ? true
+        : isCodexDurabilityRestorable(terminal.codexDurability)
       const existing = runningSessionMap.get(sessionKey)
       if (existing) {
         existing.allTerminalIds.push(terminal.terminalId)
+        existing.isRestorable = existing.isRestorable || isRestorable
         if (terminal.createdAt < existing.createdAt) {
           existing.terminalId = terminal.terminalId
           existing.createdAt = terminal.createdAt
         }
       } else {
-        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt, allTerminalIds: [terminal.terminalId] })
+        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt, allTerminalIds: [terminal.terminalId], isRestorable })
       }
     }
   }
@@ -147,11 +171,12 @@ export function buildSessionItems(
     cwd?: string
     timestamp?: number
     metadata?: SessionListMetadata
+    hasTab?: boolean
+    isRestorable?: boolean
   }) => {
     const key = `${input.provider}:${input.sessionId}`
     const existing = itemsByKey.get(key)
     if (existing) {
-      existing.hasTab = true
       existing.timestamp = Math.max(existing.timestamp, input.timestamp ?? 0)
       const fallbackTitle = input.title?.trim()
       if (!existing.hasTitle && fallbackTitle) {
@@ -168,6 +193,8 @@ export function buildSessionItems(
       if (!existing.firstUserMessage && input.metadata?.firstUserMessage) {
         existing.firstUserMessage = input.metadata.firstUserMessage
       }
+      existing.hasTab = existing.hasTab || (input.hasTab ?? true)
+      existing.isRestorable = existing.isRestorable || input.isRestorable
       if (existing.isSubagent === undefined && input.metadata?.isSubagent !== undefined) {
         existing.isSubagent = input.metadata.isSubagent
       }
@@ -181,6 +208,7 @@ export function buildSessionItems(
     const runningTerminal = runningSessionMap.get(key)
     const runningTerminalId = runningTerminal?.terminalId
     const runningTerminalIds = runningTerminal?.allTerminalIds
+    const hasTab = input.hasTab ?? true
     const item: SidebarSessionItem = {
       id: `session-${input.provider}-${input.sessionId}`,
       sessionId: input.sessionId,
@@ -192,7 +220,7 @@ export function buildSessionItems(
       projectPath: input.cwd,
       timestamp: input.timestamp ?? 0,
       cwd: input.cwd,
-      hasTab: true,
+      hasTab,
       ratchetedActivity: sessionActivity[key],
       isRunning: !!runningTerminalId,
       runningTerminalId,
@@ -201,6 +229,7 @@ export function buildSessionItems(
       isNonInteractive: input.metadata?.isNonInteractive,
       firstUserMessage: input.metadata?.firstUserMessage,
       isFallback: true,
+      isRestorable: input.isRestorable ?? runningTerminal?.isRestorable,
     }
     items.push(item)
     itemsByKey.set(key, item)
@@ -238,7 +267,23 @@ export function buildSessionItems(
     if (node.content.kind !== 'terminal') return
     if (node.content.mode === 'shell') return
     const sessionRef = node.content.sessionRef
-    if (!sessionRef) return
+    if (!sessionRef) {
+      const codexDurability = node.content.mode === 'codex'
+        ? node.content.codexDurability
+        : undefined
+      const codexSessionId = getCodexDurabilitySessionId(codexDurability)
+      if (!codexSessionId) return
+      pushFallbackItem({
+        provider: 'codex',
+        sessionId: codexSessionId,
+        sessionType: 'codex',
+        title: paneTitle || tab.title,
+        cwd: node.content.initialCwd,
+        timestamp: fallbackTimestamp,
+        isRestorable: isCodexDurabilityRestorable(codexDurability),
+      })
+      return
+    }
 
     const metadata = getSessionMetadata(tab, sessionRef.provider, sessionRef.sessionId)
     pushFallbackItem({
@@ -272,6 +317,22 @@ export function buildSessionItems(
       cwd: undefined,
       timestamp: tab.lastInputAt ?? tab.createdAt ?? 0,
       metadata,
+    })
+  }
+
+  for (const terminal of terminals || []) {
+    if (terminal.status !== 'running' || terminal.mode !== 'codex' || terminal.sessionRef) continue
+    const codexSessionId = getCodexDurabilitySessionId(terminal.codexDurability)
+    if (!codexSessionId) continue
+    pushFallbackItem({
+      provider: 'codex',
+      sessionId: codexSessionId,
+      sessionType: 'codex',
+      title: terminal.title,
+      cwd: terminal.cwd,
+      timestamp: terminal.lastActivityAt,
+      hasTab: false,
+      isRestorable: isCodexDurabilityRestorable(terminal.codexDurability),
     })
   }
 

@@ -238,7 +238,12 @@ function normalizeTerminalInventoryForClient(value: unknown): unknown {
   const provider = typeof terminal.mode === 'string' && modeSupportsResume(terminal.mode as TerminalMode)
     ? terminal.mode
     : undefined
-  const migratedSessionRef = provider && isNonEmptyString(legacyResumeSessionId)
+  const codexDurability = terminal.codexDurability as { state?: unknown; durableThreadId?: unknown } | undefined
+  const canMigrateLegacySessionRef = provider !== 'codex' || (
+    codexDurability?.state === 'durable'
+    && codexDurability.durableThreadId === legacyResumeSessionId
+  )
+  const migratedSessionRef = provider && isNonEmptyString(legacyResumeSessionId) && canMigrateLegacySessionRef
     ? { provider, sessionId: legacyResumeSessionId }
     : undefined
   const sessionRef = explicitSessionRef ?? migratedSessionRef

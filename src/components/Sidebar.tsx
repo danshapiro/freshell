@@ -19,7 +19,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
-import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
+import { selectPrimaryTerminalIdForTab, selectTabIdByTerminalId } from '@/store/selectors/paneTerminalSelectors'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
@@ -39,6 +39,18 @@ function sameSessionRef(
   return a.provider === b.provider && a.sessionId === b.sessionId
 }
 
+function sameCodexDurability(
+  a?: BackgroundTerminal['codexDurability'],
+  b?: BackgroundTerminal['codexDurability'],
+): boolean {
+  if (a === b) return true
+  if (!a || !b) return false
+  return a.state === b.state
+    && a.durableThreadId === b.durableThreadId
+    && a.candidate?.candidateThreadId === b.candidate?.candidateThreadId
+    && a.candidate?.rolloutPath === b.candidate?.rolloutPath
+}
+
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores terminal `lastActivityAt` since it changes frequently but doesn't affect rendering. */
 export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
@@ -53,7 +65,8 @@ export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal
       ai.status !== bi.status ||
       ai.hasClients !== bi.hasClients ||
       ai.mode !== bi.mode ||
-      !sameSessionRef(ai.sessionRef, bi.sessionRef)
+      !sameSessionRef(ai.sessionRef, bi.sessionRef) ||
+      !sameCodexDurability(ai.codexDurability, bi.codexDurability)
     ) return false
   }
   return true
@@ -84,6 +97,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.cwd !== bi.cwd ||
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
+      ai.isRestorable !== bi.isRestorable ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -140,7 +154,8 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.hasTitle === b.hasTitle &&
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
-    a.firstUserMessage === b.firstUserMessage
+    a.firstUserMessage === b.firstUserMessage &&
+    a.isRestorable === b.isRestorable
   )
 }
 
@@ -334,6 +349,30 @@ export default function Sidebar({
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
     const localServerInstanceId = state.connection.serverInstanceId
 
+    if (runningTerminalId && item.isRestorable === false) {
+      const existingTabId = selectTabIdByTerminalId(state, runningTerminalId)
+      if (existingTabId) {
+        dispatch(setActiveTab(existingTabId))
+        const activePaneId = state.panes.activePane[existingTabId]
+        if (activePaneId) {
+          dispatch(setActivePane({ tabId: existingTabId, paneId: activePaneId }))
+        }
+        onNavigate('terminal')
+        return
+      }
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
+        title: item.title,
+        cwd: item.cwd,
+        provider,
+        sessionType: item.sessionType || provider,
+        terminalId: runningTerminalId,
+        isRestorable: false,
+      }))
+      onNavigate('terminal')
+      return
+    }
+
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(
       state,
@@ -367,6 +406,7 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
@@ -385,6 +425,7 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        isRestorable: item.isRestorable,
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
