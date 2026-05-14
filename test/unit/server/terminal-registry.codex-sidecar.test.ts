@@ -245,6 +245,37 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
   })
 
+  it('marks fresh Codex non-restorable and closes it when candidate capture times out', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'non_restorable',
+        nonRestorableReason: 'candidate_capture_timeout',
+      })
+      expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
   it('promotes Codex to canonical session identity after turn completion rollout proof succeeds', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     try {

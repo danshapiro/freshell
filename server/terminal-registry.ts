@@ -1513,6 +1513,9 @@ export class TerminalRegistry extends EventEmitter {
     const candidateUnsubscribe = sidecar.onCandidate?.((candidate) => {
       void this.persistCodexCandidate(record.terminalId, candidate).catch((err) => {
         logger.error({ err, terminalId: record.terminalId }, 'Failed to persist Codex restore identity')
+        void this.failCodexFreshIdentity(record.terminalId, 'candidate_persist_failed').catch((failErr) => {
+          logger.error({ err: failErr, terminalId: record.terminalId }, 'Failed to mark Codex terminal non-restorable after candidate persistence failure')
+        })
       })
     })
     if (candidateUnsubscribe) unsubscribers.push(candidateUnsubscribe)
@@ -1532,6 +1535,12 @@ export class TerminalRegistry extends EventEmitter {
     if (turnCompletedUnsubscribe) unsubscribers.push(turnCompletedUnsubscribe)
 
     const repairUnsubscribe = sidecar.onRepairTrigger?.((event) => {
+      if (event.kind === 'candidate_capture_timeout') {
+        void this.failCodexFreshIdentity(record.terminalId, 'candidate_capture_timeout').catch((err) => {
+          logger.error({ err, terminalId: record.terminalId }, 'Failed to mark Codex terminal non-restorable after candidate capture timeout')
+        })
+        return
+      }
       this.requestCodexDurabilityProof(record.terminalId, `repair:${event.kind}`)
     })
     if (repairUnsubscribe) unsubscribers.push(repairUnsubscribe)
@@ -1639,6 +1648,27 @@ export class TerminalRegistry extends EventEmitter {
       source: storedDurability.candidate?.source,
     }, 'Persisted Codex restore identity before user input')
     this.broadcastCodexDurability(record, storedDurability)
+  }
+
+  private async failCodexFreshIdentity(terminalId: string, reason: string): Promise<void> {
+    const record = this.terminals.get(terminalId)
+    if (!record || record.mode !== 'codex' || record.status !== 'running') return
+    if (record.codexDurability?.candidate || record.resumeSessionId) return
+
+    const durability: CodexDurabilityRef = {
+      schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+      state: 'non_restorable',
+      nonRestorableReason: reason,
+    }
+    try {
+      const stored = await this.writeCodexDurability(record, durability)
+      record.codexInputGate = undefined
+      this.broadcastCodexDurability(record, stored)
+    } catch (err) {
+      logger.error({ err, terminalId, reason }, 'Failed to persist non-restorable Codex identity state')
+    }
+    logger.warn({ terminalId, reason }, 'Closing Codex terminal before user input because restore identity was not captured')
+    await this.killAndWait(terminalId)
   }
 
   private async handleCodexTurnStarted(terminalId: string, event: CodexTurnEvent): Promise<void> {

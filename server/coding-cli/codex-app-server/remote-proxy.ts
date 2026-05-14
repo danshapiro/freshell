@@ -17,7 +17,7 @@ export type CodexRemoteProxyCandidate = {
 }
 
 export type CodexRemoteProxyRepairTrigger =
-  | { kind: 'proxy_close' | 'proxy_error'; error?: Error }
+  | { kind: 'proxy_close' | 'proxy_error' | 'candidate_capture_timeout'; error?: Error }
   | { kind: 'fs_changed'; watchId: string; changedPaths: string[] }
 
 type JsonRpcId = string | number
@@ -118,6 +118,7 @@ export class CodexRemoteProxy {
 
   failCandidateCapture(message = 'Freshell could not persist Codex restore identity before accepting user input.'): void {
     this.clearCandidateCaptureTimer()
+    this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
     for (const pending of [...this.pendingTurnStarts]) {
       this.failHeldTurnStart(pending, message)
     }
@@ -314,6 +315,7 @@ export class CodexRemoteProxy {
   private failHeldTurnStart(pending: PendingTurnStart, message: string): void {
     if (!this.pendingTurnStarts.delete(pending)) return
     clearTimeout(pending.timer)
+    this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
     this.sendJsonRpcError(pending.client, pending.id, message)
     pending.client.close()
     pending.upstream.close()

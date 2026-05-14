@@ -198,6 +198,8 @@ describe('CodexRemoteProxy', () => {
       requestHoldTimeoutMs: 20,
       candidateCaptureTimeoutMs: 1_000,
     })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
     const tui = await connect(proxy.wsUrl)
     const responsePromise = nextMessage(tui)
 
@@ -212,6 +214,7 @@ describe('CodexRemoteProxy', () => {
     })
     await socketClosed(tui)
     expect(upstream.messages).toHaveLength(0)
+    expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
   it('closes an idle TUI when candidate capture times out before user input', async () => {
@@ -219,10 +222,13 @@ describe('CodexRemoteProxy', () => {
     const proxy = await startProxy(upstream.wsUrl, {
       candidateCaptureTimeoutMs: 20,
     })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
     const tui = await connect(proxy.wsUrl)
 
     await socketClosed(tui)
     expect(upstream.messages).toHaveLength(0)
+    expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
   it('emits turn/completed notifications', async () => {
