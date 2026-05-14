@@ -786,6 +786,8 @@ export function createAgentApiRouter({
       if (inputResult.status !== 'written') {
         throw new Error(inputResult.status === 'blocked_codex_identity_pending'
           ? 'Codex restore identity is not ready yet.'
+          : inputResult.status === 'blocked_codex_recovery_pending'
+            ? 'Codex durable recovery is still in progress.'
           : 'Terminal is not running.')
       }
 

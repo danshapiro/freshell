@@ -486,6 +486,7 @@ export type TerminalRecord = {
 export type TerminalInputResult =
   | { status: 'written' }
   | { status: 'blocked_codex_identity_pending'; terminalId: string }
+  | { status: 'blocked_codex_recovery_pending'; terminalId: string }
   | { status: 'no_terminal' }
   | { status: 'not_running' }
 
@@ -1444,6 +1445,13 @@ export class TerminalRegistry extends EventEmitter {
       if (record.status === 'exited') {
         return
       }
+      if (this.startCodexDurableRecovery(record, {
+        source: 'pty_exit',
+        exitCode: e.exitCode,
+        signal: e.signal,
+      })) {
+        return
+      }
       this.markCodexRecoveryFinalClose(record)
       record.status = 'exited'
       record.exitCode = e.exitCode
@@ -1893,31 +1901,49 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    if (record.codexRecoveryBlockedError) {
-      logger.error(
-        { err: record.codexRecoveryBlockedError, terminalId, event },
-        'Codex durable recovery is blocked by a previous sidecar teardown failure',
-      )
-      return
+    this.startCodexDurableRecovery(record, { source: 'lifecycle_loss', event })
+  }
+
+  private startCodexDurableRecovery(
+    record: TerminalRecord,
+    trigger: { source: 'lifecycle_loss'; event: unknown } | { source: 'pty_exit'; exitCode: number; signal?: number },
+  ): boolean {
+    if (
+      record.mode !== 'codex'
+      || record.status !== 'running'
+      || record.codexRecoveryFinalClose
+      || !record.resumeSessionId
+      || !record.codexRecovery
+    ) {
+      return false
     }
 
-    if (record.codexRecoveryAttempt) return
+    if (record.codexRecoveryBlockedError) {
+      logger.error(
+        { err: record.codexRecoveryBlockedError, terminalId: record.terminalId, trigger },
+        'Codex durable recovery is blocked by a previous sidecar teardown failure',
+      )
+      return true
+    }
+
+    if (record.codexRecoveryAttempt) return true
 
     logger.warn(
-      { terminalId, event, resumeSessionId: record.resumeSessionId },
-      'Codex app-server reported terminal lifecycle loss; starting durable recovery',
+      { terminalId: record.terminalId, trigger, resumeSessionId: record.resumeSessionId },
+      'Codex durable terminal lost its live worker; starting durable recovery',
     )
-    const attempt = this.runCodexRecoveryLoop(terminalId)
+    const attempt = this.runCodexRecoveryLoop(record.terminalId)
       .catch((err) => {
-        logger.error({ err, terminalId }, 'Codex durable recovery loop failed')
+        logger.error({ err, terminalId: record.terminalId }, 'Codex durable recovery loop failed')
       })
       .finally(() => {
-        const latest = this.terminals.get(terminalId)
+        const latest = this.terminals.get(record.terminalId)
         if (latest?.codexRecoveryAttempt === attempt) {
           latest.codexRecoveryAttempt = undefined
         }
       })
     record.codexRecoveryAttempt = attempt
+    return true
   }
 
   private canContinueCodexRecovery(record: TerminalRecord | undefined, resumeSessionId?: string): record is TerminalRecord {
@@ -2197,6 +2223,13 @@ export class TerminalRegistry extends EventEmitter {
         return
       }
       if (record.pty !== ptyProc || record.status === 'exited') return
+      if (this.startCodexDurableRecovery(record, {
+        source: 'pty_exit',
+        exitCode: event.exitCode,
+        signal: event.signal,
+      })) {
+        return
+      }
       this.markCodexRecoveryFinalClose(record)
       record.status = 'exited'
       record.exitCode = event.exitCode
@@ -2255,6 +2288,9 @@ export class TerminalRegistry extends EventEmitter {
     if (term.status !== 'running') return { status: 'not_running' }
     if (term.codexInputGate?.state === 'identity_pending') {
       return { status: 'blocked_codex_identity_pending', terminalId }
+    }
+    if (term.codexRecoveryAttempt) {
+      return { status: 'blocked_codex_recovery_pending', terminalId }
     }
     const now = Date.now()
     term.lastActivityAt = now

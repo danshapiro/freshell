@@ -30,7 +30,7 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 process.env.AUTH_TOKEN = 'test-token'
@@ -351,7 +351,7 @@ describe('Codex Session Flow Integration', () => {
     await fsp.rm(tempDir, { recursive: true, force: true })
   })
 
-  it('starts the exact codex thread before PTY spawn and launches the TUI in remote mode', async () => {
+  it('launches fresh Codex in remote mode without treating the bootstrap id as durable', async () => {
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -373,10 +373,10 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-new-1')
+      expect(created.effectiveResumeSessionId).toBeUndefined()
 
       const record = registry.get(created.terminalId)
-      expect(record?.resumeSessionId).toBe('thread-new-1')
+      expect(record?.resumeSessionId).toBeUndefined()
 
       await waitForFile(argLogPath)
       const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
@@ -384,8 +384,8 @@ describe('Codex Session Flow Integration', () => {
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       ])
-      expect(recordedArgs).toContain('resume')
-      expect(recordedArgs).toContain('thread-new-1')
+      expect(recordedArgs).not.toContain('resume')
+      expect(recordedArgs).not.toContain('thread-new-1')
       expect(recordedArgs).toContain('tui.notification_method=bel')
       expect(recordedArgs).not.toContain('--model')
       expect(recordedArgs).not.toContain('--sandbox')
@@ -394,7 +394,7 @@ describe('Codex Session Flow Integration', () => {
     }
   })
 
-  it('restores a persisted Codex session without calling thread/resume on the app-server', async () => {
+  it('restores a persisted Codex session from canonical sessionRef', async () => {
     process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
       loadedThreadIds: ['thread-existing-1'],
       overrides: {
@@ -415,7 +415,11 @@ describe('Codex Session Flow Integration', () => {
         requestId: 'test-req-codex-restore',
         mode: 'codex',
         cwd: tempDir,
-        resumeSessionId: 'thread-existing-1',
+        restore: true,
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-existing-1',
+        },
       }))
 
       const created = await waitForMessage(
@@ -429,7 +433,7 @@ describe('Codex Session Flow Integration', () => {
         throw new Error(`terminal.create failed: ${created.message}`)
       }
 
-      expect(created.effectiveResumeSessionId).toBe('thread-existing-1')
+      expect(created.effectiveResumeSessionId).toBeUndefined()
 
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBe('thread-existing-1')
@@ -481,7 +485,6 @@ describe('Codex Session Flow Integration', () => {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           spawnNativeChild: true,
           nativePidFile: oldNativePidFile,
-          wrapperLeavesNativeOnSigterm: true,
           signalFileOnSigterm: oldSidecarShutdownSignalPath,
           delayExitOnSigtermMs: 200,
           loadedThreadIds: ['thread-existing-1'],
@@ -511,6 +514,7 @@ describe('Codex Session Flow Integration', () => {
     try {
       const oldPlan = await oldPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })
       const oldNativePid = await waitForPidFile(oldNativePidFile)
+      expect(oldNativePid).toEqual(expect.any(Number))
       const recovery = {
         planCreate: vi.fn(() => replacementPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })),
         retryDelayMs: 0,
@@ -530,6 +534,7 @@ describe('Codex Session Flow Integration', () => {
         } as any,
       })
       terminalId = term.terminalId
+      await oldPlan.sidecar.adopt({ terminalId: term.terminalId, generation: 0 })
       const oldPtyPid = term.pty.pid
       await waitForJsonLine(launchLogPath, (line) => line.pid === oldPtyPid)
 
@@ -539,7 +544,7 @@ describe('Codex Session Flow Integration', () => {
       )
 
       const replacementNativePid = await waitForPidFile(replacementNativePidFile)
-      await waitForProcessExit(oldNativePid)
+      await waitForFile(oldSidecarShutdownSignalPath)
       await waitForProcessExit(oldPtyPid)
       expect(await isProcessAlive(replacementNativePid)).toBe(true)
 
@@ -548,7 +553,7 @@ describe('Codex Session Flow Integration', () => {
       expect(replacementPtyPid).toEqual(expect.any(Number))
       expect(replacementPtyPid).not.toBe(oldPtyPid)
 
-      expect(registry.input(term.terminalId, 'after recovery replacement\n')).toBe(true)
+      expect(registry.input(term.terminalId, 'after recovery replacement\n')).toEqual({ status: 'written' })
       await waitForJsonLine(
         inputLogPath,
         (line) => line.pid === replacementPtyPid && line.data.includes('after recovery replacement'),

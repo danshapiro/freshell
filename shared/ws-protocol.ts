@@ -555,7 +555,7 @@ export type TerminalCodexDurabilityUpdatedMessage = {
 export type TerminalInputBlockedMessage = {
   type: 'terminal.input.blocked'
   terminalId: string
-  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout'
+  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_recovery_pending'
 }
 
 export type TerminalsChangedMessage = {

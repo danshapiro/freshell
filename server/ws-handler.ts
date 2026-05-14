@@ -1850,6 +1850,21 @@ export class WsHandler {
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
+          && m.resumeSessionId
+          && !requestedSessionRef
+        ) {
+          error = true
+          this.sendError(ws, {
+            code: 'INVALID_MESSAGE',
+            message: 'Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.',
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
+        if (
+          m.restore === true
+          && modeSupportsResume(m.mode as TerminalMode)
           && (
             !requestedSessionRef
             || requestedSessionRef.provider !== m.mode
@@ -2394,6 +2409,19 @@ export class WsHandler {
             type: 'terminal.input.blocked',
             terminalId: m.terminalId,
             reason: 'codex_identity_pending',
+          })
+          return
+        }
+        if (result.status === 'blocked_codex_recovery_pending') {
+          log.debug({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+          }, 'Codex terminal input blocked while durable recovery is in progress')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_recovery_pending',
           })
           return
         }
