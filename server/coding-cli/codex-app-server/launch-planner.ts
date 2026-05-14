@@ -9,7 +9,15 @@ import {
 
 type CodexRuntimeLike = Pick<
   CodexAppServerRuntime,
-  'ensureReady' | 'startThread' | 'listLoadedThreads' | 'shutdown' | 'updateOwnershipMetadata' | 'onThreadLifecycleLoss'
+  | 'ensureReady'
+  | 'startThread'
+  | 'listLoadedThreads'
+  | 'shutdown'
+  | 'updateOwnershipMetadata'
+  | 'onThreadLifecycleLoss'
+  | 'onFsChanged'
+  | 'watchPath'
+  | 'unwatchPath'
 >
 
 export type CodexLaunchSidecar = {
@@ -20,8 +28,11 @@ export type CodexLaunchSidecar = {
   onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
   onTurnCompleted?(handler: (event: CodexTurnEvent) => void): () => void
   onRepairTrigger?(handler: (event: CodexRemoteProxyRepairTrigger) => void): () => void
+  onFsChanged?(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void
   onThreadLifecycle?(handler: (event: CodexThreadLifecycleEvent) => void): () => void
   onLifecycleLoss?(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void
+  watchPath?(targetPath: string, watchId: string): Promise<{ path: string }>
+  unwatchPath?(watchId: string): Promise<void>
   shutdown(): Promise<void>
   waitForLoadedThread(threadId: string, options?: { timeoutMs?: number; pollMs?: number }): Promise<void>
 }
@@ -214,6 +225,7 @@ export class CodexLaunchPlanner {
       onTurnStarted: (handler) => getProxy()?.onTurnStarted(handler) ?? (() => undefined),
       onTurnCompleted: (handler) => getProxy()?.onTurnCompleted(handler) ?? (() => undefined),
       onRepairTrigger: (handler) => getProxy()?.onRepairTrigger(handler) ?? (() => undefined),
+      onFsChanged: (handler) => runtime.onFsChanged(handler),
       onThreadLifecycle: (handler) => getProxy()?.onThreadLifecycle(handler) ?? (() => undefined),
       onLifecycleLoss: (handler) => {
         const unsubRuntime = runtime.onThreadLifecycleLoss(handler)
@@ -222,6 +234,17 @@ export class CodexLaunchPlanner {
           unsubRuntime()
           unsubProxy?.()
         }
+      },
+      watchPath: async (targetPath, watchId) => {
+        assertReadable()
+        const result = await runtime.watchPath(targetPath, watchId)
+        assertReadable()
+        return result
+      },
+      unwatchPath: async (watchId) => {
+        assertReadable()
+        await runtime.unwatchPath(watchId)
+        assertReadable()
       },
       shutdown: async () => {
         if (shutdownSucceeded) return

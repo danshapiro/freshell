@@ -142,7 +142,6 @@ function acceptedSessionRefForMode(
   mode: string,
 ): ReturnType<typeof sanitizeSessionRef> {
   if (!sessionRef || sessionRef.provider !== mode) return undefined
-  if (mode === 'codex') return undefined
   return sessionRef
 }
 

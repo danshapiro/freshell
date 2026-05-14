@@ -463,12 +463,22 @@ export type TerminalRecord = {
   }
   codexSidecar?: Pick<
     CodexLaunchSidecar,
-    'shutdown' | 'onLifecycleLoss' | 'onCandidate' | 'onTurnStarted' | 'onTurnCompleted' | 'onRepairTrigger' | 'markCandidatePersisted'
+    | 'shutdown'
+    | 'onLifecycleLoss'
+    | 'onCandidate'
+    | 'onTurnStarted'
+    | 'onTurnCompleted'
+    | 'onRepairTrigger'
+    | 'onFsChanged'
+    | 'watchPath'
+    | 'unwatchPath'
+    | 'markCandidatePersisted'
   >
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
   codexSidecarPrePublicationLoss?: unknown
   codexSidecarGeneration?: number
+  codexRolloutWatch?: { watchId: string; rolloutPath: string }
   codexDurability?: CodexDurabilityRef
   codexDurabilityProof?: {
     inFlight?: Promise<void>
@@ -1589,11 +1599,73 @@ export class TerminalRegistry extends EventEmitter {
     })
     if (repairUnsubscribe) unsubscribers.push(repairUnsubscribe)
 
+    const fsChangedUnsubscribe = sidecar.onFsChanged?.((event) => {
+      this.handleCodexRolloutFsChanged(record.terminalId, event)
+    })
+    if (fsChangedUnsubscribe) unsubscribers.push(fsChangedUnsubscribe)
+
     record.codexSidecarLifecycleUnsubscribe = () => {
       for (const unsubscribe of unsubscribers.splice(0)) {
         unsubscribe()
       }
     }
+  }
+
+  private armCodexRolloutWatch(record: TerminalRecord): void {
+    const candidate = record.codexDurability?.candidate
+    const sidecar = record.codexSidecar
+    if (!candidate || !sidecar?.watchPath) return
+    if (record.codexRolloutWatch?.rolloutPath === candidate.rolloutPath) return
+
+    this.unwatchCodexRollout(record, 'replace')
+    const watchId = `codex-rollout-${record.terminalId}-${Date.now()}`
+    record.codexRolloutWatch = { watchId, rolloutPath: candidate.rolloutPath }
+    sidecar.watchPath(candidate.rolloutPath, watchId)
+      .then(() => {
+        logger.debug({
+          terminalId: record.terminalId,
+          watchId,
+          rolloutPath: candidate.rolloutPath,
+        }, 'Watching Codex rollout proof path')
+      })
+      .catch((err) => {
+        if (record.codexRolloutWatch?.watchId === watchId) {
+          record.codexRolloutWatch = undefined
+        }
+        logger.warn({
+          err,
+          terminalId: record.terminalId,
+          watchId,
+          rolloutPath: candidate.rolloutPath,
+        }, 'Failed to watch Codex rollout proof path')
+      })
+  }
+
+  private unwatchCodexRollout(record: TerminalRecord, reason: string): void {
+    const watch = record.codexRolloutWatch
+    if (!watch) return
+    record.codexRolloutWatch = undefined
+    record.codexSidecar?.unwatchPath?.(watch.watchId).catch((err) => {
+      logger.warn({
+        err,
+        terminalId: record.terminalId,
+        watchId: watch.watchId,
+        rolloutPath: watch.rolloutPath,
+        reason,
+      }, 'Failed to unwatch Codex rollout proof path')
+    })
+  }
+
+  private handleCodexRolloutFsChanged(
+    terminalId: string,
+    event: { watchId: string; changedPaths: string[] },
+  ): void {
+    const record = this.terminals.get(terminalId)
+    if (!record?.codexRolloutWatch) return
+    const watch = record.codexRolloutWatch
+    if (event.watchId !== watch.watchId) return
+    if (event.changedPaths.length > 0 && !event.changedPaths.includes(watch.rolloutPath)) return
+    this.requestCodexDurabilityProof(terminalId, 'fs_changed')
   }
 
   private codexCandidateMatches(record: TerminalRecord, threadId: string | undefined): boolean {
@@ -1719,6 +1791,7 @@ export class TerminalRegistry extends EventEmitter {
     record.codexDurability = storedDurability
     record.codexInputGate = undefined
     record.codexSidecar?.markCandidatePersisted?.()
+    this.armCodexRolloutWatch(record)
     logger.info({
       terminalId,
       candidateThreadId: storedDurability.candidate?.candidateThreadId,
@@ -1853,6 +1926,7 @@ export class TerminalRegistry extends EventEmitter {
         }
         const stored = await this.writeCodexDurability(record, failed, checkedAt)
         record.codexDurabilityProof = undefined
+        this.unwatchCodexRollout(record, 'session_binding_failed')
         logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
         this.broadcastCodexDurability(record, stored)
         return
@@ -1865,6 +1939,7 @@ export class TerminalRegistry extends EventEmitter {
       }
       const stored = await this.writeCodexDurability(record, durable, checkedAt)
       record.codexDurabilityProof = undefined
+      this.unwatchCodexRollout(record, 'durable')
       logger.info({
         terminalId,
         candidateThreadId: candidate.candidateThreadId,
@@ -2595,6 +2670,7 @@ export class TerminalRegistry extends EventEmitter {
     const existing = this.sidecarShutdowns.get(this.sidecarShutdownKey(term.terminalId))
     if (existing?.status === 'pending') return existing.promise
 
+    this.unwatchCodexRollout(term, 'sidecar_release')
     term.codexSidecarLifecycleUnsubscribe?.()
     term.codexSidecarLifecycleUnsubscribe = undefined
     const sidecar = term.codexSidecar

@@ -81,12 +81,15 @@ function createFakeSidecar(options: {
   const turnStartedHandlers = new Set<(event: any) => void>()
   const turnCompletedHandlers = new Set<(event: any) => void>()
   const repairHandlers = new Set<(event: any) => void>()
+  const fsChangedHandlers = new Set<(event: any) => void>()
   return {
     adopt: vi.fn(async () => undefined),
     listLoadedThreads: vi.fn(async () => ['thread-1']),
     waitForLoadedThread: vi.fn(options.waitForLoadedThread ?? (async () => undefined)),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
     markCandidatePersisted: vi.fn(),
+    watchPath: vi.fn(async (targetPath: string) => ({ path: targetPath })),
+    unwatchPath: vi.fn(async () => undefined),
     onCandidate: vi.fn((handler: (event: any) => void) => {
       candidateHandlers.add(handler)
       return () => candidateHandlers.delete(handler)
@@ -102,6 +105,10 @@ function createFakeSidecar(options: {
     onRepairTrigger: vi.fn((handler: (event: any) => void) => {
       repairHandlers.add(handler)
       return () => repairHandlers.delete(handler)
+    }),
+    onFsChanged: vi.fn((handler: (event: any) => void) => {
+      fsChangedHandlers.add(handler)
+      return () => fsChangedHandlers.delete(handler)
     }),
     onLifecycleLoss: vi.fn((handler: (event: unknown) => void) => {
       lifecycleLossHandlers.add(handler)
@@ -124,6 +131,11 @@ function createFakeSidecar(options: {
     },
     emitRepairTrigger(event: any) {
       for (const handler of repairHandlers) {
+        handler(event)
+      }
+    },
+    emitFsChanged(event: any) {
+      for (const handler of fsChangedHandlers) {
         handler(event)
       }
     },
@@ -748,6 +760,57 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(sent).not.toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
       }))
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('uses exact rollout watch changes as a one-shot repair trigger after proof failure', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const rolloutPath = path.join(durabilityDir, 'late-rollout.jsonl')
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-late-proof',
+          path: rolloutPath,
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
+      await vi.waitFor(() => expect(sidecar.watchPath).toHaveBeenCalledWith(rolloutPath, expect.any(String)))
+      const watchId = sidecar.watchPath.mock.calls[0][1]
+
+      sidecar.emitTurnCompleted({ threadId: 'thread-late-proof', turnId: 'turn-1', params: {} })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('durability_unproven_after_completion'))
+
+      await fsp.writeFile(
+        rolloutPath,
+        '{"type":"session_meta","payload":{"id":"thread-late-proof"}}\n',
+        'utf8',
+      )
+      sidecar.emitFsChanged({ watchId, changedPaths: [rolloutPath] })
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-late-proof',
+      }))
+      expect(sidecar.unwatchPath).toHaveBeenCalledWith(watchId)
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
     }

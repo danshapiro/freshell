@@ -886,6 +886,23 @@ describe('tabsSlice', () => {
           panes: panesReducer,
         },
       })
+      const codexDurability = {
+        schemaVersion: 1 as const,
+        state: 'durability_unproven_after_completion' as const,
+        candidate: {
+          provider: 'codex' as const,
+          candidateThreadId: 'thread-pre-durable',
+          rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+          source: 'thread_start_response' as const,
+          capturedAt: 2_000,
+        },
+        turnCompletedAt: 2_500,
+        lastProofFailure: {
+          reason: 'missing' as const,
+          message: 'missing rollout',
+          checkedAt: 2_600,
+        },
+      }
 
       await store.dispatch(openSessionTab({
         sessionId: 'thread-pre-durable',
@@ -893,6 +910,7 @@ describe('tabsSlice', () => {
         terminalId: 'term-codex-pre-durable',
         title: 'Codex CLI',
         isRestorable: false,
+        codexDurability,
       }))
 
       const tabs = store.getState().tabs.tabs
@@ -904,6 +922,7 @@ describe('tabsSlice', () => {
       })
       expect(tabs[0].sessionRef).toBeUndefined()
       expect(tabs[0].sessionMetadataByKey).toBeUndefined()
+      expect(tabs[0].codexDurability).toEqual(codexDurability)
 
       const layout = store.getState().panes.layouts[tabs[0].id]
       expect(layout).toBeDefined()
@@ -911,6 +930,7 @@ describe('tabsSlice', () => {
         expect(layout.content.terminalId).toBe('term-codex-pre-durable')
         expect(layout.content.mode).toBe('codex')
         expect(layout.content.sessionRef).toBeUndefined()
+        expect(layout.content.codexDurability).toEqual(codexDurability)
       }
     })
 

@@ -103,6 +103,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
       ai.isRestorable !== bi.isRestorable ||
+      !sameCodexDurability(ai.codexDurability, bi.codexDurability) ||
       ai.codexDurabilityState !== bi.codexDurabilityState ||
       ai.codexDurabilityReason !== bi.codexDurabilityReason ||
       ai.timestamp !== bi.timestamp
@@ -163,6 +164,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.isNonInteractive === b.isNonInteractive &&
     a.firstUserMessage === b.firstUserMessage &&
     a.isRestorable === b.isRestorable &&
+    sameCodexDurability(a.codexDurability, b.codexDurability) &&
     a.codexDurabilityState === b.codexDurabilityState &&
     a.codexDurabilityReason === b.codexDurabilityReason
   )
@@ -398,6 +400,7 @@ export default function Sidebar({
         sessionType: item.sessionType || provider,
         terminalId: runningTerminalId,
         isRestorable: false,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
@@ -891,6 +894,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.projectPath === b.projectPath &&
     a.isFallback === b.isFallback &&
     a.isRestorable === b.isRestorable &&
+    sameCodexDurability(a.codexDurability, b.codexDurability) &&
     a.codexDurabilityState === b.codexDurabilityState &&
     a.codexDurabilityReason === b.codexDurabilityReason
   )

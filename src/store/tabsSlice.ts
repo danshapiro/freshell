@@ -23,6 +23,7 @@ import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
+import type { CodexDurabilityRef } from '@shared/codex-durability'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 
@@ -530,7 +531,7 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, isRestorable }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, isRestorable, codexDurability }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -542,6 +543,7 @@ export const openSessionTab = createAsyncThunk(
       isSubagent?: boolean
       isNonInteractive?: boolean
       isRestorable?: boolean
+      codexDurability?: CodexDurabilityRef
     },
     { dispatch, getState }
   ) => {
@@ -664,6 +666,9 @@ export const openSessionTab = createAsyncThunk(
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
       const tabId = nanoid()
+      const terminalCodexDurability = resolvedProvider === 'codex' && !shouldPersistSessionRef
+        ? codexDurability
+        : undefined
       dispatch(addTab({
         id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
@@ -674,6 +679,7 @@ export const openSessionTab = createAsyncThunk(
         sessionRef: shouldPersistSessionRef && (desiredResumeContent.kind === 'terminal' || desiredResumeContent.kind === 'agent-chat')
           ? desiredResumeContent.sessionRef
           : undefined,
+        codexDurability: terminalCodexDurability,
         sessionMetadataByKey: shouldPersistSessionRef ? buildSessionMetadataByKey() : undefined,
       }))
       dispatch(initLayout({
@@ -683,6 +689,7 @@ export const openSessionTab = createAsyncThunk(
           mode: resolvedProvider,
           terminalId,
           sessionRef: shouldPersistSessionRef && desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+          codexDurability: terminalCodexDurability,
           initialCwd: cwd,
           status: 'running',
         },

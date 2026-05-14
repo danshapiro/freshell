@@ -2,7 +2,10 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import type { CodexRolloutProofFailureReason } from '../../../shared/codex-durability.js'
 
-type ProofFs = Pick<typeof fsp, 'readFile' | 'stat'>
+type ProofFs = Pick<typeof fsp, 'open' | 'stat'>
+
+const FIRST_RECORD_CHUNK_BYTES = 8192
+const MAX_FIRST_RECORD_BYTES = 1024 * 1024
 
 export type CodexRolloutProofSuccess = {
   ok: true
@@ -59,14 +62,13 @@ export async function proofCodexRollout(input: {
     return fail('not_regular_file', 'Codex rollout proof path is not a regular file.')
   }
 
-  let raw: string
+  let firstLine: string
   try {
-    raw = await fsImpl.readFile(rolloutPath, 'utf8')
+    firstLine = (await readFirstLine(fsImpl, rolloutPath)).trim()
   } catch (error) {
     return fail('read_error', `Could not read Codex rollout proof file: ${errorMessage(error)}`)
   }
 
-  const firstLine = raw.split(/\r?\n/, 1)[0]?.trim() ?? ''
   if (!firstLine) {
     return fail('empty', 'Codex rollout proof file does not start with a JSONL record.')
   }
@@ -105,6 +107,34 @@ export async function proofCodexRollout(input: {
     rolloutPath,
     rolloutProofId,
   }
+}
+
+async function readFirstLine(fsImpl: ProofFs, filePath: string): Promise<string> {
+  const handle = await fsImpl.open(filePath, 'r')
+  const chunks: Buffer[] = []
+  let bytesSeen = 0
+
+  try {
+    while (bytesSeen < MAX_FIRST_RECORD_BYTES) {
+      const buffer = Buffer.alloc(Math.min(FIRST_RECORD_CHUNK_BYTES, MAX_FIRST_RECORD_BYTES - bytesSeen))
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, bytesSeen)
+      if (bytesRead === 0) break
+
+      const slice = buffer.subarray(0, bytesRead)
+      const newlineIndex = slice.indexOf(10)
+      if (newlineIndex >= 0) {
+        chunks.push(slice.subarray(0, newlineIndex))
+        return Buffer.concat(chunks).toString('utf8').replace(/\r$/, '')
+      }
+
+      chunks.push(slice)
+      bytesSeen += bytesRead
+    }
+  } finally {
+    await handle.close()
+  }
+
+  return Buffer.concat(chunks).toString('utf8').replace(/\r$/, '')
 }
 
 function errorMessage(error: unknown): string {
