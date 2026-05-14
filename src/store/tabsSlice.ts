@@ -573,12 +573,18 @@ export const openSessionTab = createAsyncThunk(
       cwd,
       agentChatProviderSettings: providerSettings,
     })
+    const terminalCodexDurability = resolvedProvider === 'codex'
+      && !shouldPersistSessionRef
+      && codexDurability?.candidate
+      ? codexDurability
+      : undefined
     const desiredOpenContent = shouldPersistSessionRef || desiredResumeContent.kind !== 'terminal'
       ? desiredResumeContent
       : ({
           kind: 'terminal' as const,
           mode: resolvedProvider,
           initialCwd: cwd,
+          codexDurability: terminalCodexDurability,
         })
 
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
@@ -666,9 +672,6 @@ export const openSessionTab = createAsyncThunk(
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
       const tabId = nanoid()
-      const terminalCodexDurability = resolvedProvider === 'codex' && !shouldPersistSessionRef
-        ? codexDurability
-        : undefined
       dispatch(addTab({
         id: tabId,
         title: title || getProviderLabel(resolvedProvider, extensions),
@@ -740,6 +743,7 @@ export const openSessionTab = createAsyncThunk(
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
       sessionRef: shouldPersistSessionRef && desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+      codexDurability: terminalCodexDurability,
       sessionMetadataByKey: shouldPersistSessionRef ? buildSessionMetadataByKey() : undefined,
     }))
     dispatch(initLayout({

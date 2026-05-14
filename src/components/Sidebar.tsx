@@ -443,6 +443,7 @@ export default function Sidebar({
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
@@ -462,6 +463,7 @@ export default function Sidebar({
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        codexDurability: item.codexDurability,
       }))
       onNavigate('terminal')
       return
@@ -472,6 +474,7 @@ export default function Sidebar({
           kind: 'terminal' as const,
           mode: provider,
           initialCwd: item.cwd,
+          codexDurability: item.codexDurability,
         }
       : buildResumeContent({
           sessionType,
