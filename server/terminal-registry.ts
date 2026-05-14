@@ -1867,7 +1867,12 @@ export class TerminalRegistry extends EventEmitter {
 
   private requestCodexDurabilityProof(terminalId: string, trigger: string): void {
     const record = this.terminals.get(terminalId)
-    if (!record || !record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+    if (
+      !record
+      || !record.codexDurability?.candidate
+      || record.codexDurability.state === 'durable'
+      || record.codexDurability.state === 'non_restorable'
+    ) return
     if (record.codexDurability.turnCompletedAt === undefined) {
       logger.debug({ terminalId, trigger }, 'Skipping Codex rollout proof before turn completion')
       return
@@ -1900,7 +1905,12 @@ export class TerminalRegistry extends EventEmitter {
 
   private async runCodexDurabilityProof(terminalId: string, trigger: string): Promise<void> {
     const record = this.terminals.get(terminalId)
-    if (!record || !record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+    if (
+      !record
+      || !record.codexDurability?.candidate
+      || record.codexDurability.state === 'durable'
+      || record.codexDurability.state === 'non_restorable'
+    ) return
     const candidate = record.codexDurability.candidate
     const preProofDurability = record.codexDurability
 
@@ -1930,6 +1940,9 @@ export class TerminalRegistry extends EventEmitter {
         this.unwatchCodexRollout(record, 'session_binding_failed')
         logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
         this.broadcastCodexDurability(record, stored)
+        await this.killAndWait(terminalId).catch((err) => {
+          logger.warn({ err, terminalId }, 'Failed to close Codex terminal after session binding failure')
+        })
         return
       }
       const durable: CodexDurabilityRef = {
@@ -2030,6 +2043,7 @@ export class TerminalRegistry extends EventEmitter {
       && !record.resumeSessionId
       && !!record.codexDurability?.candidate
       && record.codexDurability.state !== 'durable'
+      && record.codexDurability.state !== 'non_restorable'
   }
 
   private async proveCodexBeforeFinalLoss(record: TerminalRecord, trigger: string): Promise<void> {
@@ -2572,6 +2586,7 @@ export class TerminalRegistry extends EventEmitter {
   input(terminalId: string, data: string): TerminalInputResult {
     const term = this.terminals.get(terminalId)
     if (!term) return { status: 'no_terminal' }
+    if (term.status !== 'running') return { status: 'not_running' }
     if (
       term.mode === 'codex'
       && term.codexDurability?.state === 'non_restorable'
@@ -2585,7 +2600,6 @@ export class TerminalRegistry extends EventEmitter {
         reason: term.codexDurability.nonRestorableReason,
       }
     }
-    if (term.status !== 'running') return { status: 'not_running' }
     if (term.codexInputGate?.state === 'identity_pending') {
       return { status: 'blocked_codex_identity_pending', terminalId }
     }

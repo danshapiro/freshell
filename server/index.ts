@@ -439,6 +439,29 @@ async function main() {
     }
   })
 
+  registry.on('terminal.session.bound', (payload) => {
+    const event = payload as {
+      terminalId?: string
+      provider?: CodingCliProviderName
+      sessionId?: string
+    }
+    if (event.provider !== 'codex') return
+    if (!event.terminalId || !event.sessionId) return
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'codex',
+        terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        source: 'codex_durability',
+      })
+    } catch (err) {
+      log.warn({ err, terminalId: event.terminalId, sessionId: event.sessionId }, 'Failed to broadcast Codex session association')
+    }
+  })
+
   const applyDebugLogging = (enabled: boolean, source: string) => {
     const nextEnabled = !!enabled
     setLogLevel(resolveRuntimeLogLevel(nextEnabled))

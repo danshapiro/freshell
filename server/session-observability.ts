@@ -43,7 +43,7 @@ export type SessionLifecycleEvent =
     provider: CodingCliProviderName
     terminalId: string
     sessionId: string
-    source: 'indexer_update' | 'claude_new_session' | 'opencode_controller'
+    source: 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
   }
   | {
     kind: 'terminal_session_bound'

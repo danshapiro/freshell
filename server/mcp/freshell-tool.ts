@@ -246,7 +246,7 @@ async function handleDisplay(format: string, target?: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> = {
-  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'prompt'] },
+  'new-tab':         { required: [],                          optional: ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'resume', 'sessionRef', 'prompt'] },
   'list-tabs':       { required: [],                          optional: [] },
   'select-tab':      { required: ['target'],                  optional: [] },
   'kill-tab':        { required: ['target'],                  optional: [] },
@@ -254,14 +254,14 @@ const ACTION_PARAMS: Record<string, { required: string[]; optional: string[] }> 
   'has-tab':         { required: ['target'],                  optional: [] },
   'next-tab':        { required: [],                          optional: [] },
   'prev-tab':        { required: [],                          optional: [] },
-  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor'] },
+  'split-pane':      { required: [],                          optional: ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'sessionRef'] },
   'list-panes':      { required: [],                          optional: ['target'] },
   'select-pane':     { required: ['target'],                  optional: [] },
   'rename-pane':     { required: ['name'],                    optional: ['target'] },
   'kill-pane':       { required: ['target'],                  optional: [] },
   'resize-pane':     { required: ['target'],                  optional: ['x', 'y', 'sizes'] },
   'swap-pane':       { required: ['target', 'with'],          optional: [] },
-  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd'] },
+  'respawn-pane':    { required: ['target'],                  optional: ['mode', 'shell', 'cwd', 'sessionRef'] },
   'send-keys':       { required: [],                          optional: ['target', 'keys', 'literal'] },
   'capture-pane':    { required: [],                          optional: ['target', 'S', 'J', 'e'] },
   'wait-for':        { required: [],                          optional: ['target', 'pattern', 'stable', 'exit', 'prompt', 'timeout'] },
@@ -335,7 +335,7 @@ Rules:
 ## Command reference
 
 Tab commands:
-  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, prompt?
+  new-tab         Create a tab with a terminal pane (default). Params: name?, mode?, shell?, cwd?, browser?, editor?, resume?, sessionRef?, prompt?
                   mode values: shell (default), claude, codex, kimi, opencode, or any supported CLI.
                   prompt: text to send to the terminal after creation (via send-keys with literal mode).
                   To open a URL in a browser pane, use 'open-browser' instead.
@@ -349,7 +349,7 @@ Tab commands:
   prev-tab        Switch to the previous tab.
 
 Pane commands:
-  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?
+  split-pane      Split a pane. Params: target?, direction (horizontal|vertical, default vertical), mode?, shell?, cwd?, browser?, editor?, sessionRef?
                   Omit target to split your own pane (the pane where this MCP server was spawned). Returns { paneId, tabId }.
   list-panes      List panes. Params: target? (tab ID or title to filter by). Returns { panes: [...] }.
   select-pane     Activate a pane. Params: target (pane ID or index)
@@ -358,7 +358,7 @@ Pane commands:
                   Omit target to rename the caller pane (or the tab's active pane as fallback).
   resize-pane     Resize a pane. Params: target, x? (1-99), y? (1-99)
   swap-pane       Swap two panes. Params: target, with (other pane ID)
-  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?
+  respawn-pane    Restart a pane's terminal. Params: target, mode?, shell?, cwd?, sessionRef?
 
 Terminal I/O:
   send-keys       Send input to a pane. Params: target, keys, literal?
@@ -646,8 +646,8 @@ async function routeAction(
     }
     case 'respawn-pane': {
       const target = requireParam(params, 'target')
-      const { mode, shell, cwd } = params || {}
-      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd })
+      const { mode, shell, cwd, sessionRef } = params || {}
+      return c.post(`/api/panes/${encodeURIComponent(target)}/respawn`, { mode, shell, cwd, sessionRef })
     }
 
     // -- Terminal I/O --

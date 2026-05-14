@@ -3,6 +3,7 @@ import http from 'http'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { EventEmitter } from 'node:events'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 import { FakeCodexLaunchPlanner, DEFAULT_CODEX_REMOTE_WS_URL } from '../helpers/coding-cli/fake-codex-launch-planner.js'
@@ -176,7 +177,7 @@ type FakeTerminal = {
   clients: Set<WebSocket>
 }
 
-class FakeRegistry {
+class FakeRegistry extends EventEmitter {
   records: FakeTerminal[]
   attachCalls: Array<{ terminalId: string; opts?: any }> = []
   createCalls: any[] = []
@@ -185,6 +186,7 @@ class FakeRegistry {
   promoteCalls: Array<{ terminalId: string; durableThreadId: string }> = []
 
   constructor(terminalIds: string[]) {
+    super()
     const createdAt = Date.now()
     this.records = terminalIds.map((terminalId, idx) => ({
       terminalId,
@@ -250,6 +252,10 @@ class FakeRegistry {
         state: 'durable',
         durableThreadId,
       }
+      this.emit('terminal.codex.durability.updated', {
+        terminalId,
+        durability: record.codexDurability,
+      })
     }
     return bound
   }
@@ -652,6 +658,13 @@ describe('terminal.create reuse running codex terminal', () => {
         && m.terminalId === 'term-codex-existing'
         && m.sessionRef?.sessionId === 'thread-live-proved'
       ))
+      const durabilityPromise = waitForMessage(ws, (m) => (
+        m.type === 'terminal.codex.durability.updated'
+        && m.terminalId === 'term-codex-existing'
+        && m.durability?.state === 'durable'
+        && m.durability?.durableThreadId === 'thread-live-proved'
+      ))
+      const terminalsChangedPromise = waitForMessage(ws, (m) => m.type === 'terminals.changed')
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -666,6 +679,8 @@ describe('terminal.create reuse running codex terminal', () => {
 
       const created = await createdPromise
       await associatedPromise
+      await durabilityPromise
+      await terminalsChangedPromise
       expect(created.terminalId).toBe('term-codex-existing')
       expect(registry.records[0].resumeSessionId).toBe('thread-live-proved')
       expect(registry.records[0].codexDurability).toMatchObject({

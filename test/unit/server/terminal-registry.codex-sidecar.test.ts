@@ -325,10 +325,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         state: 'non_restorable',
         nonRestorableReason: 'candidate_capture_timeout',
       })
-      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
-        status: 'blocked_codex_identity_capture_timeout',
-        terminalId: term.terminalId,
-      })
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
       expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
@@ -406,7 +403,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     }
   })
 
-  it('blocks input when candidate persistence fails before the terminal exits', async () => {
+  it('closes the terminal when candidate persistence fails before user input', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     class StoreWithFirstWriteFailure extends CodexDurabilityStore {
       private writeCount = 0
@@ -449,11 +446,8 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         state: 'non_restorable',
         nonRestorableReason: 'candidate_persist_failed',
       }))
-      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
-        status: 'blocked_codex_identity_unavailable',
-        terminalId: term.terminalId,
-        reason: 'candidate_persist_failed',
-      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
       expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
@@ -655,11 +649,14 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         state: 'non_restorable',
         nonRestorableReason: 'session_binding_failed:session_already_owned',
       }))
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
       expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
       expect(registry.findRunningTerminalBySession('codex', 'thread-binding-owner')?.terminalId).toBe(owner.terminalId)
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
       expect(sent).not.toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
       }))
+      expect(mockPtyProcess.instances.at(-1)?.kill).toHaveBeenCalledTimes(1)
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
     }

@@ -119,6 +119,28 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
   })
 
+  it('new-tab passes explicit canonical Codex sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      name: 'Codex',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      name: 'Codex',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    }))
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')
@@ -180,6 +202,35 @@ describe('executeAction -- pane actions', () => {
     expect(mockClient.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/panes/p1/split'),
       expect.objectContaining({ direction: 'vertical' }),
+    )
+  })
+
+  it('split-pane passes explicit canonical Codex sessionRef', async () => {
+    mockClient.get.mockImplementation((path: string) => {
+      if (path === '/api/tabs') return Promise.resolve({ tabs: [{ id: 't1', activePaneId: 'p1' }], activeTabId: 't1' })
+      if (path.includes('/api/panes')) return Promise.resolve({ panes: [{ id: 'p1', index: 0, kind: 'terminal', terminalId: 'term-1' }] })
+      return Promise.resolve({})
+    })
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    await executeAction('split-pane', {
+      target: 'p1',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/split'),
+      expect.objectContaining({
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+        },
+      }),
     )
   })
 
@@ -260,6 +311,30 @@ describe('executeAction -- pane actions', () => {
     mockClient.post.mockResolvedValue({ ok: true })
     await executeAction('respawn-pane', { target: 'p1' })
     expect(mockClient.post).toHaveBeenCalledWith(expect.stringContaining('/api/panes/p1/respawn'), expect.anything())
+  })
+
+  it('respawn-pane passes explicit canonical Codex sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ ok: true })
+
+    await executeAction('respawn-pane', {
+      target: 'p1',
+      mode: 'codex',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+      },
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      expect.stringContaining('/api/panes/p1/respawn'),
+      expect.objectContaining({
+        mode: 'codex',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: '019e180a-9e92-7b63-9189-edaec526ad1a',
+        },
+      }),
+    )
   })
 })
 

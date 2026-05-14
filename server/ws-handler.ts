@@ -435,6 +435,15 @@ export class WsHandler {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
   }
+  private onCodexDurabilityUpdatedBound = (payload: { terminalId?: string; durability?: unknown }) => {
+    if (!payload?.terminalId || payload.durability === undefined) return
+    this.broadcast({
+      type: 'terminal.codex.durability.updated',
+      terminalId: payload.terminalId,
+      durability: payload.durability,
+    })
+    this.broadcastTerminalsChanged()
+  }
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
     repaired: (result: SessionRepairResult) => void
@@ -563,6 +572,7 @@ export class WsHandler {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.on?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.on?.('terminal.codex.durability.updated', this.onCodexDurabilityUpdatedBound)
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -3545,6 +3555,7 @@ export class WsHandler {
       off?: (event: string, listener: (...args: any[]) => void) => void
     }
     registryWithEvents.off?.('terminal.exit', this.onTerminalExitBound)
+    registryWithEvents.off?.('terminal.codex.durability.updated', this.onCodexDurabilityUpdatedBound)
 
     if (this.sessionRepairService && this.sessionRepairListeners) {
       this.sessionRepairService.off('scanned', this.sessionRepairListeners.scanned)

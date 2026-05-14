@@ -2,7 +2,7 @@ import { recordSessionLifecycleEvent } from './session-observability.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
 import type { TerminalMetadataService } from './terminal-metadata-service.js'
 
-type AssociationBroadcastSource = 'indexer_update' | 'claude_new_session' | 'opencode_controller'
+type AssociationBroadcastSource = 'indexer_update' | 'claude_new_session' | 'opencode_controller' | 'codex_durability'
 
 export function broadcastTerminalSessionAssociation(opts: {
   wsHandler: { broadcast: (message: unknown) => void }
