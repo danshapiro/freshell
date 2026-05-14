@@ -343,6 +343,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const fsImpl = {
       mkdir: fsp.mkdir,
       readFile: fsp.readFile,
+      readdir: fsp.readdir,
       rename: fsp.rename,
       unlink: fsp.unlink,
       writeFile: vi.fn(async (...args: Parameters<typeof fsp.writeFile>) => {
@@ -402,6 +403,60 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(sidecar.markCandidatePersisted).not.toHaveBeenCalled()
     } finally {
       releaseFirstCandidateWrite.resolve()
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks input when candidate persistence fails before the terminal exits', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    class StoreWithFirstWriteFailure extends CodexDurabilityStore {
+      private writeCount = 0
+
+      override async write(...args: Parameters<CodexDurabilityStore['write']>) {
+        this.writeCount += 1
+        if (this.writeCount === 1) {
+          throw new Error('candidate write failed')
+        }
+        return super.write(...args)
+      }
+    }
+
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new StoreWithFirstWriteFailure({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-write-failed',
+          path: path.join(durabilityDir, 'rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'non_restorable',
+        nonRestorableReason: 'candidate_persist_failed',
+      }))
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_unavailable',
+        terminalId: term.terminalId,
+        reason: 'candidate_persist_failed',
+      })
+      expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
+    } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
     }
   })

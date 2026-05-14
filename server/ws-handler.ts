@@ -1945,6 +1945,7 @@ export class WsHandler {
                 terminalId: string
                 createdAt: number
                 effectiveResumeSessionId?: string
+                clearCodexDurability?: boolean
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -1955,6 +1956,7 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
+                  ...(opts.clearCodexDurability ? { clearCodexDurability: true } : {}),
                 })
                 return true
               }
@@ -2077,6 +2079,7 @@ export class WsHandler {
                 state.terminalCreateTimestamps.push(now)
               }
 
+              let clearCodexDurabilityOnCreate = false
               if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
                 const candidate = m.codexDurability.candidate
                 const proof = await proofCodexRollout({
@@ -2107,6 +2110,7 @@ export class WsHandler {
                     await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
                     return
                   }
+                  clearCodexDurabilityOnCreate = true
                 }
               }
 
@@ -2294,6 +2298,7 @@ export class WsHandler {
                 terminalId: record.terminalId,
                 createdAt: record.createdAt,
                 effectiveResumeSessionId,
+                clearCodexDurability: clearCodexDurabilityOnCreate,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for
@@ -2470,6 +2475,20 @@ export class WsHandler {
             type: 'terminal.input.blocked',
             terminalId: m.terminalId,
             reason: 'codex_identity_capture_timeout',
+          })
+          return
+        }
+        if (result.status === 'blocked_codex_identity_unavailable') {
+          log.warn({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+            reason: result.reason,
+          }, 'Codex terminal input blocked because restore identity is unavailable')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_identity_unavailable',
           })
           return
         }

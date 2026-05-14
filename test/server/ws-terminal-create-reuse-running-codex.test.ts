@@ -617,7 +617,12 @@ describe('terminal.create reuse running codex terminal', () => {
         },
       }))
 
-      await createdPromise
+      const created = await createdPromise
+      expect(created).toMatchObject({
+        type: 'terminal.created',
+        requestId,
+        clearCodexDurability: true,
+      })
       expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
         resumeSessionId: undefined,
       })

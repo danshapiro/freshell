@@ -497,6 +497,7 @@ export type TerminalInputResult =
   | { status: 'written' }
   | { status: 'blocked_codex_identity_pending'; terminalId: string }
   | { status: 'blocked_codex_identity_capture_timeout'; terminalId: string }
+  | { status: 'blocked_codex_identity_unavailable'; terminalId: string; reason?: string }
   | { status: 'blocked_codex_recovery_pending'; terminalId: string }
   | { status: 'no_terminal' }
   | { status: 'not_running' }
@@ -2546,9 +2547,15 @@ export class TerminalRegistry extends EventEmitter {
     if (
       term.mode === 'codex'
       && term.codexDurability?.state === 'non_restorable'
-      && term.codexDurability.nonRestorableReason === 'candidate_capture_timeout'
     ) {
-      return { status: 'blocked_codex_identity_capture_timeout', terminalId }
+      if (term.codexDurability.nonRestorableReason === 'candidate_capture_timeout') {
+        return { status: 'blocked_codex_identity_capture_timeout', terminalId }
+      }
+      return {
+        status: 'blocked_codex_identity_unavailable',
+        terminalId,
+        reason: term.codexDurability.nonRestorableReason,
+      }
     }
     if (term.status !== 'running') return { status: 'not_running' }
     if (term.codexInputGate?.state === 'identity_pending') {

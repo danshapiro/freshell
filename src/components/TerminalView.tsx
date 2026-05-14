@@ -2035,11 +2035,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           terminalIdRef.current = newId
-          updateContent({ terminalId: newId, status: 'running' })
+          updateContent({
+            terminalId: newId,
+            status: 'running',
+            ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+          })
           // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
-            dispatch(updateTab({ id: currentTab.id, updates: { status: 'running' } }))
+            dispatch(updateTab({
+              id: currentTab.id,
+              updates: {
+                status: 'running',
+                ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+              },
+            }))
           }
 
           applySeqState(createAttachSeqState({ lastSeq: 0 }))

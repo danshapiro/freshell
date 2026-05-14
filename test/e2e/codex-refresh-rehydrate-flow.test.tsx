@@ -507,6 +507,29 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       expect(recreated?.sessionRef).toBeUndefined()
       expect(recreated?.resumeSessionId).toBeUndefined()
     })
+
+    const recreated = sentMessages().find((msg) => (
+      msg?.type === 'terminal.create'
+      && msg?.requestId !== 'req-codex-candidate-refresh'
+    ))
+    expect(recreated?.requestId).toBeTruthy()
+
+    act(() => {
+      wsHarness.emit({
+        type: 'terminal.created',
+        requestId: recreated!.requestId,
+        terminalId: 'term-codex-candidate-fresh',
+        createdAt: 2,
+        clearCodexDurability: true,
+      })
+    })
+
+    await waitFor(() => {
+      const afterFreshCreate = readPersistedLayoutSnapshotForTest()
+      expect((afterFreshCreate?.panes.layouts[tabId] as any)?.content?.terminalId).toBe('term-codex-candidate-fresh')
+      expect((afterFreshCreate?.panes.layouts[tabId] as any)?.content?.codexDurability).toBeUndefined()
+      expect(afterFreshCreate?.tabs.tabs.find((tab) => tab.id === tabId)?.codexDurability).toBeUndefined()
+    })
   })
 
   it('reattaches a same-server live Codex terminal before any durable identity exists', async () => {

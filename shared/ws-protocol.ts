@@ -486,6 +486,7 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
+  clearCodexDurability?: boolean
 }
 
 export type TerminalAttachReadyMessage = {
@@ -555,7 +556,7 @@ export type TerminalCodexDurabilityUpdatedMessage = {
 export type TerminalInputBlockedMessage = {
   type: 'terminal.input.blocked'
   terminalId: string
-  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_recovery_pending'
+  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_identity_unavailable' | 'codex_recovery_pending'
 }
 
 export type TerminalsChangedMessage = {

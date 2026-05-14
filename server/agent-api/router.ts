@@ -189,8 +189,8 @@ function codexInputGateState(registry: any, terminalId: string): CodexInputGateS
   const record = registry.get?.(terminalId)
   if (!record) return 'missing'
   if (record.status !== 'running') return 'exited'
-  if (!record.codexInputGate) return 'ready'
   if (record.codexDurability?.state === 'non_restorable') return 'non_restorable'
+  if (!record.codexInputGate) return 'ready'
   return 'waiting'
 }
 
@@ -946,6 +946,8 @@ export function createAgentApiRouter({
           ? 'Codex restore identity is not ready yet.'
           : inputResult.status === 'blocked_codex_identity_capture_timeout'
             ? 'Codex restore identity timed out before input could be accepted.'
+          : inputResult.status === 'blocked_codex_identity_unavailable'
+            ? 'Codex restore identity could not be captured before input could be accepted.'
           : inputResult.status === 'blocked_codex_recovery_pending'
             ? 'Codex durable recovery is still in progress.'
           : 'Terminal is not running.')
