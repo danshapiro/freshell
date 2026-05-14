@@ -7,6 +7,7 @@ type UpstreamHandle = {
   server: WebSocketServer
   wsUrl: string
   messages: unknown[]
+  binaryFlags: boolean[]
   sockets: Set<WebSocket>
 }
 
@@ -29,12 +30,14 @@ async function startUpstream(handler?: (socket: WebSocket, message: any) => void
   const endpoint = await allocateLocalhostPort()
   const sockets = new Set<WebSocket>()
   const messages: unknown[] = []
+  const binaryFlags: boolean[] = []
   const server = await new Promise<WebSocketServer>((resolve) => {
     const wss = new WebSocketServer({ host: endpoint.hostname, port: endpoint.port }, () => resolve(wss))
     wss.on('connection', (socket) => {
       sockets.add(socket)
       socket.on('close', () => sockets.delete(socket))
-      socket.on('message', (raw) => {
+      socket.on('message', (raw, isBinary) => {
+        binaryFlags.push(isBinary)
         const message = JSON.parse(raw.toString())
         messages.push(message)
         handler?.(socket, message)
@@ -45,6 +48,7 @@ async function startUpstream(handler?: (socket: WebSocket, message: any) => void
     server,
     wsUrl: `ws://${endpoint.hostname}:${endpoint.port}`,
     messages,
+    binaryFlags,
     sockets,
   }
   upstreams.add(handle)
@@ -74,6 +78,15 @@ async function connect(wsUrl: string): Promise<WebSocket> {
 function nextMessage(socket: WebSocket): Promise<any> {
   return new Promise((resolve) => {
     socket.once('message', (raw) => resolve(JSON.parse(raw.toString())))
+  })
+}
+
+function nextMessageFrame(socket: WebSocket): Promise<{ message: any; isBinary: boolean }> {
+  return new Promise((resolve) => {
+    socket.once('message', (raw, isBinary) => resolve({
+      message: JSON.parse(raw.toString()),
+      isBinary,
+    }))
   })
 }
 
@@ -114,19 +127,23 @@ describe('CodexRemoteProxy', () => {
       proxy.markCandidatePersisted()
     })
     const tui = await connect(proxy.wsUrl)
-    const responsePromise = nextMessage(tui)
+    const responsePromise = nextMessageFrame(tui)
 
     tui.send(JSON.stringify({ id: 1, method: 'thread/start', params: {} }))
 
     await expect(responsePromise).resolves.toMatchObject({
-      id: 1,
-      result: {
-        thread: {
-          id: 'thread-1',
-          path: '/tmp/codex/rollout.jsonl',
+      isBinary: false,
+      message: {
+        id: 1,
+        result: {
+          thread: {
+            id: 'thread-1',
+            path: '/tmp/codex/rollout.jsonl',
+          },
         },
       },
     })
+    expect(upstream.binaryFlags).toEqual([false])
     expect(candidates).toEqual([
       {
         source: 'thread_start_response',

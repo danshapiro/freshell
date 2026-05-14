@@ -10,6 +10,9 @@ import {
   type CodexThreadHandle,
 } from './protocol.js'
 import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
+import { logger } from '../../logger.js'
+
+const log = logger.child({ component: 'codex-remote-proxy' })
 
 export type CodexRemoteProxyCandidate = {
   thread: CodexThreadHandle
@@ -23,7 +26,7 @@ export type CodexRemoteProxyRepairTrigger =
 type JsonRpcId = string | number
 
 type PendingTurnStart = {
-  raw: WebSocket.RawData
+  raw: WebSocket.RawData | string
   client: WebSocket
   upstream: WebSocket
   id?: JsonRpcId
@@ -96,6 +99,11 @@ export class CodexRemoteProxy {
     if (this.requireCandidatePersistence) {
       this.ensureCandidateCaptureTimer()
     }
+    log.info({
+      wsUrl: this.wsUrl,
+      upstreamWsUrl: this.upstreamWsUrl,
+      requireCandidatePersistence: this.requireCandidatePersistence,
+    }, 'Codex remote proxy listening')
     return { wsUrl: this.wsUrl }
   }
 
@@ -187,59 +195,123 @@ export class CodexRemoteProxy {
     if (this.requireCandidatePersistence) {
       this.ensureCandidateCaptureTimer()
     }
+    log.info({
+      proxyWsUrl: this.wsUrl,
+      upstreamWsUrl: this.upstreamWsUrl,
+      requireCandidatePersistence: this.requireCandidatePersistence,
+      activeConnections: this.connections.size,
+    }, 'Codex remote proxy client connected')
 
-    client.on('message', (raw) => this.handleClientMessage(connection, raw))
-    upstream.on('message', (raw) => this.handleUpstreamMessage(connection, raw))
+    client.on('message', (raw, isBinary) => this.handleClientMessage(connection, raw, isBinary))
+    upstream.on('message', (raw, isBinary) => this.handleUpstreamMessage(connection, raw, isBinary))
+    upstream.on('open', () => {
+      log.info({
+        proxyWsUrl: this.wsUrl,
+        upstreamWsUrl: this.upstreamWsUrl,
+      }, 'Codex remote proxy upstream connected')
+    })
 
     const closeBoth = () => {
       this.connections.delete(connection)
       client.close()
       upstream.close()
     }
-    client.on('close', closeBoth)
-    upstream.on('close', () => {
+    client.on('close', (code, reason) => {
+      log.info({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        code,
+        reason: reason.toString(),
+        activeConnections: Math.max(0, this.connections.size - 1),
+      }, 'Codex remote proxy client closed')
+      closeBoth()
+    })
+    upstream.on('close', (code, reason) => {
+      log.warn({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        code,
+        reason: reason.toString(),
+        activeConnections: Math.max(0, this.connections.size - 1),
+      }, 'Codex remote proxy upstream closed')
       this.emitRepairTrigger({ kind: 'proxy_close' })
       closeBoth()
     })
     client.on('error', (error) => {
+      log.warn({
+        err: error,
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+      }, 'Codex remote proxy client error')
       this.emitRepairTrigger({ kind: 'proxy_error', error })
       closeBoth()
     })
     upstream.on('error', (error) => {
+      log.warn({
+        err: error,
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+      }, 'Codex remote proxy upstream error')
       this.emitRepairTrigger({ kind: 'proxy_error', error })
       closeBoth()
     })
   }
 
-  private handleClientMessage(connection: ProxyConnection, raw: WebSocket.RawData): void {
+  private handleClientMessage(connection: ProxyConnection, raw: WebSocket.RawData, isBinary: boolean): void {
+    const forward = framePayload(raw, isBinary)
     const parsed = parseJson(raw)
     const method = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).method : undefined
     const id = jsonRpcId(parsed)
     if (id !== undefined && typeof method === 'string') {
       connection.pendingMethods.set(id, method)
     }
+    if (typeof method === 'string') {
+      log.debug({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        method,
+        id,
+      }, 'Codex remote proxy forwarding client request')
+    }
 
     if (this.requireCandidatePersistence && method === 'turn/start' && !this.candidatePersisted) {
-      this.holdTurnStart(connection, raw, id)
+      this.holdTurnStart(connection, forward, id)
       return
     }
 
-    sendIfOpen(connection.upstream, raw)
+    sendIfOpen(connection.upstream, forward)
   }
 
-  private handleUpstreamMessage(connection: ProxyConnection, raw: WebSocket.RawData): void {
+  private handleUpstreamMessage(connection: ProxyConnection, raw: WebSocket.RawData, isBinary: boolean): void {
+    const forward = framePayload(raw, isBinary)
     const parsed = parseJson(raw)
     const id = jsonRpcId(parsed)
     if (id !== undefined) {
       const method = connection.pendingMethods.get(id)
       connection.pendingMethods.delete(id)
+      log.debug({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        method,
+        id,
+      }, 'Codex remote proxy forwarding upstream response')
       if (method === 'thread/start') {
         this.maybeEmitThreadStartResponseCandidate(parsed)
       }
     } else {
+      const method = parsed && typeof parsed === 'object'
+        ? (parsed as Record<string, unknown>).method
+        : undefined
+      if (typeof method === 'string') {
+        log.debug({
+          proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+          upstreamWsUrl: this.upstreamWsUrl,
+          method,
+        }, 'Codex remote proxy forwarding upstream notification')
+      }
       this.handleUpstreamNotification(parsed)
     }
-    sendIfOpen(connection.client, raw)
+    sendIfOpen(connection.client, forward)
   }
 
   private maybeEmitThreadStartResponseCandidate(parsed: unknown): void {
@@ -308,7 +380,7 @@ export class CodexRemoteProxy {
     }
   }
 
-  private holdTurnStart(connection: ProxyConnection, raw: WebSocket.RawData, id?: JsonRpcId): void {
+  private holdTurnStart(connection: ProxyConnection, raw: WebSocket.RawData | string, id?: JsonRpcId): void {
     const pending: PendingTurnStart = {
       raw,
       client: connection.client,
@@ -367,6 +439,11 @@ export class CodexRemoteProxy {
   }
 
   private emitCandidate(candidate: CodexRemoteProxyCandidate): void {
+    log.info({
+      threadId: candidate.thread.id,
+      rolloutPath: candidate.thread.path,
+      source: candidate.source,
+    }, 'Codex remote proxy observed candidate restore identity')
     for (const handler of this.candidateHandlers) {
       handler(candidate)
     }
@@ -414,6 +491,10 @@ function jsonRpcId(parsed: unknown): JsonRpcId | undefined {
   if (!parsed || typeof parsed !== 'object') return undefined
   const id = (parsed as Record<string, unknown>).id
   return typeof id === 'string' || typeof id === 'number' ? id : undefined
+}
+
+function framePayload(raw: WebSocket.RawData, isBinary: boolean): WebSocket.RawData | string {
+  return isBinary ? raw : raw.toString()
 }
 
 function sendIfOpen(socket: WebSocket, data: WebSocket.RawData | string): void {
