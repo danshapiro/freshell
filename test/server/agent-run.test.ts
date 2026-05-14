@@ -107,51 +107,8 @@ it('uses the Codex planner and marks fresh /api/run sessions as starts', async (
   expect(codexLaunchPlanner.sidecar.adoptCalls).toEqual([{ terminalId: 'term1', generation: 0 }])
 })
 
-it('waits for fresh Codex restore identity before writing /api/run input', async () => {
-  const emitter = new EventEmitter()
-  let inputReady = false
-  const registry = Object.assign(emitter, {
-    create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
-    get: vi.fn(() => ({
-      status: 'running',
-      ...(inputReady ? {} : { codexInputGate: { state: 'identity_pending' } }),
-    })),
-    input: vi.fn((_terminalId: string, _data: string) => {
-      if (!inputReady) {
-        queueMicrotask(() => {
-          inputReady = true
-          emitter.emit('terminal.codex.durability.updated', {
-            terminalId: 'term1',
-            durability: { state: 'captured_pre_turn' },
-          })
-        })
-        return { status: 'blocked_codex_identity_pending', terminalId: 'term1' }
-      }
-      return { status: 'written' }
-    }),
-  })
-  const codexLaunchPlanner = new FakeCodexLaunchPlanner()
-
-  const app = express()
-  app.use(express.json())
-  app.use('/api', createAgentApiRouter({
-    layoutStore: {
-      createTab: () => ({ tabId: 't1', paneId: 'p1' }),
-      attachPaneContent: () => {},
-    },
-    registry,
-    codexLaunchPlanner,
-  }))
-
-  const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
-
-  expect(res.body.status).toBe('ok')
-  expect(registry.input).toHaveBeenCalledTimes(2)
-})
-
-it('times out when fresh Codex restore identity never becomes ready for /api/run input', async () => {
-  const emitter = new EventEmitter()
-  const registry = Object.assign(emitter, {
+it('rejects fresh Codex /api/run input while restore identity is pending', async () => {
+  const registry = {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
     get: vi.fn(() => ({
       status: 'running',
@@ -159,7 +116,7 @@ it('times out when fresh Codex restore identity never becomes ready for /api/run
     })),
     input: vi.fn(() => ({ status: 'blocked_codex_identity_pending', terminalId: 'term1' })),
     killAndWait: vi.fn(async () => true),
-  })
+  }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
 
   const app = express()
@@ -167,23 +124,21 @@ it('times out when fresh Codex restore identity never becomes ready for /api/run
   app.use('/api', createAgentApiRouter({
     layoutStore: {
       createTab: () => ({ tabId: 't1', paneId: 'p1' }),
-      closeTab: vi.fn(),
       attachPaneContent: () => {},
     },
     registry,
     codexLaunchPlanner,
-    codexInputGateTimeoutMs: 10,
   }))
 
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('Timed out waiting for Codex restore identity before accepting input.')
+  expect(res.body.message).toBe('Codex restore identity is not ready yet.')
   expect(registry.input).toHaveBeenCalledTimes(1)
   expect(registry.killAndWait).toHaveBeenCalledWith('term1')
 })
 
-it('fails when a fresh Codex terminal exits before /api/run input can be accepted', async () => {
+it('does not buffer pending Codex /api/run input even if the terminal exits later', async () => {
   const emitter = new EventEmitter()
   const registry = Object.assign(emitter, {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
@@ -216,33 +171,21 @@ it('fails when a fresh Codex terminal exits before /api/run input can be accepte
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('Codex terminal exited before restore identity was ready.')
+  expect(res.body.message).toBe('Codex restore identity is not ready yet.')
   expect(registry.input).toHaveBeenCalledTimes(1)
   expect(registry.killAndWait).toHaveBeenCalledWith('term1')
 })
 
-it('fails when Codex restore identity becomes non-restorable before /api/run input', async () => {
-  const emitter = new EventEmitter()
-  let nonRestorable = false
-  const registry = Object.assign(emitter, {
+it('fails when Codex restore identity is unavailable before /api/run input', async () => {
+  const registry = {
     create: vi.fn((opts?: { terminalId?: string }) => ({ terminalId: opts?.terminalId ?? 'term1' })),
     get: vi.fn(() => ({
       status: 'running',
-      codexInputGate: { state: 'identity_pending' },
-      ...(nonRestorable ? { codexDurability: { state: 'non_restorable' } } : {}),
+      codexDurability: { state: 'non_restorable' },
     })),
-    input: vi.fn(() => {
-      queueMicrotask(() => {
-        nonRestorable = true
-        emitter.emit('terminal.codex.durability.updated', {
-          terminalId: 'term1',
-          durability: { state: 'non_restorable' },
-        })
-      })
-      return { status: 'blocked_codex_identity_pending', terminalId: 'term1' }
-    }),
+    input: vi.fn(() => ({ status: 'blocked_codex_identity_unavailable', terminalId: 'term1' })),
     killAndWait: vi.fn(async () => true),
-  })
+  }
   const codexLaunchPlanner = new FakeCodexLaunchPlanner()
 
   const app = express()
@@ -260,7 +203,7 @@ it('fails when Codex restore identity becomes non-restorable before /api/run inp
   const res = await request(app).post('/api/run').send({ command: 'echo done', mode: 'codex' })
 
   expect(res.status).toBe(500)
-  expect(res.body.message).toBe('Codex restore identity could not be captured before accepting input.')
+  expect(res.body.message).toBe('Codex restore identity could not be captured before input could be accepted.')
   expect(registry.input).toHaveBeenCalledTimes(1)
   expect(registry.killAndWait).toHaveBeenCalledWith('term1')
 })

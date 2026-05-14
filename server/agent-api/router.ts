@@ -175,109 +175,20 @@ function assertCodexCreateTerminalRunning(terminal: { status?: unknown }): void 
   }
 }
 
-function removeRegistryListener(registry: any, eventName: string, listener: (...args: any[]) => void): void {
-  if (typeof registry?.off === 'function') {
-    registry.off(eventName, listener)
-    return
+function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { status: 'written' }>): string {
+  if (result.status === 'blocked_codex_identity_pending') {
+    return 'Codex restore identity is not ready yet.'
   }
-  registry?.removeListener?.(eventName, listener)
-}
-
-type CodexInputGateState = 'ready' | 'waiting' | 'missing' | 'exited' | 'non_restorable'
-
-function codexInputGateState(registry: any, terminalId: string): CodexInputGateState {
-  const record = registry.get?.(terminalId)
-  if (!record) return 'missing'
-  if (record.status !== 'running') return 'exited'
-  if (record.codexDurability?.state === 'non_restorable') return 'non_restorable'
-  if (!record.codexInputGate) return 'ready'
-  return 'waiting'
-}
-
-function codexInputGateFailureMessage(state: Exclude<CodexInputGateState, 'ready' | 'waiting'>): string {
-  if (state === 'non_restorable') {
-    return 'Codex restore identity could not be captured before accepting input.'
+  if (result.status === 'blocked_codex_identity_capture_timeout') {
+    return 'Codex restore identity timed out before input could be accepted.'
   }
-  if (state === 'missing') {
-    return 'Codex terminal disappeared before restore identity was ready.'
+  if (result.status === 'blocked_codex_identity_unavailable') {
+    return 'Codex restore identity could not be captured before input could be accepted.'
   }
-  return 'Codex terminal exited before restore identity was ready.'
-}
-
-async function waitForCodexInputGateRelease(
-  registry: any,
-  terminalId: string,
-  timeoutMs = 10_000,
-): Promise<void> {
-  const currentState = codexInputGateState(registry, terminalId)
-  if (currentState === 'ready') return
-  if (currentState !== 'waiting') {
-    const message = codexInputGateFailureMessage(currentState)
-    log.warn({ terminalId, reason: currentState }, 'Codex input blocked and cannot become ready')
-    throw new Error(message)
+  if (result.status === 'blocked_codex_recovery_pending') {
+    return 'Codex durable recovery is still in progress.'
   }
-  if (typeof registry?.on !== 'function') {
-    log.warn({ terminalId, reason: 'registry_events_unavailable' }, 'Codex input gate wait cannot subscribe to registry events')
-    throw new Error('Codex terminal registry cannot wait for restore identity.')
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const cleanup = () => {
-      clearTimeout(timeout)
-      removeRegistryListener(registry, 'terminal.codex.durability.updated', onDurabilityUpdated)
-      removeRegistryListener(registry, 'terminal.exit', onTerminalExit)
-    }
-    const completeFromCurrentState = () => {
-      const state = codexInputGateState(registry, terminalId)
-      if (state === 'ready') {
-        cleanup()
-        resolve()
-        return true
-      }
-      if (state !== 'waiting') {
-        const message = codexInputGateFailureMessage(state)
-        cleanup()
-        log.warn({ terminalId, reason: state }, 'Codex input gate wait failed')
-        reject(new Error(message))
-        return true
-      }
-      return false
-    }
-    const onDurabilityUpdated = (event: { terminalId?: string }) => {
-      if (event?.terminalId === terminalId) {
-        completeFromCurrentState()
-      }
-    }
-    const onTerminalExit = (event: { terminalId?: string }) => {
-      if (event?.terminalId === terminalId) {
-        cleanup()
-        log.warn({ terminalId, reason: 'terminal_exit' }, 'Codex input gate wait failed')
-        reject(new Error('Codex terminal exited before restore identity was ready.'))
-      }
-    }
-    const timeout = setTimeout(() => {
-      cleanup()
-      log.warn({ terminalId, timeoutMs }, 'Timed out waiting for Codex input gate')
-      reject(new Error('Timed out waiting for Codex restore identity before accepting input.'))
-    }, timeoutMs)
-    timeout.unref?.()
-
-    registry.on('terminal.codex.durability.updated', onDurabilityUpdated)
-    registry.on('terminal.exit', onTerminalExit)
-    completeFromCurrentState()
-  })
-}
-
-async function writeTerminalInputWhenReady(
-  registry: any,
-  terminalId: string,
-  input: string,
-  codexInputGateTimeoutMs?: number,
-): Promise<TerminalInputResult> {
-  const firstResult = registry.input(terminalId, input) as TerminalInputResult
-  if (firstResult.status !== 'blocked_codex_identity_pending') return firstResult
-  await waitForCodexInputGateRelease(registry, terminalId, codexInputGateTimeoutMs)
-  return registry.input(terminalId, input) as TerminalInputResult
+  return 'Terminal is not running.'
 }
 
 async function cleanupCreatedTerminal(registry: any, terminalId: string | undefined): Promise<void> {
@@ -360,7 +271,6 @@ export function createAgentApiRouter({
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
-  codexInputGateTimeoutMs,
 }: {
   layoutStore: any
   registry: any
@@ -371,7 +281,6 @@ export function createAgentApiRouter({
   codexActivityTracker?: CodexPromptBlocker
   codexLaunchPlanner?: CodexLaunchPlanner
   assertTerminalCreateAccepted?: () => void
-  codexInputGateTimeoutMs?: number
 }) {
   const router = Router()
   const assertTerminalAdmission = () => {
@@ -940,17 +849,9 @@ export function createAgentApiRouter({
 
       const sentinel = `__FRESHELL_DONE_${nanoid()}__`
       const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-      const inputResult = await writeTerminalInputWhenReady(registry, terminal.terminalId, input, codexInputGateTimeoutMs)
+      const inputResult = registry.input(terminal.terminalId, input) as TerminalInputResult
       if (inputResult.status !== 'written') {
-        throw new Error(inputResult.status === 'blocked_codex_identity_pending'
-          ? 'Codex restore identity is not ready yet.'
-          : inputResult.status === 'blocked_codex_identity_capture_timeout'
-            ? 'Codex restore identity timed out before input could be accepted.'
-          : inputResult.status === 'blocked_codex_identity_unavailable'
-            ? 'Codex restore identity could not be captured before input could be accepted.'
-          : inputResult.status === 'blocked_codex_recovery_pending'
-            ? 'Codex durable recovery is still in progress.'
-          : 'Terminal is not running.')
+        throw new Error(terminalInputFailureMessage(inputResult))
       }
 
       if (!capture || detached) {
@@ -1378,11 +1279,11 @@ export function createAgentApiRouter({
       if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
     }
     if (!terminalId) return res.status(404).json(fail('terminal not found'))
-    const inputResult = registry.input(terminalId, data)
-    res.json(ok(
-      { terminalId },
-      inputResult.status === 'written' ? 'input sent' : 'terminal not running',
-    ))
+    const inputResult = registry.input(terminalId, data) as TerminalInputResult
+    if (inputResult.status !== 'written') {
+      return res.status(409).json(fail(terminalInputFailureMessage(inputResult)))
+    }
+    res.json(ok({ terminalId }, 'input sent'))
   })
 
   return router

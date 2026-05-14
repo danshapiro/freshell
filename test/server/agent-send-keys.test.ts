@@ -31,3 +31,24 @@ it('resolves tmux-style target to a pane before sending', async () => {
   expect(res.body.status).toBe('ok')
   expect(input).toHaveBeenCalledWith('term_2', 'C-c')
 })
+
+it('rejects blocked Codex input instead of reporting success', async () => {
+  const app = express()
+  app.use(express.json())
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { resolvePaneToTerminal: () => 'term_1' },
+    registry: {
+      input: () => ({
+        status: 'blocked_codex_identity_unavailable',
+        terminalId: 'term_1',
+        reason: 'candidate_persist_failed',
+      }),
+    },
+  }))
+
+  const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
+
+  expect(res.status).toBe(409)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toBe('Codex restore identity could not be captured before input could be accepted.')
+})

@@ -231,6 +231,13 @@ class FakeRegistry {
     })
   }
 
+  bindSession(terminalId: string, mode: string, sessionId: string) {
+    const record = this.findById(terminalId)
+    if (!record || mode !== 'codex') return { ok: false, reason: 'terminal_missing' }
+    record.resumeSessionId = sessionId
+    return { ok: true, terminalId, sessionId }
+  }
+
   findRunningClaudeTerminalBySession(sessionId: string) {
     return this.findRunningTerminalBySession('claude', sessionId)
   }
@@ -423,7 +430,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      await waitForReady(ws)
+      const helloReady = await waitForReady(ws)
 
       const firstCreatedPromise = waitForMessage(
         ws,
@@ -555,6 +562,11 @@ describe('terminal.create reuse running codex terminal', () => {
 
       const requestId = 'codex-proved-reopen'
       const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const associatedPromise = waitForMessage(ws, (m) => (
+        m.type === 'terminal.session.associated'
+        && m.sessionRef?.provider === 'codex'
+        && m.sessionRef?.sessionId === 'thread-proved'
+      ))
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -574,7 +586,9 @@ describe('terminal.create reuse running codex terminal', () => {
       }))
 
       const created = await createdPromise
+      const associated = await associatedPromise
       expect(created).not.toHaveProperty('effectiveResumeSessionId')
+      expect(associated.terminalId).toBe(created.terminalId)
       expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
         resumeSessionId: 'thread-proved',
       })
@@ -582,6 +596,67 @@ describe('terminal.create reuse running codex terminal', () => {
         mode: 'codex',
         resumeSessionId: 'thread-proved',
       })
+    } finally {
+      await closeWebSocket(ws)
+      await fsp.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('proof-reads a same-server live Codex candidate before reattaching it', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-'))
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
+      await fsp.writeFile(
+        rolloutPath,
+        '{"type":"session_meta","payload":{"id":"thread-live-proved"}}\n',
+        'utf8',
+      )
+      registry.records[0].resumeSessionId = undefined
+      registry.records[0].codexDurability = {
+        schemaVersion: 1,
+        state: 'durability_unproven_after_completion',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'thread-live-proved',
+          rolloutPath,
+          source: 'thread_started_notification',
+          capturedAt: Date.now(),
+        },
+        turnCompletedAt: Date.now(),
+      }
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const helloReady = await waitForReady(ws)
+
+      const requestId = 'codex-proved-live-reopen'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const associatedPromise = waitForMessage(ws, (m) => (
+        m.type === 'terminal.session.associated'
+        && m.terminalId === 'term-codex-existing'
+        && m.sessionRef?.sessionId === 'thread-live-proved'
+      ))
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'term-codex-existing',
+          serverInstanceId: helloReady.serverInstanceId,
+        },
+        codexDurability: registry.records[0].codexDurability,
+      }))
+
+      const created = await createdPromise
+      await associatedPromise
+      expect(created.terminalId).toBe('term-codex-existing')
+      expect(registry.records[0].resumeSessionId).toBe('thread-live-proved')
+      expect(registry.records[0].codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-live-proved',
+      })
+      expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(0)
     } finally {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })

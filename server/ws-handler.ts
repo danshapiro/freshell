@@ -79,7 +79,7 @@ import {
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
 import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
-import { CodexDurabilityRefSchema } from '../shared/codex-durability.js'
+import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import { proofCodexRollout } from './coding-cli/codex-app-server/durability-proof.js'
@@ -1995,6 +1995,21 @@ export class WsHandler {
                 this.broadcastTerminalsChanged()
                 return true
               }
+              const requestedLiveTerminal = (): TerminalRecord | undefined => {
+                if (m.liveTerminal?.serverInstanceId !== this.serverInstanceId) return undefined
+                const live = this.registry.get(m.liveTerminal.terminalId)
+                return live && live.status === 'running' && live.mode === m.mode ? live : undefined
+              }
+              const broadcastCodexSessionAssociated = (associatedTerminalId: string, sessionId: string) => {
+                this.broadcast({
+                  type: 'terminal.session.associated',
+                  terminalId: associatedTerminalId,
+                  sessionRef: {
+                    provider: 'codex',
+                    sessionId,
+                  },
+                })
+              }
 
               const existingId = resolveExistingRequestTerminalId(m.requestId)
               if (existingId) {
@@ -2013,9 +2028,66 @@ export class WsHandler {
                 this.forgetCreatedRequestId(m.requestId)
               }
 
-              if (m.liveTerminal?.serverInstanceId === this.serverInstanceId) {
-                const live = this.registry.get(m.liveTerminal.terminalId)
-                if (live && live.status === 'running' && live.mode === m.mode) {
+              let clearCodexDurabilityOnCreate = false
+              if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
+                const candidate = m.codexDurability.candidate
+                const proof = await proofCodexRollout({
+                  rolloutPath: candidate.rolloutPath,
+                  candidateThreadId: candidate.candidateThreadId,
+                })
+                if (proof.ok) {
+                  const live = requestedLiveTerminal()
+                  if (live) {
+                    const bound = this.registry.bindSession?.(live.terminalId, 'codex', proof.rolloutProofId, 'association')
+                    if (!bound || bound.ok) {
+                      live.resumeSessionId = proof.rolloutProofId
+                      live.codexDurability = {
+                        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+                        state: 'durable',
+                        durableThreadId: proof.rolloutProofId,
+                      }
+                      await attachReusedTerminal(live.terminalId, live.createdAt, proof.rolloutProofId)
+                      broadcastCodexSessionAssociated(live.terminalId, proof.rolloutProofId)
+                      return
+                    }
+                    log.warn({
+                      requestId: m.requestId,
+                      connectionId: ws.connectionId,
+                      terminalId: live.terminalId,
+                      sessionId: proof.rolloutProofId,
+                      reason: bound.reason,
+                    }, 'Codex captured restore state proved durable but live terminal binding failed')
+                  }
+                  effectiveResumeSessionId = proof.rolloutProofId
+                  log.info({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    candidateThreadId: candidate.candidateThreadId,
+                    rolloutPath: candidate.rolloutPath,
+                  }, 'Codex captured restore state proved durable during terminal.create')
+                } else {
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    candidateThreadId: candidate.candidateThreadId,
+                    rolloutPath: candidate.rolloutPath,
+                    reason: proof.reason,
+                  }, 'Codex captured restore state could not be proved during terminal.create')
+                  const live = this.registry.findRunningCodexTerminalByCandidate(
+                    candidate.candidateThreadId,
+                    candidate.rolloutPath,
+                  ) ?? requestedLiveTerminal()
+                  if (live) {
+                    await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                    return
+                  }
+                  clearCodexDurabilityOnCreate = true
+                }
+              }
+
+              if (!m.codexDurability?.candidate) {
+                const live = requestedLiveTerminal()
+                if (live) {
                   await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
                   return
                 }
@@ -2077,41 +2149,6 @@ export class WsHandler {
                   return
                 }
                 state.terminalCreateTimestamps.push(now)
-              }
-
-              let clearCodexDurabilityOnCreate = false
-              if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
-                const candidate = m.codexDurability.candidate
-                const proof = await proofCodexRollout({
-                  rolloutPath: candidate.rolloutPath,
-                  candidateThreadId: candidate.candidateThreadId,
-                })
-                if (proof.ok) {
-                  effectiveResumeSessionId = proof.rolloutProofId
-                  log.info({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    candidateThreadId: candidate.candidateThreadId,
-                    rolloutPath: candidate.rolloutPath,
-                  }, 'Codex captured restore state proved durable during terminal.create')
-                } else {
-                  log.warn({
-                    requestId: m.requestId,
-                    connectionId: ws.connectionId,
-                    candidateThreadId: candidate.candidateThreadId,
-                    rolloutPath: candidate.rolloutPath,
-                    reason: proof.reason,
-                  }, 'Codex captured restore state could not be proved during terminal.create')
-                  const live = this.registry.findRunningCodexTerminalByCandidate(
-                    candidate.candidateThreadId,
-                    candidate.rolloutPath,
-                  )
-                  if (live) {
-                    await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
-                    return
-                  }
-                  clearCodexDurabilityOnCreate = true
-                }
               }
 
               // Re-check session ownership after async config loading in case another request
@@ -2306,6 +2343,9 @@ export class WsHandler {
                 // other clients can discover it.
                 this.broadcastTerminalsChanged()
                 return
+              }
+              if (m.mode === 'codex' && effectiveResumeSessionId) {
+                broadcastCodexSessionAssociated(record.terminalId, effectiveResumeSessionId)
               }
 
               recordSessionLifecycleEvent({
