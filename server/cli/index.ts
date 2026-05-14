@@ -316,7 +316,10 @@ async function main() {
       const res = await client.post('/api/tabs', { name, mode, shell, cwd, browser, editor, resumeSessionId })
       const data = unwrap(res)
       if (prompt && data?.paneId) {
-        await client.post(`/api/panes/${encodeURIComponent(data.paneId)}/send-keys`, { data: `${prompt}\r` })
+        await client.post(`/api/panes/${encodeURIComponent(data.paneId)}/send-keys`, {
+          data: `${prompt}\r`,
+          ...(mode === 'codex' ? { waitForCodexIdentity: true } : {}),
+        })
       }
       writeJson(res)
       return

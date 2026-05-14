@@ -111,6 +111,26 @@ const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
 const TRUNCATED_REPLAY_BYTES = 128 * 1024
+const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
+
+type TerminalInputBlockedReason =
+  | 'codex_identity_pending'
+  | 'codex_identity_capture_timeout'
+  | 'codex_identity_unavailable'
+  | 'codex_recovery_pending'
+
+function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
+  switch (reason) {
+    case 'codex_identity_pending':
+      return 'Input not sent: Codex is still saving restore state. Try again in a moment.'
+    case 'codex_recovery_pending':
+      return 'Input not sent: Codex is still reconnecting. Try again in a moment.'
+    case 'codex_identity_capture_timeout':
+      return 'Input not sent: Codex did not provide restore state before startup timed out. Start a new Codex pane or resume inside Codex.'
+    case 'codex_identity_unavailable':
+      return 'Input not sent: Codex did not provide restorable session state. Start a new Codex pane or resume inside Codex.'
+  }
+}
 
 type StartupProbeReplayDiscardState = {
   remainder: string | null
@@ -368,6 +388,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
   const turnCompletedSinceLastInputRef = useRef(true)
+  const lastInputBlockedNoticeRef = useRef<{ reason: TerminalInputBlockedReason; at: number } | null>(null)
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -2201,6 +2222,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               capturedAt: candidate.capturedAt,
             })
           }
+        }
+
+        if (msg.type === 'terminal.input.blocked' && msg.terminalId === tid) {
+          const reason = msg.reason as TerminalInputBlockedReason
+          log.warn('terminal_input_blocked', {
+            tabId,
+            paneId: paneIdRef.current,
+            terminalId: tid,
+            reason,
+          })
+          const now = Date.now()
+          const previous = lastInputBlockedNoticeRef.current
+          if (!previous || previous.reason !== reason || now - previous.at >= INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
+            lastInputBlockedNoticeRef.current = { reason, at: now }
+            term.writeln(`\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
+          }
+          return
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {

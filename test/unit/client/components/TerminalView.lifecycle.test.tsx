@@ -2486,6 +2486,38 @@ describe('TerminalView lifecycle updates', () => {
     expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 
+  it('shows feedback when Codex input is blocked by the restore identity gate', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-codex',
+      status: 'running',
+      mode: 'codex',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-codex',
+        reason: 'codex_identity_pending',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expect(term.writeln).toHaveBeenCalledWith(
+      expect.stringContaining('Input not sent: Codex is still saving restore state. Try again in a moment.'),
+    )
+  })
+
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'

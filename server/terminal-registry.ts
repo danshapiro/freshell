@@ -2616,7 +2616,6 @@ export class TerminalRegistry extends EventEmitter {
   input(terminalId: string, data: string): TerminalInputResult {
     const term = this.terminals.get(terminalId)
     if (!term) return { status: 'no_terminal' }
-    if (term.status !== 'running') return { status: 'not_running' }
     if (
       term.mode === 'codex'
       && term.codexDurability?.state === 'non_restorable'
@@ -2630,6 +2629,7 @@ export class TerminalRegistry extends EventEmitter {
         reason: term.codexDurability.nonRestorableReason,
       }
     }
+    if (term.status !== 'running') return { status: 'not_running' }
     if (term.codexInputGate?.state === 'identity_pending') {
       if (isCodexStartupTerminalControlInput(data)) {
         term.pty.write(data)

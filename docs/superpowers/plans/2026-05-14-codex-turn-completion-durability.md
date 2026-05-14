@@ -223,6 +223,7 @@ git commit -m "Launch fresh Codex without pre-durable resume"
   - [ ] On `terminal.session.associated`, clear matching `codexDurability` and set the canonical `sessionRef` through the existing durable path.
   - [ ] Include persisted `codexDurability` in `terminal.create` when there is no canonical Codex `sessionRef`.
   - [ ] Do not send a candidate thread id as `resumeSessionId`.
+  - [ ] On `terminal.input.blocked`, log the blocked reason and show a throttled terminal-local message so browser-originated input is not silently dropped during the identity gate.
 - [ ] Update `server/terminal-registry.ts`.
   - [ ] Extend `TerminalRecord` with `codexDurability` and `codexInputGate`.
   - [ ] When proxy emits a candidate, write it to the server-side durability store first. After that atomic write succeeds, transition to `captured_pre_turn`, emit `terminal.codex.durability.updated`, call sidecar/proxy `markCandidatePersisted()`, and release held `turn/start` requests.
@@ -230,11 +231,17 @@ git commit -m "Launch fresh Codex without pre-durable resume"
   - [ ] Change `input()` to return `TerminalInputResult`:
     - [ ] `{ status: "written" }`
     - [ ] `{ status: "blocked_codex_identity_pending"; terminalId: string }`
+    - [ ] `{ status: "blocked_codex_identity_capture_timeout"; terminalId: string }`
+    - [ ] `{ status: "blocked_codex_identity_unavailable"; terminalId: string; reason?: string }`
+    - [ ] `{ status: "blocked_codex_recovery_pending"; terminalId: string }`
     - [ ] `{ status: "no_terminal" }`
     - [ ] `{ status: "not_running" }`
   - [ ] Update all callers of `TerminalRegistry.input()` to handle the new result shape.
   - [ ] Keep terminal resize and output flowing while input is gated.
   - [ ] Duplicate or replayed client `terminal.codex.candidate.persisted` acknowledgements succeed only when they match the stored candidate; mismatched acks are logged and ignored.
+- [ ] Update automation prompt-seeding surfaces.
+  - [ ] For `freshell new-tab --codex --prompt ...` and MCP `new-tab` with `mode: "codex"` and `prompt`, opt into an event-driven `send-keys` wait.
+  - [ ] The server retries the prompt when a matching `terminal.codex.durability.updated` or terminal exit event arrives. Do not poll, and do not send the prompt while the terminal is still `identity_pending`.
 - [ ] Update `server/ws-handler.ts`.
   - [ ] Handle `terminal.codex.candidate.persisted` and call the registry acknowledgement method.
   - [ ] For blocked input, log at debug/info with terminal id and bytes, send `terminal.input.blocked`, and do not misreport it as `INVALID_TERMINAL_ID`.

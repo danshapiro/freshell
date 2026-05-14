@@ -25,6 +25,7 @@ import { sanitizeSessionRef } from '../../shared/session-contract.js'
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const log = logger.child({ component: 'agent-api' })
+const CODEX_INPUT_READY_WAIT_TIMEOUT_MS = 60_000
 
 function agentRouteErrorStatus(error: unknown): number {
   return error instanceof CodexLaunchConfigError ? 400 : 500
@@ -189,6 +190,68 @@ function terminalInputFailureMessage(result: Exclude<TerminalInputResult, { stat
     return 'Codex durable recovery is still in progress.'
   }
   return 'Terminal is not running.'
+}
+
+function shouldWaitForCodexIdentity(payload: Record<string, unknown>): boolean {
+  return truthy(payload.waitForCodexIdentity)
+}
+
+function registrySupportsEvents(registry: any): registry is {
+  input: (terminalId: string, data: string) => TerminalInputResult
+  on: (event: string, handler: (...args: any[]) => void) => void
+  off: (event: string, handler: (...args: any[]) => void) => void
+} {
+  return typeof registry?.on === 'function' && typeof registry?.off === 'function'
+}
+
+async function sendTerminalInput(
+  registry: any,
+  terminalId: string,
+  data: string,
+  options: { waitForCodexIdentity?: boolean } = {},
+): Promise<TerminalInputResult> {
+  const first = registry.input(terminalId, data) as TerminalInputResult
+  if (first.status !== 'blocked_codex_identity_pending' || !options.waitForCodexIdentity) {
+    return first
+  }
+  if (!registrySupportsEvents(registry)) return first
+
+  return new Promise<TerminalInputResult>((resolve) => {
+    let settled = false
+    let timeout: ReturnType<typeof setTimeout> | undefined
+
+    const cleanup = () => {
+      if (timeout) clearTimeout(timeout)
+      registry.off('terminal.codex.durability.updated', onDurabilityUpdated)
+      registry.off('terminal.exit', onTerminalExit)
+    }
+    const finish = (result: TerminalInputResult) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(result)
+    }
+    const retry = () => {
+      const next = registry.input(terminalId, data) as TerminalInputResult
+      if (next.status === 'blocked_codex_identity_pending') return
+      finish(next)
+    }
+    const onDurabilityUpdated = (event: { terminalId?: string }) => {
+      if (event?.terminalId !== terminalId) return
+      retry()
+    }
+    const onTerminalExit = (event: { terminalId?: string }) => {
+      if (event?.terminalId !== terminalId) return
+      finish({ status: 'not_running' })
+    }
+
+    registry.on('terminal.codex.durability.updated', onDurabilityUpdated)
+    registry.on('terminal.exit', onTerminalExit)
+    timeout = setTimeout(() => {
+      finish({ status: 'blocked_codex_identity_capture_timeout', terminalId })
+    }, CODEX_INPUT_READY_WAIT_TIMEOUT_MS)
+    queueMicrotask(retry)
+  })
 }
 
 async function cleanupCreatedTerminal(registry: any, terminalId: string | undefined): Promise<void> {
@@ -1267,7 +1330,7 @@ export function createAgentApiRouter({
     res.json(ok(undefined, 'navigate requested'))
   })
 
-  router.post('/panes/:id/send-keys', (req, res) => {
+  router.post('/panes/:id/send-keys', async (req, res) => {
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
@@ -1279,7 +1342,9 @@ export function createAgentApiRouter({
       if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
     }
     if (!terminalId) return res.status(404).json(fail('terminal not found'))
-    const inputResult = registry.input(terminalId, data) as TerminalInputResult
+    const inputResult = await sendTerminalInput(registry, terminalId, data, {
+      waitForCodexIdentity: shouldWaitForCodexIdentity(payload),
+    })
     if (inputResult.status !== 'written') {
       return res.status(409).json(fail(terminalInputFailureMessage(inputResult)))
     }

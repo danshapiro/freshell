@@ -559,7 +559,10 @@ async function routeAction(
         const data = unwrapData(tabResult)
         const paneId = data?.paneId
         if (paneId) {
-          await c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, { data: `${prompt}\r` })
+          await c.post(`/api/panes/${encodeURIComponent(paneId)}/send-keys`, {
+            data: `${prompt}\r`,
+            ...(mode === 'codex' ? { waitForCodexIdentity: true } : {}),
+          })
         }
       }
       return tabResult

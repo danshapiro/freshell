@@ -267,6 +267,30 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
   })
 
+  it('keeps reporting the Codex identity capture timeout after closing the failed terminal', async () => {
+    const registry = new TerminalRegistry()
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+        },
+      } as any,
+    })
+
+    sidecar.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
+
+    await vi.waitFor(() => {
+      expect(registry.get(term.terminalId)?.status).toBe('exited')
+    })
+    expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+      status: 'blocked_codex_identity_capture_timeout',
+      terminalId: term.terminalId,
+    })
+  })
+
   it('does not release fresh Codex input from a browser persistence acknowledgement alone', () => {
     const registry = new TerminalRegistry()
     const term = registry.create({
@@ -358,7 +382,10 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         state: 'non_restorable',
         nonRestorableReason: 'candidate_capture_timeout',
       })
-      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_capture_timeout',
+        terminalId: term.terminalId,
+      })
       expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
@@ -480,7 +507,11 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         nonRestorableReason: 'candidate_persist_failed',
       }))
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
-      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_unavailable',
+        terminalId: term.terminalId,
+        reason: 'candidate_persist_failed',
+      })
       expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })
@@ -685,7 +716,11 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
       expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
       expect(registry.findRunningTerminalBySession('codex', 'thread-binding-owner')?.terminalId).toBe(owner.terminalId)
-      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'not_running' })
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_unavailable',
+        terminalId: term.terminalId,
+        reason: 'session_binding_failed:session_already_owned',
+      })
       expect(sent).not.toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
       }))

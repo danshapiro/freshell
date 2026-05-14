@@ -1074,6 +1074,25 @@ describe('executeAction -- new-tab with prompt sends keys', () => {
     )
   })
 
+  it('new-tab with a Codex prompt asks the server to wait for Codex identity capture', async () => {
+    mockClient.post.mockImplementation((path: string) => {
+      if (path === '/api/tabs') {
+        return Promise.resolve({ status: 'ok', data: { id: 't1', paneId: 'p-new' } })
+      }
+      return Promise.resolve({ ok: true })
+    })
+
+    await executeAction('new-tab', { name: 'Work', mode: 'codex', prompt: 'build the thing' })
+
+    expect(mockClient.post).toHaveBeenCalledWith(
+      '/api/panes/p-new/send-keys',
+      expect.objectContaining({
+        data: 'build the thing\r',
+        waitForCodexIdentity: true,
+      }),
+    )
+  })
+
   it('new-tab without prompt does not send keys', async () => {
     mockClient.post.mockResolvedValue({ status: 'ok', data: { id: 't1', paneId: 'p-new' } })
     await executeAction('new-tab', { name: 'Work', mode: 'claude' })
