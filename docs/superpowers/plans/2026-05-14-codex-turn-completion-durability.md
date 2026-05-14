@@ -4,7 +4,7 @@
 
 **Goal:** Make Codex terminal restore identity mandatory, observable, and promoted only by deterministic evidence. A fresh Codex pane must not accept user input until Freshell has persisted the provider-reported candidate thread id and rollout path, must not treat that candidate as durable, and must promote to `sessionRef` only after the exact rollout file proves the same Codex root TUI `ThreadId`.
 
-**Architecture:** Add a Freshell-owned websocket proxy between the visible Codex TUI and the Codex app-server sidecar. The proxy observes `thread/start` responses and `thread/started` notifications for candidate capture, observes `turn/completed` for the mandatory proof-check boundary, and forwards traffic normally. Terminal input is gated only until candidate persistence is acknowledged. Durable promotion is an event-driven one-shot proof read of the exact rollout path, not a polling loop.
+**Architecture:** Add a Freshell-owned websocket proxy between the visible Codex TUI and the Codex app-server sidecar. The proxy observes `thread/start` responses and `thread/started` notifications for candidate capture, observes `turn/completed` for the mandatory proof-check boundary, and forwards traffic normally. Terminal input is gated only until the candidate is atomically written to the Freshell server-side durability store. Durable promotion is an event-driven one-shot proof read of the exact rollout path, not a polling loop.
 
 **Tech Stack:** Node.js/TypeScript ESM, `ws`, `node-pty`, Express WebSocket protocol, React 18, Redux Toolkit, Zod, Vitest, Testing Library, superwstest, Freshell orchestration.
 
@@ -25,17 +25,19 @@
 
 - `server/coding-cli/codex-app-server/launch-planner.ts` currently calls `runtime.startThread()` for fresh Codex launches and returns that id as the launch `sessionId`; `server/ws-handler.ts` then passes it as `resumeSessionId`, so `buildSpawnSpec()` launches the visible TUI with `codex --remote <ws> resume <threadId>`. This is exactly the pre-durable resume pattern the research rejects.
 - `server/coding-cli/codex-app-server/protocol.ts`, `client.ts`, and `runtime.ts` handle `thread/started`, lifecycle loss, and `fs/changed`, but do not expose `turn/completed`.
-- `server/terminal-registry.ts` writes PTY input immediately once the terminal exists. It has no state that can block input until candidate persistence is acknowledged.
+- `server/terminal-registry.ts` writes PTY input immediately once the terminal exists. It has no state that can block input until candidate persistence is complete.
 - `src/components/TerminalView.tsx` persists canonical identity only after `terminal.session.associated`; it has no candidate-only Codex durability state and no acknowledgement path back to the server.
 - The sidebar and persisted tab state can represent `sessionRef` or legacy `resumeSessionId`, but not a non-canonical Codex candidate. This is why an unpromoted live Codex pane can appear as a generic grey terminal and then split into a second entry when canonical metadata appears later.
+- The research document also mentions `durable-rollout-tracker.ts` and a `running_live_only` stability timer in `/home/user/code/freshell/.worktrees/dev` (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:576-582`). Those files/constructs are not present in this `origin/main`-based implementation worktree, so this plan does not include a removal task for them.
 
 ## State Model To Implement
 
 - `identity_pending`: fresh Codex TUI has been spawned through the proxy, but no candidate has been durably saved by Freshell. PTY output and resize pass through. User-originating input is blocked.
-- `captured_pre_turn`: Freshell has persisted `{ provider: "codex", candidateThreadId, rolloutPath, source, capturedAt }` and received client acknowledgement. Input is allowed. This is not restorable/durable.
+- `captured_pre_turn`: Freshell has atomically persisted `{ provider: "codex", candidateThreadId, rolloutPath, source, capturedAt }` in the server-side durability store. Input is allowed. This is not restorable/durable. Client localStorage acknowledgement may arrive later and is idempotent.
 - `turn_in_progress_unproven`: the proxy observed `turn/start` or equivalent user-turn activity for the candidate. Live use continues. This is not restorable/durable.
 - `proof_checking`: `turn/completed` or a deterministic repair trigger fired and one exact proof read is running.
 - `durable`: the proof succeeded. Freshell sends the existing `terminal.session.associated` message with `sessionRef.provider == "codex"` and `sessionRef.sessionId == candidateThreadId`; normal resume uses that id.
+- `durable_resuming`: a terminal launched from an existing canonical Codex `sessionRef`. It starts from already-proven durable identity and does not return to candidate capture. Normal launch trusts the saved canonical `sessionRef`; if durable proof metadata with `rolloutPath` is also available, repair/list/open paths may proof-read it before resume. If no proof metadata exists, Freshell must not invent one from cwd/time/title.
 - `durability_unproven_after_completion`: proof failed after completion. Live terminal access remains possible if the PTY is alive, but sidebar/pane state must be degraded, not green/normal.
 - `non_restorable`: no durable proof exists and no live terminal is attachable. Reopening fresh-creates Codex and keeps a local restore-error explanation.
 
@@ -57,21 +59,32 @@
   - [ ] Require first record JSON to have `type === "session_meta"` and `payload.id === candidateThreadId`.
   - [ ] Return a typed success/failure result with a machine-readable reason: `missing`, `not_regular_file`, `empty`, `malformed_json`, `wrong_record_type`, `missing_payload_id`, `mismatched_thread_id`, `read_error`.
   - [ ] Do not check cwd, date directories, shell snapshots, or filename proximity. The proof is the exact path plus first-record identity (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:456`, `:520-526`).
+- [ ] Create `server/coding-cli/codex-app-server/durability-store.ts`.
+  - [ ] Atomically persist candidate and proof-state records under a Freshell-owned directory, defaulting to `~/.freshell/codex-durability/`.
+  - [ ] Key records by `terminalId`, and include `tabId`, `paneId`, `candidateThreadId`, `rolloutPath`, `state`, `capturedAt`, and `serverInstanceId`.
+  - [ ] Treat this server-side write as the authoritative gate-release persistence. Client localStorage persistence is still required for refresh/reopen UX, but it is not what releases PTY input.
+  - [ ] Make duplicate writes idempotent when `candidateThreadId` and `rolloutPath` match; reject mismatched rewrites for the same terminal.
+  - [ ] Delete records when the terminal is killed and either durable `sessionRef` was promoted or the candidate is intentionally abandoned.
 - [ ] Add `test/unit/server/coding-cli/codex-app-server/durability-proof.test.ts`.
   - [ ] Success: first line is matching `session_meta`.
   - [ ] Failure: missing path, directory, empty file, malformed first line, first line not `session_meta`, missing `payload.id`, mismatched id.
   - [ ] Regression: a later matching line must not succeed if the first record is wrong.
+- [ ] Add `test/unit/server/coding-cli/codex-app-server/durability-store.test.ts`.
+  - [ ] Atomic write/read round trip.
+  - [ ] Duplicate matching candidate is idempotent.
+  - [ ] Mismatched candidate for the same terminal is rejected.
+  - [ ] Missing older persisted layouts with no Codex durability data read cleanly and never synthesize a candidate from `resumeSessionId`.
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/server/coding-cli/codex-app-server/durability-proof.test.ts --run
+npm run test:vitest -- test/unit/server/coding-cli/codex-app-server/durability-proof.test.ts test/unit/server/coding-cli/codex-app-server/durability-store.test.ts --run
 ```
 
 Commit:
 
 ```bash
-git add shared/codex-durability.ts server/coding-cli/codex-app-server/durability-proof.ts test/unit/server/coding-cli/codex-app-server/durability-proof.test.ts
+git add shared/codex-durability.ts server/coding-cli/codex-app-server/durability-proof.ts server/coding-cli/codex-app-server/durability-store.ts test/unit/server/coding-cli/codex-app-server/durability-proof.test.ts test/unit/server/coding-cli/codex-app-server/durability-store.test.ts
 git commit -m "Add Codex rollout durability proof reader"
 ```
 
@@ -111,15 +124,21 @@ git commit -m "Observe Codex turn lifecycle notifications"
   - [ ] Allocate a loopback websocket endpoint for the visible TUI.
   - [ ] Forward TUI websocket traffic to the real app-server sidecar endpoint.
   - [ ] Observe client-to-server JSON-RPC requests and remember request id to method for `thread/start`, `thread/resume`, `turn/start`, and any turn methods present in fixtures.
+  - [ ] Parse client-to-server `turn/start` as a generic JSON-RPC envelope by method name; do not require a full request-params Zod schema unless the implementation needs fields beyond the method and id.
   - [ ] Observe server-to-client JSON-RPC responses. For a `thread/start` response, parse the `thread` payload and emit candidate `{ threadId, rolloutPath, source: "thread_start_response" }`.
   - [ ] Observe server-to-client notifications. Emit candidate from `thread/started` if no response candidate has been persisted yet; emit `turn_started`, `turn_completed`, `fs_changed`, lifecycle loss, and connection loss events.
-  - [ ] If a `turn/start` request arrives before the candidate persistence acknowledgement, hold that request until the acknowledgement completes. If acknowledgement fails or the terminal is shutting down, fail the held request with a clear JSON-RPC error. This is a secondary safety net; the PTY input gate remains the primary guard (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:551-553`).
+  - [ ] If a `turn/start` request arrives before the server-side candidate persistence write completes, hold that request until the write completes. If the write fails, the terminal is shutting down, or `5_000ms` elapse without a persisted candidate, fail the held request with JSON-RPC error code `-32000` and message `Freshell could not persist Codex restore identity before accepting user input.` Transition the terminal to `non_restorable`, stop that fresh TUI, and fresh-create only if the user explicitly retries.
   - [ ] Do not periodically query the app-server or filesystem from the proxy.
   - [ ] Include structured logs for proxy start, candidate observed, held turn request, released turn request, turn completed, proof trigger, and proxy close/error.
+- [ ] Ensure readiness ordering is explicit.
+  - [ ] `CodexRemoteProxy.start()` must resolve only after the local proxy websocket server is listening and all local event handlers are installed.
+  - [ ] `launch-planner.ts` must await proxy readiness before returning the plan that will spawn the visible TUI.
+  - [ ] Freshell-owned upstream observer/listener setup must complete before `buildSpawnSpec()` can hand the proxy URL to Codex.
 - [ ] Add `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`.
   - [ ] Fresh TUI traffic through the proxy captures candidate from `thread/start` response.
   - [ ] Candidate can also be captured from `thread/started` notification.
-  - [ ] `turn/start` before candidate ack is held, then forwarded after ack.
+  - [ ] `turn/start` before server-side candidate persistence is held, then forwarded after the store write completes.
+  - [ ] `turn/start` times out and fails cleanly if candidate persistence never completes.
   - [ ] `turn/completed` is emitted with the matching thread id.
   - [ ] Proxy close/error emits a deterministic repair trigger and shuts down without leaking sockets.
 
@@ -140,9 +159,10 @@ git commit -m "Proxy Codex remote traffic for deterministic identity capture"
 
 - [ ] Update `server/coding-cli/codex-app-server/launch-planner.ts`.
   - [ ] For fresh Codex launch, call `runtime.ensureReady()` instead of `runtime.startThread()`.
-  - [ ] Start a `CodexRemoteProxy` before returning the plan.
+  - [ ] Start and await a `CodexRemoteProxy` before returning the plan.
   - [ ] Return a launch plan whose `sessionId` is undefined for fresh launches. The fresh visible command must be `codex --remote <proxyWsUrl>` with no `resume <threadId>`.
   - [ ] For durable resume launches, keep `sessionId == resumeSessionId`, route the TUI through the proxy, and keep readiness behavior for the durable id.
+  - [ ] Durable resume launches start in `durable_resuming`/`durable`; they do not perform candidate capture and they do not re-promote on `thread/started`.
   - [ ] Sidecar shutdown must close the proxy and the runtime sidecar.
   - [ ] Sidecar adoption must still update sidecar ownership metadata with terminal id and generation.
   - [ ] Expose proxy events on the sidecar: `onCandidate`, `markCandidatePersisted`, `onTurnStarted`, `onTurnCompleted`, `onRepairTrigger`, `onLifecycleLoss`, and `onFsChanged`.
@@ -150,6 +170,7 @@ git commit -m "Proxy Codex remote traffic for deterministic identity capture"
   - [ ] Do not overwrite `effectiveResumeSessionId` with a fresh Codex plan id when the launch is fresh.
   - [ ] Continue passing `effectiveResumeSessionId` only for proven durable resumes.
   - [ ] Record lifecycle events distinguishing `codex_candidate_pending`, `codex_candidate_captured`, and `codex_durable_session_observed`.
+  - [ ] Remove the existing adoption-time `codex_durable_session_observed` emission for fresh Codex. That event must be emitted only after rollout proof success; durable resume can log `codex_durable_resume_started`.
 - [ ] Update `server/terminal-registry.ts` recovery spawning.
   - [ ] Durable recovery still spawns `resume <durableThreadId>`.
   - [ ] Fresh launch never spawns `resume <candidateThreadId>`.
@@ -181,30 +202,37 @@ git commit -m "Launch fresh Codex without pre-durable resume"
   - [ ] Add server-to-client `terminal.codex.durability.updated` payload carrying `terminalId` and `CodexDurabilityRef`.
   - [ ] Add client-to-server `terminal.codex.candidate.persisted` with `terminalId`, `candidateThreadId`, `rolloutPath`, and `capturedAt`.
   - [ ] Add optional `codexDurability` to `terminal.create` so persisted captured-but-unproven panes can be repaired or fresh-created deterministically on reopen.
-  - [ ] Add error code `CODEX_IDENTITY_PENDING` only if the existing error schema needs a specific code for rejected held input; prefer the durability update path over noisy user-facing errors during normal startup.
+  - [ ] Add server-to-client `terminal.input.blocked` with `reason: "codex_identity_pending"` for diagnostic UI/logging when PTY input arrives during the narrow gate. Do not send `INVALID_TERMINAL_ID` for gated input.
 - [ ] Update `src/store/paneTypes.ts`, `src/store/types.ts`, `src/store/persistedState.ts`, `src/store/storage-migration.ts`, `src/store/panesSlice.ts`, and `src/store/tabsSlice.ts`.
   - [ ] Add optional `codexDurability?: CodexDurabilityRef` to terminal pane content and tab metadata.
   - [ ] Persist it in localStorage.
   - [ ] Preserve it across tab/pane merge logic.
-  - [ ] Clear it when a canonical `sessionRef.provider == "codex"` is set for the same thread id.
+  - [ ] When canonical `sessionRef.provider == "codex"` is set for the same thread id, retain durable proof metadata if available with `state: "durable"` and clear only degraded/pending warnings. Do not keep a stale non-canonical pending state next to a matching canonical `sessionRef`.
   - [ ] Do not backfill it from `resumeSessionId`, cwd, title, or time.
+  - [ ] Add a named migration test: older persisted layouts with no `codexDurability` field must load cleanly and must not synthesize candidate state from `resumeSessionId`.
 - [ ] Update `src/components/TerminalView.tsx`.
   - [ ] On `terminal.codex.durability.updated`, update pane content with the candidate/degraded state and flush persisted layout immediately.
-  - [ ] After flush succeeds, send `terminal.codex.candidate.persisted` for candidate states.
+  - [ ] After flush succeeds, send `terminal.codex.candidate.persisted` for candidate states. This acknowledgement is idempotent and observational; it must not be required for server-side gate release because the server-side durability store is authoritative.
   - [ ] On `terminal.session.associated`, clear matching `codexDurability` and set the canonical `sessionRef` through the existing durable path.
   - [ ] Include persisted `codexDurability` in `terminal.create` when there is no canonical Codex `sessionRef`.
   - [ ] Do not send a candidate thread id as `resumeSessionId`.
 - [ ] Update `server/terminal-registry.ts`.
   - [ ] Extend `TerminalRecord` with `codexDurability` and `codexInputGate`.
-  - [ ] When proxy emits a candidate, transition to `captured_pre_turn` only after sending `terminal.codex.durability.updated` and receiving the matching `terminal.codex.candidate.persisted` acknowledgement.
-  - [ ] While `identity_pending`, `input()` returns a blocked result that `server/ws-handler.ts` can distinguish from invalid terminal id. It must not write to PTY.
-  - [ ] Once acknowledgement arrives, call sidecar/proxy `markCandidatePersisted()` and release blocked `turn/start` requests.
+  - [ ] When proxy emits a candidate, write it to the server-side durability store first. After that atomic write succeeds, transition to `captured_pre_turn`, emit `terminal.codex.durability.updated`, call sidecar/proxy `markCandidatePersisted()`, and release held `turn/start` requests.
+  - [ ] If the candidate store write fails, do not release PTY input or held `turn/start`. Mark the terminal `non_restorable`, log the failure, and keep user work from entering an untracked Codex session.
+  - [ ] Change `input()` to return `TerminalInputResult`:
+    - [ ] `{ status: "written" }`
+    - [ ] `{ status: "blocked_codex_identity_pending"; terminalId: string }`
+    - [ ] `{ status: "no_terminal" }`
+    - [ ] `{ status: "not_running" }`
+  - [ ] Update all callers of `TerminalRegistry.input()` to handle the new result shape.
   - [ ] Keep terminal resize and output flowing while input is gated.
+  - [ ] Duplicate or replayed client `terminal.codex.candidate.persisted` acknowledgements succeed only when they match the stored candidate; mismatched acks are logged and ignored.
 - [ ] Update `server/ws-handler.ts`.
   - [ ] Handle `terminal.codex.candidate.persisted` and call the registry acknowledgement method.
-  - [ ] For blocked input, log at debug/info with terminal id and bytes, but do not misreport it as `INVALID_TERMINAL_ID`.
+  - [ ] For blocked input, log at debug/info with terminal id and bytes, send `terminal.input.blocked`, and do not misreport it as `INVALID_TERMINAL_ID`.
 - [ ] Add/update tests:
-  - [ ] `test/unit/server/terminal-registry.codex-sidecar.test.ts`: input is blocked before candidate ack and written after ack.
+  - [ ] `test/unit/server/terminal-registry.codex-sidecar.test.ts`: input is blocked before server-side candidate persistence and written after the store write completes.
   - [ ] `test/unit/client/components/TerminalView.test.tsx` or nearest focused test: candidate update persists and sends ack; canonical association clears candidate state.
   - [ ] `test/unit/client/store/*`: persisted state keeps `codexDurability`.
 
@@ -230,11 +258,11 @@ git commit -m "Persist Codex candidate identity before accepting input"
     - [ ] Success: transition to `durable`, bind `resumeSessionId` through the existing `bindSessionToTerminal()` path, emit `terminal.session.associated`, record `codex_durable_session_observed`, and clear candidate state in the client.
     - [ ] Failure: transition to `durability_unproven_after_completion`, emit `terminal.codex.durability.updated`, keep the live PTY attachable if running, and log structured proof failure data.
   - [ ] Coalesce overlapping deterministic proof triggers into at most one extra immediate proof read after the current one finishes. Do not use `setInterval`, delayed backoff loops, or path-existence polling (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:526`).
-  - [ ] Watch the exact rollout path and parent if the app-server accepts it, but treat `fs/changed` only as a repair trigger that calls the same proof reader (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:482-490`, `:528-538`).
+  - [ ] Watch the exact rollout path and parent through the Freshell-owned runtime/client connection, not by injecting requests into the TUI proxy socket. This avoids JSON-RPC request-id collisions with the visible TUI. Treat `fs/changed` only as a repair trigger that calls the same proof reader (`docs/lab-notes/2026-05-13-coding-cli-session-restore-research.md:482-490`, `:528-538`).
   - [ ] On PTY exit or app-server/proxy close/error, run one proof read before finalizing state.
 - [ ] Update `server/ws-handler.ts`.
   - [ ] Ensure `terminal.session.associated` is sent only after proof success for fresh Codex.
-  - [ ] Ensure `sendError` logs server-side structured errors for `RESTORE_UNAVAILABLE`, `CODEX_IDENTITY_PENDING` if added, and Codex proof failures. This closes the silent logging gap from the original observation.
+  - [ ] Ensure `sendError` logs server-side structured errors for `RESTORE_UNAVAILABLE` and Codex proof failures. This closes the silent logging gap from the original observation.
 - [ ] Add/update tests:
   - [ ] `test/unit/server/terminal-registry.codex-sidecar.test.ts`: `turn_completed` plus matching rollout emits canonical `terminal.session.associated`.
   - [ ] `test/unit/server/terminal-registry.codex-sidecar.test.ts`: `turn_completed` plus missing/malformed/mismatched rollout emits degraded state and does not bind `resumeSessionId`.
@@ -257,6 +285,7 @@ git commit -m "Promote Codex sessions only after rollout proof"
 ### 7. Reopen Captured-But-Unproven State Deterministically
 
 - [ ] Update `server/ws-handler.ts` create/reuse flow.
+  - [ ] Ensure all user restore/list/open surfaces funnel through this create/reuse decision: sidebar row click, tab restore, background terminal restore, MCP/new-tab restore, and any history/session open path that creates a Codex terminal.
   - [ ] When `terminal.create` includes `codexDurability` and no canonical `sessionRef`, ask the registry to run one proof read before deciding how to open.
   - [ ] If proof succeeds, set `effectiveResumeSessionId` to the proven `durableThreadId` and launch a durable resume.
   - [ ] If proof fails and a live terminal on this server matches the exact candidate thread id and rollout path, attach that live terminal and keep degraded/unproven state visible.
@@ -274,6 +303,7 @@ git commit -m "Promote Codex sessions only after rollout proof"
   - [ ] Server: captured unproven reopen proof fail plus live exact candidate attaches live and stays degraded.
   - [ ] Server: captured unproven reopen proof fail plus no live exact candidate fresh-creates without passing candidate to resume.
   - [ ] Client/sidebar: live pending Codex appears as Codex, not a generic grey terminal; durable promotion updates the same entry rather than adding a duplicate.
+  - [ ] Each restore/list/open surface above uses the same proof-first path and has no independent cwd/time/title matching.
 
 Run:
 
@@ -296,7 +326,7 @@ git commit -m "Repair captured Codex reopen without nondeterministic matching"
   - [ ] Add fixture controls for delayed candidate, missing rollout, malformed rollout, mismatched rollout id, delayed `turn/completed`, proxy close, and app-server close.
   - [ ] Ensure fixture processes are tagged with temp env vars so cleanup cannot kill real user sessions.
 - [ ] Add or update e2e/integration tests:
-  - [ ] Fresh Codex launch: candidate captured, input initially gated, ack releases input, `turn/completed` promotes to canonical `sessionRef`.
+  - [ ] Fresh Codex launch: candidate captured, input initially gated, server-side candidate persistence releases input, `turn/completed` promotes to canonical `sessionRef`.
   - [ ] Missing rollout after `turn/completed`: state becomes degraded and no canonical `sessionRef` is persisted.
   - [ ] Reopen degraded with later rollout proof: proof-read repairs and resumes durable id.
   - [ ] Reopen degraded without proof after server restart: fresh-creates Codex and does not call `resume <candidateThreadId>`.
@@ -382,9 +412,9 @@ PORT=3477 npm start > /tmp/freshell-codex-durability-3477.log 2>&1 & echo $! > /
 ps -fp "$(cat /tmp/freshell-codex-durability-3477.pid)"
 ```
 
-- [ ] Use Freshell orchestration against `http://127.0.0.1:3477` and run each scenario at least three times:
-  - [ ] Fresh Codex pane: before candidate capture, input is not accepted; after candidate ack, input works.
-  - [ ] Fresh Codex pane: send a real test prompt, wait for Codex to finish, verify canonical `sessionRef` is persisted and sidebar entry remains a single Codex item.
+- [ ] Use Freshell orchestration against `http://127.0.0.1:3477` and run each fixture-backed scenario at least three times:
+  - [ ] Fresh Codex pane: before candidate capture, input is not accepted; after server-side candidate persistence, input works.
+  - [ ] Fresh Codex pane with fake TUI: send a test prompt, wait for fake `turn/completed`, verify canonical `sessionRef` is persisted and sidebar entry remains a single Codex item.
   - [ ] Fresh Codex pane: close/reopen after durable promotion, verify it resumes with `codex --remote <proxy> resume <durableThreadId>`.
   - [ ] Fresh Codex pane: reload browser before first turn completes, verify candidate state is preserved and no candidate id is used as `resumeSessionId`.
   - [ ] Fresh Codex pane: restart only the temporary server after durable promotion, verify reopen resumes durable id.
@@ -392,6 +422,9 @@ ps -fp "$(cat /tmp/freshell-codex-durability-3477.pid)"
   - [ ] Captured-but-unproven pane after temporary server restart: verify Freshell proof-reads once and fresh-creates if proof fails, without trying `codex resume <candidateThreadId>`.
   - [ ] Existing durable Codex pane: sidecar lifecycle loss triggers durable recovery and preserves the same sidebar item.
   - [ ] Shell and Claude panes: create, type, close/reopen, and server restart to verify Codex changes did not regress non-Codex terminal state.
+- [ ] Run a real Codex smoke only if the machine has working Codex auth and model access:
+  - [ ] Fresh real Codex pane: send a short harmless prompt, wait for completion, verify canonical `sessionRef` is persisted and restore works.
+  - [ ] If real Codex auth/model access is unavailable, record the skipped reason and rely on fixture-backed scenarios plus unit/integration coverage.
 
 - [ ] Inspect `/tmp/freshell-codex-durability-3477.log`.
   - [ ] Confirm structured events exist for candidate observed, candidate persisted, input gate release, turn completed, proof success/failure, and reopen decisions.
