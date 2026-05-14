@@ -43,6 +43,7 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
+  SessionLocatorSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
@@ -72,8 +73,11 @@ import {
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
+import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
+import { CodexDurabilityRefSchema } from '../shared/codex-durability.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
+import { proofCodexRollout } from './coding-cli/codex-app-server/durability-proof.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -439,7 +443,7 @@ export class WsHandler {
       ? options.serverInstanceId
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
-    this.registry.setServerInstanceId(this.serverInstanceId)
+    this.registry.setServerInstanceId?.(this.serverInstanceId)
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
     // Build the set of valid CLI provider/mode names from extensions
@@ -468,6 +472,9 @@ export class WsHandler {
       shell: ShellSchema.default('system'),
       cwd: z.string().optional(),
       resumeSessionId: z.string().optional(),
+      sessionRef: SessionLocatorSchema.optional(),
+      codexDurability: CodexDurabilityRefSchema.optional(),
+      liveTerminal: LiveTerminalHandleSchema.optional(),
       restore: z.boolean().optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
@@ -1822,8 +1829,8 @@ export class WsHandler {
           ...(m.cwd ? { cwd: m.cwd } : {}),
           mode: m.mode as TerminalMode,
           restoreRequested: m.restore === true,
-          hasRequestedSessionRef: false,
-          ...(m.resumeSessionId ? { requestedSessionId: m.resumeSessionId } : {}),
+          hasRequestedSessionRef: !!m.sessionRef,
+          ...(m.resumeSessionId || m.sessionRef?.sessionId ? { requestedSessionId: m.resumeSessionId ?? m.sessionRef.sessionId } : {}),
         })
         const endCreateTimer = startPerfTimer(
           'terminal_create',
@@ -1835,7 +1842,29 @@ export class WsHandler {
         let reused = false
         let error = false
         let rateLimited = false
+        const requestedSessionRef = normalizeUiSessionLocator(m.sessionRef)
         let effectiveResumeSessionId = m.resumeSessionId
+        if (!effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
+          effectiveResumeSessionId = requestedSessionRef.sessionId
+        }
+        if (
+          m.restore === true
+          && modeSupportsResume(m.mode as TerminalMode)
+          && (
+            !requestedSessionRef
+            || requestedSessionRef.provider !== m.mode
+            || (m.mode === 'claude' && !isValidClaudeSessionId(requestedSessionRef.sessionId))
+          )
+        ) {
+          error = true
+          this.sendError(ws, {
+            code: 'RESTORE_UNAVAILABLE',
+            message: 'Restore requires a canonical session reference.',
+            requestId: m.requestId,
+          })
+          endCreateTimer({ error, rateLimited })
+          return
+        }
         try {
           await this.withTerminalCreateLock(
             this.terminalCreateLockKey(m.mode as TerminalMode, m.requestId, effectiveResumeSessionId),
@@ -1867,7 +1896,7 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
+                  ...(m.mode !== 'codex' && opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
@@ -1922,6 +1951,14 @@ export class WsHandler {
                 // If it no longer exists, fall through and create a new one.
                 state.createdByRequestId.delete(m.requestId)
                 this.forgetCreatedRequestId(m.requestId)
+              }
+
+              if (m.liveTerminal?.serverInstanceId === this.serverInstanceId) {
+                const live = this.registry.get(m.liveTerminal.terminalId)
+                if (live && live.status === 'running' && live.mode === m.mode) {
+                  await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                  return
+                }
               }
 
               if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
@@ -1980,6 +2017,39 @@ export class WsHandler {
                   return
                 }
                 state.terminalCreateTimestamps.push(now)
+              }
+
+              if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
+                const candidate = m.codexDurability.candidate
+                const proof = await proofCodexRollout({
+                  rolloutPath: candidate.rolloutPath,
+                  candidateThreadId: candidate.candidateThreadId,
+                })
+                if (proof.ok) {
+                  effectiveResumeSessionId = proof.rolloutProofId
+                  log.info({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    candidateThreadId: candidate.candidateThreadId,
+                    rolloutPath: candidate.rolloutPath,
+                  }, 'Codex captured restore state proved durable during terminal.create')
+                } else {
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    candidateThreadId: candidate.candidateThreadId,
+                    rolloutPath: candidate.rolloutPath,
+                    reason: proof.reason,
+                  }, 'Codex captured restore state could not be proved during terminal.create')
+                  const live = this.registry.findRunningCodexTerminalByCandidate(
+                    candidate.candidateThreadId,
+                    candidate.rolloutPath,
+                  )
+                  if (live) {
+                    await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
+                    return
+                  }
+                }
               }
 
               // Re-check session ownership after async config loading in case another request
@@ -2062,9 +2132,6 @@ export class WsHandler {
                 : undefined
               pendingCodexPlan = codexPlan
 
-              if (codexPlan?.sessionId) {
-                effectiveResumeSessionId = codexPlan.sessionId
-              }
               this.assertTerminalCreateAccepted()
 
               const codexRecovery = codexPlan

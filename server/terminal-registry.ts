@@ -2762,6 +2762,21 @@ export class TerminalRegistry extends EventEmitter {
     return matches[0]
   }
 
+  findRunningCodexTerminalByCandidate(candidateThreadId: string, rolloutPath: string): TerminalRecord | undefined {
+    for (const term of this.terminals.values()) {
+      const candidate = term.codexDurability?.candidate
+      if (
+        term.mode === 'codex'
+        && term.status === 'running'
+        && candidate?.candidateThreadId === candidateThreadId
+        && candidate.rolloutPath === rolloutPath
+      ) {
+        return term
+      }
+    }
+    return undefined
+  }
+
   repairLegacySessionOwners(mode: TerminalMode, sessionId: string, cwd?: string): RepairLegacySessionOwnersResult {
     if (!modeSupportsResume(mode)) {
       return { repaired: false, clearedTerminalIds: [] }
