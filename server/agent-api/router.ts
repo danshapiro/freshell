@@ -782,7 +782,12 @@ export function createAgentApiRouter({
 
       const sentinel = `__FRESHELL_DONE_${nanoid()}__`
       const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-      registry.input(terminal.terminalId, input)
+      const inputResult = registry.input(terminal.terminalId, input)
+      if (inputResult.status !== 'written') {
+        throw new Error(inputResult.status === 'blocked_codex_identity_pending'
+          ? 'Codex restore identity is not ready yet.'
+          : 'Terminal is not running.')
+      }
 
       if (!capture || detached) {
         const message = detached ? 'command started (detached)' : 'command sent'
@@ -1186,8 +1191,11 @@ export function createAgentApiRouter({
       if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
     }
     if (!terminalId) return res.status(404).json(fail('terminal not found'))
-    const okInput = registry.input(terminalId, data)
-    res.json(ok({ terminalId }, okInput ? 'input sent' : 'terminal not running'))
+    const inputResult = registry.input(terminalId, data)
+    res.json(ok(
+      { terminalId },
+      inputResult.status === 'written' ? 'input sent' : 'terminal not running',
+    ))
   })
 
   return router

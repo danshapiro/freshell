@@ -22,6 +22,7 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 
 const log = createLogger('StorageMigration')
 
@@ -57,10 +58,12 @@ function normalizeLayoutTab(tab: Record<string, unknown>): Record<string, unknow
     sessionRef: tab.sessionRef,
     resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
   })
+  const codexDurability = sanitizeCodexDurabilityRef(tab.codexDurability)
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
   return {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
   }
 }
 
@@ -113,6 +116,7 @@ function normalizeLayoutNode(node: unknown): unknown {
         resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
       })
       const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+      const codexDurability = sanitizeCodexDurabilityRef(content.codexDurability)
       const normalizedRuntime = normalizeLegacyRecoveryFailedTerminal(rest, durableState)
       const isLegacyRecoveryFailed = (
         rest.kind === 'terminal'
@@ -127,6 +131,7 @@ function normalizeLayoutNode(node: unknown): unknown {
         content: {
           ...normalizedRuntime,
           ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
+          ...(codexDurability ? { codexDurability } : {}),
           ...(!isLegacyRecoveryFailed && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
         },
       }

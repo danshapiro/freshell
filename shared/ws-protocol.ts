@@ -10,6 +10,7 @@ import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema } from './session-contract.js'
+import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -219,10 +220,19 @@ export const TerminalCreateSchema = z.object({
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
+  codexDurability: CodexDurabilityRefSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
   restore: z.boolean().optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
+}).strict()
+
+export const TerminalCodexCandidatePersistedSchema = z.object({
+  type: z.literal('terminal.codex.candidate.persisted'),
+  terminalId: z.string().min(1),
+  candidateThreadId: z.string().min(1),
+  rolloutPath: z.string().min(1),
+  capturedAt: z.number().int().nonnegative(),
 }).strict()
 
 export const TerminalAttachIntentSchema = z.enum([
@@ -416,6 +426,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   PingSchema,
   ClientDiagnosticSchema,
   TerminalCreateSchema,
+  TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -533,6 +544,18 @@ export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
   sessionRef: SessionLocator
+}
+
+export type TerminalCodexDurabilityUpdatedMessage = {
+  type: 'terminal.codex.durability.updated'
+  terminalId: string
+  durability: CodexDurabilityRef
+}
+
+export type TerminalInputBlockedMessage = {
+  type: 'terminal.input.blocked'
+  terminalId: string
+  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout'
 }
 
 export type TerminalsChangedMessage = {
@@ -752,6 +775,7 @@ export type TerminalInventoryMessage = {
     status: 'running' | 'exited'
     runtimeStatus?: 'running' | 'recovering'
     cwd?: string
+    codexDurability?: CodexDurabilityRef
   }>
   terminalMeta: TerminalMetaRecord[]
 }
@@ -771,6 +795,8 @@ export type ServerMessage =
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
+  | TerminalCodexDurabilityUpdatedMessage
+  | TerminalInputBlockedMessage
   | TerminalsChangedMessage
   | TerminalMetaUpdatedMessage
   | TerminalInventoryMessage

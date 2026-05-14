@@ -1761,6 +1761,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         sessionRef: createSessionState.sessionRef,
         liveTerminal: createSessionState.liveTerminal,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
+        codexDurability: createSessionState.codexDurability,
         mode,
       })
       ws.send({
@@ -1770,6 +1771,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         shell: shell || 'system',
         cwd: initialCwd,
         ...(createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
+        ...(createSessionState.codexDurability ? { codexDurability: createSessionState.codexDurability } : {}),
         ...(createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
         tabId,
         paneId: paneIdRef.current,
@@ -2142,13 +2144,33 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             tabResumeSessionId: currentTab?.resumeSessionId,
           })
           if (durableIdentityUpdate?.paneUpdates) {
-            updateContent(durableIdentityUpdate.paneUpdates)
+            updateContent({ ...durableIdentityUpdate.paneUpdates, codexDurability: undefined })
           }
           if (currentTab && durableIdentityUpdate?.tabUpdates) {
-            dispatch(updateTab({ id: currentTab.id, updates: durableIdentityUpdate.tabUpdates }))
+            dispatch(updateTab({ id: currentTab.id, updates: { ...durableIdentityUpdate.tabUpdates, codexDurability: undefined } }))
           }
           if (durableIdentityUpdate?.shouldFlush) {
             dispatch(flushPersistedLayoutNow())
+          }
+        }
+
+        if (msg.type === 'terminal.codex.durability.updated' && msg.terminalId === tid) {
+          const durability = msg.durability
+          updateContent({ codexDurability: durability })
+          const currentTab = tabHasSinglePaneRef.current ? tabRef.current : undefined
+          if (currentTab) {
+            dispatch(updateTab({ id: currentTab.id, updates: { codexDurability: durability } }))
+          }
+          dispatch(flushPersistedLayoutNow())
+          const candidate = durability?.candidate
+          if (candidate) {
+            ws.send({
+              type: 'terminal.codex.candidate.persisted',
+              terminalId: tid,
+              candidateThreadId: candidate.candidateThreadId,
+              rolloutPath: candidate.rolloutPath,
+              capturedAt: candidate.capturedAt,
+            })
           }
         }
 

@@ -439,6 +439,7 @@ export class WsHandler {
       ? options.serverInstanceId
       : `srv-${randomUUID()}`
     this.bootId = `boot-${randomUUID()}`
+    this.registry.setServerInstanceId(this.serverInstanceId)
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
     // Build the set of valid CLI provider/mode names from extensions
@@ -2315,9 +2316,22 @@ export class WsHandler {
       }
 
       case 'terminal.input': {
-        const ok = this.registry.input(m.terminalId, m.data)
-        if (!ok) {
-          if (!this.registry.get(m.terminalId)) {
+        const result = this.registry.input(m.terminalId, m.data)
+        if (result.status === 'blocked_codex_identity_pending') {
+          log.debug({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+          }, 'Codex terminal input blocked until restore identity is captured')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_identity_pending',
+          })
+          return
+        }
+        if (result.status !== 'written') {
+          if (result.status === 'no_terminal') {
             recordSessionLifecycleEvent({
               kind: 'invalid_terminal_id_without_session_ref',
               terminalId: m.terminalId,
@@ -2327,6 +2341,20 @@ export class WsHandler {
             })
           }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+        }
+        return
+      }
+
+      case 'terminal.codex.candidate.persisted': {
+        const result = this.registry.acknowledgeCodexCandidatePersisted(m)
+        if (result !== 'accepted') {
+          log.warn({
+            terminalId: m.terminalId,
+            candidateThreadId: m.candidateThreadId,
+            rolloutPath: m.rolloutPath,
+            connectionId: ws.connectionId,
+            reason: result,
+          }, 'Received Codex candidate persisted acknowledgement that did not match server state')
         }
         return
       }

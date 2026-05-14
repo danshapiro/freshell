@@ -23,6 +23,7 @@ import { createLogger } from '@/lib/client-logger'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 
 
@@ -69,6 +70,7 @@ function migrateTabFields(t: Tab): Tab {
     sessionRef: (t as any).sessionRef,
     resumeSessionId: t.resumeSessionId,
   })
+  const codexDurability = sanitizeCodexDurabilityRef((t as any).codexDurability)
   return {
     ...rest,
     codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
@@ -79,6 +81,7 @@ function migrateTabFields(t: Tab): Tab {
     mode: t.mode || 'shell',
     shell: t.shell || 'system',
     sessionRef: durableState.sessionRef,
+    codexDurability,
     resumeSessionId: undefined,
     lastInputAt: t.lastInputAt,
   }
@@ -232,6 +235,7 @@ type AddTabPayload = {
   shell?: ShellType
   initialCwd?: string
   sessionRef?: Tab['sessionRef']
+  codexDurability?: Tab['codexDurability']
   serverInstanceId?: string
   resumeSessionId?: string
   sessionMetadataByKey?: Tab['sessionMetadataByKey']
@@ -254,6 +258,7 @@ export const tabsSlice = createSlice({
       const codingCliProvider =
         payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
       const sessionRef = sanitizeSessionRef(payload.sessionRef)
+      const codexDurability = sanitizeCodexDurabilityRef(payload.codexDurability)
       const tab: Tab = {
         id,
         createRequestId: payload.createRequestId || id,
@@ -267,6 +272,7 @@ export const tabsSlice = createSlice({
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
         sessionRef,
+        codexDurability,
         serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
         sessionMetadataByKey: payload.sessionMetadataByKey,

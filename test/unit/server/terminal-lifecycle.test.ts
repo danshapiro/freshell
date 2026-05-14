@@ -664,7 +664,7 @@ describe('TerminalRegistry Lifecycle', () => {
       pty._emitExit(0)
 
       const result = registry.input(term.terminalId, 'some input')
-      expect(result).toBe(false)
+      expect(result).toEqual({ status: 'not_running' })
     })
 
     it('should not call pty.write on exited terminal', () => {
@@ -679,7 +679,7 @@ describe('TerminalRegistry Lifecycle', () => {
 
     it('should return false for input to non-existent terminal', () => {
       const result = registry.input('non-existent-id', 'some input')
-      expect(result).toBe(false)
+      expect(result).toEqual({ status: 'no_terminal' })
     })
 
     it('should update lastActivityAt on successful input', () => {

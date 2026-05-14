@@ -6,6 +6,7 @@ import {
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -95,11 +96,13 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     sessionRef: tab.sessionRef,
     resumeSessionId: typeof tab.resumeSessionId === 'string' ? tab.resumeSessionId : undefined,
   })
+  const codexDurability = sanitizeCodexDurabilityRef(tab.codexDurability)
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, ...rest } = tab
 
   return {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
   } as PersistedTab
 }
 
@@ -164,6 +167,7 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
     ? content.restoreError
     : undefined
   const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
+  const codexDurability = sanitizeCodexDurabilityRef(content.codexDurability)
   const isLegacyRecoveryFailed = (
     rest.kind === 'terminal'
     && rest.mode === 'codex'
@@ -180,6 +184,7 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
   return {
     ...normalizedRuntime,
     ...(normalizedSessionRef ? { sessionRef: normalizedSessionRef } : {}),
+    ...(codexDurability ? { codexDurability } : {}),
     ...(normalizedRestoreError
       ? { restoreError: normalizedRestoreError }
       : {}),

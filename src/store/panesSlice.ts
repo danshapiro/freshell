@@ -19,6 +19,7 @@ import { createLogger } from '@/lib/client-logger'
 import { patchBrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
 import { RestoreErrorSchema, sanitizeSessionRef } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 
 
 const log = createLogger('PanesSlice')
@@ -49,6 +50,7 @@ function normalizePaneContent(
       : undefined
     const resumeSessionId = inputResumeSessionId
     const sessionRef = sanitizeSessionRef(input.sessionRef)
+    const codexDurability = sanitizeCodexDurabilityRef(input.codexDurability)
     const restoreError = RestoreErrorSchema.safeParse((input as { restoreError?: unknown }).restoreError)
     return {
       kind: 'terminal',
@@ -61,6 +63,7 @@ function normalizePaneContent(
       shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      ...(codexDurability ? { codexDurability } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,

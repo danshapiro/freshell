@@ -330,7 +330,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     expect(record.pty).toBe(replacementPty)
     expect(record.codex?.recoveryState).toBe('recovering_durable')
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
     replacementPty.onData.mock.calls[0][0]('process output before proof')
     expect(oldPty.write).not.toHaveBeenCalledWith('abc')
     expect(replacementPty.write).not.toHaveBeenCalledWith('abc')
@@ -429,7 +429,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
     expect(registry.resize(record.terminalId, 132, 41)).toBe(true)
     expect(record.cols).toBe(132)
     expect(record.rows).toBe(41)
@@ -548,7 +548,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const firstReplacementPty = await lastPty()
-    expect(registry.input(record.terminalId, 'pre-dead')).toBe(true)
+    expect(registry.input(record.terminalId, 'pre-dead')).toEqual({ status: 'written' })
 
     firstReplacementPty.onExit.mock.calls[0][0]({ exitCode: 2, signal: 0 })
 
@@ -578,7 +578,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
     replacementSidecar.emitLifecycle({
       kind: 'thread_status_changed',
       threadId: 'thread-durable-1',
@@ -610,7 +610,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
     replacementSidecar.emitLifecycle({
       kind: 'thread_status_changed',
       threadId: 'thread-durable-1',
@@ -641,7 +641,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
 
     replacementSidecar.emitLifecycle({
       kind: 'thread_started',
@@ -665,7 +665,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const pty = await lastPty()
     record.codex!.recoveryState = 'recovering_durable'
 
-    expect(registry.input(record.terminalId, 'abc')).toBe(true)
+    expect(registry.input(record.terminalId, 'abc')).toEqual({ status: 'written' })
 
     expect(pty.write).not.toHaveBeenCalledWith('abc')
   })
@@ -681,8 +681,8 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const pty = await lastPty()
     record.codex!.recoveryState = 'recovering_durable'
 
-    expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toBe(true)
-    expect(registry.input(record.terminalId, 'y')).toBe(true)
+    expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toEqual({ status: 'written' })
+    expect(registry.input(record.terminalId, 'y')).toEqual({ status: 'written' })
 
     expect(pty.write).not.toHaveBeenCalled()
     expect(record.buffer.snapshot()).toContain('Codex is reconnecting; input was not sent')
@@ -702,8 +702,8 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const client = createMockWs('pending-local-diagnostic')
 
     expect(registry.attach(record.terminalId, client as any, { pendingSnapshot: true })).toBe(record)
-    expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toBe(true)
-    expect(registry.input(record.terminalId, 'y')).toBe(true)
+    expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toEqual({ status: 'written' })
+    expect(registry.input(record.terminalId, 'y')).toEqual({ status: 'written' })
 
     expect(sentPayloads(client).some((payload) =>
       payload.type === 'terminal.output'
@@ -732,9 +732,9 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const pty = await lastPty()
     record.codex!.recoveryState = 'recovering_durable'
 
-    expect(registry.input(record.terminalId, 'first')).toBe(true)
+    expect(registry.input(record.terminalId, 'first')).toEqual({ status: 'written' })
     vi.advanceTimersByTime(10_001)
-    expect(registry.input(record.terminalId, 'second')).toBe(true)
+    expect(registry.input(record.terminalId, 'second')).toEqual({ status: 'written' })
 
     expect(pty.write).not.toHaveBeenCalled()
     expect(record.buffer.snapshot()).toContain('Codex is reconnecting; input was not sent')
@@ -756,7 +756,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const pty = await lastPty()
     record.codex!.recoveryState = 'recovering_durable'
 
-    expect(registry.input(record.terminalId, 'first')).toBe(true)
+    expect(registry.input(record.terminalId, 'first')).toEqual({ status: 'written' })
     vi.advanceTimersByTime(10_001)
 
     expect(pty.write).not.toHaveBeenCalled()
@@ -790,7 +790,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
 
-    expect(registry.input(record.terminalId, 'too-late')).toBe(true)
+    expect(registry.input(record.terminalId, 'too-late')).toEqual({ status: 'written' })
     vi.advanceTimersByTime(10_001)
     replacementSidecar.emitLifecycle({
       kind: 'thread_started',
@@ -822,8 +822,8 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
 
       const liveWs = createMockWs('live-recovery-diagnostic')
       await broker.attach(liveWs as any, record.terminalId, 'viewport_hydrate', 120, 40, 0, 'live-attach')
-      expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toBe(true)
-      expect(registry.input(record.terminalId, 'y')).toBe(true)
+      expect(registry.input(record.terminalId, 'x'.repeat(8 * 1024))).toEqual({ status: 'written' })
+      expect(registry.input(record.terminalId, 'y')).toEqual({ status: 'written' })
       await new Promise((resolve) => setTimeout(resolve, 5))
 
       expect(sentPayloads(liveWs).some((payload) =>
@@ -874,7 +874,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
     expect(record.codex?.recoveryState).toBe('recovering_pre_durable')
-    expect(registry.input(record.terminalId, 'pre')).toBe(true)
+    expect(registry.input(record.terminalId, 'pre')).toEqual({ status: 'written' })
     expect(replacementPty.write).not.toHaveBeenCalledWith('pre')
 
     await vi.waitFor(() => expect(record.codex?.recoveryState).toBe('running_live_only'), 2_000)
@@ -902,7 +902,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
     await vi.waitFor(() => expect(record.codex?.workerGeneration).toBe(2))
     const replacementPty = await lastPty()
-    expect(registry.input(record.terminalId, 'late-durable')).toBe(true)
+    expect(registry.input(record.terminalId, 'late-durable')).toEqual({ status: 'written' })
 
     replacementSidecar.emitDurableSession('thread-durable-late')
     await vi.waitFor(() => expect(record.codex?.recoveryState).toBe('recovering_durable'))
@@ -952,7 +952,7 @@ describe('TerminalRegistry Codex recovery generation guards', () => {
     const oldPty = await lastPty()
 
     oldPty.onExit.mock.calls[0][0]({ exitCode: 1, signal: 0 })
-    expect(registry.input(record.terminalId, 'fast')).toBe(true)
+    expect(registry.input(record.terminalId, 'fast')).toEqual({ status: 'written' })
 
     await vi.waitFor(() => expect(record.codex?.recoveryState).toBe('running_durable'), 600)
     const replacementPty = await lastPty()

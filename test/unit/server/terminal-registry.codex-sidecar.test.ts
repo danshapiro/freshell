@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 
 const mockPtyProcess = vi.hoisted(() => {
   const createMockPty = () => {
@@ -52,10 +55,11 @@ vi.mock('../../../server/logger', () => {
     child: vi.fn(),
   }
   logger.child.mockReturnValue(logger)
-  return { logger }
+  return { logger, sessionLifecycleLogger: logger }
 })
 
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
+import { CodexDurabilityStore } from '../../../server/coding-cli/codex-app-server/durability-store.js'
 import { logger } from '../../../server/logger.js'
 
 function deferred<T = void>() {
@@ -73,15 +77,26 @@ function createFakeSidecar(options: {
   shutdown?: () => Promise<void>
 } = {}) {
   const lifecycleLossHandlers = new Set<(event: unknown) => void>()
+  const candidateHandlers = new Set<(event: any) => void>()
   return {
     adopt: vi.fn(async () => undefined),
     listLoadedThreads: vi.fn(async () => ['thread-1']),
     waitForLoadedThread: vi.fn(options.waitForLoadedThread ?? (async () => undefined)),
     shutdown: vi.fn(options.shutdown ?? (async () => undefined)),
+    markCandidatePersisted: vi.fn(),
+    onCandidate: vi.fn((handler: (event: any) => void) => {
+      candidateHandlers.add(handler)
+      return () => candidateHandlers.delete(handler)
+    }),
     onLifecycleLoss: vi.fn((handler: (event: unknown) => void) => {
       lifecycleLossHandlers.add(handler)
       return () => lifecycleLossHandlers.delete(handler)
     }),
+    emitCandidate(event: any) {
+      for (const handler of candidateHandlers) {
+        handler(event)
+      }
+    },
     emitLifecycleLoss(event: unknown) {
       for (const handler of lifecycleLossHandlers) {
         handler(event)
@@ -94,6 +109,110 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
   beforeEach(() => {
     mockPtyProcess.instances = []
     vi.clearAllMocks()
+  })
+
+  it('persists Codex restore identity server-side before releasing fresh terminal input', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        envContext: { tabId: 'tab-1', paneId: 'pane-1' },
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_pending',
+        terminalId: term.terminalId,
+      })
+      expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
+
+      const sent: unknown[] = []
+      const client = {
+        readyState: 1,
+        bufferedAmount: 0,
+        send: vi.fn((message: string) => sent.push(JSON.parse(message))),
+      }
+      registry.attach(term.terminalId, client as any)
+
+      sidecar.emitCandidate({
+        source: 'thread_started_notification',
+        thread: {
+          id: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3',
+          path: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+          ephemeral: false,
+        },
+      })
+
+      await vi.waitFor(() => expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1))
+      const record = registry.get(term.terminalId)!
+      expect(record.codexInputGate).toBeUndefined()
+      expect(record.codexDurability).toMatchObject({
+        state: 'captured_pre_turn',
+        candidate: {
+          candidateThreadId: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3',
+          rolloutPath: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+          source: 'thread_started_notification',
+        },
+      })
+
+      const stored = await new CodexDurabilityStore({ dir: durabilityDir }).read(term.terminalId)
+      expect(stored).toMatchObject({
+        terminalId: term.terminalId,
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        serverInstanceId: 'srv-test',
+        state: 'captured_pre_turn',
+        candidate: {
+          candidateThreadId: '019e2a0c-7cef-7281-94df-d0d05d7b9ac3',
+          rolloutPath: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+        },
+      })
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'terminal.codex.durability.updated',
+        terminalId: term.terminalId,
+        durability: expect.objectContaining({
+          state: 'captured_pre_turn',
+        }),
+      }))
+
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({ status: 'written' })
+      expect(mockPtyProcess.instances[0].write).toHaveBeenCalledWith('hello\r')
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not release fresh Codex input from a browser persistence acknowledgement alone', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    expect(registry.acknowledgeCodexCandidatePersisted({
+      terminalId: term.terminalId,
+      candidateThreadId: 'thread-1',
+      rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+    })).toBe('no_candidate')
+    expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
   })
 
   it('awaits Codex sidecar teardown when killing a terminal', async () => {
@@ -183,7 +302,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(mockPtyProcess.instances[0].kill).toHaveBeenCalled()
     expect(mockPtyProcess.instances[1].write).toBeDefined()
 
-    expect(registry.input(term.terminalId, 'after recovery')).toBe(true)
+    expect(registry.input(term.terminalId, 'after recovery')).toEqual({ status: 'written' })
     expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     expect(mockPtyProcess.instances[1].write).toHaveBeenCalledWith('after recovery')
   })
@@ -279,7 +398,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     await vi.waitFor(() => expect(replacementSidecar.shutdown).toHaveBeenCalledTimes(1))
 
     expect(planCreate).toHaveBeenCalledTimes(1)
-    expect(registry.input(term.terminalId, 'still old generation')).toBe(true)
+    expect(registry.input(term.terminalId, 'still old generation')).toEqual({ status: 'written' })
     expect(mockPtyProcess.instances[0].write).toHaveBeenCalledWith('still old generation')
     expect(mockPtyProcess.instances[1].write).not.toHaveBeenCalled()
   })
@@ -511,7 +630,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(planCreate).toHaveBeenCalledTimes(2)
     expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
     expect(firstCandidate.shutdown).toHaveBeenCalledTimes(1)
-    expect(registry.input(term.terminalId, 'after retry')).toBe(true)
+    expect(registry.input(term.terminalId, 'after retry')).toEqual({ status: 'written' })
     expect(mockPtyProcess.instances[1].write).not.toHaveBeenCalled()
     expect(mockPtyProcess.instances[2].write).toHaveBeenCalledWith('after retry')
   })
@@ -549,7 +668,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     expect(oldPtyExitedDuringShutdown).toBe(true)
     expect(registry.get(term.terminalId)?.status).toBe('running')
     expect(replacementSidecar.shutdown).not.toHaveBeenCalled()
-    expect(registry.input(term.terminalId, 'after atomic handoff')).toBe(true)
+    expect(registry.input(term.terminalId, 'after atomic handoff')).toEqual({ status: 'written' })
     expect(mockPtyProcess.instances[0].write).not.toHaveBeenCalled()
     expect(mockPtyProcess.instances[1].write).toHaveBeenCalledWith('after atomic handoff')
   })

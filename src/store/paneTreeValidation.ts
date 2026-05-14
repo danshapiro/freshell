@@ -1,4 +1,5 @@
 import { isAgentChatModelSelection, normalizeAgentChatEffortOverride, type PaneNode } from './paneTypes'
+import { CodexDurabilityRefSchema } from '@shared/codex-durability'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -25,6 +26,10 @@ function isRestoreErrorShape(value: unknown): boolean {
     && typeof (value as any).reason === 'string'
 }
 
+function isCodexDurabilityShape(value: unknown): boolean {
+  return value === undefined || CodexDurabilityRefSchema.safeParse(value).success
+}
+
 function isPaneContentShape(content: unknown): boolean {
   if (!isRecord(content) || typeof content.kind !== 'string') {
     return false
@@ -39,6 +44,7 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.shell)
         && isOptionalString(content.resumeSessionId)
         && isSessionRefShape(content.sessionRef)
+        && isCodexDurabilityShape(content.codexDurability)
         && isRestoreErrorShape(content.restoreError)
         && isOptionalString(content.initialCwd)
     case 'browser':

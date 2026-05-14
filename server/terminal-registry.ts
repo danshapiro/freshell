@@ -9,6 +9,12 @@ import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { ServerSettings } from '../shared/settings.js'
+import {
+  CODEX_DURABILITY_SCHEMA_VERSION,
+  type CodexCandidateSource,
+  type CodexDurabilityRef,
+  type CodexDurabilityStoreRecord,
+} from '../shared/codex-durability.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { LoopbackServerEndpoint } from './local-port.js'
@@ -26,6 +32,8 @@ import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
+import { CodexDurabilityStore } from './coding-cli/codex-app-server/durability-store.js'
+import type { CodexRemoteProxyCandidate } from './coding-cli/codex-app-server/remote-proxy.js'
 import { collectShutdownFailures, throwShutdownFailures } from './shutdown-join.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 
@@ -451,11 +459,13 @@ export type TerminalRecord = {
     lastInputToOutputMs?: number
     maxInputToOutputMs: number
   }
-  codexSidecar?: Pick<CodexLaunchSidecar, 'shutdown' | 'onLifecycleLoss'>
+  codexSidecar?: Pick<CodexLaunchSidecar, 'shutdown' | 'onLifecycleLoss' | 'onCandidate' | 'markCandidatePersisted'>
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
   codexSidecarPrePublicationLoss?: unknown
   codexSidecarGeneration?: number
+  codexDurability?: CodexDurabilityRef
+  codexInputGate?: { state: 'identity_pending' }
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
   codexRecoveryRetry?: { timer: NodeJS.Timeout; resolve: () => void }
@@ -463,6 +473,12 @@ export type TerminalRecord = {
   codexRecoveryFinalClose?: boolean
   codexRecoveryRetiringPty?: pty.IPty
 }
+
+export type TerminalInputResult =
+  | { status: 'written' }
+  | { status: 'blocked_codex_identity_pending'; terminalId: string }
+  | { status: 'no_terminal' }
+  | { status: 'not_running' }
 
 export type BindSessionResult =
   | { ok: true; terminalId: string; sessionId: string }
@@ -473,6 +489,11 @@ export type RepairLegacySessionOwnersResult = {
   repaired: boolean
   canonicalTerminalId?: string
   clearedTerminalIds: string[]
+}
+
+type TerminalRegistryOptions = {
+  codexDurabilityStore?: CodexDurabilityStore
+  serverInstanceId?: string
 }
 
 export class ChunkRingBuffer {
@@ -1006,11 +1027,18 @@ export class TerminalRegistry extends EventEmitter {
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
   private sidecarShutdowns = new Map<string, SidecarShutdownEntry>()
+  private codexDurabilityStore: CodexDurabilityStore
+  private serverInstanceId: string
   // Legacy transport batching path. Broker cutover destination:
   // - outputBuffers/flush timers/mobile batching -> broker client-output queue.
   private outputBuffers = new Map<WebSocket, PendingOutput>()
 
-  constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
+  constructor(
+    settings?: ServerSettings,
+    maxTerminals?: number,
+    maxExitedTerminals?: number,
+    options: TerminalRegistryOptions = {},
+  ) {
     super()
     // Permanent terminal.exit listeners: index, ws-handler, broker, codex-wiring,
     // terminal-view. Shutdown uses a single shared listener (no per-terminal scaling).
@@ -1018,6 +1046,8 @@ export class TerminalRegistry extends EventEmitter {
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
     this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
+    this.codexDurabilityStore = options.codexDurabilityStore ?? new CodexDurabilityStore()
+    this.serverInstanceId = options.serverInstanceId?.trim() || process.env.FRESHELL_SERVER_INSTANCE_ID || `srv-${process.pid}`
     this.scrollbackMaxChars = this.computeScrollbackMaxChars(settings)
     {
       const raw = Number(process.env.MAX_PENDING_SNAPSHOT_CHARS || DEFAULT_MAX_PENDING_SNAPSHOT_CHARS)
@@ -1025,6 +1055,12 @@ export class TerminalRegistry extends EventEmitter {
     }
     this.startIdleMonitor()
     this.startPerfMonitor()
+  }
+
+  setServerInstanceId(serverInstanceId: string): void {
+    const normalized = serverInstanceId.trim()
+    if (!normalized) return
+    this.serverInstanceId = normalized
   }
 
   setSettings(settings: ServerSettings) {
@@ -1297,6 +1333,9 @@ export class TerminalRegistry extends EventEmitter {
         ? !opts.providerSettings?.codexAppServer?.deferLifecycleUntilPublished
         : undefined,
       codexSidecarGeneration: opts.mode === 'codex' ? 0 : undefined,
+      codexInputGate: opts.mode === 'codex' && !resumeForBinding
+        ? { state: 'identity_pending' }
+        : undefined,
       codexRecovery: opts.mode === 'codex' ? opts.providerSettings?.codexAppServer?.recovery : undefined,
       perf: perfConfig.enabled
         ? {
@@ -1450,8 +1489,131 @@ export class TerminalRegistry extends EventEmitter {
 
   private registerCodexSidecarLifecycle(record: TerminalRecord): void {
     record.codexSidecarLifecycleUnsubscribe?.()
-    record.codexSidecarLifecycleUnsubscribe = record.codexSidecar?.onLifecycleLoss?.((event) => {
+    const sidecar = record.codexSidecar
+    if (!sidecar) {
+      record.codexSidecarLifecycleUnsubscribe = undefined
+      return
+    }
+
+    const unsubscribers: Array<() => void> = []
+    const lifecycleUnsubscribe = sidecar.onLifecycleLoss?.((event) => {
       this.handleCodexLifecycleLoss(record.terminalId, event)
+    })
+    if (lifecycleUnsubscribe) unsubscribers.push(lifecycleUnsubscribe)
+
+    const candidateUnsubscribe = sidecar.onCandidate?.((candidate) => {
+      void this.persistCodexCandidate(record.terminalId, candidate).catch((err) => {
+        logger.error({ err, terminalId: record.terminalId }, 'Failed to persist Codex restore identity')
+      })
+    })
+    if (candidateUnsubscribe) unsubscribers.push(candidateUnsubscribe)
+
+    record.codexSidecarLifecycleUnsubscribe = () => {
+      for (const unsubscribe of unsubscribers.splice(0)) {
+        unsubscribe()
+      }
+    }
+  }
+
+  private buildCodexDurabilityRef(candidate: CodexRemoteProxyCandidate, capturedAt: number): CodexDurabilityRef | undefined {
+    const candidateThreadId = candidate.thread.id
+    const rolloutPath = typeof candidate.thread.path === 'string' ? candidate.thread.path : undefined
+    if (!candidateThreadId || !rolloutPath || candidate.thread.ephemeral === true || !path.isAbsolute(rolloutPath)) {
+      return undefined
+    }
+    return {
+      schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+      state: 'captured_pre_turn',
+      candidate: {
+        provider: 'codex',
+        candidateThreadId,
+        rolloutPath,
+        source: candidate.source as CodexCandidateSource,
+        capturedAt,
+      },
+    }
+  }
+
+  private codexDurabilityRecordToRef(record: CodexDurabilityStoreRecord): CodexDurabilityRef {
+    return {
+      schemaVersion: record.schemaVersion,
+      state: record.state,
+      ...(record.candidate ? { candidate: record.candidate } : {}),
+      ...(record.turnCompletedAt !== undefined ? { turnCompletedAt: record.turnCompletedAt } : {}),
+      ...(record.lastProofFailure ? { lastProofFailure: record.lastProofFailure } : {}),
+      ...(record.durableThreadId ? { durableThreadId: record.durableThreadId } : {}),
+      ...(record.nonRestorableReason ? { nonRestorableReason: record.nonRestorableReason } : {}),
+    }
+  }
+
+  private async persistCodexCandidate(terminalId: string, candidate: CodexRemoteProxyCandidate): Promise<void> {
+    const record = this.terminals.get(terminalId)
+    if (!record || record.status !== 'running') return
+    if (record.mode !== 'codex') return
+    if (record.resumeSessionId) return
+
+    const capturedAt = Date.now()
+    const durability = this.buildCodexDurabilityRef(candidate, capturedAt)
+    if (!durability?.candidate) {
+      logger.warn({
+        terminalId,
+        threadId: candidate.thread.id,
+        rolloutPath: candidate.thread.path,
+        ephemeral: candidate.thread.ephemeral,
+        source: candidate.source,
+      }, 'Ignoring Codex restore identity candidate without deterministic rollout path')
+      return
+    }
+
+    if (record.codexDurability?.candidate) {
+      const existing = record.codexDurability.candidate
+      if (
+        existing.candidateThreadId === durability.candidate.candidateThreadId
+        && existing.rolloutPath === durability.candidate.rolloutPath
+      ) {
+        record.codexSidecar?.markCandidatePersisted?.()
+        return
+      }
+      logger.warn({
+        terminalId,
+        existingThreadId: existing.candidateThreadId,
+        candidateThreadId: durability.candidate.candidateThreadId,
+      }, 'Ignoring mismatched Codex restore identity candidate after one was already persisted')
+      return
+    }
+
+    const stored = await this.codexDurabilityStore.write({
+      ...durability,
+      terminalId,
+      ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
+      ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
+      serverInstanceId: this.serverInstanceId,
+      updatedAt: capturedAt,
+    })
+    const storedDurability = this.codexDurabilityRecordToRef(stored)
+    record.codexDurability = storedDurability
+    record.codexInputGate = undefined
+    record.codexSidecar?.markCandidatePersisted?.()
+    logger.info({
+      terminalId,
+      candidateThreadId: storedDurability.candidate?.candidateThreadId,
+      rolloutPath: storedDurability.candidate?.rolloutPath,
+      source: storedDurability.candidate?.source,
+    }, 'Persisted Codex restore identity before user input')
+    this.broadcastCodexDurability(record, storedDurability)
+  }
+
+  private broadcastCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef): void {
+    for (const client of record.clients) {
+      this.safeSend(client, {
+        type: 'terminal.codex.durability.updated',
+        terminalId: record.terminalId,
+        durability,
+      }, { terminalId: record.terminalId, perf: record.perf })
+    }
+    this.emit('terminal.codex.durability.updated', {
+      terminalId: record.terminalId,
+      durability,
     })
   }
 
@@ -1861,9 +2023,13 @@ export class TerminalRegistry extends EventEmitter {
     return true
   }
 
-  input(terminalId: string, data: string): boolean {
+  input(terminalId: string, data: string): TerminalInputResult {
     const term = this.terminals.get(terminalId)
-    if (!term || term.status !== 'running') return false
+    if (!term) return { status: 'no_terminal' }
+    if (term.status !== 'running') return { status: 'not_running' }
+    if (term.codexInputGate?.state === 'identity_pending') {
+      return { status: 'blocked_codex_identity_pending', terminalId }
+    }
     const now = Date.now()
     term.lastActivityAt = now
     if (term.perf) {
@@ -1882,6 +2048,32 @@ export class TerminalRegistry extends EventEmitter {
       data,
       at: now,
     } satisfies TerminalInputRawEvent)
+    return { status: 'written' }
+  }
+
+  acknowledgeCodexCandidatePersisted(input: {
+    terminalId: string
+    candidateThreadId: string
+    rolloutPath: string
+  }): 'accepted' | 'missing_terminal' | 'mismatch' | 'no_candidate' {
+    const term = this.terminals.get(input.terminalId)
+    if (!term) return 'missing_terminal'
+    const candidate = term.codexDurability?.candidate
+    if (!candidate) return 'no_candidate'
+    if (
+      candidate.candidateThreadId !== input.candidateThreadId
+      || candidate.rolloutPath !== input.rolloutPath
+    ) {
+      return 'mismatch'
+    }
+    return 'accepted'
+  }
+
+  releaseCodexInputGateForTest(terminalId: string): boolean {
+    const term = this.terminals.get(terminalId)
+    if (!term) return false
+    term.codexInputGate = undefined
+    term.codexSidecar?.markCandidatePersisted?.()
     return true
   }
 
@@ -2079,6 +2271,7 @@ export class TerminalRegistry extends EventEmitter {
     status: 'running' | 'exited'
     hasClients: boolean
     cwd?: string
+    codexDurability?: CodexDurabilityRef
   }> {
     return Array.from(this.terminals.values()).map((t) => ({
       terminalId: t.terminalId,
@@ -2091,6 +2284,7 @@ export class TerminalRegistry extends EventEmitter {
       status: t.status,
       hasClients: t.clients.size > 0,
       cwd: t.cwd,
+      codexDurability: t.codexDurability,
     }))
   }
 

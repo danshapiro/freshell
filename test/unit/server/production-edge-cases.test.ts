@@ -509,7 +509,7 @@ describe('TerminalRegistry Production Edge Cases', () => {
       registry = new TerminalRegistry()
 
       const result = registry.input('nonexistent-terminal-id', 'test')
-      expect(result).toBe(false)
+      expect(result).toEqual({ status: 'no_terminal' })
     })
 
     it('handles input to exited terminal', () => {
@@ -522,7 +522,7 @@ describe('TerminalRegistry Production Edge Cases', () => {
       emitExit(0)
 
       const result = registry.input(record.terminalId, 'test')
-      expect(result).toBe(false)
+      expect(result).toEqual({ status: 'not_running' })
     })
 
     it('handles resize with extreme dimensions', () => {
