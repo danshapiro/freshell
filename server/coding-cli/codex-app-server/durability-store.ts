@@ -6,7 +6,7 @@ import {
   type CodexDurabilityStoreRecord,
 } from '../../../shared/codex-durability.js'
 
-type StoreFs = Pick<typeof fsp, 'mkdir' | 'readFile' | 'rename' | 'unlink' | 'writeFile'>
+type StoreFs = Pick<typeof fsp, 'mkdir' | 'readFile' | 'readdir' | 'rename' | 'unlink' | 'writeFile'>
 
 export function defaultCodexDurabilityStoreDir(): string {
   return process.env.FRESHELL_CODEX_DURABILITY_DIR
@@ -64,6 +64,49 @@ export class CodexDurabilityStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
+  }
+
+  async deleteRecordsForOtherServers(serverInstanceId: string): Promise<number> {
+    const currentServerInstanceId = serverInstanceId.trim()
+    if (!currentServerInstanceId) return 0
+
+    let entries: string[]
+    try {
+      entries = await this.fsImpl.readdir(this.dir)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0
+      throw error
+    }
+
+    let deleted = 0
+    for (const entry of entries) {
+      if (!entry.endsWith('.json')) continue
+      const filePath = path.join(this.dir, entry)
+      let raw: string
+      try {
+        raw = await this.fsImpl.readFile(filePath, 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
+        throw error
+      }
+
+      let parsedJson: unknown
+      try {
+        parsedJson = JSON.parse(raw)
+      } catch {
+        await this.fsImpl.unlink(filePath)
+        deleted += 1
+        continue
+      }
+
+      const parsed = CodexDurabilityStoreRecordSchema.safeParse(parsedJson)
+      if (!parsed.success || parsed.data.serverInstanceId !== currentServerInstanceId) {
+        await this.fsImpl.unlink(filePath)
+        deleted += 1
+      }
+    }
+
+    return deleted
   }
 
   recordPath(terminalId: string): string {

@@ -1074,6 +1074,19 @@ export class TerminalRegistry extends EventEmitter {
       const raw = Number(process.env.MAX_PENDING_SNAPSHOT_CHARS || DEFAULT_MAX_PENDING_SNAPSHOT_CHARS)
       this.maxPendingSnapshotChars = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_PENDING_SNAPSHOT_CHARS
     }
+    void this.codexDurabilityStore.deleteRecordsForOtherServers(this.serverInstanceId).then((deleted) => {
+      if (deleted > 0) {
+        logger.info({
+          deleted,
+          serverInstanceId: this.serverInstanceId,
+        }, 'Deleted stale Codex durability store records from older server instances')
+      }
+    }).catch((err) => {
+      logger.warn({
+        err,
+        serverInstanceId: this.serverInstanceId,
+      }, 'Failed to delete stale Codex durability store records from older server instances')
+    })
     this.startIdleMonitor()
     this.startPerfMonitor()
   }

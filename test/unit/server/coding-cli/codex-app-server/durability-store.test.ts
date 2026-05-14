@@ -82,4 +82,29 @@ describe('CodexDurabilityStore', () => {
     await expect(store.delete('term-1')).resolves.toBeUndefined()
     await expect(store.read('term-1')).resolves.toBeUndefined()
   })
+
+  it('deletes stale records owned by older server instances', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    await store.write(record({ terminalId: 'term-current', serverInstanceId: 'srv-current' }))
+    await store.write(record({ terminalId: 'term-old', serverInstanceId: 'srv-old' }))
+
+    await expect(store.deleteRecordsForOtherServers('srv-current')).resolves.toBe(1)
+
+    await expect(store.read('term-current')).resolves.toMatchObject({
+      terminalId: 'term-current',
+      serverInstanceId: 'srv-current',
+    })
+    await expect(store.read('term-old')).resolves.toBeUndefined()
+  })
+
+  it('deletes invalid stale files during startup reaping', async () => {
+    const store = new CodexDurabilityStore({ dir: tempDir })
+    await store.write(record({ terminalId: 'term-current', serverInstanceId: 'srv-current' }))
+    await fsp.writeFile(path.join(tempDir, 'bad.json'), '{bad json\n')
+    await fsp.writeFile(path.join(tempDir, 'wrong-shape.json'), '{}\n')
+
+    await expect(store.deleteRecordsForOtherServers('srv-current')).resolves.toBe(2)
+
+    await expect(fsp.readdir(tempDir)).resolves.toEqual(['term-current.json'])
+  })
 })
