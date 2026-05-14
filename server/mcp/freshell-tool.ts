@@ -541,7 +541,7 @@ async function routeAction(
     // -- Tab actions --
     case 'new-tab': {
       const { name, mode, shell, cwd, browser, editor, resume, prompt, ...rest } = params || {}
-      const sessionRef = typeof mode === 'string' && typeof resume === 'string'
+      const sessionRef = typeof mode === 'string' && mode !== 'codex' && typeof resume === 'string'
         ? { provider: mode, sessionId: resume }
         : undefined
       const tabResult = await c.post('/api/tabs', {

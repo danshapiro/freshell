@@ -102,6 +102,23 @@ describe('executeAction -- tab actions', () => {
     expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
   })
 
+  it('new-tab does not treat Codex resume as a durable sessionRef', async () => {
+    mockClient.post.mockResolvedValue({ id: 't1' })
+
+    await executeAction('new-tab', {
+      name: 'Codex',
+      mode: 'codex',
+      resume: 'thread-pre-durable',
+    })
+
+    expect(mockClient.post).toHaveBeenCalledWith('/api/tabs', expect.objectContaining({
+      name: 'Codex',
+      mode: 'codex',
+    }))
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('sessionRef')
+    expect(mockClient.post.mock.calls.at(-1)?.[1]).not.toHaveProperty('resumeSessionId')
+  })
+
   it('list-tabs calls GET /api/tabs', async () => {
     mockClient.get.mockResolvedValue({ tabs: [] })
     await executeAction('list-tabs')

@@ -405,7 +405,7 @@ describe('tab endpoints', () => {
     expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
   })
 
-  it('kills the created Codex terminal when resume readiness returns after the PTY exited', async () => {
+  it('fresh-creates Codex tabs when raw resume ids arrive without durability proof', async () => {
     const app = express()
     app.use(express.json())
     const terminal = { terminalId: 'term_exited_before_publish', status: 'running' }
@@ -430,17 +430,28 @@ describe('tab endpoints', () => {
     }
     app.use('/api', createAgentApiRouter({ layoutStore, registry, codexLaunchPlanner }))
 
+    const sessionRef = { provider: 'codex', sessionId: 'thread-session-ref' }
     const res = await request(app).post('/api/tabs').send({
       mode: 'codex',
       name: 'resume tab',
+      sessionRef,
       resumeSessionId: 'thread-resume-exits',
     })
 
-    expect(res.status).toBe(500)
-    expect(res.body.message).toContain('Codex terminal PTY exited before create completed')
-    expect(registry.killAndWait).toHaveBeenCalledWith('term_exited_before_publish')
-    expect(codexLaunchPlanner.sidecar.shutdownCalls).toBe(1)
-    expect(layoutStore.attachPaneContent).not.toHaveBeenCalled()
+    expect(res.status).toBe(200)
+    expect(codexLaunchPlanner.planCreateCalls[0]).toEqual(expect.objectContaining({
+      resumeSessionId: undefined,
+    }))
+    expect(codexLaunchPlanner.sidecar.waitForLoadedThreadCalls).toEqual([])
+    expect(registry.create).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'codex',
+      resumeSessionId: undefined,
+    }))
+    expect(registry.killAndWait).not.toHaveBeenCalled()
+    expect(layoutStore.attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.any(Object))
+    const content = layoutStore.attachPaneContent.mock.calls[0]?.[2]
+    expect(content).not.toHaveProperty('sessionRef')
+    expect(content).not.toHaveProperty('resumeSessionId')
   })
 
   it('kills the created Codex terminal without waiting for readiness when shutdown admission closes after adoption', async () => {

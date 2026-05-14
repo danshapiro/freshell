@@ -571,6 +571,13 @@ export const openSessionTab = createAsyncThunk(
       cwd,
       agentChatProviderSettings: providerSettings,
     })
+    const desiredOpenContent = shouldPersistSessionRef || desiredResumeContent.kind !== 'terminal'
+      ? desiredResumeContent
+      : ({
+          kind: 'terminal' as const,
+          mode: resolvedProvider,
+          initialCwd: cwd,
+        })
 
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
       if (!tab) return
@@ -606,7 +613,16 @@ export const openSessionTab = createAsyncThunk(
             && resolvedProvider === 'claude'
             && content.resumeSessionId === sessionId
           )
-          if (matchesExplicitSessionRef || matchesImplicitSessionRef) {
+          const matchesCodexDurability = (
+            resolvedProvider === 'codex'
+            && content.kind === 'terminal'
+            && content.mode === 'codex'
+            && (
+              content.codexDurability?.durableThreadId === sessionId
+              || content.codexDurability?.candidate?.candidateThreadId === sessionId
+            )
+          )
+          if (matchesExplicitSessionRef || matchesImplicitSessionRef || matchesCodexDurability) {
             matchingLeaves.push({ id: node.id, content })
           }
           return
@@ -716,12 +732,12 @@ export const openSessionTab = createAsyncThunk(
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
-      sessionRef: desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
-      sessionMetadataByKey: buildSessionMetadataByKey(),
+      sessionRef: shouldPersistSessionRef && desiredResumeContent.kind === 'terminal' ? desiredResumeContent.sessionRef : undefined,
+      sessionMetadataByKey: shouldPersistSessionRef ? buildSessionMetadataByKey() : undefined,
     }))
     dispatch(initLayout({
       tabId,
-      content: desiredResumeContent,
+      content: desiredOpenContent,
     }))
   }
 )

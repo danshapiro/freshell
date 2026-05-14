@@ -131,10 +131,19 @@ function requestedResumeSessionIdForMode(
   mode: string,
   legacyResumeSessionId: unknown,
 ): string | undefined {
-  if (sessionRef && sessionRef.provider === mode) {
-    return sessionRef.sessionId
-  }
+  const acceptedSessionRef = acceptedSessionRefForMode(sessionRef, mode)
+  if (acceptedSessionRef) return acceptedSessionRef.sessionId
+  if (mode === 'codex') return undefined
   return typeof legacyResumeSessionId === 'string' ? legacyResumeSessionId : undefined
+}
+
+function acceptedSessionRefForMode(
+  sessionRef: ReturnType<typeof sanitizeSessionRef>,
+  mode: string,
+): ReturnType<typeof sanitizeSessionRef> {
+  if (!sessionRef || sessionRef.provider !== mode) return undefined
+  if (mode === 'codex') return undefined
+  return sessionRef
 }
 
 async function adoptCodexLaunch(
@@ -503,6 +512,7 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
+        const acceptedSessionRef = acceptedSessionRefForMode(requestedSessionRef, effectiveMode)
         const requestedResumeSessionId = requestedResumeSessionIdForMode(
           requestedSessionRef,
           effectiveMode,
@@ -546,8 +556,8 @@ export function createAgentApiRouter({
           status: 'running',
           mode: mode || 'shell',
           shell: shell || 'system',
-          ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
-          ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
+          ...(acceptedSessionRef ? { sessionRef: acceptedSessionRef } : {}),
+          ...(launchResumeSessionId && !acceptedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
           initialCwd: cwd,
         }
 
@@ -1016,6 +1026,7 @@ export function createAgentApiRouter({
       } else {
         const splitMode = req.body?.mode || 'shell'
         const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+        const acceptedSessionRef = acceptedSessionRefForMode(requestedSessionRef, splitMode)
         const requestedResumeSessionId = requestedResumeSessionIdForMode(
           requestedSessionRef,
           splitMode,
@@ -1049,7 +1060,7 @@ export function createAgentApiRouter({
         assertTerminalAdmission()
         await adoptCodexLaunch(launch, terminal.terminalId)
         assertTerminalAdmission()
-        await waitForCodexResumeReadiness(launch, req.body?.resumeSessionId)
+        await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
         assertCodexCreateTerminalRunning(terminal)
         assertTerminalAdmission()
         publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -1061,8 +1072,8 @@ export function createAgentApiRouter({
           status: 'running',
           mode: req.body?.mode || 'shell',
           shell: req.body?.shell || 'system',
-          ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
-          ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
+          ...(acceptedSessionRef ? { sessionRef: acceptedSessionRef } : {}),
+          ...(launchResumeSessionId && !acceptedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
         }
       }
 
@@ -1253,6 +1264,7 @@ export function createAgentApiRouter({
       if (!tabId) return res.status(404).json(fail('pane not found'))
       const effectiveMode = req.body?.mode || 'shell'
       const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+      const acceptedSessionRef = acceptedSessionRefForMode(requestedSessionRef, effectiveMode)
       const requestedResumeSessionId = requestedResumeSessionIdForMode(
         requestedSessionRef,
         effectiveMode,
@@ -1299,8 +1311,8 @@ export function createAgentApiRouter({
         mode: req.body?.mode || 'shell',
         shell: req.body?.shell || 'system',
         createRequestId: nanoid(),
-        ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
-        ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
+        ...(acceptedSessionRef ? { sessionRef: acceptedSessionRef } : {}),
+        ...(launchResumeSessionId && !acceptedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
       }
       layoutStore.attachPaneContent(tabId, paneId, content)
       wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })

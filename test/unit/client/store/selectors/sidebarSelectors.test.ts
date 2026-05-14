@@ -449,6 +449,7 @@ describe('sidebarSelectors', () => {
           runningTerminalId: 'term-codex-a',
           runningTerminalIds: ['term-codex-a', 'term-codex-b'],
           isRestorable: false,
+          codexDurabilityState: 'captured_pre_turn',
           isFallback: true,
         }),
       ])
@@ -491,6 +492,7 @@ describe('sidebarSelectors', () => {
           isRunning: true,
           runningTerminalId: 'term-codex-durable',
           isRestorable: true,
+          codexDurabilityState: 'durable',
         }),
       ])
     })
@@ -540,6 +542,7 @@ describe('sidebarSelectors', () => {
           hasTab: true,
           isRunning: false,
           isRestorable: false,
+          codexDurabilityState: 'captured_pre_turn',
         }),
       ])
     })

@@ -7,7 +7,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import type { SessionListMetadata } from '../types'
 import { getLeafDirectoryName, matchTitleTierMetadata } from '../../../shared/session-title-search.js'
-import type { CodexDurabilityRef } from '../../../shared/codex-durability.js'
+import type { CodexDurabilityRef, CodexDurabilityStateName } from '../../../shared/codex-durability.js'
 
 export interface SidebarSessionItem {
   id: string
@@ -32,6 +32,8 @@ export interface SidebarSessionItem {
   hasTitle: boolean
   isFallback?: true
   isRestorable?: boolean
+  codexDurabilityState?: CodexDurabilityStateName
+  codexDurabilityReason?: string
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
@@ -70,6 +72,19 @@ function isCodexDurabilityRestorable(durability?: CodexDurabilityRef): boolean {
   return Boolean(durability?.state === 'durable' && durability.durableThreadId)
 }
 
+function getCodexDurabilityReason(durability?: CodexDurabilityRef): string | undefined {
+  return durability?.nonRestorableReason ?? durability?.lastProofFailure?.message ?? durability?.lastProofFailure?.reason
+}
+
+type RunningSessionInfo = {
+  terminalId: string
+  createdAt: number
+  allTerminalIds: string[]
+  isRestorable?: boolean
+  codexDurabilityState?: CodexDurabilityStateName
+  codexDurabilityReason?: string
+}
+
 export function buildSessionItems(
   projects: RootState['sessions']['projects'],
   tabs: RootState['tabs']['tabs'],
@@ -80,7 +95,7 @@ export function buildSessionItems(
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
   const itemsByKey = new Map<string, SidebarSessionItem>()
-  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[]; isRestorable?: boolean }>()
+  const runningSessionMap = new Map<string, RunningSessionInfo>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
@@ -99,16 +114,33 @@ export function buildSessionItems(
       const isRestorable = sessionRef === terminal.sessionRef
         ? true
         : isCodexDurabilityRestorable(terminal.codexDurability)
+      const codexDurabilityState = terminal.mode === 'codex'
+        ? terminal.codexDurability?.state
+        : undefined
+      const codexDurabilityReason = terminal.mode === 'codex'
+        ? getCodexDurabilityReason(terminal.codexDurability)
+        : undefined
       const existing = runningSessionMap.get(sessionKey)
       if (existing) {
         existing.allTerminalIds.push(terminal.terminalId)
         existing.isRestorable = existing.isRestorable || isRestorable
+        if (!existing.codexDurabilityState || codexDurabilityState === 'durable') {
+          existing.codexDurabilityState = codexDurabilityState
+        }
+        existing.codexDurabilityReason = existing.codexDurabilityReason ?? codexDurabilityReason
         if (terminal.createdAt < existing.createdAt) {
           existing.terminalId = terminal.terminalId
           existing.createdAt = terminal.createdAt
         }
       } else {
-        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt, allTerminalIds: [terminal.terminalId], isRestorable })
+        runningSessionMap.set(sessionKey, {
+          terminalId: terminal.terminalId,
+          createdAt: terminal.createdAt,
+          allTerminalIds: [terminal.terminalId],
+          isRestorable,
+          codexDurabilityState,
+          codexDurabilityReason,
+        })
       }
     }
   }
@@ -155,6 +187,9 @@ export function buildSessionItems(
         isNonInteractive: session.isNonInteractive,
         firstUserMessage: session.firstUserMessage,
         isFallback: undefined,
+        isRestorable: runningTerminal?.isRestorable,
+        codexDurabilityState: runningTerminal?.codexDurabilityState,
+        codexDurabilityReason: runningTerminal?.codexDurabilityReason,
       }
       items.push(item)
       itemsByKey.set(key, item)
@@ -173,6 +208,8 @@ export function buildSessionItems(
     metadata?: SessionListMetadata
     hasTab?: boolean
     isRestorable?: boolean
+    codexDurabilityState?: CodexDurabilityStateName
+    codexDurabilityReason?: string
   }) => {
     const key = `${input.provider}:${input.sessionId}`
     const existing = itemsByKey.get(key)
@@ -195,6 +232,12 @@ export function buildSessionItems(
       }
       existing.hasTab = existing.hasTab || (input.hasTab ?? true)
       existing.isRestorable = existing.isRestorable || input.isRestorable
+      existing.codexDurabilityState = existing.codexDurabilityState
+        ?? input.codexDurabilityState
+        ?? runningSessionMap.get(key)?.codexDurabilityState
+      existing.codexDurabilityReason = existing.codexDurabilityReason
+        ?? input.codexDurabilityReason
+        ?? runningSessionMap.get(key)?.codexDurabilityReason
       if (existing.isSubagent === undefined && input.metadata?.isSubagent !== undefined) {
         existing.isSubagent = input.metadata.isSubagent
       }
@@ -230,6 +273,8 @@ export function buildSessionItems(
       firstUserMessage: input.metadata?.firstUserMessage,
       isFallback: true,
       isRestorable: input.isRestorable ?? runningTerminal?.isRestorable,
+      codexDurabilityState: input.codexDurabilityState ?? runningTerminal?.codexDurabilityState,
+      codexDurabilityReason: input.codexDurabilityReason ?? runningTerminal?.codexDurabilityReason,
     }
     items.push(item)
     itemsByKey.set(key, item)
@@ -281,6 +326,8 @@ export function buildSessionItems(
         cwd: node.content.initialCwd,
         timestamp: fallbackTimestamp,
         isRestorable: isCodexDurabilityRestorable(codexDurability),
+        codexDurabilityState: codexDurability?.state,
+        codexDurabilityReason: getCodexDurabilityReason(codexDurability),
       })
       return
     }
@@ -333,6 +380,8 @@ export function buildSessionItems(
       timestamp: terminal.lastActivityAt,
       hasTab: false,
       isRestorable: isCodexDurabilityRestorable(terminal.codexDurability),
+      codexDurabilityState: terminal.codexDurability?.state,
+      codexDurabilityReason: getCodexDurabilityReason(terminal.codexDurability),
     })
   }
 

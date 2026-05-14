@@ -914,6 +914,83 @@ describe('tabsSlice', () => {
       }
     })
 
+    it('opens a non-restorable Codex row as a fresh terminal when no live terminal can be attached', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'thread-pre-durable',
+        provider: 'codex',
+        title: 'Codex CLI',
+        cwd: '/repo',
+        isRestorable: false,
+      }))
+
+      const tabs = store.getState().tabs.tabs
+      expect(tabs).toHaveLength(1)
+      expect(tabs[0].sessionRef).toBeUndefined()
+      expect(tabs[0].sessionMetadataByKey).toBeUndefined()
+
+      const layout = store.getState().panes.layouts[tabs[0].id]
+      expect(layout).toBeDefined()
+      if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
+        expect(layout.content.mode).toBe('codex')
+        expect(layout.content.initialCwd).toBe('/repo')
+        expect(layout.content.sessionRef).toBeUndefined()
+        expect(layout.content.resumeSessionId).toBeUndefined()
+      }
+    })
+
+    it('reuses an existing candidate-only Codex pane without promoting it to sessionRef', async () => {
+      const store = createOpenSessionStore()
+      const codexDurability = {
+        schemaVersion: 1 as const,
+        state: 'captured_pre_turn' as const,
+        candidate: {
+          provider: 'codex' as const,
+          candidateThreadId: 'thread-pre-durable',
+          rolloutPath: '/home/user/.codex/sessions/rollout.jsonl',
+          source: 'restored_client_state' as const,
+          capturedAt: 2_000,
+        },
+      }
+
+      store.dispatch(addTab({ id: 'tab-candidate', mode: 'codex', title: 'Codex CLI' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-candidate',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          status: 'creating',
+          initialCwd: '/repo',
+          codexDurability,
+        },
+      }))
+      store.dispatch(addTab({ id: 'tab-other', mode: 'shell' }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'thread-pre-durable',
+        provider: 'codex',
+        title: 'Codex CLI',
+        cwd: '/repo',
+        isRestorable: false,
+      }))
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(2)
+      expect(state.tabs.activeTabId).toBe('tab-candidate')
+      expect(state.tabs.tabs.find((tab) => tab.id === 'tab-candidate')?.sessionRef).toBeUndefined()
+      const layout = state.panes.layouts['tab-candidate']
+      if (layout?.type === 'leaf' && layout.content.kind === 'terminal') {
+        expect(layout.content.sessionRef).toBeUndefined()
+        expect(layout.content.codexDurability).toEqual(codexDurability)
+      }
+    })
+
     it('uses capitalized provider label for codex tab title', async () => {
       const store = configureStore({
         reducer: {

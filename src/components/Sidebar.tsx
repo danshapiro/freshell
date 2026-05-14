@@ -49,6 +49,11 @@ function sameCodexDurability(
     && a.durableThreadId === b.durableThreadId
     && a.candidate?.candidateThreadId === b.candidate?.candidateThreadId
     && a.candidate?.rolloutPath === b.candidate?.rolloutPath
+    && a.turnCompletedAt === b.turnCompletedAt
+    && a.nonRestorableReason === b.nonRestorableReason
+    && a.lastProofFailure?.reason === b.lastProofFailure?.reason
+    && a.lastProofFailure?.message === b.lastProofFailure?.message
+    && a.lastProofFailure?.checkedAt === b.lastProofFailure?.checkedAt
 }
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
@@ -98,6 +103,8 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.projectPath !== bi.projectPath ||
       ai.isFallback !== bi.isFallback ||
       ai.isRestorable !== bi.isRestorable ||
+      ai.codexDurabilityState !== bi.codexDurabilityState ||
+      ai.codexDurabilityReason !== bi.codexDurabilityReason ||
       ai.timestamp !== bi.timestamp
     ) return false
   }
@@ -155,8 +162,31 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.isSubagent === b.isSubagent &&
     a.isNonInteractive === b.isNonInteractive &&
     a.firstUserMessage === b.firstUserMessage &&
-    a.isRestorable === b.isRestorable
+    a.isRestorable === b.isRestorable &&
+    a.codexDurabilityState === b.codexDurabilityState &&
+    a.codexDurabilityReason === b.codexDurabilityReason
   )
+}
+
+function getCodexDurabilityStatusLabel(item: SessionItem): string | undefined {
+  if (item.provider !== 'codex') return undefined
+  switch (item.codexDurabilityState) {
+    case 'identity_pending':
+      return 'Preparing restore'
+    case 'captured_pre_turn':
+    case 'turn_in_progress_unproven':
+      return 'Restore pending'
+    case 'proof_checking':
+      return 'Checking restore'
+    case 'durable_resuming':
+      return 'Restoring'
+    case 'durability_unproven_after_completion':
+      return 'Restore not verified'
+    case 'non_restorable':
+      return 'Not restorable'
+    default:
+      return undefined
+  }
 }
 
 /**
@@ -434,14 +464,21 @@ export default function Sidebar({
       return
     }
 
+    const newContent = item.isRestorable === false && provider === 'codex'
+      ? {
+          kind: 'terminal' as const,
+          mode: provider,
+          initialCwd: item.cwd,
+        }
+      : buildResumeContent({
+          sessionType,
+          sessionId: item.sessionId,
+          cwd: item.cwd,
+          agentChatProviderSettings: providerSettings,
+        })
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent: buildResumeContent({
-        sessionType,
-        sessionId: item.sessionId,
-        cwd: item.cwd,
-        agentChatProviderSettings: providerSettings,
-      }),
+      newContent,
     }))
     const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
     const sessionMetadataByKey = mergeSessionMetadataByKey(
@@ -455,7 +492,7 @@ export default function Sidebar({
         isNonInteractive: item.isNonInteractive,
       },
     )
-    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+    if (activeTab && item.isRestorable !== false && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
       dispatch(updateTab({
         id: currentActiveTabId,
         updates: { sessionMetadataByKey },
@@ -852,7 +889,10 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
     a.projectPath === b.projectPath &&
-    a.isFallback === b.isFallback
+    a.isFallback === b.isFallback &&
+    a.isRestorable === b.isRestorable &&
+    a.codexDurabilityState === b.codexDurabilityState &&
+    a.codexDurabilityReason === b.codexDurabilityReason
   )
 }
 
@@ -860,6 +900,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, isBusy = false, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
+  const codexStatusLabel = getCodexDurabilityStatusLabel(item)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -892,7 +933,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
 
           {/* Content */}
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 min-w-0">
               <span
                 className={cn(
                   'text-sm truncate',
@@ -903,6 +944,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
               </span>
               {item.archived && (
                 <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
+              )}
+              {codexStatusLabel && (
+                <span className="text-2xs text-muted-foreground/70 flex-shrink-0">
+                  {codexStatusLabel}
+                </span>
               )}
             </div>
             {item.subtitle && showProjectBadge && (
@@ -921,6 +967,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
       <TooltipContent>
         <div>{sessionLabel}: {item.title}</div>
         <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
+        {codexStatusLabel && (
+          <div className="text-muted-foreground">
+            {codexStatusLabel}{item.codexDurabilityReason ? `: ${item.codexDurabilityReason}` : ''}
+          </div>
+        )}
       </TooltipContent>
     </Tooltip>
   )
