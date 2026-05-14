@@ -33,7 +33,9 @@ import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import { CodexDurabilityStore } from './coding-cli/codex-app-server/durability-store.js'
+import { proofCodexRollout } from './coding-cli/codex-app-server/durability-proof.js'
 import type { CodexRemoteProxyCandidate } from './coding-cli/codex-app-server/remote-proxy.js'
+import type { CodexTurnEvent } from './coding-cli/codex-app-server/client.js'
 import { collectShutdownFailures, throwShutdownFailures } from './shutdown-join.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
 
@@ -459,12 +461,19 @@ export type TerminalRecord = {
     lastInputToOutputMs?: number
     maxInputToOutputMs: number
   }
-  codexSidecar?: Pick<CodexLaunchSidecar, 'shutdown' | 'onLifecycleLoss' | 'onCandidate' | 'markCandidatePersisted'>
+  codexSidecar?: Pick<
+    CodexLaunchSidecar,
+    'shutdown' | 'onLifecycleLoss' | 'onCandidate' | 'onTurnStarted' | 'onTurnCompleted' | 'onRepairTrigger' | 'markCandidatePersisted'
+  >
   codexSidecarLifecycleUnsubscribe?: () => void
   codexSidecarLifecyclePublished?: boolean
   codexSidecarPrePublicationLoss?: unknown
   codexSidecarGeneration?: number
   codexDurability?: CodexDurabilityRef
+  codexDurabilityProof?: {
+    inFlight?: Promise<void>
+    rerunRequested?: boolean
+  }
   codexInputGate?: { state: 'identity_pending' }
   codexRecovery?: CodexRecoveryOptions
   codexRecoveryAttempt?: Promise<void>
@@ -1508,11 +1517,35 @@ export class TerminalRegistry extends EventEmitter {
     })
     if (candidateUnsubscribe) unsubscribers.push(candidateUnsubscribe)
 
+    const turnStartedUnsubscribe = sidecar.onTurnStarted?.((event) => {
+      void this.handleCodexTurnStarted(record.terminalId, event).catch((err) => {
+        logger.error({ err, terminalId: record.terminalId }, 'Failed to update Codex turn-start durability state')
+      })
+    })
+    if (turnStartedUnsubscribe) unsubscribers.push(turnStartedUnsubscribe)
+
+    const turnCompletedUnsubscribe = sidecar.onTurnCompleted?.((event) => {
+      void this.handleCodexTurnCompleted(record.terminalId, event).catch((err) => {
+        logger.error({ err, terminalId: record.terminalId }, 'Failed to proof Codex rollout after turn completion')
+      })
+    })
+    if (turnCompletedUnsubscribe) unsubscribers.push(turnCompletedUnsubscribe)
+
+    const repairUnsubscribe = sidecar.onRepairTrigger?.((event) => {
+      this.requestCodexDurabilityProof(record.terminalId, `repair:${event.kind}`)
+    })
+    if (repairUnsubscribe) unsubscribers.push(repairUnsubscribe)
+
     record.codexSidecarLifecycleUnsubscribe = () => {
       for (const unsubscribe of unsubscribers.splice(0)) {
         unsubscribe()
       }
     }
+  }
+
+  private codexCandidateMatches(record: TerminalRecord, threadId: string | undefined): boolean {
+    const candidateThreadId = record.codexDurability?.candidate?.candidateThreadId
+    return !!candidateThreadId && candidateThreadId === threadId
   }
 
   private buildCodexDurabilityRef(candidate: CodexRemoteProxyCandidate, capturedAt: number): CodexDurabilityRef | undefined {
@@ -1544,6 +1577,20 @@ export class TerminalRegistry extends EventEmitter {
       ...(record.durableThreadId ? { durableThreadId: record.durableThreadId } : {}),
       ...(record.nonRestorableReason ? { nonRestorableReason: record.nonRestorableReason } : {}),
     }
+  }
+
+  private async writeCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef, updatedAt = Date.now()): Promise<CodexDurabilityRef> {
+    const stored = await this.codexDurabilityStore.write({
+      ...durability,
+      terminalId: record.terminalId,
+      ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
+      ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
+      serverInstanceId: this.serverInstanceId,
+      updatedAt,
+    })
+    const storedDurability = this.codexDurabilityRecordToRef(stored)
+    record.codexDurability = storedDurability
+    return storedDurability
   }
 
   private async persistCodexCandidate(terminalId: string, candidate: CodexRemoteProxyCandidate): Promise<void> {
@@ -1582,16 +1629,7 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    const stored = await this.codexDurabilityStore.write({
-      ...durability,
-      terminalId,
-      ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
-      ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
-      serverInstanceId: this.serverInstanceId,
-      updatedAt: capturedAt,
-    })
-    const storedDurability = this.codexDurabilityRecordToRef(stored)
-    record.codexDurability = storedDurability
+    const storedDurability = await this.writeCodexDurability(record, durability, capturedAt)
     record.codexInputGate = undefined
     record.codexSidecar?.markCandidatePersisted?.()
     logger.info({
@@ -1601,6 +1639,151 @@ export class TerminalRegistry extends EventEmitter {
       source: storedDurability.candidate?.source,
     }, 'Persisted Codex restore identity before user input')
     this.broadcastCodexDurability(record, storedDurability)
+  }
+
+  private async handleCodexTurnStarted(terminalId: string, event: CodexTurnEvent): Promise<void> {
+    const record = this.terminals.get(terminalId)
+    if (!record || record.status !== 'running') return
+    if (!this.codexCandidateMatches(record, event.threadId)) return
+    if (!record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+
+    const durability: CodexDurabilityRef = {
+      ...record.codexDurability,
+      state: 'turn_in_progress_unproven',
+    }
+    const stored = await this.writeCodexDurability(record, durability)
+    logger.info({
+      terminalId,
+      candidateThreadId: stored.candidate?.candidateThreadId,
+      turnId: event.turnId,
+    }, 'Codex turn started before restore proof')
+    this.broadcastCodexDurability(record, stored)
+  }
+
+  private async handleCodexTurnCompleted(terminalId: string, event: CodexTurnEvent): Promise<void> {
+    const record = this.terminals.get(terminalId)
+    if (!record || record.status !== 'running') return
+    if (!this.codexCandidateMatches(record, event.threadId)) return
+    if (!record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+
+    const completedAt = Date.now()
+    const durability: CodexDurabilityRef = {
+      ...record.codexDurability,
+      state: 'proof_checking',
+      turnCompletedAt: completedAt,
+    }
+    const stored = await this.writeCodexDurability(record, durability, completedAt)
+    logger.info({
+      terminalId,
+      candidateThreadId: stored.candidate?.candidateThreadId,
+      rolloutPath: stored.candidate?.rolloutPath,
+      turnId: event.turnId,
+    }, 'Codex turn completed; checking rollout proof')
+    this.broadcastCodexDurability(record, stored)
+    this.requestCodexDurabilityProof(terminalId, 'turn_completed')
+  }
+
+  private requestCodexDurabilityProof(terminalId: string, trigger: string): void {
+    const record = this.terminals.get(terminalId)
+    if (!record || !record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+    const proofState = record.codexDurabilityProof ?? {}
+    record.codexDurabilityProof = proofState
+    if (proofState.inFlight) {
+      proofState.rerunRequested = true
+      return
+    }
+
+    const run = async (): Promise<void> => {
+      do {
+        proofState.rerunRequested = false
+        await this.runCodexDurabilityProof(terminalId, trigger)
+      } while (proofState.rerunRequested)
+    }
+    proofState.inFlight = run()
+      .catch((err) => {
+        logger.error({ err, terminalId, trigger }, 'Codex rollout proof execution failed')
+      })
+      .finally(() => {
+        const current = this.terminals.get(terminalId)
+        if (current?.codexDurabilityProof === proofState) {
+          proofState.inFlight = undefined
+          proofState.rerunRequested = false
+        }
+      })
+  }
+
+  private async runCodexDurabilityProof(terminalId: string, trigger: string): Promise<void> {
+    const record = this.terminals.get(terminalId)
+    if (!record || !record.codexDurability?.candidate || record.codexDurability.state === 'durable') return
+    const candidate = record.codexDurability.candidate
+    const preProofDurability = record.codexDurability
+
+    const checking: CodexDurabilityRef = {
+      ...record.codexDurability,
+      state: 'proof_checking',
+    }
+    const checkingStored = await this.writeCodexDurability(record, checking)
+    this.broadcastCodexDurability(record, checkingStored)
+
+    const proof = await proofCodexRollout({
+      rolloutPath: candidate.rolloutPath,
+      candidateThreadId: candidate.candidateThreadId,
+    })
+    const checkedAt = Date.now()
+    if (proof.ok) {
+      const durable: CodexDurabilityRef = {
+        ...checkingStored,
+        state: 'durable',
+        durableThreadId: proof.rolloutProofId,
+        lastProofFailure: undefined,
+      }
+      const stored = await this.writeCodexDurability(record, durable, checkedAt)
+      record.codexDurabilityProof = undefined
+      const bound = this.bindSession(terminalId, 'codex', proof.rolloutProofId, 'association')
+      if (!bound.ok) {
+        logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
+      }
+      logger.info({
+        terminalId,
+        candidateThreadId: candidate.candidateThreadId,
+        durableThreadId: proof.rolloutProofId,
+        rolloutPath: candidate.rolloutPath,
+        trigger,
+      }, 'Codex rollout proof succeeded')
+      this.broadcastCodexDurability(record, stored)
+      this.broadcastCodexSessionAssociated(record, proof.rolloutProofId)
+      recordSessionLifecycleEvent({
+        kind: 'codex_durable_session_observed',
+        provider: 'codex',
+        terminalId,
+        sessionId: proof.rolloutProofId,
+        generation: record.codexSidecarGeneration ?? 0,
+        source: 'sidecar',
+      })
+      return
+    }
+
+    const failed: CodexDurabilityRef = {
+      ...checkingStored,
+      state: checkingStored.turnCompletedAt !== undefined
+        ? 'durability_unproven_after_completion'
+        : preProofDurability.state,
+      lastProofFailure: {
+        reason: proof.reason,
+        message: proof.message,
+        checkedAt,
+      },
+    }
+    const stored = await this.writeCodexDurability(record, failed, checkedAt)
+    logger.warn({
+      terminalId,
+      candidateThreadId: candidate.candidateThreadId,
+      rolloutPath: candidate.rolloutPath,
+      trigger,
+      reason: proof.reason,
+      message: proof.message,
+    }, 'Codex rollout proof failed')
+    this.broadcastCodexDurability(record, stored)
   }
 
   private broadcastCodexDurability(record: TerminalRecord, durability: CodexDurabilityRef): void {
@@ -1615,6 +1798,19 @@ export class TerminalRegistry extends EventEmitter {
       terminalId: record.terminalId,
       durability,
     })
+  }
+
+  private broadcastCodexSessionAssociated(record: TerminalRecord, sessionId: string): void {
+    for (const client of record.clients) {
+      this.safeSend(client, {
+        type: 'terminal.session.associated',
+        terminalId: record.terminalId,
+        sessionRef: {
+          provider: 'codex',
+          sessionId,
+        },
+      }, { terminalId: record.terminalId, perf: record.perf })
+    }
   }
 
   publishCodexSidecar(terminalId: string): void {

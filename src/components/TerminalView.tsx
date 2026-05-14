@@ -2143,11 +2143,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             paneResumeSessionId: contentRef.current?.resumeSessionId,
             tabResumeSessionId: currentTab?.resumeSessionId,
           })
+          const paneCodexDurability = contentRef.current?.codexDurability
+          const nextPaneCodexDurability = sessionRef.provider === 'codex'
+            && paneCodexDurability?.state === 'durable'
+            && (
+              paneCodexDurability.durableThreadId === sessionRef.sessionId
+              || paneCodexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+            )
+            ? paneCodexDurability
+            : undefined
+          const tabCodexDurability = currentTab?.codexDurability
+          const nextTabCodexDurability = sessionRef.provider === 'codex'
+            && tabCodexDurability?.state === 'durable'
+            && (
+              tabCodexDurability.durableThreadId === sessionRef.sessionId
+              || tabCodexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+            )
+            ? tabCodexDurability
+            : undefined
           if (durableIdentityUpdate?.paneUpdates) {
-            updateContent({ ...durableIdentityUpdate.paneUpdates, codexDurability: undefined })
+            updateContent({ ...durableIdentityUpdate.paneUpdates, codexDurability: nextPaneCodexDurability })
           }
           if (currentTab && durableIdentityUpdate?.tabUpdates) {
-            dispatch(updateTab({ id: currentTab.id, updates: { ...durableIdentityUpdate.tabUpdates, codexDurability: undefined } }))
+            dispatch(updateTab({ id: currentTab.id, updates: { ...durableIdentityUpdate.tabUpdates, codexDurability: nextTabCodexDurability } }))
           }
           if (durableIdentityUpdate?.shouldFlush) {
             dispatch(flushPersistedLayoutNow())
