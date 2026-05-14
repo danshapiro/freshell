@@ -153,6 +153,77 @@ describe('tabs view flow', () => {
     expect(copiedLayout?.content?.terminalId).toBeUndefined()
   })
 
+  it('preserves candidate-only Codex durability state when pulling a registry tab', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        connection: connectionReducer,
+      },
+    })
+    store.dispatch(setServerInstanceId('srv-local'))
+    const codexDurability = {
+      schemaVersion: 1,
+      state: 'captured_pre_turn',
+      candidate: {
+        provider: 'codex',
+        candidateThreadId: '019e2413-b8d0-7a98-b5fb-2f4af05baf58',
+        rolloutPath: '/home/user/.codex/sessions/2026/05/14/rollout.jsonl',
+        source: 'thread_start_response',
+        capturedAt: 1778764200000,
+      },
+    } as const
+
+    store.dispatch(setTabRegistrySnapshot({
+      localOpen: [],
+      remoteOpen: [{
+        tabKey: 'remote:tab-codex-candidate',
+        tabId: 'tab-codex-candidate',
+        serverInstanceId: 'srv-remote',
+        deviceId: 'remote',
+        deviceLabel: 'remote-device',
+        tabName: 'codex candidate',
+        status: 'open',
+        revision: 2,
+        createdAt: 10,
+        updatedAt: 20,
+        paneCount: 1,
+        titleSetByUser: false,
+        panes: [{
+          paneId: 'pane-codex-candidate',
+          kind: 'terminal',
+          payload: {
+            mode: 'codex',
+            codexDurability,
+            liveTerminal: {
+              terminalId: 'term-remote-candidate',
+              serverInstanceId: 'srv-remote',
+            },
+          },
+        }],
+      }],
+      closed: [],
+    }))
+
+    render(
+      <Provider store={store}>
+        <TabsView />
+      </Provider>,
+    )
+
+    const remoteCard = screen.getByLabelText('remote-device: codex candidate')
+    expect(remoteCard).toBeTruthy()
+    fireEvent.click(remoteCard)
+
+    const copiedTab = store.getState().tabs.tabs[0]
+    expect(copiedTab?.title).toBe('codex candidate')
+    const copiedLayout = copiedTab ? (store.getState().panes.layouts[copiedTab.id] as any) : undefined
+    expect(copiedLayout?.content?.sessionRef).toBeUndefined()
+    expect(copiedLayout?.content?.codexDurability).toEqual(codexDurability)
+    expect(copiedLayout?.content?.terminalId).toBeUndefined()
+  })
+
   it('opens same-server tab copies with an explicit live terminal handle', () => {
     const store = configureStore({
       reducer: {

@@ -35,6 +35,7 @@ import {
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                             */
@@ -111,11 +112,15 @@ function sanitizePaneSnapshot(
     const mode = (payload.mode as TabMode) || 'shell'
     const sessionRef = resolveSessionRef({ payload })
     const liveTerminal = parseLiveTerminalHandle(payload.liveTerminal, record.serverInstanceId)
+    const codexDurability = mode === 'codex'
+      ? sanitizeCodexDurabilityRef(payload.codexDurability)
+      : undefined
     return {
       kind: 'terminal',
       mode,
       shell: (payload.shell as 'system' | 'cmd' | 'powershell' | 'wsl') || 'system',
       sessionRef,
+      ...(codexDurability ? { codexDurability } : {}),
       terminalId: sameServer ? liveTerminal?.terminalId : undefined,
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
