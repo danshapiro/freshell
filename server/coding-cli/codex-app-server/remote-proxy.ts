@@ -45,7 +45,7 @@ type CodexRemoteProxyOptions = {
 }
 
 const DEFAULT_REQUEST_HOLD_TIMEOUT_MS = 5_000
-const DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS = 10_000
+const DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS = 45_000
 
 export class CodexRemoteProxy {
   private readonly upstreamWsUrl: string
