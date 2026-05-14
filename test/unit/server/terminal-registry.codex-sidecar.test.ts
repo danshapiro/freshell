@@ -313,8 +313,83 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         state: 'non_restorable',
         nonRestorableReason: 'candidate_capture_timeout',
       })
+      expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+        status: 'blocked_codex_identity_capture_timeout',
+        terminalId: term.terminalId,
+      })
       expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
     } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('discards a delayed candidate write after candidate capture already timed out', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    const firstCandidateWriteStarted = deferred()
+    const releaseFirstCandidateWrite = deferred()
+    let writeCount = 0
+    const fsImpl = {
+      mkdir: fsp.mkdir,
+      readFile: fsp.readFile,
+      rename: fsp.rename,
+      unlink: fsp.unlink,
+      writeFile: vi.fn(async (...args: Parameters<typeof fsp.writeFile>) => {
+        writeCount += 1
+        if (writeCount === 1) {
+          firstCandidateWriteStarted.resolve()
+          await releaseFirstCandidateWrite.promise
+        }
+        return fsp.writeFile(...args)
+      }),
+    }
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir, fsImpl })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-late-candidate',
+          path: path.join(durabilityDir, 'rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+      await firstCandidateWriteStarted.promise
+
+      sidecar.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.status).toBe('exited'))
+      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'non_restorable',
+        nonRestorableReason: 'candidate_capture_timeout',
+      })
+
+      releaseFirstCandidateWrite.resolve()
+
+      await vi.waitFor(() => {
+        expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+          state: 'non_restorable',
+          nonRestorableReason: 'candidate_capture_timeout',
+        })
+      })
+      await vi.waitFor(async () => {
+        await expect(store.read(term.terminalId)).resolves.toBeUndefined()
+      })
+      expect(sidecar.markCandidatePersisted).not.toHaveBeenCalled()
+    } finally {
+      releaseFirstCandidateWrite.resolve()
       await fsp.rm(durabilityDir, { recursive: true, force: true })
     }
   })
@@ -375,6 +450,66 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
           provider: 'codex',
           sessionId: 'thread-proof-ok',
         },
+      }))
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does not broadcast a durable Codex session when rollout proof cannot bind canonical ownership', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const rolloutPath = path.join(durabilityDir, 'rollout.jsonl')
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
+        serverInstanceId: 'srv-test',
+      })
+      const owner = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-binding-owner',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const sent: unknown[] = []
+      const client = {
+        readyState: 1,
+        bufferedAmount: 0,
+        send: vi.fn((message: string) => sent.push(JSON.parse(message))),
+      }
+      registry.attach(term.terminalId, client as any)
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-binding-owner',
+          path: rolloutPath,
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
+      await fsp.writeFile(
+        rolloutPath,
+        '{"type":"session_meta","payload":{"id":"thread-binding-owner"}}\n',
+        'utf8',
+      )
+      sidecar.emitTurnCompleted({ threadId: 'thread-binding-owner', turnId: 'turn-1', params: {} })
+
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'non_restorable',
+        nonRestorableReason: 'session_binding_failed:session_already_owned',
+      }))
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+      expect(registry.findRunningTerminalBySession('codex', 'thread-binding-owner')?.terminalId).toBe(owner.terminalId)
+      expect(sent).not.toContainEqual(expect.objectContaining({
+        type: 'terminal.session.associated',
       }))
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })

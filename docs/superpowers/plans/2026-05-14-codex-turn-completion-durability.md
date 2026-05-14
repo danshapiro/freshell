@@ -419,6 +419,9 @@ These checks come from the implementation reviews and are part of the same one-s
 - [ ] Preserve captured candidate state across browser refresh and use it for the recreate request after the old live terminal id is gone. This is the client-side half of "prefer terminal, then proof-read candidate, then fresh-create if proof fails" (`/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/docs/lab-notes/2026-04-20-coding-cli-session-contract.md`, "Failure handling without polling").
 - [ ] Extend the fake app-server/fake TUI integration path so tests exercise actual proxy candidate capture, input, `turn/completed`, rollout proof, durable promotion, and sidebar/inventory exposure instead of only direct sidecar callbacks.
 - [ ] Delete transient Codex durability store records when the owning terminal is killed, removed, or reaped. The server-side store is a crash bridge for an active terminal, not a durable session database.
+- [ ] If rollout proof succeeds but canonical session binding fails, do not broadcast `terminal.session.associated`; mark the terminal non-restorable instead so the client cannot persist a session the server does not own.
+- [ ] After an async candidate-store write completes, re-check that the same terminal is still running and still accepting a candidate before mutating in-memory state or calling `markCandidatePersisted()`.
+- [ ] Report input after a candidate-capture timeout as `terminal.input.blocked` with `codex_identity_capture_timeout`, not as a generic invalid/dead terminal.
 
 ## Temporary Server Validation
 

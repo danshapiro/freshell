@@ -2460,6 +2460,19 @@ export class WsHandler {
           })
           return
         }
+        if (result.status === 'blocked_codex_identity_capture_timeout') {
+          log.warn({
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId,
+            attemptedInputBytes: Buffer.byteLength(m.data, 'utf8'),
+          }, 'Codex terminal input blocked after restore identity capture timed out')
+          this.send(ws, {
+            type: 'terminal.input.blocked',
+            terminalId: m.terminalId,
+            reason: 'codex_identity_capture_timeout',
+          })
+          return
+        }
         if (result.status === 'blocked_codex_recovery_pending') {
           log.debug({
             terminalId: m.terminalId,

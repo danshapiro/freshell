@@ -486,6 +486,7 @@ export type TerminalRecord = {
 export type TerminalInputResult =
   | { status: 'written' }
   | { status: 'blocked_codex_identity_pending'; terminalId: string }
+  | { status: 'blocked_codex_identity_capture_timeout'; terminalId: string }
   | { status: 'blocked_codex_recovery_pending'; terminalId: string }
   | { status: 'no_terminal' }
   | { status: 'not_running' }
@@ -1681,7 +1682,41 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    const storedDurability = await this.writeCodexDurability(record, durability, capturedAt)
+    const stored = await this.codexDurabilityStore.write({
+      ...durability,
+      terminalId: record.terminalId,
+      ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
+      ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
+      serverInstanceId: this.serverInstanceId,
+      updatedAt: capturedAt,
+    })
+    const latest = this.terminals.get(terminalId)
+    if (
+      latest !== record
+      || record.status !== 'running'
+      || record.resumeSessionId
+      || record.codexDurability?.state === 'non_restorable'
+    ) {
+      await this.codexDurabilityStore.delete(terminalId)
+      logger.warn({
+        terminalId,
+        threadId: durability.candidate.candidateThreadId,
+        rolloutPath: durability.candidate.rolloutPath,
+      }, 'Discarded late Codex restore identity candidate after terminal stopped accepting candidates')
+      return
+    }
+    if (record.codexDurability?.candidate) {
+      const existing = record.codexDurability.candidate
+      if (
+        existing.candidateThreadId === durability.candidate.candidateThreadId
+        && existing.rolloutPath === durability.candidate.rolloutPath
+      ) {
+        record.codexSidecar?.markCandidatePersisted?.()
+      }
+      return
+    }
+    const storedDurability = this.codexDurabilityRecordToRef(stored)
+    record.codexDurability = storedDurability
     record.codexInputGate = undefined
     record.codexSidecar?.markCandidatePersisted?.()
     logger.info({
@@ -1808,6 +1843,20 @@ export class TerminalRegistry extends EventEmitter {
     })
     const checkedAt = Date.now()
     if (proof.ok) {
+      const bound = this.bindSession(terminalId, 'codex', proof.rolloutProofId, 'association')
+      if (!bound.ok) {
+        const failed: CodexDurabilityRef = {
+          ...checkingStored,
+          state: 'non_restorable',
+          lastProofFailure: undefined,
+          nonRestorableReason: `session_binding_failed:${bound.reason}`,
+        }
+        const stored = await this.writeCodexDurability(record, failed, checkedAt)
+        record.codexDurabilityProof = undefined
+        logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
+        this.broadcastCodexDurability(record, stored)
+        return
+      }
       const durable: CodexDurabilityRef = {
         ...checkingStored,
         state: 'durable',
@@ -1816,10 +1865,6 @@ export class TerminalRegistry extends EventEmitter {
       }
       const stored = await this.writeCodexDurability(record, durable, checkedAt)
       record.codexDurabilityProof = undefined
-      const bound = this.bindSession(terminalId, 'codex', proof.rolloutProofId, 'association')
-      if (!bound.ok) {
-        logger.warn({ terminalId, proof, reason: bound.reason }, 'Codex rollout proof succeeded but session binding failed')
-      }
       logger.info({
         terminalId,
         candidateThreadId: candidate.candidateThreadId,
@@ -2410,6 +2455,13 @@ export class TerminalRegistry extends EventEmitter {
   input(terminalId: string, data: string): TerminalInputResult {
     const term = this.terminals.get(terminalId)
     if (!term) return { status: 'no_terminal' }
+    if (
+      term.mode === 'codex'
+      && term.codexDurability?.state === 'non_restorable'
+      && term.codexDurability.nonRestorableReason === 'candidate_capture_timeout'
+    ) {
+      return { status: 'blocked_codex_identity_capture_timeout', terminalId }
+    }
     if (term.status !== 'running') return { status: 'not_running' }
     if (term.codexInputGate?.state === 'identity_pending') {
       return { status: 'blocked_codex_identity_pending', terminalId }

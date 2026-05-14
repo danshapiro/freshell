@@ -171,9 +171,9 @@ class FakeRegistry {
 
   input(terminalId: string, data: string) {
     const rec = this.records.get(terminalId)
-    if (!rec) return false
+    if (!rec) return { status: 'no_terminal' }
     this.inputCalls.push({ terminalId, data })
-    return true
+    return { status: 'written' }
   }
 
   resize(terminalId: string, cols: number, rows: number) {
@@ -1223,6 +1223,31 @@ describe('ws protocol', () => {
     expect(error.terminalId).toBe('nonexistent_terminal')
 
     await close()
+  })
+
+  it('terminal.input reports Codex identity capture timeout as blocked input', async () => {
+    const { ws, close } = await createAuthenticatedConnection()
+
+    const terminalId = await createTerminal(ws, 'create-for-codex-timeout-input')
+    const originalInput = registry.input.bind(registry)
+    registry.input = vi.fn(() => ({
+      status: 'blocked_codex_identity_capture_timeout',
+      terminalId,
+    })) as any
+
+    try {
+      ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'test' }))
+
+      const blocked = await waitForMessage(ws, (msg) => msg.type === 'terminal.input.blocked')
+      expect(blocked).toEqual({
+        type: 'terminal.input.blocked',
+        terminalId,
+        reason: 'codex_identity_capture_timeout',
+      })
+    } finally {
+      registry.input = originalInput as any
+      await close()
+    }
   })
 
   it('terminal.resize changes terminal dimensions', async () => {
