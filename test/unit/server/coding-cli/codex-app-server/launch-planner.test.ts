@@ -13,10 +13,13 @@ function deferred<T = void>() {
 
 class FakeRuntime {
   shutdownCalls = 0
+  ensureReadyCalls = 0
   startThreadCalls = 0
   adopted: Array<{ terminalId: string; generation: number }> = []
   loadedThreadListCalls = 0
   adoptError?: Error
+  ensureReadyBlocker?: Promise<void>
+  ensureReadyError?: Error
   startThreadBlocker?: Promise<void>
   shutdownBlocker?: Promise<void>
   shutdownError?: Error
@@ -29,6 +32,9 @@ class FakeRuntime {
   ) {}
 
   async ensureReady() {
+    this.ensureReadyCalls += 1
+    await this.ensureReadyBlocker
+    if (this.ensureReadyError) throw this.ensureReadyError
     return {
       wsUrl: this.wsUrl,
       processPid: 100,
@@ -82,8 +88,14 @@ describe('CodexLaunchPlanner', () => {
     const second = await planner.planCreate({ cwd: '/repo/two' })
 
     expect(runtimes).toHaveLength(2)
-    expect(first.remote.wsUrl).toBe('ws://127.0.0.1:43001')
-    expect(second.remote.wsUrl).toBe('ws://127.0.0.1:43002')
+    expect(first.remote.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
+    expect(second.remote.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
+    expect(first.remote.wsUrl).not.toBe('ws://127.0.0.1:43001')
+    expect(second.remote.wsUrl).not.toBe('ws://127.0.0.1:43002')
+    expect(first.sessionId).toBeUndefined()
+    expect(second.sessionId).toBeUndefined()
+    expect(runtimes[0].startThreadCalls).toBe(0)
+    expect(runtimes[1].startThreadCalls).toBe(0)
 
     await first.sidecar.adopt({ terminalId: 'term-one', generation: 1 })
     await second.sidecar.shutdown()
@@ -91,10 +103,12 @@ describe('CodexLaunchPlanner', () => {
     expect(runtimes[0].adopted).toEqual([{ terminalId: 'term-one', generation: 1 }])
     expect(runtimes[0].shutdownCalls).toBe(0)
     expect(runtimes[1].shutdownCalls).toBe(1)
+    await first.sidecar.shutdown()
   })
 
   it('shuts down the owned sidecar when planning fails before adoption', async () => {
-    const runtime = new FakeRuntime('ws://127.0.0.1:43010', 'thread-fail', new Error('start failed'))
+    const runtime = new FakeRuntime('ws://127.0.0.1:43010', 'thread-fail')
+    runtime.ensureReadyError = new Error('start failed')
     const planner = new CodexLaunchPlanner(() => runtime as any)
 
     await expect(planner.planCreate({ cwd: '/repo/fail' })).rejects.toThrow('start failed')
@@ -103,7 +117,8 @@ describe('CodexLaunchPlanner', () => {
   })
 
   it('marks planning cleanup teardown failures as sidecar teardown failures', async () => {
-    const runtime = new FakeRuntime('ws://127.0.0.1:43022', 'thread-fail', new Error('start failed'))
+    const runtime = new FakeRuntime('ws://127.0.0.1:43022', 'thread-fail')
+    runtime.ensureReadyError = new Error('start failed')
     runtime.shutdownError = new Error('verified runtime teardown failed')
     const planner = new CodexLaunchPlanner(() => runtime as any)
 
@@ -178,19 +193,19 @@ describe('CodexLaunchPlanner', () => {
     await expect(planner.planCreate({ cwd: '/repo/after-shutdown-complete' })).rejects.toThrow(/shutting down/i)
   })
 
-  it('rejects and cleans up an in-flight launch plan when shutdown starts before thread creation returns', async () => {
+  it('rejects and cleans up an in-flight launch plan when shutdown starts before readiness returns', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43018', 'thread-after-shutdown')
-    const startThreadGate = deferred()
-    runtime.startThreadBlocker = startThreadGate.promise
+    const readinessGate = deferred()
+    runtime.ensureReadyBlocker = readinessGate.promise
     const planner = new CodexLaunchPlanner(() => runtime as any)
 
     const plan = planner.planCreate({ cwd: '/repo/in-flight' })
-    await vi.waitFor(() => expect(runtime.startThreadCalls).toBe(1))
+    await vi.waitFor(() => expect(runtime.ensureReadyCalls).toBe(1))
 
     const shutdown = planner.shutdown()
     await vi.waitFor(() => expect(runtime.shutdownCalls).toBe(1))
 
-    startThreadGate.resolve()
+    readinessGate.resolve()
 
     await expect(plan).rejects.toThrow(/shutting down/i)
     await expect(shutdown).resolves.toBeUndefined()
@@ -266,9 +281,10 @@ describe('CodexLaunchPlanner', () => {
 
     const second = await planner.planCreate({ cwd: '/repo/two' })
 
-    expect(second.sessionId).toBe('thread-2')
+    expect(second.sessionId).toBeUndefined()
     expect(runtimes).toHaveLength(2)
     expect(runtimes[0].shutdownCalls).toBe(3)
+    expect(runtimes[1].startThreadCalls).toBe(0)
   })
 
   it('waits for every planner-owned sidecar shutdown before reporting a teardown failure', async () => {

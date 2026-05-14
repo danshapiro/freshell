@@ -2061,7 +2061,7 @@ export class WsHandler {
                 : undefined
               pendingCodexPlan = codexPlan
 
-              if (codexPlan) {
+              if (codexPlan?.sessionId) {
                 effectiveResumeSessionId = codexPlan.sessionId
               }
               this.assertTerminalCreateAccepted()

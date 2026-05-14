@@ -1,6 +1,11 @@
 import type { CodexAppServerRuntime } from './runtime.js'
-import type { CodexThreadLifecycleLossEvent } from './client.js'
+import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
 import { waitForAllSettledOrThrow } from '../../shutdown-join.js'
+import {
+  CodexRemoteProxy,
+  type CodexRemoteProxyCandidate,
+  type CodexRemoteProxyRepairTrigger,
+} from './remote-proxy.js'
 
 type CodexRuntimeLike = Pick<
   CodexAppServerRuntime,
@@ -10,13 +15,19 @@ type CodexRuntimeLike = Pick<
 export type CodexLaunchSidecar = {
   adopt(input: { terminalId: string; generation: number }): Promise<void>
   listLoadedThreads(): Promise<string[]>
+  markCandidatePersisted?(): void
+  onCandidate?(handler: (candidate: CodexRemoteProxyCandidate) => void): () => void
+  onTurnStarted?(handler: (event: CodexTurnEvent) => void): () => void
+  onTurnCompleted?(handler: (event: CodexTurnEvent) => void): () => void
+  onRepairTrigger?(handler: (event: CodexRemoteProxyRepairTrigger) => void): () => void
+  onThreadLifecycle?(handler: (event: CodexThreadLifecycleEvent) => void): () => void
   onLifecycleLoss?(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void
   shutdown(): Promise<void>
   waitForLoadedThread(threadId: string, options?: { timeoutMs?: number; pollMs?: number }): Promise<void>
 }
 
 export type CodexLaunchPlan = {
-  sessionId: string
+  sessionId?: string
   remote: {
     wsUrl: string
   }
@@ -69,34 +80,33 @@ export class CodexLaunchPlanner {
     this.assertAcceptingPlans()
 
     const runtime = this.runtimeFactory()
-    const sidecar = this.createSidecar(runtime)
+    let proxy: CodexRemoteProxy | undefined
+    const sidecar = this.createSidecar(runtime, () => proxy)
     this.activeSidecars.add(sidecar)
 
     try {
       if (input.resumeSessionId) {
         const ready = await runtime.ensureReady()
+        proxy = new CodexRemoteProxy({ upstreamWsUrl: ready.wsUrl })
+        const proxyReady = await proxy.start()
         this.assertAcceptingPlans()
         return {
           sessionId: input.resumeSessionId,
           remote: {
-            wsUrl: ready.wsUrl,
+            wsUrl: proxyReady.wsUrl,
           },
           sidecar,
         }
       }
 
-      const planResult = await runtime.startThread({
-        cwd: input.cwd,
-        model: input.model,
-        sandbox: input.sandbox,
-        approvalPolicy: input.approvalPolicy,
-      })
+      const ready = await runtime.ensureReady()
+      proxy = new CodexRemoteProxy({ upstreamWsUrl: ready.wsUrl })
+      const proxyReady = await proxy.start()
       this.assertAcceptingPlans()
 
       return {
-        sessionId: planResult.threadId,
         remote: {
-          wsUrl: planResult.wsUrl,
+          wsUrl: proxyReady.wsUrl,
         },
         sidecar,
       }
@@ -157,7 +167,7 @@ export class CodexLaunchPlanner {
     }
   }
 
-  private createSidecar(runtime: CodexRuntimeLike): CodexLaunchSidecar {
+  private createSidecar(runtime: CodexRuntimeLike, getProxy: () => CodexRemoteProxy | undefined): CodexLaunchSidecar {
     let shutdownPromise: Promise<void> | null = null
     let shutdownAttemptStarted = false
     let shutdownSucceeded = false
@@ -196,7 +206,20 @@ export class CodexLaunchPlanner {
         assertReadable()
         return loaded
       },
-      onLifecycleLoss: (handler) => runtime.onThreadLifecycleLoss(handler),
+      markCandidatePersisted: () => getProxy()?.markCandidatePersisted(),
+      onCandidate: (handler) => getProxy()?.onCandidate(handler) ?? (() => undefined),
+      onTurnStarted: (handler) => getProxy()?.onTurnStarted(handler) ?? (() => undefined),
+      onTurnCompleted: (handler) => getProxy()?.onTurnCompleted(handler) ?? (() => undefined),
+      onRepairTrigger: (handler) => getProxy()?.onRepairTrigger(handler) ?? (() => undefined),
+      onThreadLifecycle: (handler) => getProxy()?.onThreadLifecycle(handler) ?? (() => undefined),
+      onLifecycleLoss: (handler) => {
+        const unsubRuntime = runtime.onThreadLifecycleLoss(handler)
+        const unsubProxy = getProxy()?.onLifecycleLoss(handler)
+        return () => {
+          unsubRuntime()
+          unsubProxy?.()
+        }
+      },
       shutdown: async () => {
         if (shutdownSucceeded) return
         if (shutdownPromise) {
@@ -208,7 +231,10 @@ export class CodexLaunchPlanner {
           notifyShutdownStarted()
         }
         const attempt = Promise.resolve()
-          .then(() => runtime.shutdown())
+          .then(async () => {
+            await getProxy()?.close()
+            await runtime.shutdown()
+          })
           .then(() => {
             shutdownSucceeded = true
             this.activeSidecars.delete(sidecar)
