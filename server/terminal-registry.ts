@@ -1947,13 +1947,46 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   private canContinueCodexRecovery(record: TerminalRecord | undefined, resumeSessionId?: string): record is TerminalRecord {
-    return !!record
-      && record.status === 'running'
-      && !record.codexRecoveryFinalClose
-      && !record.codexRecoveryBlockedError
-      && !!record.codexRecovery
-      && !!record.resumeSessionId
-      && (!resumeSessionId || record.resumeSessionId === resumeSessionId)
+    const expectedResumeSessionId = resumeSessionId ?? record?.resumeSessionId
+    if (
+      !record
+      || record.status !== 'running'
+      || record.codexRecoveryFinalClose
+      || record.codexRecoveryBlockedError
+      || !record.codexRecovery
+      || !expectedResumeSessionId
+    ) {
+      return false
+    }
+
+    return this.ensureCodexRecoverySessionBinding(record, expectedResumeSessionId)
+  }
+
+  private ensureCodexRecoverySessionBinding(record: TerminalRecord, resumeSessionId: string): boolean {
+    if (
+      record.status !== 'running'
+      || record.codexRecoveryFinalClose
+      || record.codexRecoveryBlockedError
+      || !record.codexRecovery
+    ) {
+      return false
+    }
+
+    const provider = record.mode as CodingCliProviderName
+    const expectedKey = makeSessionKey(provider, resumeSessionId)
+    const owner = this.bindingAuthority.ownerForSession(provider, resumeSessionId)
+    if (owner && owner !== record.terminalId) return false
+
+    const currentBinding = this.bindingAuthority.sessionForTerminal(record.terminalId)
+    if (currentBinding && currentBinding !== expectedKey) return false
+
+    if (!currentBinding) {
+      const bound = this.bindSession(record.terminalId, provider, resumeSessionId, 'resume')
+      if (!bound.ok) return false
+    }
+
+    record.resumeSessionId = resumeSessionId
+    return true
   }
 
   private async runCodexRecoveryLoop(terminalId: string): Promise<void> {
@@ -2130,7 +2163,25 @@ export class TerminalRegistry extends EventEmitter {
       published = true
 
       try {
+        let oldPtyExited = false
+        let forceRetireTimer: NodeJS.Timeout | undefined
+        oldPty.onExit(() => {
+          oldPtyExited = true
+          if (forceRetireTimer) {
+            clearTimeout(forceRetireTimer)
+            forceRetireTimer = undefined
+          }
+        })
         oldPty.kill('SIGTERM')
+        forceRetireTimer = setTimeout(() => {
+          if (oldPtyExited) return
+          try {
+            oldPty.kill('SIGKILL')
+          } catch {
+            // The old PTY may already be gone; the delayed kill is only a safety net.
+          }
+        }, 500)
+        forceRetireTimer.unref?.()
       } catch (err) {
         logger.warn({ err, terminalId: record.terminalId }, 'Failed to retire previous Codex recovery PTY')
       }
@@ -2528,6 +2579,7 @@ export class TerminalRegistry extends EventEmitter {
     description?: string
     mode: TerminalMode
     resumeSessionId?: string
+    sessionRef?: { provider: CodingCliProviderName; sessionId: string }
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
@@ -2541,6 +2593,14 @@ export class TerminalRegistry extends EventEmitter {
       description: t.description,
       mode: t.mode,
       resumeSessionId: t.resumeSessionId,
+      sessionRef: modeSupportsResume(t.mode)
+        && t.resumeSessionId
+        && (t.mode !== 'codex' || (
+          t.codexDurability?.state === 'durable'
+          && t.codexDurability.durableThreadId === t.resumeSessionId
+        ))
+        ? { provider: t.mode as CodingCliProviderName, sessionId: t.resumeSessionId }
+        : undefined,
       createdAt: t.createdAt,
       lastActivityAt: t.lastActivityAt,
       status: t.status,

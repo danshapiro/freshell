@@ -44,6 +44,7 @@ export class FakeCodexLaunchSidecar {
 export class FakeCodexLaunchPlanner {
   planCreateCalls: any[] = []
   sidecar = new FakeCodexLaunchSidecar()
+  private failuresRemaining = 0
 
   constructor(
     private readonly plan: {
@@ -56,8 +57,16 @@ export class FakeCodexLaunchPlanner {
     },
   ) {}
 
+  failNext(count: number) {
+    this.failuresRemaining = Math.max(0, count)
+  }
+
   async planCreate(input: any) {
     this.planCreateCalls.push(input)
+    if (this.failuresRemaining > 0) {
+      this.failuresRemaining -= 1
+      throw new Error('fake Codex launch failed')
+    }
     return {
       ...this.plan,
       sidecar: this.plan.sidecar ?? this.sidecar,

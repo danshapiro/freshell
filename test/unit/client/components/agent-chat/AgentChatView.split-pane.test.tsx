@@ -386,7 +386,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'sess-1',
+        'cli-abc',
         expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
@@ -709,7 +709,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
 
     await waitFor(() => {
       expect(getAgentTimelinePage).toHaveBeenCalledWith(
-        'sess-1',
+        'cli-abc',
         expect.objectContaining({ priority: 'visible', includeBodies: true, revision: 2 }),
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       )
@@ -723,7 +723,7 @@ describe('AgentChatView — split pane (Bug 2)', () => {
 
     await waitFor(() => {
       expect(getAgentTurnBody).toHaveBeenCalledWith(
-        'sess-1',
+        'cli-abc',
         'turn-2',
         expect.objectContaining({ signal: expect.any(AbortSignal), revision: 2 }),
       )

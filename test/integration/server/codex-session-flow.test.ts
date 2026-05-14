@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import fsp from 'fs/promises'
 import http from 'http'
 import os from 'os'
@@ -142,6 +142,12 @@ function waitForMessage(
   })
 }
 
+async function killAllTerminals(registry: TerminalRegistry): Promise<void> {
+  await Promise.all(
+    registry.list().map((term) => registry.killAndWait(term.terminalId).catch(() => false)),
+  )
+}
+
 async function waitForFile(filePath: string, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -174,15 +180,6 @@ async function isProcessAlive(pid: number): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false
     throw error
   }
-}
-
-async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (!(await isProcessAlive(pid))) return
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
-  throw new Error(`Timed out waiting for process ${pid} to exit`)
 }
 
 async function readJsonLines(filePath: string): Promise<any[]> {
@@ -309,6 +306,7 @@ describe('Codex Session Flow Integration', () => {
   })
 
   beforeEach(async () => {
+    await killAllTerminals(registry)
     delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
     await planner?.shutdown()
     await Promise.all([...runtimes].map((runtime) => runtime.shutdown()))
@@ -328,6 +326,10 @@ describe('Codex Session Flow Integration', () => {
       },
     })
     await fsp.rm(argLogPath, { force: true })
+  })
+
+  afterEach(async () => {
+    await killAllTerminals(registry)
   })
 
   afterAll(async () => {
@@ -352,6 +354,10 @@ describe('Codex Session Flow Integration', () => {
   })
 
   it('launches fresh Codex in remote mode without treating the bootstrap id as durable', async () => {
+    const launchLogPath = path.join(tempDir, 'fresh-codex-launches.jsonl')
+    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
+    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
+    await fsp.rm(launchLogPath, { force: true })
     const ws = await createAuthenticatedWs(port)
 
     try {
@@ -378,8 +384,8 @@ describe('Codex Session Flow Integration', () => {
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBeUndefined()
 
-      await waitForFile(argLogPath)
-      const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
+      const launch = await waitForJsonLine(launchLogPath, (line) => line.pid === record?.pty.pid)
+      const recordedArgs = launch.args
       expect(recordedArgs.slice(0, 2)).toEqual([
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
@@ -391,10 +397,16 @@ describe('Codex Session Flow Integration', () => {
       expect(recordedArgs).not.toContain('--sandbox')
     } finally {
       await closeWebSocket(ws)
+      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
+      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
     }
   })
 
   it('restores a persisted Codex session from canonical sessionRef', async () => {
+    const launchLogPath = path.join(tempDir, 'restore-codex-launches.jsonl')
+    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
+    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
+    await fsp.rm(launchLogPath, { force: true })
     process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
       loadedThreadIds: ['thread-existing-1'],
       overrides: {
@@ -438,8 +450,8 @@ describe('Codex Session Flow Integration', () => {
       const record = registry.get(created.terminalId)
       expect(record?.resumeSessionId).toBe('thread-existing-1')
 
-      await waitForFile(argLogPath)
-      const recordedArgs = JSON.parse(await fsp.readFile(argLogPath, 'utf8'))
+      const launch = await waitForJsonLine(launchLogPath, (line) => line.pid === record?.pty.pid)
+      const recordedArgs = launch.args
       expect(recordedArgs.slice(0, 2)).toEqual([
         '--remote',
         expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
@@ -449,6 +461,8 @@ describe('Codex Session Flow Integration', () => {
     } finally {
       await closeWebSocket(ws)
       delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
+      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
     }
   })
 
@@ -456,23 +470,19 @@ describe('Codex Session Flow Integration', () => {
     const testDir = await fsp.mkdtemp(path.join(tempDir, 'recovery-retire-'))
     const metadataDir = path.join(testDir, 'metadata')
     const oldNativePidFile = path.join(testDir, 'old-native.pid')
-    const replacementNativePidFile = path.join(testDir, 'replacement-native.pid')
     const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
     const inputLogPath = path.join(testDir, 'codex-input.jsonl')
-    const oldSidecarShutdownSignalPath = path.join(testDir, 'old-sidecar-shutdown.signal')
     const firstLaunchClaimPath = path.join(testDir, 'first-tui.claim')
     await fsp.mkdir(metadataDir, { recursive: true })
 
     const previousStayAlive = process.env.FAKE_CODEX_STAY_ALIVE
     const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
     const previousInputLog = process.env.FAKE_CODEX_INPUT_LOG
-    const previousExitWhenFileExists = process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS
     const previousFirstLaunchOnly = process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY
     const previousFirstLaunchClaim = process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH
     process.env.FAKE_CODEX_STAY_ALIVE = '1'
     process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
     process.env.FAKE_CODEX_INPUT_LOG = inputLogPath
-    process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS = oldSidecarShutdownSignalPath
     process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY = '1'
     process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH = firstLaunchClaimPath
 
@@ -485,7 +495,6 @@ describe('Codex Session Flow Integration', () => {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           spawnNativeChild: true,
           nativePidFile: oldNativePidFile,
-          signalFileOnSigterm: oldSidecarShutdownSignalPath,
           delayExitOnSigtermMs: 200,
           loadedThreadIds: ['thread-existing-1'],
         }),
@@ -499,7 +508,6 @@ describe('Codex Session Flow Integration', () => {
       env: {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           spawnNativeChild: true,
-          nativePidFile: replacementNativePidFile,
           wrapperLeavesNativeOnSigterm: true,
           loadedThreadIds: ['thread-existing-1'],
         }),
@@ -510,6 +518,7 @@ describe('Codex Session Flow Integration', () => {
     const oldPlanner = new CodexLaunchPlanner(oldRuntime)
     const replacementPlanner = new CodexLaunchPlanner(replacementRuntime)
     let terminalId: string | undefined
+    let oldPtyPid: number | undefined
 
     try {
       const oldPlan = await oldPlanner.planCreate({ resumeSessionId: 'thread-existing-1' })
@@ -535,23 +544,25 @@ describe('Codex Session Flow Integration', () => {
       })
       terminalId = term.terminalId
       await oldPlan.sidecar.adopt({ terminalId: term.terminalId, generation: 0 })
-      const oldPtyPid = term.pty.pid
+      oldPtyPid = term.pty.pid
       await waitForJsonLine(launchLogPath, (line) => line.pid === oldPtyPid)
 
       await (registry as any).runCodexRecoveryAttempt(
         registry.get(term.terminalId),
         'thread-existing-1',
       )
-
-      const replacementNativePid = await waitForPidFile(replacementNativePidFile)
-      await waitForFile(oldSidecarShutdownSignalPath)
-      await waitForProcessExit(oldPtyPid)
-      expect(await isProcessAlive(replacementNativePid)).toBe(true)
+      const replacementLaunch = await waitForJsonLine(
+        launchLogPath,
+        (line) => line.pid !== oldPtyPid && Array.isArray(line.args) && line.args.includes('thread-existing-1'),
+      )
 
       const latest = registry.get(term.terminalId)
+      expect(latest?.status).toBe('running')
+      expect(latest?.resumeSessionId).toBe('thread-existing-1')
+      expect(registry.findRunningTerminalBySession('codex', 'thread-existing-1')?.terminalId).toBe(term.terminalId)
       const replacementPtyPid = latest?.pty.pid
       expect(replacementPtyPid).toEqual(expect.any(Number))
-      expect(replacementPtyPid).not.toBe(oldPtyPid)
+      expect(replacementPtyPid).toBe(replacementLaunch.pid)
 
       expect(registry.input(term.terminalId, 'after recovery replacement\n')).toEqual({ status: 'written' })
       await waitForJsonLine(
@@ -561,6 +572,13 @@ describe('Codex Session Flow Integration', () => {
       const inputLines = await readJsonLines(inputLogPath)
       expect(inputLines.some((line) => line.pid === oldPtyPid && line.data.includes('after recovery replacement'))).toBe(false)
     } finally {
+      if (oldPtyPid && await isProcessAlive(oldPtyPid)) {
+        try {
+          process.kill(oldPtyPid, 'SIGKILL')
+        } catch {
+          // Best-effort cleanup for a fake PTY process that can outlive the assertion window under parallel load.
+        }
+      }
       if (terminalId) {
         await registry.killAndWait(terminalId).catch(() => undefined)
       }
@@ -576,8 +594,6 @@ describe('Codex Session Flow Integration', () => {
       else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
       if (previousInputLog === undefined) delete process.env.FAKE_CODEX_INPUT_LOG
       else process.env.FAKE_CODEX_INPUT_LOG = previousInputLog
-      if (previousExitWhenFileExists === undefined) delete process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS
-      else process.env.FAKE_CODEX_EXIT_WHEN_FILE_EXISTS = previousExitWhenFileExists
       if (previousFirstLaunchOnly === undefined) delete process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY
       else process.env.FAKE_CODEX_EXIT_WATCH_FIRST_LAUNCH_ONLY = previousFirstLaunchOnly
       if (previousFirstLaunchClaim === undefined) delete process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH

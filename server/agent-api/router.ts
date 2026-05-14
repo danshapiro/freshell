@@ -5,20 +5,26 @@ import { nanoid } from 'nanoid'
 import { allocateLocalhostPort } from '../local-port.js'
 import type { CodexLaunchPlan, CodexLaunchPlanner } from '../coding-cli/codex-app-server/launch-planner.js'
 import {
+  planCodexLaunchWithRetry,
+} from '../coding-cli/codex-app-server/launch-retry.js'
+import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
   normalizeCodexSandboxSetting,
 } from '../coding-cli/codex-launch-config.js'
 import { makeSessionKey } from '../coding-cli/types.js'
-import { terminalIdFromCreateError, type ProviderSettings } from '../terminal-registry.js'
+import { terminalIdFromCreateError, type ProviderSettings, type TerminalInputResult } from '../terminal-registry.js'
 import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
+import { logger } from '../logger.js'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
+import { sanitizeSessionRef } from '../../shared/session-contract.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+const log = logger.child({ component: 'agent-api' })
 
 function agentRouteErrorStatus(error: unknown): number {
   return error instanceof CodexLaunchConfigError ? 400 : 500
@@ -71,15 +77,19 @@ async function resolveSpawnProviderSettings(
       throw new Error('Codex terminal launch requires the app-server launch planner.')
     }
     opts.assertTerminalCreateAccepted?.()
-    const plan = await opts.codexLaunchPlanner.planCreate({
-      cwd: opts.cwd,
-      resumeSessionId: opts.resumeSessionId,
-      model: providerSettings?.model,
-      sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
-      approvalPolicy: providerSettings?.permissionMode,
+    const plan = await planCodexLaunchWithRetry({
+      planner: opts.codexLaunchPlanner,
+      logger: log,
+      input: {
+        cwd: opts.cwd,
+        resumeSessionId: opts.resumeSessionId,
+        model: providerSettings?.model,
+        sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
+        approvalPolicy: providerSettings?.permissionMode,
+      },
     })
     return {
-      resumeSessionId: plan.sessionId,
+      resumeSessionId: opts.resumeSessionId ? (plan.sessionId ?? opts.resumeSessionId) : undefined,
       providerSettings: {
         codexAppServer: {
           ...plan.remote,
@@ -116,6 +126,17 @@ async function resolveSpawnProviderSettings(
 
 type ResolvedSpawnProviderSettings = Awaited<ReturnType<typeof resolveSpawnProviderSettings>>
 
+function requestedResumeSessionIdForMode(
+  sessionRef: ReturnType<typeof sanitizeSessionRef>,
+  mode: string,
+  legacyResumeSessionId: unknown,
+): string | undefined {
+  if (sessionRef && sessionRef.provider === mode) {
+    return sessionRef.sessionId
+  }
+  return typeof legacyResumeSessionId === 'string' ? legacyResumeSessionId : undefined
+}
+
 async function adoptCodexLaunch(
   launch: ResolvedSpawnProviderSettings | undefined,
   terminalId: string,
@@ -144,6 +165,111 @@ function assertCodexCreateTerminalRunning(terminal: { status?: unknown }): void 
   if (terminal.status === 'exited') {
     throw new Error('Codex terminal PTY exited before create completed.')
   }
+}
+
+function removeRegistryListener(registry: any, eventName: string, listener: (...args: any[]) => void): void {
+  if (typeof registry?.off === 'function') {
+    registry.off(eventName, listener)
+    return
+  }
+  registry?.removeListener?.(eventName, listener)
+}
+
+type CodexInputGateState = 'ready' | 'waiting' | 'missing' | 'exited' | 'non_restorable'
+
+function codexInputGateState(registry: any, terminalId: string): CodexInputGateState {
+  const record = registry.get?.(terminalId)
+  if (!record) return 'missing'
+  if (record.status !== 'running') return 'exited'
+  if (!record.codexInputGate) return 'ready'
+  if (record.codexDurability?.state === 'non_restorable') return 'non_restorable'
+  return 'waiting'
+}
+
+function codexInputGateFailureMessage(state: Exclude<CodexInputGateState, 'ready' | 'waiting'>): string {
+  if (state === 'non_restorable') {
+    return 'Codex restore identity could not be captured before accepting input.'
+  }
+  if (state === 'missing') {
+    return 'Codex terminal disappeared before restore identity was ready.'
+  }
+  return 'Codex terminal exited before restore identity was ready.'
+}
+
+async function waitForCodexInputGateRelease(
+  registry: any,
+  terminalId: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const currentState = codexInputGateState(registry, terminalId)
+  if (currentState === 'ready') return
+  if (currentState !== 'waiting') {
+    const message = codexInputGateFailureMessage(currentState)
+    log.warn({ terminalId, reason: currentState }, 'Codex input blocked and cannot become ready')
+    throw new Error(message)
+  }
+  if (typeof registry?.on !== 'function') {
+    log.warn({ terminalId, reason: 'registry_events_unavailable' }, 'Codex input gate wait cannot subscribe to registry events')
+    throw new Error('Codex terminal registry cannot wait for restore identity.')
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timeout)
+      removeRegistryListener(registry, 'terminal.codex.durability.updated', onDurabilityUpdated)
+      removeRegistryListener(registry, 'terminal.exit', onTerminalExit)
+    }
+    const completeFromCurrentState = () => {
+      const state = codexInputGateState(registry, terminalId)
+      if (state === 'ready') {
+        cleanup()
+        resolve()
+        return true
+      }
+      if (state !== 'waiting') {
+        const message = codexInputGateFailureMessage(state)
+        cleanup()
+        log.warn({ terminalId, reason: state }, 'Codex input gate wait failed')
+        reject(new Error(message))
+        return true
+      }
+      return false
+    }
+    const onDurabilityUpdated = (event: { terminalId?: string }) => {
+      if (event?.terminalId === terminalId) {
+        completeFromCurrentState()
+      }
+    }
+    const onTerminalExit = (event: { terminalId?: string }) => {
+      if (event?.terminalId === terminalId) {
+        cleanup()
+        log.warn({ terminalId, reason: 'terminal_exit' }, 'Codex input gate wait failed')
+        reject(new Error('Codex terminal exited before restore identity was ready.'))
+      }
+    }
+    const timeout = setTimeout(() => {
+      cleanup()
+      log.warn({ terminalId, timeoutMs }, 'Timed out waiting for Codex input gate')
+      reject(new Error('Timed out waiting for Codex restore identity before accepting input.'))
+    }, timeoutMs)
+    timeout.unref?.()
+
+    registry.on('terminal.codex.durability.updated', onDurabilityUpdated)
+    registry.on('terminal.exit', onTerminalExit)
+    completeFromCurrentState()
+  })
+}
+
+async function writeTerminalInputWhenReady(
+  registry: any,
+  terminalId: string,
+  input: string,
+  codexInputGateTimeoutMs?: number,
+): Promise<TerminalInputResult> {
+  const firstResult = registry.input(terminalId, input) as TerminalInputResult
+  if (firstResult.status !== 'blocked_codex_identity_pending') return firstResult
+  await waitForCodexInputGateRelease(registry, terminalId, codexInputGateTimeoutMs)
+  return registry.input(terminalId, input) as TerminalInputResult
 }
 
 async function cleanupCreatedTerminal(registry: any, terminalId: string | undefined): Promise<void> {
@@ -226,6 +352,7 @@ export function createAgentApiRouter({
   codexActivityTracker,
   codexLaunchPlanner,
   assertTerminalCreateAccepted,
+  codexInputGateTimeoutMs,
 }: {
   layoutStore: any
   registry: any
@@ -236,6 +363,7 @@ export function createAgentApiRouter({
   codexActivityTracker?: CodexPromptBlocker
   codexLaunchPlanner?: CodexLaunchPlanner
   assertTerminalCreateAccepted?: () => void
+  codexInputGateTimeoutMs?: number
 }) {
   const router = Router()
   const assertTerminalAdmission = () => {
@@ -358,10 +486,12 @@ export function createAgentApiRouter({
 
   router.post('/tabs', async (req, res) => {
     const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
+    const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let launch: ResolvedSpawnProviderSettings | undefined
     let createdTerminalId: string | undefined
+    let createdTabId: string | undefined
 
     try {
       let paneContent: any
@@ -373,16 +503,22 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
+        const requestedResumeSessionId = requestedResumeSessionIdForMode(
+          requestedSessionRef,
+          effectiveMode,
+          resumeSessionId,
+        )
         assertTerminalAdmission()
         launch = await resolveSpawnProviderSettings(
           effectiveMode,
           configStore,
           { permissionMode, model, sandbox },
-          { cwd, resumeSessionId, codexLaunchPlanner, assertTerminalCreateAccepted: assertTerminalAdmission },
+          { cwd, resumeSessionId: requestedResumeSessionId, codexLaunchPlanner, assertTerminalCreateAccepted: assertTerminalAdmission },
         )
         assertTerminalAdmission()
         const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
-        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, resumeSessionId)
+        createdTabId = tabId
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedResumeSessionId)
         assertTerminalAdmission()
         const terminal = registry.create({
           mode: effectiveMode,
@@ -398,7 +534,7 @@ export function createAgentApiRouter({
         assertTerminalAdmission()
         await adoptCodexLaunch(launch, terminal.terminalId)
         assertTerminalAdmission()
-        await waitForCodexResumeReadiness(launch, resumeSessionId)
+        await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
         assertCodexCreateTerminalRunning(terminal)
         assertTerminalAdmission()
         publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -410,7 +546,8 @@ export function createAgentApiRouter({
           status: 'running',
           mode: mode || 'shell',
           shell: shell || 'system',
-          resumeSessionId: launchResumeSessionId,
+          ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
+          ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
           initialCwd: cwd,
         }
 
@@ -425,7 +562,8 @@ export function createAgentApiRouter({
             shell,
             terminalId,
             initialCwd: cwd,
-            resumeSessionId: paneContent?.resumeSessionId,
+            ...(paneContent?.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
+            ...(paneContent?.sessionRef ? { sessionRef: paneContent.sessionRef } : {}),
             paneId,
             paneContent,
           },
@@ -437,6 +575,7 @@ export function createAgentApiRouter({
       }
 
       const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
+      createdTabId = tabId
       layoutStore.attachPaneContent(tabId, paneId, paneContent)
 
       wsHandler?.broadcastUiCommand({
@@ -449,6 +588,7 @@ export function createAgentApiRouter({
           terminalId,
           initialCwd: cwd,
           resumeSessionId: paneContent?.resumeSessionId,
+          sessionRef: paneContent?.sessionRef,
           paneId,
           paneContent,
         },
@@ -460,6 +600,13 @@ export function createAgentApiRouter({
       await cleanupFailedCodexCreate(registry, createdTerminalId ?? terminalIdFromCreateError(err), launch).catch((cleanupError) => {
         responseError = combineWithCleanupError(err, cleanupError)
       })
+      if (createdTabId && typeof layoutStore.closeTab === 'function') {
+        try {
+          layoutStore.closeTab(createdTabId)
+        } catch {
+          // best-effort cleanup; terminal/sidecar cleanup errors above remain authoritative
+        }
+      }
       const status = agentRouteErrorStatus(responseError)
       res.status(status).json(fail(responseError?.message || 'Failed to create tab'))
     }
@@ -746,6 +893,7 @@ export function createAgentApiRouter({
     const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
     let launch: ResolvedSpawnProviderSettings | undefined
     let createdTerminalId: string | undefined
+    let createdTabId: string | undefined
     try {
       assertTerminalAdmission()
       launch = await resolveSpawnProviderSettings(mode, configStore, {}, {
@@ -757,6 +905,7 @@ export function createAgentApiRouter({
       const created = layoutStore.createTab?.({ title })
       const tabId = created?.tabId || nanoid()
       const paneId = created?.paneId || nanoid()
+      createdTabId = created?.tabId
       const sessionBindingReason = getCodexSessionBindingReason(mode)
       assertTerminalAdmission()
       const terminal = registry.create({
@@ -782,7 +931,7 @@ export function createAgentApiRouter({
 
       const sentinel = `__FRESHELL_DONE_${nanoid()}__`
       const input = capture ? `${command}; echo ${sentinel}\r` : `${command}\r`
-      const inputResult = registry.input(terminal.terminalId, input)
+      const inputResult = await writeTerminalInputWhenReady(registry, terminal.terminalId, input, codexInputGateTimeoutMs)
       if (inputResult.status !== 'written') {
         throw new Error(inputResult.status === 'blocked_codex_identity_pending'
           ? 'Codex restore identity is not ready yet.'
@@ -814,6 +963,13 @@ export function createAgentApiRouter({
       await cleanupFailedCodexCreate(registry, createdTerminalId ?? terminalIdFromCreateError(err), launch).catch((cleanupError) => {
         responseError = combineWithCleanupError(err, cleanupError)
       })
+      if (createdTabId && typeof layoutStore.closeTab === 'function') {
+        try {
+          layoutStore.closeTab(createdTabId)
+        } catch {
+          // best-effort cleanup; terminal/sidecar cleanup errors above remain authoritative
+        }
+      }
       const status = agentRouteErrorStatus(responseError)
       return res.status(status).json(fail(responseError?.message || 'Failed to run command'))
     }
@@ -857,19 +1013,25 @@ export function createAgentApiRouter({
         content = { kind: 'editor', filePath: req.body.editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const splitMode = req.body?.mode || 'shell'
+        const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+        const requestedResumeSessionId = requestedResumeSessionIdForMode(
+          requestedSessionRef,
+          splitMode,
+          req.body?.resumeSessionId,
+        )
         launch = await resolveSpawnProviderSettings(
           splitMode,
           configStore,
           {},
           {
             cwd: req.body?.cwd,
-            resumeSessionId: req.body?.resumeSessionId,
+            resumeSessionId: requestedResumeSessionId,
             codexLaunchPlanner,
             assertTerminalCreateAccepted: assertTerminalAdmission,
           },
         )
         assertTerminalAdmission()
-        const sessionBindingReason = getCodexSessionBindingReason(splitMode, req.body?.resumeSessionId)
+        const sessionBindingReason = getCodexSessionBindingReason(splitMode, requestedResumeSessionId)
         assertTerminalAdmission()
         const terminal = registry.create({
           mode: splitMode,
@@ -897,7 +1059,8 @@ export function createAgentApiRouter({
           status: 'running',
           mode: req.body?.mode || 'shell',
           shell: req.body?.shell || 'system',
-          ...(launchResumeSessionId ? { resumeSessionId: launchResumeSessionId } : {}),
+          ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
+          ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
         }
       }
 
@@ -1087,6 +1250,12 @@ export function createAgentApiRouter({
       const tabId = target?.tabId
       if (!tabId) return res.status(404).json(fail('pane not found'))
       const effectiveMode = req.body?.mode || 'shell'
+      const requestedSessionRef = sanitizeSessionRef(req.body?.sessionRef)
+      const requestedResumeSessionId = requestedResumeSessionIdForMode(
+        requestedSessionRef,
+        effectiveMode,
+        req.body?.resumeSessionId,
+      )
       assertTerminalAdmission()
       launch = await resolveSpawnProviderSettings(
         effectiveMode,
@@ -1094,13 +1263,13 @@ export function createAgentApiRouter({
         {},
         {
           cwd: req.body?.cwd,
-          resumeSessionId: req.body?.resumeSessionId,
+          resumeSessionId: requestedResumeSessionId,
           codexLaunchPlanner,
           assertTerminalCreateAccepted: assertTerminalAdmission,
         },
       )
       assertTerminalAdmission()
-      const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, req.body?.resumeSessionId)
+      const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedResumeSessionId)
       assertTerminalAdmission()
       const terminal = registry.create({
         mode: effectiveMode,
@@ -1116,7 +1285,7 @@ export function createAgentApiRouter({
       assertTerminalAdmission()
       await adoptCodexLaunch(launch, terminal.terminalId)
       assertTerminalAdmission()
-      await waitForCodexResumeReadiness(launch, req.body?.resumeSessionId)
+      await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
       assertCodexCreateTerminalRunning(terminal)
       assertTerminalAdmission()
       publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -1128,7 +1297,8 @@ export function createAgentApiRouter({
         mode: req.body?.mode || 'shell',
         shell: req.body?.shell || 'system',
         createRequestId: nanoid(),
-        ...(launchResumeSessionId ? { resumeSessionId: launchResumeSessionId } : {}),
+        ...(requestedSessionRef ? { sessionRef: requestedSessionRef } : {}),
+        ...(launchResumeSessionId && !requestedSessionRef ? { resumeSessionId: launchResumeSessionId } : {}),
       }
       layoutStore.attachPaneContent(tabId, paneId, content)
       wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })

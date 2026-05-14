@@ -472,7 +472,9 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     }))
     expect(replacementSidecar.adopt).toHaveBeenCalledWith({ terminalId: term.terminalId, generation: 1 })
     expect(currentSidecar.shutdown).toHaveBeenCalledTimes(1)
-    expect(mockPtyProcess.instances[0].kill).toHaveBeenCalled()
+    expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledWith('SIGTERM')
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
     expect(mockPtyProcess.instances[1].write).toBeDefined()
 
     expect(registry.input(term.terminalId, 'after recovery')).toEqual({ status: 'written' })

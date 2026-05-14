@@ -1,3 +1,6 @@
+import fsp from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
@@ -6,6 +9,8 @@ import { SessionAssociationCoordinator } from '../../server/session-association-
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
 import { recordSessionLifecycleEvent } from '../../server/session-observability'
+import { CodexDurabilityStore } from '../../server/coding-cli/codex-app-server/durability-store'
+import { CODEX_DURABILITY_SCHEMA_VERSION } from '../../shared/codex-durability'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -188,39 +193,60 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
-  it('records a lifecycle event when the Codex sidecar reports durable identity', () => {
-    let onDurableSession: ((sessionId: string) => void) | undefined
-    const sidecar = {
-      attachTerminal: vi.fn((callbacks: { onDurableSession: (sessionId: string) => void }) => {
-        onDurableSession = callbacks.onDurableSession
-      }),
-      shutdown: vi.fn(async () => undefined),
-    }
-    const registry = new TerminalRegistry()
-    const terminal = registry.create({
-      mode: 'codex',
-      cwd: '/home/user/project',
-      codexSidecar: sidecar,
+  it('records a lifecycle event when Codex durable identity is proven from the rollout file', async () => {
+    const testDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-proof-'))
+    const durabilityDir = path.join(testDir, 'durability')
+    const rolloutPath = path.join(testDir, 'rollout.jsonl')
+    await fsp.writeFile(
+      rolloutPath,
+      `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-thread-1' } })}\n`,
+      'utf8',
+    )
+    const registry = new TerminalRegistry(undefined, undefined, undefined, {
+      codexDurabilityStore: new CodexDurabilityStore({ dir: durabilityDir }),
     })
 
-    onDurableSession?.('codex-thread-1')
-    onDurableSession?.('codex-thread-1')
+    try {
+      const terminal = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        codexSidecar: {
+          shutdown: vi.fn(async () => undefined),
+        } as any,
+      })
+      const record = registry.get(terminal.terminalId)
+      expect(record).toBeTruthy()
+      record!.codexDurability = {
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'captured_pre_turn',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'codex-thread-1',
+          rolloutPath,
+          source: 'thread_start_response',
+          capturedAt: 1_000,
+        },
+      }
 
-    const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
-      event.kind === 'codex_durable_session_observed'
-    )
-    expect(durableObservationCalls).toEqual([[
-      {
-        kind: 'codex_durable_session_observed',
-        provider: 'codex',
-        terminalId: terminal.terminalId,
-        sessionId: 'codex-thread-1',
-        generation: 1,
-        source: 'sidecar',
-      },
-    ]])
+      await (registry as any).runCodexDurabilityProof(terminal.terminalId, 'test')
 
-    registry.shutdown()
+      const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
+        event.kind === 'codex_durable_session_observed'
+      )
+      expect(durableObservationCalls).toEqual([[
+        {
+          kind: 'codex_durable_session_observed',
+          provider: 'codex',
+          terminalId: terminal.terminalId,
+          sessionId: 'codex-thread-1',
+          generation: 0,
+          source: 'sidecar',
+        },
+      ]])
+    } finally {
+      registry.shutdown()
+      await fsp.rm(testDir, { recursive: true, force: true })
+    }
   })
 })
 

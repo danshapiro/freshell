@@ -35,6 +35,10 @@ import type { ServerSettings } from '../shared/settings.js'
 import { stripAnsi } from './ai-prompts.js'
 import type { CodexLaunchPlan, CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
 import {
+  CODEX_INITIAL_LAUNCH_ATTEMPTS,
+  planCodexLaunchWithRetry,
+} from './coding-cli/codex-app-server/launch-retry.js'
+import {
   CodexLaunchConfigError,
   getCodexSessionBindingReason,
   normalizeCodexSandboxSetting,
@@ -223,6 +227,24 @@ function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | unde
     ...(isNonEmptyString(candidate.serverInstanceId)
       ? { serverInstanceId: candidate.serverInstanceId }
       : {}),
+  }
+}
+
+function normalizeTerminalInventoryForClient(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return value
+  const terminal = value as Record<string, unknown>
+  const { resumeSessionId: legacyResumeSessionId, ...rest } = terminal
+  const explicitSessionRef = normalizeUiSessionLocator(terminal.sessionRef)
+  const provider = typeof terminal.mode === 'string' && modeSupportsResume(terminal.mode as TerminalMode)
+    ? terminal.mode
+    : undefined
+  const migratedSessionRef = provider && isNonEmptyString(legacyResumeSessionId)
+    ? { provider, sessionId: legacyResumeSessionId }
+    : undefined
+  const sessionRef = explicitSessionRef ?? migratedSessionRef
+  return {
+    ...rest,
+    ...(sessionRef ? { sessionRef } : {}),
   }
 }
 
@@ -478,7 +500,7 @@ export class WsHandler {
       restore: z.boolean().optional(),
       tabId: z.string().min(1).optional(),
       paneId: z.string().min(1).optional(),
-    })
+    }).strict()
 
     const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
       if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
@@ -499,7 +521,7 @@ export class WsHandler {
       maxTurns: z.number().int().positive().optional(),
       permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
       sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    })
+    }).strict()
 
     this.clientMessageSchema = z.discriminatedUnion('type', [
       HelloSchema,
@@ -687,16 +709,23 @@ export class WsHandler {
     cwd: string | undefined,
     resumeSessionId: string | undefined,
     providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    attempts = 1,
   ) {
     if (!this.codexLaunchPlanner) {
       throw new Error('Codex terminal launch requires the app-server launch planner.')
     }
-    return this.codexLaunchPlanner.planCreate({
+    const input = {
       cwd,
       resumeSessionId,
       model: providerSettings?.model,
       sandbox: normalizeCodexSandboxSetting(providerSettings?.sandbox),
       approvalPolicy: providerSettings?.permissionMode,
+    }
+    return planCodexLaunchWithRetry({
+      planner: this.codexLaunchPlanner,
+      input,
+      attempts,
+      logger: log,
     })
   }
 
@@ -1635,7 +1664,7 @@ export class WsHandler {
       }
 
       // Send terminal inventory so the client knows what's alive
-      const terminals = this.registry.list()
+      const terminals = this.registry.list().map(normalizeTerminalInventoryForClient)
       const terminalMeta = this.terminalMetaListProvider?.() ?? []
       this.safeSend(ws, {
         type: 'terminal.inventory',
@@ -1911,7 +1940,6 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(m.mode !== 'codex' && opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
@@ -2143,7 +2171,12 @@ export class WsHandler {
                 : undefined
               this.assertTerminalCreateAccepted()
               const codexPlan = m.mode === 'codex'
-                ? await this.planCodexLaunch(m.cwd, requestedCodexResumeSessionId, providerSettings)
+                ? await this.planCodexLaunch(
+                  m.cwd,
+                  requestedCodexResumeSessionId,
+                  providerSettings,
+                  CODEX_INITIAL_LAUNCH_ATTEMPTS,
+                )
                 : undefined
               pendingCodexPlan = codexPlan
 

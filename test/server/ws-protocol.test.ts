@@ -505,7 +505,7 @@ describe('ws protocol', () => {
       resumeSessionId: undefined,
       sandbox: 'workspace-write',
     }])
-    expect(registry.createCalls[0]?.resumeSessionId).toBe('thread-new-1')
+    expect(registry.createCalls[0]?.resumeSessionId).toBeUndefined()
     expect(registry.createCalls[0]?.providerSettings).toEqual({
       codexAppServer: expect.objectContaining({
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,

@@ -8,7 +8,7 @@ it('sends input to a pane terminal', async () => {
   app.use(express.json())
   app.use('/api', createAgentApiRouter({
     layoutStore: { resolvePaneToTerminal: () => 'term_1' },
-    registry: { input: () => true },
+    registry: { input: () => ({ status: 'written' }) },
   }))
 
   const res = await request(app).post('/api/panes/p1/send-keys').send({ data: 'ls\r' })
@@ -16,7 +16,7 @@ it('sends input to a pane terminal', async () => {
 })
 
 it('resolves tmux-style target to a pane before sending', async () => {
-  const input = vi.fn(() => true)
+  const input = vi.fn(() => ({ status: 'written' }))
   const app = express()
   app.use(express.json())
   app.use('/api', createAgentApiRouter({
