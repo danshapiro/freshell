@@ -182,6 +182,7 @@ class FakeRegistry {
   createCalls: any[] = []
   repairCalls: Array<{ mode: string; sessionId: string }> = []
   candidatePersistedAcks: any[] = []
+  promoteCalls: Array<{ terminalId: string; durableThreadId: string }> = []
 
   constructor(terminalIds: string[]) {
     const createdAt = Date.now()
@@ -236,6 +237,21 @@ class FakeRegistry {
     if (!record || mode !== 'codex') return { ok: false, reason: 'terminal_missing' }
     record.resumeSessionId = sessionId
     return { ok: true, terminalId, sessionId }
+  }
+
+  async promoteCodexDurabilityFromCreateProof(terminalId: string, durableThreadId: string) {
+    this.promoteCalls.push({ terminalId, durableThreadId })
+    const bound = this.bindSession(terminalId, 'codex', durableThreadId)
+    if (!bound.ok) return bound
+    const record = this.findById(terminalId)
+    if (record) {
+      record.codexDurability = {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId,
+      }
+    }
+    return bound
   }
 
   findRunningClaudeTerminalBySession(sessionId: string) {
@@ -315,6 +331,7 @@ describe('terminal.create reuse running codex terminal', () => {
     registry.createCalls = []
     registry.repairCalls = []
     registry.candidatePersistedAcks = []
+    registry.promoteCalls = []
   }, HOOK_TIMEOUT_MS)
 
   afterEach(async () => {
@@ -655,6 +672,10 @@ describe('terminal.create reuse running codex terminal', () => {
         state: 'durable',
         durableThreadId: 'thread-live-proved',
       })
+      expect(registry.promoteCalls).toEqual([{
+        terminalId: 'term-codex-existing',
+        durableThreadId: 'thread-live-proved',
+      }])
       expect(codexLaunchPlanner.planCreateCalls).toHaveLength(0)
       expect(registry.createCalls).toHaveLength(0)
     } finally {
@@ -697,6 +718,10 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.created',
         requestId,
         clearCodexDurability: true,
+        restoreError: {
+          code: 'RESTORE_UNAVAILABLE',
+          reason: 'durable_artifact_missing',
+        },
       })
       expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
         resumeSessionId: undefined,

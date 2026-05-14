@@ -521,6 +521,10 @@ describe('codex refresh rehydrate flow (e2e)', () => {
         terminalId: 'term-codex-candidate-fresh',
         createdAt: 2,
         clearCodexDurability: true,
+        restoreError: {
+          code: 'RESTORE_UNAVAILABLE',
+          reason: 'durable_artifact_missing',
+        },
       })
     })
 
@@ -528,6 +532,10 @@ describe('codex refresh rehydrate flow (e2e)', () => {
       const afterFreshCreate = readPersistedLayoutSnapshotForTest()
       expect((afterFreshCreate?.panes.layouts[tabId] as any)?.content?.terminalId).toBe('term-codex-candidate-fresh')
       expect((afterFreshCreate?.panes.layouts[tabId] as any)?.content?.codexDurability).toBeUndefined()
+      expect((afterFreshCreate?.panes.layouts[tabId] as any)?.content?.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'durable_artifact_missing',
+      })
       expect(afterFreshCreate?.tabs.tabs.find((tab) => tab.id === tabId)?.codexDurability).toBeUndefined()
     })
   })

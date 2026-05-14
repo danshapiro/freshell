@@ -1075,19 +1075,6 @@ export class TerminalRegistry extends EventEmitter {
       const raw = Number(process.env.MAX_PENDING_SNAPSHOT_CHARS || DEFAULT_MAX_PENDING_SNAPSHOT_CHARS)
       this.maxPendingSnapshotChars = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_PENDING_SNAPSHOT_CHARS
     }
-    void this.codexDurabilityStore.deleteRecordsForOtherServers(this.serverInstanceId).then((deleted) => {
-      if (deleted > 0) {
-        logger.info({
-          deleted,
-          serverInstanceId: this.serverInstanceId,
-        }, 'Deleted stale Codex durability store records from older server instances')
-      }
-    }).catch((err) => {
-      logger.warn({
-        err,
-        serverInstanceId: this.serverInstanceId,
-      }, 'Failed to delete stale Codex durability store records from older server instances')
-    })
     this.startIdleMonitor()
     this.startPerfMonitor()
   }
@@ -1995,6 +1982,47 @@ export class TerminalRegistry extends EventEmitter {
       message: proof.message,
     }, 'Codex rollout proof failed')
     this.broadcastCodexDurability(record, stored)
+  }
+
+  async promoteCodexDurabilityFromCreateProof(
+    terminalId: string,
+    durableThreadId: string,
+    checkedAt = Date.now(),
+  ): Promise<BindSessionResult> {
+    const record = this.terminals.get(terminalId)
+    if (!record) return { ok: false, reason: 'terminal_missing' }
+    if (record.mode !== 'codex') return { ok: false, reason: 'mode_mismatch' }
+    if (record.status !== 'running') return { ok: false, reason: 'terminal_not_running' }
+
+    const bound = this.bindSession(terminalId, 'codex', durableThreadId, 'association')
+    if (!bound.ok) return bound
+    const sessionId = record.resumeSessionId
+    if (!sessionId) return { ok: false, reason: 'invalid_session_id' }
+
+    const durability: CodexDurabilityRef = {
+      schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+      state: 'durable',
+      ...(record.codexDurability?.candidate ? { candidate: record.codexDurability.candidate } : {}),
+      ...(record.codexDurability?.turnCompletedAt !== undefined ? { turnCompletedAt: record.codexDurability.turnCompletedAt } : {}),
+      durableThreadId: sessionId,
+    }
+    const stored = await this.writeCodexDurability(record, durability, checkedAt)
+    record.codexDurabilityProof = undefined
+    this.unwatchCodexRollout(record, 'durable')
+    logger.info({
+      terminalId,
+      durableThreadId: sessionId,
+    }, 'Codex rollout proof promoted captured restore state during terminal.create')
+    this.broadcastCodexDurability(record, stored)
+    recordSessionLifecycleEvent({
+      kind: 'codex_durable_session_observed',
+      provider: 'codex',
+      terminalId,
+      sessionId,
+      generation: record.codexSidecarGeneration ?? 0,
+      source: 'sidecar',
+    })
+    return { ok: true, terminalId, sessionId }
   }
 
   private needsCodexFinalDurabilityProof(record: TerminalRecord): boolean {

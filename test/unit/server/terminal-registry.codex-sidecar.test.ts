@@ -343,7 +343,6 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const fsImpl = {
       mkdir: fsp.mkdir,
       readFile: fsp.readFile,
-      readdir: fsp.readdir,
       rename: fsp.rename,
       unlink: fsp.unlink,
       writeFile: vi.fn(async (...args: Parameters<typeof fsp.writeFile>) => {
@@ -517,6 +516,89 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
           provider: 'codex',
           sessionId: 'thread-proof-ok',
         },
+      }))
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists and broadcasts durable Codex identity promoted from create-time proof', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const rolloutPath = path.join(durabilityDir, 'rollout.jsonl')
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        envContext: { tabId: 'tab-create-proof', paneId: 'pane-create-proof' },
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const sent: unknown[] = []
+      const client = {
+        readyState: 1,
+        bufferedAmount: 0,
+        send: vi.fn((message: string) => sent.push(JSON.parse(message))),
+      }
+      registry.attach(term.terminalId, client as any)
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-create-candidate',
+          path: rolloutPath,
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
+
+      await expect(registry.promoteCodexDurabilityFromCreateProof(
+        term.terminalId,
+        'thread-create-durable',
+        12345,
+      )).resolves.toEqual({
+        ok: true,
+        terminalId: term.terminalId,
+        sessionId: 'thread-create-durable',
+      })
+
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-create-durable')
+      expect(registry.get(term.terminalId)?.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-create-durable',
+        candidate: {
+          candidateThreadId: 'thread-create-candidate',
+          rolloutPath,
+        },
+      })
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        terminalId: term.terminalId,
+        tabId: 'tab-create-proof',
+        paneId: 'pane-create-proof',
+        serverInstanceId: 'srv-test',
+        state: 'durable',
+        durableThreadId: 'thread-create-durable',
+        candidate: {
+          candidateThreadId: 'thread-create-candidate',
+          rolloutPath,
+        },
+        updatedAt: 12345,
+      })
+      expect(sent).toContainEqual(expect.objectContaining({
+        type: 'terminal.codex.durability.updated',
+        terminalId: term.terminalId,
+        durability: expect.objectContaining({
+          state: 'durable',
+          durableThreadId: 'thread-create-durable',
+        }),
       }))
     } finally {
       await fsp.rm(durabilityDir, { recursive: true, force: true })

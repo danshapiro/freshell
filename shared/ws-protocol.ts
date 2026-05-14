@@ -9,7 +9,7 @@
 import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
-import { LiveTerminalHandleSchema, SessionRefSchema } from './session-contract.js'
+import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 
 // ──────────────────────────────────────────────────────────────
@@ -487,6 +487,7 @@ export type TerminalCreatedMessage = {
   terminalId: string
   createdAt: number
   clearCodexDurability?: boolean
+  restoreError?: RestoreError
 }
 
 export type TerminalAttachReadyMessage = {

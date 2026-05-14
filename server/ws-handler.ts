@@ -78,7 +78,7 @@ import {
   UiScreenshotResultSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
-import { LiveTerminalHandleSchema } from '../shared/session-contract.js'
+import { buildRestoreError, LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
@@ -1946,6 +1946,7 @@ export class WsHandler {
                 createdAt: number
                 effectiveResumeSessionId?: string
                 clearCodexDurability?: boolean
+                restoreError?: RestoreError
               }): Promise<boolean> => {
                 if (opts.ws.readyState !== WebSocket.OPEN) {
                   return false
@@ -1957,6 +1958,7 @@ export class WsHandler {
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
                   ...(opts.clearCodexDurability ? { clearCodexDurability: true } : {}),
+                  ...(opts.restoreError ? { restoreError: opts.restoreError } : {}),
                 })
                 return true
               }
@@ -2010,6 +2012,13 @@ export class WsHandler {
                   },
                 })
               }
+              const broadcastCodexDurabilityUpdated = (associatedTerminalId: string, durability: unknown) => {
+                this.broadcast({
+                  type: 'terminal.codex.durability.updated',
+                  terminalId: associatedTerminalId,
+                  durability,
+                })
+              }
 
               const existingId = resolveExistingRequestTerminalId(m.requestId)
               if (existingId) {
@@ -2029,6 +2038,7 @@ export class WsHandler {
               }
 
               let clearCodexDurabilityOnCreate = false
+              let restoreErrorOnCreate: RestoreError | undefined
               if (m.mode === 'codex' && !effectiveResumeSessionId && m.codexDurability?.candidate) {
                 const candidate = m.codexDurability.candidate
                 const proof = await proofCodexRollout({
@@ -2038,14 +2048,24 @@ export class WsHandler {
                 if (proof.ok) {
                   const live = requestedLiveTerminal()
                   if (live) {
-                    const bound = this.registry.bindSession?.(live.terminalId, 'codex', proof.rolloutProofId, 'association')
+                    const promoted = typeof this.registry.promoteCodexDurabilityFromCreateProof === 'function'
+                      ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, proof.rolloutProofId)
+                      : undefined
+                    const bound = promoted ?? this.registry.bindSession?.(live.terminalId, 'codex', proof.rolloutProofId, 'association')
                     if (!bound || bound.ok) {
-                      live.resumeSessionId = proof.rolloutProofId
-                      live.codexDurability = {
+                      if (!promoted) {
+                        live.resumeSessionId = proof.rolloutProofId
+                        live.codexDurability = {
+                          schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+                          state: 'durable',
+                          durableThreadId: proof.rolloutProofId,
+                        }
+                      }
+                      broadcastCodexDurabilityUpdated(live.terminalId, live.codexDurability ?? {
                         schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
                         state: 'durable',
                         durableThreadId: proof.rolloutProofId,
-                      }
+                      })
                       await attachReusedTerminal(live.terminalId, live.createdAt, proof.rolloutProofId)
                       broadcastCodexSessionAssociated(live.terminalId, proof.rolloutProofId)
                       return
@@ -2082,6 +2102,7 @@ export class WsHandler {
                     return
                   }
                   clearCodexDurabilityOnCreate = true
+                  restoreErrorOnCreate = buildRestoreError('durable_artifact_missing')
                 }
               }
 
@@ -2336,6 +2357,7 @@ export class WsHandler {
                 createdAt: record.createdAt,
                 effectiveResumeSessionId,
                 clearCodexDurability: clearCodexDurabilityOnCreate,
+                restoreError: restoreErrorOnCreate,
               })
               if (!sent) {
                 // Terminal may still exist even if created delivery failed (for

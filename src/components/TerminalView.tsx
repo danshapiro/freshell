@@ -2039,6 +2039,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             terminalId: newId,
             status: 'running',
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
+            ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
           // Also update tab status
           const currentTab = tabRef.current
