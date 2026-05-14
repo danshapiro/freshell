@@ -1521,6 +1521,17 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     this.terminals.set(terminalId, record)
+    if (opts.mode === 'codex' && record.codexInputGate?.state === 'identity_pending') {
+      recordSessionLifecycleEvent({
+        kind: 'codex_candidate_pending',
+        provider: 'codex',
+        terminalId,
+        generation: record.codexSidecarGeneration ?? 0,
+        ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
+        ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
+        ...(record.cwd ? { cwd: record.cwd } : {}),
+      })
+    }
     const exactSessionId = resumeForBinding
     if (modeSupportsResume(opts.mode) && exactSessionId) {
       const bound = this.bindSession(
@@ -1799,6 +1810,17 @@ export class TerminalRegistry extends EventEmitter {
       rolloutPath: storedDurability.candidate?.rolloutPath,
       source: storedDurability.candidate?.source,
     }, 'Persisted Codex restore identity before user input')
+    if (storedDurability.candidate) {
+      recordSessionLifecycleEvent({
+        kind: 'codex_candidate_captured',
+        provider: 'codex',
+        terminalId,
+        candidateThreadId: storedDurability.candidate.candidateThreadId,
+        rolloutPath: storedDurability.candidate.rolloutPath,
+        source: storedDurability.candidate.source,
+        generation: record.codexSidecarGeneration ?? 0,
+      })
+    }
     this.broadcastCodexDurability(record, storedDurability)
   }
 

@@ -30,12 +30,38 @@ export type SessionLifecycleEvent =
     hasSessionRef: boolean
   })
   | {
+    kind: 'codex_candidate_pending'
+    provider: 'codex'
+    terminalId: string
+    generation: number
+    tabId?: string
+    paneId?: string
+    cwd?: string
+  }
+  | {
+    kind: 'codex_candidate_captured'
+    provider: 'codex'
+    terminalId: string
+    candidateThreadId: string
+    rolloutPath: string
+    source: string
+    generation: number
+  }
+  | {
     kind: 'codex_durable_session_observed'
     provider: 'codex'
     terminalId: string
     sessionId: string
     generation: number
     attemptId?: string
+    source: 'sidecar'
+  }
+  | {
+    kind: 'codex_durable_resume_started'
+    provider: 'codex'
+    terminalId: string
+    sessionId: string
+    generation: number
     source: 'sidecar'
   }
   | {
@@ -135,6 +161,26 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         reused: event.reused,
         hasSessionRef: event.hasSessionRef,
       }
+    case 'codex_candidate_pending':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        generation: event.generation,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        cwd: event.cwd,
+      }
+    case 'codex_candidate_captured':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        candidateThreadId: event.candidateThreadId,
+        rolloutPath: event.rolloutPath,
+        source: event.source,
+        generation: event.generation,
+      }
     case 'codex_durable_session_observed':
       return {
         ...base,
@@ -143,6 +189,15 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         sessionId: event.sessionId,
         generation: event.generation,
         attemptId: event.attemptId,
+        source: event.source,
+      }
+    case 'codex_durable_resume_started':
+      return {
+        ...base,
+        provider: event.provider,
+        terminalId: event.terminalId,
+        sessionId: event.sessionId,
+        generation: event.generation,
         source: event.source,
       }
     case 'session_association_broadcast':

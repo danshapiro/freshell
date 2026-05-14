@@ -699,6 +699,72 @@ describe('terminal.create reuse running codex terminal', () => {
     }
   })
 
+  it('does not promote a stale same-server live Codex handle when its candidate differs', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-live-mismatch-'))
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      const rolloutPath = path.join(tempDir, 'rollout.jsonl')
+      await fsp.writeFile(
+        rolloutPath,
+        '{"type":"session_meta","payload":{"id":"thread-proved-mismatch"}}\n',
+        'utf8',
+      )
+      registry.records[0].resumeSessionId = undefined
+      registry.records[0].codexDurability = {
+        schemaVersion: 1,
+        state: 'durability_unproven_after_completion',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'different-live-thread',
+          rolloutPath,
+          source: 'thread_started_notification',
+          capturedAt: Date.now(),
+        },
+        turnCompletedAt: Date.now(),
+      }
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      const helloReady = await waitForReady(ws)
+
+      const requestId = 'codex-proved-live-mismatch-reopen'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        restore: true,
+        liveTerminal: {
+          terminalId: 'term-codex-existing',
+          serverInstanceId: helloReady.serverInstanceId,
+        },
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durability_unproven_after_completion',
+          candidate: {
+            provider: 'codex',
+            candidateThreadId: 'thread-proved-mismatch',
+            rolloutPath,
+            source: 'thread_started_notification',
+            capturedAt: Date.now(),
+          },
+          turnCompletedAt: Date.now(),
+        },
+      }))
+
+      await createdPromise
+      expect(registry.promoteCalls).toEqual([])
+      expect(codexLaunchPlanner.planCreateCalls[0]).toMatchObject({
+        resumeSessionId: 'thread-proved-mismatch',
+      })
+      expect(registry.createCalls[0]).toMatchObject({
+        mode: 'codex',
+        resumeSessionId: 'thread-proved-mismatch',
+      })
+    } finally {
+      await closeWebSocket(ws)
+      await fsp.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   it('does not resume a captured Codex candidate when proof fails', async () => {
     const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-ws-codex-proof-'))
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)

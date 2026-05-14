@@ -1288,6 +1288,7 @@ export class WsHandler {
     log.warn({
       connectionId: ws.connectionId || 'unknown',
       code: params.code,
+      message: params.message,
       ...(params.requestId ? { requestId: params.requestId } : {}),
       ...(params.terminalId ? { terminalId: params.terminalId } : {}),
     }, 'Sending WebSocket error')
@@ -2012,6 +2013,28 @@ export class WsHandler {
                 const live = this.registry.get(m.liveTerminal.terminalId)
                 return live && live.status === 'running' && live.mode === m.mode ? live : undefined
               }
+              const requestedLiveCodexCandidate = (candidate: {
+                candidateThreadId: string
+                rolloutPath: string
+              }): TerminalRecord | undefined => {
+                const live = requestedLiveTerminal()
+                if (!live) return undefined
+                const liveCandidate = live.codexDurability?.candidate
+                if (
+                  liveCandidate?.candidateThreadId !== candidate.candidateThreadId
+                  || liveCandidate?.rolloutPath !== candidate.rolloutPath
+                ) {
+                  log.warn({
+                    requestId: m.requestId,
+                    connectionId: ws.connectionId,
+                    terminalId: live.terminalId,
+                    requestedCandidateThreadId: candidate.candidateThreadId,
+                    liveCandidateThreadId: liveCandidate?.candidateThreadId,
+                  }, 'Ignoring stale Codex live terminal handle with mismatched restore candidate')
+                  return undefined
+                }
+                return live
+              }
               const broadcastCodexSessionAssociated = (associatedTerminalId: string, sessionId: string) => {
                 this.broadcast({
                   type: 'terminal.session.associated',
@@ -2056,7 +2079,10 @@ export class WsHandler {
                   candidateThreadId: candidate.candidateThreadId,
                 })
                 if (proof.ok) {
-                  const live = requestedLiveTerminal()
+                  const live = this.registry.findRunningCodexTerminalByCandidate(
+                    candidate.candidateThreadId,
+                    candidate.rolloutPath,
+                  ) ?? requestedLiveCodexCandidate(candidate)
                   if (live) {
                     const promoted = typeof this.registry.promoteCodexDurabilityFromCreateProof === 'function'
                       ? await this.registry.promoteCodexDurabilityFromCreateProof(live.terminalId, proof.rolloutProofId)
@@ -2106,7 +2132,7 @@ export class WsHandler {
                   const live = this.registry.findRunningCodexTerminalByCandidate(
                     candidate.candidateThreadId,
                     candidate.rolloutPath,
-                  ) ?? requestedLiveTerminal()
+                  )
                   if (live) {
                     await attachReusedTerminal(live.terminalId, live.createdAt, live.resumeSessionId)
                     return
@@ -2339,7 +2365,7 @@ export class WsHandler {
                 pendingCodexPlan = undefined
                 if (effectiveResumeSessionId) {
                   recordSessionLifecycleEvent({
-                    kind: 'codex_durable_session_observed',
+                    kind: 'codex_durable_resume_started',
                     provider: 'codex',
                     terminalId: record.terminalId,
                     sessionId: effectiveResumeSessionId,
