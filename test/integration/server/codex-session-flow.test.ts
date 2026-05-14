@@ -5,6 +5,7 @@ import os from 'os'
 import path from 'path'
 import express from 'express'
 import WebSocket from 'ws'
+import { createRequire } from 'module'
 import { WsHandler } from '../../../server/ws-handler.js'
 import { TerminalRegistry } from '../../../server/terminal-registry.js'
 import { CodexAppServerRuntime } from '../../../server/coding-cli/codex-app-server/runtime.js'
@@ -40,14 +41,23 @@ const FAKE_APP_SERVER_PATH = path.resolve(
   process.cwd(),
   'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
 )
+const requireForFixture = createRequire(import.meta.url)
+const WS_MODULE_PATH = requireForFixture.resolve('ws')
 
 async function writeFakeCodexExecutable(binaryPath: string) {
   const script = `#!/usr/bin/env node
 const fs = require('fs')
+let WebSocket
 
 function appendJsonLine(filePath, value) {
   if (!filePath) return
   fs.appendFileSync(filePath, JSON.stringify(value) + '\\n', 'utf8')
+}
+
+function remoteUrlFromArgs(args) {
+  const index = args.indexOf('--remote')
+  if (index === -1 || index === args.length - 1) return undefined
+  return args[index + 1]
 }
 
 const argLogPath = process.env.FAKE_CODEX_ARG_LOG
@@ -70,14 +80,64 @@ if (process.env.FAKE_CODEX_FIRST_LAUNCH_CLAIM_PATH) {
   }
 }
 
+const remoteUrl = remoteUrlFromArgs(process.argv.slice(2))
+let remoteSocket
+let remoteMessageId = 1
+let remoteThreadId
+let remoteReady = false
+if (process.env.FAKE_CODEX_CONNECT_REMOTE === '1' && remoteUrl) {
+  WebSocket = require(${JSON.stringify(WS_MODULE_PATH)})
+  setTimeout(() => {
+    remoteSocket = new WebSocket(remoteUrl)
+    remoteSocket.on('open', () => {
+      remoteSocket.send(JSON.stringify({
+        id: remoteMessageId++,
+        method: 'thread/start',
+        params: { cwd: process.cwd() },
+      }))
+    })
+    remoteSocket.on('message', (raw) => {
+      appendJsonLine(process.env.FAKE_CODEX_REMOTE_LOG, {
+        pid: process.pid,
+        message: JSON.parse(raw.toString('utf8')),
+      })
+      const message = JSON.parse(raw.toString('utf8'))
+      const threadId = message && message.result && message.result.thread && message.result.thread.id
+      if (threadId) {
+        remoteThreadId = threadId
+        remoteReady = true
+      }
+    })
+    remoteSocket.on('error', (error) => {
+      appendJsonLine(process.env.FAKE_CODEX_REMOTE_LOG, {
+        pid: process.pid,
+        error: error.message,
+      })
+    })
+  }, Number(process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS || 0))
+}
+
 process.stdin.on('data', (chunk) => {
   appendJsonLine(process.env.FAKE_CODEX_INPUT_LOG, {
     pid: process.pid,
     data: chunk.toString('utf8'),
   })
+  if (remoteSocket && remoteSocket.readyState === WebSocket.OPEN && remoteReady && remoteThreadId) {
+    remoteSocket.send(JSON.stringify({
+      id: remoteMessageId++,
+      method: 'turn/start',
+      params: {
+        threadId: remoteThreadId,
+        input: chunk.toString('utf8'),
+      },
+    }))
+  }
 })
 
-process.on('SIGTERM', () => process.exit(0))
+process.on('SIGTERM', () => {
+  if (remoteSocket) remoteSocket.close()
+  process.exit(0)
+})
 process.stdout.write('codex remote attached\\n')
 if (process.env.FAKE_CODEX_STAY_ALIVE === '1') {
   if (
@@ -399,6 +459,112 @@ describe('Codex Session Flow Integration', () => {
       await closeWebSocket(ws)
       if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
       else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
+    }
+  })
+
+  it('captures a fresh Codex restore identity from the fake TUI and promotes it after turn completion', async () => {
+    const testDir = await fsp.mkdtemp(path.join(tempDir, 'fresh-durable-flow-'))
+    const rolloutPath = path.join(testDir, 'rollout.jsonl')
+    const remoteLogPath = path.join(testDir, 'remote.jsonl')
+    const launchLogPath = path.join(testDir, 'codex-launches.jsonl')
+    const previousConnectRemote = process.env.FAKE_CODEX_CONNECT_REMOTE
+    const previousRemoteDelay = process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS
+    const previousRemoteLog = process.env.FAKE_CODEX_REMOTE_LOG
+    const previousStayAlive = process.env.FAKE_CODEX_STAY_ALIVE
+    const previousLaunchLog = process.env.FAKE_CODEX_LAUNCH_LOG
+    process.env.FAKE_CODEX_CONNECT_REMOTE = '1'
+    process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS = '25'
+    process.env.FAKE_CODEX_REMOTE_LOG = remoteLogPath
+    process.env.FAKE_CODEX_STAY_ALIVE = '1'
+    process.env.FAKE_CODEX_LAUNCH_LOG = launchLogPath
+    process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+      threadStartThreadId: 'thread-fake-tui-durable',
+      threadStartRolloutPath: rolloutPath,
+      writeRolloutOnMethods: {
+        'turn/start': {
+          path: rolloutPath,
+          threadId: 'thread-fake-tui-durable',
+        },
+      },
+      notificationsAfterMethods: {
+        'turn/start': [{
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-fake-tui-durable',
+            turnId: 'turn-1',
+            status: 'completed',
+          },
+        }],
+      },
+    })
+
+    const ws = await createAuthenticatedWs(port)
+
+    try {
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'test-req-codex-fake-tui',
+        mode: 'codex',
+        cwd: testDir,
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (msg) => (
+          msg.requestId === 'test-req-codex-fake-tui'
+          && (msg.type === 'terminal.created' || msg.type === 'error')
+        ),
+      )
+      if (created.type === 'error') {
+        throw new Error(`terminal.create failed: ${created.message}`)
+      }
+
+      await vi.waitFor(() => {
+        expect(registry.get(created.terminalId)?.codexDurability).toMatchObject({
+          state: 'captured_pre_turn',
+          candidate: {
+            candidateThreadId: 'thread-fake-tui-durable',
+            rolloutPath,
+          },
+        })
+      })
+      await waitForJsonLine(remoteLogPath, (line) => (
+        line.pid === registry.get(created.terminalId)?.pty.pid
+        && line.message?.result?.thread?.id === 'thread-fake-tui-durable'
+      ))
+
+      ws.send(JSON.stringify({
+        type: 'terminal.input',
+        terminalId: created.terminalId,
+        data: 'hello from fake TUI\r',
+      }))
+
+      await vi.waitFor(() => {
+        expect(registry.get(created.terminalId)?.resumeSessionId).toBe('thread-fake-tui-durable')
+      })
+      expect(registry.get(created.terminalId)?.codexDurability).toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-fake-tui-durable',
+      })
+      expect(registry.list().find((term) => term.terminalId === created.terminalId)?.sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: 'thread-fake-tui-durable',
+      })
+      expect(await fsp.readFile(rolloutPath, 'utf8')).toContain('"thread-fake-tui-durable"')
+    } finally {
+      await closeWebSocket(ws)
+      if (previousConnectRemote === undefined) delete process.env.FAKE_CODEX_CONNECT_REMOTE
+      else process.env.FAKE_CODEX_CONNECT_REMOTE = previousConnectRemote
+      if (previousRemoteDelay === undefined) delete process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS
+      else process.env.FAKE_CODEX_REMOTE_CONNECT_DELAY_MS = previousRemoteDelay
+      if (previousRemoteLog === undefined) delete process.env.FAKE_CODEX_REMOTE_LOG
+      else process.env.FAKE_CODEX_REMOTE_LOG = previousRemoteLog
+      if (previousStayAlive === undefined) delete process.env.FAKE_CODEX_STAY_ALIVE
+      else process.env.FAKE_CODEX_STAY_ALIVE = previousStayAlive
+      if (previousLaunchLog === undefined) delete process.env.FAKE_CODEX_LAUNCH_LOG
+      else process.env.FAKE_CODEX_LAUNCH_LOG = previousLaunchLog
+      delete process.env.FAKE_CODEX_APP_SERVER_BEHAVIOR
+      await fsp.rm(testDir, { recursive: true, force: true })
     }
   })
 

@@ -87,6 +87,10 @@ function socketClosed(socket: WebSocket): Promise<void> {
   })
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 describe('CodexRemoteProxy', () => {
   it('captures a fresh candidate from the thread/start response and forwards the response', async () => {
     const upstream = await startUpstream((socket, message) => {
@@ -257,6 +261,35 @@ describe('CodexRemoteProxy', () => {
     await socketClosed(tui)
     expect(upstream.messages).toHaveLength(0)
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('times out candidate capture even when the TUI never connects to the proxy', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 20,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    await delay(50)
+
+    expect(upstream.messages).toHaveLength(0)
+    expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('does not arm the no-client candidate-capture timeout for durable resumes', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 20,
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+
+    await delay(50)
+
+    expect(upstream.messages).toHaveLength(0)
+    expect(repairTriggers).toEqual([])
   })
 
   it('emits turn/completed notifications', async () => {

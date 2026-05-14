@@ -1961,29 +1961,27 @@ describe('TerminalRegistry', () => {
       expect(terminals[0].resumeSessionId).toBeUndefined()
     })
 
-    it('does not expose a Codex sessionRef until the stored session id is durable', () => {
+    it('exposes a Codex sessionRef for an explicit durable resume', () => {
       const created = registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
-        resumeSessionId: 'thread-not-yet-proved',
+        resumeSessionId: 'thread-proved-resume',
       })
 
       expect(registry.list()[0]).toMatchObject({
-        resumeSessionId: 'thread-not-yet-proved',
-        sessionRef: undefined,
+        resumeSessionId: 'thread-proved-resume',
+        sessionRef: {
+          provider: 'codex',
+          sessionId: 'thread-proved-resume',
+        },
+        codexDurability: {
+          state: 'durable',
+          durableThreadId: 'thread-proved-resume',
+        },
       })
 
       const record = registry.get(created.terminalId)!
-      record.codexDurability = {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-not-yet-proved',
-      }
-
-      expect(registry.list()[0].sessionRef).toEqual({
-        provider: 'codex',
-        sessionId: 'thread-not-yet-proved',
-      })
+      expect(record.codexInputGate).toBeUndefined()
     })
   })
 

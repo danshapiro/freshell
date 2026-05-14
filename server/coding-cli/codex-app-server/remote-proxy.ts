@@ -56,6 +56,7 @@ export class CodexRemoteProxy {
   private server: WebSocketServer | null = null
   private endpoint: LoopbackServerEndpoint | null = null
   private candidatePersisted = false
+  private candidateCaptureFailed = false
   private candidateCaptureTimer: NodeJS.Timeout | null = null
   private readonly pendingTurnStarts = new Set<PendingTurnStart>()
   private readonly connections = new Set<ProxyConnection>()
@@ -92,6 +93,9 @@ export class CodexRemoteProxy {
       this.server = server
       this.endpoint = endpoint
     })
+    if (this.requireCandidatePersistence) {
+      this.ensureCandidateCaptureTimer()
+    }
     return { wsUrl: this.wsUrl }
   }
 
@@ -113,6 +117,7 @@ export class CodexRemoteProxy {
 
   markCandidatePersisted(): void {
     if (this.candidatePersisted) return
+    if (this.candidateCaptureFailed) return
     this.candidatePersisted = true
     this.clearCandidateCaptureTimer()
     for (const pending of [...this.pendingTurnStarts]) {
@@ -122,6 +127,8 @@ export class CodexRemoteProxy {
 
   failCandidateCapture(message = 'Freshell could not persist Codex restore identity before accepting user input.'): void {
     if (!this.requireCandidatePersistence) return
+    if (this.candidateCaptureFailed || this.candidatePersisted) return
+    this.candidateCaptureFailed = true
     this.clearCandidateCaptureTimer()
     this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
     for (const pending of [...this.pendingTurnStarts]) {
@@ -165,6 +172,11 @@ export class CodexRemoteProxy {
   }
 
   private handleClientConnection(client: WebSocket): void {
+    if (this.candidateCaptureFailed) {
+      this.sendJsonRpcError(client, undefined, 'Freshell timed out before Codex restore identity was captured.')
+      client.close()
+      return
+    }
     const upstream = new WebSocket(this.upstreamWsUrl)
     const connection: ProxyConnection = {
       client,

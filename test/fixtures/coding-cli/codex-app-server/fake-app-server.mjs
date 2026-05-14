@@ -3,6 +3,7 @@
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import path from 'node:path'
 
 if (process.argv[2] === 'fake-native-child') {
   process.on('SIGTERM', () => {
@@ -69,9 +70,13 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/start') {
+    const threadId = behavior.threadStartThreadId || 'thread-new-1'
+    const rolloutPath = behavior.threadStartRolloutPath || behavior.rolloutPath
     return {
       thread: {
-        id: 'thread-new-1',
+        id: threadId,
+        ...(rolloutPath ? { path: rolloutPath } : {}),
+        ...(typeof behavior.threadStartEphemeral === 'boolean' ? { ephemeral: behavior.threadStartEphemeral } : {}),
       },
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
@@ -85,9 +90,12 @@ function successResult(method, params) {
     }
   }
   if (method === 'thread/resume') {
+    const rolloutPath = behavior.threadResumeRolloutPath || behavior.rolloutPath
     return {
       thread: {
         id: params?.threadId,
+        ...(rolloutPath ? { path: rolloutPath } : {}),
+        ...(typeof behavior.threadResumeEphemeral === 'boolean' ? { ephemeral: behavior.threadResumeEphemeral } : {}),
       },
       cwd: params?.cwd ?? process.cwd(),
       model: 'fixture-model',
@@ -106,6 +114,22 @@ function successResult(method, params) {
     }
   }
   return {}
+}
+
+function maybeWriteRolloutForMethod(method, params) {
+  const spec = behavior.writeRolloutOnMethods?.[method]
+  if (!spec?.path) return
+  const threadId = spec.threadId || params?.threadId || behavior.threadStartThreadId || 'thread-new-1'
+  fs.mkdirSync(path.dirname(spec.path), { recursive: true })
+  const line = JSON.stringify(spec.record || {
+    type: 'session_meta',
+    payload: { id: threadId },
+  }) + '\n'
+  if (spec.append) {
+    fs.appendFileSync(spec.path, line, 'utf8')
+  } else {
+    fs.writeFileSync(spec.path, line, 'utf8')
+  }
 }
 
 const listenUrl = parseListenUrl(process.argv.slice(2))
@@ -196,6 +220,7 @@ wss.on('connection', (socket) => {
         id: message.id,
         result: override?.result ?? successResult(method, message.params),
       }))
+      maybeWriteRolloutForMethod(method, message.params)
       for (const notification of behavior.notificationsAfterMethods?.[method] || []) {
         socket.send(JSON.stringify(notification))
       }

@@ -409,6 +409,17 @@ git add <changed-files>
 git commit -m "Stabilize Codex durability verification"
 ```
 
+### 11. Review Hardening Items
+
+These checks come from the implementation reviews and are part of the same one-shot delivery, not follow-up work.
+
+- [ ] Arm fresh Codex candidate-capture timeout when the proxy is ready, even if the visible Codex TUI never connects. This closes the stuck `identity_pending` state described in the research evidence that input must not be accepted until Freshell has server-persisted Codex's reported restore identity (`/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/docs/lab-notes/2026-04-20-coding-cli-session-contract.md`, "Working Codex contract").
+- [ ] Initialize durable Codex resume records as durable in `TerminalRegistry.create()` when the caller supplies a canonical `sessionRef`. The research says `sessionRef` is the only durable restore identity; a terminal created from one must advertise that same identity through inventory and sidebar state (`/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/docs/lab-notes/2026-04-20-coding-cli-session-contract.md`, "Recommendation").
+- [ ] On final Codex process loss, run exactly one rollout proof if a candidate exists, even if the `turn/completed` notification was lost. Ordinary repair events still wait for `turn/completed`; final loss is the last chance to avoid falsely discarding a restorable session (`/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/docs/lab-notes/2026-04-20-coding-cli-session-contract.md`, "What remains unproven").
+- [ ] Preserve captured candidate state across browser refresh and use it for the recreate request after the old live terminal id is gone. This is the client-side half of "prefer terminal, then proof-read candidate, then fresh-create if proof fails" (`/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514/docs/lab-notes/2026-04-20-coding-cli-session-contract.md`, "Failure handling without polling").
+- [ ] Extend the fake app-server/fake TUI integration path so tests exercise actual proxy candidate capture, input, `turn/completed`, rollout proof, durable promotion, and sidebar/inventory exposure instead of only direct sidecar callbacks.
+- [ ] Delete transient Codex durability store records when the owning terminal is killed, removed, or reaped. The server-side store is a crash bridge for an active terminal, not a durable session database.
+
 ## Temporary Server Validation
 
 Use a port that does not interfere with dev, for example `3477`. Do not restart `/home/user/code/freshell/.worktrees/dev`.

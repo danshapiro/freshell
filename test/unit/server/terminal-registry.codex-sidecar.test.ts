@@ -245,6 +245,49 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     })
   })
 
+  it('deletes the transient Codex durability store record when the terminal is killed', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+
+      sidecar.emitCandidate({
+        source: 'thread_start_response',
+        thread: {
+          id: 'thread-delete-store',
+          path: path.join(durabilityDir, 'rollout.jsonl'),
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        terminalId: term.terminalId,
+        state: 'captured_pre_turn',
+      })
+
+      await registry.killAndWait(term.terminalId)
+
+      await vi.waitFor(async () => {
+        await expect(store.read(term.terminalId)).resolves.toBeUndefined()
+      })
+    } finally {
+      await fsp.rm(durabilityDir, { recursive: true, force: true })
+    }
+  })
+
   it('marks fresh Codex non-restorable and closes it when candidate capture times out', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     try {
@@ -400,7 +443,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     }
   })
 
-  it('runs a final rollout proof before marking a completed fresh Codex PTY exit non-restorable', async () => {
+  it('runs a final rollout proof before marking a fresh Codex PTY exit non-restorable', async () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     try {
       const rolloutPath = path.join(durabilityDir, 'rollout.jsonl')
@@ -435,12 +478,6 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         },
       })
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
-      const record = registry.get(term.terminalId)!
-      record.codexDurability = {
-        ...record.codexDurability!,
-        state: 'durability_unproven_after_completion',
-        turnCompletedAt: Date.now(),
-      }
       await fsp.writeFile(
         rolloutPath,
         '{"type":"session_meta","payload":{"id":"thread-final-proof"}}\n',
@@ -509,12 +546,6 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         },
       })
       await vi.waitFor(() => expect(registry.get(term.terminalId)?.codexDurability?.state).toBe('captured_pre_turn'))
-      const record = registry.get(term.terminalId)!
-      record.codexDurability = {
-        ...record.codexDurability!,
-        state: 'durability_unproven_after_completion',
-        turnCompletedAt: Date.now(),
-      }
       await fsp.writeFile(
         rolloutPath,
         '{"type":"session_meta","payload":{"id":"thread-final-recovery"}}\n',

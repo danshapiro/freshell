@@ -1221,6 +1221,14 @@ export class TerminalRegistry extends EventEmitter {
     })
   }
 
+  private forgetCodexDurabilityStoreRecord(record: TerminalRecord, reason: string): void {
+    if (record.mode !== 'codex') return
+    if (!record.codexDurability) return
+    void this.codexDurabilityStore.delete(record.terminalId).catch((err) => {
+      logger.warn({ err, terminalId: record.terminalId, reason }, 'Failed to delete Codex durability store record')
+    })
+  }
+
   private reapExitedTerminals(): void {
     const max = this.maxExitedTerminals
     if (!max || max <= 0) return
@@ -1232,7 +1240,9 @@ export class TerminalRegistry extends EventEmitter {
     const excess = exited.length - max
     if (excess <= 0) return
     for (let i = 0; i < excess; i += 1) {
-      this.terminals.delete(exited[i].terminalId)
+      const terminal = exited[i]
+      this.terminals.delete(terminal.terminalId)
+      this.forgetCodexDurabilityStoreRecord(terminal, 'reap_exited')
     }
   }
 
@@ -1320,6 +1330,14 @@ export class TerminalRegistry extends EventEmitter {
 
     const title = getModeLabel(opts.mode)
 
+    const initialCodexDurability: CodexDurabilityRef | undefined = opts.mode === 'codex' && resumeForBinding
+      ? {
+          schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+          state: 'durable',
+          durableThreadId: resumeForBinding,
+        }
+      : undefined
+
     const record: TerminalRecord = {
       terminalId,
       title,
@@ -1347,6 +1365,7 @@ export class TerminalRegistry extends EventEmitter {
         ? !opts.providerSettings?.codexAppServer?.deferLifecycleUntilPublished
         : undefined,
       codexSidecarGeneration: opts.mode === 'codex' ? 0 : undefined,
+      codexDurability: initialCodexDurability,
       codexInputGate: opts.mode === 'codex' && !resumeForBinding
         ? { state: 'identity_pending' }
         : undefined,
@@ -1474,6 +1493,7 @@ export class TerminalRegistry extends EventEmitter {
         this.releaseBinding(terminalId, 'exit')
         this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
         this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
+        this.forgetCodexDurabilityStoreRecord(record, 'pty_exit')
         void this.releaseCodexSidecar(record).catch(() => undefined)
         this.reapExitedTerminals()
       }
@@ -1848,7 +1868,6 @@ export class TerminalRegistry extends EventEmitter {
       && !record.resumeSessionId
       && !!record.codexDurability?.candidate
       && record.codexDurability.state !== 'durable'
-      && record.codexDurability.turnCompletedAt !== undefined
   }
 
   private async proveCodexBeforeFinalLoss(record: TerminalRecord, trigger: string): Promise<void> {
@@ -2488,6 +2507,7 @@ export class TerminalRegistry extends EventEmitter {
     this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
     this.recordTerminalExitWithoutDurableSession(term, term.exitCode, 'user_final_close')
+    this.forgetCodexDurabilityStoreRecord(term, 'user_final_close')
     void this.releaseCodexSidecar(term).catch(() => undefined)
     this.reapExitedTerminals()
     return true
@@ -2515,6 +2535,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!term) return false
     this.kill(terminalId)
     this.terminals.delete(terminalId)
+    this.forgetCodexDurabilityStoreRecord(term, 'remove')
     return true
   }
 

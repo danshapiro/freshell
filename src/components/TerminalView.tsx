@@ -2251,7 +2251,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
-            if (!current?.sessionRef) {
+            const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
+            if (!current?.sessionRef && !hasCodexCapturedRestoreState) {
               const restoreDiagnostic = {
                 event: 'restore_unavailable' as const,
                 reason: 'dead_live_handle' as const,
