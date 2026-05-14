@@ -561,7 +561,7 @@ This path must not use cwd, launch time, title, pane title, shell snapshots, hid
 #### Practical Freshell contract
 
 1. Fresh Codex launch starts in `identity_pending`. Freshell installs the remote websocket proxy/listeners and prepares its own atomic persistence before spawning `codex --remote`.
-2. While `identity_pending`, Freshell forwards provider output and resize signals, but not user-originating PTY input. The UI should show a clear starting state rather than silently accepting untracked work.
+2. While `identity_pending`, Freshell forwards provider output, resize signals, and narrow terminal-control replies required for TUI startup, but not user-originating PTY input. The UI should show a clear starting state rather than silently accepting untracked work.
 3. Freshell captures the first valid candidate from either the `thread/start` response or the `thread/started` notification. The candidate must have `ephemeral == false`, a non-empty root TUI `ThreadId`, and a provider-reported absolute `rolloutPath`.
 4. Freshell atomically persists the candidate as non-canonical state: provider `codex`, candidate root TUI `ThreadId`, `rolloutPath`, source event/response, CLI version, capture timestamp, and durability state.
 5. After that write succeeds, Freshell transitions to `captured_pre_turn` and may unblock user-originating PTY input. This prevents unknown-thread work, but it does not claim the first prompt is restorable.

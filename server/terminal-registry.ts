@@ -502,6 +502,14 @@ export type TerminalInputResult =
   | { status: 'no_terminal' }
   | { status: 'not_running' }
 
+function isCodexStartupTerminalControlInput(data: string): boolean {
+  if (data.length === 0 || data.length > 128) return false
+  if (data === '\x1b[I' || data === '\x1b[O') return true
+  if (/^\x1b\[\d{1,4};\d{1,4}R$/.test(data)) return true
+  if (/^\x1b\[(?:\?|\>)?[\d;]{0,32}c$/.test(data)) return true
+  return /^\x1b\](?:10|11|12|4;\d{1,3});rgb:[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}\/[0-9a-fA-F]{1,4}(?:\x07|\x1b\\)$/.test(data)
+}
+
 export type BindSessionResult =
   | { ok: true; terminalId: string; sessionId: string }
   | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' | 'terminal_not_running' }
@@ -2623,6 +2631,10 @@ export class TerminalRegistry extends EventEmitter {
       }
     }
     if (term.codexInputGate?.state === 'identity_pending') {
+      if (isCodexStartupTerminalControlInput(data)) {
+        term.pty.write(data)
+        return { status: 'written' }
+      }
       return { status: 'blocked_codex_identity_pending', terminalId }
     }
     if (term.codexRecoveryAttempt) {

@@ -32,7 +32,7 @@
 
 ## State Model To Implement
 
-- `identity_pending`: fresh Codex TUI has been spawned through the proxy, but no candidate has been durably saved by Freshell. PTY output and resize pass through. User-originating input is dropped, not buffered or replayed, and the server emits `terminal.input.blocked` for observability.
+- `identity_pending`: fresh Codex TUI has been spawned through the proxy, but no candidate has been durably saved by Freshell. PTY output, resize, and narrow terminal-control replies required for TUI startup pass through. User-originating input is dropped, not buffered or replayed, and the server emits `terminal.input.blocked` for observability.
 - `captured_pre_turn`: Freshell has atomically persisted `{ provider: "codex", candidateThreadId, rolloutPath, source, capturedAt }` in the server-side durability store. Input is allowed. This is not restorable/durable. Client localStorage acknowledgement may arrive later and is idempotent.
 - `turn_in_progress_unproven`: the proxy observed `turn/start` or equivalent user-turn activity for the candidate. Live use continues. This is not restorable/durable.
 - `proof_checking`: `turn/completed` or a deterministic repair trigger fired and one exact proof read is running.
@@ -454,7 +454,7 @@ ps -fp "$(cat /tmp/freshell-codex-durability-3477.pid)"
 ```
 
 - [ ] Use Freshell orchestration against `http://127.0.0.1:3477` and run each fixture-backed scenario at least three times:
-  - [ ] Fresh Codex pane: before candidate capture, input is not accepted; after server-side candidate persistence, input works.
+  - [ ] Fresh Codex pane: before candidate capture, user input is not accepted but terminal-control replies needed for TUI startup are allowed; after server-side candidate persistence, user input works.
   - [ ] Fresh Codex pane with fake TUI: send a test prompt, wait for fake `turn/completed`, verify canonical `sessionRef` is persisted and sidebar entry remains a single Codex item.
   - [ ] Fresh Codex pane: close/reopen after durable promotion, verify it resumes with `codex --remote <proxy> resume <durableThreadId>`.
   - [ ] Fresh Codex pane: reload browser before first turn completes, verify candidate state is preserved and no candidate id is used as `resumeSessionId`.

@@ -234,6 +234,39 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     }
   })
 
+  it('allows only terminal startup control replies while Codex restore identity is pending', () => {
+    const registry = new TerminalRegistry()
+    const term = registry.create({
+      mode: 'codex',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar: createFakeSidecar(),
+        },
+      } as any,
+    })
+
+    for (const data of [
+      '\x1b[1;1R',
+      '\x1b[I',
+      '\x1b[?1;2c',
+      '\x1b]10;rgb:2424/2929/2f2f\x1b\\',
+      '\x1b]11;rgb:ffff/ffff/ffff\x1b\\',
+    ]) {
+      expect(registry.input(term.terminalId, data)).toEqual({ status: 'written' })
+      expect(mockPtyProcess.instances[0].write).toHaveBeenLastCalledWith(data)
+    }
+
+    expect(registry.input(term.terminalId, 'hello\r')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+    expect(registry.input(term.terminalId, '\x1b[A')).toEqual({
+      status: 'blocked_codex_identity_pending',
+      terminalId: term.terminalId,
+    })
+  })
+
   it('does not release fresh Codex input from a browser persistence acknowledgement alone', () => {
     const registry = new TerminalRegistry()
     const term = registry.create({
