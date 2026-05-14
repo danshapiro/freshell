@@ -58,6 +58,7 @@ import {
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
+  TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -533,6 +534,7 @@ export class WsHandler {
       PingSchema,
       ClientDiagnosticSchema,
       dynamicTerminalCreateSchema,
+      TerminalCodexCandidatePersistedSchema,
       TerminalAttachSchema,
       TerminalDetachSchema,
       TerminalInputSchema,
@@ -1273,6 +1275,12 @@ export class WsHandler {
     ws: LiveWebSocket,
     params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string; terminalId?: string }
   ) {
+    log.warn({
+      connectionId: ws.connectionId || 'unknown',
+      code: params.code,
+      ...(params.requestId ? { requestId: params.requestId } : {}),
+      ...(params.terminalId ? { terminalId: params.terminalId } : {}),
+    }, 'Sending WebSocket error')
     this.send(ws, {
       type: 'error',
       code: params.code,
@@ -1881,6 +1889,7 @@ export class WsHandler {
         if (!effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
           effectiveResumeSessionId = requestedSessionRef.sessionId
         }
+        const hasCodexCapturedRestoreState = m.mode === 'codex' && !!m.codexDurability?.candidate
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
@@ -1899,6 +1908,7 @@ export class WsHandler {
         if (
           m.restore === true
           && modeSupportsResume(m.mode as TerminalMode)
+          && !hasCodexCapturedRestoreState
           && (
             !requestedSessionRef
             || requestedSessionRef.provider !== m.mode

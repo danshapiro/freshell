@@ -41,6 +41,7 @@ type CodexRemoteProxyOptions = {
   portAllocator?: () => Promise<LoopbackServerEndpoint>
   requestHoldTimeoutMs?: number
   candidateCaptureTimeoutMs?: number
+  requireCandidatePersistence?: boolean
 }
 
 const DEFAULT_REQUEST_HOLD_TIMEOUT_MS = 5_000
@@ -51,6 +52,7 @@ export class CodexRemoteProxy {
   private readonly portAllocator: () => Promise<LoopbackServerEndpoint>
   private readonly requestHoldTimeoutMs: number
   private readonly candidateCaptureTimeoutMs: number
+  private readonly requireCandidatePersistence: boolean
   private server: WebSocketServer | null = null
   private endpoint: LoopbackServerEndpoint | null = null
   private candidatePersisted = false
@@ -69,6 +71,8 @@ export class CodexRemoteProxy {
     this.portAllocator = options.portAllocator ?? allocateLocalhostPort
     this.requestHoldTimeoutMs = options.requestHoldTimeoutMs ?? DEFAULT_REQUEST_HOLD_TIMEOUT_MS
     this.candidateCaptureTimeoutMs = options.candidateCaptureTimeoutMs ?? DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS
+    this.requireCandidatePersistence = options.requireCandidatePersistence ?? true
+    this.candidatePersisted = !this.requireCandidatePersistence
   }
 
   get wsUrl(): string {
@@ -117,6 +121,7 @@ export class CodexRemoteProxy {
   }
 
   failCandidateCapture(message = 'Freshell could not persist Codex restore identity before accepting user input.'): void {
+    if (!this.requireCandidatePersistence) return
     this.clearCandidateCaptureTimer()
     this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
     for (const pending of [...this.pendingTurnStarts]) {
@@ -167,7 +172,9 @@ export class CodexRemoteProxy {
       pendingMethods: new Map(),
     }
     this.connections.add(connection)
-    this.ensureCandidateCaptureTimer()
+    if (this.requireCandidatePersistence) {
+      this.ensureCandidateCaptureTimer()
+    }
 
     client.on('message', (raw) => this.handleClientMessage(connection, raw))
     upstream.on('message', (raw) => this.handleUpstreamMessage(connection, raw))
@@ -200,7 +207,7 @@ export class CodexRemoteProxy {
       connection.pendingMethods.set(id, method)
     }
 
-    if (method === 'turn/start' && !this.candidatePersisted) {
+    if (this.requireCandidatePersistence && method === 'turn/start' && !this.candidatePersisted) {
       this.holdTurnStart(connection, raw, id)
       return
     }
@@ -333,6 +340,7 @@ export class CodexRemoteProxy {
   }
 
   private ensureCandidateCaptureTimer(): void {
+    if (!this.requireCandidatePersistence) return
     if (this.candidatePersisted || this.candidateCaptureTimer) return
     this.candidateCaptureTimer = setTimeout(() => {
       this.failCandidateCapture('Freshell timed out before Codex restore identity was captured.')

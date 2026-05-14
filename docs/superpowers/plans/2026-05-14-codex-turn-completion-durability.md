@@ -129,6 +129,7 @@ git commit -m "Observe Codex turn lifecycle notifications"
   - [ ] Observe server-to-client notifications. Emit candidate from `thread/started` if no response candidate has been persisted yet; emit `turn_started`, `turn_completed`, `fs_changed`, lifecycle loss, and connection loss events.
   - [ ] If a `turn/start` request arrives before the server-side candidate persistence write completes, hold that request until the write completes. If the write fails, the terminal is shutting down, or `5_000ms` elapse without a persisted candidate, fail the held request with JSON-RPC error code `-32000` and message `Freshell could not persist Codex restore identity before accepting user input.` Transition the terminal to `non_restorable`, stop that fresh TUI, and fresh-create only if the user explicitly retries.
   - [ ] Also start a candidate-capture deadline when the visible TUI is spawned, independent of user input. If no candidate has been persisted within `10_000ms`, transition the terminal to `non_restorable`, emit `terminal.codex.durability.updated`, send `terminal.input.blocked` with terminal reason `codex_identity_capture_timeout` for any later input, and stop the fresh TUI/sidecar.
+  - [ ] Apply the candidate-capture deadline and `turn/start` hold only to fresh Codex launches that do not yet have a canonical durable `sessionRef`. Durable resume launches still pass through the proxy for turn/lifecycle observation, but the proxy must start with candidate persistence disabled, must not arm the fresh-candidate timeout, and must not hold `turn/start`.
   - [ ] On held `turn/start` failure or candidate-capture timeout, return the JSON-RPC error if a request is pending, then close the proxy websocket and kill the PTY process for that failed fresh TUI. Do not leave Codex running against a dead or untrusted proxy, and do not replay held user bytes into a replacement session.
   - [ ] Do not periodically query the app-server or filesystem from the proxy.
   - [ ] Include structured logs for proxy start, candidate observed, held turn request, released turn request, turn completed, proof trigger, and proxy close/error.
@@ -142,6 +143,7 @@ git commit -m "Observe Codex turn lifecycle notifications"
   - [ ] `turn/start` before server-side candidate persistence is held, then forwarded after the store write completes.
   - [ ] `turn/start` times out and fails cleanly if candidate persistence never completes.
   - [ ] Candidate-capture timeout fires even when the user never types and no `turn/start` request arrives.
+  - [ ] Durable resume proxy traffic forwards `turn/start` immediately and does not emit candidate-capture timeout when no fresh candidate is expected.
   - [ ] Timeout/failure closes the proxy websocket and terminates the failed TUI rather than leaving it running.
   - [ ] `turn/completed` is emitted with the matching thread id.
   - [ ] Proxy close/error emits a deterministic repair trigger and shuts down without leaking sockets.
@@ -166,7 +168,7 @@ git commit -m "Proxy Codex remote traffic for deterministic identity capture"
   - [ ] Start and await a `CodexRemoteProxy` before returning the plan.
   - [ ] Return a launch plan whose `sessionId` is undefined for fresh launches. The fresh visible command must be `codex --remote <proxyWsUrl>` with no `resume <threadId>`.
   - [ ] For durable resume launches, keep `sessionId == resumeSessionId`, route the TUI through the proxy, and keep readiness behavior for the durable id.
-  - [ ] Durable resume launches start in `durable_resuming`/`durable`; they do not perform candidate capture and they do not re-promote on `thread/started`.
+  - [ ] Durable resume launches start in `durable_resuming`/`durable`; they construct the proxy with fresh-candidate persistence disabled, do not arm candidate-capture timeout, and do not re-promote on `thread/started`.
   - [ ] Sidecar shutdown must close the proxy and the runtime sidecar.
   - [ ] Sidecar adoption must still update sidecar ownership metadata with terminal id and generation.
   - [ ] Expose proxy events on the sidecar: `onCandidate`, `markCandidatePersisted`, `onTurnStarted`, `onTurnCompleted`, `onRepairTrigger`, `onLifecycleLoss`, and `onFsChanged`.
@@ -205,6 +207,7 @@ git commit -m "Launch fresh Codex without pre-durable resume"
 - [ ] Update `shared/ws-protocol.ts`.
   - [ ] Add server-to-client `terminal.codex.durability.updated` payload carrying `terminalId` and `CodexDurabilityRef`.
   - [ ] Add client-to-server `terminal.codex.candidate.persisted` with `terminalId`, `candidateThreadId`, `rolloutPath`, and `capturedAt`.
+  - [ ] Register `terminal.codex.candidate.persisted` in every server-side websocket validator, including the dynamic schema built by `server/ws-handler.ts`, so browser acknowledgements cannot be rejected as `INVALID_MESSAGE`.
   - [ ] Add optional `codexDurability` to `terminal.create` so persisted captured-but-unproven panes can be repaired or fresh-created deterministically on reopen.
   - [ ] Add server-to-client `terminal.input.blocked` with `reason: "codex_identity_pending"` for diagnostic UI/logging when PTY input arrives during the narrow gate. Do not send `INVALID_TERMINAL_ID` for gated input.
 - [ ] Update `src/store/paneTypes.ts`, `src/store/types.ts`, `src/store/persistedState.ts`, `src/store/storage-migration.ts`, `src/store/panesSlice.ts`, and `src/store/tabsSlice.ts`.
@@ -292,6 +295,7 @@ git commit -m "Promote Codex sessions only after rollout proof"
 - [ ] Update `server/ws-handler.ts` create/reuse flow.
   - [ ] Ensure all user restore/list/open surfaces funnel through this create/reuse decision: sidebar row click, tab restore, background terminal restore, MCP/new-tab restore, and any history/session open path that creates a Codex terminal.
   - [ ] When `terminal.create` includes `codexDurability` and no canonical `sessionRef`, ask the registry to run one proof read before deciding how to open.
+  - [ ] Permit `restore: true` for Codex candidate-only requests when `codexDurability.candidate` is present, even without `sessionRef`, so the proof-first path runs instead of rejecting the request before repair.
   - [ ] Reopen of `durability_unproven_after_completion` follows the same proof-first path as captured-but-unproven. Success promotes; failure with an exact live candidate attaches live and remains degraded; failure with no live attachable terminal becomes `non_restorable` and fresh-creates only for a new Codex session.
   - [ ] If proof succeeds, set `effectiveResumeSessionId` to the proven `durableThreadId` and launch a durable resume.
   - [ ] If proof fails and a live terminal on this server matches the exact candidate thread id and rollout path, attach that live terminal and keep degraded/unproven state visible.
@@ -316,6 +320,7 @@ git commit -m "Promote Codex sessions only after rollout proof"
   - [ ] Server: captured unproven reopen proof success resumes durable id.
   - [ ] Server: captured unproven reopen proof fail plus live exact candidate attaches live and stays degraded.
   - [ ] Server: captured unproven reopen proof fail plus no live exact candidate fresh-creates without passing candidate to resume.
+  - [ ] Server websocket tests must exercise the real client shape with `restore: true` and candidate-only `codexDurability`, not only raw `terminal.create` messages without restore semantics.
   - [ ] Client/sidebar: live pending Codex appears as Codex, not a generic grey terminal; durable promotion updates the same entry rather than adding a duplicate.
   - [ ] Each restore/list/open surface above uses the same proof-first path and has no independent cwd/time/title matching.
 

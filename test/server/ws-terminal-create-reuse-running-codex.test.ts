@@ -181,6 +181,7 @@ class FakeRegistry {
   attachCalls: Array<{ terminalId: string; opts?: any }> = []
   createCalls: any[] = []
   repairCalls: Array<{ mode: string; sessionId: string }> = []
+  candidatePersistedAcks: any[] = []
 
   constructor(terminalIds: string[]) {
     const createdAt = Date.now()
@@ -271,6 +272,11 @@ class FakeRegistry {
   }
 
   list() { return [] }
+
+  acknowledgeCodexCandidatePersisted(input: any) {
+    this.candidatePersistedAcks.push(input)
+    return 'accepted'
+  }
 }
 
 describe('terminal.create reuse running codex terminal', () => {
@@ -301,6 +307,7 @@ describe('terminal.create reuse running codex terminal', () => {
     registry.attachCalls = []
     registry.createCalls = []
     registry.repairCalls = []
+    registry.candidatePersistedAcks = []
   }, HOOK_TIMEOUT_MS)
 
   afterEach(async () => {
@@ -552,6 +559,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
+        restore: true,
         codexDurability: {
           schemaVersion: 1,
           state: 'captured_pre_turn',
@@ -594,6 +602,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
+        restore: true,
         codexDurability: {
           schemaVersion: 1,
           state: 'durability_unproven_after_completion',
@@ -648,6 +657,7 @@ describe('terminal.create reuse running codex terminal', () => {
         type: 'terminal.create',
         requestId,
         mode: 'codex',
+        restore: true,
         codexDurability: registry.records[0].codexDurability,
       }))
 
@@ -658,6 +668,34 @@ describe('terminal.create reuse running codex terminal', () => {
     } finally {
       await closeWebSocket(ws)
       await fsp.rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts Codex candidate persisted acknowledgements through the dynamic websocket schema', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const messagesPromise = collectMessages(ws, 75)
+      ws.send(JSON.stringify({
+        type: 'terminal.codex.candidate.persisted',
+        terminalId: 'term-codex-existing',
+        candidateThreadId: 'thread-ack',
+        rolloutPath: '/tmp/codex/thread-ack.jsonl',
+        capturedAt: Date.now(),
+      }))
+
+      const messages = await messagesPromise
+      expect(registry.candidatePersistedAcks).toHaveLength(1)
+      expect(registry.candidatePersistedAcks[0]).toMatchObject({
+        terminalId: 'term-codex-existing',
+        candidateThreadId: 'thread-ack',
+        rolloutPath: '/tmp/codex/thread-ack.jsonl',
+      })
+      expect(messages.some((message) => message.type === 'error' && message.code === 'INVALID_MESSAGE')).toBe(false)
+    } finally {
+      await closeWebSocket(ws)
     }
   })
 

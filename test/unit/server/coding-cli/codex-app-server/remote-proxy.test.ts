@@ -54,6 +54,7 @@ async function startUpstream(handler?: (socket: WebSocket, message: any) => void
 async function startProxy(upstreamWsUrl: string, options: {
   requestHoldTimeoutMs?: number
   candidateCaptureTimeoutMs?: number
+  requireCandidatePersistence?: boolean
 } = {}): Promise<CodexRemoteProxy> {
   const proxy = new CodexRemoteProxy({ upstreamWsUrl, ...options })
   await proxy.start()
@@ -215,6 +216,33 @@ describe('CodexRemoteProxy', () => {
     await socketClosed(tui)
     expect(upstream.messages).toHaveLength(0)
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
+  })
+
+  it('does not hold turn/start or arm candidate-capture timeout when candidate persistence is not required', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method === 'turn/start') {
+        socket.send(JSON.stringify({ id: message.id, result: { ok: true } }))
+      }
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requestHoldTimeoutMs: 20,
+      candidateCaptureTimeoutMs: 20,
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    const tui = await connect(proxy.wsUrl)
+    const responsePromise = nextMessage(tui)
+
+    tui.send(JSON.stringify({ id: 11, method: 'turn/start', params: { threadId: 'durable-thread-1' } }))
+
+    await expect(responsePromise).resolves.toEqual({ id: 11, result: { ok: true } })
+    expect(upstream.messages).toEqual([
+      { id: 11, method: 'turn/start', params: { threadId: 'durable-thread-1' } },
+    ])
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(tui.readyState).toBe(WebSocket.OPEN)
+    expect(repairTriggers).toEqual([])
   })
 
   it('closes an idle TUI when candidate capture times out before user input', async () => {
