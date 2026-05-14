@@ -13,6 +13,8 @@ import {
   CodexThreadLifecycleNotificationSchema,
   CodexThreadStartedNotificationSchema,
   CodexThreadOperationResultSchema,
+  CodexTurnCompletedNotificationSchema,
+  CodexTurnStartedNotificationSchema,
   type CodexInitializeResult,
   type CodexRpcError,
   type CodexThreadHandle,
@@ -60,6 +62,12 @@ export type CodexAppServerDisconnectEvent = {
   error?: Error
 }
 
+export type CodexTurnEvent = {
+  threadId: string
+  turnId?: string
+  params: Record<string, unknown>
+}
+
 function normalizeThread(thread: CodexThreadHandle): CodexThreadHandle {
   return {
     ...thread,
@@ -79,6 +87,8 @@ export class CodexAppServerClient {
   private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly disconnectHandlers = new Set<(event: CodexAppServerDisconnectEvent) => void>()
   private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
+  private readonly turnStartedHandlers = new Set<(event: CodexTurnEvent) => void>()
+  private readonly turnCompletedHandlers = new Set<(event: CodexTurnEvent) => void>()
   private lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
 
   constructor(
@@ -229,6 +239,20 @@ export class CodexAppServerClient {
     }
   }
 
+  onTurnStarted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnStartedHandlers.add(handler)
+    return () => {
+      this.turnStartedHandlers.delete(handler)
+    }
+  }
+
+  onTurnCompleted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnCompletedHandlers.add(handler)
+    return () => {
+      this.turnCompletedHandlers.delete(handler)
+    }
+  }
+
   onThreadLifecycleLoss(handler: (event: CodexThreadLifecycleLossEvent) => void): () => void {
     this.lifecycleLossHandlers.add(handler)
     return () => {
@@ -316,6 +340,18 @@ export class CodexAppServerClient {
           return
         }
 
+        const turnStarted = CodexTurnStartedNotificationSchema.safeParse(notification.data)
+        if (turnStarted.success) {
+          this.emitTurnEvent(this.turnStartedHandlers, turnStarted.data.params)
+          return
+        }
+
+        const turnCompleted = CodexTurnCompletedNotificationSchema.safeParse(notification.data)
+        if (turnCompleted.success) {
+          this.emitTurnEvent(this.turnCompletedHandlers, turnCompleted.data.params)
+          return
+        }
+
         this.handleNotification(notification.data)
         return
       }
@@ -368,6 +404,17 @@ export class CodexAppServerClient {
 
   private emitLifecycleLoss(event: CodexThreadLifecycleLossEvent): void {
     for (const handler of this.lifecycleLossHandlers) {
+      handler(event)
+    }
+  }
+
+  private emitTurnEvent(handlers: Set<(event: CodexTurnEvent) => void>, params: { threadId: string; turnId?: string } & Record<string, unknown>): void {
+    const event: CodexTurnEvent = {
+      threadId: params.threadId,
+      ...(typeof params.turnId === 'string' ? { turnId: params.turnId } : {}),
+      params,
+    }
+    for (const handler of handlers) {
       handler(event)
     }
   }

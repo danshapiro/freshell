@@ -1215,6 +1215,51 @@ describe('CodexAppServerRuntime', () => {
     })
   })
 
+  it('re-emits turn notifications from the sidecar client', async () => {
+    const runtime = createRuntime({
+      env: {
+        FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
+          notificationsAfterMethods: {
+            'thread/loaded/list': [
+              {
+                method: 'turn/started',
+                params: { threadId: 'thread-1', turnId: 'turn-1' },
+              },
+              {
+                method: 'turn/completed',
+                params: { threadId: 'thread-1', turnId: 'turn-1', status: 'completed' },
+              },
+            ],
+          },
+        }),
+      },
+    })
+    const started: unknown[] = []
+    const completed: unknown[] = []
+    const unsubscribeStarted = runtime.onTurnStarted((event) => started.push(event))
+    const unsubscribeCompleted = runtime.onTurnCompleted((event) => completed.push(event))
+
+    await runtime.listLoadedThreads()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    unsubscribeStarted()
+    unsubscribeCompleted()
+
+    expect(started).toEqual([
+      {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        params: { threadId: 'thread-1', turnId: 'turn-1' },
+      },
+    ])
+    expect(completed).toEqual([
+      {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        params: { threadId: 'thread-1', turnId: 'turn-1', status: 'completed' },
+      },
+    ])
+  })
+
   it('drops cached state after an unexpected child exit and starts a fresh process on the next call', async () => {
     const runtime = createRuntime()
 

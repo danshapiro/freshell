@@ -7,6 +7,7 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-
 import { logger } from '../../logger.js'
 import {
   CodexAppServerClient,
+  type CodexTurnEvent,
   type CodexThreadLifecycleEvent,
   type CodexThreadLifecycleLossEvent,
 } from './client.js'
@@ -506,6 +507,8 @@ export class CodexAppServerRuntime {
   private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
   private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
   private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
+  private readonly turnStartedHandlers = new Set<(event: CodexTurnEvent) => void>()
+  private readonly turnCompletedHandlers = new Set<(event: CodexTurnEvent) => void>()
 
   private readonly command: string
   private readonly commandArgs: string[]
@@ -635,6 +638,20 @@ export class CodexAppServerRuntime {
     }
   }
 
+  onTurnStarted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnStartedHandlers.add(handler)
+    return () => {
+      this.turnStartedHandlers.delete(handler)
+    }
+  }
+
+  onTurnCompleted(handler: (event: CodexTurnEvent) => void): () => void {
+    this.turnCompletedHandlers.add(handler)
+    return () => {
+      this.turnCompletedHandlers.delete(handler)
+    }
+  }
+
   async watchPath(targetPath: string, watchId: string): Promise<CodexFsWatchResult> {
     await this.ensureReady()
     return this.client!.watchPath(targetPath, watchId)
@@ -757,6 +774,16 @@ export class CodexAppServerRuntime {
         })
         client.onFsChanged((event) => {
           for (const handler of this.fsChangedHandlers) {
+            handler(event)
+          }
+        })
+        client.onTurnStarted((event) => {
+          for (const handler of this.turnStartedHandlers) {
+            handler(event)
+          }
+        })
+        client.onTurnCompleted((event) => {
+          for (const handler of this.turnCompletedHandlers) {
             handler(event)
           }
         })

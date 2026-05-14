@@ -125,6 +125,22 @@ export const CodexFsChangedNotificationSchema = z.object({
   }),
 }).passthrough()
 
+export const CodexTurnStartedNotificationSchema = z.object({
+  method: z.literal('turn/started'),
+  params: z.object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1).optional(),
+  }).passthrough(),
+}).passthrough()
+
+export const CodexTurnCompletedNotificationSchema = z.object({
+  method: z.literal('turn/completed'),
+  params: z.object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1).optional(),
+  }).passthrough(),
+}).passthrough()
+
 export type CodexInitializeCapabilities = z.infer<typeof CodexInitializeCapabilitiesSchema>
 export type CodexInitializeParams = z.infer<typeof CodexInitializeParamsSchema>
 export type CodexInitializeResult = z.infer<typeof CodexInitializeResultSchema>
@@ -142,3 +158,5 @@ export type CodexThreadClosedNotification = z.infer<typeof CodexThreadClosedNoti
 export type CodexThreadStatusChangedNotification = z.infer<typeof CodexThreadStatusChangedNotificationSchema>
 export type CodexThreadLifecycleNotification = z.infer<typeof CodexThreadLifecycleNotificationSchema>
 export type CodexFsChangedNotification = z.infer<typeof CodexFsChangedNotificationSchema>
+export type CodexTurnStartedNotification = z.infer<typeof CodexTurnStartedNotificationSchema>
+export type CodexTurnCompletedNotification = z.infer<typeof CodexTurnCompletedNotificationSchema>
